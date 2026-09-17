@@ -1,0 +1,103 @@
+{
+  "_comment": [
+    "PORT campaign: IBM Spyre deeptools' SCHEDULER and BRIDGE 1, re-ported into",
+    "crates/compiler/deeptools after the first attempt was deleted whole on 2026-09-17.",
+    "",
+    "⭐⭐ THE SCOPE IS THE REAL C++ TREE, NOT A VENDORED EXTRACT. A class declaration and its method",
+    "bodies are ONE unit of work here, so there is nothing to cut into an extract without splitting",
+    "exactly what must stay together. Agents read /Users/nickm/git/deeptools-src directly.",
+    "",
+    "READ crustify-scheduler/AGENT-BRIEF.md IN FULL BEFORE EDITING ANYTHING. Its Rules 1 and 2 are",
+    "absolute: an agent can NEVER introduce a trait, and can NEVER make up a type."
+  ],
+  "campaign_objective": "port",
+  "impl_files": [
+    "dsc/dsc2.h",
+    "dsc/dsc2.cpp",
+    "dsc/designSpaceConfig.h",
+    "dsc/designSpaceConfig.cpp",
+    "dsc/dims.h",
+    "dsc/dims.cpp",
+    "ddc/",
+    "dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp",
+    "dsc-based-utils/DSC2ToDataflowIR/"
+  ],
+  "api_headers": [],
+  "_comment_authority": [
+    "THE ULTIMATE AUTHORITY IS /Users/nickm/git/deeptools-src, revision a0d29abbed. Cite path:line.",
+    "⛔ /Users/nickm/git/deeptools is a DIFFERENT revision. Do not use it.",
+    "⛔ AND OUR OWN DOC COMMENTS ARE NOT EVIDENCE. Ten defects in the deleted port were found by reading",
+    "IBM's source instead of our comments, every one self-documented as deliberate, two citations off by",
+    "410 and 48 lines. A review wave found ten MORE in code that had already passed check and test."
+  ],
+  "_comment_why_this_exists": [
+    "199,023 lines of Rust across 92 files were deleted for ~31,000 lines of working C++:",
+    "  schedule/  114,193  for L3DlOpsScheduler.cpp 8,033 + ddc/*.cpp 13,029   (3.2-3.5x)",
+    "  bridges/    84,830  for dsc-based-utils/DSC2ToDataflowIR/ 1,739         (49x)",
+    "",
+    "⛔ THE ALGORITHMS WERE NEVER THE PROBLEM — l3/dl_ops.rs and ddc/v1.rs held ZERO todo!s. The SHAPE",
+    "was. Both halves were made generic over traits standing in for DATA: eight in the scheduler",
+    "(Dsc2Store, Dsc2Reads, Dsc2Tree, Dsc2Stages, Dsc2Sites, Dsc2State, DdcState, DscState) and five in",
+    "the bridge (ScheduleView and Dsc among them). Every C++ member access became a trait method that",
+    "something else had to implement, and that something was schedule/stages/ — 20,494 lines with NO C++",
+    "counterpart, holding 130 todo!()s, 129 of them BARE because there was no C++ line to cite.",
+    "Five days moved that count from 131 to 130.",
+    "",
+    "⛔ AND TWO VOCABULARIES FOR ONE C++ HIERARCHY IS HOW THE TREE GOT TWO HOMES: the bridge's only",
+    "`ScheduleNode` was an unrelated enum in shape_constraints.rs while the scheduler's five node structs",
+    "carried NONE of the C++ base class's 13 fields — not outerLoops_, prev_ or loop_, which are its",
+    "parent and sibling links. That is why ancestry(), producer_loops() and relevant_comps() were",
+    "unanswerable rather than unported. The scheduler and the bridge are ONE campaign so they cannot",
+    "diverge again."
+  ],
+  "out_of_scope": {
+    "paths": [
+      "dsc-based-utils/PCFGToDataflowIR/",
+      "dsc-based-utils/Stitcher/",
+      "dbo/",
+      "dsm/"
+    ],
+    "features": []
+  },
+  "_comment_memtrack_and_ddl_are_IN_scope": [
+    "⛔⛔ I FIRST DECLARED THESE TWO 'CLEAN, RESTORE FROM THE TAG, DO NOT RE-PORT'. THAT WAS WRONG, and",
+    "checking took one command. Restored from `scheduler-before-nuke-2026-09-17` they brought back 13",
+    "TRAIT DECLARATIONS of exactly the disease this campaign exists to remove:",
+    "  ddl/conversion.rs  ScheduleReads, ScheduleWrites, DdlSite, DdlSizes, MatchSite, AllocationSite,",
+    "                     InternalTensorSite, DdlTemplateSet   — ScheduleReads/ScheduleWrites are the",
+    "                     same shape as the deleted Dsc2Reads/Dsc2Store.",
+    "  ddl/mod.rs         DdlSource        ddl/ops.rs  Defining",
+    "  memtrack/bundle.rs GrowExPhases, ShiftExPhases, InitMemTrack — a trait PER OPERATION.",
+    "And memtrack was 4,763 Rust lines for 703 lines of C++ (6.8x), which is not what a clean port looks",
+    "like either.",
+    "",
+    "⛔ THEY ALSO DO NOT STAND ALONE: the restored files reference the deleted modules FIFTY times",
+    "(ddc:: 27, l3:: 14, bridges:: 5, stages:: 3, dcg:: 1). They cannot compile without the carrier",
+    "layer, which is the proof they were never a separable clean port — they are part of the same",
+    "trait-coupled mass. So util/memtracker/mem_track.{h,cpp} (703 lines) is IN scope, and the DDL",
+    "conversion is already in scope under ddc/ (ddc/ddl/ddl_conversion.cpp — its :1065 is the",
+    "representative node-minting site, which mints a dsc2::LoopNode and registers it in loop_labels_).",
+    "",
+    "⭐ WHAT REMAINS TRUE: the 32 vendored .ddl templates ARE DATA and ARE the schedule — expanding them",
+    "yields 11,218 of the reference's 14,711 nodes (76%). The templates themselves are not to be",
+    "re-derived; the C++ that PARSES and EXPANDS them is what gets ported."
+  ],
+  "_comment_acceptance": [
+    "⛔ THE GATE IS NOT `cargo test` GREEN AND IT IS NOT AN ANCHOR COUNT. The deleted port ended with",
+    "1,567 tests passing, cargo check clean, 17 of 18 units anchored — and it minted 22 nodes where the",
+    "reference mints 30 on the same program, then stopped at a carrier refusal.",
+    "",
+    "⭐⭐ THE GATE IS HOW MANY NODES OUR SCHEDULER MINTS ON A REAL PROGRAM. IBM's scheduled trees hold",
+    "14,711 nodes across the 187 g0 fixture programs — transfer 3,102, compute 2,834, block 2,158, loop",
+    "2,043, allocate 1,899, sync 1,783, condition 892. Fixtures: ~/tmp/bridge1-fixtures/g0/sdsc_N.json",
+    "is OUR INPUT (allocate nodes only, by construction) and debug/sdsc_N/sdsc.json is the reference's",
+    "SCHEDULED output at dscs_[0][<prog>].scheduleTree_. ⛔ Comparing our INPUT to their OUTPUT measures",
+    "nothing — run OUR scheduler, then compare.",
+    "",
+    "Then: sdscToDataflowIR consumes that tree, dbo-opt --from-dfir bakes it, init_binary comes out.",
+    "⛔ REPORT PER UNIT, NEVER PER CAMPAIGN. A campaign cannot audit its own boundary; '1,076 units",
+    "ported' once meant 238 stubs.",
+    "The build gate is `cargo check -p deeptools` + `cargo test -p deeptools`; never the workspace and",
+    "never the acceptance build from an agent worktree (~6 GB of target/ each)."
+  ]
+}

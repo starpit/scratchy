@@ -83,11 +83,20 @@ the scheduler builds and the two must share ONE set of concrete node types. The 
 them disagree: the bridge's only `ScheduleNode` was an unrelated enum while the scheduler's five node
 structs carried none of the C++ base class's 13 fields.
 
-⛔ **Do NOT re-port these — restore them from the tag instead:**
-- `util/memtracker/mem_track.cpp` → was `schedule/memtrack/`, a clean 703-line port with no traits.
-- the 32 `.ddl` templates and their expansion → `build.rs` generates the parser and
-  `schedule/ddl/conversion.rs` mints into the tree. **The templates ARE the schedule**: expanding them
-  yields 11,218 of the reference's 14,711 nodes. Do not re-derive what they already state.
+⛔ **`util/memtracker/mem_track.{h,cpp}` and the DDL conversion are IN scope too.** I first called them
+clean and said to restore them from the tag. That was wrong, and one command disproved it: restored,
+they bring back **13 trait declarations** of exactly this disease — `ScheduleReads`, `ScheduleWrites`,
+`DdlSite`, `DdlSizes`, `MatchSite`, `AllocationSite`, `InternalTensorSite`, `DdlTemplateSet`,
+`DdlSource`, `Defining`, and in `memtrack/bundle.rs` a trait *per operation* (`GrowExPhases`,
+`ShiftExPhases`, `InitMemTrack`). `memtrack/` was also 4,763 Rust lines for 703 of C++. And they do not
+stand alone: those files reference the deleted modules **fifty times**, so they never were a separable
+clean port.
+
+⭐ What remains true: the 32 `.ddl` templates are **data**, and they *are* the schedule — expanding them
+yields 11,218 of the reference's 14,711 nodes. Do not re-derive what the templates state. The C++ that
+**parses and expands** them is what you port (`ddc/ddl/ddl_conversion.cpp`; its `:1065` is the
+representative node-minting site — it mints a `dsc2::LoopNode`, takes its dims from the DDL, names it
+`loop_ds<num>_ds<den>` and registers it in `ddlInterface.loop_labels_`).
 
 ⛔ **DCG/PCFG is off our path** (decided 2026-09-09). Only `DSC2ToDataflowIR` is ours, never
 `PCFGToDataflowIR` or `Stitcher`.
