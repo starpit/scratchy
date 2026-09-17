@@ -12,81 +12,12 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 2,
-  "layer_count": 2,
-  "batch_count": 2,
+  "unit_count": 1,
+  "layer_count": 1,
+  "batch_count": 1,
   "file_count": 2
  },
  "waves": [
-  {
-   "unit_count": 1,
-   "batches": [
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/ddc_metadata.h",
-     "items": [
-      {
-       "name": "e017_Metadata",
-       "defined_in": "crustify-types/cpp/ddc_metadata.h",
-       "kind": "type",
-       "source_kind": "struct",
-       "layer": 0,
-       "loc": 209,
-       "deps": {
-        "types": [],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": [
-        "TransferNodesInterSliceTranspose_",
-        "accessPatternPerDim_",
-        "allocate_",
-        "allowEpilogue_",
-        "cannotBeSymbolic_",
-        "clSplitDims_",
-        "constraints_",
-        "consumers_",
-        "dataConnects_",
-        "datastages_",
-        "datatransfers_",
-        "dimToCoreChunkLoops_",
-        "discardAboveLxSchedule_",
-        "externalNodes_",
-        "externalTransfers_",
-        "implicitSyncs_",
-        "inOutRegAllocs_",
-        "internalRegAlloc_",
-        "internalRegsWithUnroll_",
-        "internalRegs_",
-        "ldsIdx_",
-        "loopDimKind_",
-        "max_",
-        "min_",
-        "mustBeMultiple_",
-        "name_",
-        "nearestNumeratorIdx_",
-        "newAllocations_",
-        "nodeCloningMap_",
-        "opFuncBackup_",
-        "opaqueOps_",
-        "peSfpSplitDims_",
-        "prefilledExternalTransferToDataConnectToFill_",
-        "producers_",
-        "relevantDimsAndNumerator_",
-        "replicated_",
-        "shadowAllocations_",
-        "strategyMinimize_",
-        "transfer_",
-        "transformationConfig_",
-        "values_"
-       ]
-      }
-     ]
-    }
-   ]
-  },
   {
    "unit_count": 1,
    "batches": [
