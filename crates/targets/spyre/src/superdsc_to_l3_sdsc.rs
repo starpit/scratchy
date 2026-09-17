@@ -153,12 +153,12 @@ use deeptools::formats::DataFormat;
 // ⭐ THE AUDIT IS `grep deeptools::schedule crates/targets/` AND ITS ANSWER IS ZERO.
 use deeptools::sdsc::{
     ConstIdx, ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage,
-    DataStages, DdcFacts, DesignSpaceConfig, DscComputeOp, DscFilled, DscIdx, DscList,
-    DscScheduleStep, DscState, DsType, Extent, FilledDims, L0Tethered, LabeledDs,
-    LabeledDsAllocations, LabeledDsList, LayoutDims, LdsIdx, LdsRecord, NamedDims, NodeKind, OpFunc,
-    OpFuncs, Pinning, PrimaryDim, PrimaryDsInfo, Scale, Scheduling, SenComponent, StageDims,
-    StageName, StickDims, StorageName, SuperDsc, WkSlice, WkSliceCount, WkSliceId, WordLength,
-    layout_dims, run_stages_2a_2b,
+    DataStages, DdcFacts, DesignSpaceConfig, DsType, DscComputeOp, DscFilled, DscIdx, DscList,
+    DscName, DscScheduleStep, DscState, Extent, FilledDims, L0Tethered, LabeledDs,
+    LabeledDsAllocations, LabeledDsList, LayoutDims, LdsIdx, LdsRecord, NamedDims, NodeKind,
+    OpFunc, OpFuncs, Pinning, PrimaryDim, PrimaryDsInfo, Scale, Scheduling, SenComponent,
+    SenTarget, StageDims, StageName, StickDims, StorageName, SuperDsc, WkSlice, WkSliceCount,
+    WkSliceId, WordLength, layout_dims, run_stages_2a_2b,
 };
 use deeptools::units::Core;
 use scratchy_subtile::superdsc_opspec::Role;
@@ -641,7 +641,7 @@ impl LabeledDsAllocations for WireAllocations {
 ///
 /// ⭐ `maskingConstId_` AND `constantInfo_` **ARE** READ, ONTO [`DdcFacts`] — see [`constant_info_of`].
 #[must_use]
-pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
+pub fn design_space_config(name: &str, dsc: &WireDsc) -> Option<DesignSpaceConfig> {
     // 1. `numCoreletsUsed_` — READ. Scratchy emits `1` (`ACTIVE_CORELETS`) on all 187 programs, but
     //    the count is taken from the field rather than assumed, so a two-corelet emission converts.
     let corelets_used = CoreletsUsed::new(NonZeroU32::new(dsc.numCoreletsUsed_)?);
@@ -758,6 +758,23 @@ pub fn design_space_config(dsc: &WireDsc) -> Option<DesignSpaceConfig> {
     };
 
     Some(DesignSpaceConfig {
+        // 17. `name_` — READ, AND FROM THE ONE PLACE SCRATCHY WRITES IT: the `dscs_` map KEY. The
+        //     wire's `dscs_` is a `Vec<BTreeMap<String, Dsc>>`
+        //     (`lower_subtile_tape_to_superdsc.rs:1300`) whose key is the program name the emitter
+        //     states (`"MatMul_0"`, `"rmsq_o728"` in `g0/sdsc_0.json`), and `importJsonObj` assigns
+        //     exactly that (`dsc->name_ = map0.first`, `dsc/designSpaceConfig.cpp:6836`). ⛔ NOT A
+        //     REFUSAL WHEN EMPTY: a `BTreeMap` entry has a key by construction.
+        name: DscName(name.to_owned()),
+        // 18/19. `unpadN_` AND `dscN_` — ⭐ THE DECLARED `-1` IN EVERY DIM, because scratchy emits
+        //        neither at DSC level (the emitter's own field list calls `unpadN_` an OP-level extra,
+        //        `lower_subtile_tape_to_superdsc.rs:1272`) and NOTHING in `dcg/`, `ddc/` or `dbo/`
+        //        reads either — see their fields' own docs. The vendor's ddc fixtures carry `-1`.
+        unpad_dims: StageDims::default(),
+        dsc_dims: StageDims::default(),
+        // 20. `target_` — ⭐ THE DECLARED `SenTargets::UNDEFINED`. ⛔ AND THAT IS NOT A GAP: the DSC's
+        //     copy has no reader on this path; the one the three standalone entries build their
+        //     globals from is `SuperDsc::target_`, which `dcg::manager::SuperDsc` carries.
+        target: SenTarget::default(),
         // 15/16. `dimToSymbolMapping_` AND `l0TetheredMode_` — ⭐ THE DECLARED `{}` AND `false`,
         //        because scratchy EMITS NEITHER: the emitter's own field list calls both scheduler
         //        OUTPUTS and drops them (`lower_subtile_tape_to_superdsc.rs:1240-1241`). ⛔ THAT IS AN
@@ -921,27 +938,6 @@ pub fn compute_ops_of(op: &SdscOp) -> Option<Vec<Vec<DscComputeOp>>> {
         .collect()
 }
 
-/// ⭐⭐ EVERY DSC'S `name_`, POSITIONALLY BESIDE `dscs_` — READ, and read from the one place scratchy
-/// writes it.
-///
-/// ⭐ `dsc.name_` IS THE `dscs_` MAP **KEY**. The wire's `dscs_` is a `Vec<BTreeMap<String, Dsc>>`
-/// (`lower_subtile_tape_to_superdsc.rs:1300`) whose key is the program name the emitter states
-/// (`"MatMul_0"`, `"rmsq_o728"` in `g0/sdsc_0.json`), and `dsc/designSpaceConfig.h:72`'s `name_` is
-/// the same fact — so this is a READ and not the positional `dsc{at}` spelling
-/// `Dsc2State::seeded` falls back to.
-///
-/// ⛔ IT IS NOT LOAD-BEARING BEYOND DIAGNOSTICS — only `v1::Dsc2Fill::said`'s two verbose lines read
-/// it — which is why an absent key is not a refusal here; there is no absent key, because a
-/// `BTreeMap` entry has one by construction.
-#[must_use]
-pub fn dsc_names(op: &SdscOp) -> Vec<StorageName> {
-    op.dscs_
-        .iter()
-        .flat_map(BTreeMap::keys)
-        .map(|name| StorageName(name.clone()))
-        .collect()
-}
-
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //  One SuperDSC op
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -959,8 +955,8 @@ pub fn super_dsc(op: &SdscOp) -> Option<SuperDsc> {
     let mut dscs = op
         .dscs_
         .iter()
-        .flat_map(BTreeMap::values)
-        .map(design_space_config)
+        .flat_map(BTreeMap::iter)
+        .map(|(name, dsc)| design_space_config(name, dsc))
         .collect::<Option<Vec<_>>>()?
         .into_iter();
     let dscs = DscList::new(dscs.next()?, dscs.collect());
@@ -1209,7 +1205,7 @@ impl Ran {
 /// the answer it did not give.
 ///
 /// ⛔ IT IS SOUND TO READ THE ARTIFACTS AFTER THE UNWIND — and they SURVIVE it, which is why the
-/// `Option` is unwrapped outside the closure. `sdsc`, `ops` and `names` are owned by THIS frame, so an
+/// `Option` is unwrapped outside the closure. `sdsc` and `ops` are owned by THIS frame, so an
 /// unwind inside [`run_stages_2a_2b`] would drop the [`Scheduling`] it
 /// was building; a caught panic therefore reports where it stopped and carries no artifacts, which is
 /// the honest answer rather than a half-scheduled tree.
@@ -1222,11 +1218,10 @@ pub fn run_stages(op: &SdscOp) -> Ran {
         return Ran::NotConverted;
     };
     let ops = op_funcs_of(op);
-    let names = dsc_names(op);
     let compute_ops = dsc_ops.iter().map(Vec::len).sum();
 
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_stages_2a_2b::<deeptools::arch::Dd2>(sdsc, ops, &dsc_ops, &names)
+        run_stages_2a_2b::<deeptools::arch::Dd2>(sdsc, ops, &dsc_ops)
     }));
     match ran {
         Ok(scheduling) => Ran::Scheduled(Scheduled {
@@ -2028,11 +2023,18 @@ mod tests {
              write, so it must STOP rather than resolve — a wrong `usePt` splits the wrong dim"
         );
 
-        // ⭐ AND THE PER-DSC NAME IS THE `dscs_` MAP KEY, READ — not the positional `dsc0` fallback.
+        // ⭐ AND THE PER-DSC NAME IS THE `dscs_` MAP KEY, ON THE DSC — not a positional `dsc0`.
         assert_eq!(
-            dsc_names(&wire),
-            vec![StorageName("MatMul_0".to_owned())],
-            "`dsc.name_` is the key the emitter states, which is what `Dsc2Fill::said` prints"
+            super_dsc(&wire)
+                .expect("the MatMul op converts")
+                .dscs()
+                .at(DscIdx(0))
+                .expect("one DSC")
+                .name
+                .clone(),
+            DscName("MatMul_0".to_owned()),
+            "`dsc.name_` is the key the emitter states, and `createPcfgForUnitPerCore` turns it back \
+             into the `dscs_` index (`dcg/dcg_fe/pcfg_gen/dlOps.cpp:22-28`)"
         );
     }
 

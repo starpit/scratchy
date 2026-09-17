@@ -6394,9 +6394,6 @@ pub trait Dsc2Sites {
     /// The coordinate tables.
     type Coords: CoordinateOffsets;
 
-    /// `dsc.name_` (`dsc/designSpaceConfig.h:72`), which only the two verbose lines read.
-    fn dsc_name(&self, dsc: DscIdx) -> StorageName;
-
     /// Every store of that DSC at once — ⛔ [`None`] is `dscs_.at(idx)`'s own throw.
     fn carriers(
         &mut self,
@@ -6608,8 +6605,11 @@ where
     let mut offsets = options.offsets;
 
     let mut idx = DscIdx(0);
-    while sdsc.dscs().at(idx).is_some() {
-        let name = sites.dsc_name(idx);
+    // ⭐ THE LOOP CONDITION IS THE `name_` READ. `dsc.name_` is a [`DesignSpaceConfig`] field
+    // ([`crate::schedule::l3::dsc::DesignSpaceConfig::name`]), so the entry this condition tests IS
+    // the entry that carries the name — there is no provider method for it and no fallback spelling
+    // for a `dscs_` position that has none.
+    while let Some(name) = sdsc.dscs().at(idx).map(|dsc| dsc.name.clone()) {
         let Dsc2Carriers {
             dsc: store,
             stages,

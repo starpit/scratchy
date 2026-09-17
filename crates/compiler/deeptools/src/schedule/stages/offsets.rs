@@ -1020,6 +1020,12 @@ mod tests {
             lx_chunk_capacity: BTreeMap::new(),
             full_padding: BTreeMap::new(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             labeled_ds: LabeledDsList::new(
                 LabeledDs::new(DsType::Input, vec![], LdsIdx(0), Pinning::default())
                     .with_record(LdsRecord {

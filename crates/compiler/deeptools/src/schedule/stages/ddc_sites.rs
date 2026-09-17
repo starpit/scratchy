@@ -1671,14 +1671,6 @@ impl<'s, 'l> v1::Dsc2Sites for Dsc2Provider<'s, 'l> {
     type Symbols = ddc_state::DdcSymbols;
     type Coords = ddc_state::DdcCoords;
 
-    /// `dsc.name_` — the construction argument [`Dsc2State::seeded`] takes, which only the two verbose
-    /// lines read.
-    fn dsc_name(&self, dsc: DscIdx) -> v1::StorageName {
-        self.state
-            .facts(dsc)
-            .map_or_else(|| v1::StorageName(format!("dsc{}", dsc.0)), |facts| facts.name())
-    }
-
     /// ⛔ [`None`] IS `dscs_.at(idx)`'s OWN THROW — a `dscs_` position this provider holds no stores
     /// for, which is what ends `run_v1`'s loop.
     fn carriers(
@@ -1834,7 +1826,6 @@ mod live_tree_tests {
     use crate::schedule::ddc::metadata::Metadata;
     use crate::schedule::ddc::transformation::DsType;
     use crate::schedule::ddc::transformation_util::StageName;
-    use crate::schedule::ddc::v1;
     use crate::schedule::ddl::conversion::{
         CondProp, DdlConversion, DdlInterface, DdlOp, DdlRoot, RegionId, RegionOp, RegionTree,
         parse_ddl2_dsc,
@@ -1874,6 +1865,12 @@ mod live_tree_tests {
         DesignSpaceConfig {
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: two,
             corelets_used_dsc2: Some(two),
             corelet_shares: BTreeMap::new(),
@@ -1953,12 +1950,7 @@ mod live_tree_tests {
             .with(|tree| tree.head())
             .expect("a seeded tree has a head");
 
-        let state2 = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[Vec::new()],
-            &[v1::StorageName("bare".to_owned())],
-        );
+        let state2 = Dsc2State::seeded(&sdsc, &l3_state, &[Vec::new()]);
         let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
         // ⛔ `belowLxScheduleInsertBlock` IS NEVER THE HEAD — `traverseTreeDFSMutable` seeds from
         // `head_.next_` (`dsc/dsc2.cpp:2233`) — so the reference's `!=` holds and
@@ -2156,12 +2148,7 @@ mod live_tree_tests {
                 BTreeMap::new(),
             );
             let l3_state = DscState::seeded(&sdsc);
-            let state2 = Dsc2State::seeded(
-                &sdsc,
-                &l3_state,
-                &[Vec::new()],
-                &[v1::StorageName("bare".to_owned())],
-            );
+            let state2 = Dsc2State::seeded(&sdsc, &l3_state, &[Vec::new()]);
             let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
             let templates = DdlTemplates::new();
             let stated = DdlTemplateSet::stated(&templates, Template::BroadcastOps)
@@ -2248,12 +2235,7 @@ mod live_tree_tests {
             BTreeMap::new(),
         );
         let l3_state = DscState::seeded(&sdsc);
-        let state2 = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[Vec::new()],
-            &[v1::StorageName("bare".to_owned())],
-        );
+        let state2 = Dsc2State::seeded(&sdsc, &l3_state, &[Vec::new()]);
         let mut site = Dsc2Ddl::new(&state2, DscIdx(0));
         let templates = DdlTemplates::new();
         let stated = DdlTemplateSet::stated(&templates, Template::BroadcastOps)

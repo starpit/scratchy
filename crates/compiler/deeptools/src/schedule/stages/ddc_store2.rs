@@ -1935,6 +1935,12 @@ mod authority_tests {
                 ..crate::schedule::l3::dsc::DdcFacts::default()
             },
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: two,
             corelets_used_dsc2: Some(two),
             corelet_shares: BTreeMap::new(),
@@ -2047,7 +2053,7 @@ mod authority_tests {
             "root_level_operations plus the HBM allocation of the one pinned labelled DS: {:?}",
             l3.dsc(DscIdx(0)).expect("the one DSC").names()
         );
-        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()]);
 
         // ── MINT INTO THE LIVE TREE through the DDL expansion's own writer ─────────────────────
         let head = l3
@@ -2279,7 +2285,7 @@ mod authority_tests {
             BTreeMap::new(),
         );
         let l3 = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()]);
         let head = l3
             .dsc(DscIdx(0))
             .expect("the one DSC's tree")
@@ -2334,7 +2340,7 @@ mod authority_tests {
             BTreeMap::new(),
         );
         let l3 = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()]);
         let store = Dsc2Store::new(&state, DscIdx(0), AddressFoldCoords::flat());
         assert_eq!(
             tr::HoistTransfers::hoist_parent(&store, NodeId(9_999)),
@@ -2354,7 +2360,7 @@ mod authority_tests {
             BTreeMap::new(),
         );
         let l3 = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()], &[v1::StorageName("d".to_owned())]);
+        let state = Dsc2State::seeded(&sdsc, &l3, &[Vec::new()]);
         let head = l3
             .dsc(DscIdx(0))
             .expect("the one DSC's tree")

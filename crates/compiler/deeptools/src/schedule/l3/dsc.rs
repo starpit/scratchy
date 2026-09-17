@@ -17,6 +17,7 @@ use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     self as shape_constraints, Extent, PrimaryDim, StickDims, StickPart, VectorComp,
 };
 use crate::formats::DataFormat;
+use crate::schedule::dcg::manager::SenTarget;
 use crate::schedule::ddc::fold::{
     AllocId, ConstIdx, Dilation, MxScaleTensor, NodeId, PadType, ScaleBlock, ScaledLds, Stride,
 };
@@ -357,7 +358,20 @@ impl CoreIdsUsed {
         self.first
     }
 
-    /// `numCoresUsed_`, which is `coreIdsUsed_.size()` — ONE at minimum, by construction.
+    /// Field: e018_DesignSpaceConfig.numCoresUsed_
+    ///
+    /// `numCoresUsed_` (`dsc/designSpaceConfig.h:73`), which is `coreIdsUsed_.size()` — ONE at
+    /// minimum, by construction. DERIVED AND NOT STORED, for the reason [`CoreCount`] states: ten
+    /// `DT_CHECK(coreIdsUsed_.size() == numCoresUsed_)` sites say the two agree
+    /// (`dsc/designSpaceConfig.cpp:1033`, `dsc/dsc2Pcfg.cpp:21`, `dsc/superdsc.cpp:1347`,
+    /// `dsc/sdsc-perfmodel/perfmodel.cpp:951`, `dsm/dsm.cpp:22698`, `dsm/spadprefetch.cpp:416`,
+    /// `dsm/dsmperf.cpp:1858`, `:2285`, `:2811`, `senulator/parser.cpp:409`).
+    ///
+    /// ⭐ AND IT IS LOAD-BEARING ON THIS PATH, which is why it is anchored rather than dropped: the
+    /// DDL's minimum-core constraint compares against it (`ddc/ddl/ddl_conversion.cpp:2559`), stage
+    /// 2a multiplies its flop estimate by it (`L3DlOpsScheduler.cpp:2294`) and sums it across DSCs
+    /// (`:2518`), and dbo's program correction loops `coreId < dsc.numCoresUsed_`
+    /// (`ProgramCorrection.cpp:1554`, `:1572`, `:1588`).
     #[must_use]
     pub fn count(&self) -> CoreCount {
         CoreCount(
@@ -522,15 +536,33 @@ pub struct DdcFacts {
     /// entries (max-pivot) for irregular dims"*, so a dim's entry is a LIST and an ABSENT dim is a
     /// `count(dim) == 0`.
     pub dim_to_symbol: BTreeMap<PrimaryDim, Vec<VariableSymbol>>,
+    /// Field: e018_DesignSpaceConfig.l0TetheredMode_
+    ///
     /// `l0TetheredMode_` (`:117`) — ⛔ [`L0Tethered::Split`] IS THE DECLARED `false`.
     pub l0_tethered: L0Tethered,
 }
 
+/// WHAT ONE DSC IS CALLED — `DesignSpaceConfig::name_` (`dsc/designSpaceConfig.h:72`).
+///
+/// ⭐⭐ IT IS THE `dscs_` MAP **KEY**, NOT A LABEL THE DSC CHOSE: `importJsonObj` assigns
+/// `dsc->name_ = map0.first` (`dsc/designSpaceConfig.cpp:6836`), so the name and the position are one
+/// fact stated twice — and `createPcfgForUnitPerCore` READS IT BACK AS THE POSITION, scanning
+/// `sdsc.dscs_` for `myDsc->name_ == sdsc.dscs_.at(i).name_` to recover the index a
+/// `coreIdToDsc_` pointer came from, under `DT_CHECK(myDscId >= 0)`
+/// (`dcg/dcg_fe/pcfg_gen/dlOps.cpp:22-28`, and again in `dlOpsNew.cpp:129-135`).
+///
+/// ⛔ SO IT IS NOT [`crate::schedule::ddc::v1::StorageName`], WHICH NAMES A LABELLED DS OR A
+/// CONSTANT. Comparing a DSC's name against a storage's is a defect this type makes an E0308.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct DscName(pub String);
+
+/// Replaces: e018_DesignSpaceConfig
+///
 /// ONE DESIGN SPACE CONFIG — `DesignSpaceConfig` (`dsc/designSpaceConfig.h:51`) reduced to the
 /// fields this batch reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesignSpaceConfig {
-    /// The four fields the DSM and the DM fill — see [`DdcFacts`].
+    /// The four fields the DSM and the DM fill, `l0TetheredMode_` among them — see [`DdcFacts`].
     pub ddc: DdcFacts,
     /// `numCoreletsUsed_`.
     pub corelets_used: CoreletsUsed,
@@ -548,7 +580,8 @@ pub struct DesignSpaceConfig {
     pub corelet_shares: BTreeMap<PrimaryDim, CoreletShare>,
     /// `primaryDsInfo_` (`dsc/dscdefn.h:474`).
     pub primary_ds_info: BTreeMap<DsType, PrimaryDsInfo>,
-    /// `coreIdsUsed_`.
+    /// `coreIdsUsed_`, and with it `numCoresUsed_` (`dsc/designSpaceConfig.h:73`) — its count, by
+    /// [`CoreIdsUsed::count`], and not a second field.
     pub core_ids_used: CoreIdsUsed,
     /// `getLayoutDims(ldsIdx)` (`dsc/dsc2.cpp:4007`), per labelled data structure.
     pub layout_dims: BTreeMap<LdsIdx, LayoutDims>,
@@ -576,6 +609,63 @@ pub struct DesignSpaceConfig {
     /// multicast transfers claim. EMPTY on a DSC the L3 scheduler has not reached; entries 218 and
     /// 291 are what fill it, and only for a group with more than one sharer.
     pub gtr_ids_used: BTreeSet<GtrGroupId>,
+    /// Field: e018_DesignSpaceConfig.name_
+    ///
+    /// `name_` (`dsc/designSpaceConfig.h:72`) — see [`DscName`] for why the name IS the position.
+    ///
+    /// ⛔ IT WAS A CONSTRUCTION ARGUMENT AND THAT WAS THE DEFECT. `Dsc2State::seeded` took a
+    /// `&[StorageName]` positional beside `sdsc.dscs()` and spelled a DSC the caller named none for
+    /// `dsc{at}` — a FABRICATED identity for the one field whose whole job is to be the identity.
+    /// The name lives here now and that fallback is gone.
+    pub name: DscName,
+    /// Field: e018_DesignSpaceConfig.unpadN_
+    ///
+    /// `unpadN_` (`dsc/designSpaceConfig.h:82`) — the data structure's dims BEFORE padding, filled by
+    /// the DGP.
+    ///
+    /// ⛔ NO SITE ON THIS CAMPAIGN'S PATH READS IT, so [`Default`] is what every construction site
+    /// here states — and that is the reference's own default construction, which is `-1` in every
+    /// slot. Nothing in `dcg/`, `ddc/` or `dbo/` names the member: its live readers are the senulator
+    /// (`senulator/parser.cpp:1078-1079`, `:1259`) and the perf model
+    /// (`dsc/sdsc-perfmodel/perfmodel.cpp:477-505`), and every write is upstream in `dsm/`
+    /// (`graphOptimizer.cpp:23679`, `:23782`, `dsm.cpp:22494`). ⚠️ `getDsdFromStr("unpadn")` CANNOT
+    /// REACH IT EITHER: both callers pass a ONE-CHARACTER data-stage letter off a loop name
+    /// (`dsc/designSpaceConfig.cpp:644`, `:691`), and `"unpadn"` is six.
+    ///
+    /// ⭐ THE VENDOR'S OWN DDC FIXTURES AGREE: every `"unpadN_"` in `ddc/test/` carries `-1` in all
+    /// twenty-two dims (e.g. `ddc/test/l0_tethering/fp8_2core/sdsc_alxs_input_..._MatMul_49.json:48`).
+    pub unpad_dims: StageDims,
+    /// Field: e018_DesignSpaceConfig.dscN_
+    ///
+    /// `dscN_` (`dsc/designSpaceConfig.h:83`) — *"total parameters performed by this DSC"*, the
+    /// header's own words, also filled by the DGP.
+    ///
+    /// ⛔ AND READ NOWHERE ON THIS PATH, on the same measurement as [`Self::unpad_dims`]: its live
+    /// readers are `Dsi`'s split census (`dsi/dsi.cpp:1768-1778`), `dsm` (`dsm.cpp:10856-10872`,
+    /// `:17533`, `:17574`) and the senulator (`senulator/parser.cpp:1611-1646`), none of which any
+    /// unit in this campaign reaches. Its fixtures are `-1` throughout too.
+    ///
+    /// ⛔ NOT A COPY OF `N_` EITHER, which is the reason it is a field of its own rather than a read
+    /// of [`Self::data_stages`]: `dsm.cpp:22549-22615` seeds it FROM `N_` and then rewrites `i_`,
+    /// `r_`, `rc_` and `in_` off the work split, so the two disagree by design.
+    pub dsc_dims: StageDims,
+    /// Field: e018_DesignSpaceConfig.target_
+    ///
+    /// `target_` (`dsc/designSpaceConfig.h:121`) — ⛔ [`SenTarget::Undefined`] IS THE DECLARED
+    /// `SenTargets::UNDEFINED`.
+    ///
+    /// ⛔ THE DSC'S OWN COPY, AND THE PATH READS THE SUPER-DSC'S INSTEAD. Every `target_` in `dcg/`,
+    /// `ddc/` and `dbo/` is `SuperDsc::target_` (`dsc/superdsc.h:114`) — the three standalone entries
+    /// build their globals from `sdsc.target_` (`ddc/ddc_standalone.cpp:63`,
+    /// `ddc/ddl/ddl_standalone.cpp:78`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler_standalone.cpp:180`)
+    /// and entry 282 branches on `mySDsc.target_ == SENPCFG` (`dcg/dcg_manager/dcg_manager.cpp:739`),
+    /// which [`crate::schedule::dcg::manager::SuperDsc`] already carries. ⚠️ `ddsc.target_`
+    /// (`dcg/tools/dcg_standalone.cpp:389`, `:392`) is a `DataOpDsc`, a different class.
+    ///
+    /// ⛔ ITS ONE APPARENT VALIDATOR IS DEAD: `DesignSpaceConfig::verify`'s read
+    /// (`dsc/designSpaceConfig.cpp:8241`) sits inside an `#if 0`, and `checkAssumption`'s four
+    /// (`:8548`, `:8574`, `:8619`, `:8977`) are reached only from the senulator and `deeprt`.
+    pub target: SenTarget,
 }
 
 impl DesignSpaceConfig {
@@ -3958,5 +4048,61 @@ mod tests_e018_design_space_config {
         assert_eq!(four.count(), CoreCount(4));
         assert_eq!(four.count().0 as usize, four.iter().count());
         assert_eq!(four.first(), core(0));
+    }
+
+    /// ⛔ A DSC NAME IS NOT A STORAGE NAME, AND THAT IS THE WHOLE POINT OF [`DscName`]. `name_` is the
+    /// `dscs_` map key `createPcfgForUnitPerCore` turns back into an INDEX under
+    /// `DT_CHECK(myDscId >= 0)` (`dcg/dcg_fe/pcfg_gen/dlOps.cpp:22-28`), while
+    /// [`StorageName`] names a labelled DS or a constant — and the seam this unit replaced typed both
+    /// as `StorageName`, so a `dsc{i}` spelled positionally was assignable to either.
+    ///
+    /// ⭐ THE CARRIED VALUE, NOT A RATIO: the two orderings a `dscs_` lookup depends on
+    /// ([`Ord`] is what a `BTreeMap` key needs) plus the `-1`-in-every-dim [`Default`] the three
+    /// read-nowhere members declare.
+    #[test]
+    fn a_dsc_name_orders_like_its_map_key_and_the_dead_dims_default_to_the_declared_minus_one() {
+        let key = DscName("MatMul_0".to_owned());
+        assert_eq!(
+            key,
+            DscName("MatMul_0".to_owned()),
+            "the `dscs_` lookup IS equality"
+        );
+        assert!(
+            key < DscName("rmsq_o728".to_owned()),
+            "and it orders as its `BTreeMap` key does, which is what makes the index recoverable"
+        );
+        assert_eq!(
+            DscName::default(),
+            DscName(String::new()),
+            "the declared empty name"
+        );
+
+        // `unpadN_`/`dscN_` — the reference default-constructs both, and its own ddc fixtures carry
+        // `-1` in every one of the twenty-two dims. ⛔ ABSENT IS THAT `-1`, not `Extent(-1)`:
+        // `StageDims::extent` answers absence for an unset dim, so no slot claims a size.
+        let dead = StageDims::default();
+        assert_eq!(dead, StageDims::default());
+        let every_dim = [
+            PrimaryDim::In,
+            PrimaryDim::Out,
+            PrimaryDim::Ij,
+            PrimaryDim::Mb,
+            PrimaryDim::X,
+            PrimaryDim::Y,
+            PrimaryDim::Kij,
+            PrimaryDim::I,
+            PrimaryDim::J,
+            PrimaryDim::Ki,
+            PrimaryDim::Kj,
+            PrimaryDim::X1,
+        ];
+        assert!(
+            every_dim.iter().all(|dim| dead.extent(*dim).is_none()),
+            "no dim of a default-constructed `unpadN_`/`dscN_` states an extent"
+        );
+
+        // `target_` — ⭐ `SenTargets::UNDEFINED` IS THE DECLARED VALUE, and the DSC's copy is not the
+        // one this path reads; `SuperDsc::target_` is.
+        assert_eq!(SenTarget::default(), SenTarget::Undefined);
     }
 }

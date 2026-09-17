@@ -38,9 +38,9 @@
 //! access a target did not have — it CONCENTRATES it, so that `grep deeptools::schedule
 //! crates/targets/` is the audit and its answer is zero.
 //!
-//! # ⭐ THE THREE STAGE ARGUMENTS, AND WHY A CALLER STATES THEM
+//! # ⭐ THE TWO STAGE ARGUMENTS, AND WHY A CALLER STATES THEM
 //!
-//! [`run_stages_2a_2b`] takes the super-DSC plus three things that are NOT fields of
+//! [`run_stages_2a_2b`] takes the super-DSC plus two things that are NOT fields of
 //! [`DesignSpaceConfig`] or [`SuperDsc`], so no carrier can read them off the value in hand:
 //!
 //! * [`OpFuncs`] — `computeOp_[i].opFuncName`, which the min-param units specialise on.
@@ -48,7 +48,11 @@
 //!   LIST IS A FALSE GREEN: [`crate::schedule::ddc::v1::PrepDsc::compute_ops`] is the FIRST provider
 //!   call `run_v1` makes (`ddc/v1.rs:6437`) and an empty answer makes it `continue` past the DSC, so
 //!   the stage answers [`DscFilled::Yes`] having placed no address and minted no node.
-//! * `&[StorageName]` — `dsc.name_`, which only the two verbose lines read.
+//!
+//! ⛔ THERE WAS A THIRD, AND IT WAS WRONG: a `&[StorageName]` positional beside `sdsc.dscs()` for
+//! `dsc.name_`. That field IS a [`DesignSpaceConfig`] field
+//! ([`crate::schedule::l3::dsc::DesignSpaceConfig::name`]), so stating it beside the value produced a
+//! FABRICATED `dsc{i}` for any caller that stated none.
 
 /// ⭐ THE DIM VOCABULARY A SuperDSC IS WRITTEN IN — `PrimaryDimTypes` (`dsc/dims.h:34`) and the two
 /// extent newtypes beside it. ⛔ RE-EXPORTED HERE BECAUSE THEY LIVE INSIDE A BRIDGE'S OWN MODULE
@@ -57,6 +61,9 @@
 pub use crate::bridges::superdsc_to_dataflow_ir::shape_constraints::{
     Extent, PrimaryDim, StickDims,
 };
+/// ⭐ WHAT A SUPER-DSC IS BEING BUILT FOR — `SenTargets` (`sendefs.h:63-73`), needed here because
+/// `DesignSpaceConfig::target_` is a DSC field a converter must state.
+pub use crate::schedule::dcg::manager::SenTarget;
 pub use crate::schedule::ddc::fold::{ConstIdx, NodeKind, ScaledLds};
 pub use crate::schedule::ddc::transformation::{DsType, Scale};
 pub use crate::schedule::ddc::transformation_util::StageName;
@@ -71,9 +78,9 @@ pub use crate::schedule::dsc2::{
 };
 pub use crate::schedule::l3::dsc::{
     ConstantInfo, CoreIdsUsed, CoreletShare, CoreletsUsed, DATA_STAGE_CORE, DataStage, DataStages,
-    DdcFacts, DesignSpaceConfig, DimPadding, DscIdx, DscList, DscScheduleStep, FilledDims, LabeledDs,
-    LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims, SuperDsc,
-    WkSlice, WkSliceCount, WkSliceId,
+    DdcFacts, DesignSpaceConfig, DimPadding, DscIdx, DscList, DscName, DscScheduleStep, FilledDims,
+    LabeledDs, LabeledDsList, LdsRecord, NamedDims, Pinning, PrimaryDsInfo, SenComponent, StageDims,
+    SuperDsc, WkSlice, WkSliceCount, WkSliceId,
 };
 pub use crate::schedule::stages::{Scheduling, StagesRan, run_stages_2a_2b};
 

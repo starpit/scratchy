@@ -352,8 +352,6 @@ impl UtilStageExtents for Dsc2Dims {
 /// ⭐ ONE DSC'S FACTS BEYOND ITS TREE — what `currDsc` answers that [`DscTree`] does not.
 #[derive(Debug)]
 pub struct Dsc2Facts {
-    /// `dsc.name_` (`dsc/designSpaceConfig.h:72`) — a construction argument; see the module note.
-    name: v1::StorageName,
     /// ⛔⛔ A CLONE OF `sdsc.dscs_.at(idx)`, AND THAT IS `run_v1`'S OWN CUT. The reference's
     /// `currDsc` IS that entry; `run_v1` takes `sdsc: &mut SuperDsc` beside `sites: &mut P`, so no
     /// provider may borrow it. `select_and_parse_ddl_template` writes the DSC through the super-DSC
@@ -381,11 +379,6 @@ pub struct Dsc2Facts {
 }
 
 impl Dsc2Facts {
-    /// `dsc.name_`.
-    pub(super) fn name(&self) -> v1::StorageName {
-        self.name.clone()
-    }
-
     /// The design space, for the length of ONE read.
     pub(super) fn with_dsc<T>(&self, ask: impl FnOnce(&DesignSpaceConfig) -> T) -> T {
         ask(&self.dsc.borrow())
@@ -476,23 +469,19 @@ impl<'l> Dsc2State<'l> {
     /// list, which is `run_v1`'s own `continue` (`ddc/v1.rs:6438`) — the DSC is skipped, exactly as
     /// the reference skips a DSC with no compute op.
     ///
-    /// ⛔ AND `names` LIKEWISE: `dsc.name_` is not a [`DesignSpaceConfig`] field, so a caller that
-    /// has none gets the positional spelling, which only the two verbose lines read.
+    /// ⛔ `dsc.name_` IS NOT AMONG THEM ANY MORE, AND IT USED TO BE. This function took a
+    /// `&[StorageName]` positional beside `sdsc.dscs()` and spelled a DSC the caller named none for
+    /// `dsc{at}` — a FABRICATED identity for the one field whose whole job is to BE the identity, and
+    /// one `createPcfgForUnitPerCore` turns back into a `dscs_` index under a `DT_CHECK`
+    /// (`dcg/dcg_fe/pcfg_gen/dlOps.cpp:22-28`). It is
+    /// [`crate::schedule::l3::dsc::DesignSpaceConfig::name`] now, so it arrives WITH the DSC.
     #[must_use]
-    pub fn seeded(
-        sdsc: &SuperDsc,
-        l3: &'l DscState,
-        ops: &[Vec<v1::DscComputeOp>],
-        names: &[v1::StorageName],
-    ) -> Self {
+    pub fn seeded(sdsc: &SuperDsc, l3: &'l DscState, ops: &[Vec<v1::DscComputeOp>]) -> Self {
         let dscs = sdsc
             .dscs()
             .iter()
             .enumerate()
             .map(|(at, dsc)| Dsc2Facts {
-                name: names.get(at).cloned().unwrap_or_else(|| {
-                    v1::StorageName(format!("dsc{at}"))
-                }),
                 dsc: RefCell::new(dsc.clone()),
                 ops: RefCell::new(ops.get(at).cloned().unwrap_or_default()),
                 corelets_dsc2: Cell::new(dsc.corelets_used_dsc2.map(|used| used.get())),
@@ -1094,6 +1083,12 @@ mod tests {
         DesignSpaceConfig {
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),

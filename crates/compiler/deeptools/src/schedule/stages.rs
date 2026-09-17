@@ -359,7 +359,7 @@ impl Scheduling {
 /// a wrong ADDRESS. A caller holding the SDSC's own `sdscFoldProps_` builds them with
 /// [`l3::dl_ops::AddressFoldCoords::of`] and calls [`run_l3`]/[`run_ddc`] itself.
 ///
-/// ⛔ `ops` AND `names` ARE POSITIONAL BESIDE `sdsc.dscs()`, and `dsc_ops` MUST NOT BE EMPTY for a
+/// ⛔ `dsc_ops` IS POSITIONAL BESIDE `sdsc.dscs()`, AND IT MUST NOT BE EMPTY for a
 /// DSC that has computes: [`v1::PrepDsc::compute_ops`] is the FIRST provider call `run_v1` makes
 /// (`ddc/v1.rs:6437`) and an empty answer makes it `continue` past the DSC — [`v1::DscFilled::Yes`]
 /// having done nothing at all, which is a false green and not a schedule.
@@ -368,7 +368,6 @@ pub fn run_stages_2a_2b<A: crate::arch::Arch>(
     mut sdsc: l3::dsc::SuperDsc,
     ops: v1::OpFuncs,
     dsc_ops: &[Vec<v1::DscComputeOp>],
-    names: &[v1::StorageName],
 ) -> Scheduling {
     let state = DscState::seeded(&sdsc);
     let nodes_before = state.node_count();
@@ -391,7 +390,7 @@ pub fn run_stages_2a_2b<A: crate::arch::Arch>(
 
     // ⭐ THE SAME `state`, HANDED ON. This is the line the composition is.
     let (fill, ddc_refusal) = if l3 {
-        let dsc2 = Dsc2State::seeded(&sdsc, &state, dsc_ops, names);
+        let dsc2 = Dsc2State::seeded(&sdsc, &state, dsc_ops);
         let fill = run_ddc::<A>(&mut sdsc, &dsc2, ddc_defaults(), &coords);
         (fill, dsc2.first_refusal())
     } else {
@@ -628,6 +627,12 @@ mod tests {
             lx_chunk_capacity: BTreeMap::new(),
             full_padding: BTreeMap::new(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
         }
     }
 
@@ -937,12 +942,7 @@ mod tests {
     fn stage_2b_on_the_seed_tree_stops_on_the_missing_below_lx_block() {
         let mut sdsc = a_rmsq_super_dsc();
         let l3_state = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
         let ran = run_ddc::<Dd2>(
             &mut sdsc,
             &state,
@@ -1042,12 +1042,7 @@ mod tests {
             "the reference's own stage-2a tree for `rmsq_o728`"
         );
 
-        let state = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
         // ⭐⭐⭐ AND STAGE 2B NOW RUNS *THROUGH* `Dsc2Store::schedule_head_block` — `run_v1`'s line
         // 6483 — INTO `select_and_parse_ddl_template` (`:6489`), which is the DDL step itself.
         //
@@ -1175,12 +1170,7 @@ mod tests {
             ops::create_synchronization(&sdsc, ops::LxBuffering::Double, &reads, &reads, &mut env)
                 .expect("the L3LU/LXLU and LXSU/L3SU sync pairs");
         }
-        let state = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
         let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
         let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
             .expect("the one DSC's carriers");
@@ -1307,7 +1297,7 @@ mod tests {
         let mut sdsc = a_rmsq_super_dsc();
         let l3_state = DscState::seeded(&sdsc);
         let before = l3_state.node_count();
-        let state = Dsc2State::seeded(&sdsc, &l3_state, &[], &[]);
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[]);
         let fill = run_ddc::<Dd2>(
             &mut sdsc,
             &state,
@@ -1461,12 +1451,8 @@ mod tests {
     ///
     #[test]
     fn the_composition_hands_back_the_tree_it_grew_and_gates_stage_2b_on_stage_2a() {
-        let scheduled = run_stages_2a_2b::<Dd2>(
-            a_rmsq_super_dsc(),
-            an_op_func(),
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let scheduled =
+            run_stages_2a_2b::<Dd2>(a_rmsq_super_dsc(), an_op_func(), &[the_rmsq_compute_ops()]);
         let ran = scheduled.ran();
         assert_eq!(
             ran.nodes_before, 4,
@@ -1622,12 +1608,7 @@ mod tests {
 
         let sdsc = a_rmsq_super_dsc();
         let l3_state = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
         let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
         let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
             .expect("the one DSC's carriers");
@@ -1723,12 +1704,7 @@ mod tests {
 
         let sdsc = a_rmsq_super_dsc();
         let l3_state = DscState::seeded(&sdsc);
-        let state = Dsc2State::seeded(
-            &sdsc,
-            &l3_state,
-            &[the_rmsq_compute_ops()],
-            &[v1::StorageName("rmsq_o728".to_owned())],
-        );
+        let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
         let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
         let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
             .expect("the one DSC's carriers");
@@ -1832,12 +1808,7 @@ mod tests {
         let ask = |facts: DdcFacts, check: &dyn Fn(&mut super::Dsc2Store<'_, '_>)| {
             let sdsc = with_constants(facts);
             let l3_state = DscState::seeded(&sdsc);
-            let state = Dsc2State::seeded(
-                &sdsc,
-                &l3_state,
-                &[the_rmsq_compute_ops()],
-                &[v1::StorageName("rmmean_o728".to_owned())],
-            );
+            let state = Dsc2State::seeded(&sdsc, &l3_state, &[the_rmsq_compute_ops()]);
             let mut sites = Dsc2Provider::new(&state, &l3::dl_ops::AddressFoldCoords::flat());
             let carriers = v1::Dsc2Sites::carriers(&mut sites, l3::dsc::DscIdx(0))
                 .expect("the one DSC's carriers");

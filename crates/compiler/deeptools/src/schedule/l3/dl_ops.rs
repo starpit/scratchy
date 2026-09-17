@@ -545,6 +545,12 @@ mod tests_e001_e008 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -1273,6 +1279,12 @@ mod tests_e009_e016 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -2365,6 +2377,12 @@ mod tests_e033_e040 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -3015,6 +3033,12 @@ mod tests_e041_e048 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -3624,6 +3648,12 @@ mod tests_e049_e056 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -5729,6 +5759,12 @@ mod tests_e197_e204 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: None,
             corelet_shares: BTreeMap::new(),
@@ -7036,6 +7072,12 @@ mod tests_e205_e212 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -7939,6 +7981,12 @@ mod tests_e213_e217 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -10311,6 +10359,12 @@ mod tests_e221_e228 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -12901,6 +12955,12 @@ mod tests_e229 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: corelets(2),
             corelets_used_dsc2: Some(corelets(2)),
             corelet_shares: BTreeMap::new(),
@@ -14057,6 +14117,12 @@ mod tests_e283_e295 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
@@ -18569,6 +18635,12 @@ mod tests_e328_e335 {
             // [`crate::schedule::l3::dsc::DdcFacts`].
             ddc: crate::schedule::l3::dsc::DdcFacts::default(),
             gtr_ids_used: BTreeSet::new(),
+            // `name_` is the `dscs_` map key and a fixture is keyless; the other three have no reader
+            // in this crate — see [`crate::schedule::l3::dsc::DesignSpaceConfig`].
+            name: crate::schedule::l3::dsc::DscName::default(),
+            unpad_dims: crate::schedule::l3::dsc::StageDims::default(),
+            dsc_dims: crate::schedule::l3::dsc::StageDims::default(),
+            target: crate::schedule::dcg::manager::SenTarget::default(),
             corelets_used: CoreletsUsed::ONE,
             corelets_used_dsc2: Some(CoreletsUsed::ONE),
             corelet_shares: BTreeMap::new(),
