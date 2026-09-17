@@ -12,62 +12,12 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 7,
-  "layer_count": 7,
-  "batch_count": 7,
+  "unit_count": 6,
+  "layer_count": 6,
+  "batch_count": 6,
   "file_count": 2
  },
  "waves": [
-  {
-   "unit_count": 1,
-   "batches": [
-    {
-     "kind": "type",
-     "source_file": "crustify-types/cpp/designSpaceConfig.h",
-     "items": [
-      {
-       "name": "e018_DesignSpaceConfig",
-       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
-       "kind": "type",
-       "source_kind": "struct",
-       "layer": 5,
-       "loc": 650,
-       "deps": {
-        "types": [
-         {
-          "name": "e001_PaddingFormType",
-          "defined_in": "crustify-types/cpp/dims.h",
-          "scope": "port"
-         },
-         {
-          "name": "e006_DataStructDims",
-          "defined_in": "crustify-types/cpp/dims.h",
-          "scope": "port"
-         },
-         {
-          "name": "e016_ScheduleTree",
-          "defined_in": "crustify-types/cpp/dsc2.h",
-          "scope": "port"
-         }
-        ],
-        "symbols": []
-       },
-       "fallback": [],
-       "back_fill": [],
-       "generates": [],
-       "field_anchors": [
-        "dscN_",
-        "l0TetheredMode_",
-        "name_",
-        "numCoresUsed_",
-        "target_",
-        "unpadN_"
-       ]
-      }
-     ]
-    }
-   ]
-  },
   {
    "unit_count": 1,
    "batches": [
