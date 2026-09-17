@@ -742,7 +742,13 @@
         "types": [
          "e003_SymbolicDimInfo",
          "e006_DataStructDims",
-         "e018_DesignSpaceConfig"
+         "e018_DesignSpaceConfig",
+         "e019_DesignSpaceConfig_loops",
+         "e020_DesignSpaceConfig_tree",
+         "e021_DesignSpaceConfig_geometry",
+         "e022_DesignSpaceConfig_ops",
+         "e023_DesignSpaceConfig_masking",
+         "e024_DesignSpaceConfig_storage"
         ]
        }
       },

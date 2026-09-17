@@ -12,9 +12,9 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 2,
-  "layer_count": 2,
-  "batch_count": 2,
+  "unit_count": 8,
+  "layer_count": 8,
+  "batch_count": 8,
   "file_count": 2
  },
  "waves": [
@@ -65,7 +65,6 @@
         "max_",
         "min_",
         "mustBeMultiple_",
-        "name_",
         "nearestNumeratorIdx_",
         "newAllocations_",
         "nodeCloningMap_",
@@ -125,55 +124,236 @@
        "back_fill": [],
        "generates": [],
        "field_anchors": [
+        "dscN_",
+        "l0TetheredMode_",
+        "name_",
+        "numCoresUsed_",
+        "target_",
+        "unpadN_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e019_DesignSpaceConfig_loops",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 6,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e018_DesignSpaceConfig",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "auxLoopOrder_",
+        "loopOrder_",
+        "loopProperties_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e020_DesignSpaceConfig_tree",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 7,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e019_DesignSpaceConfig_loops",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "scheduleTree_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e021_DesignSpaceConfig_geometry",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 8,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e020_DesignSpaceConfig_tree",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
         "B_",
         "ChipD_",
         "ChipletD_",
-        "CoreD_",
-        "CoreletD_",
-        "N_",
         "P_",
         "Pel_",
         "T_",
         "Tel_",
-        "auxLoopOrder_",
-        "c_",
+        "sc_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e022_DesignSpaceConfig_ops",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 9,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e021_DesignSpaceConfig_geometry",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
         "computeOp_",
         "constantInfo_",
-        "coordinateMasking_",
-        "coreIdsUsed_",
-        "dataStageParam_",
         "dimToSymbolMapping_",
-        "dscN_",
-        "gtrIdsUsed_",
-        "i_",
-        "ij_",
-        "j_",
-        "l0TetheredMode_",
-        "labeledDs_",
-        "loopOrder_",
-        "loopProperties_",
-        "maskingConstId_",
-        "mb_",
-        "name_",
-        "numCoreletsUsed_",
-        "numCoresUsed_",
-        "out_",
-        "pcfg_",
-        "pdsRelation_",
-        "primaryDsInfo_",
+        "pdsRelation_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e023_DesignSpaceConfig_masking",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 10,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e022_DesignSpaceConfig_ops",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "coordinateMasking_",
+        "maskingConstId_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "unit_count": 1,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-types/cpp/designSpaceConfig.h",
+     "items": [
+      {
+       "name": "e024_DesignSpaceConfig_storage",
+       "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 11,
+       "loc": 650,
+       "deps": {
+        "types": [
+         {
+          "name": "e023_DesignSpaceConfig_masking",
+          "defined_in": "crustify-types/cpp/designSpaceConfig.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
         "ptr_",
-        "r_",
-        "rc_",
-        "sc_",
-        "scheduleTree_",
-        "size_",
-        "stickDimOrder_",
-        "target_",
-        "unpadN_",
-        "x_",
-        "y_",
-        "zi_",
-        "zj_"
+        "size_"
        ]
       }
      ]

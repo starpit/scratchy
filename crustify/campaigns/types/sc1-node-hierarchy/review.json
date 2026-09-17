@@ -154,14 +154,11 @@
        "back_fill": [],
        "generates": [],
        "field_anchors": [
-        "bufferAddrOffset_",
         "bufferSwitchPosition_",
-        "constEleOffsets_",
         "constantId_",
         "dataConnect_",
         "isStartAddrSymbolic_",
         "latchDataId_",
-        "loopEleOffsets_",
         "myLdsIdx_",
         "startAddr_"
        ]
@@ -230,30 +227,20 @@
         "c_",
         "coreletSplit_",
         "i_",
-        "ij_",
-        "in_",
         "j_",
         "ki_",
-        "kij_",
         "kj_",
         "maxSymbolicVolume_",
         "mb_",
         "name_",
-        "out_",
         "paddingSizes_",
         "peSfpSplit_",
         "r_",
-        "rc_",
         "rowSplit_",
         "si_",
-        "sij_",
         "sj_",
         "symbolicDimInfo_",
-        "x1_",
-        "x_",
-        "y_",
         "zi_",
-        "zij_",
         "zj_"
        ]
       }
@@ -362,7 +349,6 @@
        "field_anchors": [
         "implicitSyncRefTransfer_",
         "isReceive_",
-        "isSoft_",
         "otherEndOfTheSignals_",
         "units_"
        ]
@@ -403,7 +389,6 @@
         "dstIndirectLdsAndLoopOffsets_",
         "dstIndirectLoopsAndSizes_",
         "dstReps_",
-        "dstSizeIdx_",
         "dstVias_",
         "lastFusableParentLoopDst_",
         "lastFusableParentLoopSrc_",
@@ -469,16 +454,13 @@
         "inputsLdsAndLoopOffsets_",
         "inputsLoopsAndSizes_",
         "inputs_",
-        "instrAttribute_",
         "isOpaqueOp_",
-        "loopEleOffsets_",
         "mode_",
         "outputCoordinate_",
         "outputsLdsAndLoopOffsets_",
         "outputsLoopsAndSizes_",
         "outputs_",
         "repetitionWithOffset_",
-        "repetition_",
         "type_"
        ]
       }
@@ -520,10 +502,8 @@
        "generates": [],
        "field_anchors": [
         "denId_",
-        "dim_",
         "dims_",
         "isParametricLoop_",
-        "kind_",
         "loopCountSymbolIds_",
         "numId_",
         "parametricLdsIdx_"
@@ -556,8 +536,7 @@
        "generates": [],
        "field_anchors": [
         "coreClCond_",
-        "loopCond_",
-        "next_"
+        "loopCond_"
        ]
       }
      ]
@@ -597,7 +576,6 @@
        "back_fill": [],
        "generates": [],
        "field_anchors": [
-        "denId_",
         "head_"
        ]
       }

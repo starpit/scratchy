@@ -204,6 +204,19 @@ stage() { # $1 schedule json (relative to $CAMP)  $2 objective  $3 tag
   # NON-empty remainder means the marker is stale (a promote landed after it), so it is deleted and
   # the stage re-runs. Trusting the marker alone once had 9 agents re-reviewing 142 done functions.
   n=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['summary']['unit_count'])" "$CAMP/$1" 2>/dev/null || echo 1)
+  # ⛔⛔ THE REMAINDER-OVERRULES-MARKER RULE IS FOR **PORT** STAGES ONLY. A port stage's remainder is
+  # regenerated from the anchors after every promote, so a non-empty remainder beside a .done marker
+  # really does mean the marker is stale. A REVIEW stage reads review.json, which is STATIC and never
+  # empties — so a finished review looks "stale" forever and is re-run on every single launch.
+  # MEASURED 2026-09-17: sc1-review had completed at 06:57 and promoted EIGHT findings; a later launch
+  # read `.done-sc1-review present but remainder has 16 units — MARKER IS STALE` and started the whole
+  # 3h36m wave again. For a review, the marker is the only completion record there is: TRUST IT.
+  # ⭐ To deliberately re-review (e.g. a unit was re-ported since), delete that one marker:
+  #     rm .campaign-done/types/.done-<stage>-review
+  if [ -f "$STATE/.done-$3" ] && [ "$2" = "review" ]; then
+    say "STAGE $3 SKIPPED (.done-$3 present; a review schedule is static, so the marker is the record)"
+    return 0
+  fi
   if [ -f "$STATE/.done-$3" ]; then
     if [ "$n" = "0" ]; then
       say "STAGE $3 SKIPPED (.done-$3 present, remainder empty)"; return 0

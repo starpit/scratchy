@@ -36,7 +36,11 @@ BUDGETS = {"max_syms": 8, "max_loc": 320, "max_types": 5, "min_fields": 20}
 STAGES = {
     # stage dir            -> the unit entries it schedules, in UNITS.tsv order
     "sc1-node-hierarchy": [f"e{n:03d}" for n in range(1, 17)],
-    "sc2-designspaceconfig": ["e017", "e018"],
+    # e018-e024 are the SEVEN pieces DesignSpaceConfig was split into after it failed three times as
+    # one 27-field unit. They chain e018 -> e019 -> ... -> e024 so each gets its own dependency layer:
+    # all seven write schedule/l3/dsc.rs:515, and same-layer batches run CONCURRENTLY, which would put
+    # two agents in one file.
+    "sc2-designspaceconfig": ["e017"] + [f"e{n:03d}" for n in range(18, 25)],
 }
 
 FIELD = re.compile(r"^[a-zA-Z][a-zA-Z0-9]*_$")
@@ -69,11 +73,20 @@ def cpp_class(header: str, name: str) -> tuple[str, int, int, list[str]]:
     if kind == "class":
         kind = "struct"
     end = next(i for i in range(start, len(lines)) if lines[i].startswith("};"))
-    body = "\n".join(lines[start:end + 1])
-    fields = sorted({
-        t for t in re.findall(r"\b([a-zA-Z][a-zA-Z0-9]*_)\s*[;=\[]", body) if FIELD.match(t)
-    })
-    return kind, end - start + 1, start + 1, fields
+    # ⛔⛔ DECLARATIONS ONLY. `\b(name_)\s*[;=\[]` over the whole class body also matches MEMBER
+    # ACCESSES inside the class's own methods: `paramNameToVal["ni"] = &N_.i_;`
+    # (designSpaceConfig.h:618) yields i_, and `return primaryDsInfo_.at(dsType).stickDimOrder_;`
+    # (:242) yields stickDimOrder_ — both fields of NESTED types. That inflated
+    # DesignSpaceConfig's anchors 36 -> 49 and the campaign total 171 -> 197, and every
+    # field_anchors list carried the surplus, so a unit could never be "complete".
+    fields = []
+    for ln in lines[start:end + 1]:
+        if re.search(r"return|\(|\.|->|&|\[\"", ln) or ln.lstrip().startswith("//"):
+            continue
+        m = re.search(r"\b([a-zA-Z][a-zA-Z0-9]*_)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;", ln)
+        if m and FIELD.match(m.group(1)):
+            fields.append(m.group(1))
+    return kind, end - start + 1, start + 1, sorted(set(fields))
 
 
 def rows():
@@ -82,8 +95,25 @@ def rows():
         c = line.split("\t")
         entry, level, _loc, authority, _ex, _home, callees = c[0], c[1], c[2], c[3], c[4], c[5], c[6]
         header = authority.split("/")[-1].split(":")[0]
-        name = entry.split("_", 1)[1]
+        # ⭐ OPTIONAL COLUMNS 9 AND 10 SPLIT ONE C++ TYPE ACROSS SEVERAL UNITS. Column 9 names the C++
+        # type when the unit name is not it (e.g. e020_DesignSpaceConfig_loops -> DesignSpaceConfig);
+        # column 10 is that unit's own comma-separated field subset, which becomes its field_anchors.
+        # WHY: e018_DesignSpaceConfig failed THREE times as a single unit — 27 missing fields on the
+        # crate's most-referenced type — each time inventing type names that exist nowhere (DscInputs,
+        # DscDims, dsc_names). `min_fields` isolates a wide type in its own batch but never splits one,
+        # and a unit an agent cannot finish is a unit that burns ~1.5h and commits nothing.
+        cpp_name = (c[8].strip() if len(c) > 8 and c[8].strip() else entry.split("_", 1)[1])
+        subset = [f for f in (c[9].split(",") if len(c) > 9 else []) if f.strip()]
+        name = cpp_name
         kind, span, first, fields = cpp_class(header, name)
+        if subset:
+            subset = [f.strip() for f in subset]
+            unknown = [f for f in subset if f not in fields]
+            if unknown:
+                raise SystemExit(
+                    f"⛔ {entry}: field(s) {unknown} are not DECLARED in {header}'s {name} — "
+                    f"a split unit may only claim fields the authority declares")
+            fields = sorted(subset)
         out.append({
             "entry": entry, "pref": entry.split("_", 1)[0], "layer": int(level),
             "header": header, "name": name,
