@@ -2,6 +2,8 @@
 
 use crate::schedule::dims::{DataStructDims, PrimaryDimAndKind, PrimaryDimTypes};
 use std::collections::BTreeMap;
+use sys_arch_spec::CoreId;
+use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 
 /// A group tag register's group id — `gtrIdsUsed_` holds the set of them (`dsc/dsc2.h:35`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,6 +50,20 @@ pub struct ElemArrLevel(pub u32);
 /// (`:2792-2816`). Only the dim the extent is paired with says which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DimSize(pub i32);
+
+/// An index INTO a unit view's size vector — `UnitView::LoopInfo::sizeIdx_` (`dsc/dsc2.h:503-504`)
+/// and a chunk entry's `srcSizeIdx_`/`dstSizeIdx_` (`dsc/dsc2.h:822`) are the same currency.
+///
+/// ⛔ A POSITION, NOT A DIM AND NOT A [`DimSize`]. Bridge 1 walks `view_sizes` positionally and
+/// matches this against the POSITION `dim_id`, never against a `Size`'s dim
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:333-348`) — which is why a chunk
+/// entry carries an index AND a dim, and why the two are not interchangeable.
+///
+/// ⭐ UNSIGNED BECAUSE EVERY PRODUCER IS: the two DDC writers pass the stick-size loop counter
+/// (`ddc/ddcv1.cpp:524-525`) or a layout position offset past the stick dims (`:1591-1598`), and
+/// bridge 1 passes `i` (`SNTransferLowering.cpp:631`). The authority's `-1` initialiser is [`None`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SizeIdx(pub u32);
 
 /// One data stage's id — the key of `DesignSpaceConfig::dataStageParam_`
 /// (`dsc/designSpaceConfig.h:105`). `metadata_.core_dstgid` and `metadata_.chunk_dstgid` name the
@@ -768,6 +784,123 @@ mod unit_tests {
         assert_eq!(LoopDistributionCat::BelowChunk.name(), "Below_chunk");
         assert_eq!(LoopDistributionCat::CoreletSlice.name(), "Corelet_slice");
     }
+
+    /// `dsc/dsc2.cpp:4364-4383` over the set at `dsc/dscdefn.cpp:142-144`.
+    #[test]
+    fn the_memory_questions_test_the_storage_half_and_take_the_first_non_memory_dst() {
+        // ⛔ `unit` IS NEVER TESTED: a read by the LXLU (a unit) out of LX (a memory) has a memory
+        // source, and swapping the two halves flips the answer.
+        let lxlu_reads_lx = DataLocation {
+            unit: SenComponent::Lxlu,
+            storage: SenComponent::Lx,
+        };
+        let mut node = TransferNode {
+            src: lxlu_reads_lx,
+            ..TransferNode::default()
+        };
+        assert!(!node.has_non_memory_source());
+        node.src = lxlu_reads_lx.swapped();
+        assert!(node.has_non_memory_source());
+
+        // `dsc/dsc2Pcfg.cpp:1039` tests `storage_ != LATCH` beside this very call, so LATCH is a
+        // storage that reaches it and is not in the set.
+        node.src = DataLocation {
+            unit: SenComponent::Lxlu,
+            storage: SenComponent::Latch,
+        };
+        assert!(node.has_non_memory_source());
+
+        // No destination at all is "no non-memory result" — the `-1` both callers test for
+        // (`ddc/ddc_transformation.cpp:1570-1572`, `:1818-1819`).
+        assert_eq!(node.non_memory_result_index(), None);
+        assert!(!node.has_non_memory_result());
+
+        let landing_in = |storage| DstVia {
+            loc: DataLocation {
+                unit: SenComponent::Lxlu,
+                storage,
+            },
+            ..DstVia::default()
+        };
+        node.dst_vias = vec![
+            landing_in(SenComponent::Lx),
+            landing_in(SenComponent::Latch),
+            landing_in(SenComponent::Constant),
+        ];
+
+        // ⭐ THE FIRST MATCH, not any match: `getNonMemoryResultIndex` returns inside the loop
+        // (`dsc/dsc2.cpp:4376-4383`), and `hoistTransfersUpForReuse` indexes another vector with it.
+        assert_eq!(node.non_memory_result_index(), Some(1));
+        assert!(node.has_non_memory_result());
+        assert!(!node.check_non_memory_result_index(0));
+        assert!(node.check_non_memory_result_index(1));
+        assert!(node.check_non_memory_result_index(2));
+
+        // Every component IBM lists is a memory, and these four are not.
+        for storage in MEMORIES {
+            node.src = DataLocation {
+                unit: SenComponent::Lxlu,
+                storage,
+            };
+            assert!(!node.has_non_memory_source());
+        }
+        for storage in [
+            SenComponent::Latch,
+            SenComponent::Constant,
+            SenComponent::Zero,
+            SenComponent::Lxlu,
+        ] {
+            assert!(!MEMORIES.contains(&storage));
+        }
+    }
+
+    /// `dsc/dsc2.h:877` and `:879-883`, and the route bridge 1 walks at
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2631-2639`.
+    #[test]
+    fn indirect_is_the_unit_half_being_set_and_via_runs_source_to_destination() {
+        let mut node = TransferNode::default();
+        assert!(!node.is_src_indirect());
+
+        // ⛔ THE `unit` HALF — the opposite half of the same type from the memory questions above.
+        node.src_indirect = DataLocation {
+            unit: SenComponent::Lxlu,
+            storage: SenComponent::NoComponent,
+        };
+        assert!(node.is_src_indirect());
+
+        node.dst_vias = vec![
+            DstVia::default(),
+            DstVia {
+                loc_indirect: node.src_indirect,
+                via: vec![SenComponent::Lxlu, SenComponent::Ptxrf],
+                ..DstVia::default()
+            },
+        ];
+        assert!(!node.is_dst_indirect_at_index(0));
+        assert!(node.is_dst_indirect_at_index(1));
+
+        // `via_.front()` is the first hop out of the source and `.back()` the last unit before
+        // `loc_` (`SNTransferLowering.cpp:2530`, `:2572`); empty means the destination's own unit.
+        assert_eq!(node.dst_vias[1].via.first(), Some(&SenComponent::Lxlu));
+        assert_eq!(node.dst_vias[1].via.last(), Some(&SenComponent::Ptxrf));
+        assert!(node.dst_vias[0].via.is_empty());
+    }
+
+    /// The authority's member initialisers, `dsc/dsc2.h:834`, `:837`, `:839`, `:817`.
+    #[test]
+    fn a_default_transfer_node_carries_the_authoritys_initialisers() {
+        let node = TransferNode::default();
+        assert_eq!(node.replication_factor, 1);
+        assert_eq!(node.unit_time_transfer_num_chunks, 1);
+        assert_eq!(node.rotate_num_elements, 0);
+        assert_eq!(node.src, DataLocation::UNSET);
+        assert_eq!(DstVia::default().loc_indirect, DataLocation::UNSET);
+
+        // ⛔ EMPTY, AND IT STAYS EMPTY ON EVERY PATH BUT THE JSON IMPORTER'S: the one C++ writer is
+        // inside a lambda whose only callsite is commented out (`ddc/ddcv1.cpp:1640`, `:1649-1650`).
+        assert!(node.unit_time_transfer_chunk_stride.is_empty());
+        assert!(node.unit_time_transfer_chunk_size.is_empty());
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -1295,3 +1428,402 @@ impl LoopDistributionCat {
 }
 
 // crustify:todo: e021_LoopDistributionInfo
+
+// crustify:todo: e022_LoopCondComposite
+
+// crustify:todo: e022_LoopCondComposite.negated_
+
+// crustify:todo: e022_LoopCondComposite.twoLevelOrOfAnds_
+
+/// Replaces: dsc2::memories
+///
+/// The components that ARE memories — declared `dsc/dscdefn.h:518`, filled `dsc/dscdefn.cpp:142-144`.
+///
+/// ⛔ THE TEST IS ALWAYS ON THE `storage` HALF OF A [`DataLocation`] AND NEVER THE `unit`: all four
+/// of [`TransferNode`]'s memory questions are `memories.count(x.storage_) == 0`
+/// (`dsc/dsc2.cpp:4364-4383`). Both halves hold the same enum, so only the callsite says which.
+///
+/// ⛔ `nonCoreletMemories` AND `directAddressableMemories` ARE DIFFERENT, SMALLER SETS declared
+/// beside it (`dsc/dscdefn.h:519-520`, filled `dsc/dscdefn.cpp:145-150`) — no unit on this worklist
+/// reads either, so neither is ported here and neither may be substituted for this one.
+pub const MEMORIES: [SenComponent; 16] = [
+    SenComponent::Lx,
+    SenComponent::L0,
+    SenComponent::L0Scale,
+    SenComponent::Lrfreg,
+    SenComponent::Pelrf,
+    SenComponent::Sfplrf,
+    SenComponent::Ptarf,
+    SenComponent::Ptxrf,
+    SenComponent::Ptirf,
+    SenComponent::Hbm,
+    SenComponent::L3luibr,
+    SenComponent::L3suibr,
+    SenComponent::Pestate,
+    SenComponent::Sfpstate,
+    SenComponent::Lxluscalereg,
+    SenComponent::Qgi,
+];
+
+/// ⛔ E0080 IF A COMPONENT IS EVER LISTED TWICE: IBM's is a `std::set`, which collapses a duplicate
+/// and keeps its `size()` honest; this array would keep both and make its `len()` a lie.
+const _: () = {
+    let mut i = 0;
+    while i < MEMORIES.len() {
+        let mut j = i + 1;
+        while j < MEMORIES.len() {
+            assert!(
+                MEMORIES[i] as i32 != MEMORIES[j] as i32,
+                "MEMORIES lists one component twice"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+/// Replaces: TransferNode::DstVia
+///
+/// One destination of a transfer: where the data lands, the location that addresses it indirectly,
+/// and the units it routes through on the way (`dsc/dsc2.h:816-819`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DstVia {
+    /// Field: e023_TransferNode.loc_
+    ///
+    /// Where this destination writes (`dsc/dsc2.h:817`). Its `storage` is what decides whether the
+    /// destination is a memory at all (`dsc/dsc2.cpp:4372-4383`).
+    pub loc: DataLocation,
+    /// Field: e023_TransferNode.locIndirect_
+    ///
+    /// The location holding the address when this destination is indirect, or
+    /// [`DataLocation::UNSET`] when it is not —
+    /// [`is_dst_indirect_at_index`](TransferNode::is_dst_indirect_at_index) tests the `unit` half
+    /// against `NO_COMPONENT` (`dsc/dsc2.h:879-883`).
+    pub loc_indirect: DataLocation,
+    /// Field: e023_TransferNode.via_
+    ///
+    /// ⛔ ORDERED SOURCE TO DESTINATION, and bridge 1 walks it as a route: at the component it is
+    /// lowering for, `via_[i + 1]` is the next hop and `via_[i - 1]` the previous
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2631-2639`), `via_.front()` is
+    /// the first hop out of the source (`:2530`, `:2764`) and `via_.back()` the last unit before
+    /// [`loc`](Self::loc) (`:2572`, `ddc/ddc_transformation.cpp:24-28`). Empty means "no hop": the
+    /// readers then take `loc_.unit_` itself (`SNTransferLowering.cpp:2764`).
+    pub via: Vec<SenComponent>,
+}
+
+impl Default for DstVia {
+    /// `dsc/dsc2.h:817-818` writes no member initialisers, but [`DataLocation`]'s own are both
+    /// `NO_COMPONENT` (`sys-arch-spec/arch_enums.h:390-391`), so the DDL conversion's
+    /// `dstVias_.emplace_back()` (`ddc/ddl/ddl_conversion.cpp:1176`) lands exactly here and
+    /// `setDataLocAndInfo` fills `loc_` and `via_` immediately after (`:1178-1179`).
+    fn default() -> Self {
+        Self {
+            loc: DataLocation::UNSET,
+            loc_indirect: DataLocation::UNSET,
+            via: Vec::new(),
+        }
+    }
+}
+
+/// Replaces: TransferNode::SizeAndIndex
+///
+/// One dimension of a unit-time transfer chunk: its extent, and where that dimension sits in the
+/// source's and in the destination's view (`dsc/dsc2.h:820-823`).
+///
+/// ⛔ NO `Default`, FOR THE SAME REASON [`Size`] HAS NONE — `sizeDim_.dim_` has no initialiser, so
+/// the JSON importer's `unitTimeTransferChunkStride_.emplace_back()` (`dsc/dsc2.cpp:1575`) leaves an
+/// indeterminate dim behind until the entry's fields are read out of the JSON:
+///
+/// ```compile_fail
+/// use deeptools::schedule::dsc2::SizeAndIndex;
+/// let _ = SizeAndIndex::default();
+/// ```
+///
+/// ⭐ THE TWO INDICES ARE EQUAL AT EVERY PRODUCER — `{{dim, size}, i, i}` (`ddc/ddcv1.cpp:524-525`,
+/// `:1597-1598`) and `dim.srcSizeIdx_ = dim.dstSizeIdx_ = i`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:631`). Only the JSON round trip can
+/// make them differ (`dsc/dsc2.cpp:1564-1567`), and only bridge 1 tells them apart, by direction:
+/// the load path matches `srcSizeIdx_` and the store path `dstSizeIdx_` (`:338-348`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeAndIndex {
+    /// Field: e023_TransferNode.sizeDim_
+    ///
+    /// The dim and how much of it this chunk covers (`dsc/dsc2.h:821`). ⛔ MUTATED IN PLACE by the
+    /// DDC: the 4B-splat path multiplies the first entry's extent by 4 (`ddc/ddcv1.cpp:544-546`) and
+    /// the hole split sets an entry's extent to 1 before moving it to the strides (`:1637-1640`).
+    pub size_dim: Size,
+    /// Field: e023_TransferNode.srcSizeIdx_
+    ///
+    /// This dim's position in the SOURCE's view sizes, absent as the authority's `-1`
+    /// (`dsc/dsc2.h:822`). Bridge 1's load path searches for the entry whose index equals the
+    /// position it is emitting (`SNTransferLowering.cpp:338-341`), so an absent index simply never
+    /// matches — and the miss is a live answer there, not a refusal (`:349-370`).
+    pub src_size_idx: Option<SizeIdx>,
+    /// Field: e023_TransferNode.dstSizeIdx_
+    ///
+    /// The same position in the DESTINATION's view sizes, read by the store path
+    /// (`SNTransferLowering.cpp:344-347`).
+    pub dst_size_idx: Option<SizeIdx>,
+}
+
+/// Replaces: TransferNode::TransferType
+///
+/// `dsc/dsc2.h:854-861`. Which ends of a transfer are tensors — the answer `getTransferType`
+/// derives from whether each side is a labeled data structure or a constant (`dsc/dsc2.h:884-896`).
+///
+/// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE: no map is keyed by this enum, it has no spelling, the
+/// JSON round trip does not carry it, and every use is an `==` or `!=` against a named enumerator
+/// (`ddc/ddcv1.cpp:448`, `:471-475`, `:1050`, `:2325-2327`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4135`, `:7108`, `:7886`, `dsc/dsc2.cpp:3483-3501`).
+///
+/// ⛔ `INVALID_TRANSFER_TYPE` IS REACHABLE AND MEANS "NEITHER END IS A TENSOR": it is the
+/// fallthrough of the five tests (`dsc/dsc2.h:895`), and
+/// `getBlockTransferSizePerDimCustomLocation` answers with an empty size map on it rather than
+/// refusing (`dsc/dsc2.cpp:3483-3485`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TransferType {
+    ConstantToConstant = 0,
+    ConstantToTensor = 1,
+    TensorToTensor = 2,
+    NoTransferToTensor = 3,
+    NoTransferFromTensor = 4,
+    /// The authority's `INVALID_TRANSFER_TYPE` — the enum's own name already says "transfer type".
+    Invalid = 5,
+}
+
+impl TransferType {
+    /// Every form in the authority's declaration order (`dsc/dsc2.h:854-861`).
+    pub const ALL: [Self; 6] = [
+        Self::ConstantToConstant,
+        Self::ConstantToTensor,
+        Self::TensorToTensor,
+        Self::NoTransferToTensor,
+        Self::NoTransferFromTensor,
+        Self::Invalid,
+    ];
+}
+
+/// `dsc/dsc2.h:814-898`. A transfer of one data stage from one source to one or more destinations —
+/// the node bridge 1 lowers into an `agen` load or store. Its minting site is
+/// `ddc/ddl/ddl_conversion.cpp:1166-1195`: a DDL `DataTransferOp` becomes one of these, with one
+/// [`DstVia`] per declared destination.
+///
+/// ⛔ THIS CARRIES TEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED, so the
+/// `e023_TransferNode` anchor at the end of this file is still open. The other ten, with the reason:
+///  * `srcLdsAndLoopOffsets_`, `srcIndirectLdsAndLoopOffsets_` (`:832`) and
+///    `dstLdsAndLoopOffsets_`, `dstIndirectLdsAndLoopOffsets_` (`:833`) are `DataInfo` — e019;
+///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
+///    `const LoopNode*` held as POINTER IDENTITY, which needs e013's `name_`, exactly as e018 does;
+///  * `paddingInfo_` (`:845`) is `TransferPadInfo` — e008, blocked on the unscoped
+///    `util/foldManager/`;
+///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) — e013;
+///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012;
+///  * `repetition_` (`:826-829`) is an UNNAMED struct with no reader tree-wide. Its only writers are
+///    `repetition_.srcRep_ =` (`ddc/ddl/ddl_conversion.cpp:1171`) and
+///    `repetition_.dstReps_.push_back` (`:1189`); nothing reads either member, the JSON round trip
+///    does not carry them (the `"repetition_"` entries at `dsc/dsc2.cpp:132` and `:1172` are
+///    `ComputeNode::instrAttribute_.repetition_`, `dsc/dsc2.h:907`), and `srcRep_` has no member
+///    initialiser, so a default-constructed node's copy is indeterminate. Carrying it means naming
+///    C++'s unnamed struct, so it is named here instead.
+///
+/// ⛔ AND SEVEN METHODS STAY OUT WITH THEM: `isSrcLabeledDs`, `isDstLabeledDs`, `isSrcConstant`,
+/// `isDstConstant` and `isDstIndirect` are one-line reads of the `DataInfo` fields above
+/// (`dsc/dsc2.h:867-878`), `getTransferType` is built from four of those five (`:884-896`), and
+/// `print` prints `name_` and each `DataInfo` (`dsc/dsc2.cpp:4385-4441`).
+///
+/// ⛔ `dstVias_` AND `dstLdsAndLoopOffsets_` ARE PARALLEL VECTORS IN THE AUTHORITY, and this type
+/// cannot say so until e019 lands: the DDL conversion emplaces one of each per destination in the
+/// same iteration (`ddc/ddl/ddl_conversion.cpp:1176-1177`), and `hoistTransfersUpForReuse` takes
+/// [`non_memory_result_index`](Self::non_memory_result_index) — an index into `dstVias_` — and
+/// indexes `dstLdsAndLoopOffsets_` with it (`ddc/ddc_transformation.cpp:1570-1575`).
+///
+/// ⛔ NO `PartialEq`, as [`LoopNode`] has none: IBM declares no `operator==` and every consumer
+/// keys on the POINTER. `Clone` is IBM's own, through `InheritWithClone` (`dsc/dsc2.h:814`).
+#[derive(Clone, Debug)]
+pub struct TransferNode {
+    /// Field: e023_TransferNode.src_
+    ///
+    /// Where the data comes from (`dsc/dsc2.h:824`), written by `setDataLocAndInfo`
+    /// (`ddc/ddl/ddl_conversion.cpp:1169`).
+    pub src: DataLocation,
+    /// Field: e023_TransferNode.srcIndirect_
+    ///
+    /// The location holding the source address when the read is indirect, or
+    /// [`DataLocation::UNSET`] when it is direct (`dsc/dsc2.h:824`).
+    /// [`is_src_indirect`](Self::is_src_indirect) is the test every reader applies before touching
+    /// it (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
+    pub src_indirect: DataLocation,
+    /// Field: e023_TransferNode.dstVias_
+    ///
+    /// One entry per destination, in the DDL's declaration order (`dsc/dsc2.h:825`,
+    /// `ddc/ddl/ddl_conversion.cpp:1175-1190`). Several entries is a multicast; the row-expansion
+    /// path rejects several destinations at once (`:1183-1187`).
+    pub dst_vias: Vec<DstVia>,
+    /// Field: e023_TransferNode.replicationFactor_
+    ///
+    /// How many times the loaded chunk is splatted, `1` for no splat (`dsc/dsc2.h:834`). Bridge 1
+    /// divides the recorded stick and element counts by it, and refuses an LXLU splat it cannot
+    /// express (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:728-729`, `:963-971`).
+    pub replication_factor: i32,
+    /// Field: e023_TransferNode.unitTimeTransferChunkSize_
+    ///
+    /// "Continuous elements within a stick" (`dsc/dsc2.h:835-836`) — the contiguous dims of one
+    /// unit-time transfer, ordered as the stick sizes are and then extended with layout dims
+    /// (`ddc/ddcv1.cpp:524-525`, `:1597-1598`). Bridge 1 multiplies the extents into the element
+    /// count of one `agen` access (`SNTransferLowering.cpp:33-38`).
+    pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
+    /// Field: e023_TransferNode.unitTimeTransferNumChunks_
+    ///
+    /// How many chunks one unit-time transfer covers, `1` for a single contiguous chunk
+    /// (`dsc/dsc2.h:837`). It is the product of the extents the hole split moved out of
+    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size)
+    /// (`ddc/ddcv1.cpp:1633-1642`), which bridge 1 multiplies back in
+    /// (`SNTransferLowering.cpp:33-38`).
+    pub unit_time_transfer_num_chunks: i32,
+    /// Field: e023_TransferNode.unitTimeTransferChunkStride_
+    ///
+    /// The dims the chunks stride over — the entries the hole split removed from
+    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size), each with its extent
+    /// set to 1 (`dsc/dsc2.h:838`, `ddc/ddcv1.cpp:1635-1642`).
+    ///
+    /// ⛔ NO LIVE C++ PRODUCER FILLS THIS. Its one writer is inside the lambda
+    /// `checkAndResetUnitTimeTransfer` (`ddc/ddcv1.cpp:1640`), whose sole callsite is commented out
+    /// (`:1648-1650`), so outside the JSON importer (`dsc/dsc2.cpp:1573-1584`) it is always empty —
+    /// which is why the `size() <= 1` check at `dsc/dsc2.cpp:3555` never fires and why bridge 1's
+    /// own refusal of more than one stride dim (`SNTransferLowering.cpp:324-331`) is never reached.
+    /// It is carried rather than dropped because bridge 1 reads it in eight places (`:930`, `:1270`,
+    /// `:1713`, `:1723`, `:2227`, `:2256`, `:2454`) and a JSON-imported tree can carry it.
+    pub unit_time_transfer_chunk_stride: Vec<SizeAndIndex>,
+    /// Field: e023_TransferNode.rotateNumElements_
+    ///
+    /// How far the LXLU rotates the loaded data, `0` for no rotation (`dsc/dsc2.h:839`). Every
+    /// reader guards on `> 0` (`SNTransferLowering.cpp:991`, `:1097`, `:2239`, `:2277`).
+    pub rotate_num_elements: i32,
+    /// Field: e023_TransferNode.coreIdToGTRInfo_
+    ///
+    /// The group tag register each core uses for this transfer — L3 only, as the authority's own
+    /// comment says (`dsc/dsc2.h:840`). The L3 scheduler writes it one core at a time and refuses to
+    /// overwrite an entry (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4836`, `:5249-5260`).
+    pub core_id_to_gtr_info: BTreeMap<CoreId, GroupTagRegInfo>,
+    /// Field: e023_TransferNode.transferSize_
+    ///
+    /// "Explicit transfer size. If filled, use this size rather than derived from data stage"
+    /// (`dsc/dsc2.h:841-843`). ⛔ ABSENCE IS THE COMMON CASE AND IS TESTED PER DIM, never for the
+    /// whole map: `getBlockTransferSizePerDimCustomLocation` overrides one dim's extent only where
+    /// `count(dim)` says so (`dsc/dsc2.cpp:3561-3562`), while two fill sites require the map to be
+    /// EMPTY first (`dsc/dsc2.cpp:4776-4777`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7897-7905`).
+    pub transfer_size: BTreeMap<PrimaryDimTypes, DimSize>,
+}
+
+impl Default for TransferNode {
+    /// The authority's member initialisers (`dsc/dsc2.h:834`, `:837`, `:839`) over
+    /// [`DataLocation`]'s own (`sys-arch-spec/arch_enums.h:390-391`).
+    ///
+    /// ⛔ IT IS NOT `TransferNode()`: that constructor also passes `TRANSFER` to the base class
+    /// (`dsc/dsc2.h:815`), and `nodeType_` is `ScheduleNode`'s, e013's to port.
+    fn default() -> Self {
+        Self {
+            src: DataLocation::UNSET,
+            src_indirect: DataLocation::UNSET,
+            dst_vias: Vec::new(),
+            replication_factor: 1,
+            unit_time_transfer_chunk_size: Vec::new(),
+            unit_time_transfer_num_chunks: 1,
+            unit_time_transfer_chunk_stride: Vec::new(),
+            rotate_num_elements: 0,
+            core_id_to_gtr_info: BTreeMap::new(),
+            transfer_size: BTreeMap::new(),
+        }
+    }
+}
+
+impl TransferNode {
+    /// `dsc/dsc2.cpp:4364-4366`. Whether the source's storage is not one of [`MEMORIES`] — a FIFO, a
+    /// latch or a constant rather than a memory.
+    ///
+    /// ⛔ ITS ONLY CALLER IS OFF THIS CAMPAIGN'S PATH (`dsc/dsc2Pcfg.cpp:1039`, and DCG/PCFG is not
+    /// ours). It is ported because it is this class's own method over this class's own field.
+    pub fn has_non_memory_source(&self) -> bool {
+        !MEMORIES.contains(&self.src.storage)
+    }
+
+    /// `dsc/dsc2.cpp:4368-4370`. Whether ANY destination is not a memory, i.e. whether
+    /// [`non_memory_result_index`](Self::non_memory_result_index) found one. Its caller is
+    /// `moveTransferNode`, which refuses to hoist a transfer that has one
+    /// (`ddc/ddc_transformation_util.cpp:397`).
+    pub fn has_non_memory_result(&self) -> bool {
+        self.non_memory_result_index().is_some()
+    }
+
+    /// `dsc/dsc2.cpp:4372-4374`. Whether the destination at `index` is not a memory.
+    ///
+    /// ⛔ ITS ONLY CALLERS ARE OFF THIS CAMPAIGN'S PATH (`dsc/dsc2Pcfg.cpp:1041`, `:1309`), and IBM's
+    /// `dstVias_[i]` is unchecked there — an out-of-range index is undefined behaviour in the
+    /// authority, where here it is the slice's own bound.
+    pub fn check_non_memory_result_index(&self, index: usize) -> bool {
+        !MEMORIES.contains(&self.dst_vias[index].loc.storage)
+    }
+
+    /// `dsc/dsc2.cpp:4376-4383`. The FIRST destination that is not a memory, as an index into
+    /// [`dst_vias`](Self::dst_vias).
+    ///
+    /// ⭐ THE AUTHORITY'S `-1` IS [`None`], AND BOTH CALLERS ALREADY TREAT IT THAT WAY: each writes
+    /// `int fifoInd` and guards every use with `fifoInd != -1`
+    /// (`ddc/ddc_transformation.cpp:1570-1572`, `:1818-1819`).
+    pub fn non_memory_result_index(&self) -> Option<usize> {
+        self.dst_vias
+            .iter()
+            .position(|dst| !MEMORIES.contains(&dst.loc.storage))
+    }
+
+    /// `dsc/dsc2.h:877`. Whether the source address comes from
+    /// [`src_indirect`](Self::src_indirect) rather than from the data stage. Its in-scope callers
+    /// gate every read of the indirect fields on it (`dsc/dsc2.cpp:506`, `:558`, `:656`, `:3066`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
+    pub fn is_src_indirect(&self) -> bool {
+        self.src_indirect.unit != SenComponent::NoComponent
+    }
+
+    /// `dsc/dsc2.h:879-883`. Whether the destination at `dst_vias_idx` is addressed indirectly.
+    /// Called per destination by `fillLoopOffsetsAndAddresses`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6317`).
+    ///
+    /// ⭐ HALF OF THE AUTHORITY'S `DT_CHECK_MSG(dstViasIdx >= 0 && ... < size())` (`:880-881`) IS A
+    /// TYPE GUARD HERE: `usize` makes a negative index unrepresentable, so only the upper bound is
+    /// left to check and the slice checks it.
+    ///
+    /// ```compile_fail
+    /// use deeptools::schedule::dsc2::TransferNode;
+    /// let _ = TransferNode::default().is_dst_indirect_at_index(-1);
+    /// ```
+    pub fn is_dst_indirect_at_index(&self, dst_vias_idx: usize) -> bool {
+        self.dst_vias[dst_vias_idx].loc_indirect.unit != SenComponent::NoComponent
+    }
+}
+
+// crustify:todo: e023_TransferNode
+
+// crustify:todo: e023_TransferNode.coreletViews_
+
+// crustify:todo: e023_TransferNode.dstIndirectLdsAndLoopOffsets_
+
+// crustify:todo: e023_TransferNode.dstIndirectLoopsAndSizes_
+
+// crustify:todo: e023_TransferNode.dstReps_
+
+// crustify:todo: e023_TransferNode.lastFusableParentLoopDst_
+
+// crustify:todo: e023_TransferNode.lastFusableParentLoopSrc_
+
+// crustify:todo: e023_TransferNode.paddingInfo_
+
+// crustify:todo: e023_TransferNode.repetition_
+
+// crustify:todo: e023_TransferNode.srcIndirectLdsAndLoopOffsets_
+
+// crustify:todo: e023_TransferNode.srcIndirectLoopsAndSize_
+
+// crustify:todo: e023_TransferNode.srcRep_
+
+// crustify:todo: e023_TransferNode.transferCoordinates_
