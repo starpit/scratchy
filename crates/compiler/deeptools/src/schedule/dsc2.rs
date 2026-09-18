@@ -6,7 +6,7 @@ use crate::schedule::fold::{
     AffineFoldFunctionLeaf, AffineFoldFunctionNonLeaf, FoldDimIndex, FoldDimProp, FoldDimSize,
     FoldFunc,
 };
-use core::num::Wrapping;
+use core::num::{NonZeroUsize, Wrapping};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
@@ -3886,6 +3886,264 @@ pub struct LoopCond {
 
 // crustify:todo: e018_LoopCond.loopComp_
 
+/// One conjunction of a condition node's guard — one entry of `twoLevelOrOfAnds_`
+/// (`dsc/dsc2.h:676`): the [`LoopCond`] terms that must ALL hold for the guarded region to run.
+///
+/// ⛔ NON-EMPTY BY SHAPE, BECAUSE AN EMPTY CONJUNCTION IS A SILENTLY DROPPED GUARD OR A CRASH:
+/// bridge 1's single-clause path emits no comparison at all for an empty term list, leaves `if_op`
+/// DEFAULT-CONSTRUCTED and then builds the "then" region with the UNCHANGED builder — that is,
+/// unconditionally (`SNControlFlowLowering.cpp:203-272`, mapped at `:1063`) — while its multi-clause
+/// path reads `cmp_list[cmp_list.size() - 1]` with `cmp_list` still empty (`:180`).
+///
+/// ⭐ AND THE AUTHORITY CHECKS NEITHER: one minter's term vector is non-empty only because its first
+/// dim is seeded before the filter that fills it (`ddc/ddc_transformation.cpp:919`, `:1056-1065`),
+/// and the SAMV minter's is a walk over enclosing loops that may match no dim at all
+/// (`ddc/ddcv1.cpp:3638-3649`). A mandatory first term is the check nobody wrote.
+#[derive(Clone, Debug)]
+pub struct LoopCondConjunction {
+    first: LoopCond,
+    rest: Vec<LoopCond>,
+}
+
+impl LoopCondConjunction {
+    /// The one-term conjunction all five minters start from (`ddc/ddl/ddl_conversion.cpp:317-319`,
+    /// `ddc/ddcv1.cpp:3638`, `ddc/ddc_transformation.cpp:1056-1060`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811-4815`, `dsc/dsc2.cpp:1436-1438`).
+    pub fn new(term: LoopCond) -> Self {
+        Self {
+            first: term,
+            rest: Vec::new(),
+        }
+    }
+
+    /// One further term, ANDed on the end — the SAMV minter's inner `emplace_back`
+    /// (`ddc/ddcv1.cpp:3643-3644`).
+    pub fn and_term(mut self, term: LoopCond) -> Self {
+        self.rest.push(term);
+        self
+    }
+
+    /// ⭐ THE DDL'S `ConditionAndOp`, AND TOTAL WHERE THE AUTHORITY'S IS GUARDED: it appends the
+    /// operand's terms to ours (`ddc/ddl/ddl_conversion.cpp:390-392`) behind a four-part check that
+    /// each side be a SINGLE, UN-NEGATED clause (`:380-389`) — which is what having this type at all
+    /// says, so the check has no input left to reject.
+    pub fn and(mut self, other: Self) -> Self {
+        self.rest.push(other.first);
+        self.rest.extend(other.rest);
+        self
+    }
+
+    /// Its terms in declaration order, which is OBSERVABLE and therefore not a set: the PCFG
+    /// translator spells a condition node's NAME from the dims it walks in this order
+    /// (`dsc/dsc2Pcfg.cpp:721-725`).
+    pub fn terms(&self) -> impl Iterator<Item = LoopCond> + '_ {
+        core::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    /// How many terms, never zero.
+    pub fn term_count(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+}
+
+impl From<LoopCond> for LoopCondConjunction {
+    fn from(term: LoopCond) -> Self {
+        Self::new(term)
+    }
+}
+
+/// The whole of `twoLevelOrOfAnds_` (`dsc/dsc2.h:676`): the conjunctions, ANY of which lets the
+/// guarded region run.
+///
+/// ⛔ NON-EMPTY FOR THE SAME REASON ONE LEVEL UP, and here the empty state is not a weaker condition
+/// but a DIFFERENT KIND OF NODE: `hasCoreClCond()` IS that emptiness (`dsc/dsc2.h:693-695`), so what
+/// e025 must carry is this type's ABSENCE. ⭐ THAT DELETES A CHECK IN BOTH DSC-TO-DATAFLOW-IR
+/// LOWERINGS, each re-asserting `twoLevelOrOfAnds_.empty()` inside the arm the same predicate
+/// already selected (`SNControlFlowLowering.cpp:1049`, `:1079`; `DSC2ToDataflowIR.cpp:91`, `:113`).
+#[derive(Clone, Debug)]
+pub struct LoopCondDisjunction {
+    first: LoopCondConjunction,
+    rest: Vec<LoopCondConjunction>,
+}
+
+impl LoopCondDisjunction {
+    /// The one-clause disjunction, which is every minter's whole condition: all five push exactly
+    /// one clause.
+    pub fn new(clause: LoopCondConjunction) -> Self {
+        Self {
+            first: clause,
+            rest: Vec::new(),
+        }
+    }
+
+    /// One further clause, ORed on the end — `adjustConditionForSplitLoop`'s outer `push_back`
+    /// (`dsc/dsc2.cpp:2134`).
+    pub fn or_clause(mut self, clause: LoopCondConjunction) -> Self {
+        self.rest.push(clause);
+        self
+    }
+
+    /// ⭐ THE DDL'S `ConditionOrOp`, TOTAL AGAIN: it concatenates the clause lists
+    /// (`ddc/ddl/ddl_conversion.cpp:401-403`) behind a check that NEITHER side be negated
+    /// (`:393-399`), and a negation cannot reach this level — it lives one up, in
+    /// [`LoopCondComposite`].
+    pub fn or(mut self, other: Self) -> Self {
+        self.rest.push(other.first);
+        self.rest.extend(other.rest);
+        self
+    }
+
+    /// Back down to one conjunction when that is all this is — the narrowing that makes a clause
+    /// composable with [`LoopCondConjunction::and`] again, and exactly what the authority's
+    /// `size() != 1` half asks (`ddc/ddl/ddl_conversion.cpp:380-382`).
+    pub fn into_conjunction(self) -> Option<LoopCondConjunction> {
+        if self.rest.is_empty() {
+            Some(self.first)
+        } else {
+            None
+        }
+    }
+
+    /// Its clauses in declaration order, for the same reason [`LoopCondConjunction::terms`] is
+    /// ordered.
+    pub fn clauses(&self) -> impl Iterator<Item = &LoopCondConjunction> + '_ {
+        core::iter::once(&self.first).chain(self.rest.iter())
+    }
+
+    /// How many clauses, never zero. Bridge 1 dispatches its whole condition lowering on this being
+    /// more than one (`SNControlFlowLowering.cpp:81`).
+    pub fn clause_count(&self) -> NonZeroUsize {
+        NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+}
+
+impl From<LoopCondConjunction> for LoopCondDisjunction {
+    fn from(clause: LoopCondConjunction) -> Self {
+        Self::new(clause)
+    }
+}
+
+/// A condition node's loop guard: `LoopCondComposite` (`dsc/dsc2.h:675-683`), an OR of ANDs under
+/// one overall negation — which is the shape the DDL's own diagnostic names, "two-level OR of ANDs,
+/// with optionally an overall negation" (`ddc/ddl/ddl_conversion.cpp:385-388`).
+///
+/// ⭐ THREE GRAMMAR LEVELS, THREE TYPES, AND THAT DELETES BOTH OF THAT DIAGNOSTIC'S REFUSALS: the
+/// authority keeps all three in one flat struct, so `ConditionAndOp` must re-check at run time that
+/// each operand is a single un-negated clause (`:380-389`) and `ConditionOrOp` that neither operand
+/// is negated (`:393-399`). [`LoopCondConjunction::and`] and [`LoopCondDisjunction::or`] take
+/// operands of the level they compose, so both checks lose their inputs. The two narrowings a
+/// doubly negated operand needs to compose again — [`without_negation`](Self::without_negation) and
+/// [`LoopCondDisjunction::into_conjunction`] — are those same two questions asked as PROJECTIONS,
+/// and they answer a value where the authority aborts the compiler.
+///
+/// ⛔ AND NEGATED-WITH-NO-CONDITION IS A CRASH, WHICH IS WHY THE FLAG SITS AT THIS LEVEL: bridge 1
+/// enters its multi-clause path on `negated_` ALONE (`SNControlFlowLowering.cpp:81`) and then reads
+/// `cmp_list[cmp_list.size() - 1]` on an empty `cmp_list` (`:180`). Both writers already guard the
+/// toggle on exactly the emptiness this type cannot spell — explicitly
+/// (`ddc/ddl/ddl_conversion.cpp:325-326`, where a `condNot` over an empty composite negates
+/// `coreClCond_` instead) and through `hasCoreClCond()`'s else arm
+/// (`ddc/ddc_transformation_util.cpp:489`, `:592`).
+///
+/// ⛔ PARTIAL, AND THE `e022`/`e043` ANCHORS STAY OPEN BELOW: every term is [`LoopCond`]'s value
+/// half, so a composite still cannot name the loops it is a condition ON, and
+/// `adjustConditionForSplitLoop` selects and rebuilds its terms by that pointer
+/// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`). ⚠️ THAT DISPATCH HAS A FIFTH REFUSAL THE E025 ANCHOR
+/// DOES NOT LIST: `(LE, FIRST)` and `(GE, LAST)` fall through to
+/// `DT_ERROR("Unsupported condition operation")` (`:2136`) even though, on an index that cannot
+/// leave its own bounds, they are the `EQ` case `:2131` handles.
+///
+/// ⛔ TWO CARRIERS, and both must reach this type: `ConditionNode::loopCond_` (`dsc/dsc2.h:690`) and
+/// `DdlInterface::CondProp::loopCond_` (`ddc/ddl/ddl_conversion.h:420-421`).
+///
+/// ⛔ NO `Default`, unlike the authority's aggregate: `myCp.loopCond_ = {}` is how the DDL DROPS a
+/// condition that resolved to a constant (`ddc/ddl/ddl_conversion.cpp:353`, `:359`), and what it
+/// leaves behind is the discriminator, not a guard that holds trivially.
+///
+/// ```compile_fail
+/// // E0599, for the reader only: stable rustdoc parses the code an annotation names and ignores
+/// // it, so the annotation is documentation and the positive control below is the check.
+/// use deeptools::schedule::dsc2::LoopCondComposite;
+/// let _ = LoopCondComposite::default();
+/// ```
+///
+/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — the one-clause guard every minter
+/// builds, reached the only way a value of this type exists:
+///
+/// ```
+/// use deeptools::schedule::dims::PrimaryDimTypes;
+/// use deeptools::schedule::dsc2::{
+///     CondVal, LoopCond, LoopCondComposite, LoopCondConjunction, LoopCondOp,
+/// };
+/// let term = LoopCond {
+///     dim: PrimaryDimTypes::Y,
+///     cond_op: LoopCondOp::Eq,
+///     cond_val: CondVal::Last,
+/// };
+/// let cond: LoopCondComposite = LoopCondConjunction::new(term).into();
+/// assert!(!cond.negated);
+/// assert_eq!(cond.or_of_ands.clause_count().get(), 1);
+/// ```
+///
+/// ⛔ NO `PartialEq`, for [`LoopCond`]'s reason: two guards agreeing on dims, operators and values
+/// are the same guard only on the same loops, and that is the field the terms are missing.
+#[derive(Clone, Debug)]
+pub struct LoopCondComposite {
+    /// Field: e043_LoopCondComposite.twoLevelOrOfAnds_
+    /// Field: e022_LoopCondComposite.twoLevelOrOfAnds_
+    ///
+    /// The OR of ANDs itself (`dsc/dsc2.h:676`) — non-empty, per [`LoopCondDisjunction`].
+    pub or_of_ands: LoopCondDisjunction,
+    /// Field: e043_LoopCondComposite.negated_
+    /// Field: e022_LoopCondComposite.negated_
+    ///
+    /// Whether the whole disjunction is inverted (`dsc/dsc2.h:677`).
+    ///
+    /// ⛔ A PARITY, NEVER A SET: both writers TOGGLE it (`ddc/ddc_transformation_util.cpp:592`, where
+    /// the flip is what makes a cloned condition guard the ELSE region, and
+    /// `ddc/ddl/ddl_conversion.cpp:326`), so compose through [`negate`](Self::negate) — two flips
+    /// must be none. ⚠️ AND ON THE WIRE IT IS AN INTEGER, not a JSON bool: the exporter writes `0`
+    /// or `1` through `operator<<` with no `boolalpha` anywhere (`dsc/dsc2.cpp:483`) and the importer
+    /// reads `int_value()` (`:1462`), which json11 answers `0` for on a JSON `true`
+    /// (`external/json11/json11.cpp:193-196`, `:283`) — so a hand-written `true` imports as FALSE
+    /// and inverts the guard.
+    pub negated: bool,
+}
+
+impl LoopCondComposite {
+    /// The `condNot` toggle (`ddc/ddl/ddl_conversion.cpp:326`,
+    /// `ddc/ddc_transformation_util.cpp:592`).
+    pub fn negate(mut self) -> Self {
+        self.negated = !self.negated;
+        self
+    }
+
+    /// The disjunction back out, when the negation is off — the other half of what the authority's
+    /// composition checks ask (`ddc/ddl/ddl_conversion.cpp:381`, `:394`), which read the FLAG and
+    /// not the history of it, so a doubly negated operand composes again.
+    pub fn without_negation(self) -> Option<LoopCondDisjunction> {
+        if self.negated {
+            None
+        } else {
+            Some(self.or_of_ands)
+        }
+    }
+}
+
+impl From<LoopCondDisjunction> for LoopCondComposite {
+    fn from(or_of_ands: LoopCondDisjunction) -> Self {
+        Self {
+            or_of_ands,
+            negated: false,
+        }
+    }
+}
+
+impl From<LoopCondConjunction> for LoopCondComposite {
+    fn from(clause: LoopCondConjunction) -> Self {
+        LoopCondDisjunction::new(clause).into()
+    }
+}
+
 /// One constant element offset added on top of a start address — the `int` of `constEleOffsets_`
 /// (`dsc/dsc2.h:727-729`).
 ///
@@ -4193,10 +4451,6 @@ impl LoopDistributionCat {
 // crustify:todo: e021_LoopDistributionInfo
 
 // crustify:todo: e022_LoopCondComposite
-
-// crustify:todo: e022_LoopCondComposite.negated_
-
-// crustify:todo: e022_LoopCondComposite.twoLevelOrOfAnds_
 
 /// Replaces: dsc2::memories
 ///
@@ -7894,6 +8148,198 @@ mod equivalence {
             }
         }
     }
+
+    /// A DDL conditional expression: the four ops `processCondition` accepts, an operand at a time
+    /// (`ddc/ddl/ddl_conversion.cpp:317`, `:321`, `:345`). Its `And`/`Or` are binary because the
+    /// authority folds an n-ary op operand by operand into the same two guards.
+    enum Cond {
+        Term(LoopCond),
+        Not(Box<Cond>),
+        And(Box<Cond>, Box<Cond>),
+        Or(Box<Cond>, Box<Cond>),
+    }
+
+    fn term(dim: PrimaryDimTypes, cond_op: LoopCondOp, cond_val: CondVal) -> Cond {
+        Cond::Term(LoopCond {
+            dim,
+            cond_op,
+            cond_val,
+        })
+    }
+
+    fn not(inner: Cond) -> Cond {
+        Cond::Not(Box::new(inner))
+    }
+
+    fn and(lhs: Cond, rhs: Cond) -> Cond {
+        Cond::And(Box::new(lhs), Box::new(rhs))
+    }
+
+    fn or(lhs: Cond, rhs: Cond) -> Cond {
+        Cond::Or(Box::new(lhs), Box::new(rhs))
+    }
+
+    /// The authority's composite as it really is: all three grammar levels in ONE flat pair, a
+    /// `vector<vector<LoopCond>>` and a `bool` (`dsc/dsc2.h:675-683`).
+    type FlatComposite = (Vec<Vec<LoopCond>>, bool);
+
+    /// `ConditionAndOp` transcribed: the four-part shape check (`ddc/ddl/ddl_conversion.cpp:380-383`)
+    /// and then the term concatenation it guards (`:390-392`). [`None`] is its
+    /// `DT_ERROR("Illegal ddl")` (`:389`).
+    fn flat_and(lhs: FlatComposite, rhs: FlatComposite) -> Option<FlatComposite> {
+        if lhs.0.len() != 1 || lhs.1 || rhs.0.len() != 1 || rhs.1 {
+            return None;
+        }
+        let mut clauses = lhs.0;
+        for clause in rhs.0 {
+            if let Some(dest) = clauses.first_mut() {
+                dest.extend(clause);
+            }
+        }
+        Some((clauses, false))
+    }
+
+    /// `ConditionOrOp` transcribed: its negation check (`:393-399`) and clause concatenation
+    /// (`:401-403`).
+    fn flat_or(lhs: FlatComposite, rhs: FlatComposite) -> Option<FlatComposite> {
+        if lhs.1 || rhs.1 {
+            return None;
+        }
+        let mut clauses = lhs.0;
+        clauses.extend(rhs.0);
+        Some((clauses, false))
+    }
+
+    /// The whole expression over the flat pair. ⭐ THE `condNot` ARM'S OWN `!empty()` GUARD
+    /// (`:325-326`) IS UNREACHABLE HERE: no expression below resolves to an empty composite, which is
+    /// the state that guard sends to `coreClCond_` instead.
+    fn flat_eval(cond: &Cond) -> Option<FlatComposite> {
+        match cond {
+            Cond::Term(loop_cond) => Some((vec![vec![*loop_cond]], false)),
+            Cond::Not(inner) => {
+                let (clauses, negated) = flat_eval(inner)?;
+                Some((clauses, !negated))
+            }
+            Cond::And(lhs, rhs) => flat_and(flat_eval(lhs)?, flat_eval(rhs)?),
+            Cond::Or(lhs, rhs) => flat_or(flat_eval(lhs)?, flat_eval(rhs)?),
+        }
+    }
+
+    /// The same expression through the layered types. ⭐ EVERY [`None`] HERE IS A GRAMMAR LEVEL THAT
+    /// IS NOT THERE, never a check these functions perform: [`LoopCondConjunction::and`] and
+    /// [`LoopCondDisjunction::or`] are total, and all this recursion can fail at is asking a negated
+    /// composite or a multi-clause disjunction to be a conjunction.
+    fn layered_conjunction(cond: &Cond) -> Option<LoopCondConjunction> {
+        match cond {
+            Cond::Term(loop_cond) => Some(LoopCondConjunction::new(*loop_cond)),
+            Cond::And(lhs, rhs) => Some(layered_conjunction(lhs)?.and(layered_conjunction(rhs)?)),
+            Cond::Not(_) | Cond::Or(..) => layered_disjunction(cond)?.into_conjunction(),
+        }
+    }
+
+    fn layered_disjunction(cond: &Cond) -> Option<LoopCondDisjunction> {
+        match cond {
+            Cond::Or(lhs, rhs) => Some(layered_disjunction(lhs)?.or(layered_disjunction(rhs)?)),
+            Cond::Not(_) => layered_eval(cond)?.without_negation(),
+            term_or_and => Some(layered_conjunction(term_or_and)?.into()),
+        }
+    }
+
+    fn layered_eval(cond: &Cond) -> Option<LoopCondComposite> {
+        match cond {
+            Cond::Not(inner) => Some(layered_eval(inner)?.negate()),
+            other => Some(layered_disjunction(other)?.into()),
+        }
+    }
+
+    /// [`LoopCond`] carries no `PartialEq` — its identity is the loop pointer it is still missing —
+    /// so both forms are compared over the three value fields it does carry, nested exactly as the
+    /// two levels are.
+    type CondKey = (Vec<Vec<(PrimaryDimTypes, LoopCondOp, CondVal)>>, bool);
+
+    fn flat_key(flat: FlatComposite) -> CondKey {
+        (
+            flat.0
+                .into_iter()
+                .map(|clause| {
+                    clause
+                        .into_iter()
+                        .map(|t| (t.dim, t.cond_op, t.cond_val))
+                        .collect()
+                })
+                .collect(),
+            flat.1,
+        )
+    }
+
+    fn layered_key(cond: &LoopCondComposite) -> CondKey {
+        (
+            cond.or_of_ands
+                .clauses()
+                .map(|clause| {
+                    clause
+                        .terms()
+                        .map(|t| (t.dim, t.cond_op, t.cond_val))
+                        .collect()
+                })
+                .collect(),
+            cond.negated,
+        )
+    }
+
+    /// ⭐ THE LEVELS COST NOTHING AND GUARD THE TWO SHAPES: over every expression shape the DDL can
+    /// hand `processCondition`, the layered types compose exactly where the authority's flat pair
+    /// does — same clauses, same terms, same order, same parity — and refuse exactly where it raises
+    /// `DT_ERROR("Illegal ddl")`. ⛔ WHAT THE FLAT PAIR ADMITS AND THE TYPES DO NOT IS NOT IN THIS
+    /// TABLE, BECAUSE NO EXPRESSION REACHES IT: an empty clause, an empty composite and a negated
+    /// empty composite are all unspellable here, and all three are a dropped guard or an
+    /// out-of-bounds read in bridge 1 (`SNControlFlowLowering.cpp:180`, `:203-272`).
+    #[test]
+    fn the_layered_condition_composes_and_refuses_exactly_where_the_authoritys_flat_pair_does() {
+        let x = || term(PrimaryDimTypes::X, LoopCondOp::Eq, CondVal::First);
+        let y = || term(PrimaryDimTypes::Y, LoopCondOp::Ne, CondVal::Last);
+        let it3 = CondVal::Iteration(IterationIdx(3));
+        let z = || term(PrimaryDimTypes::Mb, LoopCondOp::Lt, it3);
+
+        let cases = [
+            ("term", x()),
+            ("not", not(x())),
+            ("not not", not(not(x()))),
+            ("and", and(x(), y())),
+            ("and and", and(and(x(), y()), z())),
+            ("or", or(x(), y())),
+            ("or or", or(or(x(), y()), z())),
+            ("or of and", or(and(x(), y()), z())),
+            ("and of or", and(or(x(), y()), z())),
+            ("and of not", and(not(x()), y())),
+            ("or of not", or(not(x()), y())),
+            ("and of not not", and(x(), not(not(y())))),
+            ("or of not not", or(not(not(x())), y())),
+            ("not of and", not(and(x(), y()))),
+            ("not of or", not(or(x(), y()))),
+            ("not of or of and", not(or(and(x(), y()), z()))),
+        ];
+
+        for (case, cond) in &cases {
+            assert_eq!(
+                flat_eval(cond).map(flat_key),
+                layered_eval(cond).as_ref().map(layered_key),
+                "case {case}"
+            );
+        }
+
+        // ⛔ AND THE TABLE IS NOT ALL-ACCEPTING OR ALL-REFUSING, which is the only way the assertion
+        // above means anything: the two shapes the authority's diagnostic names are refused, and
+        // every other shape is composed.
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|(_, cond)| flat_eval(cond).is_none())
+                .count(),
+            3,
+            "and of or, and of not, or of not"
+        );
+    }
 }
 
 // crustify:todo: e030_BlockNode
@@ -7983,3 +8429,5 @@ mod equivalence {
 // crustify:todo: e042_LoopDistributionInfo.dimAndKind
 
 // crustify:todo: e042_LoopDistributionInfo.loopNode
+
+// crustify:todo: e043_LoopCondComposite
