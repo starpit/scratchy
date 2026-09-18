@@ -168,633 +168,108 @@
    "sys_crate": "crustify/rust/deeptools-sys",
    "depends_on": [],
    "modules": {
-    "dcg": {
-     "rust_path": "crates/compiler/deeptools/src/schedule/dcg",
-     "rs": {
-      "src/schedule/dcg/manager.rs": {
-       "_comment": "16 unit(s) from dcg/dcg_manager/dcg_manager.cpp, dcg/dcg_manager/dcg_manager.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/dcg.cpp",
-       "headers": [
-        "dcg/dcg_manager/dcg_manager.cpp",
-        "dcg/dcg_manager/dcg_manager.h"
-       ],
-       "members": {
-        "functions": [
-         "e188_runDcgComputeTransfer",
-         "e189_runDcgForDlOps",
-         "e190_runDcgForDlOpsStandalone",
-         "e191_removeextraPTrows",
-         "e192_printSenProgram",
-         "e193_runDcgForGenKG3",
-         "e194_runDcgForSparseKG3CONV2D",
-         "e195_runDcgForSparseKG3BMM",
-         "e196_printTrafficPerCore",
-         "e280_runDcgGenerateProgIR",
-         "e281_runDcgForInputFetchNeighbor",
-         "e282_mergePcfgInSuperDSC",
-         "e326_mergePcfgInSuperDSC",
-         "e327_printSenProgram",
-         "e348_runDcgForDataOpsDlOps",
-         "e349_convertToProgIRDataOp"
-        ]
-       }
-      }
-     }
-    },
     "ddc": {
-     "rust_path": "crates/compiler/deeptools/src/schedule/ddc",
+     "rust_path": "crates/compiler/deeptools/src/schedule",
      "rs": {
-      "src/schedule/ddc/fold.rs": {
-       "_comment": "36 unit(s) from ddc/ddc_fold.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/ddc_fold.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e078_dbgPrint",
-         "e079_dbgPrint",
-         "e080_allDimsCovered",
-         "e081_buildFoldForBroadcastDim",
-         "e082_getCompRowId",
-         "e083_getComponent",
-         "e084_getLayoutDimsFromNode",
-         "e085_needToConsiderRowBundling",
-         "e086_isAllocateIncoming",
-         "e087_findCommonAncestor",
-         "e088_orderDescendants",
-         "e089_constructAllocElemArrLayout",
-         "e090_combineContigousLevels",
-         "e091_matchDataStream",
-         "e092_getNumElementsInPTSlice",
-         "e093_buildSpatialFold",
-         "e094_getDefaultRowSplitFold",
-         "e095_gatherFoldParams",
-         "e233_dbgPrint",
-         "e234_scaleUpCoord",
-         "e235_scaleDownCoord",
-         "e236_needNonRowBundling",
-         "e237_sameCoordinateRange",
-         "e238_getRelatedComputeCoord",
-         "e239_computeParamsForRowSplitFold",
-         "e240_buildFoldForExternalAllocation",
-         "e241_relateLoopsToAllocElemArr",
-         "e297_gatherRelatedPTRowsBase",
-         "e298_buildFoldFromAllocation",
-         "e299_buildFoldFromNonAllocRef",
-         "e337_gatherRelatedPTRows",
-         "e356_buildFoldForAllocation",
-         "e357_buildFoldForCompute",
-         "e358_buildFoldForTransfer",
-         "e370_buildAndPropagateFold",
-         "e375_coordinateCapture"
-        ]
-       }
-      },
-      "src/schedule/ddc/metadata.rs": {
-       "_comment": "9 unit(s) from ddc/ddc_metadata.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/ddc_metadata.h",
-        "crustify-types/cpp/ddc_metadata.h"
-       ],
-       "members": {
-        "functions": [
-         "e096_updateMin",
-         "e097_updateMax",
-         "e098_updateValues",
-         "e099_dump",
-         "e100_insertProducer",
-         "e101_insertConsumer",
-         "e102_print",
-         "e103_getLoops",
-         "e104_clear"
-        ],
-        "types": [
-         "e004_FailedAlloc",
-         "e017_Metadata"
-        ]
-       }
-      },
-      "src/schedule/ddc/mod.rs": {
-       "_comment": "9 unit(s) from ddc/ddc.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
+      "src/schedule/ddc.rs": {
+       "tu": "crustify-scheduler/cpp/ddc.h",
        "headers": [
         "ddc/ddc.h"
        ],
        "members": {
-        "functions": [
-         "e073_addPropInfo",
-         "e074_retry",
-         "e075_getCurrItem",
-         "e076_print",
-         "e077_printFoldParams",
-         "e230_addPropInfo",
-         "e231_rollbackToPos",
-         "e232_reset",
-         "e296_rollBackNodesInBlock"
-        ]
-       }
-      },
-      "src/schedule/ddc/shuffle.rs": {
-       "_comment": "50 unit(s) from ddc/transformations/automatic_shuffle/shuffle.cpp, ddc/transformations/automatic_shuffle/shuffle.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/transformations/automatic_shuffle/shuffle.cpp",
-        "ddc/transformations/automatic_shuffle/shuffle.h"
-       ],
-       "members": {
-        "functions": [
-         "e137_int_log2",
-         "e138_swap",
-         "e139_packmerge_psuedostring",
-         "e140_repeat_over_dims",
-         "e141_act",
-         "e142_cost",
-         "e143_get_shuffle_indices",
-         "e144_act",
-         "e145_get_indices",
-         "e146_act",
-         "e147_cost",
-         "e148_act",
-         "e149_act",
-         "e150_cost",
-         "e151_act",
-         "e152__out_format",
-         "e153_act",
-         "e154__out_format",
-         "e155_act",
-         "e156_contains",
-         "e157_get_node",
-         "e158_make_stick_number_key",
-         "e159_all_one",
-         "e160_update_worklist",
-         "e161_codegen_psuedocode",
-         "e162_getDefaultSymbols",
-         "e163_constexpr",
-         "e164_insert_before",
-         "e264_bin_op",
-         "e265_unary_op",
-         "e266_canonicalize_layout",
-         "e267_reset_graph",
-         "e268_sort_by_stick_key",
-         "e269_check_single_inorder_accesses",
-         "e270_inferLayouts",
-         "e310_add_valid_actions",
-         "e311_enumerate_stick_computations",
-         "e312_add_valid_actions",
-         "e313_enumerate_stick_computations",
-         "e314_add_valid_actions",
-         "e315_enumerate_stick_computations",
-         "e316_add_valid_actions",
-         "e317_add_valid_actions",
-         "e318_add_valid_actions",
-         "e319_add_valid_actions",
-         "e320_add_valid_actions",
-         "e342_codegen_generic",
-         "e343_get_legal_transforms",
-         "e362_get_shuffle",
-         "e371_replace_assign"
-        ]
-       }
-      },
-      "src/schedule/ddc/transformation.rs": {
-       "_comment": "18 unit(s) from ddc/ddc_transformation.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/ddc_transformation.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e105_isReleventComputeToPackStickDim",
-         "e106_findReleventStickPackingTransfers",
-         "e107_isEligibleCompute",
-         "e108_cloneComputeForOffsetAdjustment",
-         "e109_transformAComputeNodeForInterSliceRestickify",
-         "e242_canUseFifo",
-         "e243_canUseLatch",
-         "e244_cloneForOffsetAdjustment",
-         "e245_setSizeForFixedSizeTransfers",
-         "e246_transformForInterSliceRestickify",
-         "e300_packStickDim",
-         "e301_hoistTransfersUpForReuse",
-         "e302_unrollSymbolicTransfers",
-         "e303_unrollSpreadTransfers",
-         "e338_performPeSfpWorkSplit",
-         "e359_transformRegToFifoOrLatch",
-         "e360_transformFor4BsplatRead",
-         "e376_performAutomaticShuffling"
-        ]
-       }
-      },
-      "src/schedule/ddc/transformation_util.rs": {
-       "_comment": "32 unit(s) from ddc/ddc_transformation_util.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/ddc_transformation_util.cpp",
-        "crustify-types/cpp/dims.h"
-       ],
-       "members": {
-        "functions": [
-         "e110_constructAllocation",
-         "e111_reduceUsersOrDeleteAllocationAndMetadata",
-         "e112_constructDatastage",
-         "e113_constructDatastage",
-         "e114_constructLoopNode",
-         "e115_collectLoopReferences",
-         "e116_getPaddingPerDim",
-         "e117_getNodeDescription",
-         "e118_cloneForPeSfpWorkSplit",
-         "e119_cloneForPeSfpWorkSplit",
-         "e120_storageOrDatastreamIsExternal",
-         "e121_relatedToExternalNodes",
-         "e122_isNodeRelatedToComps",
-         "e123_updateNodesWithNewLds",
-         "e247_splitLoopBandOnDim",
-         "e248_splitLoopBandOnDatastage",
-         "e249_moveTransferNode",
-         "e250_convertResultFromFIFOtoReg",
-         "e251_unrollTransfer",
-         "e252_unrollTransferForSymbolicDims",
-         "e253_srcRelatedToExternalNodes",
-         "e254_destRelatedToExternalNodes",
-         "e255_inputRelatedToExternalNodes",
-         "e256_outputRelatedToExternalNodes",
-         "e257_addNewLds",
-         "e304_cloneForPeSfpWorkSplit",
-         "e305_destRelatedToExternalNodes",
-         "e306_relatedToExternalNodes",
-         "e339_convertResultToSkipReg",
-         "e340_insertComputeBetweenTransferAndReg",
-         "e341_relatedToExternalNodes",
-         "e361_relatedToExternalNodes"
-        ],
         "types": [
-         "e001_PaddingFormType"
-        ]
-       }
-      },
-      "src/schedule/ddc/v1.rs": {
-       "_comment": "24 unit(s) from ddc/ddcv1.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddc.cpp",
-       "headers": [
-        "ddc/ddcv1.cpp",
-        "crustify-types/cpp/dims.h"
-       ],
-       "members": {
-        "functions": [
-         "e124_getLdsOrConstNameOfAllocNode",
-         "e125_minimizeAllocations",
-         "e126_populateUnitTimeTransfers",
-         "e127_spreadDataInAllocate",
-         "e128_finalizeAllocateLayouts",
-         "e129_getClSplitDim",
-         "e130_getPeSfpSplitDim",
-         "e131_setPeFoldsIfPtInteraction",
-         "e132_restoreDsc",
-         "e133_adjustLoopOffsetsAndAddresses",
-         "e134_simplifyScheduleTree",
-         "e135_updateLdsIdxMetadata",
-         "e136_initGlobalData",
-         "e258_allocAllMem",
-         "e259_calculateClStartAddress",
-         "e260_fillLoopOffsetsAndAddresses",
-         "e261_finalizeOps",
-         "e262_coordinateMasking",
-         "e263_identifyBelowChunkBoundaryLoops",
-         "e307_exploreAssignDataStages",
-         "e308_prepDsc",
-         "e309_attachToPrefilledSchedule",
-         "e379_run_v1",
-         "e381_run"
-        ],
-        "types": [
-         "e002_DimPaddingSizes"
+         "e032_Ddc"
         ]
        }
       }
      }
     },
-    "ddl": {
-     "rust_path": "crates/compiler/deeptools/src/schedule/ddl",
+    "dims": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
      "rs": {
-      "src/schedule/ddl/conversion.rs": {
-       "_comment": "31 unit(s) from ddc/ddl/ddl_conversion.cpp, ddc/ddl/ddl_conversion.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddl.cpp",
+      "src/schedule/dims.rs": {
+       "tu": "crustify-scheduler/cpp/dims.h",
        "headers": [
-        "ddc/ddl/ddl_conversion.cpp",
-        "ddc/ddl/ddl_conversion.h"
+        "dsc/dims.h"
        ],
        "members": {
-        "functions": [
-         "e172_processTypes",
-         "e173_addInternalTensor",
-         "e174_processExpression",
-         "e175_getTensorProp",
-         "e176_getTensor",
-         "e177_dump",
-         "e178_getAccessPattern",
-         "e179_getAccessPatternAsStr",
-         "e180_checkAccessPattern",
-         "e181_convertAccessPatternStrToDdcType",
-         "e182_convertAccessPatternStrToDdcType",
-         "e183_dump",
-         "e184_setMetaDimKind",
-         "e185_isMetaDim",
-         "e186_getNonPaddedDimProp",
-         "e187_clear",
-         "e274_processDimensionOp",
-         "e275_processCondition",
-         "e276_verifyDdlConstraints",
-         "e277_getTensorAndAllocation",
-         "e278_checkMetaDimensions",
-         "e279_processAccessPatterns",
-         "e322_processPaddedDimensionOp",
-         "e323_processOp",
-         "e324_processTransformations",
-         "e325_convertDsc2Ddl",
-         "e345_exportToDdl",
-         "e346_processRegion",
-         "e347_matchDdl2Dsc",
-         "e364_parseDdl2Dsc",
-         "e372_selectAndParseDdlTemplate"
-        ]
-       }
-      },
-      "src/schedule/ddl/mod.rs": {
-       "_comment": "5 unit(s) from ddc/ddl/ddl.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddl.cpp",
-       "headers": [
-        "ddc/ddl/ddl.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e171_performActions",
-         "e273_processBuffer",
-         "e321_DdlMain",
-         "e344_DdlMain",
-         "e363_parseDdl"
-        ]
-       }
-      },
-      "src/schedule/ddl/ops.rs": {
-       "_comment": "8 unit(s) from ddc/ddl/Dialect/DdlOps.cpp. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/ddl.cpp",
-       "headers": [
-        "ddc/ddl/Dialect/DdlOps.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e165_initialize",
-         "e166_verify",
-         "e167_verify",
-         "e168_verify",
-         "e169_verify",
-         "e170_parse",
-         "e271_verify",
-         "e272_print"
-        ]
-       }
-      }
-     }
-    },
-    "l3": {
-     "rust_path": "crates/compiler/deeptools/src/schedule/l3",
-     "rs": {
-      "src/schedule/l3/dl_ops.rs": {
-       "_comment": "144 unit(s) from dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp, dcg/dcg_fe/scheduler/L3DlOpsScheduler.h. Authority: /Users/nickm/git/deeptools-src/<file>:<line> per unit.",
-       "tu": "crustify-ddc/cpp/l3.cpp",
-       "headers": [
-        "dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp",
-        "dcg/dcg_fe/scheduler/L3DlOpsScheduler.h"
-       ],
-       "members": {
-        "functions": [
-         "e001_isSameDscGroup",
-         "e002_isLabeledDsDimensionBroadcast",
-         "e003_isDimensionCoreletSplit",
-         "e004_voidPaddingIfChunking",
-         "e005_addOrUpdateSymbolicInfoInParams",
-         "e006_getLabeledDsWkSliceMulticastDegree",
-         "e007_scheduleDimTypeToString",
-         "e008_hasDimensionReuse",
-         "e009_getStickSize",
-         "e010_getCoreSplitDimensions",
-         "e011_getLabeledDsWithDsType",
-         "e012_getAllLabeledDsIndicesSet",
-         "e013_getHbmPinnedLabeledDsIndicesSet",
-         "e014_isLabeledDsLXNeighbor",
-         "e015_getParentLoopNodes",
-         "e016_createAllocateNode",
-         "e017_createTransferNode",
-         "e018_createLoopNode",
-         "e019_createBlockNode",
-         "e020_createSyncNode",
-         "e021_getOpFuncName",
-         "e022_addOrUpdateDataStageParam",
-         "e023_isOpFuncConv2dInt4",
-         "e024_isOpFuncConv2dOs1",
-         "e025_isOpFuncBmmInt4",
-         "e026_isOpFuncBmmInt8",
-         "e027_isOpFuncBmmFp8NonXrf",
-         "e028_isOpFuncBmmFp8Xrf",
-         "e029_isOpFuncBmmFp16",
-         "e030_isOpFuncScalarBroadcast",
-         "e031_isOpFuncReduction",
-         "e032_isOpFuncPooling",
-         "e033_isOpFuncDepthwiseConv",
-         "e034_isOpFuncQuantization",
-         "e035_isOpFuncConversionDl16AndFp32",
-         "e036_getMinParamScalarBroadcast",
-         "e037_getMinParamReduction",
-         "e038_getMinParamPoolingAndDepthwiseConv",
-         "e039_getMinParamQuantization",
-         "e040_getMinParamConversionDl16AndFp32",
-         "e041_getChunkParamsFromCandidates",
-         "e042_getBurstEfficiency",
-         "e043_getLabeledDsNumOfStickVolumesInCore",
-         "e044_getOpReducedDimSet",
-         "e045_addSuperChunkDataStage",
-         "e046_getLxBelowBlockNode",
-         "e047_collectAllDimensionsForLoopOrder",
-         "e048_getSharesAndGroupName",
-         "e049_calculateCoreletOffsetInByte",
-         "e050_getInitialStartAddressAndOffset",
-         "e051_getLdsOrConstNameOfAllocNode",
-         "e052_verifyLoopOrder",
-         "e053_verifyScheduleTree",
-         "e054_prepDsc",
-         "e055_computeMinHMICoreGroupSizeForSEN1P5",
-         "e056_isIndexLds",
-         "e057_isPagedLds",
-         "e058_getNewDataStageIndex",
-         "e059_getPagedDimensions",
-         "e060_getHbmAllocations",
-         "e061_gatherFoldParams",
-         "e062_getEnclosingLoopsAndRelatedDims",
-         "e063_findAndStoreLoopWithDim",
-         "e064_constructDatastage",
-         "e065_constructLoopNode",
-         "e066_addCore",
-         "e067_getStartCoreAtCorelet",
-         "e068_getEndCoreAtCorelet",
-         "e069_updateMin",
-         "e070_updateMax",
-         "e071_updateValues",
-         "e072_getTripCount",
-         "e197_getCoreletSplitDimensions",
-         "e198_addOrUpdatePaddingSizesInChunkParams",
-         "e199_getLabeledDsNumOfWkSlices",
-         "e200_getLxNeighborLabeledDsIndicesSet",
-         "e201_computeLdsAllocateSiblingLoopNode",
-         "e202_computeLdsTransferSiblingLoopNode",
-         "e203_getOpFuncDataFormat",
-         "e204_isOpFuncConv2d",
-         "e205_isOpFuncBmm",
-         "e206_getMinParamBmm",
-         "e207_generateDscParamCandidates",
-         "e208_getLdsL3TransferNodes",
-         "e209_getLabeledDsChunkStickVolume",
-         "e210_isOpCrossCoreReduction",
-         "e211_getInsertionNode",
-         "e212_addL3LUAndLXLUSyncNodeSequence",
-         "e213_addL3LUAndLXLUSoftSyncNodeSequence",
-         "e214_optimizeHbmLdsOutputInScheduleTree",
-         "e215_buildScheduleDimensionsTable",
-         "e216_buildLoopOrder",
-         "e217_createChunkLoopNodes",
-         "e218_setCondGtr",
-         "e219_fillFinalStartAddressAndOffset",
-         "e220_fillIBRStartAddressAndOffset",
-         "e221_fillTransferZeroPaddingInfo",
-         "e222_allocAllMem",
-         "e223_getHbmLdsTransferHMIRequestEstimate",
-         "e224_getAllPagedLdsIndices",
-         "e225_createPagedDimChunkLoops",
-         "e226_createStoreIndexTensorToIbr",
-         "e227_convertTransferDirectToIndirect",
-         "e228_buildCoordinateFromAllocation",
-         "e229_sliceCoordinateForCorelet",
-         "e283_addOrUpdateCoreletSplitInParams",
-         "e284_isOpFuncStridedWindow",
-         "e285_calculateBurstEfficiency",
-         "e286_calculateFlopPerByte",
-         "e287_getCrossCoreReductionGroupInfo",
-         "e288_createSynchronizationDSC",
-         "e289_optimizeHbmTransfers",
-         "e290_createChunkLoops",
-         "e291_fillTransferMulticastInfo",
-         "e292_fillAllocationStartAddrAndOffset",
-         "e293_setLxBufferType",
-         "e294_createStoreIndexTensorToLx",
-         "e295_fillExplicitTransferSize",
-         "e328_computeMinParamForPaddedDim",
-         "e329_addChunkDataStageFromCandidates",
-         "e330_getLdsTransferCoreIds",
-         "e331_exploreSuperChunkDataStageParams",
-         "e332_createSynchronization",
-         "e333_fillLoopOffsetsAndAddresses",
-         "e334_addIbrDataStage",
-         "e335_addOnePageDataStage",
-         "e336_processPagedTensorTransfers",
-         "e350_getMinParamConv2d",
-         "e351_setSuperChunkDataStageParams",
-         "e352_updateChunkDataStagesFromCandidates",
-         "e353_createAllocationAndTransfer",
-         "e354_processDscHbmPagedTensors",
-         "e355_fillCoordinateCustomWkSliceId",
-         "e365_getMinParamForDimFromOpFunc",
-         "e366_findBestParamsForMemoryBandwidth",
-         "e367_findBestParamsForArithmeticIntensity",
-         "e368_processHbmPagedTensors",
-         "e369_buildCoordinateForAllocation",
-         "e373_getMinParamForDim",
-         "e374_propagateCoordinateDSC",
-         "e377_getInitialChunkParams",
-         "e378_propagateCoordinate",
-         "e380_setChunkDataStageParams",
-         "e382_run"
-        ]
-       }
-      },
-      "src/schedule/l3/dsc.rs": {
-       "tu": "crustify-capacity/cpp/capacity.cpp",
-       "headers": [
-        "dsc/dims.cpp",
-        "dsc/dsc2.cpp",
-        "dsc/designSpaceConfig.cpp",
-        "crustify-types/cpp/dims.h",
-        "crustify-types/cpp/designSpaceConfig.h"
-       ],
-       "members": {
-        "functions": [
-         "e002_primaryDimToValHandler_st",
-         "e003_scaleFromMaxToGranularity",
-         "e004_getDimIndexInLayoutOrder",
-         "e005_getLayoutDimSet",
-         "e008_pruneMaxSymbolicVolumes",
-         "e009_calculate_padded",
-         "e010_primaryDimToVal_base_st",
-         "e011_primaryDimToVal_clView_st",
-         "e012_primaryDimToVal_st",
-         "e013_primaryDimToVal_st_1arg"
-        ],
         "types": [
-         "e003_SymbolicDimInfo",
-         "e006_DataStructDims",
-         "e018_DesignSpaceConfig",
-         "e019_DesignSpaceConfig_loops",
-         "e020_DesignSpaceConfig_tree",
-         "e021_DesignSpaceConfig_geometry",
-         "e022_DesignSpaceConfig_ops",
-         "e023_DesignSpaceConfig_masking",
-         "e024_DesignSpaceConfig_storage"
-        ]
-       }
-      },
-      "src/schedule/l3/capacity.rs": {
-       "tu": "crustify-capacity/cpp/capacity.cpp",
-       "headers": [
-        "dsc/dsc2.cpp"
-       ],
-       "members": {
-        "functions": [
-         "e015_getSizeDataStageForNode",
-         "e016_getSizeDataStageForNode_2arg",
-         "e017_getBufferCapacityForNodePerDimCustomLocation",
-         "e018_getBufferCapacityForNodePerDim",
-         "e019_getBufferCapacityForNode"
+         "e002_PrimaryDimAndKind",
+         "e003_PaddingFormType",
+         "e004_DimPaddingSizes",
+         "e005_SymbolicDimInfo",
+         "e011_DataStructDims"
         ]
        }
       }
      }
     },
-    "schedule": {
+    "dsc": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/dsc.rs": {
+       "tu": "crustify-scheduler/cpp/designSpaceConfig.h",
+       "headers": [
+        "dsc/designSpaceConfig.h"
+       ],
+       "members": {
+        "types": [
+         "e031_DesignSpaceConfig"
+        ]
+       }
+      }
+     }
+    },
+    "dsc2": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
      "rs": {
       "src/schedule/dsc2.rs": {
-       "tu": "crustify-capacity/cpp/capacity.cpp",
+       "tu": "crustify-scheduler/cpp/dsc2.h",
        "headers": [
-        "dsc/dsc2.cpp",
-        "crustify-types/cpp/dsc2.h"
+        "dsc/dsc2.h"
        ],
        "members": {
-        "functions": [
-         "e006_getLayoutDims",
-         "e007_getPageSize",
-         "e014_parametricStride"
-        ],
         "types": [
-         "e005_CoordinateType",
-         "e007_DataInfo",
+         "e006_GroupTagRegInfo",
+         "e007_ScheduleTree",
          "e008_TransferPadInfo",
-         "e009_ScheduleNode",
-         "e010_BlockNode",
-         "e011_LoopNode",
-         "e012_ConditionNode",
-         "e013_SyncNode",
-         "e014_TransferNode",
-         "e015_ComputeNode",
-         "e016_ScheduleTree"
+         "e009_FoldParamInfoType",
+         "e010_LoopDistributionParamType",
+         "e012_CoordinateType",
+         "e013_ScheduleNode",
+         "e014_DataStage",
+         "e015_BlockNode",
+         "e016_CoordPropInfoType",
+         "e017_LoopNode",
+         "e018_LoopCond",
+         "e019_DataInfo",
+         "e020_DistributionStatusInfo",
+         "e021_LoopDistributionInfo",
+         "e022_LoopCondComposite",
+         "e023_TransferNode",
+         "e024_ComputeNode",
+         "e025_ConditionNode",
+         "e026_SyncNode",
+         "e027_StickMaskNode",
+         "e028_AllocateNode",
+         "e030_ConstantInfo"
+        ]
+       }
+      }
+     }
+    },
+    "metadata": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/metadata.rs": {
+       "tu": "crustify-scheduler/cpp/ddc_metadata.h",
+       "headers": [
+        "ddc/ddc_metadata.h"
+       ],
+       "members": {
+        "types": [
+         "e001_FailedAlloc",
+         "e029_Metadata"
         ]
        }
       }
