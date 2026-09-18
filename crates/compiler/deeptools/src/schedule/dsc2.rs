@@ -649,6 +649,125 @@ mod unit_tests {
         assert!(loop_node.is_dim_symbolic(PrimaryDimTypes::Mb));
         assert!(loop_node.loop_count_symbol_ids[&PrimaryDimTypes::Mb].is_empty());
     }
+
+    /// The eleven operators in the authority's declaration order (`dsc/dscdefn.h:95-107`) paired
+    /// with the spellings `EnumsConversion::condOpToString` gives them (`dsc/dscdefn.cpp:19-28`).
+    const EVERY_COND_OP: [(CondOp, &str); 11] = [
+        (CondOp::Eq, "eq"),
+        (CondOp::Ne, "ne"),
+        (CondOp::Lt, "lt"),
+        (CondOp::Le, "le"),
+        (CondOp::Gt, "gt"),
+        (CondOp::Ge, "ge"),
+        (CondOp::Toggle, "toggle"),
+        (CondOp::Always, "always"),
+        (CondOp::Never, "never"),
+        (CondOp::Const, "const"),
+        (CondOp::Default, "default"),
+    ];
+
+    /// `dsc/dscdefn.h:95-107` against `dsc/dscdefn.cpp:19-31`: the discriminants are positional,
+    /// every operator has a spelling, and `flipMap` makes the pair a round trip.
+    #[test]
+    fn cond_op_spellings_round_trip_and_the_discriminants_are_the_authoritys() {
+        assert_eq!(CondOp::ALL.len(), EVERY_COND_OP.len());
+        for (i, (cond_op, spelling)) in EVERY_COND_OP.into_iter().enumerate() {
+            assert_eq!(cond_op as usize, i, "{spelling} moved");
+            assert_eq!(CondOp::ALL[i], cond_op);
+            assert_eq!(cond_op.name(), spelling);
+            assert_eq!(CondOp::from_name(spelling), Some(cond_op));
+        }
+
+        // `stringToCondOp` is `flipMap`ped, so a spelling it does not hold is absent rather than a
+        // different operator — the miss the DDL conversion tests for at
+        // `ddc/ddl/ddl_conversion.cpp:254-258`.
+        assert_eq!(CondOp::from_name("=="), None);
+        assert_eq!(CondOp::from_name("EQ"), None);
+        assert_eq!(CondOp::from_name(""), None);
+
+        // `LoopCond::condOp_`'s initialiser, `dsc/dsc2.h:661`.
+        assert_eq!(CondOp::default(), CondOp::Default);
+    }
+
+    /// `ddc/ddl/ddl_conversion.cpp:260-264` and
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:23-44` state the same set
+    /// twice, independently: exactly the six relational operators reach a `LoopCond` on this path.
+    #[test]
+    fn only_the_six_relational_cond_ops_survive_both_ends_of_the_path() {
+        assert_eq!(
+            CondOp::COMPARISONS,
+            [
+                CondOp::Eq,
+                CondOp::Ne,
+                CondOp::Lt,
+                CondOp::Le,
+                CondOp::Gt,
+                CondOp::Ge
+            ]
+        );
+
+        // The five the DDL rejects and `getCmpIPredicate_dup` fails on are the rest of `ALL`, so the
+        // two lists together account for every operator and neither grew a member of the other.
+        let refused: Vec<CondOp> = CondOp::ALL
+            .into_iter()
+            .filter(|op| !CondOp::COMPARISONS.contains(op))
+            .collect();
+        assert_eq!(
+            refused,
+            vec![
+                CondOp::Toggle,
+                CondOp::Always,
+                CondOp::Never,
+                CondOp::Const,
+                CondOp::Default
+            ]
+        );
+
+        // ⛔ The default is one of the refused ones: a `LoopCond` that nobody filled cannot be
+        // lowered, which is why `dsc/dsc2.h:661` is a "not chosen yet" marker and not an operator.
+        assert!(!CondOp::COMPARISONS.contains(&CondOp::default()));
+    }
+
+    /// `dsc/dsc2.h:655` and `:662` against `dsc/dsc2.cpp:21-25` and
+    /// `ddc/ddl/ddl_conversion.cpp:266-274`.
+    #[test]
+    fn cond_val_type_defaults_to_int_and_an_unknown_spelling_is_the_ddls_integer_case() {
+        assert_eq!(CondValType::default(), CondValType::Int);
+        assert_eq!(
+            CondValType::ALL,
+            [CondValType::Int, CondValType::First, CondValType::Last]
+        );
+
+        for (value_type, spelling) in [
+            (CondValType::Int, "int"),
+            (CondValType::First, "first"),
+            (CondValType::Last, "last"),
+        ] {
+            assert_eq!(value_type.name(), spelling);
+            assert_eq!(CondValType::from_name(spelling), Some(value_type));
+        }
+
+        // ⭐ THE MISS IS THE LIVE PATH, not an error: `processExpression` parses the spelling as an
+        // integer whenever `stringToCondValType.find` fails (`ddc/ddl/ddl_conversion.cpp:268-274`),
+        // and the result is an `INT` condition rather than a rejected DDL.
+        assert_eq!(CondValType::from_name("4"), None);
+        assert_eq!(CondValType::from_name("chunk_count-1"), None);
+        assert_eq!(CondValType::from_name("INT"), None);
+    }
+
+    /// `dsc/dsc2.h:1138` and its `print` switch at `:1151-1167`.
+    #[test]
+    fn loop_distribution_cat_print_spellings_carry_the_authoritys_misspelling() {
+        for (i, cat) in LoopDistributionCat::ALL.into_iter().enumerate() {
+            assert_eq!(cat as usize, i);
+        }
+
+        // ⛔ `"Unknwon"` is the authority's, `dsc/dsc2.h:1153`.
+        assert_eq!(LoopDistributionCat::Unknown.name(), "Unknwon");
+        assert_eq!(LoopDistributionCat::AboveChunk.name(), "Above_chunk");
+        assert_eq!(LoopDistributionCat::BelowChunk.name(), "Below_chunk");
+        assert_eq!(LoopDistributionCat::CoreletSlice.name(), "Corelet_slice");
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -893,3 +1012,286 @@ impl LoopNode {
 }
 
 // crustify:todo: e017_LoopNode
+
+/// Replaces: CondOp
+///
+/// `dsc/dscdefn.h:95-107`. The comparison a conditional region's guard applies to a loop's
+/// iteration variable — the operator half of a `LoopCond` (`dsc/dsc2.h:661`).
+///
+/// ⛔ ONLY THE SIX RELATIONAL OPERATORS EVER REACH A `LoopCond`, AND BOTH ENDS OF OUR PATH REFUSE
+/// THE REST. The DDL conversion rejects the DDL outright for anything outside
+/// `{EQ, NE, GE, LE, GT, LT}` (`ddc/ddl/ddl_conversion.cpp:260-264`), and bridge 1's
+/// `getCmpIPredicate_dup` maps exactly those six onto an `arith::CmpIPredicate` and fails on every
+/// other value (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:23-44`), refused at
+/// `:141-143` and again at `:251-253`. `TOGGLE`, `ALWAYS`, `NEVER` and `CONST` carry the DCG/PCFG
+/// conditional vocabulary, which is off this campaign's path, and `DEFAULT` is the field's own
+/// initialiser (`dsc/dsc2.h:661`) — no comparison chosen yet.
+///
+/// ⛔ THE DISCRIMINANTS ARE THE AUTHORITY'S: `condOpToString` is a `std::map` keyed by this enum
+/// (`dsc/dscdefn.h:110`), so the declaration order is its iteration order. Neither map is iterated
+/// for output — every use is `.at()` or `.find()` (`dsc/dsc2.cpp:462`, `:1442`,
+/// `ddc/ddl/ddl_conversion.cpp:254`, `:3273`) — so only the mapping is ported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CondOp {
+    /// `==`
+    Eq = 0,
+    /// `!=`
+    Ne = 1,
+    /// `<`
+    Lt = 2,
+    /// `<=`
+    Le = 3,
+    /// `>`
+    Gt = 4,
+    /// `>=`
+    Ge = 5,
+    Toggle = 6,
+    Always = 7,
+    Never = 8,
+    /// The authority's `CONST`, "used when the condition should not be evaluated"
+    /// (`dsc/dscdefn.h:105`).
+    Const = 9,
+    /// `LoopCond::condOp_`'s initialiser (`dsc/dsc2.h:661`).
+    #[default]
+    Default = 10,
+}
+
+/// ⛔ E0080 IF AN OPERATOR IS EVER INSERTED, DROPPED, REORDERED OR LEFT OUT OF `ALL`: the
+/// discriminants are what `condOpToString`'s `std::map` orders by, and `ALL` is positional against
+/// them.
+const _: () = {
+    let mut i = 0;
+    while i < CondOp::ALL.len() {
+        assert!(
+            CondOp::ALL[i] as usize == i,
+            "CondOp::ALL is out of declaration order"
+        );
+        i += 1;
+    }
+};
+
+impl CondOp {
+    /// Every operator in the authority's declaration order (`dsc/dscdefn.h:95-107`). There is no
+    /// count sentinel here, so all eleven are real values.
+    pub const ALL: [Self; 11] = [
+        Self::Eq,
+        Self::Ne,
+        Self::Lt,
+        Self::Le,
+        Self::Gt,
+        Self::Ge,
+        Self::Toggle,
+        Self::Always,
+        Self::Never,
+        Self::Const,
+        Self::Default,
+    ];
+
+    /// The six a `LoopCond` can carry on this campaign's path, in the authority's declaration order
+    /// rather than the `is_any_of` argument order. Both ends state the same set independently: the
+    /// DDL conversion accepts only these (`ddc/ddl/ddl_conversion.cpp:260-261`) and bridge 1 maps
+    /// only these onto a predicate (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:23-41`).
+    pub const COMPARISONS: [Self; 6] = [Self::Eq, Self::Ne, Self::Lt, Self::Le, Self::Gt, Self::Ge];
+
+    /// The spelling `EnumsConversion::condOpToString` gives this operator (`dsc/dscdefn.h:110`,
+    /// defined `dsc/dscdefn.cpp:19-28`).
+    ///
+    /// ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO: all eleven operators have an entry, so none of the
+    /// `condOpToString.at(...)` callsites can throw.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Lt => "lt",
+            Self::Le => "le",
+            Self::Gt => "gt",
+            Self::Ge => "ge",
+            Self::Toggle => "toggle",
+            Self::Always => "always",
+            Self::Never => "never",
+            Self::Const => "const",
+            Self::Default => "default",
+        }
+    }
+
+    /// `EnumsConversion::stringToCondOp`, the flip of the above — IBM builds it with `flipMap`
+    /// (`dsc/dscdefn.h:111`, `dsc/dscdefn.cpp:30-31`). An unknown spelling is absent, which is what
+    /// both readers already test for: the DDL conversion errors out on a `find` miss
+    /// (`ddc/ddl/ddl_conversion.cpp:254-258`) while the JSON importer's `.at()` throws
+    /// (`dsc/dsc2.cpp:1442-1443`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "eq" => Some(Self::Eq),
+            "ne" => Some(Self::Ne),
+            "lt" => Some(Self::Lt),
+            "le" => Some(Self::Le),
+            "gt" => Some(Self::Gt),
+            "ge" => Some(Self::Ge),
+            "toggle" => Some(Self::Toggle),
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            "const" => Some(Self::Const),
+            "default" => Some(Self::Default),
+            _ => None,
+        }
+    }
+}
+
+/// Replaces: LoopCond::CondValType
+///
+/// `dsc/dsc2.h:655`. What the right-hand side of a loop condition IS: a literal iteration index, or
+/// the loop's first or last iteration whatever its bounds turn out to be.
+///
+/// ⛔ `condValInt_` IS ONLY READ UNDER `INT`, and bridge 1 guards every read with a
+/// `DT_CHECK(... == INT)` — for an `affine.for` it takes the constant bounds instead
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:99-114`), for an `scf.for` the
+/// bound values (`:121-135`), and the single-`and` path repeats both (`:214-226`, `:234-245`).
+///
+/// ⛔ AND `LAST` IS `upperBound - 1`, NOT THE UPPER BOUND: constant-folded at `:101-103` and
+/// emitted as an `arith.subi` against `1` at `:122-126`. Comparing against the bound itself is a
+/// legal-looking program that guards the wrong trip.
+///
+/// `INT` is the fallback as well as the declared default (`dsc/dsc2.h:662`): the DDL conversion
+/// looks the value expression up in `stringToCondValType` and, on a miss, parses it as an integer
+/// expression instead (`ddc/ddl/ddl_conversion.cpp:266-274`).
+///
+/// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE HERE, unlike [`NodeType`]'s: both maps are
+/// `std::unordered_map` (`dsc/dsc2.h:656-657`), neither is iterated, and the JSON round trip
+/// carries the spelling rather than the value (`dsc/dsc2.cpp:464-466`, `:1444-1447`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CondValType {
+    /// `LoopCond::condValType_`'s initialiser (`dsc/dsc2.h:662`) and the DDL's fallback.
+    #[default]
+    Int = 0,
+    First = 1,
+    Last = 2,
+}
+
+impl CondValType {
+    /// Every value form in the authority's declaration order (`dsc/dsc2.h:655`).
+    pub const ALL: [Self; 3] = [Self::Int, Self::First, Self::Last];
+
+    /// The spelling `LoopCond::condValTypeToString` gives this form (`dsc/dsc2.h:656`, defined
+    /// `dsc/dsc2.cpp:21-23`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Int => "int",
+            Self::First => "first",
+            Self::Last => "last",
+        }
+    }
+
+    /// `LoopCond::stringToCondValType`, the flip of the above (`dsc/dsc2.h:657`, built with
+    /// `flipMap` at `dsc/dsc2.cpp:24-25`). ⭐ AN ABSENT SPELLING IS A LIVE ANSWER HERE, not an
+    /// error: the DDL conversion treats the miss as "this is an integer expression"
+    /// (`ddc/ddl/ddl_conversion.cpp:268-274`). Only the JSON importer's `.at()` throws
+    /// (`dsc/dsc2.cpp:1445-1447`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "int" => Some(Self::Int),
+            "first" => Some(Self::First),
+            "last" => Some(Self::Last),
+            _ => None,
+        }
+    }
+}
+
+// crustify:todo: e018_LoopCond
+
+// crustify:todo: e018_LoopCond.condOp_
+
+// crustify:todo: e018_LoopCond.condValInt_
+
+// crustify:todo: e018_LoopCond.condValType_
+
+// crustify:todo: e018_LoopCond.dim_
+
+// crustify:todo: e018_LoopCond.loopComp_
+
+// crustify:todo: e019_DataInfo
+
+// crustify:todo: e019_DataInfo.bufferSwitchPosition_
+
+// crustify:todo: e019_DataInfo.constantId_
+
+// crustify:todo: e019_DataInfo.dataConnect_
+
+// crustify:todo: e019_DataInfo.isStartAddrSymbolic_
+
+// crustify:todo: e019_DataInfo.latchDataId_
+
+// crustify:todo: e019_DataInfo.myLdsIdx_
+
+// crustify:todo: e019_DataInfo.startAddr_
+
+// crustify:todo: e020_DistributionStatusInfo
+
+/// Replaces: LoopDistributionInfo::LoopDistributionCat
+///
+/// `dsc/dsc2.h:1138`. Where one entry of an enclosing-loop chain sits relative to the chunk
+/// boundary, which is what decides whether that loop's fold is distributed over the element
+/// arrangement.
+///
+/// ⛔ IT IS A SET MEMBERSHIP TEST, NOT A PROPERTY OF THE LOOP. `getEnclosingLoopsAndRelatedDims`
+/// tags a chain entry `BELOW_CHUNK` when the loop is in the caller's `loopsBelowChunkBoundary` set
+/// and `ABOVE_CHUNK` otherwise (`dsc/dsc2.cpp:6587`, the lambda at `:6593-6605` and its ternary at
+/// `:6601-6603`), and `ddc/ddc_fold.cpp:3512-3517` writes the same ternary again. The same loop can
+/// therefore be tagged either way in two different chains: the tag belongs to the chain, not the
+/// loop.
+///
+/// ⛔ `CORELET_SLICE` IS A SYNTHETIC CHAIN ENTRY, NOT A REAL LOOP'S TAG. Its one writer inserts an
+/// extra entry for the corelet-split dim at the first loop at or above the chunk boundary
+/// (`dsc/dsc2.cpp:6616-6623`), and every reader branches on it to take a different path from the one
+/// a real loop gets (`dsc/dsc2.cpp:6029`, `:6063`, `:6067`, `:6340`, `ddc/ddc_fold.cpp:2547`,
+/// `:3222`).
+///
+/// ⛔ `UNKNOWN` IS UNREACHABLE BY CONSTRUCTION, so the `cat = UNKNOWN` initialiser at
+/// `dsc/dsc2.h:1144` is dead: `LoopDistributionInfo`'s only constructor takes the category
+/// (`:1139-1141`) and, being user-declared, suppresses the implicit default constructor — and
+/// `dsc/dsc2.h:1144` is the sole occurrence of the name `UNKNOWN` tree-wide. That is why this enum
+/// derives no `Default` even though the authority writes one, exactly as [`Size`] does not:
+///
+/// ```compile_fail
+/// use deeptools::schedule::dsc2::LoopDistributionCat;
+/// let _ = LoopDistributionCat::default();
+/// ```
+///
+/// It is still ported as an enumerator, because it holds the discriminant the other three sit
+/// behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopDistributionCat {
+    Unknown = 0,
+    AboveChunk = 1,
+    BelowChunk = 2,
+    CoreletSlice = 3,
+}
+
+impl LoopDistributionCat {
+    /// Every category in the authority's declaration order (`dsc/dsc2.h:1138`).
+    pub const ALL: [Self; 4] = [
+        Self::Unknown,
+        Self::AboveChunk,
+        Self::BelowChunk,
+        Self::CoreletSlice,
+    ];
+
+    /// The spelling `LoopDistributionInfo::print` gives this category (`dsc/dsc2.h:1151-1167`).
+    ///
+    /// ⛔ THERE IS NO MAP BEHIND THIS ONE, unlike [`NodeType::name`]: the spellings live only in
+    /// that `switch`, nothing parses them back, and `UNKNOWN`'s is the authority's misspelling
+    /// `"Unknwon"` (`:1153`) — reproduced verbatim, because correcting a debug spelling diverges the
+    /// reference's own log output for no gain.
+    ///
+    /// ⭐ TOTAL WHERE THE `switch` NEEDED A FALLBACK: its `default: "ERROR"` arm (`:1164-1166`) has
+    /// no reachable input over the four enumerators, so this match carries no error case.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknwon",
+            Self::AboveChunk => "Above_chunk",
+            Self::BelowChunk => "Below_chunk",
+            Self::CoreletSlice => "Corelet_slice",
+        }
+    }
+}
+
+// crustify:todo: e021_LoopDistributionInfo
