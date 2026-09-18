@@ -7,16 +7,32 @@
 //! `crustify-scheduler/UNITS.tsv` cites for this unit: no such file exists in the tree. Every
 //! bare `:NNN` citation below is a line of that header.
 //!
-//! ⭐ FIELDS STAY `int32_t`-SHAPED; COMPUTED SPANS AND COORDINATES WIDEN TO `i64`. The one consumer
-//! reaches this type with an `int64_t` fold dim index and takes `std::vector<std::pair<int64_t,
-//! int64_t>>` back (`util/foldManager/foldInfrastructure.h:838`, `:844`), so IBM's implicit
-//! narrowing at that call and its `int32_t` coordinate arithmetic are widened instead of copied.
-//! No real core index or work size comes near either bound.
+//! ⭐ FIELDS KEEP THE AUTHORITY'S `int32_t` RANGE; COMPUTED SPANS AND COORDINATES WIDEN TO `i64`.
+//! The one consumer reaches this type with an `int64_t` fold dim index and takes
+//! `std::vector<std::pair<int64_t, int64_t>>` back (`util/foldManager/foldInfrastructure.h:838`,
+//! `:844`), so IBM's implicit narrowing at that call and its `int32_t` span and coordinate
+//! arithmetic are widened instead of copied. No real core index or work size comes near either
+//! bound.
+//!
+//! ⛔ `real_coordinates_` IS THE ONE FIELD THAT ALSO WIDENS, and a blanket "fields stay
+//! `int32_t`-shaped" was wrong to omit it. IBM stores `std::vector<std::pair<int32_t, int32_t>>`
+//! (`:418`) and its only reader widens every entry to `int64_t` on the way out (`:250`, `:254`,
+//! `:279`), so one [`CoordRange`] serves both the stored table and the returned ranges, exactly as
+//! IBM's own two vectors do between them. The cost is that
+//! [`set_real_coordinates`](WkSplitParam::set_real_coordinates) accepts a range the authority could
+//! not store; its two callers are in out-of-scope `dsm/`.
+//!
+//! ⭐ WHAT THE WIDENING BUYS, AS A PROPERTY RATHER THAN A HOPE: every quantity computed here is
+//! exact throughout the range in which the authority's own `int32_t` arithmetic is defined, and
+//! widens where IBM wraps. It is NOT unconditionally total — see
+//! [`full_inner_length`](WkSplitParam::full_inner_length) and `coord` for the two products that can
+//! still leave `i64`, each of them thirty-one bits past where IBM has already gone undefined.
 
 // ⛔ EIGHT OF THE TWENTY-SIX FIELD ANCHORS THE SCHEDULER WROTE FOR THIS UNIT NAME METHOD-BODY
 // LOCALS, NOT DECLARED FIELDS. They are removed rather than invented as state, which Rules 2 and 5
-// of crustify-scheduler/AGENT-BRIEF.md forbid; the field census matched `Type name = init;` inside
-// a body. Named here so the removal is not silent:
+// of crustify-scheduler/AGENT-BRIEF.md forbid; the census matched a declaration inside a method
+// body — six of the eight carry an initialiser, `coord_vec` (`:252`) and `myRealCoord` (`:266`) do
+// not. Named here so the removal is not silent:
 //   offset_cid      `:197`          local of getSliceId
 //   slid            `:213`          local of getSliceId
 //   vsize           `:241`, `:447`  locals of getSize and getCoord
@@ -78,8 +94,16 @@ pub struct WkSliceId(pub i64);
 
 /// Cores spanned by some run of work slices — what `getSingleSliceInnerLength` and
 /// `getFullInnerLength` return (`:155`, `:169`).
+///
+/// ⛔ `i64`, NOT THE AUTHORITY'S `int32_t`, BECAUSE A SPAN IS A PRODUCT OF TWO INDEPENDENT `int32_t`
+/// FIELDS AND SO DOES NOT FIT ONE. With `gap_within_inner_repeat_ = INT32_MAX` and
+/// `repeat_factor_inner_ = 2` — a pair `checkLegality` (`:131-136`) accepts and every newtype in this
+/// file accepts — `getSingleSliceInnerLength(false)` wraps to **0**, measured against the header
+/// itself, and this port aborted with `attempt to add with overflow`. Widened, the quantity is exact
+/// and the `>= 1` that [`slice_id`](WkSplitParam::slice_id)'s divisors rest on holds for EVERY
+/// accepted input, rather than only downstream of the authority's own `:200`/`:208` range tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CoreSpan(pub i32);
+pub struct CoreSpan(pub i64);
 
 /// One end of a core's range in the dimension's VIRTUAL, gap-free element space (`:434-435`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -404,7 +428,7 @@ pub struct WkSplitParam {
     /// prints `stride_`, `window_` and `extra_back_` even when the flag is false (`:351-354`,
     /// `:316-319`), so a param carrying a live payload under a false flag is unequal to one
     /// carrying the declared `-1`s. Only `perfdsc`'s JSON importer can build that, reading the four
-    /// fields independently (`perfdsc/perfDscImportHelper.h:145-151`); no ported path can, and
+    /// fields independently (`perfdsc/perfDscImportHelper.h:134-137`); no ported path can, and
     /// [`print_meta_data`](Self::print_meta_data) renders `None` as IBM's declared initialisers.
     swp_info: Option<StrWinPad>,
 }
@@ -453,7 +477,11 @@ impl WkSplitParam {
         real_coordinates: Vec<CoordRange>,
         swp_info: Option<StrWinPad>,
     ) -> Option<Self> {
-        let claimed = i64::from(num_ss_slices.0 + num_epilogue_slices.0)
+        // ⛔ BOTH SLICE COUNTS WIDEN BEFORE THE ADD. Summed in `i32` first, this guard aborted on
+        // the very input it exists to refuse — `INT32_MAX` steady-state slices plus one epilogue
+        // slice — while the authority wraps `getFullInnerLength` to `-2147483648`, passes
+        // `checkLegality` and builds the illegal param anyway.
+        let claimed = (i64::from(num_ss_slices.0) + i64::from(num_epilogue_slices.0))
             * i64::from(outer_repeat_factor.get());
         (claimed <= i64::from(max_cores.0)).then_some(Self {
             wk_ss,
@@ -494,13 +522,20 @@ impl WkSplitParam {
     /// Cores spanned by one work slice, `(gap_within + 1) * repeat_factor_inner` plus the trailing
     /// gap when asked (`:155-161`).
     ///
-    /// ⭐ ALWAYS AT LEAST ONE: [`GapWithinInnerRepeat`] refuses a negative, [`RepeatFactorInner`] a
-    /// non-positive and [`GapAfterInnerRepeat`] a negative, which is what makes both arms safe
-    /// divisors in [`slice_id`](Self::slice_id).
+    /// ⭐ ALWAYS AT LEAST ONE, FOR EVERY INPUT THE TYPE ACCEPTS, which is what makes both arms safe
+    /// divisors in [`slice_id`](Self::slice_id). [`GapWithinInnerRepeat`] refuses a negative,
+    /// [`RepeatFactorInner`] a non-positive and [`GapAfterInnerRepeat`] a negative — but the three
+    /// refusals bound only the FACTORS, and claiming they bounded the RESULT was this file's own
+    /// error: the product has to be taken in [`CoreSpan`]'s `i64` too, since in `int32_t` it wraps to
+    /// 0 for `INT32_MAX` and 2 and this function aborted on the way there. Widened, `WithGap::No`
+    /// lies in `[1, 2^62]` and `WithGap::Yes` in `[1, 2^62 + 2^31]`.
     pub const fn single_slice_inner_length(&self, with_gap: WithGap) -> CoreSpan {
-        let shared = (self.gap_within_inner_repeat.get() + 1) * self.repeat_factor_inner.get();
+        // `i64::from` is not const-callable yet (rust-lang/rust#143874); each widening is lossless,
+        // and each is taken BEFORE its operator rather than after.
+        let shared =
+            (self.gap_within_inner_repeat.get() as i64 + 1) * self.repeat_factor_inner.get() as i64;
         match with_gap {
-            WithGap::Yes => CoreSpan(shared + self.gap_after_inner_repeat.get()),
+            WithGap::Yes => CoreSpan(shared + self.gap_after_inner_repeat.get() as i64),
             WithGap::No => CoreSpan(shared),
         }
     }
@@ -511,11 +546,19 @@ impl WkSplitParam {
     /// `getSingleSliceInnerLength()` with ITS default `true` (`:175`), so the per-slice trailing gap
     /// is in both arms. That is intended, not a slip: `getSliceId` needs exactly "everything but the
     /// gap after all slices" at `:207-209`.
+    ///
+    /// ⚠️ THE ONE PRODUCT IN THIS TYPE THAT CAN STILL LEAVE `i64`, NAMED RATHER THAN ASSERTED AWAY: a
+    /// per-slice span above `2^31` cores times a slice count above `2^31` exceeds `i64`. Reaching it
+    /// needs two core counts thirty-one bits past anything `seidGangs.at(seGangId).size()` produces
+    /// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1978`), and the authority's `int32_t` has
+    /// been undefined since `2^31`. [`slice_id`](Self::slice_id) inherits exactly this product and
+    /// adds none of its own — in particular not IBM's further `span * outer` (`:200`).
     pub const fn full_inner_length(&self, with_gap: WithGap) -> CoreSpan {
-        let slices = self.num_ss_slices.0 + self.num_epilogue_slices.0;
+        // `i64::from` is not const-callable yet (rust-lang/rust#143874); each widening is lossless.
+        let slices = self.num_ss_slices.0 as i64 + self.num_epilogue_slices.0 as i64;
         let full = self.single_slice_inner_length(WithGap::Yes).0 * slices;
         match with_gap {
-            WithGap::Yes => CoreSpan(full + self.gap_after_all_slices.0),
+            WithGap::Yes => CoreSpan(full + self.gap_after_all_slices.0 as i64),
             WithGap::No => CoreSpan(full),
         }
     }
@@ -561,47 +604,60 @@ impl WkSplitParam {
     /// Which work slice a core runs, or [`None`] for a gap core — IBM's four `return -1`s
     /// (`:196-227`).
     ///
-    /// ⛔ DELIBERATE DIVERGENCE, AND IT REMOVES A DIVIDE BY ZERO. IBM tests only `offset_cid >=
-    /// span * outer` (`:200`), so a NEGATIVE post-adjust offset falls through to `offset_cid %
-    /// full_wksl_size_with_after_gaps_` (`:204`) — a zero divisor whenever there are no slices and
-    /// no trailing gap, and otherwise a negative remainder, hence a negative "slice id" that
-    /// `getSize` reads as steady-state work (`:241`) and `getCoord` turns into negative coordinates
-    /// (`:438`). Range-testing the whole of `0..span * outer` answers [`None`] for both, and makes
-    /// every divisor below provably non-zero. Unreachable from the sole producer, which passes
-    /// `start_cid_offset = 0` (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1979`).
+    /// ⛔ DELIBERATE DIVERGENCE, AND THE CASE THAT JUSTIFIES IT IS AN ALIAS, NOT A NEGATIVE. IBM
+    /// tests only `offset_cid >= span * outer` (`:200`), so a NEGATIVE post-adjust offset falls
+    /// through to `offset_cid % full_wksl_size_with_after_gaps_` (`:204`). Measured against the
+    /// header, gang of eight, three steady-state slices of ten, no gaps, span three: `cid = -11`
+    /// adjusts to `-3`, C++'s `-3 % 3` is `0`, and `getSliceId` answers **slice 0** — a core below
+    /// the gang reported as doing the first slice's full work, `getSize` 10, and with a
+    /// real-coordinate table even mapped to real elements `(100, 109)`. That answer is
+    /// indistinguishable from core 0's own. `cid = -10` gives the cruder failure of the same line:
+    /// slice `-2`, past IBM's `-1` sentinel, so `getSize` reads it as steady-state work (`:241`) and
+    /// `getCoord` returns `(-20, -11)` (`:438`). Range-testing the whole of `0..span * outer` answers
+    /// [`None`] for both, and the negatives that wrap back INSIDE the gang still agree with IBM cid
+    /// for cid. Unreachable from the sole producer, which passes `start_cid_offset = 0`
+    /// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1979`).
+    ///
+    /// ⭐ THIS FUNCTION ADDS NO PRODUCT OF ITS OWN, which is why the range test is `offset / span >=
+    /// outer` rather than IBM's `offset >= span * outer`. The two are equivalent for `span >= 1` and
+    /// `offset >= 0`, and the division form cannot leave `i64`; the only overflow reachable from here
+    /// is the one [`full_inner_length`](Self::full_inner_length) already names.
     pub fn slice_id(&self, cid: Cid) -> Option<WkSliceId> {
         let offset = self.adjust_cid(Cid(cid.0 - self.start_cid_offset.0)).0;
 
         // The gap cores that come at the end (`:200-201`), widened to also exclude the negative
-        // IBM lets through.
-        let span_with_gaps = i64::from(self.full_inner_length(WithGap::Yes).0);
-        let covered = span_with_gaps * i64::from(self.outer_repeat_factor.get());
-        if !(0..covered).contains(&offset) {
+        // IBM lets through. `span_with_gaps >= 1` is what every divisor below rests on, so it is
+        // tested here instead of assumed: a span of zero or less covers no core at all.
+        let span_with_gaps = self.full_inner_length(WithGap::Yes).0;
+        if offset < 0
+            || span_with_gaps < 1
+            || offset / span_with_gaps >= i64::from(self.outer_repeat_factor.get())
+        {
             return None;
         }
 
-        // Fold cids using the outer repeat factor (`:204`). `covered > offset >= 0` forces
-        // `span_with_gaps >= 1`, so this cannot divide by zero.
+        // Fold cids using the outer repeat factor (`:204`).
         let offset = offset % span_with_gaps;
 
         // The gap that comes after all work slices are passed (`:207-209`).
-        if offset >= i64::from(self.full_inner_length(WithGap::No).0) {
+        if offset >= self.full_inner_length(WithGap::No).0 {
             return None;
         }
 
         // The work slice, ignoring inner gaps (`:212-215`). Both spans are `>= 1` by the guarded
-        // newtypes, never by a check here.
-        let single = i64::from(self.single_slice_inner_length(WithGap::Yes).0);
+        // newtypes AND [`CoreSpan`]'s width, never by a check here.
+        let single = self.single_slice_inner_length(WithGap::Yes).0;
         let slid = offset / single;
         let offset = offset % single;
 
         // The gap that comes after each work slice (`:218-220`).
-        if offset >= i64::from(self.single_slice_inner_length(WithGap::No).0) {
+        if offset >= self.single_slice_inner_length(WithGap::No).0 {
             return None;
         }
 
-        // The gap cores after each valid core assignment (`:222-224`).
-        if offset % i64::from(self.gap_within_inner_repeat.get() + 1) >= 1 {
+        // The gap cores after each valid core assignment (`:222-224`). The `+ 1` is taken after the
+        // widening; in `i32` it overflowed at `GapWithinInnerRepeat::new(i32::MAX)`.
+        if offset % (i64::from(self.gap_within_inner_repeat.get()) + 1) >= 1 {
             return None;
         }
 
@@ -635,6 +691,10 @@ impl WkSplitParam {
     /// ⛔ THE STRIDED START IS SCALED BEFORE THE END IS DERIVED FROM IT (`:450-451`), so the window
     /// lands at `start * stride`, not at `start`, and consecutive cores' ranges overlap by
     /// `window - stride`.
+    /// ⚠️ THE STRIDED PRODUCT `start * stride` (`:450`) IS THE SECOND PLACE A WIDENED VALUE CAN
+    /// LEAVE `i64`, and it needs a work size or a stride within a factor of two of `INT32_MAX` —
+    /// element counts, thirty-one bits past where the authority's own `int32_t` has gone undefined.
+    /// The epilogue start (`:441-442`) sums two such products and carries the same bound.
     fn coord(&self, cid: Cid) -> Option<VCoordRange> {
         let slice_id = self.slice_id(cid)?;
         let num_ss = i64::from(self.num_ss_slices.0);
@@ -669,6 +729,11 @@ impl WkSplitParam {
     /// ⛔ ONE SLICE CAN SPAN SEVERAL REAL RANGES, so the result is a vector and not one range: a
     /// virtual span that straddles a hole in `real_coordinates_` pushes once per range it overlaps
     /// (`:279`), and one that runs off the end of the table is silently clipped short.
+    /// ⛔ AND AN EMPTY VEC IS THE THIRD OUTCOME, REACHABLE AND PREVIOUSLY UNDOCUMENTED. A core with
+    /// real work whose virtual span lies entirely PAST the table overlaps no range, so the loop
+    /// (`:257-281`) pushes nothing: not a gap, not an absence, but "this core's work has no real
+    /// elements". Measured against the header — three slices of ten over a table of fifteen elements
+    /// gives core 2 `getSliceId` 2, `getSize` 10 and `getCoordVec` empty.
     pub fn coord_vec(&self, cid: Cid) -> Vec<CoordRange> {
         let Some(v_coord) = self.coord(cid) else {
             return vec![CoordRange::GAP];
@@ -1146,5 +1211,142 @@ mod unit_tests {
         // A negative cid wraps into the gang, IBM's own `adjustCID`.
         assert_eq!(param.adjust_cid(Cid(-2)), Cid(14));
         assert_eq!(param.adjust_cid(Cid(3)), Cid(3));
+    }
+
+    /// ⛔ THE GUARD ABORTED ON THE INPUT IT EXISTS TO REFUSE. `(num_ss_slices_ +
+    /// num_epilogue_slices_)` was summed in `i32` before widening, so `INT32_MAX` steady-state slices
+    /// plus one epilogue slice panicked with `attempt to add with overflow` instead of answering
+    /// [`None`]. The authority is worse in kind, not better: measured against the header, its
+    /// `getFullInnerLength` wraps to `-2147483648`, `checkLegality` (`:131-136`) passes, and the
+    /// illegal param is built — after which every core reads as a gap core.
+    #[test]
+    fn the_legality_guard_refuses_a_slice_sum_past_i32_instead_of_aborting() {
+        let unrepresentable = WkSplitParam::new(
+            WkSs(1),
+            WkEpilogue(1),
+            MaxCores(i32::MAX),
+            Cid(0),
+            NumSsSlices(i32::MAX),
+            NumEpilogueSlices(1),
+            GapWithinInnerRepeat::NONE,
+            RepeatFactorInner::ONE,
+            GapAfterInnerRepeat::NONE,
+            GapAfterAllSlices(0),
+            OuterRepeatFactor::ONE,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(unrepresentable, None);
+
+        // One slice fewer is exactly representable and exactly legal: it claims every core.
+        let exact = built(
+            1,
+            1,
+            i32::MAX,
+            0,
+            i32::MAX - 1,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(exact.num_ss_slices(), NumSsSlices(i32::MAX - 1));
+    }
+
+    /// ⛔ "ALWAYS AT LEAST ONE" HELD ONLY BECAUSE THE FUNCTION ABORTED FIRST. `(gap_within + 1) *
+    /// repeat_factor_inner` was an `i32` product, so `gap_within = INT32_MAX, repeat_factor_inner =
+    /// 2` — accepted by every newtype here AND by `checkLegality` (`:131-136`) — panicked with
+    /// `attempt to add with overflow`. Measured against the header, the authority instead wraps:
+    /// `getSingleSliceInnerLength(false)` is **0**, and with `gap_after_inner_repeat_ = 0` so is the
+    /// `true` arm, after which the `:200`/`:208` range tests report every core a gap core.
+    /// [`CoreSpan`]'s width is the fix, so the extreme is asserted rather than avoided.
+    #[test]
+    fn one_work_slice_spans_at_least_one_core_at_the_widest_gap() {
+        let param = built(
+            1,
+            0,
+            1,
+            0,
+            1,
+            0,
+            i32::MAX,
+            2,
+            i32::MAX,
+            0,
+            1,
+            Vec::new(),
+            None,
+        );
+        let shared = (i64::from(i32::MAX) + 1) * 2;
+
+        assert_eq!(
+            param.single_slice_inner_length(WithGap::No),
+            CoreSpan(shared)
+        );
+        assert_eq!(
+            param.single_slice_inner_length(WithGap::Yes),
+            CoreSpan(shared + i64::from(i32::MAX))
+        );
+        assert!(param.single_slice_inner_length(WithGap::No).0 >= 1);
+
+        // The one slice still starts at core 0, and the 2^31 - 1 gap cores still follow it.
+        assert_eq!(param.slice_id(Cid(0)), Some(WkSliceId(0)));
+        assert_eq!(param.size(Cid(0)), WkSize(1));
+        assert_eq!(param.slice_id(Cid(1)), None);
+        assert_eq!(param.size(Cid(1)), WkSize(0));
+    }
+
+    /// ⚠️ THE DIVERGENCE AT [`WkSplitParam::slice_id`], AND THE VALUE IT SUPPRESSES IS A PLAUSIBLE
+    /// ONE. Measured against `util/foldManager/wkDivisionParams.h:196-227`: a gang of eight with
+    /// three steady-state slices of ten and no gaps has a span of three, so `cid = -11` adjusts to
+    /// `-3`, C++'s `-3 % 3` is `0`, and IBM answers slice 0 — `getSize` 10 and, with the table below,
+    /// real elements `(100, 109)`, byte for byte what core 0 answers. `cid = -10` answers slice `-2`,
+    /// past the `-1` sentinel, so `getSize` returns 10 there too and `getCoord` gives `(-20, -11)`.
+    #[test]
+    fn a_core_below_the_gang_does_not_alias_onto_a_real_slice() {
+        let table = vec![range(100, 109), range(200, 204)];
+        let param = built(10, 0, 8, 0, 3, 0, 0, 1, 0, 0, 1, table, None);
+
+        // What core 0 answers, and what IBM hands cid -11 as well.
+        assert_eq!(param.slice_id(Cid(0)), Some(WkSliceId(0)));
+        assert_eq!(param.coord_vec(Cid(0)), vec![range(100, 109)]);
+
+        assert_eq!(param.adjust_cid(Cid(-11)), Cid(-3));
+        assert_eq!(param.slice_id(Cid(-11)), None);
+        assert_eq!(param.size(Cid(-11)), WkSize(0));
+        assert_eq!(param.coord_vec(Cid(-11)), vec![CoordRange::GAP]);
+
+        assert_eq!(param.slice_id(Cid(-10)), None);
+        assert_eq!(param.size(Cid(-10)), WkSize(0));
+
+        // ⭐ THE NEGATIVES THAT WRAP BACK INSIDE THE GANG STILL AGREE WITH IBM, CID FOR CID, so the
+        // divergence is confined to the offsets `adjustCID` cannot bring back (`:145-147`).
+        assert_eq!(param.slice_id(Cid(-8)), Some(WkSliceId(0)));
+        assert_eq!(param.slice_id(Cid(-7)), Some(WkSliceId(1)));
+        assert_eq!(param.coord_vec(Cid(-7)), vec![range(200, 204)]);
+        assert_eq!(param.slice_id(Cid(-5)), None);
+    }
+
+    /// ⛔ `getCoordVec`'S THIRD OUTCOME, REACHABLE AND UNDOCUMENTED UNTIL THIS REVIEW: a core with
+    /// real work whose virtual span lies entirely past `real_coordinates_` overlaps no range, so the
+    /// loop (`:257-281`) pushes nothing and the vector comes back EMPTY — neither a
+    /// [`CoordRange::GAP`] nor a clipped range. Measured against the header, which answers `sl=2
+    /// sz=10 cv=` for core 2 of this exact param.
+    #[test]
+    fn a_slice_entirely_past_the_real_table_yields_no_ranges_at_all() {
+        let table = vec![range(100, 109), range(200, 204)];
+        let param = built(10, 0, 8, 0, 3, 0, 0, 1, 0, 0, 1, table, None);
+
+        // Core 2 is a real core doing real work ...
+        assert_eq!(param.slice_id(Cid(2)), Some(WkSliceId(2)));
+        assert_eq!(param.size(Cid(2)), WkSize(10));
+        // ... and has nowhere real to do it. Three answers, three distinct shapes.
+        assert_eq!(param.coord_vec(Cid(2)), Vec::new());
+        assert_eq!(param.coord_vec(Cid(1)), vec![range(200, 204)]);
+        assert_eq!(param.coord_vec(Cid(3)), vec![CoordRange::GAP]);
     }
 }

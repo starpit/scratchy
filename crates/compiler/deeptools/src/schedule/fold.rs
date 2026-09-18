@@ -465,8 +465,12 @@ impl WkSplitFoldFunctionLeaf {
     /// real element ranges the core at this coordinate covers.
     ///
     /// ⛔ ONE RANGE PER REAL RUN, and a gap core yields one [`CoordRange::GAP`] rather than an empty
-    /// vector (`util/foldManager/wkDivisionParams.h:250-284`), so an empty result would mean neither
-    /// a gap nor an absence.
+    /// vector (`util/foldManager/wkDivisionParams.h:250-284`), so an empty result means neither a gap
+    /// nor an absence.
+    /// ⛔ WHAT IT DOES MEAN: the core's work lies entirely past the dimension's real-coordinate
+    /// table, so it has real work and no real elements to do it on
+    /// (`util/foldManager/wkDivisionParams.h:257-281`). A caller that treats empty as "no work" is
+    /// reading a gap core's answer into a working core.
     pub fn folded_coord_vec(&self, dim_index: FoldDimIndex) -> Option<Vec<CoordRange>> {
         Some(
             self.wk_split_param
