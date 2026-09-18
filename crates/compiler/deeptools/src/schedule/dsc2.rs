@@ -1840,9 +1840,11 @@ mod unit_tests {
     }
 
     /// `ForceInnermostDimensionsOp` inserting at `begin()` on both vectors
-    /// (`ddc/ddl/ddl_conversion.cpp:1902-1905`), over an allocation the DDL conversion sized with
-    /// `-1`s (`:803`). The pass refuses to run twice by testing `any_of(maxDimSizes_, >= 0)`
-    /// (`:1879-1884`), which is [`Option::is_some`] here.
+    /// (`ddc/ddl/ddl_conversion.cpp:1900-1901`, `:1904-1905`), over an allocation the DDL conversion
+    /// sized with `-1`s (`:803`). The pass refuses to run twice by testing `any_of(maxDimSizes_,
+    /// >= 0)` (`:1879-1885`), which is [`Option::is_some`] here — and the entry that separates that
+    /// predicate from `buildUnitView`'s cap is pinned below, in
+    /// `a_zero_max_dim_size_is_filled_to_every_writer_and_absent_to_the_only_cap`.
     #[test]
     fn forcing_inner_dims_prepends_to_both_vectors_and_is_refused_twice() {
         let mut node = AllocateNode {
@@ -1852,13 +1854,116 @@ mod unit_tests {
         node.max_dim_sizes.resize(node.layout_dim_order.len(), None);
         assert!(!node.max_dim_sizes.iter().any(Option::is_some));
 
-        // `:1902-1905`: the forced dim becomes the innermost, and it carries a data stage index —
+        // `:1900-1905`: the forced dim becomes the innermost, and it carries a data stage index —
         // not an extent — until `finalizeAllocateLayouts` overwrites it (`ddc/ddcv1.cpp:1710-1732`).
         node.layout_dim_order.insert(0, PrimaryDimTypes::In);
         node.max_dim_sizes.insert(0, Some(MaxDimSize(2)));
         assert_eq!(node.layout_dim_order[0], PrimaryDimTypes::In);
         assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
         assert!(node.max_dim_sizes.iter().any(Option::is_some));
+    }
+
+    /// ⛔ THE THREE READERS OF ONE `maxDimSizes_` ENTRY DRAW THREE DIFFERENT BOUNDARIES, and a ZERO
+    /// extent is what separates them. `getPageSize` calls only a negative entry unbounded
+    /// (`dsc/dsc2.cpp:4501`); `ForceInnermostDimensionsOp` and `finalizeAllocateLayouts` call every
+    /// non-negative entry filled (`ddc/ddl/ddl_conversion.cpp:1879-1881`, `ddc/ddcv1.cpp:1719`); and
+    /// `buildUnitView` caps a dim only on a STRICTLY POSITIVE one (`dsc/dsc2.cpp:2806`). So
+    /// [`Option::is_some`] is the writers' predicate and never the cap's, and the zero it lets
+    /// through is the one entry `buildUnitView` neither caps nor `DT_CHECK`s (`:2810`) while
+    /// `getPageSize` multiplies it into the page size two `DesignSpaceConfig` readers then divide by
+    /// (`:4508`, `:3569`, `:3899`).
+    #[test]
+    fn a_zero_max_dim_size_is_filled_to_every_writer_and_absent_to_the_only_cap() {
+        let node = AllocateNode {
+            layout_dim_order: vec![
+                PrimaryDimTypes::Y,
+                PrimaryDimTypes::Out,
+                PrimaryDimTypes::In,
+            ],
+            max_dim_sizes: vec![None, Some(MaxDimSize(0)), Some(MaxDimSize(4))],
+            ..AllocateNode::default()
+        };
+        assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
+
+        // `getPageSize`'s `maxSize < 0`: only the absent entry leaves its dim unbounded.
+        let unbounded = node
+            .layout_dim_order
+            .iter()
+            .zip(&node.max_dim_sizes)
+            .filter(|(_, max)| max.is_none())
+            .map(|(dim, _)| *dim)
+            .collect::<Vec<_>>();
+        assert_eq!(unbounded, [PrimaryDimTypes::Y]);
+
+        // The writers' `>= 0`: the zero counts as ALREADY WRITTEN, so the DDL pass refuses to run a
+        // second time over it and `finalizeAllocateLayouts` overwrites it in place.
+        let filled = node
+            .max_dim_sizes
+            .iter()
+            .filter(|max| max.is_some())
+            .count();
+        assert!(node.max_dim_sizes.iter().any(Option::is_some));
+        assert_eq!(filled, 2);
+
+        // `buildUnitView`'s `> 0`: the zero is NOT a cap, and it is `is_some` all the same.
+        let caps = node
+            .max_dim_sizes
+            .iter()
+            .filter(|max| max.is_some_and(|MaxDimSize(size)| size > 0))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(caps, [Some(MaxDimSize(4))]);
+        assert_eq!(caps.len(), 1);
+
+        // And the entry that cap ignored is a bound of ZERO downstream, not an absence: one dim's
+        // page size is the product of its own entries (`dsc/dsc2.cpp:4507-4508`).
+        let page_size_of_out = node
+            .layout_dim_order
+            .iter()
+            .zip(&node.max_dim_sizes)
+            .filter(|(dim, max)| **dim == PrimaryDimTypes::Out && max.is_some())
+            .map(|(_, max)| max.unwrap().0)
+            .product::<i32>();
+        assert_eq!(page_size_of_out, 0);
+    }
+
+    /// `allocAllMem`'s buffer arithmetic end to end (`ddc/ddcv1.cpp:224-226`, `:244`, `:317-328`,
+    /// `:340`, `:352-356`) for a streaming allocation — the one case where the REQUEST and the
+    /// RESERVATION differ. ⛔ THE STRIDE IS THE REQUEST OVER THE COUNT, NOT THE RESERVATION OVER THE
+    /// COUNT: `kv.second` at `:356` is what was pushed at `:244`, while the widening at `:327` only
+    /// reached the local `mySize` that `checkAndAddDs` places at `:340`.
+    #[test]
+    fn a_streaming_buffer_offset_is_one_buffers_capacity_and_not_half_the_reservation() {
+        // `:224-226`: the count `-1` becomes 2 before anything is sized with it.
+        let declared = NumBuffers::STREAMING;
+        let buffers = i64::from(if declared == NumBuffers::STREAMING {
+            2
+        } else {
+            declared.0
+        });
+        assert_eq!(buffers, 2);
+
+        // `:244`: the request is that count times one buffer's capacity.
+        let capacity = 6 * 1024;
+        let requested = buffers * capacity;
+
+        // `:317-328`: only a streaming allocation has its reservation widened to the whole memory,
+        // and `:340` places it at that widened size.
+        let mem_capacity = 256 * 1024;
+        let reserved = requested.max(mem_capacity);
+        assert_eq!(reserved, mem_capacity);
+        assert_ne!(reserved, requested);
+
+        // `:355-356`: the divisor is the count, but the dividend is the REQUEST.
+        let offset = BufferOffset(requested / buffers);
+        assert_eq!(offset, BufferOffset(capacity));
+        assert_ne!(offset, BufferOffset(reserved / buffers));
+
+        // A non-streaming count is the case where the two agree, which is how reading the stride as
+        // half of the reservation survives every fixture that holds no streaming allocation.
+        let plain = NumBuffers(2);
+        let plain_reserved = i64::from(plain.0) * capacity;
+        assert_eq!(BufferOffset(plain_reserved / i64::from(plain.0)), offset);
     }
 
     /// `dsc/dsc2.h:47-51`: a fresh constant is INVALID, unnamed and not symbolic. ⛔ ITS FORMAT IS
@@ -4371,7 +4476,7 @@ impl IndirectAllocType {
 /// writes it only then (`dsc/dsc2.cpp:910-915`), so an imported non-index allocation always reads
 /// back the default rather than whatever it held.
 ///
-/// ⛔ THE STRING MAP LISTS `INDEX` FIRST (`dsc/dsc2.cpp:2431-2435`) while the enum declares
+/// ⛔ THE STRING MAP LISTS `INDEX` FIRST (`dsc/dsc2.cpp:2432-2435`) while the enum declares
 /// `ADDRESS` first — the map is an `unordered_map` and its initialiser order is not the enum's, so
 /// the discriminants come from the declaration and nothing else.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4388,7 +4493,7 @@ impl IndexTensorType {
     pub const ALL: [Self; 2] = [Self::Address, Self::Index];
 
     /// The spelling `indexTensorTypeToString` gives this form (`dsc/dsc2.h:1053-1054`, filled
-    /// `dsc/dsc2.cpp:2431-2435`).
+    /// `dsc/dsc2.cpp:2432-2435`).
     pub fn name(self) -> &'static str {
         match self {
             Self::Address => "address",
@@ -4413,14 +4518,15 @@ impl IndexTensorType {
 ///
 /// ⛔ NOT AN ENUM OF THOSE THREE, because the set is not closed: the DDL conversion assigns it
 /// straight from the `AllocateOp`'s `num_buffers` attribute (`ddc/ddl/ddl_conversion.cpp:804`,
-/// `:833`), so a template may state any count, and `allocAllMem` divides a reserved size by it
-/// (`ddc/ddcv1.cpp:353-355`).
+/// `:833`), so a template may state any count, and `allocAllMem` multiplies one buffer's capacity by
+/// it to size the request (`ddc/ddcv1.cpp:224-226`, `:244`).
 ///
 /// ⛔ AND NOT AN [`Option`] EITHER: [`STREAMING`](Self::STREAMING) is a live third mode, not the
 /// absence of a count, and its readers keep it distinct from `2` even while mapping it to `2` —
-/// `allocAllMem` reserves the WHOLE memory capacity for a streaming buffer before dividing
-/// (`ddc/ddcv1.cpp:317-329`, `:353-355`) and `processImplicitSync` refuses an implicit sync on
-/// anything else, "Implicit syncs are only possible on circular buffers (num_buffers=-1)"
+/// `allocAllMem` sizes its REQUEST with `2` (`ddc/ddcv1.cpp:224-226`) and then widens the
+/// RESERVATION to the whole memory capacity, which no other count gets (`ddc/ddcv1.cpp:317-328`),
+/// and `processImplicitSync` refuses an implicit sync on anything else, "Implicit syncs are only
+/// possible on circular buffers (num_buffers=-1)"
 /// (`ddc/ddl/ddl_conversion.cpp:1777-1782`).
 ///
 /// ⛔ THE L3 SCHEDULER ADMITS ONLY 1 OR 2: `DT_CHECK_MSG` "Expect no buffering or double buffering"
@@ -4459,9 +4565,24 @@ impl NumBuffers {
 /// (`dsc/dsc2.cpp:1761-1764`), so a dump taken before that pass reimports stage indices into the
 /// same slots an extent would occupy.
 ///
-/// Every reader after the pass treats it as an extent: `buildUnitView` caps a dim at it and
-/// `DT_CHECK`s that the remainder divides (`dsc/dsc2.cpp:2805-2812`), and `getPageSize` multiplies
-/// the entries of one dim together (`dsc/dsc2.cpp:4497-4510`).
+/// ⛔⛔ AND ITS READERS DO NOT AGREE ON WHERE ABSENCE STOPS. [`None`] here is the authority's
+/// NEGATIVE entry, which is the boundary `getPageSize` draws (`maxSize < 0` is the unbounded dim,
+/// `dsc/dsc2.cpp:4501`) and the boundary both `>= 0` writers draw (`finalizeAllocateLayouts`,
+/// `ddc/ddcv1.cpp:1719`, and `ForceInnermostDimensionsOp`'s already-applied refusal,
+/// `ddc/ddl/ddl_conversion.cpp:1879-1881`). `buildUnitView`'s is `> 0` —
+/// `if (maxDimSize > 0 && size > maxDimSize)` (`dsc/dsc2.cpp:2806`) — so a ZERO entry takes the
+/// `else` branch: it is never capped, and it never reaches the `DT_CHECK` that the remainder divides
+/// (`:2810`), which is the one guard that would have refused it.
+///
+/// ⭐ ZERO IS REACHABLE AND IT IS NOT INERT. The pass that fills these entries divides by the
+/// cumulative stick size with INTEGER division, so any extent below one stick lands on zero
+/// (`ddc/ddcv1.cpp:1723-1729`), and the JSON importer pushes back whatever the dump held
+/// (`dsc/dsc2.cpp:1761-1764`). Downstream, that zero is a bound and not an absence: `getPageSize`
+/// multiplies it into the dim's page size (`dsc/dsc2.cpp:4508`), and both in-file readers of that map
+/// then divide a per-dim size by it under `INDEX_TENSOR` (`dsc/dsc2.cpp:3569`, `:3899`) or
+/// `DT_CHECK` `dimSize <= 0` under `VALUE_TENSOR` (`:3572-3573`). So the three boundaries are three
+/// different predicates over the same [`Option`], and [`Option::is_some`] is the writers' test, NEVER
+/// `buildUnitView`'s cap test.
 ///
 /// ⭐ NEITHER OTHER CURRENCY CAN REACH THE VECTOR:
 ///
@@ -4476,10 +4597,19 @@ pub struct MaxDimSize(pub i32);
 /// The distance in bytes between one buffer of an allocation and the next — one value of
 /// `AllocateNode::bufferOffsetCoreCorelet_` (`dsc/dsc2.h:988`).
 ///
-/// ⛔ A STRIDE, NOT A BASE ADDRESS: `allocAllMem` writes the reserved size divided by the buffer
-/// count while the base goes to `startAddressCoreCorelet_` beside it (`ddc/ddcv1.cpp:351-356`), and
-/// the L3 scheduler reads the pair together (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`).
-/// A streaming allocation is divided by 2, not by its `-1` (`ddc/ddcv1.cpp:353-354`).
+/// ⛔ A STRIDE, NOT A BASE ADDRESS: `allocAllMem` writes one buffer's own capacity here while the
+/// base goes to `startAddressCoreCorelet_` beside it (`ddc/ddcv1.cpp:351-356`), and the L3 scheduler
+/// reads the pair together (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`).
+///
+/// ⛔ ITS NUMERATOR IS THE REQUESTED SIZE, NOT THE RESERVED ONE, and the two differ on exactly the
+/// allocations [`NumBuffers::STREAMING`] marks. The request is `numBuffers * capacity` with `-1`
+/// already mapped to `2` before the multiply (`ddc/ddcv1.cpp:224-226`, `:244`); a streaming
+/// allocation then has its RESERVATION widened to the whole memory capacity (`:317-328`) and is
+/// placed at that widened size (`:340`); but the division at `:355-356` is over `kv.second`, the
+/// REQUEST pushed at `:244`, so the stride is one buffer's capacity and not half of what was
+/// reserved. ⭐ A READER THAT RECOVERED THE BUFFER COUNT AS `reserved / offset` WOULD GET THE MEMORY
+/// CAPACITY DIVIDED BY ONE BUFFER instead of `2`, which is why the reservation is not ported as a
+/// second currency of this newtype.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BufferOffset(pub i64);
 
@@ -4488,13 +4618,17 @@ pub struct BufferOffset(pub i64);
 ///
 /// ⛔ IT IS A MULTIPLIER IN ONE READER AND A DIVISOR IN THE OTHER, over the same dim.
 /// `buildUnitView` multiplies the dim's unit-view size and every matching loop's `elemOffset_` by it
-/// (`dsc/dsc2.cpp:2882-2899`), while `getBufferCapacityForNodePerDimCustomLocation` divides that
+/// (`dsc/dsc2.cpp:2880-2897`), while `getBufferCapacityForNodePerDimCustomLocation` divides that
 /// dim's capacity by it (`dsc/dsc2.cpp:3958-3961`) — the spread inflates the addresses and deflates
 /// the capacity, so it is not a size in either direction.
 ///
 /// Its in-scope writers are the masked-compute pass, which puts `8` on the INNERMOST layout dim
-/// (`ddc/ddcv1.cpp:1704`), and the internal-register transformations
-/// (`ddc/ddc_transformation.cpp:1132-1135`, `:1380`).
+/// (`ddc/ddcv1.cpp:1704`); the internal-register transformation, which puts one new stick dim's own
+/// size on every input, output and internal-register allocation of the compute
+/// (`ddc/ddc_transformation.cpp:1132-1135`); and `cloneComputeForOffsetAdjustment`, which puts the
+/// OUTPUT REPETITION COUNT on the innermost layout dim of the cloned compute's output allocation
+/// (`ddc/ddc_transformation.cpp:1356`, written at `:1378-1380`) — so a filled entry is not always a
+/// stick count, and reading one as the masked pass's `8` would be wrong for every cloned compute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StickSpread(pub i32);
 
@@ -4516,12 +4650,20 @@ pub struct StickSpread(pub i32);
 /// `CoordinateType`, e012, which is built on the same `util/foldManager/` — and the authority's own
 /// JSON round trip leaves the slice view a "TO DO" on both sides (`dsc/dsc2.cpp:1828`).
 ///
-/// ⛔ AND ITS SEVEN METHODS STAY OUT WITH THOSE FIELDS. `getPageSize` (`:1011`, defined
-/// `dsc/dsc2.cpp:4480-4513`) computes the page extents from the VALUE tensor's layout, and under
-/// [`IndirectAllocType::IndexTensor`] that is `relatedIndirectAccessAlloc_`'s layout, reached
-/// through the pointer it `DT_CHECK`s non-null (`dsc/dsc2.cpp:4491-4493`) — an answer computed from
-/// this node's own layout instead would be silently wrong for exactly the index allocations the
-/// paged path mints (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6709-6729` is the caller).
+/// ⛔ AND ITS SEVEN METHODS STAY OUT WITH THOSE FIELDS — but only ONE OF `getPageSize`'S THREE ARMS
+/// IS WHAT HOLDS IT OUT (`:1011`, defined `dsc/dsc2.cpp:4480-4513`). `NO_INDIRECTION` answers the
+/// empty map (`:4483-4485`) and `VALUE_TENSOR` reads `this` (`:4486-4488`), so both are total in the
+/// fields carried here; it is `INDEX_TENSOR` that takes the page extents out of
+/// `relatedIndirectAccessAlloc_`'s layout, through the pointer it `DT_CHECK`s non-null
+/// (`:4489-4492`), and an answer computed from this node's own layout instead would be silently
+/// wrong for exactly the index allocations the paged path mints.
+///
+/// ⛔ AND IT IS NOT AN L3-ONLY METHOD: of its eleven callers, TWO ARE IN THIS SAME FILE — both
+/// `DesignSpaceConfig` methods, which divide a per-dim size by the page size under `INDEX_TENSOR`
+/// and bound-check it under `VALUE_TENSOR` (`dsc/dsc2.cpp:3557` and `:3566-3576` in
+/// `getBlockTransferSizePerDimCustomLocation`, `:3806` and `:3893-3902` in
+/// `getBufferCapacityForNodePerDimCustomLocation`) — and five more are in the L3 scheduler
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1647`, `:5893`, `:5994`, `:6692`, `:6721`).
 /// `addAllocUser`, `removeAllocUser`, `hasAllocUsers`, `hasAllocUser` and `clearAllocUsers`
 /// (`:1012-1046`) are that list's five operations, and `print` (`:1048`) streams both.
 ///
@@ -4534,9 +4676,9 @@ pub struct AllocateNode {
     ///
     /// The labeled data structure this region holds, or [`None`] for the authority's `-1`
     /// (`dsc/dsc2.h:976`). The DDL conversion sets it for a tensor allocation
-    /// (`ddc/ddl/ddl_conversion.cpp:800`) and `ForceInnermostDimensionsOp` refuses any allocation
-    /// without one, "Inner dims can only be applied on tensors"
-    /// (`ddc/ddl/ddl_conversion.cpp:1874-1878`).
+    /// (`ddc/ddl/ddl_conversion.cpp:805`) and `ForceInnermostDimensionsOp` refuses any allocation
+    /// without one, "Op can be applied only to tensor allocations"
+    /// (`ddc/ddl/ddl_conversion.cpp:1869-1872`).
     ///
     /// ⛔ THIS IS ONE THIRD OF A THREE-WAY IDENTITY, AND THE ORDER IS FIXED:
     /// `getLdsOrConstNameOfAllocNode` names the region by `tempStorageForCompute_`'s node first,
@@ -4575,14 +4717,17 @@ pub struct AllocateNode {
     /// [`max_dim_sizes`](Self::max_dim_sizes) (`dsc/dsc2.h:982`).
     ///
     /// ⛔ INDEX 0 IS THE INNERMOST DIM: `ForceInnermostDimensionsOp` `insert`s at `begin()`
-    /// (`ddc/ddl/ddl_conversion.cpp:1902-1905`), the masked-compute pass puts its stick spread on
+    /// (`ddc/ddl/ddl_conversion.cpp:1900-1901`), the masked-compute pass puts its stick spread on
     /// `at(0)` (`ddc/ddcv1.cpp:1704`), and `buildUnitView` appends these dims to the unit view AFTER
-    /// the stick dims (`dsc/dsc2.cpp:2882`, whose walk starts at `getStickSizes(...).size()`).
+    /// the stick dims (`dsc/dsc2.cpp:2880-2881`, whose walk starts at `getStickSizes(...).size()`).
     ///
     /// ⛔ A DIM MAY REPEAT — `backGapCore_`'s reader says so outright, "sizes may have dimensions
-    /// repeated. Add gaps to outermost" (`dsc/dsc2.cpp:2903-2904`), and `getPageSize` multiplies
-    /// every entry of one dim together (`dsc/dsc2.cpp:4503-4508`). What the DDL forbids is a repeat
-    /// WITHIN one `AllocateOp`'s own dim list (`ddc/ddl/ddl_conversion.cpp:796-799`).
+    /// repeated. Add gaps to outermost" (`dsc/dsc2.cpp:2905`), and `getPageSize` multiplies every
+    /// entry of one dim together (`dsc/dsc2.cpp:4507-4508`). What the DDL forbids is a repeat in the
+    /// layout it copies out of the labeled data structure (`ddc/ddl/ddl_conversion.cpp:797`),
+    /// "Handling of external allocations with repeated dimensions is not yet implemented" (`:798-802`)
+    /// — the repeats the readers above tolerate are the ones `ForceInnermostDimensionsOp` prepends,
+    /// which it inserts without ever testing whether the layout already holds that dim (`:1886-1906`).
     pub layout_dim_order: Vec<PrimaryDimTypes>,
     /// Field: e028_AllocateNode.maxDimSizes_
     ///
