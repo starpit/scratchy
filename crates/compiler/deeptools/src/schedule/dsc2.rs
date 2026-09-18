@@ -112,6 +112,28 @@ pub struct DimSize(pub i32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SizeIdx(pub u32);
 
+/// How many elements one trip of a loop moves along one extent of a
+/// [`UnitView`] — `ScheduleNode::UnitView::LoopInfo::elemOffset_` (`dsc/dsc2.h:504`).
+///
+/// ⛔ A STRIDE, NOT AN ELEMENT COUNT. Every reader multiplies it by an induction value: bridge 1
+/// builds the address expression as `iv_expr * elemOffset_`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:157`) and scales a composite loop's
+/// contribution by it (`:246`). Its seed is `DataInfo::loopEleOffsets_`, an offset "in number of
+/// elements in that dim (e.g. 4 mb)" per loop and dim (`dsc/dsc2.h:730-734`), which
+/// `calculateSizeIdxAndOffset` then DIVIDES down by the running product of the extents it has already
+/// passed, so what is stored is the step in units of the extent at
+/// [`LoopInfo::size_idx`] (`dsc/dsc2.cpp:2731-2746`).
+///
+/// ⛔ AND IT IS REWRITTEN AFTER THAT: when a gap spreads the extent this loop steps, the gap pass
+/// multiplies the stored value by that dim's `gapStickSpread_` (`dsc/dsc2.cpp:2880-2897`) — so the
+/// value the bridge reads is in gapped elements, not in the elements the seed named.
+///
+/// `i32` and not `u32` because the authority's initialiser is `-1` (`dsc/dsc2.h:504`) and because `0`
+/// is a live value meaning "reuse is expected" (`:732-734`); absence is
+/// [`Option<ElemOffset>`](Option) and the sign is not how it is spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ElemOffset(pub i32);
+
 /// One data stage's id — the key of `DesignSpaceConfig::dataStageParam_`
 /// (`dsc/designSpaceConfig.h:105`). `metadata_.core_dstgid` and `metadata_.chunk_dstgid` name the
 /// two the DDL conversion compares a minted loop against (`ddc/ddl/ddl_conversion.cpp:1114-1115`).
@@ -273,6 +295,8 @@ impl NodeType {
         Self::StickMask,
     ];
 
+    /// Field: e029_ScheduleNode.nodeTypeToString
+    ///
     /// The spelling `ScheduleNode::nodeTypeToString` gives this kind
     /// (`dsc/dsc2.h:457`, defined `dsc/dsc2.cpp:1878-1888`).
     ///
@@ -295,6 +319,8 @@ impl NodeType {
         }
     }
 
+    /// Field: e029_ScheduleNode.stringToNodeType
+    ///
     /// `ScheduleNode::stringToNodeType`, the flip of the above — IBM builds it with `flipMap`
     /// (`dsc/dsc2.h:458`, `dsc/dsc2.cpp:1889-1890`). An unknown spelling is absent, where IBM's
     /// `.at()` throws on the JSON import path (`dsc/dsc2.cpp:1337-1338`).
@@ -379,13 +405,17 @@ impl NodeType {
 /// value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
+    /// Field: e029_ScheduleNode.dim_
     /// Field: e013_ScheduleNode.dim_
     ///
-    /// ⚠️ THE SCHEDULER'S `.dim_` ANCHOR COVERS TWO C++ FIELDS. This is `ScheduleNode::Size::dim_`
-    /// (`dsc/dsc2.h:487`). `ScheduleNode::UnitView::LoopInfo::dim_` (`:502`) spells the same name
-    /// and is a different field with a different default; it is not ported — see the still-open
-    /// `e013_ScheduleNode` anchor below.
+    /// ⚠️ THE SCHEDULER'S `.dim_` ANCHOR COVERS TWO C++ FIELDS, so both sites carry it. This is
+    /// `ScheduleNode::Size::dim_` (`dsc/dsc2.h:487`), which is a dim of the data structure the extent
+    /// belongs to and has no default at all. [`LoopInfo::dim`] (`:502`) spells the same name, is a
+    /// different field, defaults to `PrimaryDimTypesCount`, and is the dim of a LOOP rather than of
+    /// an extent — `buildUnitView` can store one in the `LoopInfo` while resolving the extent under
+    /// another (`dsc/dsc2.cpp:2852-2868`).
     pub dim: PrimaryDimTypes,
+    /// Field: e029_ScheduleNode.size_
     /// Field: e013_ScheduleNode.size_
     pub size: DimSize,
 }
@@ -2276,6 +2306,161 @@ mod unit_tests {
         assert_eq!(props[1].size(), FoldDimSize(3));
         assert_eq!(props[1].label(), "chunk_index");
     }
+
+    /// `isNodeRelevant`'s component reading against the map the authority's own writer builds
+    /// (`dsc/dsc2.cpp:2689-2694`), and the divergence between it and `getRelevantComps`: a core
+    /// present with an EMPTY corelet set is relevant to the first and invisible to the second
+    /// (`dsc/dsc2.cpp:1929-1931` against `:1964-1967`).
+    #[test]
+    fn a_core_with_no_corelets_is_relevant_but_absent_from_get_relevant_comps() {
+        let mut node = ScheduleNode::new(NodeType::Transfer);
+        node.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([
+                (CoreId(0), BTreeSet::from([CoreletId(0), CoreletId(1)])),
+                (CoreId(1), BTreeSet::new()),
+            ]),
+        );
+
+        assert!(node.is_relevant(SenComponent::Lx));
+        assert!(!node.is_relevant(SenComponent::L0));
+
+        // `isNodeRelevant(LX, -1, 1)` — the core's presence alone answers true.
+        let cores = node
+            .relevant_cores(SenComponent::Lx)
+            .expect("LX is relevant");
+        assert!(cores.contains_key(&CoreId(1)));
+        // `getRelevantComps(1)` — the same core, and LX does not count.
+        assert!(node.relevant_comps_of_core(CoreId(1)).is_empty());
+        assert_eq!(
+            node.relevant_comps_of_core(CoreId(0)),
+            BTreeSet::from([SenComponent::Lx])
+        );
+        assert_eq!(
+            node.relevant_comps_of_corelet(CoreId(0), CoreletId(1)),
+            BTreeSet::from([SenComponent::Lx])
+        );
+        assert!(
+            node.relevant_comps_of_corelet(CoreId(0), CoreletId(2))
+                .is_empty()
+        );
+        // `getRelevantComps()` — LX has cores, so it counts (`dsc/dsc2.cpp:1969-1971`).
+        assert_eq!(
+            node.relevant_comps_any_core(),
+            BTreeSet::from([SenComponent::Lx])
+        );
+    }
+
+    /// `ALL` is the authority's "do not filter", answered by an early return and never by a lookup
+    /// (`dsc/dsc2.cpp:1918-1922`, `:1939`) — so a node with an empty `relevantComps_`, which is what
+    /// every node has before `setRelevantCompCoreCl` runs (`dsc/dsc2.cpp:2647-2729`), is still
+    /// relevant to it.
+    #[test]
+    fn the_all_component_is_relevant_without_ever_being_a_key() {
+        let node = ScheduleNode::new(NodeType::Sync);
+
+        assert!(node.relevant_comps().is_empty());
+        assert!(node.is_relevant(SenComponent::All));
+        assert!(!node.is_relevant(SenComponent::Lx));
+        assert_eq!(node.relevant_cores(SenComponent::All), None);
+        assert_eq!(
+            node.relevant_core_cl_of_comp(SenComponent::All),
+            node.relevant_core_cl()
+        );
+        assert_eq!(node.node_type(), NodeType::Sync);
+        assert!(!node.is_block_node());
+    }
+
+    /// `getRelevantCoreCl()` merges the corelets of EVERY component onto one core map and drops a
+    /// core whose corelet set is empty, `if (!cls.empty())` (`dsc/dsc2.cpp:1940-1942`); named a
+    /// component it filters, and named `ALL` it filters nothing (`:1939`).
+    #[test]
+    fn relevant_core_cl_merges_every_component_and_drops_a_core_with_no_corelet() {
+        let mut node = ScheduleNode::new(NodeType::Compute);
+        node.relevant_comps_mut().extend([
+            (
+                SenComponent::Pe,
+                BTreeMap::from([
+                    (CoreId(0), BTreeSet::from([CoreletId(0)])),
+                    (CoreId(2), BTreeSet::new()),
+                ]),
+            ),
+            (
+                SenComponent::Sfp,
+                BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(1)]))]),
+            ),
+        ]);
+
+        assert_eq!(
+            node.relevant_core_cl(),
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0), CoreletId(1)]))])
+        );
+        assert_eq!(
+            node.relevant_core_cl_of_comp(SenComponent::Pe),
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))])
+        );
+        assert!(node.relevant_core_cl_of_comp(SenComponent::Lx).is_empty());
+        assert_eq!(
+            node.relevant_core_cl_of_comp(SenComponent::All),
+            node.relevant_core_cl()
+        );
+    }
+
+    /// `getSizesForCoreId`'s three-step fallback (`dsc/dsc2.cpp:2398-2405`): this core, then HBM's
+    /// `-1` pseudo-core, then the gapless view.
+    #[test]
+    fn a_unit_views_sizes_fall_back_from_the_core_to_hbm_to_the_gapless_view() {
+        let no_gaps = vec![Size::new(PrimaryDimTypes::Ij, DimSize(4))];
+        let hbm = vec![Size::new(PrimaryDimTypes::Ij, DimSize(6))];
+        let core_three = vec![Size::new(PrimaryDimTypes::Ij, DimSize(8))];
+        let view = UnitView {
+            sizes_no_gaps: no_gaps.clone(),
+            sizes_with_gaps: BTreeMap::from([
+                (None, hbm.clone()),
+                (Some(CoreId(3)), core_three.clone()),
+            ]),
+            ..UnitView::default()
+        };
+
+        assert_eq!(view.sizes_for_core(CoreId(3)), core_three.as_slice());
+        assert_eq!(view.sizes_for_core(CoreId(0)), hbm.as_slice());
+
+        let gapless = UnitView {
+            sizes_no_gaps: no_gaps.clone(),
+            ..UnitView::default()
+        };
+        assert_eq!(gapless.sizes_for_core(CoreId(0)), no_gaps.as_slice());
+    }
+
+    /// The gap rescale multiplies the offset of every loop entry whose `sizeIdx_` names the gapped
+    /// extent (`dsc/dsc2.cpp:2880-2897`), and an unrelated loop's `{currLoop, dim, -1, -1}` entry
+    /// (`:2872`) is not one of them — which [`None`] states rather than relies on `-1` failing the
+    /// comparison.
+    #[test]
+    fn the_gap_rescale_passes_over_a_loop_that_names_no_extent() {
+        let unrelated = LoopInfo {
+            dim: PrimaryDimTypes::Mb,
+            ..LoopInfo::default()
+        };
+        let stepping = LoopInfo {
+            dim: PrimaryDimTypes::Ij,
+            size_idx: Some(SizeIdx(1)),
+            elem_offset: Some(ElemOffset(4)),
+        };
+        assert_eq!(unrelated.size_idx, None);
+        assert_eq!(unrelated.elem_offset, None);
+        assert_eq!(LoopInfo::default().dim, PrimaryDimTypes::Undefined);
+
+        let mut composite_loops = vec![unrelated, stepping];
+        for loop_info in &mut composite_loops {
+            if loop_info.size_idx == Some(SizeIdx(1)) {
+                loop_info.elem_offset = loop_info.elem_offset.map(|o| ElemOffset(o.0 * 3));
+            }
+        }
+
+        assert_eq!(composite_loops[0].elem_offset, None);
+        assert_eq!(composite_loops[1].elem_offset, Some(ElemOffset(12)));
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -2294,29 +2479,425 @@ mod unit_tests {
 
 // crustify:todo: e012_CoordinateType.padding_
 
+/// `dsc2::ScheduleNode` (`dsc/dsc2.h:444-524`) — the base every node in a schedule tree derives
+/// from. `BlockNode` (`:526`) derives from it and owns the children; `LoopNode` (`:563`) and
+/// `ConditionNode` (`:685`) derive from `BlockNode`; `TransferNode` (`:814`), `ComputeNode`
+/// (`:900`), `SyncNode` (`:964`), `AllocateNode` (`:974`) and `StickMaskNode` (`:1059`) derive from
+/// it directly. Those eight are the whole hierarchy, and [`NodeType`] is its discriminant — the
+/// importer's `new`-per-kind chain is the exhaustive list (`dsc/dsc2.cpp:1337-1358`).
+///
+/// ⛔ THIS CARRIES 3 OF SCHEDULENODE'S 4 FIELDS, so the `e029_ScheduleNode`/`e013_ScheduleNode`
+/// anchors below stay open. `prev_` (`dsc/dsc2.h:515`) is a `BlockNode*` pointing back at the parent
+/// that OWNS this node, through `BlockNode::next_`, a `VectorOfChildren` of `unique_ptr`s (`:538`).
+/// Every reader of it is a tree operation, not a question about one node: `getPrev` and
+/// `getMutableParent` hand it straight out (`:463-464`), `getOwnerLoop` climbs it to the nearest
+/// `LOOP` (`dsc/dsc2.cpp:1896-1900`), `getParentDimLoop` climbs on from there to the nearest loop
+/// carrying a dim (`:1906-1914`), `insertLoopAbove` finds `this` in `prev_->next_` by ADDRESS,
+/// `nodePtr.get() == this`, and splices a loop into its slot (`:2169-2186`), and `moveNode` forwards
+/// the whole job to `prev_->moveChildNode` (`:1977-1982`). So the identity a Rust parent link would
+/// need is the one `ScheduleTree::head_` (`dsc/dsc2.h:623`) and `BlockNode::next_` have to define,
+/// and both of those anchors are open — `e030_BlockNode`/`e015_BlockNode` and
+/// `e032_ScheduleTree`/`e007_ScheduleTree`.
+///
+/// ⛔ AND `name_` IS NOT THAT IDENTITY IN MEMORY, ONLY ON THE JSON SEAM. Names are made unique by
+/// `finalizeScheduleTree`, which appends `__1`, `__2`, … as it walks and `DT_ERROR`s on a node with
+/// no name at all (`dsc/dsc2.cpp:2976-2992`), and the tree importer refuses a duplicate outright
+/// (`:1369-1371`). Before that pass runs the authority mints colliding names deliberately — every
+/// condition node the DDL conversion builds is named the literal `"condition"`
+/// (`ddc/ddl/ddl_conversion.cpp:1556`), and every implicit L0 sync `"sync_implicit_L0"` (`:1790`).
+///
+/// ⛔ NO `Default`: the authority's only constructor takes the kind (`dsc/dsc2.h:482`), every
+/// concrete node passes its own, and the field is `const` (`:460`), so [`NodeType::Invalid`] is what
+/// a base that was never constructed reads as rather than a kind any C++ path produces. [`Size`]
+/// above refuses one for the same reason.
+///
+/// ⛔ NO `PartialEq`: the authority declares none, and a derive would answer "the same node" for two
+/// distinct nodes agreeing on kind, name and relevance — exactly what `insertLoopAbove`'s
+/// `nodePtr.get() == this` (`dsc/dsc2.cpp:2177`) and `finalizeScheduleTree`'s uniquifier
+/// (`:2988-2992`) exist to tell apart.
+///
+/// ⛔ `clone()` IS NOT PORTED AND IS NOT [`Clone`]. The authority's is pure virtual (`dsc/dsc2.h:484`)
+/// and every node in the hierarchy inherits its override from `InheritWithClone<Base, Derived>`
+/// (`:526`, `:563`, `:685`, `:814`), which `new`s a node of the DERIVED type — an operation this base
+/// cannot answer. [`Clone`] here copies the three carried fields, which is the implicit copy
+/// constructor, not `clone()`.
+#[derive(Clone, Debug)]
+pub struct ScheduleNode {
+    /// Field: e029_ScheduleNode.nodeType_
+    /// Field: e013_ScheduleNode.nodeType_
+    ///
+    /// Which kind of node this is (`dsc/dsc2.h:460`). PRIVATE because the authority's is `const`:
+    /// it is fixed by the constructor and there is no path that rewrites it, which is what lets the
+    /// JSON exporter and importer dispatch on it (`dsc/dsc2.cpp:376-377`, `:1337-1358`).
+    node_type: NodeType,
+    /// Field: e029_ScheduleNode.name_
+    /// Field: e013_ScheduleNode.name_
+    ///
+    /// The node's name (`dsc/dsc2.h:461`). It is the node's identity ON THE JSON SEAM: the exporter
+    /// writes a `LoopInfo`'s loop as `li.loop_->name_` (`dsc/dsc2.cpp:209-210`) and the importer
+    /// resolves it back through `nodeNamePtrMap` (`:1284-1286`), the same map that refuses a
+    /// duplicate name (`:1369-1371`).
+    ///
+    /// ⛔ AND IT IS WRITTEN AFTER THE FACT, so it is not a construction-time identity: every node
+    /// reaches `finalizeScheduleTree` with whatever name minted it, and that pass renames the
+    /// collisions (`dsc/dsc2.cpp:2988-2992`). A `String` and not an enum because the set is open —
+    /// the DDL conversion builds one per template loop, `loop_ds<numId>_ds<denId>`
+    /// (`ddc/ddl/ddl_conversion.cpp:1104`), and one per allocation, `allocate_<node>` (`:1627`).
+    pub name: String,
+    /// Field: e029_ScheduleNode.relevantComps_
+    /// Field: e013_ScheduleNode.relevantComps_
+    ///
+    /// Which components, cores and corelets this node is relevant to (`dsc/dsc2.h:516`) — a
+    /// component, then that component's cores, then each core's corelets.
+    ///
+    /// NOT A PUBLIC FIELD, because the authority's is `protected` behind five friend classes and one
+    /// friend function (`dsc/dsc2.h:514-523`) while every reading below is a public method: a caller
+    /// that wants "is this node relevant to LX" gets that answer, and only the two whole-map
+    /// accessors, [`Self::relevant_comps`] and [`Self::relevant_comps_mut`], hand over the map.
+    ///
+    /// ⛔ [`SenComponent::All`] IS NEVER A KEY, AND [`SenComponent::NoComponent`] IS ONE ONLY UNTIL
+    /// FINALIZATION. `setRelevantCompCoreCl` seeds the head and then every node with a
+    /// `NO_COMPONENT` entry, splits a condition node's two branches under that same key, and only
+    /// then fills the real components from each location, "Leave NO_COMPONENT in relevantComps_ as
+    /// it is useful for analysis" (`dsc/dsc2.cpp:2647-2729`) — and `finalizeScheduleTree` erases that
+    /// key from the head and from every node (`:2977-2980`). `ALL` reaches the map from neither
+    /// writer, nor from the importer that rebuilds it key by key (`:1373-1382`), which is why
+    /// [`Self::is_relevant`] answers it from the authority's early return instead of a lookup.
+    ///
+    /// ⛔ AN EMPTY CORELET SET IS A REAL STATE AND THE TWO READERS DISAGREE ABOUT IT. The writer
+    /// reaches it through `operator[]`: `relCoreCls[core].insert(cls.begin(), cls.end())` creates the
+    /// core's entry before it inserts anything, so a core the `NO_COMPONENT` map carries with no
+    /// corelets is created empty under the real component too (`dsc/dsc2.cpp:2692-2694`). Then
+    /// `isNodeRelevant(comp, -1, coreId)` returns true on nothing but that core's PRESENCE
+    /// (`:1929-1931`), while `getRelevantComps(coreId)` requires `!clSet.empty()` (`:1964-1967`) and
+    /// `getRelevantCoreCl` drops such a core from its result altogether (`:1940-1942`). So neither
+    /// reader can be composed out of the other, and both are ported.
+    relevant_comps: BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>>,
+}
+
+impl ScheduleNode {
+    /// `ScheduleNode(NodeType)` (`dsc/dsc2.h:482`), the authority's only constructor — `name_` starts
+    /// empty (`:461`) and `relevantComps_` starts empty (`:516`).
+    pub fn new(node_type: NodeType) -> Self {
+        Self {
+            node_type,
+            name: String::new(),
+            relevant_comps: BTreeMap::new(),
+        }
+    }
+
+    /// `nodeType_` (`dsc/dsc2.h:460`), read-only because the authority's is `const`.
+    pub fn node_type(&self) -> NodeType {
+        self.node_type
+    }
+
+    /// `isBlockNode` (`dsc/dsc2.h:479-481`), which reads nothing but the kind — see
+    /// [`NodeType::is_block_node`] for which three kinds those are and why.
+    pub fn is_block_node(&self) -> bool {
+        self.node_type.is_block_node()
+    }
+
+    /// `isNodeRelevant(comp)` with both filters left at their `-1` defaults
+    /// (`dsc/dsc2.h:470`, `dsc/dsc2.cpp:1916-1928`): [`SenComponent::All`] means "do not filter by
+    /// component" and every node answers yes to it (`:1918-1922`), and any other component is
+    /// relevant exactly when it has an entry (`:1923-1928`). This is the reading the ddc and the L3
+    /// scheduler take to decide whether a transfer belongs to a unit
+    /// (`ddc/ddcv1.cpp:2818`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6285`).
+    ///
+    /// ⛔ THE CORE- AND CORELET-FILTERED READINGS ARE [`Self::relevant_cores`]'s, NOT THIS ONE'S. The
+    /// authority's `DT_ERROR("Cannot filter node by clId/coreId and not by SenComponent")`
+    /// (`:1919-1921`) fires for one argument combination — a core or corelet filter beside a
+    /// component filter of `ALL` — and no function here takes both a component and a core, so that
+    /// combination cannot be spelled. `isNodeRelevant(comp, -1, coreId)` is
+    /// `relevant_cores(comp).is_some_and(|cores| cores.contains_key(&core))` and
+    /// `isNodeRelevant(comp, clId, coreId)` continues into the corelet set — the two readings the
+    /// bridge's sync lowering and the tree traversals call for
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:109`, `dsc/dsc2.cpp:1988`, `:2245`).
+    ///
+    /// ```
+    /// use deeptools::schedule::dsc2::{NodeType, ScheduleNode};
+    /// use sys_arch_spec::arch_enums::SenComponent;
+    ///
+    /// let node = ScheduleNode::new(NodeType::Transfer);
+    /// assert!(node.is_relevant(SenComponent::All));
+    /// assert!(!node.is_relevant(SenComponent::Lx));
+    /// ```
+    pub fn is_relevant(&self, comp: SenComponent) -> bool {
+        comp == SenComponent::All || self.relevant_comps.contains_key(&comp)
+    }
+
+    /// `isNodeRelevant`'s `relevantComps_.find(comp)` (`dsc/dsc2.cpp:1923-1924`) — this component's
+    /// cores and their corelets, absent when the component is not relevant at all. See
+    /// [`Self::is_relevant`] for why the core-filtered readings are spelled from here.
+    pub fn relevant_cores(
+        &self,
+        comp: SenComponent,
+    ) -> Option<&BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        self.relevant_comps.get(&comp)
+    }
+
+    /// `getRelevantCoreCl()` with its default `ALL`, i.e. no component filter
+    /// (`dsc/dsc2.h:471-472`, `dsc/dsc2.cpp:1935-1945`): every relevant core, with the corelets of
+    /// ALL components merged. This is the reading the ddc and the DDL conversion take
+    /// (`ddc/ddcv1.cpp:2701`, `:3467`, `:3476`, `ddc/ddl/ddl_conversion.cpp:3233`).
+    ///
+    /// ⛔ A CORE WITH AN EMPTY CORELET SET IS DROPPED, not carried empty — `if (!cls.empty())`
+    /// (`dsc/dsc2.cpp:1941`) — so this is not `relevantComps_` flattened.
+    pub fn relevant_core_cl(&self) -> BTreeMap<CoreId, BTreeSet<CoreletId>> {
+        let mut all_core_cl: BTreeMap<CoreId, BTreeSet<CoreletId>> = BTreeMap::new();
+        for core_cl in self.relevant_comps.values() {
+            for (core, cls) in core_cl {
+                if !cls.is_empty() {
+                    all_core_cl
+                        .entry(*core)
+                        .or_default()
+                        .extend(cls.iter().copied());
+                }
+            }
+        }
+        all_core_cl
+    }
+
+    /// `getRelevantCoreCl(comp)` with a component named (`dsc/dsc2.cpp:1935-1945`) — the fold reads
+    /// it for one component and then again for `NO_COMPONENT` (`ddc/ddc_fold.cpp:1371-1374`).
+    ///
+    /// ⛔ [`SenComponent::All`] IS THE AUTHORITY'S "NO FILTER" HERE, NOT A COMPONENT TO MATCH:
+    /// `if (comp != SenComponents::ALL && comp != relevantComp) continue` (`dsc/dsc2.cpp:1939`)
+    /// skips the test entirely for it, so it delegates to [`Self::relevant_core_cl`] rather than
+    /// looking for a key that no writer creates.
+    pub fn relevant_core_cl_of_comp(
+        &self,
+        comp: SenComponent,
+    ) -> BTreeMap<CoreId, BTreeSet<CoreletId>> {
+        if comp == SenComponent::All {
+            return self.relevant_core_cl();
+        }
+        let mut all_core_cl: BTreeMap<CoreId, BTreeSet<CoreletId>> = BTreeMap::new();
+        if let Some(core_cl) = self.relevant_comps.get(&comp) {
+            for (core, cls) in core_cl {
+                if !cls.is_empty() {
+                    all_core_cl.insert(*core, cls.clone());
+                }
+            }
+        }
+        all_core_cl
+    }
+
+    /// `getRelevantComps()` with both filters at their `-1` defaults
+    /// (`dsc/dsc2.h:473-474`, `dsc/dsc2.cpp:1947-1975`): the components relevant to ANY core, which
+    /// is every component whose core map is non-empty (`:1969-1971`).
+    ///
+    /// ⚠️ `getRelevantComps`'s ONLY CALLER TREE-WIDE IS `dsc/dsc2Pcfg.cpp:64`, and DCG/PCFG is off
+    /// this campaign's path — so all three readings below are ported because the method belongs to
+    /// this unit, not because anything in scope reads them yet.
+    pub fn relevant_comps_any_core(&self) -> BTreeSet<SenComponent> {
+        self.relevant_comps
+            .iter()
+            .filter(|(_, core_cl)| !core_cl.is_empty())
+            .map(|(comp, _)| *comp)
+            .collect()
+    }
+
+    /// `getRelevantComps(coreId)` (`dsc/dsc2.cpp:1955-1968`) — the components relevant to THAT core
+    /// through any of its corelets, which is the reading `dsc/dsc2Pcfg.cpp:64` takes.
+    ///
+    /// ⛔ A CORE PRESENT WITH AN EMPTY CORELET SET COUNTS FOR NOTHING HERE, `!clSet.empty()`
+    /// (`dsc/dsc2.cpp:1964`), where `isNodeRelevant` on the same core answers true — see
+    /// [`Self::relevant_comps`].
+    pub fn relevant_comps_of_core(&self, core: CoreId) -> BTreeSet<SenComponent> {
+        self.relevant_comps
+            .iter()
+            .filter(|(_, core_cl)| core_cl.get(&core).is_some_and(|cls| !cls.is_empty()))
+            .map(|(comp, _)| *comp)
+            .collect()
+    }
+
+    /// `getRelevantComps(coreId, clId)` with both named (`dsc/dsc2.cpp:1959-1963`) — the components
+    /// relevant to that one corelet of that one core.
+    ///
+    /// ⛔ THE AUTHORITY'S `DT_ERROR("Cannot filter comps by clId and not by coreId")` (`:1950-1952`)
+    /// IS UNSPELLABLE ACROSS THESE THREE READERS: a corelet filter here always arrives with the core
+    /// it belongs to, and the reader that takes no core takes no corelet either.
+    pub fn relevant_comps_of_corelet(
+        &self,
+        core: CoreId,
+        corelet: CoreletId,
+    ) -> BTreeSet<SenComponent> {
+        self.relevant_comps
+            .iter()
+            .filter(|(_, core_cl)| core_cl.get(&core).is_some_and(|cls| cls.contains(&corelet)))
+            .map(|(comp, _)| *comp)
+            .collect()
+    }
+
+    /// `relevantComps_` itself (`dsc/dsc2.h:516`) — a named accessor rather than a public field,
+    /// because the authority's is `protected` with five friend classes and one friend function
+    /// (`:514-523`) and Rust has neither. Its whole-map readers are the ddc's assertion that the
+    /// head's is non-empty (`ddc/ddcv1.cpp:3458`) and `SyncNode::getComponentsFromOtherEnds`, which
+    /// merges the other end's map component by component (`dsc/dsc2.cpp:2411-2417`).
+    pub fn relevant_comps(&self) -> &BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        &self.relevant_comps
+    }
+
+    /// The write side, which those same friends need: `setRelevantCompCoreCl` writes and reads the
+    /// `NO_COMPONENT` entry and then fills the real components (`dsc/dsc2.cpp:2647-2729`),
+    /// `finalizeScheduleTree` erases that entry (`:2977-2980`), the tree importer builds the map key
+    /// by key (`:1373-1382`), and the work split copies a node's whole map onto its clone (`:5355`).
+    ///
+    /// ⛔ THE FIELD IS UNWRITEABLE WITHOUT IT, and a carried field with no writer is the defect this
+    /// campaign already booked once: every one of those four writers is a method of a type whose own
+    /// anchor is still open, so this accessor is what they will write through rather than something
+    /// added for them later.
+    pub fn relevant_comps_mut(
+        &mut self,
+    ) -> &mut BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        &mut self.relevant_comps
+    }
+}
+
+/// `ScheduleNode::UnitView` (`dsc/dsc2.h:499-512`) — what one unit sees of one data structure at one
+/// point in the schedule: the extents it addresses, and the enclosing loops that step through them.
+/// `buildUnitView` produces every one of them, from a default-constructed value
+/// (`dsc/dsc2.cpp:2759`), and a transfer's and a compute node's per-corelet views are vectors of
+/// these (`dsc/dsc2.h:846-851`, `:943-947`).
+///
+/// ⛔ THE TWO LOOP VECTORS ARE A PARTITION OF THE SAME CLIMB, NOT TWO KINDS OF LOOP. `buildUnitView`
+/// walks `getOwnerLoop()` upwards and pushes into `compositeLoops_` while the walk is still at or
+/// below `lastFusableParentLoop`, into `outerLoops_` after it, flipping `compLoop` off at that node
+/// (`dsc/dsc2.cpp:2842-2877`). So which vector a loop lands in is a property of the FUSION boundary,
+/// and a view built with no such parent starts with `compLoop` already false (`:2843`).
+///
+/// ⛔ AND `print` IS NOT PORTED: it dereferences `it.loop_->name_` for every entry of both vectors
+/// (`dsc/dsc2.cpp:4588`, `:4596`) — unconditionally, where the exporter beside it tests the pointer
+/// first (`:209`) — so it needs the field this port does not carry. See the `loop_` anchor below.
+#[derive(Clone, Debug, Default)]
+pub struct UnitView {
+    /// Field: e029_ScheduleNode.sizesNoGaps_
+    /// Field: e013_ScheduleNode.sizesNoGaps_
+    ///
+    /// The unit's extents, innermost first, with no per-core gap folded in (`dsc/dsc2.h:506`).
+    /// `buildUnitView` fills the stick dims first, clamped to what is left of the stick's capacity,
+    /// and then the layout dims in `layoutOrder` (`dsc/dsc2.cpp:2776-2818`) — which is why
+    /// [`DimSize`] counts elements in the leading entries and sticks in the trailing ones, and why
+    /// the same dim can appear twice.
+    ///
+    /// ⭐ POSITION IS THE CURRENCY THAT LEAVES THIS VECTOR: [`SizeIdx`] indexes it, bridge 1 walks it
+    /// positionally against `srcSizeIdx_`/`dstSizeIdx_`
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:333-349`), and
+    /// `calculateSizeIdxAndOffset` divides the offset down by the running product of the entries it
+    /// has passed (`dsc/dsc2.cpp:2731-2746`). Innermost-first is what the gap writer relies on when
+    /// it takes the HIGHEST index of a repeated dim as the outermost one (`:2905-2924`).
+    pub sizes_no_gaps: Vec<Size>,
+    /// Field: e029_ScheduleNode.compositeLoops_
+    /// Field: e013_ScheduleNode.compositeLoops_
+    ///
+    /// The enclosing loops up to and including the last fusable parent (`dsc/dsc2.h:507`). Unlike
+    /// [`Self::outer_loops`] this one also carries loops that touch NONE of the data structure's
+    /// dims, pushed with no extent and no offset at all (`dsc/dsc2.cpp:2869-2873`).
+    pub composite_loops: Vec<LoopInfo>,
+    /// Field: e029_ScheduleNode.outerLoops_
+    /// Field: e013_ScheduleNode.outerLoops_
+    ///
+    /// The enclosing loops beyond the fusion boundary (`dsc/dsc2.h:508`). Only loops that address a
+    /// dim of this data structure reach it — the `else if (compLoop)` arm that admits an unrelated
+    /// loop pushes into `compositeLoops_` and never here (`dsc/dsc2.cpp:2869-2873`).
+    pub outer_loops: Vec<LoopInfo>,
+    /// Field: e029_ScheduleNode.sizesWithGaps_
+    /// Field: e013_ScheduleNode.sizesWithGaps_
+    ///
+    /// The same extents per core, with that core's back gap added to the OUTERMOST entry of the
+    /// gapped dim (`dsc/dsc2.h:509`, filled at `dsc/dsc2.cpp:2899-2926`).
+    ///
+    /// ⛔ [`None`] IS THE AUTHORITY'S `-1`, WHICH IS HBM. The keys come from an allocation's
+    /// [`AllocateNode::back_gap_core`], whose own header comment says "HBM is -1"
+    /// (`dsc/dsc2.h:989`), copied key for key by `try_emplace(core, sizesNoGaps_)`
+    /// (`dsc/dsc2.cpp:2903`), and [`Self::sizes_for_core`] falls back to that entry for any core,
+    /// which is the whole reason the pseudo-key exists. [`CoreId`] is unsigned, so it cannot spell
+    /// one, and `None` sorting before every `Some` is where `-1` sits in the authority's
+    /// `std::map`.
+    ///
+    /// ⚠️ THE PLAN DROPPED THIS FIELD BETWEEN WAVES: `e013_ScheduleNode` scheduled it, and
+    /// `e029_ScheduleNode` — the same class, re-scheduled — lists `sizesNoGaps_`, `compositeLoops_`
+    /// and `outerLoops_` but not this fourth member of the same struct (`dsc/dsc2.h:509`), which
+    /// `getSizesForCoreId` reads before either of the others.
+    pub sizes_with_gaps: BTreeMap<Option<CoreId>, Vec<Size>>,
+}
+
+impl UnitView {
+    /// `getSizesForCoreId` (`dsc/dsc2.h:510`, defined `dsc/dsc2.cpp:2398-2405`): this core's gapped
+    /// extents if it has any, else HBM's `-1` entry, else the gapless view. Bridge 1 reads it for
+    /// the core it is lowering for, at nine sites
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:872`, `:1227`, `:1413`, `:1528`,
+    /// `:2076`, `:2356`, `:2447`, `SNComputeLowering.cpp:575`, `:843`).
+    ///
+    /// ⭐ THE FALLBACK CHAIN IS WHY THE WILDCARD CANNOT BE ASKED FOR AS A CORE: taking a [`CoreId`]
+    /// makes the authority's `getSizesForCoreId(-1)`, which would find the pseudo-key by its first
+    /// lookup rather than its second, unspellable.
+    pub fn sizes_for_core(&self, core: CoreId) -> &[Size] {
+        self.sizes_with_gaps
+            .get(&Some(core))
+            .or_else(|| self.sizes_with_gaps.get(&None))
+            .map_or(self.sizes_no_gaps.as_slice(), Vec::as_slice)
+    }
+}
+
+/// `ScheduleNode::UnitView::LoopInfo` (`dsc/dsc2.h:500-505`) — one enclosing loop's view of one
+/// dimension of the unit: which dim it steps, which extent of [`UnitView::sizes_no_gaps`] that dim
+/// resolved to, and how many elements one trip moves.
+///
+/// ⛔ ONE LOOP CONTRIBUTES ONE ENTRY PER DIM IT CARRIES, not one entry per loop: `buildUnitView`
+/// iterates `currLoop->dims_` and pushes inside that iteration (`dsc/dsc2.cpp:2850-2874`).
+///
+/// ⛔ AND [`Self::dim`] IS THE LOOP'S OWN DIM, NOT THE ONE THE EXTENT WAS FOUND UNDER. When the
+/// allocation pads a window dim, `buildUnitView` resolves the extent and the offset against the
+/// PADDED dim, `effectiveDim`, and then stores the unpadded `dim` beside them
+/// (`dsc/dsc2.cpp:2852-2868`). So this field does not index `sizes_no_gaps` — [`Self::size_idx`]
+/// does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoopInfo {
+    /// Field: e029_ScheduleNode.dim_
+    ///
+    /// Which dimension of the data structure this entry is about (`dsc/dsc2.h:502`). Its initialiser
+    /// is `PrimaryDimTypesCount`, [`PrimaryDimTypes::Undefined`] here, which is a live value and not
+    /// an absent one — the exporter spells it through `primaryDimToString` like any other dim
+    /// (`dsc/dsc2.cpp:211-212`), where that enumerator maps to `"undefined"` (`dsc/dims.cpp:23`).
+    pub dim: PrimaryDimTypes,
+    /// Field: e029_ScheduleNode.sizeIdx_
+    /// Field: e013_ScheduleNode.sizeIdx_
+    ///
+    /// Which entry of [`UnitView::sizes_no_gaps`] this loop steps (`dsc/dsc2.h:503`), as
+    /// `calculateSizeIdxAndOffset` resolved it (`dsc/dsc2.cpp:2731-2746`).
+    ///
+    /// ⛔ [`None`] IS THE AUTHORITY'S `-1` AND IT IS REACHABLE IN A STORED ENTRY: a loop that touches
+    /// none of the data structure's dims is pushed as `{currLoop, dim, -1, -1}`
+    /// (`dsc/dsc2.cpp:2872`). The gap rescale then multiplies the offset of every entry whose
+    /// `sizeIdx_ == i` for a gapped layout entry `i` (`dsc/dsc2.cpp:2880-2897`), a test the `-1`
+    /// silently fails and a [`None`] cannot be mistaken for a position.
+    pub size_idx: Option<SizeIdx>,
+    /// Field: e029_ScheduleNode.elemOffset_
+    /// Field: e013_ScheduleNode.elemOffset_
+    ///
+    /// How many elements of the extent at [`Self::size_idx`] one trip of this loop moves
+    /// (`dsc/dsc2.h:504`) — see [`ElemOffset`] for the currency and its rescale.
+    ///
+    /// ⛔ [`None`] IS THE `-1` OF THE SAME UNRELATED-LOOP ENTRY (`dsc/dsc2.cpp:2872`), AND `0` IS A
+    /// VALUE, NOT AN ABSENCE: the seed's own declaration says so — "put 1 if popping next element, or
+    /// 0 if reuse is expected" (`dsc/dsc2.h:732-734`) — so absent and reuse are different states and
+    /// only one of them is spelled by [`None`].
+    pub elem_offset: Option<ElemOffset>,
+}
+
+// crustify:todo: e029_ScheduleNode
+
+// crustify:todo: e029_ScheduleNode.loop_
+
+// crustify:todo: e029_ScheduleNode.prev_
+
 // crustify:todo: e013_ScheduleNode
-
-// crustify:todo: e013_ScheduleNode.compositeLoops_
-
-// crustify:todo: e013_ScheduleNode.elemOffset_
 
 // crustify:todo: e013_ScheduleNode.loop_
 
-// crustify:todo: e013_ScheduleNode.name_
-
-// crustify:todo: e013_ScheduleNode.nodeType_
-
-// crustify:todo: e013_ScheduleNode.outerLoops_
-
 // crustify:todo: e013_ScheduleNode.prev_
-
-// crustify:todo: e013_ScheduleNode.relevantComps_
-
-// crustify:todo: e013_ScheduleNode.sizeIdx_
-
-// crustify:todo: e013_ScheduleNode.sizesNoGaps_
-
-// crustify:todo: e013_ScheduleNode.sizesWithGaps_
 
 /// Replaces: e014_DataStage
 ///
@@ -5181,9 +5762,11 @@ impl Default for AllocateNode {
 /// `DesignSpaceConfig::constantInfo_`, keyed by the [`ConstantId`] an
 /// [`AllocateNode::const_idx`] points back at (`dsc/designSpaceConfig.h:90`).
 ///
-/// ⛔ THIS CARRIES 3 OF CONSTANTINFO'S 5 FIELDS, so the `e030_ConstantInfo` anchor below stays open.
-/// `data_` (`:49-50`) is a `FoldManager<std::vector<int64_t>>`, and `util/foldManager/` is the
-/// blocker e008 and e012 are already held by. `allocations_` (`:52`) is a
+/// ⛔ THIS CARRIES 3 OF CONSTANTINFO'S 5 FIELDS, so the `e028_ConstantInfo` and `e030_ConstantInfo`
+/// anchors below stay open. `data_` (`:49-50`) is a `FoldManager<std::vector<int64_t>>`, and
+/// `util/foldManager/` is the blocker e008 and e012 are already held by — the re-scheduled
+/// `e028_ConstantInfo` no longer lists that field at all, so only the `e030` anchor still names it.
+/// `allocations_` (`:52`) is a
 /// `std::map<SenComponents, AllocateNode*>` of NON-OWNING aliases into the schedule tree: the DDL
 /// conversion hangs the minted node on its parent block and aliases it here in the same breath
 /// (`ddc/ddl/ddl_conversion.cpp:826-832`), and the PE/SFP work split clones a node into a second
@@ -5225,6 +5808,7 @@ impl Default for AllocateNode {
 /// fields alone would answer "the same constant" for two constants holding different values.
 #[derive(Clone, Debug)]
 pub struct ConstantInfo {
+    /// Field: e028_ConstantInfo.dataFormat_
     /// Field: e030_ConstantInfo.dataFormat_
     ///
     /// The format the datum's values are encoded in — the field's own comment says so, "values
@@ -5256,6 +5840,7 @@ pub struct ConstantInfo {
     /// `IEEE_FP32` compute op is stored as `IEEE_FP32` with its datum put through `Fp16BinToFloat`
     /// (`ddc/ddl/ddl_conversion.cpp:667-673`), so this is not simply the DDL's declared type.
     pub data_format: DataFormats,
+    /// Field: e028_ConstantInfo.name_
     /// Field: e030_ConstantInfo.name_
     ///
     /// The constant's name (`dsc/dsc2.h:48`) — the DDL's own for a defined constant
@@ -5277,6 +5862,7 @@ pub struct ConstantInfo {
     /// carries (`ddc/ddl/ddl_conversion.cpp:694-695`), and those three literals are compared against
     /// it rather than enumerating it.
     pub name: String,
+    /// Field: e028_ConstantInfo.isDataSymbolic_
     /// Field: e030_ConstantInfo.isDataSymbolic_
     ///
     /// Whether the datum holds a [`VariableSymbol`] still to be resolved rather than a value
@@ -5322,6 +5908,10 @@ impl Default for ConstantInfo {
         }
     }
 }
+
+// crustify:todo: e028_ConstantInfo
+
+// crustify:todo: e028_ConstantInfo.allocations_
 
 // crustify:todo: e030_ConstantInfo
 
