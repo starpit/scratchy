@@ -7537,6 +7537,12 @@ pub struct ChunkIdx(pub i64);
 /// it per dim (`dsc/dsc2.cpp:4827`), and measured, a value past the extent makes the reader throw
 /// unless the walk breaks first — immediately on the back end, whose first coordinate is
 /// `numChunks - 1`.
+///
+/// ⛔ A `u32` OVER THE AUTHORITY'S `int`, AND THE TRADE IS NOT SYMMETRIC. The negative half costs
+/// nothing: measured, -1 and `INT_MIN` both answer 0 at both ends, exactly as 0 does, so
+/// `NumChunks(0)` speaks for all of them. The residual is the other half — counts past `INT_MAX` are
+/// spellable here and unspellable there, and unlike [`WkSliceIdx`] there is no wider authority seam
+/// to appeal to, because `numChunks` is an `int` the whole way down.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NumChunks(pub u32);
 
@@ -7800,7 +7806,10 @@ impl TransferPadInfo {
             }
             num_chunks_visited += 1;
         }
-        // `int` arithmetic on `int` inputs (`:4715`), so it wraps where the authority's does.
+        // ⛔ [`Wrapping`] BECAUSE `:4715` IS UNDEFINED THERE, NOT BECAUSE IT WRAPS: `chunkOffset *
+        // numChunksVisited + partialPadSize` is `int` arithmetic, and UBSan reports both operators
+        // on it. Clang wraps at -O0, -O2 and under UBSan alike, so this is the only behaviour the
+        // authority has been observed to have — and the only form here that does not panic.
         Some(PadSize(
             (Wrapping(chunk_offset.0) * Wrapping(num_chunks_visited as i32)
                 + Wrapping(partial_pad_size))
@@ -8224,6 +8233,181 @@ mod equivalence {
             info.front[&PrimaryDimTypes::Y].data(WkSliceIdx(0), ChunkIdx(0)),
             Some(PadSize(25)),
             "the refusal did not write `BETAS_BACK`'s -53 over the level"
+        );
+        // `F.after.tp_y_0_0 = 25`, `F.after.tp_y_0_2 = 5`, `F.after.wk_y_3chunk = 25` — the same
+        // refusal through the PUBLIC readers, which is where a half-applied rebuild would surface.
+        assert_eq!(
+            info.transfer_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::Y,
+                WkSliceIdx(0),
+                ChunkIdx(0),
+                ChunkSizePadded(i32::MAX)
+            ),
+            Some(PadSize(25)),
+            "`F.after.tp_y_0_0`"
+        );
+        assert_eq!(
+            info.transfer_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::Y,
+                WkSliceIdx(0),
+                ChunkIdx(2),
+                ChunkSizePadded(i32::MAX)
+            ),
+            Some(PadSize(5)),
+            "`F.after.tp_y_0_2`"
+        );
+        assert_eq!(
+            info.wk_slice_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::Y,
+                WkSliceIdx(0),
+                NumChunks(3),
+                ChunkOffset(10),
+                ChunkSizePadded(10)
+            ),
+            Some(PadSize(25)),
+            "`F.after.wk_y_3chunk`"
+        );
+    }
+
+    /// `N.front_neg1 = 0`, `N.back_neg1 = 0`, `N.front_intmin = 0`, `N.front_zero = 0`.
+    ///
+    /// ⛔ THE EVIDENCE THAT [`NumChunks`] LOSES NOTHING BY BEING UNSIGNED. The authority's
+    /// `numChunks` is an `int` (`dsc/dsc2.cpp:4685`), and measured, -1 and `INT_MIN` each answer 0 at
+    /// both ends — identically to 0 — because `numChunksVisited < numChunks` fails before the first
+    /// `getDataForKey` (`:4699`), leaving `chunkOffset * 0 + 0`. So every negative the authority
+    /// accepts is spelled `NumChunks(0)` here, and the `chunkOffset` is never applied.
+    #[test]
+    fn e024_a_chunk_count_of_zero_visits_nothing_and_speaks_for_the_authoritys_negatives() {
+        let info = both_ends();
+        for end in [PadEnd::Front, PadEnd::Back] {
+            assert_eq!(
+                info.wk_slice_pad_size(
+                    end,
+                    PrimaryDimTypes::X,
+                    WkSliceIdx(0),
+                    NumChunks(0),
+                    ChunkOffset(10),
+                    ChunkSizePadded(10)
+                ),
+                Some(PadSize(0)),
+                "`N.{end:?}_neg1`"
+            );
+        }
+    }
+
+    /// `O.mul_ovf = -1894967296`, `O.add_ovf_back = -2147483640`.
+    ///
+    /// ⛔ THE AUTHORITY IS UNDEFINED AT `:4715`, NOT WRAPPING, AND THESE ARE THE VALUES IT PRODUCES
+    /// ANYWAY. `chunkOffset * numChunksVisited + partialPadSize` is `int` arithmetic on `int`s, and
+    /// UndefinedBehaviorSanitizer reports it on the second fixture below ("signed integer overflow:
+    /// 10 + 2147483646 cannot be represented in type 'int'"); clang nonetheless wraps identically at
+    /// -O0, -O2 and under UBSan. [`Wrapping`] reproduces that and is the only form that does not
+    /// panic, which this crate forbids — so what this test pins is a UB-dependent agreement, and a
+    /// future reader must not have to rediscover that the authority has no defined answer here.
+    #[test]
+    fn e024_the_wk_slice_tail_wraps_where_the_authoritys_int_arithmetic_is_undefined() {
+        // Three fully padded chunks against a cap of 0, so the walk visits all of them and the
+        // MULTIPLY overflows: 800000000 * 3 = 2400000000.
+        assert_eq!(
+            both_ends().wk_slice_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(1),
+                NumChunks(3),
+                ChunkOffset(800_000_000),
+                ChunkSizePadded(0)
+            ),
+            Some(PadSize(-1_894_967_296)),
+            "`O.mul_ovf`"
+        );
+
+        // And the ADD, which needs a partial pad near `i32::MAX`: at work slice `i32::MIN` the outer
+        // level folds to 2147483646 on chunk 0, one below the cap, so the walk breaks having visited
+        // the back end's chunk 1 — and 10 * 1 + 2147483646 does not fit.
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Back,
+                PrimaryDimTypes::X,
+                SIZES,
+                [PadSize(1), PadSize(1)],
+                [PadSize(-1), PadSize(-1)]
+            ),
+            Some(())
+        );
+        assert_eq!(
+            info.wk_slice_pad_size(
+                PadEnd::Back,
+                PrimaryDimTypes::X,
+                WkSliceIdx(i64::from(i32::MIN)),
+                NumChunks(2),
+                ChunkOffset(10),
+                ChunkSizePadded(i32::MAX)
+            ),
+            Some(PadSize(-2_147_483_640)),
+            "`O.add_ovf_back`"
+        );
+    }
+
+    /// `C.api_tp_1000000 = 0`, `C.api_wk_1000000_cap10 = 0`, `C.api_wk_int32max_cap10 = 30`.
+    ///
+    /// ⛔ THE VACUOUS RANGE GUARD REACHES THE PUBLIC SURFACE, AND THE CLAMP DISGUISES IT. The
+    /// four-billion extent admits work slice 1000000, which folds to -39999975; both readers
+    /// `max(.., 0)` that to 0 (`dsc/dsc2.cpp:4707`, `:4729-4731`), so `wk_slice_pad_size` breaks on
+    /// chunk 0 and answers 0 — indistinguishable from a slice that is legitimately unpadded, where an
+    /// in-range extent would have thrown instead. `i32::MAX` is the coordinate that does NOT
+    /// disguise itself: it folds to 65, stays at or above a cap of 10 across all three chunks, and
+    /// answers `10 * 3 = 30`.
+    #[test]
+    fn e024_a_four_billion_extent_answers_a_clamped_zero_through_the_public_readers() {
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                [FoldDimSize(u32::MAX), FoldDimSize(3)],
+                ALPHAS_FRONT,
+                BETAS_FRONT
+            ),
+            Some(())
+        );
+        assert_eq!(
+            info.transfer_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(1_000_000),
+                ChunkIdx(0),
+                ChunkSizePadded(i32::MAX)
+            ),
+            Some(PadSize(0)),
+            "`C.api_tp_1000000`"
+        );
+        assert_eq!(
+            info.wk_slice_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(1_000_000),
+                NumChunks(3),
+                ChunkOffset(10),
+                ChunkSizePadded(10)
+            ),
+            Some(PadSize(0)),
+            "`C.api_wk_1000000_cap10`"
+        );
+        assert_eq!(
+            info.wk_slice_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(i64::from(i32::MAX)),
+                NumChunks(3),
+                ChunkOffset(10),
+                ChunkSizePadded(10)
+            ),
+            Some(PadSize(30)),
+            "`C.api_wk_int32max_cap10`"
         );
     }
 
