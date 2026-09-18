@@ -7544,10 +7544,13 @@ impl PadSizeFold {
                 FoldDimProp::new(sizes[outer], "wkslice_index"),
                 FoldDimProp::new(sizes[inner], "chunk_index"),
             ],
-            fold: FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+            fold: FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i32>::new(
                 alphas[outer].0,
                 betas[outer].0,
-                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(alphas[inner].0, betas[inner].0)),
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(
+                    alphas[inner].0,
+                    betas[inner].0,
+                )),
             )),
         }
     }

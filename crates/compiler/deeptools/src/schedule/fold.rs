@@ -19,8 +19,6 @@
 
 use crate::schedule::wk_division::{Cid, CoordRange, WkSize, WkSplitParam};
 use core::fmt;
-use core::num::Wrapping;
-use core::ops::{Add, Mul};
 
 /// One folded dimension's extent — `FoldDimProp::factor_`, `uint32_t` (`foldInfrastructure.h:153`).
 ///
@@ -800,50 +798,110 @@ impl<D> ConstFoldFunctionLeaf<D> {
 /// type: `alpha_ * dim_index + beta_`, plus the child's data at a non-leaf.
 ///
 /// ⛔ WHY THIS IS A STORED `fn` AND NOT A BOUND ON THE WALK. The authority picks between four
-/// overloads on `Dtype` by SFINAE and `DT_ERROR`s in the CONSTRUCTOR for any `Dtype` that is not one
-/// of the three it can compute (`:353-359`, `:536-542`) — a run-time refusal on a property of a
-/// type. Resolving the overload once, where the node is built, turns that refusal into a COMPILE
-/// error: `Wrapping<Vec<i64>>` has no `Mul`, so `AffineFoldFunctionLeaf::<Vec<i64>>::new` does not
-/// exist. Putting the same bound on [`FoldFunc::get_data`] instead would ALSO take away the constant
-/// and Map walks at that payload, which `FoldManager<std::vector<int64_t>>` (`ConstantInfo::data_`,
-/// `dsc/dsc2.h:49`) needs and the authority provides. A trait is the other way to write this, and
-/// this campaign forbids one.
-type GetDataAffine<D> = fn(&D, &D, FoldDimIndex, Option<&D>) -> Option<D>;
+/// overloads on `Dtype` by SFINAE, so both the arithmetic AND its truncation are properties of the
+/// concrete `Dtype` and of nothing else. Resolving the overload once, where the node is built, keeps
+/// that out of [`FoldFunc::get_data`]: a bound on the walk would ALSO take away the constant and Map
+/// walks at a payload no affine fold uses, which `FoldManager<std::vector<int64_t>>`
+/// (`ConstantInfo::data_`, `dsc/dsc2.h:49`) needs and the authority provides. A trait is the other
+/// way to write this, and this campaign forbids one.
+///
+/// ⛔ IT RETURNS `D` AND NOT `Option<D>`, AND THAT IS THIS BATCH'S CORRECTION. It was ONE generic
+/// body reducing the coordinate with `D::try_from(i64)` and answering [`None`] when it did not fit —
+/// a REFUSAL WHERE THE AUTHORITY COMPUTES. Measured against the authority's own header: an
+/// `AffineFoldFunction_Leaf<int>` with `alpha_ = 1` at coordinate `2^32 + 5` answers **5**, and a
+/// `<uint64_t>` one with `(3, 10)` at coordinate **-2** answers **4** — C++ CONVERTS a coordinate,
+/// it never refuses one. A negative coordinate is not exotic either: `FoldManager::isLegal`'s range
+/// test is signed (`:1677`), `PadSizeFold::data` records exactly that
+/// (`crate::schedule::dsc2`), and the affine leaf computing `3 * -2 + 10 = 4` is pinned two tests
+/// below. The old justification — "a coordinate is bounded by its level's `FoldDimProp::factor_`" —
+/// argued about MAGNITUDE and said nothing about SIGN, which is the case that is reachable.
+type GetDataAffine<D> = fn(&D, &D, FoldDimIndex, Option<&D>) -> D;
 
-/// The arithmetic overload (`:405-416` with a child, `:575-582` without), and the only one with a
-/// caller: `BaseFuncType::Affine` reaches `FoldManager<int64_t>` through `CoordinateType::addFold`
-/// (`dsc/dsc2.h:126`, the one production caller of `buildAffineDim`) and `FoldManager<int>` through
-/// `TransferPadInfo::buildTransferFoldDim` (`dsc/dsc2.cpp:4677-4681`). Nothing tree-wide
-/// instantiates an affine fold at `std::pair<int64_t, int64_t>`, and the
+/// THE AUTHORITY'S WHOLE AFFINE CENSUS, and it is what lets [`GetDataAffine`] be total: an affine
+/// fold exists at exactly TWO payloads tree-wide, and one `affine_payload!` line per payload is the
+/// compile-time guard that replaced the run-time refusal.
+///
+/// | payload | the callsite that builds one |
+/// |---|---|
+/// | `int64_t` | `CoordinateType<CoordinateBaseType>::addFold` (`dsc/dsc2.h:120-126`), the one production caller of `buildAffineDim`; `#define CoordinateBaseType int64_t` (`dsc/dsc2.h:442`) |
+/// | `int` | `TransferPadInfo::buildTransferFoldDim` (`dsc/dsc2.cpp:4677-4681`) through `MapWithFMHelper<PrimaryDimTypes, int>` (`dsc/dsc2.h:808`), AND `FoldManager<SdscFoldId>::buildAffineDim` (`dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:6487`) with `using SdscFoldId = int` (`util/sendefs/sendefs.h:197`) |
+///
+/// ⛔ THE CENSUS IS NARROWER THAN `std::is_arithmetic` AND THE GAP IS DELIBERATE. The authority's
+/// constructor guard (`:353-359`, `:536-542`) admits EVERY arithmetic type, so
+/// `AffineFoldFunction_Leaf<double>(0.5, 0.25)` compiles, constructs and answers **1.75** at
+/// coordinate 3 — measured, which is why the guard here must not be described as that `DT_ERROR`'s
+/// compile-time twin. It is strictly stronger. Nothing is lost: no `FoldManager<float>`, `<double>`
+/// or unsigned instantiation exists tree-wide. What is gained is that a payload whose truncation
+/// nobody has written down is a COMPILE ERROR instead of a wrong number or a silent [`None`].
+/// ⛔ `std::pair<int64_t, int64_t>` HAS NO INSTANTIATION EITHER, and the
 /// `std::vector<std::pair<int64_t, int64_t>>` overload is `DT_ERROR("Not yet implemented")` in the
 /// authority as well (`:431-441`, `:596-606`) — so both are unported, not dropped.
-///
-/// ⛔ WRAPPING, BECAUSE THE AUTHORITY TRUNCATES. C++ promotes `alpha_`, `beta_` and the child's data
-/// to `int64_t` for the arithmetic and narrows the result back to `Dtype` on return, so a
-/// `FoldManager<int>` level with `alpha_ = 2^20` at coordinate `2^20` answers 0, not `2^40` —
-/// measured, both at a leaf and through a non-leaf. Truncation to 32 bits is a ring homomorphism, so
-/// the same bits come out of wrapping arithmetic in `D` without any widening machinery, and plain
-/// `*` would instead panic in a debug build on a value the authority accepts.
-/// ⛔ [`None`] ONLY IF THE COORDINATE ITSELF DOES NOT FIT `D`, where C++ truncates it. Unreachable
-/// and reported as such: a coordinate is bounded by its level's `FoldDimProp::factor_` (`:153`), and
-/// no `int` fold has a factor near `i32::MAX`.
-fn get_data_affine<D>(
-    alpha: &D,
-    beta: &D,
-    dim_index: FoldDimIndex,
-    child_data: Option<&D>,
-) -> Option<D>
-where
-    D: Clone + TryFrom<i64>,
-    Wrapping<D>: Add<Output = Wrapping<D>> + Mul<Output = Wrapping<D>>,
-{
-    let index = Wrapping(D::try_from(dim_index.0).ok()?);
-    let affine = Wrapping(alpha.clone()) * index + Wrapping(beta.clone());
-    Some(match child_data {
-        Some(data) => (affine + Wrapping(data.clone())).0,
-        None => affine.0,
-    })
+macro_rules! affine_payload {
+    ($D:ty, $get_data_affine:ident, $reduce:expr) => {
+        /// The arithmetic overload (`:405-416` with a child, `:575-582` without) at one payload.
+        ///
+        /// ⛔ WRAPPING, BECAUSE THE AUTHORITY TRUNCATES. C++ promotes `alpha_`, `beta_` and the
+        /// child's data to the common type of `Dtype` and `int64_t`, computes there, and narrows the
+        /// result back to `Dtype` on return, so a `FoldManager<int>` level with `alpha_ = 2^20` at
+        /// coordinate `2^20` answers 0, not `2^40`, and a non-leaf's `2^32 + 1` answers 1 —
+        /// measured, both. Truncation to the payload's width is a ring homomorphism, so the same
+        /// bits come out of wrapping arithmetic in the payload; plain `*` would instead panic in a
+        /// debug build on a value the authority accepts.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::unnecessary_cast,
+            reason = "$reduce IS the authority's coordinate conversion, and it is the identity at \
+                      the payload that is already `int64_t`"
+        )]
+        fn $get_data_affine(
+            alpha: &$D,
+            beta: &$D,
+            dim_index: FoldDimIndex,
+            child_data: Option<&$D>,
+        ) -> $D {
+            let index: $D = ($reduce)(dim_index.0);
+            let affine = alpha.wrapping_mul(index).wrapping_add(*beta);
+            match child_data {
+                Some(data) => affine.wrapping_add(*data),
+                None => affine,
+            }
+        }
+
+        impl AffineFoldFunctionNonLeaf<$D> {
+            /// `AffineFoldFunction_NonLeaf(Dtype alpha, Dtype beta, FoldFunction<Dtype>* new_child)`
+            /// (`:347-359`), and — with two zeroes — the child-only form at `:373-382`.
+            pub fn new(alpha: $D, beta: $D, child: FoldFunc<$D>) -> Self {
+                Self {
+                    alpha,
+                    beta,
+                    child: Box::new(child),
+                    get_data_affine: $get_data_affine,
+                }
+            }
+        }
+
+        impl AffineFoldFunctionLeaf<$D> {
+            /// `AffineFoldFunction_Leaf(Dtype alpha, Dtype beta)` (`:532-542`).
+            pub fn new(alpha: $D, beta: $D) -> Self {
+                Self {
+                    alpha,
+                    beta,
+                    get_data_affine: $get_data_affine,
+                }
+            }
+        }
+
+        /// `AffineFoldFunction_Leaf()` (`:544-552`) — `alpha_{}`, `beta_{}`.
+        impl Default for AffineFoldFunctionLeaf<$D> {
+            fn default() -> Self {
+                Self::new(0, 0)
+            }
+        }
+    };
 }
+
+affine_payload!(i64, get_data_affine_i64, |index: i64| index as i64);
+affine_payload!(i32, get_data_affine_i32, |index: i64| index as i32);
 
 // ⛔ THE SCHEDULER ALSO SCHEDULED `e015_AffineFoldFunction_NonLeaf.val`. THERE IS NO SUCH FIELD:
 // `val` is a METHOD-BODY LOCAL — `Dtype val; return val;` (`:401-402`) — the uninitialised return of
@@ -873,9 +931,11 @@ where
 /// `AffineFoldFunction_NonLeaf(FoldFunction<Dtype>* new_child)` (`:373-382`) is the one
 /// `createNonLeafFunc` calls, and it leaves `alpha_{}` and `beta_{}` at zero (`:517-518`), so
 /// `new(D::default(), D::default(), child)` is it.
-/// ⛔ IT IS ALSO WHERE THE `Dtype` GUARD LIVES: all three constructors `DT_ERROR` unless `Dtype` is
-/// arithmetic, `std::pair<int64_t, int64_t>` or a vector of those (`:353-359`). See
-/// [`GetDataAffine`] for how that becomes a compile error here.
+/// ⛔ ITS `Dtype` GUARD IS A COMPILE ERROR HERE, AND A STRICTLY STRONGER ONE: all three constructors
+/// `DT_ERROR` unless `Dtype` is arithmetic, `std::pair<int64_t, int64_t>` or a vector of those
+/// (`:353-359`), while `affine_payload!` admits only the two payloads an affine fold is ever BUILT
+/// at. An `AffineFoldFunction_NonLeaf<double>` constructs and computes in the authority — refusing it
+/// is this port's choice, not IBM's. See [`GetDataAffine`].
 #[derive(Clone)]
 pub struct AffineFoldFunctionNonLeaf<D> {
     /// Field: e015_AffineFoldFunction_NonLeaf.alpha_
@@ -892,23 +952,6 @@ pub struct AffineFoldFunctionNonLeaf<D> {
     /// The overload `getDataAffine` resolves to for `D` (`:390-441`), fixed at construction. See
     /// [`GetDataAffine`]; it is not one of the class's members.
     get_data_affine: GetDataAffine<D>,
-}
-
-impl<D> AffineFoldFunctionNonLeaf<D>
-where
-    D: Clone + TryFrom<i64>,
-    Wrapping<D>: Add<Output = Wrapping<D>> + Mul<Output = Wrapping<D>>,
-{
-    /// `AffineFoldFunction_NonLeaf(Dtype alpha, Dtype beta, FoldFunction<Dtype>* new_child)`
-    /// (`:347-359`), and — with `D::default()` twice — the child-only form at `:373-382`.
-    pub fn new(alpha: D, beta: D, child: FoldFunc<D>) -> Self {
-        Self {
-            alpha,
-            beta,
-            child: Box::new(child),
-            get_data_affine: get_data_affine::<D>,
-        }
-    }
 }
 
 impl<D> AffineFoldFunctionNonLeaf<D> {
@@ -976,7 +1019,12 @@ impl<D> AffineFoldFunctionNonLeaf<D> {
         let rest = non_leaf_rest(fold_dim_indices)?;
         let dim_index = *fold_dim_indices.first()?;
         let child_data = self.child.get_data(rest)?;
-        (self.get_data_affine)(&self.alpha, &self.beta, dim_index, Some(&child_data))
+        Some((self.get_data_affine)(
+            &self.alpha,
+            &self.beta,
+            dim_index,
+            Some(&child_data),
+        ))
     }
 
     /// `insertData` (`:452-457`) — forwards, and unlike [`get_data`](Self::get_data) never reads its
@@ -1036,13 +1084,19 @@ impl<D: fmt::Debug> fmt::Debug for AffineFoldFunctionNonLeaf<D> {
 /// so the no-argument constructor (`:544-552`, `createLeafFunc`'s at `:1879-1880`) is [`Default`] —
 /// measured, it answers 0 at every coordinate.
 ///
-/// The `Dtype` guard the authority throws for (`:536-542`) is a compile error here, and the control
-/// is what makes the `compile_fail` evidence — stable rustdoc does not check the annotated code:
-/// ```compile_fail,E0277
-/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::new(vec![1i64], vec![2i64]);
+/// The `Dtype` guard is a compile error here, and per [`GetDataAffine`] a STRONGER one than the
+/// authority's `DT_ERROR` — `3u64, 10u64` below is a pair C++ accepts and computes with. The controls
+/// are what make these `compile_fail` blocks evidence; stable rustdoc does not check the annotated
+/// error code:
+/// ```compile_fail,E0599
+/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::<Vec<i64>>::new(vec![1], vec![2]);
+/// ```
+/// ```compile_fail,E0599
+/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::<u64>::new(3, 10);
 /// ```
 /// ```
-/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::new(1i64, 2i64);
+/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::<i64>::new(1, 2);
+/// let _ = deeptools::schedule::fold::AffineFoldFunctionLeaf::<i32>::new(1, 2);
 /// ```
 /// And the walk that guard must NOT take away — a CONSTANT fold over that same payload
 /// (`ConstantInfo::data_`, `dsc/dsc2.h:49`) still reads:
@@ -1059,32 +1113,6 @@ pub struct AffineFoldFunctionLeaf<D> {
     beta: D,
     /// The overload `getDataAffine` resolves to for `D` (`:561-606`), fixed at construction.
     get_data_affine: GetDataAffine<D>,
-}
-
-impl<D> AffineFoldFunctionLeaf<D>
-where
-    D: Clone + TryFrom<i64>,
-    Wrapping<D>: Add<Output = Wrapping<D>> + Mul<Output = Wrapping<D>>,
-{
-    /// `AffineFoldFunction_Leaf(Dtype alpha, Dtype beta)` (`:532-542`).
-    pub fn new(alpha: D, beta: D) -> Self {
-        Self {
-            alpha,
-            beta,
-            get_data_affine: get_data_affine::<D>,
-        }
-    }
-}
-
-/// `AffineFoldFunction_Leaf()` (`:544-552`) — `alpha_{}`, `beta_{}`.
-impl<D> Default for AffineFoldFunctionLeaf<D>
-where
-    D: Default + Clone + TryFrom<i64>,
-    Wrapping<D>: Add<Output = Wrapping<D>> + Mul<Output = Wrapping<D>>,
-{
-    fn default() -> Self {
-        Self::new(D::default(), D::default())
-    }
 }
 
 impl<D> AffineFoldFunctionLeaf<D> {
@@ -1122,12 +1150,14 @@ impl<D> AffineFoldFunctionLeaf<D> {
     /// ⛔ `DT_CHECK(idx == fold_dim_indices.size() - 1)` (`:579`) is EXACTLY one remaining
     /// coordinate: an empty list throws here (`0 == SIZE_MAX` is false) where the non-leaf check lets
     /// it through. See [`non_leaf_rest`].
-    fn get_data(&self, fold_dim_indices: &[FoldDimIndex]) -> Option<D>
-    where
-        D: Clone,
-    {
+    fn get_data(&self, fold_dim_indices: &[FoldDimIndex]) -> Option<D> {
         match fold_dim_indices {
-            [dim_index] => (self.get_data_affine)(&self.alpha, &self.beta, *dim_index, None),
+            [dim_index] => Some((self.get_data_affine)(
+                &self.alpha,
+                &self.beta,
+                *dim_index,
+                None,
+            )),
             _ => None,
         }
     }
@@ -1623,7 +1653,7 @@ mod unit_tests {
                 true,
             ),
             (
-                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(1i64, 2)),
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(1i64, 2)),
                 FuncType::AffineLeaf,
                 true,
             ),
@@ -1640,7 +1670,7 @@ mod unit_tests {
                 false,
             ),
             (
-                FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+                FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
                     1i64,
                     2,
                     FoldFunc::ConstantLeaf(const_leaf),
@@ -1676,30 +1706,31 @@ mod unit_tests {
     /// levels the authority cannot tell apart could compare unequal from one build to the next.
     #[test]
     fn an_affine_level_is_its_alpha_beta_and_subtree_and_never_the_overload_it_resolved() {
-        let leaf = AffineFoldFunctionLeaf::new(3i64, 10);
-        assert_eq!(leaf, AffineFoldFunctionLeaf::new(3i64, 10));
+        let leaf = AffineFoldFunctionLeaf::<i64>::new(3i64, 10);
+        assert_eq!(leaf, AffineFoldFunctionLeaf::<i64>::new(3i64, 10));
         assert_eq!(leaf, leaf.clone());
         assert_ne!(
             leaf,
-            AffineFoldFunctionLeaf::new(10i64, 3),
+            AffineFoldFunctionLeaf::<i64>::new(10i64, 3),
             "alpha_ and beta_ do not commute"
         );
         assert_eq!(
-            AffineFoldFunctionLeaf::default(),
-            AffineFoldFunctionLeaf::new(0i64, 0)
+            AffineFoldFunctionLeaf::<i64>::default(),
+            AffineFoldFunctionLeaf::<i64>::new(0i64, 0)
         );
 
-        let level = AffineFoldFunctionNonLeaf::new(1i64, 0, FoldFunc::AffineLeaf(leaf.clone()));
+        let level =
+            AffineFoldFunctionNonLeaf::<i64>::new(1i64, 0, FoldFunc::AffineLeaf(leaf.clone()));
         assert_eq!(
             level,
-            AffineFoldFunctionNonLeaf::new(1i64, 0, FoldFunc::AffineLeaf(leaf))
+            AffineFoldFunctionNonLeaf::<i64>::new(1i64, 0, FoldFunc::AffineLeaf(leaf))
         );
         assert_ne!(
             level,
-            AffineFoldFunctionNonLeaf::new(
+            AffineFoldFunctionNonLeaf::<i64>::new(
                 1i64,
                 0,
-                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(3i64, 11))
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3i64, 11))
             ),
             "the subtree is part of the fold function"
         );
@@ -1817,7 +1848,7 @@ mod equivalence {
     /// ⛔ THE PREFIX IS EMITTED TWICE, mid-line after the separator (`:650-651`).
     #[test]
     fn e016_an_affine_leaf_is_alpha_times_its_coordinate_plus_beta() {
-        let mut al = AffineFoldFunctionLeaf::new(3i64, 10);
+        let mut al = AffineFoldFunctionLeaf::<i64>::new(3i64, 10);
         let data = |al: &AffineFoldFunctionLeaf<i64>, coords: &[FoldDimIndex]| {
             FoldFunc::AffineLeaf(al.clone()).get_data(coords)
         };
@@ -1841,7 +1872,10 @@ mod equivalence {
         assert_eq!((*al.alpha(), *al.beta()), (-1, -1));
 
         assert_eq!(
-            data(&AffineFoldFunctionLeaf::default(), &[FoldDimIndex(9)]),
+            data(
+                &AffineFoldFunctionLeaf::<i64>::default(),
+                &[FoldDimIndex(9)]
+            ),
             Some(0),
             "alpha_{{}}, beta_{{}} (:676-677)"
         );
@@ -1868,10 +1902,10 @@ mod equivalence {
     /// leaf is `107 + 21 + 31`.
     #[test]
     fn e015_an_affine_level_adds_its_own_term_to_its_child_s() {
-        let mut anl = AffineFoldFunctionNonLeaf::new(
+        let mut anl = AffineFoldFunctionNonLeaf::<i64>::new(
             100i64,
             7,
-            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(3i64, 10)),
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3i64, 10)),
         );
         let data = |anl: &AffineFoldFunctionNonLeaf<i64>, coords: &[FoldDimIndex]| {
             FoldFunc::AffineNonLeaf(anl.clone()).get_data(coords)
@@ -1901,13 +1935,13 @@ mod equivalence {
         anl.print_meta_data(&mut out, "");
         assert_eq!(out, "\"alpha_\" : 1, \"beta_\" : 0");
 
-        let top = AffineFoldFunctionNonLeaf::new(
+        let top = AffineFoldFunctionNonLeaf::<i64>::new(
             100i64,
             7,
-            FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+            FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
                 10i64,
                 1,
-                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(3i64, 10)),
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3i64, 10)),
             )),
         );
         assert_eq!(
@@ -1925,13 +1959,13 @@ mod equivalence {
     /// value IBM accepts.
     #[test]
     fn the_affine_arithmetic_truncates_to_the_payload_type_the_way_the_authority_does() {
-        let truncating = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(1i32 << 20, 0));
+        let truncating = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(1i32 << 20, 0));
         assert_eq!(truncating.get_data(&[FoldDimIndex(1 << 20)]), Some(0));
 
-        let normal = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(2i32, 3));
+        let normal = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(2i32, 3));
         assert_eq!(normal.get_data(&[FoldDimIndex(4)]), Some(11));
 
-        let level = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+        let level = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i32>::new(
             1i32 << 16,
             0,
             FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(1i32)),
@@ -1940,6 +1974,215 @@ mod equivalence {
             level.get_data(&[FoldDimIndex(1 << 16), FoldDimIndex(0)]),
             Some(1)
         );
+    }
+
+    /// `arith.int_negative = 4`, `arith.int_coord_over_i32max = 5`, `c15.negative_own_coord = -277`.
+    ///
+    /// ⛔ ONE OF THE THREE ANSWERED [`None`] BEFORE THIS REVIEW PASS, AND IT IS `2^32 + 5` — measured
+    /// by putting these assertions against the old body, which failed on that line alone with
+    /// `left: None, right: Some(5)`. [`GetDataAffine`] reduced the coordinate with `D::try_from(i64)`
+    /// and refused when it did not fit, which is a REFUSAL WHERE THE AUTHORITY CONVERTS: `:575-582`
+    /// narrows on return, it never validates. The other two are here because they are what the old
+    /// justification — "a coordinate is bounded by its level's `FoldDimProp::factor_`" — was about:
+    /// MAGNITUDE. It was wrong on its own terms, since the coordinate that overflows `int` is exactly
+    /// the reachable case; and it was silent about SIGN, where the refusal was worse still — at a
+    /// `uint32_t` or `uint64_t` payload `try_from` failed for EVERY negative coordinate while the
+    /// authority answered 4 (`arith.u64_negative`, `arith.u32_negative`). Those two payloads are now a
+    /// compile error rather than a wrong answer, pinned by [`AffineFoldFunctionLeaf`]'s
+    /// `compile_fail` block.
+    /// ⛔ A NEGATIVE COORDINATE IS LEGAL ALL THE WAY DOWN: `FoldManager::isLegal` widens a `uint32_t`
+    /// extent to `int64_t` for its range test (`:1677`), and
+    /// [`PadSizeFold`](crate::schedule::dsc2) — the live `FoldManager<int>` consumer — records the
+    /// same fact in its own header.
+    #[test]
+    fn an_affine_coordinate_is_converted_at_the_payload_s_width_and_never_refused() {
+        let narrow = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(3, 10));
+        assert_eq!(narrow.get_data(&[FoldDimIndex(-2)]), Some(4), "3 * -2 + 10");
+
+        let past_i32_max = FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(1, 0));
+        assert_eq!(
+            past_i32_max.get_data(&[FoldDimIndex((1 << 32) | 5)]),
+            Some(5),
+            "static_cast<int>(2^32 + 5)"
+        );
+
+        let level = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+            100,
+            7,
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3, 10)),
+        ));
+        assert_eq!(
+            level.get_data(&[FoldDimIndex(-3), FoldDimIndex(2)]),
+            Some(-277),
+            "(100 * -3 + 7) + (3 * 2 + 10)"
+        );
+    }
+
+    /// `c13.three_coords = 77`, `c13.over_affine_two = 31`, `c13.over_affine_three = THROW`,
+    /// `c13.two_levels_three = 31`, `c15.three_coords = THROW`, `c15.over_const_three = 1002`,
+    /// `c17.three_coords = 20`.
+    ///
+    /// ⛔ NO LEVEL BOUNDS THE LIST FROM ABOVE, SO THE LEAF DECIDES. Every non-leaf's `DT_CHECK` only
+    /// asks that it is not itself the last (`:277`, `:409`, `:701`), so whether a too-deep list is
+    /// refused depends entirely on what the LEAF demands: a constant leaf reads neither the list nor
+    /// its length (`:318-321`) and answers, an affine leaf insists on being last (`:579`) and throws.
+    /// ⛔ THE SAME AFFINE LEVEL THEREFORE ANSWERS 1002 OVER A CONSTANT LEAF AND THROWS OVER AN AFFINE
+    /// ONE — which is why [`non_leaf_rest`] hands the tail down instead of validating a depth it
+    /// cannot know.
+    /// ⛔ THIS TEST PASSES AGAINST THE PRE-REVIEW BODY TOO — measured. It is COVERAGE, not a
+    /// regression pin: the depth contract was already right and nothing asserted it past two
+    /// coordinates.
+    #[test]
+    fn a_too_deep_coordinate_list_is_refused_by_the_leaf_and_never_by_the_level_above_it() {
+        let three = [FoldDimIndex(1), FoldDimIndex(2), FoldDimIndex(3)];
+
+        let over_const = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(77i64)),
+        ));
+        assert_eq!(over_const.get_data(&three), Some(77));
+
+        let over_affine = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3, 10)),
+        ));
+        assert_eq!(
+            over_affine.get_data(&[FoldDimIndex(5), FoldDimIndex(7)]),
+            Some(31)
+        );
+        assert_eq!(
+            over_affine.get_data(&three),
+            None,
+            "the leaf's :579, not :277"
+        );
+
+        let two_levels = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(FoldFunc::AffineLeaf(
+                AffineFoldFunctionLeaf::<i64>::new(3, 10),
+            ))),
+        ));
+        assert_eq!(
+            two_levels.get_data(&[FoldDimIndex(1), FoldDimIndex(2), FoldDimIndex(7)]),
+            Some(31),
+            "two levels shed two coordinates: 3 * 7 + 10"
+        );
+
+        let affine_over_affine = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+            100,
+            7,
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3, 10)),
+        ));
+        assert_eq!(affine_over_affine.get_data(&three), None);
+
+        let affine_over_const = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+            1,
+            0,
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(1000i64)),
+        ));
+        assert_eq!(
+            affine_over_const.get_data(&[FoldDimIndex(2), FoldDimIndex(7), FoldDimIndex(9)]),
+            Some(1002),
+            "the same kind of level, and it answers"
+        );
+
+        let map = FoldFunc::MapNonLeaf(MapFoldFunctionNonLeaf::new(vec![
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(10i64)),
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(20i64)),
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(30i64)),
+        ]));
+        assert_eq!(map.get_data(&three), Some(20));
+    }
+
+    /// `c13.empty_underflow = 77`, `c13.insert_empty_list = OK` then `c13.after_insert_empty = -3`,
+    /// `c13.get_fold_func_empty_is_leaf2 = 1`, `c13.over_affine_empty = THROW`,
+    /// `c13.two_levels_empty = THROW`, `c15.insert_data_empty = OK` then
+    /// `c15.after_insert_data_empty = -2`, `c15.insert_empty_over_affine_leaf = OK`,
+    /// `c15.insert_empty_over_map_leaf = THROW`, `c17.insert_empty = THROW`,
+    /// `c17.get_fold_func_empty = THROW`.
+    ///
+    /// ⛔ THE EMPTY LIST IS [`non_leaf_rest`]'S WHOLE REASON FOR EXISTING AND ONLY `getData` PINNED
+    /// IT. `idx < fold_dim_indices.size() - 1` underflows to `SIZE_MAX` on an empty `deque` (`:277`,
+    /// `:409`, `:701`), so every non-leaf passes its OWN check and hands the same empty list down —
+    /// the tail never shrinks, which is why the slice model answers `Some(&[])` rather than refusing.
+    /// Two constant levels over an affine leaf therefore throw at the LEAF, not at either level.
+    /// ⛔ A LEVEL THAT READS THE COORDINATE IN ITS OWN BODY THROWS AT ONCE: the Map one's `.at(idx)`
+    /// (`:702`) is a different line from its `DT_CHECK`, and `insertData`/`getFoldFunc` reach it the
+    /// same way `getData` does — the two walks the `WkSplitParam` accessors use (`:2655-2681`).
+    /// ⛔ THIS TEST ALSO PASSES AGAINST THE PRE-REVIEW BODY — measured. [`non_leaf_rest`] was already
+    /// correct; what was missing is that only `getData` exercised it, so the two walks below rested on
+    /// an unasserted claim.
+    #[test]
+    fn an_empty_coordinate_list_passes_every_level_and_stops_at_the_first_one_that_reads_it() {
+        let mut const_over_const = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(77i64)),
+        ));
+        assert_eq!(const_over_const.get_data(&[]), Some(77));
+        assert_eq!(const_over_const.insert_data(-3, &[]), Some(()));
+        assert_eq!(const_over_const.get_data(&[]), Some(-3));
+        if let FoldFunc::ConstantNonLeaf(nl) = &const_over_const {
+            let reached = const_over_const.fold_func(&[]).map(std::ptr::from_ref);
+            assert_eq!(
+                reached,
+                Some(std::ptr::from_ref(nl.child())),
+                "getFoldFunc still reaches the child (:293-297)"
+            );
+        }
+
+        let over_affine = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3, 10)),
+        ));
+        assert_eq!(over_affine.get_data(&[]), None, "the leaf's :579");
+
+        let two_levels = FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(
+            FoldFunc::ConstantNonLeaf(ConstFoldFunctionNonLeaf::new(FoldFunc::AffineLeaf(
+                AffineFoldFunctionLeaf::<i64>::new(3, 10),
+            ))),
+        ));
+        assert_eq!(
+            two_levels.get_data(&[]),
+            None,
+            "both levels pass their own check and neither shrinks the tail"
+        );
+
+        let mut affine_over_const = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+            1,
+            0,
+            FoldFunc::ConstantLeaf(ConstFoldFunctionLeaf::new(1000i64)),
+        ));
+        assert_eq!(affine_over_const.insert_data(-4, &[]), Some(()));
+        assert_eq!(
+            affine_over_const.get_data(&[FoldDimIndex(2), FoldDimIndex(7)]),
+            Some(-2),
+            "1 * 2 + 0 + -4 — the write landed through an empty list"
+        );
+
+        let mut affine_over_affine =
+            FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+                1,
+                0,
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(3, 10)),
+            ));
+        assert_eq!(
+            affine_over_affine.insert_data(7, &[]),
+            Some(()),
+            "an affine leaf's insertData is `// ignored` and checks no depth (:613-617)"
+        );
+
+        let mut affine_over_map = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
+            1,
+            0,
+            FoldFunc::MapLeaf(MapFoldFunctionLeaf::new(vec![1i64, 2, 3]).unwrap()),
+        ));
+        assert_eq!(
+            affine_over_map.insert_data(7, &[]),
+            None,
+            "a map leaf's insertData does check its depth"
+        );
+
+        let mut map =
+            FoldFunc::MapNonLeaf(MapFoldFunctionNonLeaf::new(vec![FoldFunc::ConstantLeaf(
+                ConstFoldFunctionLeaf::new(10i64),
+            )]));
+        assert_eq!(map.insert_data(-8, &[]), None, "the .at(idx) at :702");
+        assert_eq!(map.fold_func(&[]), None);
     }
 
     /// `c17.k0 = 10`, `c17.k2 = 30`, `c17.out_of_range = THROW`, `c17.negative = THROW`,
@@ -1993,8 +2236,8 @@ mod equivalence {
         }
 
         let affine = FoldFunc::MapNonLeaf(MapFoldFunctionNonLeaf::new(vec![
-            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(1i64, 0)),
-            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(0i64, 100)),
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(1i64, 0)),
+            FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i64>::new(0i64, 100)),
         ]));
         assert_eq!(
             affine.get_data(&[FoldDimIndex(0), FoldDimIndex(9)]),
@@ -2060,7 +2303,7 @@ mod equivalence {
         assert_eq!(root.get_data(&[FoldDimIndex(2), FoldDimIndex(0)]), None);
         assert_eq!(root.get_data(&[]), None);
 
-        let affine = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+        let affine = FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i64>::new(
             100i64,
             7,
             FoldFunc::MapLeaf(run()),
