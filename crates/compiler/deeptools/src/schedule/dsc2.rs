@@ -1,6 +1,6 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
-use crate::schedule::dims::{DataStructDims, PrimaryDimAndKind, PrimaryDimTypes};
+use crate::schedule::dims::{DataStructDims, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes};
 use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 use sys_arch_spec::fields::Gen;
@@ -1262,6 +1262,105 @@ mod unit_tests {
             .view(),
             None
         );
+    }
+
+    /// `dsc/dsc2.h:976-1005`: every declared initialiser at once. ⛔ `numBuffers_` STARTS AT ONE, NOT
+    /// AT [`NumBuffers::STREAMING`] — a default-constructed allocation is unbuffered, and bridge 1
+    /// reads mode 1 for it (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:58-64`).
+    #[test]
+    fn allocate_node_defaults_to_an_unidentified_unbuffered_direct_allocation() {
+        let node = AllocateNode::default();
+        // The three-way identity starts empty in both of its ported arms (`ddc/ddcv1.cpp:20-29`).
+        assert_eq!(node.lds_idx, None);
+        assert_eq!(node.const_idx, None);
+        assert_eq!(node.component, SenComponent::NoComponent);
+        assert_eq!(node.padding, PaddingFormType::default());
+        assert!(node.layout_dim_order.is_empty());
+        assert!(node.max_dim_sizes.is_empty());
+        assert_eq!(node.num_buffers, NumBuffers(1));
+        assert_ne!(node.num_buffers, NumBuffers::STREAMING);
+        assert!(!node.is_start_addr_symbolic);
+        assert!(node.buffer_offset_core_corelet.is_empty());
+        assert!(node.back_gap_core.is_empty());
+        assert_eq!(node.indirect_alloc_type, IndirectAllocType::NoIndirection);
+        assert_eq!(node.index_tensor_type, IndexTensorType::Address);
+        assert!(node.gap_stick_spread.is_empty());
+        assert!(!node.ignore_symbolic_volume_limits);
+        assert!(!node.non_unified_alloc_in_hbm);
+    }
+
+    /// The two indirection enums against their four string maps (`dsc/dsc2.cpp:2423-2438`). ⛔ THE
+    /// `IndexTensorType` MAP LISTS `INDEX` BEFORE `ADDRESS` while the enum declares `ADDRESS` first
+    /// (`dsc/dsc2.h:995-998`), so the map's initialiser order is not the discriminant order.
+    #[test]
+    fn the_indirection_enums_round_trip_every_spelling_in_declaration_order() {
+        assert_eq!(
+            IndirectAllocType::ALL.map(IndirectAllocType::name),
+            ["no_indirection", "value_tensor", "index_tensor"]
+        );
+        assert_eq!(
+            IndexTensorType::ALL.map(IndexTensorType::name),
+            ["address", "index"]
+        );
+        for role in IndirectAllocType::ALL {
+            assert_eq!(IndirectAllocType::from_name(role.name()), Some(role));
+        }
+        for form in IndexTensorType::ALL {
+            assert_eq!(IndexTensorType::from_name(form.name()), Some(form));
+        }
+        assert_eq!(IndirectAllocType::from_name("index"), None);
+        assert_eq!(IndexTensorType::from_name("index_tensor"), None);
+    }
+
+    /// `dsc/dsc2.h:989` ("HBM is -1") against the reader that demands that key on an HBM allocation
+    /// and takes the first entry otherwise (`dsc/dsc2.cpp:3937-3955`). The iteration order is
+    /// exported (`dsc/dsc2.cpp:893-906`) and linearized into the SuperDsc fingerprint
+    /// (`dsc/superdsc.cpp:1458-1464`), and `-1` leads there as `None` leads here.
+    #[test]
+    fn back_gap_core_puts_hbms_pseudo_core_before_every_real_core() {
+        let node = AllocateNode {
+            component: SenComponent::Hbm,
+            back_gap_core: BTreeMap::from([(
+                PrimaryDimTypes::Out,
+                BTreeMap::from([
+                    (Some(CoreId(3)), DimSize(16)),
+                    (None, DimSize(4)),
+                    (Some(CoreId(0)), DimSize(8)),
+                ]),
+            )]),
+            ..AllocateNode::default()
+        };
+        let out_gaps = &node.back_gap_core[&PrimaryDimTypes::Out];
+        assert_eq!(
+            out_gaps.keys().copied().collect::<Vec<_>>(),
+            [None, Some(CoreId(0)), Some(CoreId(3))]
+        );
+        // The HBM read takes the `-1` entry; the LX read takes the first, which is that same entry
+        // only because no real core can precede it.
+        assert_eq!(out_gaps.get(&None), Some(&DimSize(4)));
+        assert_eq!(out_gaps.values().next(), Some(&DimSize(4)));
+    }
+
+    /// `ForceInnermostDimensionsOp` inserting at `begin()` on both vectors
+    /// (`ddc/ddl/ddl_conversion.cpp:1902-1905`), over an allocation the DDL conversion sized with
+    /// `-1`s (`:803`). The pass refuses to run twice by testing `any_of(maxDimSizes_, >= 0)`
+    /// (`:1879-1884`), which is [`Option::is_some`] here.
+    #[test]
+    fn forcing_inner_dims_prepends_to_both_vectors_and_is_refused_twice() {
+        let mut node = AllocateNode {
+            layout_dim_order: vec![PrimaryDimTypes::Y, PrimaryDimTypes::Out],
+            ..AllocateNode::default()
+        };
+        node.max_dim_sizes.resize(node.layout_dim_order.len(), None);
+        assert!(!node.max_dim_sizes.iter().any(Option::is_some));
+
+        // `:1902-1905`: the forced dim becomes the innermost, and it carries a data stage index —
+        // not an extent — until `finalizeAllocateLayouts` overwrites it (`ddc/ddcv1.cpp:1710-1732`).
+        node.layout_dim_order.insert(0, PrimaryDimTypes::In);
+        node.max_dim_sizes.insert(0, Some(MaxDimSize(2)));
+        assert_eq!(node.layout_dim_order[0], PrimaryDimTypes::In);
+        assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
+        assert!(node.max_dim_sizes.iter().any(Option::is_some));
     }
 }
 
@@ -3339,3 +3438,433 @@ impl StickMaskNode {
 // crustify:todo: e027_StickMaskNode
 
 // crustify:todo: e027_StickMaskNode.affectedTransfers_
+
+/// Which half of an indirect access an allocation is — `AllocateNode::IndirectAllocType`
+/// (`dsc/dsc2.h:990-994`). It is the paged-access discriminator the L3 scheduler reads: `isPagedLds`
+/// is `VALUE_TENSOR` on an HBM allocation (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6596-6604`)
+/// and `isIndexLds` is `INDEX_TENSOR` on one (`:6582-6594`).
+///
+/// ⛔ AN INDIRECT ACCESS IS TWO ALLOCATIONS AND THIS ONLY NAMES ONE HALF: the value tensor holds the
+/// paged data, the index tensor holds the addresses into it, and the link between them is
+/// `relatedIndirectAccessAlloc_` (`dsc/dsc2.h:999-1001`) — schedule-node pointer identity, not
+/// ported here — so nothing in this port can walk from one half to the other. The JSON exporter
+/// `DT_CHECK`s that link non-null whenever this is not `NO_INDIRECTION` (`dsc/dsc2.cpp:916-921`).
+///
+/// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE, unlike [`NodeType`]'s: both string maps are
+/// `std::unordered_map` (`dsc/dsc2.h:1049-1052`), the JSON round trip carries the spelling
+/// (`dsc/dsc2.cpp:907-909`, `:1792-1794`), and `fillAllocateNode` does not put this field into the
+/// SuperDsc fingerprint at all (`dsc/superdsc.cpp:1446-1467`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndirectAllocType {
+    /// `indirectAllocType_`'s initialiser (`dsc/dsc2.h:994`): an ordinary, directly addressed
+    /// allocation. `getPageSize` answers the empty map for it (`dsc/dsc2.cpp:4481-4485`).
+    #[default]
+    NoIndirection = 0,
+    /// The paged data itself, whose own layout gives the page size.
+    ValueTensor = 1,
+    /// The addresses into a value tensor.
+    IndexTensor = 2,
+}
+
+impl IndirectAllocType {
+    /// Every role in the authority's declaration order (`dsc/dsc2.h:990-994`).
+    pub const ALL: [Self; 3] = [Self::NoIndirection, Self::ValueTensor, Self::IndexTensor];
+
+    /// The spelling `indirectAllocTypeToString` gives this role (`dsc/dsc2.h:1049-1050`, filled
+    /// `dsc/dsc2.cpp:2423-2427`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NoIndirection => "no_indirection",
+            Self::ValueTensor => "value_tensor",
+            Self::IndexTensor => "index_tensor",
+        }
+    }
+
+    /// `stringToIndirectAllocType`, the `flipMap` of the above (`dsc/dsc2.h:1051-1052`, built
+    /// `dsc/dsc2.cpp:2428-2430`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
+    /// (`dsc/dsc2.cpp:1793-1794`), so [`None`] here is that throw's input, never a live answer.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "no_indirection" => Some(Self::NoIndirection),
+            "value_tensor" => Some(Self::ValueTensor),
+            "index_tensor" => Some(Self::IndexTensor),
+            _ => None,
+        }
+    }
+}
+
+/// What one entry of an index tensor holds — `AllocateNode::IndexTensorType` (`dsc/dsc2.h:995-998`).
+///
+/// ⛔ ONLY `ADDRESS` IS SUPPORTED: `isIndexLds` `DT_CHECK_MSG`s it on every index allocation it
+/// recognises, "Only index tensors of type address are supported"
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6587-6589`), and it is also the declared default
+/// (`dsc/dsc2.h:998`). `INDEX` is ported because it holds the discriminant that check rejects.
+///
+/// ⛔ THE FIELD IS ONLY MEANINGFUL UNDER [`IndirectAllocType::IndexTensor`]: the JSON exporter
+/// writes it only then (`dsc/dsc2.cpp:910-915`), so an imported non-index allocation always reads
+/// back the default rather than whatever it held.
+///
+/// ⛔ THE STRING MAP LISTS `INDEX` FIRST (`dsc/dsc2.cpp:2431-2435`) while the enum declares
+/// `ADDRESS` first — the map is an `unordered_map` and its initialiser order is not the enum's, so
+/// the discriminants come from the declaration and nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IndexTensorType {
+    /// `indexTensorType_`'s initialiser (`dsc/dsc2.h:998`): the entry is an address.
+    #[default]
+    Address = 0,
+    /// The entry is an index the hardware still has to convert to an address.
+    Index = 1,
+}
+
+impl IndexTensorType {
+    /// Both forms in the authority's declaration order (`dsc/dsc2.h:995-998`).
+    pub const ALL: [Self; 2] = [Self::Address, Self::Index];
+
+    /// The spelling `indexTensorTypeToString` gives this form (`dsc/dsc2.h:1053-1054`, filled
+    /// `dsc/dsc2.cpp:2431-2435`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Address => "address",
+            Self::Index => "index",
+        }
+    }
+
+    /// `stringToIndexTensorType`, the `flipMap` of the above (`dsc/dsc2.h:1055-1056`, built
+    /// `dsc/dsc2.cpp:2436-2438`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
+    /// (`dsc/dsc2.cpp:1796-1797`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "address" => Some(Self::Address),
+            "index" => Some(Self::Index),
+            _ => None,
+        }
+    }
+}
+
+/// How many buffers one allocation reserves — `AllocateNode::numBuffers_` (`dsc/dsc2.h:984`), whose
+/// own comment enumerates the encoding: "1:no buffering, 2:double-buffer, -1:streaming buffer".
+///
+/// ⛔ NOT AN ENUM OF THOSE THREE, because the set is not closed: the DDL conversion assigns it
+/// straight from the `AllocateOp`'s `num_buffers` attribute (`ddc/ddl/ddl_conversion.cpp:804`,
+/// `:833`), so a template may state any count, and `allocAllMem` divides a reserved size by it
+/// (`ddc/ddcv1.cpp:353-355`).
+///
+/// ⛔ AND NOT AN [`Option`] EITHER: [`STREAMING`](Self::STREAMING) is a live third mode, not the
+/// absence of a count, and its readers keep it distinct from `2` even while mapping it to `2` —
+/// `allocAllMem` reserves the WHOLE memory capacity for a streaming buffer before dividing
+/// (`ddc/ddcv1.cpp:317-329`, `:353-355`) and `processImplicitSync` refuses an implicit sync on
+/// anything else, "Implicit syncs are only possible on circular buffers (num_buffers=-1)"
+/// (`ddc/ddl/ddl_conversion.cpp:1777-1782`).
+///
+/// ⛔ THE L3 SCHEDULER ADMITS ONLY 1 OR 2: `DT_CHECK_MSG` "Expect no buffering or double buffering"
+/// on an HBM-pinned LX allocation and "Expect no buffering" on any other
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4940-4947`).
+///
+/// ⭐ A BARE COUNT CANNOT REACH THE FIELD:
+///
+/// ```compile_fail
+/// use deeptools::schedule::dsc2::AllocateNode;
+/// let mut node = AllocateNode::default();
+/// node.num_buffers = -1;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumBuffers(pub i32);
+
+impl NumBuffers {
+    /// The streaming (circular) buffer's encoding, `-1` (`dsc/dsc2.h:984`). ⭐ IT IS THE ONE VALUE
+    /// BRIDGE 1 TESTS: `getBufferingOrStreamingMode` answers mode 2 for it and mode 1 for every
+    /// other count (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:58-64`, `:76-82`).
+    pub const STREAMING: Self = Self(-1);
+}
+
+/// One entry of `AllocateNode::maxDimSizes_` (`dsc/dsc2.h:983`), positionally paired with
+/// [`layout_dim_order`](AllocateNode::layout_dim_order).
+///
+/// ⛔⛔ IT HOLDS TWO DIFFERENT CURRENCIES AND THE PASS ORDER IS WHAT SAYS WHICH, which is why it is
+/// neither a [`DataStageId`] nor a [`DimSize`]. The DDL conversion stores a DATA-STAGE INDEX here —
+/// its own comment says "store the Datastage index in the maxDimSizes vector. It will be later
+/// converted into an actual size" (`ddc/ddl/ddl_conversion.cpp:1902-1905`) — and
+/// `finalizeAllocateLayouts` overwrites each non-negative entry in place with that stage's EXTENT
+/// for the paired dim, divided by the cumulative stick size when the dim is a stick dim, so the
+/// result counts sticks there and elements elsewhere (`ddc/ddcv1.cpp:1710-1732`).
+///
+/// ⛔ AND THE JSON IMPORTER CANNOT TELL THEM APART: it pushes the bare integer
+/// (`dsc/dsc2.cpp:1761-1764`), so a dump taken before that pass reimports stage indices into the
+/// same slots an extent would occupy.
+///
+/// Every reader after the pass treats it as an extent: `buildUnitView` caps a dim at it and
+/// `DT_CHECK`s that the remainder divides (`dsc/dsc2.cpp:2805-2812`), and `getPageSize` multiplies
+/// the entries of one dim together (`dsc/dsc2.cpp:4497-4510`).
+///
+/// ⭐ NEITHER OTHER CURRENCY CAN REACH THE VECTOR:
+///
+/// ```compile_fail
+/// use deeptools::schedule::dsc2::{AllocateNode, DimSize};
+/// let mut node = AllocateNode::default();
+/// node.max_dim_sizes.push(Some(DimSize(8)));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaxDimSize(pub i32);
+
+/// The distance in bytes between one buffer of an allocation and the next — one value of
+/// `AllocateNode::bufferOffsetCoreCorelet_` (`dsc/dsc2.h:988`).
+///
+/// ⛔ A STRIDE, NOT A BASE ADDRESS: `allocAllMem` writes the reserved size divided by the buffer
+/// count while the base goes to `startAddressCoreCorelet_` beside it (`ddc/ddcv1.cpp:351-356`), and
+/// the L3 scheduler reads the pair together (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`).
+/// A streaming allocation is divided by 2, not by its `-1` (`ddc/ddcv1.cpp:353-354`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BufferOffset(pub i64);
+
+/// How many sticks one dim's data is spread across when it carries gaps — one value of
+/// `AllocateNode::gapStickSpread_` (`dsc/dsc2.h:1006`).
+///
+/// ⛔ IT IS A MULTIPLIER IN ONE READER AND A DIVISOR IN THE OTHER, over the same dim.
+/// `buildUnitView` multiplies the dim's unit-view size and every matching loop's `elemOffset_` by it
+/// (`dsc/dsc2.cpp:2882-2899`), while `getBufferCapacityForNodePerDimCustomLocation` divides that
+/// dim's capacity by it (`dsc/dsc2.cpp:3958-3961`) — the spread inflates the addresses and deflates
+/// the capacity, so it is not a size in either direction.
+///
+/// Its in-scope writers are the masked-compute pass, which puts `8` on the INNERMOST layout dim
+/// (`ddc/ddcv1.cpp:1704`), and the internal-register transformations
+/// (`ddc/ddc_transformation.cpp:1132-1135`, `:1380`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickSpread(pub i32);
+
+/// One region of one memory, reserved for one labeled data structure, one constant or one compute
+/// temporary — `dsc/dsc2.h:974-1057`. The DDL conversion mints one per `AllocateOp`
+/// (`ddc/ddl/ddl_conversion.cpp:780-840`), `allocAllMem` places it (`ddc/ddcv1.cpp:218-360`), and
+/// the L3 scheduler reads its addresses back
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4926-4950`).
+///
+/// ⛔ THIS CARRIES 15 OF ALLOCATENODE'S 21 FIELDS, so the `e028_AllocateNode` anchor below stays
+/// open. Three are schedule-node pointer identity, e013's `name_` and the tree it hangs on:
+/// `tempStorageForCompute_` (`:978`), the `ComputeNode` whose temporary this region is;
+/// `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of an indirect access; and
+/// `allocUsers_` (`:1007`), the reference-counted list of nodes that read or write the region. All
+/// three serialize by node name and re-resolve through `nodeNamePtrMap` (`dsc/dsc2.cpp:840-843`,
+/// `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`). The other three need types
+/// this campaign has not scoped: `startAddressCoreCorelet_` (`:985-986`) is a
+/// `FoldManager<int64_t>`, and `allocateCoordinates_` and `sliceViewCoordinates_` (`:1008-1009`) are
+/// `CoordinateType`, e012, which is built on the same `util/foldManager/` — and the authority's own
+/// JSON round trip leaves the slice view a "TO DO" on both sides (`dsc/dsc2.cpp:1828`).
+///
+/// ⛔ AND ITS SEVEN METHODS STAY OUT WITH THOSE FIELDS. `getPageSize` (`:1011`, defined
+/// `dsc/dsc2.cpp:4480-4513`) computes the page extents from the VALUE tensor's layout, and under
+/// [`IndirectAllocType::IndexTensor`] that is `relatedIndirectAccessAlloc_`'s layout, reached
+/// through the pointer it `DT_CHECK`s non-null (`dsc/dsc2.cpp:4491-4493`) — an answer computed from
+/// this node's own layout instead would be silently wrong for exactly the index allocations the
+/// paged path mints (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6709-6729` is the caller).
+/// `addAllocUser`, `removeAllocUser`, `hasAllocUsers`, `hasAllocUser` and `clearAllocUsers`
+/// (`:1012-1046`) are that list's five operations, and `print` (`:1048`) streams both.
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and `allocUsers_` and
+/// `relatedIndirectAccessAlloc_` compare by it. `Clone` is IBM's own, through `InheritWithClone`
+/// (`:974`).
+#[derive(Clone, Debug)]
+pub struct AllocateNode {
+    /// Field: e028_AllocateNode.ldsIdx_
+    ///
+    /// The labeled data structure this region holds, or [`None`] for the authority's `-1`
+    /// (`dsc/dsc2.h:976`). The DDL conversion sets it for a tensor allocation
+    /// (`ddc/ddl/ddl_conversion.cpp:800`) and `ForceInnermostDimensionsOp` refuses any allocation
+    /// without one, "Inner dims can only be applied on tensors"
+    /// (`ddc/ddl/ddl_conversion.cpp:1874-1878`).
+    ///
+    /// ⛔ THIS IS ONE THIRD OF A THREE-WAY IDENTITY, AND THE ORDER IS FIXED:
+    /// `getLdsOrConstNameOfAllocNode` names the region by `tempStorageForCompute_`'s node first,
+    /// then by this, then by [`const_idx`](Self::const_idx), and answers the empty string when all
+    /// three are absent (`ddc/ddcv1.cpp:20-29`). That first arm is the unported pointer, so no
+    /// ported reader can reproduce the whole discriminator.
+    pub lds_idx: Option<LdsIdx>,
+    /// Field: e028_AllocateNode.constIdx_
+    ///
+    /// The constant this region holds, or [`None`] for the authority's `-1` (`dsc/dsc2.h:977`). It
+    /// indexes `DesignSpaceConfig::constantInfo_`, whose entry supplies the region's name
+    /// (`ddc/ddcv1.cpp:26-27`), and the DDL conversion names such a node
+    /// `allocate_const<idx>_<component>` (`ddc/ddl/ddl_conversion.cpp:836-838`).
+    pub const_idx: Option<ConstantId>,
+    /// Field: e028_AllocateNode.component_
+    ///
+    /// Which memory the region is in (`dsc/dsc2.h:979`), taken from the `AllocateOp`'s storage
+    /// (`ddc/ddl/ddl_conversion.cpp:806`).
+    ///
+    /// ⛔ `HBM` IS A DIFFERENT SHAPE OF ALLOCATION, NOT JUST A DIFFERENT PLACE: unless
+    /// [`non_unified_alloc_in_hbm`](Self::non_unified_alloc_in_hbm) is set, its size data stage is
+    /// forced to `N_` in both halves and the node is `DT_CHECK`ed to sit at the schedule tree's root
+    /// (`dsc/dsc2.cpp:3624-3633`); and it is the component under which
+    /// [`back_gap_core`](Self::back_gap_core) is keyed by `-1` instead of by a core
+    /// (`dsc/dsc2.cpp:3943-3946`).
+    pub component: SenComponent,
+    /// Field: e028_AllocateNode.padding_
+    ///
+    /// The padding form of each dim of the region (`dsc/dsc2.h:981`), written from the `AllocateOp`
+    /// (`ddc/ddl/ddl_conversion.cpp:793`). `getSizeDataStageForNode` passes it on to size the
+    /// allocation (`dsc/dsc2.cpp:3613`).
+    pub padding: PaddingFormType,
+    /// Field: e028_AllocateNode.layoutDimOrder_
+    ///
+    /// The dims the region is laid out over, positionally paired with
+    /// [`max_dim_sizes`](Self::max_dim_sizes) (`dsc/dsc2.h:982`).
+    ///
+    /// ⛔ INDEX 0 IS THE INNERMOST DIM: `ForceInnermostDimensionsOp` `insert`s at `begin()`
+    /// (`ddc/ddl/ddl_conversion.cpp:1902-1905`), the masked-compute pass puts its stick spread on
+    /// `at(0)` (`ddc/ddcv1.cpp:1704`), and `buildUnitView` appends these dims to the unit view AFTER
+    /// the stick dims (`dsc/dsc2.cpp:2882`, whose walk starts at `getStickSizes(...).size()`).
+    ///
+    /// ⛔ A DIM MAY REPEAT — `backGapCore_`'s reader says so outright, "sizes may have dimensions
+    /// repeated. Add gaps to outermost" (`dsc/dsc2.cpp:2903-2904`), and `getPageSize` multiplies
+    /// every entry of one dim together (`dsc/dsc2.cpp:4503-4508`). What the DDL forbids is a repeat
+    /// WITHIN one `AllocateOp`'s own dim list (`ddc/ddl/ddl_conversion.cpp:796-799`).
+    pub layout_dim_order: Vec<PrimaryDimTypes>,
+    /// Field: e028_AllocateNode.maxDimSizes_
+    ///
+    /// One entry per [`layout_dim_order`](Self::layout_dim_order) dim, [`None`] for the authority's
+    /// negative "no limit" (`dsc/dsc2.h:983`). Read [`MaxDimSize`] before touching a filled one: the
+    /// integer means a data-stage index before `finalizeAllocateLayouts` and an extent after.
+    ///
+    /// ⛔ ITS LENGTH IS AN INVARIANT, NOT A COINCIDENCE: every producer `resize`s it to
+    /// `layoutDimOrder_.size()` with `-1` (`ddc/ddl/ddl_conversion.cpp:803`, `:1641`,
+    /// `ddc/ddc_transformation_util.cpp:52`, `ddc/ddc_transformation.cpp:2116`, `:2347`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:561`), `finalizeAllocateLayouts` raises
+    /// `DT_ERROR("Mismatch in allocate layout vectors")` when the two differ
+    /// (`ddc/ddcv1.cpp:1715-1717`), and `getPageSize` `DT_CHECK`s the same (`dsc/dsc2.cpp:4496`).
+    ///
+    /// ⛔ A `Vec` OF PAIRS WOULD NOT DO INSTEAD: `SdscCoreletSplit` finds a dim in the layout and
+    /// indexes THIS vector by that distance
+    /// (`dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:79`), and the two are linearized as separate
+    /// runs into the SuperDsc fingerprint (`dsc/superdsc.cpp:1451-1452`).
+    ///
+    /// ⛔ A NEGATIVE ENTRY IS ALSO WHAT MAKES A DIM UNBOUNDED IN `getPageSize`, and it wins over
+    /// every other entry of the same dim, erasing what earlier positions accumulated
+    /// (`dsc/dsc2.cpp:4498-4509`).
+    pub max_dim_sizes: Vec<Option<MaxDimSize>>,
+    /// Field: e028_AllocateNode.numBuffers_
+    ///
+    /// How many buffers the region holds (`dsc/dsc2.h:984`); see [`NumBuffers`] for the encoding and
+    /// [`NumBuffers::STREAMING`] for the one value bridge 1 tests.
+    pub num_buffers: NumBuffers,
+    /// Field: e028_AllocateNode.isStartAddrSymbolic_
+    ///
+    /// Whether the region's start address is a symbol rather than a placed address
+    /// (`dsc/dsc2.h:987`).
+    ///
+    /// ⛔ THE INDIRECT PATH REFUSES IT: `DT_CHECK(!indAllocation->isStartAddrSymbolic_)` before the
+    /// L3 scheduler reads an index allocation's address
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5882`).
+    pub is_start_addr_symbolic: bool,
+    /// Field: e028_AllocateNode.bufferOffsetCoreCorelet_
+    ///
+    /// The buffer stride per core and corelet (`dsc/dsc2.h:988`), written by `allocAllMem` beside
+    /// the start address (`ddc/ddcv1.cpp:351-356`) and read as `.at(coord.at(0)).at(corelet0Id)`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`). See [`BufferOffset`]: it is a stride
+    /// in bytes, not a base.
+    ///
+    /// ⭐ ORDERED, AND THE ORDER IS EXPORTED: the authority's nested `std::map`s print in key order
+    /// in the node's JSON (`dsc/dsc2.cpp:879-892`), which a [`BTreeMap`] reproduces. Both keys are
+    /// `int` there and non-negative in every writer — `allocAllMem` iterates real cores and corelets
+    /// (`ddc/ddcv1.cpp:351-356`) and the L3 scheduler writes `[coreId][coreletId]`
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4991`, `:5008`, `:5035`, `:5130`) — so unlike
+    /// [`back_gap_core`](Self::back_gap_core) this map has no `-1` pseudo-key and needs no
+    /// [`Option`].
+    pub buffer_offset_core_corelet: BTreeMap<CoreId, BTreeMap<CoreletId, BufferOffset>>,
+    /// Field: e028_AllocateNode.backGapCore_
+    ///
+    /// The gap left after each dim, per core (`dsc/dsc2.h:989`).
+    ///
+    /// ⛔ [`None`] IS THE AUTHORITY'S `-1`, WHICH IS HBM — the header says so ("HBM is -1") and
+    /// `getBufferCapacityForNodePerDimCustomLocation` `DT_CHECK`s that key present and reads only it
+    /// when the component is HBM, taking the first entry otherwise and requiring every used core to
+    /// agree, "only uniform LX back gap across cores is supported" (`dsc/dsc2.cpp:3937-3955`).
+    /// [`CoreId`] is unsigned, so the pseudo-core cannot be one, and `None` sorting before every
+    /// `Some` is the position `-1` takes in the authority's `std::map` — an order that reaches both
+    /// the node's JSON (`dsc/dsc2.cpp:893-906`) and the SuperDsc fingerprint
+    /// (`dsc/superdsc.cpp:1458-1464`).
+    ///
+    /// The gap is added to the dim's size in that dim's own currency, hence [`DimSize`]
+    /// (`dsc/dsc2.cpp:3956`); `buildUnitView` turns each core's entry into that core's
+    /// `sizesWithGaps_` (`dsc/dsc2.cpp:2900-2910`).
+    pub back_gap_core: BTreeMap<PrimaryDimTypes, BTreeMap<Option<CoreId>, DimSize>>,
+    /// Field: e028_AllocateNode.indirectAllocType_
+    ///
+    /// Which half of an indirect access this region is (`dsc/dsc2.h:990-994`); see
+    /// [`IndirectAllocType`].
+    pub indirect_alloc_type: IndirectAllocType,
+    /// Field: e028_AllocateNode.indexTensorType_
+    ///
+    /// What an index tensor's entries hold (`dsc/dsc2.h:995-998`); see [`IndexTensorType`]. It is
+    /// only meaningful under [`IndirectAllocType::IndexTensor`].
+    pub index_tensor_type: IndexTensorType,
+    /// Field: e028_AllocateNode.gapStickSpread_
+    ///
+    /// Per dim, how many sticks that dim's data is spread across (`dsc/dsc2.h:1006`); see
+    /// [`StickSpread`] for the multiplier/divisor split between its two readers.
+    ///
+    /// ⭐ ORDERED, AND THE ORDER IS EXPORTED (`dsc/dsc2.cpp:926-933`). ⛔ ITS EMPTINESS IS ITSELF A
+    /// TEST: `ddc/ddc_transformation.cpp:1716`, `:1723` gate a transformation on whether either side
+    /// of a transfer has any spread at all.
+    pub gap_stick_spread: BTreeMap<PrimaryDimTypes, StickSpread>,
+    /// Whether to place this region as a plain rectangle, ignoring the data stage's symbolic volume
+    /// limits — the authority's "force this allocation to be 'ghost rectangular'"
+    /// (`dsc/dsc2.h:1002-1003`).
+    ///
+    /// It gates the whole symbolic-volume collection in
+    /// `getBufferCapacityForNodePerDimCustomLocation` (`dsc/dsc2.cpp:3782`), where a gap on a dim
+    /// that still has a symbolic limit is refused, "Gaps on dims with symbolic volume limit not
+    /// handled" (`dsc/dsc2.cpp:3939-3940`). Its in-scope writer copies it from a reference
+    /// allocation (`dsc/designSpaceConfig.cpp:129-130`).
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, and none for
+    /// [`non_unified_alloc_in_hbm`](Self::non_unified_alloc_in_hbm) either: both are declared across
+    /// two lines with the initialiser on the second. Both have in-scope readers.
+    pub ignore_symbolic_volume_limits: bool,
+    /// Whether each core's slice of an HBM region lives somewhere different — the authority's "HBM
+    /// allocation for each core is residing in different locations" (`dsc/dsc2.h:1004-1005`).
+    ///
+    /// ⛔ IT IS THE EXEMPTION FROM HBM'S FORCED `N_` SIZE: `getSizeDataStageForNode` returns `N_` in
+    /// both data-stage halves for an HBM allocation ONLY while this is clear, and otherwise falls
+    /// through to the ordinary sizing (`dsc/dsc2.cpp:3624-3633`).
+    ///
+    /// ⛔ NO IN-SCOPE WRITER SETS IT. Its only writer tree-wide is the perf-DSC translator
+    /// (`dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:1870`), which this campaign does not scope,
+    /// so on our path it is whatever the JSON importer read (`dsc/dsc2.cpp:1804-1805`).
+    pub non_unified_alloc_in_hbm: bool,
+}
+
+impl Default for AllocateNode {
+    /// The authority's member initialisers (`dsc/dsc2.h:976-1005`).
+    ///
+    /// ⛔ IT IS NOT `AllocateNode()`: that constructor also passes `ALLOCATE` to the base class
+    /// (`dsc/dsc2.h:975`), and `nodeType_` is `ScheduleNode`'s, e013's to port.
+    fn default() -> Self {
+        Self {
+            lds_idx: None,
+            const_idx: None,
+            component: SenComponent::NoComponent,
+            padding: PaddingFormType::default(),
+            layout_dim_order: Vec::new(),
+            max_dim_sizes: Vec::new(),
+            num_buffers: NumBuffers(1),
+            is_start_addr_symbolic: false,
+            buffer_offset_core_corelet: BTreeMap::new(),
+            back_gap_core: BTreeMap::new(),
+            indirect_alloc_type: IndirectAllocType::NoIndirection,
+            index_tensor_type: IndexTensorType::Address,
+            gap_stick_spread: BTreeMap::new(),
+            ignore_symbolic_volume_limits: false,
+            non_unified_alloc_in_hbm: false,
+        }
+    }
+}
+
+// crustify:todo: e028_AllocateNode
+
+// crustify:todo: e028_AllocateNode.allocUsers_
+
+// crustify:todo: e028_AllocateNode.allocateCoordinates_
+
+// crustify:todo: e028_AllocateNode.sliceViewCoordinates_
+
+// crustify:todo: e028_AllocateNode.startAddressCoreCorelet_
+
+// crustify:todo: e028_AllocateNode.tempStorageForCompute_
