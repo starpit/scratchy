@@ -139,7 +139,7 @@ pub struct SizeIdx(pub u32);
 /// elements in that dim (e.g. 4 mb)" per loop and dim (`dsc/dsc2.h:730-734`), which
 /// `calculateSizeIdxAndOffset` then DIVIDES down by the running product of the extents it has already
 /// passed, so what is stored is the step in units of the extent at
-/// [`LoopInfo::size_idx`] (`dsc/dsc2.cpp:2731-2746`).
+/// [`LoopInfo::size_idx`] (`dsc/dsc2.cpp:2732-2746`).
 ///
 /// ⛔ AND IT IS REWRITTEN AFTER THAT: when a gap spreads the extent this loop steps, the gap pass
 /// multiplies the stored value by that dim's `gapStickSpread_` (`dsc/dsc2.cpp:2880-2897`) — so the
@@ -2431,7 +2431,7 @@ mod unit_tests {
     }
 
     /// ⛔ ONE FLAG, TWO OPPOSITE VERDICTS: bridge 1 emits `is_symbol` exactly when it is set
-    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:514-516`) and the PCFG
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:515-516`) and the PCFG
     /// translator `DT_CHECK`s that it is NOT (`dsc/dsc2Pcfg.cpp:1366`, `:1945`), so `stzJumpAddr`
     /// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1151-1154`) is a constant one consumer
     /// emits and the other refuses.
@@ -2599,10 +2599,10 @@ mod unit_tests {
         assert_eq!(props[1].label(), "chunk_index");
     }
 
-    /// `isNodeRelevant`'s component reading against the map the authority's own writer builds
-    /// (`dsc/dsc2.cpp:2689-2694`), and the divergence between it and `getRelevantComps`: a core
-    /// present with an EMPTY corelet set is relevant to the first and invisible to the second
-    /// (`dsc/dsc2.cpp:1929-1931` against `:1964-1967`).
+    /// `isNodeRelevant`'s component reading, and the divergence between it and `getRelevantComps`: a
+    /// core present with an EMPTY corelet set is relevant to the first and invisible to the second
+    /// (`dsc/dsc2.cpp:1929-1931` against `:1964-1967`). The state is hand-built here; the writer that
+    /// actually mints it is the subject of the test below.
     #[test]
     fn a_core_with_no_corelets_is_relevant_but_absent_from_get_relevant_comps() {
         let mut node = ScheduleNode::new(NodeType::Transfer);
@@ -2640,6 +2640,62 @@ mod unit_tests {
         assert_eq!(
             node.relevant_comps_any_core(),
             BTreeSet::from([SenComponent::Lx])
+        );
+    }
+
+    /// ⭐ THE WRITER THAT MINTS AN EMPTY CORELET SET, the one `setRelevantCompCoreCl` cannot be: the
+    /// importer's head-node union over a child whose own core came from `"1":[]`
+    /// (`dsc/dsc2.cpp:1373-1382`, `:1389-1395`). The head it leaves behind still satisfies
+    /// `DT_CHECK(!getHead()->relevantComps_.empty())` (`ddc/ddcv1.cpp:3458`).
+    #[test]
+    fn the_head_union_mints_an_empty_corelet_set_that_the_ddcs_check_still_accepts() {
+        // Two children as the importer built them: `{"LX": {"0": [0], "1": []}}`, `{"L0": {"0": [1]}}`.
+        let mut child_a = ScheduleNode::new(NodeType::Transfer);
+        child_a.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([
+                (CoreId(0), BTreeSet::from([CoreletId(0)])),
+                (CoreId(1), BTreeSet::new()),
+            ]),
+        );
+        let mut child_b = ScheduleNode::new(NodeType::Compute);
+        child_b.relevant_comps_mut().insert(
+            SenComponent::L0,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(1)]))]),
+        );
+
+        // `:1389-1395`, with `entry().or_default()` standing in for `operator[]`: the core's entry is
+        // created before the range goes in, so an empty range leaves it empty.
+        let mut head = ScheduleNode::new(NodeType::Block);
+        for child in [&child_a, &child_b] {
+            for (comp, core_cls) in child.relevant_comps() {
+                let head_comp = head.relevant_comps_mut().entry(*comp).or_default();
+                for (core, cls) in core_cls {
+                    head_comp
+                        .entry(*core)
+                        .or_default()
+                        .extend(cls.iter().copied());
+                }
+            }
+        }
+
+        assert_eq!(
+            head.relevant_comps()[&SenComponent::Lx][&CoreId(1)],
+            BTreeSet::new()
+        );
+        // `ddc/ddcv1.cpp:3458` tests the MAP, which is non-empty whatever the corelet sets hold.
+        assert!(!head.relevant_comps().is_empty());
+
+        // And the three readers disagree about that core on the HEAD node too.
+        assert!(
+            head.relevant_cores(SenComponent::Lx)
+                .is_some_and(|cores| cores.contains_key(&CoreId(1)))
+        );
+        assert!(head.relevant_comps_of_core(CoreId(1)).is_empty());
+        assert!(
+            !head
+                .relevant_core_cl_of_comp(SenComponent::Lx)
+                .contains_key(&CoreId(1))
         );
     }
 
@@ -3040,6 +3096,13 @@ pub struct ScheduleNode {
     /// Which kind of node this is (`dsc/dsc2.h:460`). PRIVATE because the authority's is `const`:
     /// it is fixed by the constructor and there is no path that rewrites it, which is what lets the
     /// JSON exporter and importer dispatch on it (`dsc/dsc2.cpp:376-377`, `:1337-1358`).
+    ///
+    /// ⚠️ AND C++ CANNOT SPELL A WHOLE-VALUE OVERWRITE AT ALL, WHERE RUST CAN. The `const` member
+    /// deletes the implicitly-declared copy assignment and the class declares none
+    /// (`dsc/dsc2.h:444-524`), so the authority copies a node only through the pure-virtual `clone()`
+    /// (`:484`) — which is what [`Clone`] is here. A holder of `&mut ScheduleNode` can still write
+    /// `*node = ScheduleNode::new(other)`, and no Rust construct forbids that; it is the one way this
+    /// field moves, and it moves the whole node with it.
     node_type: NodeType,
     /// Field: e029_ScheduleNode.name_
     /// Field: e013_ScheduleNode.name_
@@ -3075,14 +3138,27 @@ pub struct ScheduleNode {
     /// writer, nor from the importer that rebuilds it key by key (`:1373-1382`), which is why
     /// [`Self::is_relevant`] answers it from the authority's early return instead of a lookup.
     ///
-    /// ⛔ AN EMPTY CORELET SET IS A REAL STATE AND THE TWO READERS DISAGREE ABOUT IT. The writer
-    /// reaches it through `operator[]`: `relCoreCls[core].insert(cls.begin(), cls.end())` creates the
-    /// core's entry before it inserts anything, so a core the `NO_COMPONENT` map carries with no
-    /// corelets is created empty under the real component too (`dsc/dsc2.cpp:2692-2694`). Then
+    /// ⛔ AN EMPTY CORELET SET IS A REAL STATE AND THE THREE READERS DISAGREE ABOUT IT.
     /// `isNodeRelevant(comp, -1, coreId)` returns true on nothing but that core's PRESENCE
     /// (`:1929-1931`), while `getRelevantComps(coreId)` requires `!clSet.empty()` (`:1964-1967`) and
     /// `getRelevantCoreCl` drops such a core from its result altogether (`:1940-1942`). So neither
     /// reader can be composed out of the other, and both are ported.
+    ///
+    /// ⛔ BUT `setRelevantCompCoreCl` IS NOT THE WRITER THAT MINTS IT — THREE GUARDS CLOSE THAT
+    /// ROUTE. `relCoreCls[core].insert(cls.begin(), cls.end())` does create the core's entry before
+    /// it inserts anything (`:2692-2694`), but its `cls` comes from the `NO_COMPONENT` map, and every
+    /// core there is seeded `coreCorelets[coreId] = clIds` with `clIds` never empty (`:2648`,
+    /// `:2652`); a condition node's then-branch `emplace`s only a NON-EMPTY intersection (`:2671`),
+    /// and its else-branch ERASES a core whose difference came out empty (`:2681`). So that `insert`
+    /// always carries at least one corelet.
+    ///
+    /// ⭐ THE WRITER THAT DOES MINT IT IS THE JSON IMPORTER, AND THE STATE ROUND-TRIPS: `auto& core =
+    /// comp[std::stoi(corePair.first)]` creates the core from the key alone, and an empty `[]` leaves
+    /// it empty (`:1373-1382`) — which the exporter writes straight back out as `"0":[]`
+    /// (`:387-393`). The head node's union over its children mints it a second time — an empty `cls`
+    /// in `headComp[core].insert(cls.begin(), cls.end())` (`:1389-1395`) — on the one node the ddc
+    /// then `DT_CHECK`s, and an empty corelet set satisfies that check because what it tests is that
+    /// the MAP is non-empty (`ddc/ddcv1.cpp:3458`).
     relevant_comps: BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>>,
 }
 
@@ -3117,9 +3193,9 @@ impl ScheduleNode {
     ///
     /// ⛔ THE CORE- AND CORELET-FILTERED READINGS ARE [`Self::relevant_cores`]'s, NOT THIS ONE'S. The
     /// authority's `DT_ERROR("Cannot filter node by clId/coreId and not by SenComponent")`
-    /// (`:1919-1921`) fires for one argument combination — a core or corelet filter beside a
-    /// component filter of `ALL` — and no function here takes both a component and a core, so that
-    /// combination cannot be spelled. `isNodeRelevant(comp, -1, coreId)` is
+    /// (`dsc/dsc2.cpp:1919-1921`) fires for one argument combination — a core or corelet filter
+    /// beside a component filter of `ALL` — and no function here takes both a component and a core,
+    /// so that combination cannot be spelled. `isNodeRelevant(comp, -1, coreId)` is
     /// `relevant_cores(comp).is_some_and(|cores| cores.contains_key(&core))` and
     /// `isNodeRelevant(comp, clId, coreId)` continues into the corelet set — the two readings the
     /// bridge's sync lowering and the tree traversals call for
@@ -3253,10 +3329,11 @@ impl ScheduleNode {
     /// The write side, which those same friends need: `setRelevantCompCoreCl` writes and reads the
     /// `NO_COMPONENT` entry and then fills the real components (`dsc/dsc2.cpp:2647-2729`),
     /// `finalizeScheduleTree` erases that entry (`:2977-2980`), the tree importer builds the map key
-    /// by key (`:1373-1382`), and the work split copies a node's whole map onto its clone (`:5355`).
+    /// by key (`:1373-1382`) and then unions every child's into the HEAD's (`:1389-1395`), and the
+    /// work split copies a node's whole map onto its clone (`:5355`).
     ///
     /// ⛔ THE FIELD IS UNWRITEABLE WITHOUT IT, and a carried field with no writer is the defect this
-    /// campaign already booked once: every one of those four writers is a method of a type whose own
+    /// campaign already booked once: every one of those five writers is a method of a type whose own
     /// anchor is still open, so this accessor is what they will write through rather than something
     /// added for them later.
     pub fn relevant_comps_mut(
@@ -3296,7 +3373,7 @@ pub struct UnitView {
     /// positionally against `srcSizeIdx_`/`dstSizeIdx_`
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:333-349`), and
     /// `calculateSizeIdxAndOffset` divides the offset down by the running product of the entries it
-    /// has passed (`dsc/dsc2.cpp:2731-2746`). Innermost-first is what the gap writer relies on when
+    /// has passed (`dsc/dsc2.cpp:2732-2746`). Innermost-first is what the gap writer relies on when
     /// it takes the HIGHEST index of a repeated dim as the outermost one (`:2905-2924`).
     pub sizes_no_gaps: Vec<Size>,
     /// Field: e029_ScheduleNode.compositeLoops_
@@ -3339,7 +3416,8 @@ impl UnitView {
     /// extents if it has any, else HBM's `-1` entry, else the gapless view. Bridge 1 reads it for
     /// the core it is lowering for, at nine sites
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:872`, `:1227`, `:1413`, `:1528`,
-    /// `:2076`, `:2356`, `:2447`, `SNComputeLowering.cpp:575`, `:843`).
+    /// `:2076`, `:2356`, `:2447`, and
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:575`, `:843`).
     ///
     /// ⭐ THE FALLBACK CHAIN IS WHY THE WILDCARD CANNOT BE ASKED FOR AS A CORE: taking a [`CoreId`]
     /// makes the authority's `getSizesForCoreId(-1)`, which would find the pseudo-key by its first
@@ -3377,13 +3455,15 @@ pub struct LoopInfo {
     /// Field: e013_ScheduleNode.sizeIdx_
     ///
     /// Which entry of [`UnitView::sizes_no_gaps`] this loop steps (`dsc/dsc2.h:503`), as
-    /// `calculateSizeIdxAndOffset` resolved it (`dsc/dsc2.cpp:2731-2746`).
+    /// `calculateSizeIdxAndOffset` resolved it (`dsc/dsc2.cpp:2732-2746`).
     ///
-    /// ⛔ [`None`] IS THE AUTHORITY'S `-1` AND IT IS REACHABLE IN A STORED ENTRY: a loop that touches
-    /// none of the data structure's dims is pushed as `{currLoop, dim, -1, -1}`
-    /// (`dsc/dsc2.cpp:2872`). The gap rescale then multiplies the offset of every entry whose
-    /// `sizeIdx_ == i` for a gapped layout entry `i` (`dsc/dsc2.cpp:2880-2897`), a test the `-1`
-    /// silently fails and a [`None`] cannot be mistaken for a position.
+    /// ⛔ [`None`] IS THE AUTHORITY'S `-1` AND IT IS REACHABLE IN A STORED ENTRY, BY EXACTLY ONE
+    /// ROUTE: a loop that touches none of the data structure's dims is pushed as
+    /// `{currLoop, dim, -1, -1}` WITHOUT the call (`dsc/dsc2.cpp:2872`) — the only way, because
+    /// `calculateSizeIdxAndOffset` ends in `DT_CHECK(sizeIdx >= 0)` (`:2746`) and so never returns
+    /// one. The gap rescale then multiplies the offset of every entry whose `sizeIdx_ == i` for a
+    /// gapped layout entry `i` (`:2880-2897`), a test the `-1` silently fails and a [`None`] cannot
+    /// be mistaken for a position.
     pub size_idx: Option<SizeIdx>,
     /// Field: e029_ScheduleNode.elemOffset_
     /// Field: e013_ScheduleNode.elemOffset_
@@ -7355,10 +7435,10 @@ impl AllocateNode {
 /// [`AllocateNode::const_idx`] points back at (`dsc/designSpaceConfig.h:90`).
 ///
 /// ⛔ THIS CARRIES 3 OF CONSTANTINFO'S 5 FIELDS, so the `e028_ConstantInfo` and `e030_ConstantInfo`
-/// anchors below stay open. `data_` (`:49-50`) is a `FoldManager<std::vector<int64_t>>`, and
-/// `util/foldManager/` is the blocker e008 and e012 are already held by — the re-scheduled
-/// `e028_ConstantInfo` no longer lists that field at all, so only the `e030` anchor still names it.
-/// `allocations_` (`:52`) is a
+/// anchors below stay open. `data_` (`dsc/dsc2.h:49-50`) is a
+/// `FoldManager<std::vector<int64_t>>`, and `util/foldManager/` is the blocker e008 and e012 are
+/// already held by — the re-scheduled `e028_ConstantInfo` no longer lists that field at all, so only
+/// the `e030` anchor still names it. `allocations_` (`dsc/dsc2.h:52`) is a
 /// `std::map<SenComponents, AllocateNode*>` of NON-OWNING aliases into the schedule tree: the DDL
 /// conversion hangs the minted node on its parent block and aliases it here in the same breath
 /// (`ddc/ddl/ddl_conversion.cpp:826-832`), and the PE/SFP work split clones a node into a second
@@ -7388,12 +7468,12 @@ impl AllocateNode {
 /// `nullptr` for both under `allowMissingAlloc` and `DT_ERROR`ing otherwise.
 ///
 /// ⛔ ITS ONE METHOD STAYS OUT WITH THOSE TWO FIELDS: the copy assignment's four member assignments
-/// are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)` (`:54-60`), so two of the
-/// four are unported. It calls `clone` rather than `data_ = rhs.data_` because `FoldManager`'s own
-/// assignment `DT_ERROR`s unless the two fold spaces already agree in dimensionality and cardinality
-/// (`util/foldManager/foldInfrastructure.h:922-933`), which a fresh destination never does; `clone`
-/// destroys the destination's fold space and rebuilds it (`:987`). See
-/// [`is_data_symbolic`](Self::is_data_symbolic) for the field that assignment drops.
+/// are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)` (`dsc/dsc2.h:54-60`), so
+/// two of the four are unported. It calls `clone` rather than `data_ = rhs.data_` because
+/// `FoldManager`'s own assignment `DT_ERROR`s unless the two fold spaces already agree in
+/// dimensionality and cardinality (`util/foldManager/foldInfrastructure.h:922-933`), which a fresh
+/// destination never does; `clone` destroys the destination's fold space and rebuilds it (`:987`).
+/// See [`is_data_symbolic`](Self::is_data_symbolic) for the field that assignment drops.
 ///
 /// ⛔ NO `PartialEq`: the authority's own duplicate test compares `name_`, `dataFormat_` AND the
 /// datum's element count (`ddc/ddl/ddl_conversion.cpp:706-714`), so an equality over the carried
@@ -7466,8 +7546,8 @@ pub struct ConstantInfo {
     ///
     /// ⭐ BRIDGE 1 IS ONE READER: it becomes the `is_symbol` attribute on the emitted
     /// `ConstantBitstreamOp`, on the single-fold path and on every per-fold one
-    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:514-516`, reached from
-    /// `SNTransferLowering.cpp:2492-2496`).
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:515-516`, reached from
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2492-2496`).
     ///
     /// ⛔ AND IT IS A REFUSAL PREDICATE, NOT ONLY AN ATTRIBUTE: the PCFG translator `DT_CHECK`s
     /// `!constInfo.isDataSymbolic_` before cloning the datum, on the transfer-to-constant path and
