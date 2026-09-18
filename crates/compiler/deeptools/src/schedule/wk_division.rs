@@ -1,1 +1,1150 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
+//!
+//! How one folded dimension's work is divided across a core gang, and the size and element
+//! coordinates each core then sees (`util/foldManager/wkDivisionParams.h:19-456`).
+//!
+//! ⛔ THE AUTHORITY PATH IS `util/foldManager/wkDivisionParams.h`, NOT the `ddc/wkDivisionParams.h`
+//! `crustify-scheduler/UNITS.tsv` cites for this unit: no such file exists in the tree. Every
+//! bare `:NNN` citation below is a line of that header.
+//!
+//! ⭐ FIELDS STAY `int32_t`-SHAPED; COMPUTED SPANS AND COORDINATES WIDEN TO `i64`. The one consumer
+//! reaches this type with an `int64_t` fold dim index and takes `std::vector<std::pair<int64_t,
+//! int64_t>>` back (`util/foldManager/foldInfrastructure.h:838`, `:844`), so IBM's implicit
+//! narrowing at that call and its `int32_t` coordinate arithmetic are widened instead of copied.
+//! No real core index or work size comes near either bound.
+
+// ⛔ EIGHT OF THE TWENTY-SIX FIELD ANCHORS THE SCHEDULER WROTE FOR THIS UNIT NAME METHOD-BODY
+// LOCALS, NOT DECLARED FIELDS. They are removed rather than invented as state, which Rules 2 and 5
+// of crustify-scheduler/AGENT-BRIEF.md forbid; the field census matched `Type name = init;` inside
+// a body. Named here so the removal is not silent:
+//   offset_cid      `:197`          local of getSliceId
+//   slid            `:213`          local of getSliceId
+//   vsize           `:241`, `:447`  locals of getSize and getCoord
+//   coord_vec       `:252`          local of getCoordVec
+//   cumRunningSize  `:256`          local of getCoordVec
+//   myRealCoord     `:266`          local of getCoordVec
+//   start_vcoord    `:434`          local of getCoord
+//   end_vcoord      `:435`          local of getCoord
+// The other eighteen are this type's fourteen declared fields (`:379-420`) plus the four of its
+// nested `StrWinPad` (`:21-26`), which the scheduler flattened onto the owner.
+
+/// One core index — IBM's `cid` (`:145`).
+///
+/// ⛔ NOT `sys_arch_spec::CoreId`, which is a `u8`: the sole consumer passes a fold dim index, an
+/// `int64_t` (`util/foldManager/foldInfrastructure.h:838`), and `adjustCID` is written to be
+/// reached with a negative (`:146`), so a `u8` would force a fallible narrowing at the seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cid(pub i64);
+
+/// Work done by one steady-state core (`:382`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WkSs(pub i32);
+
+/// Work done by one epilogue core (`:383`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WkEpilogue(pub i32);
+
+/// The work one core does, as `getSize` reports it for either kind of slice (`:235-248`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WkSize(pub i64);
+
+/// How many cores the gang has — `seidGangs.at(seGangId).size()` at the producer
+/// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1978`, stored at `:386`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaxCores(pub i32);
+
+/// How many cores get steady-state work (`:391`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumSsSlices(pub i32);
+
+/// How many cores get epilogue work (`:392`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumEpilogueSlices(pub i32);
+
+/// Gap cores after all work slices are passed, IBM's `GapAfterFullWkSl` (`:407-412`).
+///
+/// ⭐ UNGUARDED WHERE ITS SIBLINGS ARE NOT: it is the only gap that never divides. It is added last
+/// (`:172-173`), and a negative can only shrink the covered span that
+/// [`slice_id`](WkSplitParam::slice_id) range-tests, never make a divisor zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GapAfterAllSlices(pub i32);
+
+/// Which work slice a core runs (`:213`, `:226`).
+///
+/// ⛔ NOT `dsc2::SliceId`, which counts a stick's slices. This one counts a dimension's work
+/// slices, and the two are indexed by unrelated things.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WkSliceId(pub i64);
+
+/// Cores spanned by some run of work slices — what `getSingleSliceInnerLength` and
+/// `getFullInnerLength` return (`:155`, `:169`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CoreSpan(pub i32);
+
+/// One end of a core's range in the dimension's VIRTUAL, gap-free element space (`:434-435`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct VCoord(pub i64);
+
+/// The virtual element range one core covers, inclusive at both ends — `getCoord`'s pair (`:454`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VCoordRange {
+    /// First virtual element, `start_vcoord`.
+    pub start: VCoord,
+    /// Last virtual element, `end_vcoord`.
+    pub end: VCoord,
+}
+
+/// One end of a range in the dimension's REAL element space (`:266`, `:418`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Coord(pub i64);
+
+/// A real element range, inclusive at both ends — one entry of `real_coordinates_` (`:418`) and one
+/// entry of what `getCoordVec` returns (`:250`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoordRange {
+    /// First real element, `pair.first`.
+    pub start: Coord,
+    /// Last real element, `pair.second`.
+    pub end: Coord,
+}
+
+impl CoordRange {
+    /// What a gap core's coordinate is — `getCoord`'s `std::make_pair(-1, -1)` (`:432`), pushed as
+    /// the one and only entry of the vector a gap core gets back (`:253-254`).
+    ///
+    /// ⛔ NOT AN ABSENCE THE CONSUMERS CAN IGNORE: the vendor's own goldens assert this pair on
+    /// nine of sixteen cores (`util/foldManager/test/test_fold_infrastructure.cpp:240-249`), so it
+    /// stays a named value rather than becoming an `Option`.
+    pub const GAP: Self = Self {
+        start: Coord(-1),
+        end: Coord(-1),
+    };
+
+    /// The identity conversion IBM performs when there is no real coordinate table: with
+    /// `real_coordinates_` empty the "real" coordinates ARE the virtual ones, widened (`:253-254`).
+    pub const fn from_virtual(range: VCoordRange) -> Self {
+        Self {
+            start: Coord(range.start.0),
+            end: Coord(range.end.0),
+        }
+    }
+}
+
+/// Whether a span includes its trailing gap cores — IBM's `with_gap`, which both call sites that
+/// omit it default to `true` (`:155`, `:169`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithGap {
+    /// Count the trailing gap cores.
+    Yes,
+    /// Leave them out.
+    No,
+}
+
+/// Gap cores after each valid core assignment, IBM's `gap_within_inner_repeat_` (`:395-396`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NEGATIVE, AND THAT IS WHAT MAKES TWO DIVISIONS SAFE. `-1` sends
+/// `offset_cid % (gap_within_inner_repeat_ + 1)` (`:222`) to a zero divisor outright, and takes
+/// `(gap_within_inner_repeat_ + 1) * repeat_factor_inner_` (`:157`) to zero with it, which is the
+/// divisor at `:213`. IBM checks neither; the producer passes a gap count
+/// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2065`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GapWithinInnerRepeat(i32);
+
+impl GapWithinInnerRepeat {
+    /// No gap after a valid core — the declared initialiser (`:395`) and what the producer passes
+    /// whenever `innerGap` is zero.
+    pub const NONE: Self = Self(0);
+
+    /// A gap core count, or absent for the negative that would divide by zero.
+    pub fn new(gap: i32) -> Option<Self> {
+        (gap >= 0).then_some(Self(gap))
+    }
+
+    /// The stored count.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Cores sharing one work slice, IBM's `NumInnerSameWkSl` (`:398-400`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NON-POSITIVE, so IBM's `DT_CHECK(repeat_factor_inner_ > 0)` (`:133`)
+/// is unreachable and the `/` at `:213` cannot divide by zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepeatFactorInner(i32);
+
+impl RepeatFactorInner {
+    /// One core per work slice.
+    pub const ONE: Self = Self(1);
+
+    /// A repeat factor, or absent for the non-positive IBM aborts on.
+    pub fn new(factor: i32) -> Option<Self> {
+        (factor > 0).then_some(Self(factor))
+    }
+
+    /// The stored factor.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Gap cores after every run of cores sharing a work slice, IBM's `GapAfterInnerSameWkSl`
+/// (`:401-405`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NEGATIVE: it is summed into the `/` divisor at `:213` (`:157-158`),
+/// where a negative can cancel `(gap_within + 1) * repeat_factor_inner` to zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GapAfterInnerRepeat(i32);
+
+impl GapAfterInnerRepeat {
+    /// No gap after a shared work slice — the declared initialiser (`:401`), and all the producer
+    /// ever passes (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2066`).
+    pub const NONE: Self = Self(0);
+
+    /// A gap core count, or absent for a negative.
+    pub fn new(gap: i32) -> Option<Self> {
+        (gap >= 0).then_some(Self(gap))
+    }
+
+    /// The stored count.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// How many times the full set of work slices repeats across the gang, IBM's `RepeatFullWkSl`
+/// (`:414-415`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NON-POSITIVE, so IBM's `DT_CHECK(outer_repeat_factor_ > 0)` (`:132`)
+/// is unreachable — including from `build(const WkSplitParam&)`, which is where it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OuterRepeatFactor(i32);
+
+impl OuterRepeatFactor {
+    /// The slices are laid down once.
+    pub const ONE: Self = Self(1);
+
+    /// A repeat factor, or absent for the non-positive IBM aborts on.
+    pub fn new(factor: i32) -> Option<Self> {
+        (factor > 0).then_some(Self(factor))
+    }
+
+    /// The stored factor.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// The step between consecutive windows, `dimToStride_` at the producer
+/// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2088`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NON-POSITIVE. `start_vcoord * stride_` (`:450`) turns a negative into
+/// negative coordinates, which `getCoordVec` then reads as its gap sentinel (`:253`), and a zero
+/// collapses every core onto element 0. IBM leaves the declared `-1` (`:23`) live whenever
+/// `isStrWinPad_` is false; here that state is [`None`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Stride(i32);
+
+impl Stride {
+    /// A stride, or absent for the non-positive that would produce negative or collapsed
+    /// coordinates.
+    pub fn new(stride: i32) -> Option<Self> {
+        (stride > 0).then_some(Self(stride))
+    }
+
+    /// The stored stride.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// How many elements one window covers, `dimToWindowSize_` at the producer
+/// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2089`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NON-POSITIVE: it is the whole of a one-element slice's expanded size
+/// (`:243-244`), so a zero gives a core no work while `getSliceId` still claims it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Window(i32);
+
+impl Window {
+    /// A window size, or absent for a non-positive.
+    pub fn new(window: i32) -> Option<Self> {
+        (window > 0).then_some(Self(window))
+    }
+
+    /// The stored size.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// Garbage padding the windowed op reads past its last window
+/// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2090-2095`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NEGATIVE, which is the producer's own clamp: it writes `0` and only
+/// then overwrites with `garbagePadding` if that is positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtraBack(i32);
+
+impl ExtraBack {
+    /// Nothing read past the last window — the declared initialiser (`:25`).
+    pub const NONE: Self = Self(0);
+
+    /// An extra-padding count, or absent for a negative.
+    pub fn new(extra_back: i32) -> Option<Self> {
+        (extra_back >= 0).then_some(Self(extra_back))
+    }
+
+    /// The stored count.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// A strided, windowed, padded dimension's expansion parameters — IBM's nested `StrWinPad`
+/// (`:21-26`).
+///
+/// ⛔ NO `Default`, DELIBERATELY: IBM's `StrWinPad swp;` is the OFF state, and the OFF state here is
+/// [`None`] in [`WkSplitParam::swp_info`], not a value of this type. A `Default` would spell it
+/// `stride_ = -1`, which [`Stride`] refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrWinPad {
+    /// Field: e011_WkSplitParam.stride_
+    ///
+    /// The step between consecutive windows (`:23`).
+    pub stride: Stride,
+    /// Field: e011_WkSplitParam.window_
+    ///
+    /// How many elements one window covers (`:24`).
+    pub window: Window,
+    /// Field: e011_WkSplitParam.extra_back_
+    ///
+    /// Garbage padding past the last window (`:25`).
+    pub extra_back: ExtraBack,
+}
+
+/// Replaces: e011_WkSplitParam
+///
+/// One folded dimension's work division across a core gang (`:19-456`).
+///
+/// ⛔ `isBuilt_` IS THE TYPE'S EXISTENCE, SO THERE IS NO `Default`. IBM's `build(const
+/// WkSplitParam&)` sets `isBuilt_ = true` and then checks the fields it copied (`:123-124`), so
+/// merging a default-constructed source aborts on `DT_CHECK(outer_repeat_factor_ > 0)` — reachable
+/// from the fold merge sites (`util/foldManager/foldInfrastructure.h:1071`, `:2515`). A holder keeps
+/// an `Option<WkSplitParam>`; the unbuilt state is that `None` and the abort is inexpressible.
+/// See [`unbuilt_meta_data`](Self::unbuilt_meta_data) for its one surviving observable effect.
+///
+/// ⭐ EVERY CONSTRUCTOR ARGUMENT HAS A DISTINCT TYPE, so none of IBM's eleven adjacent `int32_t`s
+/// can be transposed without an `E0308` — the two vendor fixtures alone pass eleven positional
+/// integers each (`util/foldManager/test/test_fold_infrastructure.cpp:161-165`, `:222-226`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WkSplitParam {
+    /// Field: e011_WkSplitParam.wk_ss_
+    ///
+    /// Work done by each steady-state core (`:382`).
+    wk_ss: WkSs,
+    /// Field: e011_WkSplitParam.wk_epilogue_
+    ///
+    /// Work done by each epilogue core (`:383`).
+    wk_epilogue: WkEpilogue,
+    /// Field: e011_WkSplitParam.max_cores_
+    ///
+    /// The gang's core count (`:386`).
+    max_cores: MaxCores,
+    /// Field: e011_WkSplitParam.start_cid_offset_
+    ///
+    /// The core index work starts at (`:387`); always `0` at the sole producer
+    /// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1979`).
+    start_cid_offset: Cid,
+    /// Field: e011_WkSplitParam.num_ss_slices_
+    ///
+    /// How many cores get steady-state work (`:391`).
+    num_ss_slices: NumSsSlices,
+    /// Field: e011_WkSplitParam.num_epilogue_slices_
+    ///
+    /// How many cores get epilogue work (`:392`).
+    num_epilogue_slices: NumEpilogueSlices,
+    /// Field: e011_WkSplitParam.gap_within_inner_repeat_
+    ///
+    /// Gap cores after each valid core assignment (`:395-396`).
+    gap_within_inner_repeat: GapWithinInnerRepeat,
+    /// Field: e011_WkSplitParam.repeat_factor_inner_
+    ///
+    /// Cores sharing one work slice (`:398-400`).
+    repeat_factor_inner: RepeatFactorInner,
+    /// Field: e011_WkSplitParam.gap_after_inner_repeat_
+    ///
+    /// Gap cores after each run of sharing cores (`:401`).
+    gap_after_inner_repeat: GapAfterInnerRepeat,
+    /// Field: e011_WkSplitParam.gap_after_all_slices_
+    ///
+    /// Gap cores after all work slices are passed (`:407`).
+    gap_after_all_slices: GapAfterAllSlices,
+    /// Field: e011_WkSplitParam.outer_repeat_factor_
+    ///
+    /// How many times the full set of work slices repeats (`:414`).
+    outer_repeat_factor: OuterRepeatFactor,
+    /// Field: e011_WkSplitParam.real_coordinates_
+    ///
+    /// The dimension's valid element ranges, in order, when it is not densely covered (`:418`,
+    /// filled at `dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2069-2074`). Empty means the
+    /// virtual space IS the real one.
+    real_coordinates: Vec<CoordRange>,
+    /// Field: e011_WkSplitParam.swp_info_
+    ///
+    /// Field: e011_WkSplitParam.isStrWinPad_
+    ///
+    /// The strided-window expansion, absent when there is none (`:420`).
+    ///
+    /// ⛔ TWO ANCHORS ON ONE FIELD BECAUSE `isStrWinPad_` (`:22`) IS THIS `Option`'S DISCRIMINANT.
+    /// The collapse is lossless against the only producer, which writes all three payload fields
+    /// inside the one branch that sets the flag and leaves all four declared
+    /// (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:2085-2096`).
+    /// ⚠️ DELIBERATE DIVERGENCE, AND IT IS IN `operator==` AND `printMetaData`: IBM compares and
+    /// prints `stride_`, `window_` and `extra_back_` even when the flag is false (`:351-354`,
+    /// `:316-319`), so a param carrying a live payload under a false flag is unequal to one
+    /// carrying the declared `-1`s. Only `perfdsc`'s JSON importer can build that, reading the four
+    /// fields independently (`perfdsc/perfDscImportHelper.h:145-151`); no ported path can, and
+    /// [`print_meta_data`](Self::print_meta_data) renders `None` as IBM's declared initialisers.
+    swp_info: Option<StrWinPad>,
+}
+
+impl WkSplitParam {
+    /// The field names `printMetaData` emits, in order (`:296-314`).
+    const META_DATA_FIELDS: [&'static str; 12] = [
+        "isBuilt_",
+        "wk_ss_",
+        "wk_epilogue_",
+        "max_cores_",
+        "start_cid_offset_",
+        "num_ss_slices_",
+        "num_epilogue_slices_",
+        "gap_within_inner_repeat_",
+        "repeat_factor_inner_",
+        "gap_after_inner_repeat_",
+        "gap_after_all_slices_",
+        "outer_repeat_factor_",
+    ];
+
+    /// IBM's thirteen-argument `build` and the constructor that delegates to it (`:50-61`,
+    /// `:85-107`), with `checkLegality` (`:131-136`) as the refusal.
+    ///
+    /// ⛔ THE THIRD `DT_CHECK` IS THE ONLY ONE LEFT HERE: `RepeatFactorInner` and
+    /// `OuterRepeatFactor` refuse a non-positive at their own construction, so `:132-133` cannot be
+    /// reached. This one is cross-field — more cores claimed than the gang has — so it belongs to
+    /// the whole value.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "IBM's own thirteen-argument build (`:85-91`); a params struct would be a type the \
+                  authority does not name, which Rule 2 of the brief forbids"
+    )]
+    pub fn new(
+        wk_ss: WkSs,
+        wk_epilogue: WkEpilogue,
+        max_cores: MaxCores,
+        start_cid_offset: Cid,
+        num_ss_slices: NumSsSlices,
+        num_epilogue_slices: NumEpilogueSlices,
+        gap_within_inner_repeat: GapWithinInnerRepeat,
+        repeat_factor_inner: RepeatFactorInner,
+        gap_after_inner_repeat: GapAfterInnerRepeat,
+        gap_after_all_slices: GapAfterAllSlices,
+        outer_repeat_factor: OuterRepeatFactor,
+        real_coordinates: Vec<CoordRange>,
+        swp_info: Option<StrWinPad>,
+    ) -> Option<Self> {
+        let claimed = i64::from(num_ss_slices.0 + num_epilogue_slices.0)
+            * i64::from(outer_repeat_factor.get());
+        (claimed <= i64::from(max_cores.0)).then_some(Self {
+            wk_ss,
+            wk_epilogue,
+            max_cores,
+            start_cid_offset,
+            num_ss_slices,
+            num_epilogue_slices,
+            gap_within_inner_repeat,
+            repeat_factor_inner,
+            gap_after_inner_repeat,
+            gap_after_all_slices,
+            outer_repeat_factor,
+            real_coordinates,
+            swp_info,
+        })
+    }
+
+    /// IBM's copy-assigning `build(const WkSplitParam&)` (`:109-125`), reached from
+    /// `WkSplitFoldFunction_Leaf::insertWkSplitParam` (`util/foldManager/foldInfrastructure.h
+    /// :859-861`). It overwrites all thirteen fields and re-checks legality, so it is a whole-value
+    /// assignment; the source is already legal, so the re-check cannot fail.
+    pub fn overwrite_with(&mut self, source: &Self) {
+        *self = source.clone();
+    }
+
+    /// IBM's `adjustCID` — wraps a negative offset core index back into the gang (`:145-147`).
+    pub const fn adjust_cid(&self, cid: Cid) -> Cid {
+        if cid.0 < 0 {
+            // `i64::from` is not const-callable yet (rust-lang/rust#143874); the widening is
+            // lossless either way.
+            Cid(cid.0 + self.max_cores.0 as i64)
+        } else {
+            cid
+        }
+    }
+
+    /// Cores spanned by one work slice, `(gap_within + 1) * repeat_factor_inner` plus the trailing
+    /// gap when asked (`:155-161`).
+    ///
+    /// ⭐ ALWAYS AT LEAST ONE: [`GapWithinInnerRepeat`] refuses a negative, [`RepeatFactorInner`] a
+    /// non-positive and [`GapAfterInnerRepeat`] a negative, which is what makes both arms safe
+    /// divisors in [`slice_id`](Self::slice_id).
+    pub const fn single_slice_inner_length(&self, with_gap: WithGap) -> CoreSpan {
+        let shared = (self.gap_within_inner_repeat.get() + 1) * self.repeat_factor_inner.get();
+        match with_gap {
+            WithGap::Yes => CoreSpan(shared + self.gap_after_inner_repeat.get()),
+            WithGap::No => CoreSpan(shared),
+        }
+    }
+
+    /// Cores spanned by one full set of work slices (`:169-177`).
+    ///
+    /// ⛔ `WithGap::No` DROPS ONLY `gap_after_all_slices_`. IBM's `false` arm still calls
+    /// `getSingleSliceInnerLength()` with ITS default `true` (`:175`), so the per-slice trailing gap
+    /// is in both arms. That is intended, not a slip: `getSliceId` needs exactly "everything but the
+    /// gap after all slices" at `:207-209`.
+    pub const fn full_inner_length(&self, with_gap: WithGap) -> CoreSpan {
+        let slices = self.num_ss_slices.0 + self.num_epilogue_slices.0;
+        let full = self.single_slice_inner_length(WithGap::Yes).0 * slices;
+        match with_gap {
+            WithGap::Yes => CoreSpan(full + self.gap_after_all_slices.0),
+            WithGap::No => CoreSpan(full),
+        }
+    }
+
+    /// IBM's `getOuterRepeatFactor` (`:179`).
+    pub const fn outer_repeat_factor(&self) -> OuterRepeatFactor {
+        self.outer_repeat_factor
+    }
+
+    /// IBM's `getNumSSslices` (`:181`).
+    pub const fn num_ss_slices(&self) -> NumSsSlices {
+        self.num_ss_slices
+    }
+
+    /// IBM's `getNumElSlices` (`:183`).
+    pub const fn num_epilogue_slices(&self) -> NumEpilogueSlices {
+        self.num_epilogue_slices
+    }
+
+    /// IBM's `getWkSs` (`:185`).
+    pub const fn wk_ss(&self) -> WkSs {
+        self.wk_ss
+    }
+
+    /// IBM's `updateWkSs` (`:186`). Every caller divides or scales the work in place, and all of
+    /// them are in out-of-scope `dsm/` (`dsm/workOptimizer/baseOptimizer/dwsrsAct2.cpp:94`,
+    /// `dyn_wkset_opt.cpp:11343`, `dyn_wkset_opt_act3.cpp:280`).
+    pub fn update_wk_ss(&mut self, new_wk_ss: WkSs) {
+        self.wk_ss = new_wk_ss;
+    }
+
+    /// IBM's `getWkEl` (`:187`).
+    pub const fn wk_epilogue(&self) -> WkEpilogue {
+        self.wk_epilogue
+    }
+
+    /// IBM's `updateWkEl` (`:188`), the epilogue counterpart of
+    /// [`update_wk_ss`](Self::update_wk_ss).
+    pub fn update_wk_epilogue(&mut self, new_wk_epilogue: WkEpilogue) {
+        self.wk_epilogue = new_wk_epilogue;
+    }
+
+    /// Which work slice a core runs, or [`None`] for a gap core — IBM's four `return -1`s
+    /// (`:196-227`).
+    ///
+    /// ⛔ DELIBERATE DIVERGENCE, AND IT REMOVES A DIVIDE BY ZERO. IBM tests only `offset_cid >=
+    /// span * outer` (`:200`), so a NEGATIVE post-adjust offset falls through to `offset_cid %
+    /// full_wksl_size_with_after_gaps_` (`:204`) — a zero divisor whenever there are no slices and
+    /// no trailing gap, and otherwise a negative remainder, hence a negative "slice id" that
+    /// `getSize` reads as steady-state work (`:241`) and `getCoord` turns into negative coordinates
+    /// (`:438`). Range-testing the whole of `0..span * outer` answers [`None`] for both, and makes
+    /// every divisor below provably non-zero. Unreachable from the sole producer, which passes
+    /// `start_cid_offset = 0` (`dsm/workOptimizer/baseOptimizer/workdivopt.cpp:1979`).
+    pub fn slice_id(&self, cid: Cid) -> Option<WkSliceId> {
+        let offset = self.adjust_cid(Cid(cid.0 - self.start_cid_offset.0)).0;
+
+        // The gap cores that come at the end (`:200-201`), widened to also exclude the negative
+        // IBM lets through.
+        let span_with_gaps = i64::from(self.full_inner_length(WithGap::Yes).0);
+        let covered = span_with_gaps * i64::from(self.outer_repeat_factor.get());
+        if !(0..covered).contains(&offset) {
+            return None;
+        }
+
+        // Fold cids using the outer repeat factor (`:204`). `covered > offset >= 0` forces
+        // `span_with_gaps >= 1`, so this cannot divide by zero.
+        let offset = offset % span_with_gaps;
+
+        // The gap that comes after all work slices are passed (`:207-209`).
+        if offset >= i64::from(self.full_inner_length(WithGap::No).0) {
+            return None;
+        }
+
+        // The work slice, ignoring inner gaps (`:212-215`). Both spans are `>= 1` by the guarded
+        // newtypes, never by a check here.
+        let single = i64::from(self.single_slice_inner_length(WithGap::Yes).0);
+        let slid = offset / single;
+        let offset = offset % single;
+
+        // The gap that comes after each work slice (`:218-220`).
+        if offset >= i64::from(self.single_slice_inner_length(WithGap::No).0) {
+            return None;
+        }
+
+        // The gap cores after each valid core assignment (`:222-224`).
+        if offset % i64::from(self.gap_within_inner_repeat.get() + 1) >= 1 {
+            return None;
+        }
+
+        Some(WkSliceId(slid))
+    }
+
+    /// The work one core does, zero for a gap core — IBM's `getSize` (`:235-248`). Its
+    /// `DT_CHECK(isBuilt_)` (`:236`) is discharged by this value existing.
+    pub fn size(&self, cid: Cid) -> WkSize {
+        let Some(slice_id) = self.slice_id(cid) else {
+            return WkSize(0);
+        };
+        let vsize = if slice_id.0 < i64::from(self.num_ss_slices.0) {
+            i64::from(self.wk_ss.0)
+        } else {
+            i64::from(self.wk_epilogue.0)
+        };
+        WkSize(match self.swp_info {
+            Some(swp) => {
+                (vsize - 1) * i64::from(swp.stride.get())
+                    + i64::from(swp.window.get())
+                    + i64::from(swp.extra_back.get())
+            }
+            None => vsize,
+        })
+    }
+
+    /// The virtual element range one core covers, [`None`] for a gap core — IBM's private `getCoord`
+    /// (`:428-455`), private here for the same reason: [`coord_vec`](Self::coord_vec) is the reader.
+    ///
+    /// ⛔ THE STRIDED START IS SCALED BEFORE THE END IS DERIVED FROM IT (`:450-451`), so the window
+    /// lands at `start * stride`, not at `start`, and consecutive cores' ranges overlap by
+    /// `window - stride`.
+    fn coord(&self, cid: Cid) -> Option<VCoordRange> {
+        let slice_id = self.slice_id(cid)?;
+        let num_ss = i64::from(self.num_ss_slices.0);
+        let (start, end) = if slice_id.0 < num_ss {
+            let start = slice_id.0 * i64::from(self.wk_ss.0);
+            (start, start + i64::from(self.wk_ss.0) - 1)
+        } else {
+            let start = num_ss * i64::from(self.wk_ss.0)
+                + (slice_id.0 - num_ss) * i64::from(self.wk_epilogue.0);
+            (start, start + i64::from(self.wk_epilogue.0) - 1)
+        };
+        let (start, end) = match self.swp_info {
+            Some(swp) => {
+                let vsize = (end - start) * i64::from(swp.stride.get())
+                    + i64::from(swp.window.get())
+                    + i64::from(swp.extra_back.get());
+                let start = start * i64::from(swp.stride.get());
+                (start, start + vsize - 1)
+            }
+            None => (start, end),
+        };
+        Some(VCoordRange {
+            start: VCoord(start),
+            end: VCoord(end),
+        })
+    }
+
+    /// The real element ranges one core covers — IBM's `getCoordVec` (`:250-284`), the one method
+    /// the fold infrastructure calls (`util/foldManager/foldInfrastructure.h:838`).
+    ///
+    /// ⛔ A GAP CORE YIELDS ONE [`CoordRange::GAP`], NOT AN EMPTY VEC (`:253-254`).
+    /// ⛔ ONE SLICE CAN SPAN SEVERAL REAL RANGES, so the result is a vector and not one range: a
+    /// virtual span that straddles a hole in `real_coordinates_` pushes once per range it overlaps
+    /// (`:279`), and one that runs off the end of the table is silently clipped short.
+    pub fn coord_vec(&self, cid: Cid) -> Vec<CoordRange> {
+        let Some(v_coord) = self.coord(cid) else {
+            return vec![CoordRange::GAP];
+        };
+        // With no table, or a negative start, IBM pushes the virtual range itself (`:253-254`) —
+        // which for a gap core is where its `(-1, -1)` comes from.
+        if self.real_coordinates.is_empty() || v_coord.start.0 < 0 {
+            return vec![CoordRange::from_virtual(v_coord)];
+        }
+
+        let mut coord_vec = Vec::new();
+        let mut cum_running_size = 0_i64;
+        for range in &self.real_coordinates {
+            // Where this real range sits in the virtual space (`:258-262`).
+            let running_start = cum_running_size;
+            let running_end = running_start + (range.end.0 - range.start.0);
+            cum_running_size += range.end.0 - range.start.0 + 1;
+
+            if running_start > v_coord.end.0 || running_end < v_coord.start.0 {
+                continue;
+            }
+            coord_vec.push(CoordRange {
+                start: if v_coord.start.0 <= running_start {
+                    range.start
+                } else {
+                    Coord(range.start.0 + (v_coord.start.0 - running_start))
+                },
+                end: if v_coord.end.0 >= running_end {
+                    range.end
+                } else {
+                    Coord(range.end.0 - (running_end - v_coord.end.0))
+                },
+            });
+        }
+        coord_vec
+    }
+
+    /// IBM's `get_real_coordinates_` (`:363-366`).
+    ///
+    /// ⚠️ NO CALLER IN THE AUTHORITY TREE: `real_coordinates_` is read only inside `getCoordVec`
+    /// (`:257`). Ported because it is part of the class's surface, not because anything wants it.
+    pub fn real_coordinates(&self) -> &[CoordRange] {
+        &self.real_coordinates
+    }
+
+    /// IBM's `set_real_coordinates_` (`:372-376`); its `DT_CHECK(isBuilt_)` (`:374`) is discharged
+    /// by this value existing. Both callers are in out-of-scope `dsm/`
+    /// (`dsm/workOptimizer/baseOptimizer/dwsrsAct2.cpp:148`, `workdivopt.cpp:2728`).
+    pub fn set_real_coordinates(&mut self, real_coordinates: Vec<CoordRange>) {
+        self.real_coordinates = real_coordinates;
+    }
+
+    /// The metadata text IBM streams (`:294-330`), returned rather than printed as
+    /// [`Constraints::dump`](crate::schedule::metadata::Constraints::dump) is.
+    ///
+    /// ⛔ `out << bool` PRINTS `1`/`0`, NOT `true`/`false` (`:296`, `:316`), and `ps` is a PREFIX ON
+    /// EVERY FIELD (`:297` onwards), not an indent written once. An absent
+    /// [`swp_info`](Self::swp_info) renders as IBM's declared initialisers (`:22-25`).
+    pub fn print_meta_data(&self, ps: &str) -> String {
+        let values: [i64; 12] = [
+            1,
+            i64::from(self.wk_ss.0),
+            i64::from(self.wk_epilogue.0),
+            i64::from(self.max_cores.0),
+            self.start_cid_offset.0,
+            i64::from(self.num_ss_slices.0),
+            i64::from(self.num_epilogue_slices.0),
+            i64::from(self.gap_within_inner_repeat.get()),
+            i64::from(self.repeat_factor_inner.get()),
+            i64::from(self.gap_after_inner_repeat.get()),
+            i64::from(self.gap_after_all_slices.0),
+            i64::from(self.outer_repeat_factor.get()),
+        ];
+        let (is_str_win_pad, stride, window, extra_back) = match self.swp_info {
+            Some(swp) => (1, swp.stride.get(), swp.window.get(), swp.extra_back.get()),
+            None => (0, -1, -1, 0),
+        };
+        let mut out = String::new();
+        for (name, value) in Self::META_DATA_FIELDS.iter().zip(values) {
+            out.push_str(ps);
+            out.push_str(&format!("\"{name}\" : {value},"));
+        }
+        out.push_str(ps);
+        out.push_str(&format!(
+            "\"swp_info_\" : {{ \"isStrWinPad_\" : {is_str_win_pad}, \"stride_\" : {stride}, \
+             \"window_\" : {window}, \"extra_back_\" : {extra_back} }},"
+        ));
+        out.push_str(ps);
+        out.push_str("\"real_coordinates_\" : [ ");
+        let ranges: Vec<String> = self
+            .real_coordinates
+            .iter()
+            .map(|range| format!("[{}, {}]", range.start.0, range.end.0))
+            .collect();
+        out.push_str(&ranges.join(", "));
+        out.push_str(" ]");
+        out
+    }
+
+    /// Field: e011_WkSplitParam.isBuilt_
+    ///
+    /// What `printMetaData` prints for a param that was never built — `isBuilt_ = false` (`:379`)
+    /// with every other declared initialiser (`:382-420`).
+    ///
+    /// ⛔ THIS IS THE ONLY OBSERVABLE EFFECT `isBuilt_` HAS LEFT, and it is why the field gets an
+    /// anchor at all: `WkSplitFoldFunction_Leaf::printMetaData` delegates unconditionally, with no
+    /// `DT_CHECK` (`util/foldManager/foldInfrastructure.h:880-882`), so an unbuilt leaf does print
+    /// this. A holder whose `Option<WkSplitParam>` is `None` prints it here rather than leaving a
+    /// later port to invent the text. Its two other readers are checks this type discharges
+    /// (`:236`, `:374`, plus `foldInfrastructure.h:849`).
+    pub fn unbuilt_meta_data(ps: &str) -> String {
+        let mut out = String::new();
+        for name in Self::META_DATA_FIELDS {
+            out.push_str(ps);
+            out.push_str(&format!("\"{name}\" : 0,"));
+        }
+        out.push_str(ps);
+        out.push_str(
+            "\"swp_info_\" : { \"isStrWinPad_\" : 0, \"stride_\" : -1, \"window_\" : -1, \
+             \"extra_back_\" : 0 },",
+        );
+        out.push_str(ps);
+        out.push_str("\"real_coordinates_\" : [  ]");
+        out
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// The vendor's own `build` argument order (`:85-91`), so a fixture line below can be diffed
+    /// against the C++ call it was transcribed from. ⛔ RAW SCALARS ONLY HERE, AND ONLY HERE: the
+    /// point of this helper is that the transcription is auditable, and the sixteen asserted golden
+    /// values are what catch a transposed argument.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the vendor's own thirteen-argument build call for auditability"
+    )]
+    fn built(
+        wk_ss: i32,
+        wk_epilogue: i32,
+        max_cores: i32,
+        start_cid_offset: i64,
+        num_ss_slices: i32,
+        num_epilogue_slices: i32,
+        gap_within_inner_repeat: i32,
+        repeat_factor_inner: i32,
+        gap_after_inner_repeat: i32,
+        gap_after_all_slices: i32,
+        outer_repeat_factor: i32,
+        real_coordinates: Vec<CoordRange>,
+        swp_info: Option<StrWinPad>,
+    ) -> WkSplitParam {
+        WkSplitParam::new(
+            WkSs(wk_ss),
+            WkEpilogue(wk_epilogue),
+            MaxCores(max_cores),
+            Cid(start_cid_offset),
+            NumSsSlices(num_ss_slices),
+            NumEpilogueSlices(num_epilogue_slices),
+            GapWithinInnerRepeat::new(gap_within_inner_repeat).unwrap(),
+            RepeatFactorInner::new(repeat_factor_inner).unwrap(),
+            GapAfterInnerRepeat::new(gap_after_inner_repeat).unwrap(),
+            GapAfterAllSlices(gap_after_all_slices),
+            OuterRepeatFactor::new(outer_repeat_factor).unwrap(),
+            real_coordinates,
+            swp_info,
+        )
+        .unwrap()
+    }
+
+    fn range(start: i64, end: i64) -> CoordRange {
+        CoordRange {
+            start: Coord(start),
+            end: Coord(end),
+        }
+    }
+
+    fn sizes(param: &WkSplitParam, cores: i64) -> Vec<i64> {
+        (0..cores).map(|cid| param.size(Cid(cid)).0).collect()
+    }
+
+    fn coords(param: &WkSplitParam, cores: i64) -> Vec<Vec<CoordRange>> {
+        (0..cores).map(|cid| param.coord_vec(Cid(cid))).collect()
+    }
+
+    /// The vendor's `constructor_test_wksplit` fixture, transcribed whole
+    /// (`util/foldManager/test/test_fold_infrastructure.cpp:157-189`): eight cores, two dimensions,
+    /// no gaps. `ij` shares each slice across four cores; `out` gives each of four slices one core
+    /// and repeats the set twice.
+    #[test]
+    fn the_vendors_eight_core_fixture_reproduces_both_dimensions() {
+        let ij = built(10, 0, 8, 0, 2, 0, 0, 4, 0, 0, 1, Vec::new(), None);
+        let out = built(4, 0, 8, 0, 4, 0, 0, 1, 0, 0, 2, Vec::new(), None);
+
+        assert_eq!(sizes(&ij, 8), vec![10; 8]);
+        assert_eq!(sizes(&out, 8), vec![4; 8]);
+
+        let golden_ij: Vec<Vec<CoordRange>> = (0..8)
+            .map(|i| vec![range(10 * (i / 4), 9 + 10 * (i / 4))])
+            .collect();
+        let golden_out: Vec<Vec<CoordRange>> = (0..8)
+            .map(|i| vec![range(4 * (i % 4), 3 + 4 * (i % 4))])
+            .collect();
+        assert_eq!(coords(&ij, 8), golden_ij);
+        assert_eq!(coords(&out, 8), golden_out);
+    }
+
+    /// The vendor's `constructor_test_wksplit2` fixture, transcribed whole
+    /// (`util/foldManager/test/test_fold_infrastructure.cpp:219-268`): sixteen cores, three gap
+    /// cores after all slices, the set laid down twice, and — for `out` — a fourth slice of
+    /// epilogue work. ⭐ THE GOLDENS PIN `(-1, -1)` ON NINE OF SIXTEEN CORES, which is why a gap
+    /// core's coordinate is a value and not an absence, and pin the last two cores as uncovered
+    /// even though the gang has room, which is `outer_repeat_factor` times the span, not `max_cores`.
+    #[test]
+    fn the_vendors_sixteen_core_fixture_pins_the_gap_coordinate() {
+        let ij = built(10, 0, 16, 0, 2, 0, 0, 2, 0, 3, 2, Vec::new(), None);
+        let out = built(3, 2, 16, 0, 3, 1, 0, 1, 0, 3, 2, Vec::new(), None);
+
+        assert_eq!(
+            sizes(&ij, 16),
+            vec![10, 10, 10, 10, 0, 0, 0, 10, 10, 10, 10, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            sizes(&out, 16),
+            vec![3, 3, 3, 2, 0, 0, 0, 3, 3, 3, 2, 0, 0, 0, 0, 0]
+        );
+
+        let gap = vec![CoordRange::GAP];
+        assert_eq!(
+            coords(&ij, 16),
+            vec![
+                vec![range(0, 9)],
+                vec![range(0, 9)],
+                vec![range(10, 19)],
+                vec![range(10, 19)],
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                vec![range(0, 9)],
+                vec![range(0, 9)],
+                vec![range(10, 19)],
+                vec![range(10, 19)],
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+            ]
+        );
+        assert_eq!(
+            coords(&out, 16),
+            vec![
+                vec![range(0, 2)],
+                vec![range(3, 5)],
+                vec![range(6, 8)],
+                vec![range(9, 10)],
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                vec![range(0, 2)],
+                vec![range(3, 5)],
+                vec![range(6, 8)],
+                vec![range(9, 10)],
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                gap.clone(),
+                gap,
+            ]
+        );
+        assert_eq!(ij.slice_id(Cid(14)), None);
+        assert_eq!(ij.slice_id(Cid(3)), Some(WkSliceId(1)));
+        assert_eq!(out.slice_id(Cid(10)), Some(WkSliceId(3)));
+    }
+
+    /// ⛔ NO FIXTURE IN THE AUTHORITY TREE EXERCISES `real_coordinates_` — both vendor tests pass a
+    /// default-constructed empty vector (`util/foldManager/test/test_fold_infrastructure.cpp:157`,
+    /// `:219`) and so does `fold_standalone.cpp`. This case is derived from the remap itself
+    /// (`:256-281`): a table of `100..=109` then `200..=204` is fifteen virtual elements, and four
+    /// cores each claiming four of them means core 2 straddles the hole and core 3 runs off the end.
+    #[test]
+    fn a_real_coordinate_table_splits_one_slice_and_clips_another() {
+        let param = built(
+            4,
+            0,
+            8,
+            0,
+            4,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            vec![range(100, 109), range(200, 204)],
+            None,
+        );
+
+        assert_eq!(param.coord_vec(Cid(0)), vec![range(100, 103)]);
+        assert_eq!(param.coord_vec(Cid(1)), vec![range(104, 107)]);
+        // Virtual 8..=11 straddles the hole: two of its elements are in each real range.
+        assert_eq!(
+            param.coord_vec(Cid(2)),
+            vec![range(108, 109), range(200, 201)]
+        );
+        // Virtual 12..=15 runs past the table's fifteen elements and is clipped to three.
+        assert_eq!(param.coord_vec(Cid(3)), vec![range(202, 204)]);
+        // A gap core still gets the sentinel, table or no table.
+        assert_eq!(param.coord_vec(Cid(4)), vec![CoordRange::GAP]);
+        assert_eq!(param.real_coordinates().len(), 2);
+    }
+
+    /// ⛔ NO FIXTURE EXERCISES `swp_info_` EITHER, so this is derived from the expansion (`:242-245`,
+    /// `:446-452`): four elements at stride 2 with a window of 3 and one element of back padding
+    /// span `(4 - 1) * 2 + 3 + 1 = 10`, and because the START is scaled before the END is derived
+    /// from it, consecutive cores overlap by `window - stride`.
+    #[test]
+    fn a_strided_window_expands_each_slice_and_overlaps_its_neighbour() {
+        let swp = StrWinPad {
+            stride: Stride::new(2).unwrap(),
+            window: Window::new(3).unwrap(),
+            extra_back: ExtraBack::new(1).unwrap(),
+        };
+        let param = built(4, 0, 8, 0, 4, 0, 0, 1, 0, 0, 1, Vec::new(), Some(swp));
+
+        assert_eq!(sizes(&param, 5), vec![10, 10, 10, 10, 0]);
+        assert_eq!(param.coord_vec(Cid(0)), vec![range(0, 9)]);
+        assert_eq!(param.coord_vec(Cid(1)), vec![range(8, 17)]);
+        assert_eq!(param.coord_vec(Cid(2)), vec![range(16, 25)]);
+        assert_eq!(param.coord_vec(Cid(3)), vec![range(24, 33)]);
+        assert_eq!(param.coord_vec(Cid(4)), vec![CoordRange::GAP]);
+
+        // Without the expansion the same division is dense and four elements wide.
+        let dense = built(4, 0, 8, 0, 4, 0, 0, 1, 0, 0, 1, Vec::new(), None);
+        assert_eq!(dense.coord_vec(Cid(1)), vec![range(4, 7)]);
+        assert_ne!(dense, param);
+    }
+
+    /// All three of IBM's `checkLegality` `DT_CHECK`s (`:131-136`) plus the two divisors it never
+    /// checks, each refused at construction instead. ⛔ The cross-field one is the only refusal left
+    /// on [`WkSplitParam::new`]: four slices laid down twice needs eight cores, and a gang of seven
+    /// is what IBM aborts on.
+    #[test]
+    fn every_legality_check_is_refused_at_construction() {
+        assert_eq!(OuterRepeatFactor::new(0), None);
+        assert_eq!(OuterRepeatFactor::new(-1), None);
+        assert_eq!(RepeatFactorInner::new(0), None);
+        assert_eq!(GapWithinInnerRepeat::new(-1), None);
+        assert_eq!(GapAfterInnerRepeat::new(-1), None);
+        assert_eq!(Stride::new(0), None);
+        assert_eq!(Window::new(0), None);
+        assert_eq!(ExtraBack::new(-1), None);
+
+        let too_few_cores = WkSplitParam::new(
+            WkSs(4),
+            WkEpilogue(0),
+            MaxCores(7),
+            Cid(0),
+            NumSsSlices(4),
+            NumEpilogueSlices(0),
+            GapWithinInnerRepeat::NONE,
+            RepeatFactorInner::ONE,
+            GapAfterInnerRepeat::NONE,
+            GapAfterAllSlices(0),
+            OuterRepeatFactor::new(2).unwrap(),
+            Vec::new(),
+            None,
+        );
+        assert_eq!(too_few_cores, None);
+        assert!(
+            WkSplitParam::new(
+                WkSs(4),
+                WkEpilogue(0),
+                MaxCores(8),
+                Cid(0),
+                NumSsSlices(4),
+                NumEpilogueSlices(0),
+                GapWithinInnerRepeat::NONE,
+                RepeatFactorInner::ONE,
+                GapAfterInnerRepeat::NONE,
+                GapAfterAllSlices(0),
+                OuterRepeatFactor::new(2).unwrap(),
+                Vec::new(),
+                None,
+            )
+            .is_some()
+        );
+    }
+
+    /// `:294-330`. ⛔ THE BOOLS ARE DIGITS AND `ps` PREFIXES EVERY FIELD, and an absent
+    /// `swp_info_` prints IBM's declared `-1`s (`:22-25`) — the `-1` is not dropped just because
+    /// this port spells the off state [`None`]. The unbuilt text is what a leaf holding no param
+    /// prints (`util/foldManager/foldInfrastructure.h:880-882`).
+    #[test]
+    fn the_metadata_text_prints_bools_as_digits_and_prefixes_every_field() {
+        let param = built(10, 0, 8, 0, 2, 0, 0, 4, 0, 0, 1, vec![range(0, 9)], None);
+
+        assert_eq!(
+            param.print_meta_data(""),
+            "\"isBuilt_\" : 1,\"wk_ss_\" : 10,\"wk_epilogue_\" : 0,\"max_cores_\" : 8,\
+             \"start_cid_offset_\" : 0,\"num_ss_slices_\" : 2,\"num_epilogue_slices_\" : 0,\
+             \"gap_within_inner_repeat_\" : 0,\"repeat_factor_inner_\" : 4,\
+             \"gap_after_inner_repeat_\" : 0,\"gap_after_all_slices_\" : 0,\
+             \"outer_repeat_factor_\" : 1,\"swp_info_\" : { \"isStrWinPad_\" : 0, \"stride_\" : -1, \
+             \"window_\" : -1, \"extra_back_\" : 0 },\"real_coordinates_\" : [ [0, 9] ]"
+        );
+        assert!(
+            param
+                .print_meta_data("\n  ")
+                .starts_with("\n  \"isBuilt_\" : 1,\n  \"wk_ss_\"")
+        );
+
+        assert!(
+            WkSplitParam::unbuilt_meta_data("").starts_with("\"isBuilt_\" : 0,\"wk_ss_\" : 0,")
+        );
+        assert!(WkSplitParam::unbuilt_meta_data("").ends_with(
+            "\"stride_\" : -1, \"window_\" : -1, \"extra_back_\" : 0 },\
+                            \"real_coordinates_\" : [  ]"
+        ));
+    }
+
+    /// `:339-357` — `operator==` compares twelve scalars, the coordinate table and all four
+    /// `swp_info_` fields, and does NOT compare `isBuilt_`; the derive matches it field for field
+    /// because this type has no `isBuilt_`. ⛔ `overwrite_with` is IBM's `build(const
+    /// WkSplitParam&)` (`:109-125`), a whole-value assignment, so equality is the way to see it
+    /// landed.
+    #[test]
+    fn overwriting_copies_every_compared_field() {
+        let source = built(3, 2, 16, 0, 3, 1, 0, 1, 0, 3, 2, vec![range(4, 8)], None);
+        let mut target = built(10, 0, 8, 0, 2, 0, 0, 4, 0, 0, 1, Vec::new(), None);
+        assert_ne!(target, source);
+
+        target.overwrite_with(&source);
+        assert_eq!(target, source);
+        assert_eq!(target.wk_ss(), WkSs(3));
+        assert_eq!(target.wk_epilogue(), WkEpilogue(2));
+        assert_eq!(target.num_ss_slices(), NumSsSlices(3));
+        assert_eq!(target.num_epilogue_slices(), NumEpilogueSlices(1));
+        assert_eq!(
+            target.outer_repeat_factor(),
+            OuterRepeatFactor::new(2).unwrap()
+        );
+        assert_eq!(target.real_coordinates(), [range(4, 8)]);
+
+        target.update_wk_ss(WkSs(1));
+        target.update_wk_epilogue(WkEpilogue(1));
+        target.set_real_coordinates(Vec::new());
+        assert_eq!(target.wk_ss(), WkSs(1));
+        assert_eq!(target.wk_epilogue(), WkEpilogue(1));
+        assert!(target.real_coordinates().is_empty());
+        assert_ne!(target, source);
+    }
+
+    /// `:145-147`, `:155-177`. ⛔ `WithGap::No` ON THE FULL LENGTH DROPS ONLY `gap_after_all_slices_`
+    /// — IBM's `false` arm still takes the per-slice trailing gap, because it calls
+    /// `getSingleSliceInnerLength()` with its own default `true` (`:175`). Two slices of two sharing
+    /// cores with one trailing gap each is `2 * 3 = 6`, not `2 * 2 = 4`.
+    #[test]
+    fn the_full_length_without_gaps_still_carries_the_per_slice_gap() {
+        let param = built(10, 0, 16, 0, 2, 0, 0, 2, 1, 3, 2, Vec::new(), None);
+
+        assert_eq!(param.single_slice_inner_length(WithGap::Yes), CoreSpan(3));
+        assert_eq!(param.single_slice_inner_length(WithGap::No), CoreSpan(2));
+        assert_eq!(param.full_inner_length(WithGap::Yes), CoreSpan(9));
+        assert_eq!(param.full_inner_length(WithGap::No), CoreSpan(6));
+
+        // The core each work slice's trailing gap eats, and the three after all slices.
+        assert_eq!(param.slice_id(Cid(1)), Some(WkSliceId(0)));
+        assert_eq!(param.slice_id(Cid(2)), None);
+        assert_eq!(param.slice_id(Cid(5)), None);
+        assert_eq!(param.slice_id(Cid(6)), None);
+
+        // A negative cid wraps into the gang, IBM's own `adjustCID`.
+        assert_eq!(param.adjust_cid(Cid(-2)), Cid(14));
+        assert_eq!(param.adjust_cid(Cid(3)), Cid(3));
+    }
+}
