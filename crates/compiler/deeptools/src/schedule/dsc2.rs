@@ -6,11 +6,22 @@ use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 use sys_arch_spec::fields::Gen;
 use sys_arch_spec::{CoreId, CoreletId, SFP_SLICES};
 
-/// A group tag register's group id — `gtrIdsUsed_` holds the set of them (`dsc/dsc2.h:35`).
+/// A group tag register's group id (`dsc/dsc2.h:35`). `DesignSpaceConfig::gtrIdsUsed_`
+/// (`dsc/designSpaceConfig.h:116`, a `std::set<int>`) holds the set of them, and only a PRESENT id
+/// is inserted (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4833-4834`, `:5257-5258`).
+///
+/// ⭐ NEVER THE OUT-OF-RANGE SEED. `getSharesAndGroupName` starts its group name at
+/// `sysDef.maxGroupID + 1` (`:4705`), one past the last legal id, but that seed survives only for a
+/// single sharer — the very case the producer answers -1 for — and on the shared path the name is
+/// `DT_CHECK`ed `<= maxGroupID` (`:4711`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupId(pub u32);
 
 /// How many cores share one group tag register (`dsc/dsc2.h:36`).
+///
+/// ⭐ AT LEAST ONE WHENEVER PRODUCED: both writers assign `sharesCoreIds.size()` (`:4701`, used at
+/// `:4828` and `:5252`) from a set `DT_CHECK_MSG`ed non-empty (`:4697`). [`None`] is reachable only
+/// on an untouched record or a JSON `-1` (`dsc/dsc2.cpp:1596-1597`), never from the scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NumSharers(pub u32);
 
@@ -22,7 +33,17 @@ pub struct Alpha(pub i64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Beta(pub i64);
 
-/// A fold level's trip count, as `FoldManager::getFoldDimSize` reports it (`dsc/dsc2.h:1083`).
+/// A fold level's trip count — `int64_t` on the field itself (`dsc/dsc2.h:1083`).
+///
+/// ⛔ THE FOLD MANAGER'S COPY IS NARROWER, so this is not `getFoldDimSize`'s currency: a cardinality
+/// reaches a fold through `CoordinateType::addFold`'s `int foldCardinality` (`dsc/dsc2.h:120-123`),
+/// is stored in `FoldDimProp::factor_` as `uint32_t` (`util/foldManager/foldInfrastructure.h:153`)
+/// and comes back out as `int` (`:2631-2633`).
+///
+/// ⛔ AND 0 IS PRODUCED, NOT MERELY DEFAULTED — "Parametric loops may have 0 iteration count"
+/// (`dsc/dsc2.cpp:6251`) — and both readers spell it as the multiplicative identity 1: one skips it
+/// in the inner-cardinality product (`:6249-6253`, `:6460-6464`), the other writes
+/// `cardinality == 0 ? 1 : cardinality` (`:6359-6361`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cardinality(pub i64);
 
@@ -31,8 +52,17 @@ pub struct Cardinality(pub i64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TemporalStride(pub i64);
 
-/// An element-arrangement fold level, counted outermost-first as `currElemArrLevel`
-/// (`ddc/ddc_fold.cpp:2689`).
+/// An element-arrangement fold level, counted INNERMOST-FIRST as `currElemArrLevel`
+/// (`ddc/ddc_fold.cpp:2666-2689`).
+///
+/// ⛔ NOT A FOLD INDEX, AND NOT OUTERMOST-FIRST. IBM's own diagram gives the conversion —
+/// `loop_elem_arr_level = foldNumDims - i - 1` over the absolute fold index `i`
+/// (`ddc/ddc_fold.cpp:2656-2660`) — and `dsc/dsc2.cpp:6728` inverts it the same way, so level 0 is
+/// the INNERMOST fold. The walk also starts at `origNumElemArrFoldsOfRefNode`, not 0 (`:2667`).
+///
+/// ⭐ UNSIGNED IS SOUND: the writers are a `foldIdx` from a `foldIdx >= 0` loop
+/// (`dsc/dsc2.cpp:6016-6017`) and a `currElemArrLevel` that cannot go negative because
+/// `elemArrParamsAfterDistribution.at(nextFoldIdx)` throws first (`:6441-6443`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ElemArrLevel(pub u32);
 
@@ -85,11 +115,13 @@ pub struct VariableSymbol(pub i64);
 
 /// Replaces: e006_GroupTagRegInfo
 ///
-/// GTR (group tag register) info, one per core on a transfer node (`dsc/dsc2.h:34-37`).
-/// TRAP: the authority's `= -1` on both fields is the ABSENT encoding, not a value. `groupId_`
-/// stays -1 whenever there is only one sharer, i.e. no share
-/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4831-4832` and `:5255-5256`), and the JSON round
-/// trip writes and reads that -1 verbatim (`dsc/dsc2.cpp:631-632`, `:1594-1597`).
+/// GTR (group tag register) info, one per core on a transfer node — `coreIdToGTRInfo_` is a
+/// `std::map<int, GroupTagRegInfo>` on `TransferNode` (`dsc/dsc2.h:34-37`, `:840`).
+/// TRAP: the two -1s are NOT symmetric. `groupId_` is genuinely written -1, whenever there is only
+/// one sharer i.e. no share (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4831-4832`, `:5255-5256`),
+/// so [`group_id`](Self::group_id) is [`Some`] exactly when `numSharers_ > 1`; `numSharers_` is
+/// never written -1 at all (`:4828`, `:5252`). The JSON round trip carries both verbatim
+/// (`dsc/dsc2.cpp:631-632`, `:1594-1597`), so neither field may be inferred from the other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupTagRegInfo {
     /// Field: e006_GroupTagRegInfo.groupId_
@@ -111,9 +143,11 @@ pub struct GroupTagRegInfo {
 /// Replaces: e009_FoldParamInfoType
 ///
 /// One fold level's affine parameters, trip count and label (`dsc/dsc2.h:1081-1085`).
-/// TRAP: `cardinality` defaults to 0, not 1, so the default value is an EMPTY fold and not an
-/// identity one; `getDefaultRowSplitFold` writes the identity explicitly
-/// (`ddc/ddc_fold.cpp:2154-2159`).
+/// TRAP: the declared default is the identity in NEITHER field, and `cardinality`'s 0 is not an
+/// empty fold — every reader takes a 0 as 1 (`dsc/dsc2.cpp:6249-6253`, `:6359-6361`; see
+/// [`Cardinality`]). The identity a caller actually wants is the one `getDefaultRowSplitFold`
+/// writes, `alpha = 0` with `cardinality = 1` (`ddc/ddc_fold.cpp:2154-2159`), which overrides BOTH
+/// declared initialisers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldParamInfoType {
     /// Field: e009_FoldParamInfoType.alpha
@@ -145,8 +179,11 @@ impl Default for FoldParamInfoType {
 ///
 /// One loop's affine parameters for one dimension after loop distribution (`dsc/dsc2.h:1110-1114`).
 /// TRAP: the authority's `= -1` on the last two fields is UNSET, not a value — nothing tests for
-/// -1, and `relatedElemArrLevel` is used as `allocFm.getNumDims() - level - 1`
-/// (`dsc/dsc2.cpp:6728`), so an unset level silently indexes off the end.
+/// -1. An unset `relatedElemArrLevel` is LOUD, not silent: `allocFm.getNumDims() - level - 1`
+/// (`dsc/dsc2.cpp:6728`) makes the position `getNumDims()`, which `FoldManager::getAlpha`
+/// `DT_CHECK`s (`util/foldManager/foldInfrastructure.h:2325-2329`). What IS silent is the opposite
+/// direction: `getAlpha` remaps a negative position to `size() + pos`, so a level past the last
+/// fold reads a DIFFERENT fold without complaint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopDistributionParamType {
     /// Field: e010_LoopDistributionParamType.alpha
@@ -340,10 +377,11 @@ impl From<(PrimaryDimTypes, DimSize)> for Size {
 mod unit_tests {
     use super::*;
 
-    /// `dsc/dsc2.h:35-36`: both fields start absent, and the two producer sites leave `groupId_`
-    /// absent for a single sharer (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4831-4832`).
+    /// `dsc/dsc2.h:35-36`: both fields start absent, and a group id is present exactly when there
+    /// is more than one sharer — both producers verbatim
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4828-4832`, `:5252-5256`).
     #[test]
-    fn group_tag_reg_info_starts_absent_and_a_lone_sharer_gets_no_group() {
+    fn group_tag_reg_info_carries_a_group_id_exactly_when_it_is_shared() {
         assert_eq!(
             GroupTagRegInfo::default(),
             GroupTagRegInfo {
@@ -352,17 +390,84 @@ mod unit_tests {
             }
         );
 
-        // `numSharers_ = first; groupId_ = first > 1 ? second : -1;`
-        let lone = GroupTagRegInfo {
-            group_id: None,
-            num_sharers: Some(NumSharers(1)),
+        // `numSharers_ = shares; groupId_ = shares > 1 ? groupName : -1;` with `shares >= 1`
+        // guaranteed at `:4697` and `groupName <= maxGroupID` at `:4711`.
+        let produce = |shares: u32, group_name: u32| GroupTagRegInfo {
+            group_id: (shares > 1).then_some(GroupId(group_name)),
+            num_sharers: Some(NumSharers(shares)),
         };
-        let shared = GroupTagRegInfo {
-            group_id: Some(GroupId(7)),
-            num_sharers: Some(NumSharers(4)),
-        };
-        assert_eq!(lone.group_id, None);
-        assert_eq!(shared.group_id, Some(GroupId(7)));
+        assert_eq!(produce(1, 7).group_id, None, "one sharer means no share");
+        assert_eq!(produce(4, 0).group_id, Some(GroupId(0)), "0 is a legal id");
+        for shares in 1..=4 {
+            assert_eq!(
+                produce(shares, 7).group_id.is_some(),
+                shares > 1,
+                "a group id is present iff numSharers_ > 1"
+            );
+        }
+    }
+
+    /// `ddc/ddc_fold.cpp:2656-2660` — IBM's own diagram, seven folds `S S T T T T E`, with
+    /// `loop_elem_arr_level = foldNumDims - i - 1` over the absolute fold index `i`, inverted the
+    /// same way at `dsc/dsc2.cpp:6728`. ⛔ Level 0 is the INNERMOST fold, so an [`ElemArrLevel`] is
+    /// neither a fold index nor an outermost-first count.
+    #[test]
+    fn the_elem_arr_level_is_counted_from_the_innermost_fold() {
+        const FOLD_NUM_DIMS: u32 = 7;
+        let level_of = |fold_index: u32| ElemArrLevel(FOLD_NUM_DIMS - fold_index - 1);
+        let fold_index_of = |level: ElemArrLevel| FOLD_NUM_DIMS - level.0 - 1;
+
+        // The diagram's own worked case, "For loops related to positions [4-5]".
+        assert_eq!(level_of(4), ElemArrLevel(2));
+        assert_eq!(level_of(5), ElemArrLevel(1));
+        // The two ends, which is what innermost-first means.
+        assert_eq!(level_of(FOLD_NUM_DIMS - 1), ElemArrLevel(0));
+        assert_eq!(level_of(0), ElemArrLevel(FOLD_NUM_DIMS - 1));
+
+        for fold_index in 0..FOLD_NUM_DIMS {
+            assert_eq!(fold_index_of(level_of(fold_index)), fold_index);
+        }
+    }
+
+    /// `dsc/dsc2.cpp:6249-6253` and `:6359-6361`: a 0 `cardinality` is PRODUCED — "Parametric loops
+    /// may have 0 iteration count" (`:6251`) — and both readers take it as the multiplicative
+    /// identity 1. ⛔ It is not an empty fold, and it does not annihilate the product.
+    #[test]
+    fn a_zero_cardinality_reads_as_one_not_as_an_empty_fold() {
+        let inner_folds = [
+            FoldParamInfoType {
+                cardinality: Cardinality(4),
+                ..Default::default()
+            },
+            // A parametric loop's 0 iteration count is the declared default's cardinality.
+            FoldParamInfoType::default(),
+            FoldParamInfoType {
+                cardinality: Cardinality(8),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(inner_folds[1].cardinality, Cardinality(0));
+
+        // `:6250-6252` skips a 0 in the inner-cardinality product.
+        let skipping_zero: i64 = inner_folds
+            .iter()
+            .filter(|fold| fold.cardinality != Cardinality(0))
+            .map(|fold| fold.cardinality.0)
+            .product();
+        // `:6359-6361` spells `cardinality == 0 ? 1 : cardinality` over the same folds.
+        let coercing_zero_to_one: i64 = inner_folds
+            .iter()
+            .map(|fold| {
+                if fold.cardinality == Cardinality(0) {
+                    1
+                } else {
+                    fold.cardinality.0
+                }
+            })
+            .product();
+
+        assert_eq!(skipping_zero, 32, "the 0 contributed the identity, not 0");
+        assert_eq!(skipping_zero, coercing_zero_to_one, "both readers agree");
     }
 
     /// `dsc/dsc2.h:1082-1084` against `getDefaultRowSplitFold`, `ddc/ddc_fold.cpp:2154-2159`:
