@@ -6602,6 +6602,9 @@ impl ComputeNode {
     /// [`DesignSpaceConfig`](crate::schedule::dsc::DesignSpaceConfig) carries no `labeledDs_` to
     /// resolve the format with.
     /// ⛔ SO THE ARGUMENT IS IGNORED ON EVERY OTHER OP, exactly as IBM's `dsc` is.
+    /// ⛔ AND THE TWO THROWS THAT LOOKUP CARRIES GO WITH IT: `outputsLdsAndLoopOffsets_.at(0)` on an
+    /// empty vector and `labeledDs_.at()` on an unregistered index both refuse (`:2352-2353`), and a
+    /// resolved `DataFormats` cannot express either — so whoever lands `labeledDs_` inherits them.
     ///
     /// ⛔ FOUR INPUTS YIELD FEWER FORMATS THAN THREE (`:2372-2373`, `:2392-2393`), and every caller
     /// indexes by operand position (`.../V3/SNComputeLowering.cpp:766`, `:789`, `:1058`, `:1207`,
@@ -6733,14 +6736,19 @@ pub struct ConditionNode {
 
 // crustify:todo: e025_ConditionNode.loopCond_
 
-/// Replaces: e026_SyncNode
+/// Replaces: e036_SyncNode
 ///
 /// `dsc/dsc2.h:964-972`. One end of a signal: which units it signals to or waits on, and which end
 /// it is. The DDL conversion mints one per `SyncOp` (`ddc/ddl/ddl_conversion.cpp:1708-1732`) and the
 /// L3 scheduler mints them in send/receive pairs
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:640-660`).
 ///
-/// ⛔ THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the `e026_SyncNode` anchor below stays open.
+/// `e026_SyncNode` is this same class under the superseded numbering, and e026 is now `Metadata`
+/// (`crustify-scheduler/UNITS.tsv:27`) — a COLLISION, not a merely stale number. All eight of its
+/// anchors are RENUMBERED onto e036 here (`UNITS.tsv:37`), the three UNFILLED ones included, so the
+/// open work stays attributed to the live entry. None is deleted and none changes meaning.
+///
+/// ⛔ THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the `e036_SyncNode` anchor below stays open.
 /// Both of the others are schedule-node pointer identity: `implicitSyncRefTransfer_` (`:968`) is a
 /// `const TransferNode*` its reader dereferences for that transfer's TILE SIZE and for its SOURCE
 /// labeled DS's precision (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:156-158`,
@@ -6757,7 +6765,7 @@ pub struct ConditionNode {
 /// ends. `Clone` is IBM's own, through `InheritWithClone` (`:964`).
 #[derive(Clone, Debug, Default)]
 pub struct SyncNode {
-    /// Field: e026_SyncNode.units_
+    /// Field: e036_SyncNode.units_
     ///
     /// "all to all signals" (`dsc/dsc2.h:966`): every unit this end signals to or waits on.
     ///
@@ -6770,13 +6778,26 @@ pub struct SyncNode {
     /// it in a diagnostic, naming whichever colliding unit it reaches first
     /// (`ddc/ddl/ddl_conversion.cpp:2806-2810`).
     ///
-    /// ⚠️ THE REMAINING READS ARE ORDER-FREE, and only two of them are the membership test this
-    /// anchor used to claim for all of them: two more iterate but accumulate into sets
-    /// (`dsc/dsc2.cpp:2702-2704`, `dsc/dsc2Pcfg.cpp:2050-2053`), and the last two ask an any-of and a
-    /// `count` (`ddc/ddc_transformation.cpp:1531-1535`,
-    /// `dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2650-2651`).
+    /// ⚠️ THE REMAINING READS ARE ORDER-FREE — but they are not six, as this anchor claimed, and
+    /// NINETEEN of them are the membership test it gave to two. `units_.count(<a named component>)`
+    /// appears THIRTEEN times in the PCFG sync builder (`dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2651`,
+    /// `:2674`, `:2680`, `:2683`, `:2706`, `:2711`, `:2736`, `:2741`, `:2774`, `:2782`, `:2790`,
+    /// `:2792`, `:2798`) and SIX times in the L3 scheduler's L3SU/L3LU pair removal
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4094-4100`). Three more iterate to accumulate into
+    /// a set or to ask an any-of (`dsc/dsc2.cpp:2702-2704`, `dsc/dsc2Pcfg.cpp:2050-2053`,
+    /// `ddc/ddc_transformation.cpp:1531-1535`). The order-free conclusion holds for every one of
+    /// them — it is the count that was wrong, and it was wrong by thirteen.
+    ///
+    /// ⛔ AND THREE READS ARE CARDINALITY, WHICH THIS TYPE CANNOT GUARANTEE AND MUST NOT NARROW TO:
+    /// `!units_.empty()` guards the membership walk (`dlOpsNew.cpp:2650`) and `units_.size() == 1` is
+    /// asserted on BOTH ends of every sync node in the tree (`L3DlOpsScheduler.cpp:4086`, `:4092`,
+    /// beside the same guard on `otherEndOfTheSignals_` at `:4088`). ⭐ A ONE-COMPONENT FIELD WOULD BE
+    /// WRONG ANYWAY: the DDL conversion mints an implicit L0 sync whose units are `{L0SU}` on one end
+    /// and one `L0LUROW<i>` PER ROW on the other (`ddc/ddl/ddl_conversion.cpp:1785-1788`), so that
+    /// guard is a PHASE constraint on the nodes the L3 scheduler is willing to delete, not an
+    /// invariant of the class.
     pub units: BTreeSet<SenComponent>,
-    /// Field: e026_SyncNode.isReceive_
+    /// Field: e036_SyncNode.isReceive_
     ///
     /// Which end this is (`dsc/dsc2.h:967`): bridge 1 emits a `sync_send` when it is false and a
     /// `sync_recv` when it is true (`SNSyncLowering.cpp:209`, `:239`).
@@ -6785,25 +6806,32 @@ pub struct SyncNode {
     /// when one is set: `is_implicit_sync` is that pointer against `nullptr` (`:208`), both arms carry
     /// `&& !is_implicit_sync`, and the third arm reads this field not at all (`:264-269`).
     pub is_receive: bool,
-    /// Field: e026_SyncNode.isSoft_
+    /// Field: e036_SyncNode.isSoft_
     ///
     /// Whether the send may run ahead of the transfers it covers (`dsc/dsc2.h:967`): bridge 1 sets
     /// the emitted send's `wait_immediately_for_async_transfers` to its NEGATION
     /// (`SNSyncLowering.cpp:210-211`). TWO sites write it — the L3 scheduler's minter
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:658`) and the JSON importer
-    /// (`dsc/dsc2.cpp:1721-1722`) — and the PCFG translator carries it onto both syncs it mints
-    /// (`dsc/dsc2Pcfg.cpp:2056-2058`).
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:658`, which only ever writes `true`) and the JSON
+    /// importer (`dsc/dsc2.cpp:1721-1722`), round-tripping the exporter at `:822`.
+    ///
+    /// ⛔ AND THE PCFG TRANSLATOR READS IT FIVE TIMES ACROSS THREE MINT PATHS, not once. The EXPLICIT
+    /// path passes it beside `isReceive_` for the single sync it builds (`dsc/dsc2Pcfg.cpp:478-479`)
+    /// — the primary reader, which this anchor left out — and the IMPLICIT path carries it onto both
+    /// syncs of the L0SU pair (`:2056`, `:2058`) AND both of the L0LU pair (`:2067`, `:2069`).
+    /// ⭐ THOSE FOUR CORROBORATE [`is_receive`](Self::is_receive)'s NOTE FROM THE OTHER SIDE: each
+    /// passes a LITERAL `false`/`true` for the receive flag and never reads that field, while still
+    /// propagating this one.
     ///
     /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT: it is declared on the same line as
     /// [`is_receive`](Self::is_receive), and that bridge-1 read is on this campaign's path.
     pub is_soft: bool,
 }
 
-// crustify:todo: e026_SyncNode
+// crustify:todo: e036_SyncNode
 
-// crustify:todo: e026_SyncNode.implicitSyncRefTransfer_
+// crustify:todo: e036_SyncNode.implicitSyncRefTransfer_
 
-// crustify:todo: e026_SyncNode.otherEndOfTheSignals_
+// crustify:todo: e036_SyncNode.otherEndOfTheSignals_
 
 /// A constant container the mask value is read out of — an index into
 /// `DesignSpaceConfig::constantInfo_` (`dsc/designSpaceConfig.h:90`).
@@ -9239,6 +9267,193 @@ mod equivalence {
                 .count(),
             3,
             "and of or, and of not, or of not"
+        );
+    }
+
+    /// ⭐ THE AUTHORITY'S OWN TWO BODIES, COMPILED AND EXECUTED — 303,028 cases, and the one
+    /// divergence [`ComputeNode::operand_sizes`] documents is the only place they may disagree.
+    /// `dsc/dsc2.cpp:2291-2346` and `:2348-2396` were LINE-EXTRACTED byte-exact — never
+    /// transcribed — beside everything they read (`sys-arch-spec/arch_enums.h:13-124`,
+    /// `util/sendefs/sendefs.h:30-54`, `dsc/dscdefn.h:134-207`, `sys-arch-spec/isa/isa.hpp:25-32`,
+    /// `util/utils.h:39-46`) and the two tables they index (`util/sendefs/sendefs.cpp:129-141`,
+    /// `dsc/dscdefn.cpp:142-144`), with `DT_ERROR` throwing as `util/dt_exception.hpp:121` makes
+    /// it. 287,408 size cases and 15,620 format cases, reference digest 14470225117110672529:
+    ///   * 23 components — `dsc2::memories` plus both PT endpoints, LATCH, CONSTANT, ZERO, LXLU and
+    ///     NO_COMPONENT — x 71 ops x 22 formats x all five arches, one input;
+    ///   * that grid again at `numFoldsEngaged = 3`, one arch each side of the RCUDD1A split;
+    ///   * 23 THREE-input rotations of the same list, so operand ORDER and per-operand independence
+    ///     are on the digest too, not just the singleton answers;
+    ///   * 71 ops x 22 formats x 0..=4 inputs x 2 packmerge formats for the formats, which is what
+    ///     covers the two arities the anchor calls out — 3 inputs yielding FOUR formats and 4
+    ///     yielding three.
+    /// Each line carries the enums' INTEGER indices, so digest equality also pins
+    /// [`ComputeOpType::ALL`] and [`DataFormats::ALL`] to the authority's declaration order and
+    /// [`Gen`] to `IsaCoreGen`'s.
+    ///
+    /// ⛔ THE DIVERGENCE IS NORMALISED, NOT HIDDEN: the C++ side reports `ABSENT` whenever an
+    /// element count comes back negative, which is exactly when the port answers `None` — the -1
+    /// bit width of `INVALID` reaching the `1024 / bitWidth` default (`:2295`). 11,347 cases take
+    /// that route and 14,520 take the two `DT_ERROR` refusals; all 25,867 are `None` here, and the
+    /// other 277,161 compare verbatim.
+    /// ⛔ WHAT IT CANNOT REACH IS `getComputeOperandFormats`' OWN TWO THROWS, because the port takes
+    /// that lookup pre-resolved — see [`ComputeNode::operand_formats`].
+    #[test]
+    fn e035_operand_sizes_and_formats_agree_with_the_executed_authority() {
+        /// FNV-1a 64 over the canonical case lines, with the same seed on the C++ side.
+        struct Digest {
+            hash: u64,
+            cases: u64,
+            nones: u64,
+        }
+
+        impl Digest {
+            fn feed(&mut self, line: &str) {
+                for byte in line.bytes() {
+                    self.hash ^= u64::from(byte);
+                    self.hash = self.hash.wrapping_mul(1_099_511_628_211);
+                }
+                self.cases += 1;
+            }
+        }
+
+        fn joined(values: impl IntoIterator<Item = i32>) -> String {
+            values
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        fn size_case(
+            digest: &mut Digest,
+            inputs: &[SenComponent],
+            r#type: ComputeOpType,
+            data_format: DataFormats,
+            arch: Gen,
+            folds: i32,
+        ) {
+            let node = ComputeNode {
+                r#type,
+                data_format,
+                inputs: inputs.to_vec(),
+                num_folds_engaged: NumFoldsEngaged(folds),
+                ..ComputeNode::default()
+            };
+            let mut line = String::from("S|");
+            for input in inputs {
+                line += &format!("{}.", *input as i32);
+            }
+            line += &format!(
+                "|{}|{}|{}|{folds}|",
+                r#type as i32, data_format as i32, arch as i32
+            );
+            match node.operand_sizes(arch) {
+                Some(sizes) => line += &joined(sizes.into_iter().map(|size| size.0)),
+                None => {
+                    line += "ABSENT";
+                    digest.nones += 1;
+                }
+            }
+            digest.feed(&(line + "\n"));
+        }
+
+        fn format_case(
+            digest: &mut Digest,
+            r#type: ComputeOpType,
+            data_format: DataFormats,
+            inputs: usize,
+            packmerge: DataFormats,
+        ) {
+            let node = ComputeNode {
+                r#type,
+                data_format,
+                inputs: vec![SenComponent::Lx; inputs],
+                ..ComputeNode::default()
+            };
+            digest.feed(&format!(
+                "F|{}|{}|{inputs}|{}|{}\n",
+                r#type as i32,
+                data_format as i32,
+                packmerge as i32,
+                joined(
+                    node.operand_formats(packmerge)
+                        .into_iter()
+                        .map(|format| format as i32)
+                ),
+            ));
+        }
+
+        // The C++ side iterates a `std::set<SenComponents>`, so both sides feed the digest in
+        // ascending discriminant order.
+        let mut components: Vec<SenComponent> = MEMORIES.to_vec();
+        components.extend([
+            SenComponent::Ptwest,
+            SenComponent::Ptnorth,
+            SenComponent::Latch,
+            SenComponent::Constant,
+            SenComponent::Zero,
+            SenComponent::Lxlu,
+            SenComponent::NoComponent,
+        ]);
+        components.sort_by_key(|component| *component as i32);
+        let archs = [Gen::Mpw2, Gen::Mpw3, Gen::Mpw4, Gen::Rcudd1a, Gen::Sen1p5];
+
+        let mut digest = Digest {
+            hash: 1_469_598_103_934_665_603,
+            cases: 0,
+            nones: 0,
+        };
+
+        for &component in &components {
+            for r#type in ComputeOpType::ALL {
+                for data_format in DataFormats::ALL {
+                    for arch in archs {
+                        size_case(&mut digest, &[component], r#type, data_format, arch, 1);
+                    }
+                }
+            }
+        }
+        for &component in &components {
+            for r#type in ComputeOpType::ALL {
+                for data_format in DataFormats::ALL {
+                    for arch in [Gen::Rcudd1a, Gen::Sen1p5] {
+                        size_case(&mut digest, &[component], r#type, data_format, arch, 3);
+                    }
+                }
+            }
+        }
+        for (i, &component) in components.iter().enumerate() {
+            let triple = [
+                component,
+                components[(i + 7) % components.len()],
+                components[(i + 13) % components.len()],
+            ];
+            for r#type in ComputeOpType::ALL {
+                for data_format in DataFormats::ALL {
+                    size_case(&mut digest, &triple, r#type, data_format, Gen::Sen1p5, 3);
+                }
+            }
+        }
+        for r#type in ComputeOpType::ALL {
+            for data_format in DataFormats::ALL {
+                for inputs in 0..=4 {
+                    for packmerge in [DataFormats::Senint2, DataFormats::IeeeFp32] {
+                        format_case(&mut digest, r#type, data_format, inputs, packmerge);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (303_028, 14_470_225_117_110_672_529),
+            "executed dsc/dsc2.cpp:2291-2346 and :2348-2396"
+        );
+        // ⛔ AND THE TWO SIDES ARE NOT MERELY AGREEING ON `ABSENT`: refusal is 8.5% of the sweep,
+        // so the digest above is carrying 277,161 answered cases.
+        assert_eq!(
+            digest.nones, 25_867,
+            "11,347 negative defaults and 14,520 DT_ERRORs"
         );
     }
 }
