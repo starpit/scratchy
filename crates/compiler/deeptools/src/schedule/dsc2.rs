@@ -874,13 +874,15 @@ mod unit_tests {
         assert_eq!(chunk_size, vec![entry(PrimaryDimTypes::In, 4, 0)]);
     }
 
-    /// `dsc/dsc2.h:43` against BOTH naming conventions: the `+ "el"` suffix the DDC gives the stages
-    /// it mints by number (`ddc/ddc_transformation_util.cpp:121-122`, `:131-132`,
-    /// `ddc/ddc_transformation.cpp:1018-1019`, `ddc/ddcv1.cpp:1236-1237`) and the shared name all
-    /// three NAMED stages carry in both halves — `"core"` (`fillLoopLatchSdsc`,
+    /// `dsc/dsc2.h:43` against all THREE naming conventions: the `+ "el"` suffix the DDC gives the
+    /// stages it mints by number (`ddc/ddc_transformation_util.cpp:121-122`, `:131-132`,
+    /// `ddc/ddc_transformation.cpp:1018-1019`, `ddc/ddcv1.cpp:1236-1237`), the shared name all three
+    /// NAMED stages carry in both halves — `"core"` (`fillLoopLatchSdsc`,
     /// `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`) and `"chunk"`
     /// (`addOrUpdateDataStageParam` called with one name for both,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1419-1420`, `:1477-1480`).
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1419-1420`, `:1477-1480`) — and the DDL's own
+    /// by-number stage, which names `ss_` and leaves `el_` unnamed
+    /// (`ddc/ddl/ddl_conversion.cpp:1512-1515`).
     #[test]
     fn a_data_stages_name_is_its_steady_states_and_the_el_suffix_is_not_an_invariant() {
         // `dsc2::DataStage newDstg;` (`dsc/dsc2.cpp:3619`) and `emplace(index, dsc2::DataStage())`
@@ -930,6 +932,51 @@ mod unit_tests {
         assert_eq!(chunk.name(), "chunk");
         assert_eq!(chunk.el.name, "chunk");
         assert_ne!(chunk.el.name, format!("{}el", chunk.name()));
+
+        // ⛔ AND THE DDL'S OWN BY-NUMBER STAGE NAMES THE STEADY STATE ONLY: the `DatastageOp` handler
+        // writes `ss_.name_ = to_string(id)` and never assigns `el_.name_`
+        // (`ddc/ddl/ddl_conversion.cpp:1512-1515`), so stage 7 there has an epilogue named "" — the
+        // third convention, and the one a derived `+ "el"` suffix gets wrong in the other direction.
+        let mut ddl_minted = DataStage::default();
+        ddl_minted.ss.name = "7".to_string();
+        assert_eq!(ddl_minted.name(), "7");
+        assert_eq!(ddl_minted.el.name, "");
+    }
+
+    /// `ddc/ddl/ddl_conversion.cpp:2974` and `:2998` read `dataStageParam_[loopnode->numId_]` through
+    /// the NON-CONST `operator[]`, and the DFS that reaches them (`:2951-3082`) has no parametric
+    /// guard — so the `-1` a `ParametricLoopOp` loop carries (`:1129-1130`, linked at `:1162`) is
+    /// INSERTED by the very test that asks whether its name is empty.
+    #[test]
+    fn the_emissions_emptiness_test_mints_the_absent_stage_it_reads() {
+        use crate::schedule::dims::DimVal;
+
+        // `:1510-1511`: the id the DDL mints next starts from `dataStageParam_.size()`.
+        let mut param: BTreeMap<DataStageId, DataStage> = BTreeMap::new();
+        param.insert(DataStageId(0), DataStage::default());
+        assert_eq!(param.len(), 1);
+
+        // `:2974`, `dataStageParam_[loopnode->numId_]` with `numId_ == -1`: the READ IS A WRITE, and
+        // what it reads back is the empty name that selects the `DatastageOp` branch at `:2985`.
+        let minted = param.entry(DataStageId(-1)).or_default().clone();
+        assert_eq!(minted.name(), "");
+        assert_eq!(param.len(), 2);
+
+        // Which is what keeps `.at(denId_)` / `.at(numId_)` at `:3066-3067` — the SAME iteration —
+        // from throwing. ⛔ AND WHAT THEY FIND ANSWERS `-1`, NOT ABSENT: the authority's unfilled dim
+        // (`dsc/dims.h:162-193`, and `calculate_padded` returns `-1` for any negative,
+        // `dsc/dims.cpp:567-568`), reproduced here in both halves. `:3070-3071` reads `numstg.ss_` and
+        // `denstg.ss_`, which with both ids `-1` is this one stage's steady state twice, so the
+        // `ss_loop_count` the emission attaches to a parametric loop is `ceil(-1.0 / -1) == 1`.
+        assert!(minted.ss.empty() && minted.el.empty());
+        let ss = minted.ss.primary_dim_to_val(PrimaryDimTypes::In);
+        assert_eq!(ss, Some(DimVal(-1)));
+        assert_eq!(
+            minted.el.primary_dim_to_val(PrimaryDimTypes::In),
+            Some(DimVal(-1))
+        );
+        let count = ss.map(|DimVal(v)| (f64::from(v) / f64::from(v)).ceil());
+        assert_eq!(count, Some(1.0));
     }
 
     /// `dsc/dsc2.h:1088`: the declared order and the field's `NOT_PROCESSED` initialiser (`:1093`).
@@ -990,8 +1037,10 @@ mod unit_tests {
         assert_eq!(parametric.parametric_lds_idx(), Some(LdsIdx(3)));
 
         // ⛔ The head carries `denId_` ALONE. This is the shape behind every `>= 0` guard on a
-        // climbed parent (`ddc/ddcv1.cpp:634`, `:645`), and the shape that makes the unguarded
-        // `dataStageParam_.at(numId_)` reads (`dsc/dsc2.cpp:2995`) a throw rather than a branch.
+        // climbed parent (`ddc/ddcv1.cpp:634`, `:645`). It is NOT what makes an absent numerator a
+        // throw everywhere: `dsc/dsc2.cpp:2995` throws only because `:2994` has already excluded
+        // parametric loops, and `ddl_conversion.cpp:2974` MINTS the key instead — pinned by
+        // `the_emissions_emptiness_test_mints_the_absent_stage_it_reads`.
         let head = LoopNode {
             den_id: Some(DataStageId(0)),
             ..LoopNode::default()
@@ -3361,12 +3410,15 @@ pub struct LoopInfo {
 
 // crustify:todo: e013_ScheduleNode.prev_
 
-/// Replaces: e014_DataStage
+/// Replaces: e022_DataStage
 ///
 /// `dsc/dsc2.h:39-44`. One data stage's two halves — the steady-state dims and the epilogue dims of
 /// the same data structure. `DesignSpaceConfig::dataStageParam_` keys them by id
 /// (`dsc/designSpaceConfig.h:105`); id 0 is the core stage, whose name `getSizeDataStageForNode`
 /// `DT_CHECK`s to be `"core"` (`dsc/dsc2.cpp:3638-3639`).
+///
+/// `e014_DataStage` is this same class under the superseded numbering; its two filled field anchors
+/// are RENUMBERED onto e022 here, not deleted.
 ///
 /// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and WHETHER THE EPILOGUE CARRIES A
 /// DIFFERENT ONE DEPENDS ON WHO MINTED THE STAGE. The `+ "el"` suffix belongs to the stages the DDC
@@ -3374,7 +3426,10 @@ pub struct LoopInfo {
 /// (`ddc/ddc_transformation_util.cpp:121-122`, `:131-132`, and the L3 scheduler's own copy at
 /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7730-7731`), the chunk split does the same from `ss_`
 /// (`ddc/ddc_transformation.cpp:1018-1019`), and `calculateEpilogues` copies `ss_` and appends to
-/// the copy's name (`ddc/ddcv1.cpp:1236-1237`). ⛔ ALL THREE **NAMED** STAGES CARRY THE SAME NAME IN
+/// the copy's name (`ddc/ddcv1.cpp:1236-1237`). ⛔ BUT NOT EVEN EVERY BY-NUMBER STAGE HAS AN
+/// EPILOGUE NAME: the DDL's own `DatastageOp` handler writes `ss_.name_ = to_string(id)` and never
+/// assigns `el_.name_` at all (`ddc/ddl/ddl_conversion.cpp:1509-1515`), so there the epilogue name is
+/// `""` and not `"<id>el"`. ⛔ ALL THREE **NAMED** STAGES CARRY THE SAME NAME IN
 /// BOTH HALVES, and two of the three are written by the L3 scheduler this campaign ports: `"core"`
 /// (`fillLoopLatchSdsc`, `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`), `"chunk"`
 /// (both callers of `addOrUpdateDataStageParam` pass one `chunkDsName` for BOTH names,
@@ -3389,13 +3444,13 @@ pub struct LoopInfo {
 /// omits `name_` (`dsc/dims.h:221-228`) — so two stages with different names would compare equal.
 #[derive(Clone, Debug, Default)]
 pub struct DataStage {
-    /// Field: e014_DataStage.ss_
+    /// Field: e022_DataStage.ss_
     ///
     /// The steady state: the dims of every trip but the last. It is the half readers reach for by
     /// default (`ddc/ddc_fold.cpp:2113`, `ddc/ddcv1.cpp:1924`,
     /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4848`).
     pub ss: DataStructDims,
-    /// Field: e014_DataStage.el_
+    /// Field: e022_DataStage.el_
     ///
     /// The epilogue: the dims of the last, short trip. `calculateEpilogues` seeds it from `ss_` and
     /// then shrinks only the dims the metadata calls relevant (`ddc/ddcv1.cpp:1230-1330`), so an
@@ -3404,10 +3459,18 @@ pub struct DataStage {
 }
 
 impl DataStage {
-    /// `DataStage::name` (`dsc/dsc2.h:43`) — what `attachToPrefilledSchedule` tests against `"core"`
-    /// and `"chunk"` (`ddc/ddcv1.cpp:2283-2285`), what the DDL conversion tests for emptiness
-    /// (`ddc/ddl/ddl_conversion.cpp:2974`, `:2998`), and what a loop label is built from
+    /// `DataStage::name` (`dsc/dsc2.h:43`) — tested against `"core"` and `"chunk"` by
+    /// `attachToPrefilledSchedule` (`ddc/ddcv1.cpp:2283-2285`) and built into a loop label
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:953-954`).
+    ///
+    /// ⛔ THE DDL EMISSION'S TWO EMPTINESS TESTS **MINT** THE STAGE THEY TEST: they reach it through
+    /// the non-const `dataStageParam_[numId_]` / `[denId_]` (`ddc/ddl/ddl_conversion.cpp:2974`,
+    /// `:2998`), so a parametric loop's absent id inserts a default stage and this answers `""`. That
+    /// insert is LOAD-BEARING: `.at(denId_)` / `.at(numId_)` later in the SAME iteration
+    /// (`:3066-3067`) only succeeds because of it; it grows the `dataStageParam_.size()` the next
+    /// minted id starts from (`:1510-1511`); and the stage's unfilled dims are what the emitted
+    /// `ss_loop_count` divides, `ceil(-1.0 / -1) == 1` (`:3070-3078`) — a trip count this port
+    /// reproduces, since an unfilled dim answers `-1` here too (`dsc/dims.cpp:567-568`).
     pub fn name(&self) -> &str {
         &self.ss.name
     }
@@ -3495,12 +3558,16 @@ pub enum PropStateType {
 pub struct LoopNode {
     /// Field: e031_LoopNode.numId_
     ///
-    /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, NOT A STAGE, AND NO READER TESTS
-    /// FOR IT: every one indexes straight through, `dataStageParam_.at(numId_)`
-    /// (`dsc/dsc2.cpp:2995`, `:6104`, `ddc/ddcv1.cpp:2496`, `:2835`, `ddc/ddc_fold.cpp:2349`,
-    /// `:3235`, `:3604`) or `constraints_[loop->numId_]` (`ddc/ddcv1.cpp:610`, `:649`), so an absent
-    /// numerator is an out-of-range throw and never a branch. The `>= 0` guards belong to
-    /// [`den_id`](Self::den_id) alone.
+    /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, AND A READER EITHER THROWS ON IT OR
+    /// **MINTS** IT. The `.at()` readers throw (`dsc/dsc2.cpp:2995`, itself behind
+    /// `!isParametricLoop()` at `:2994`; `:6104`, `ddc/ddcv1.cpp:2496`, `:2835`,
+    /// `ddc/ddc_fold.cpp:2349`, `:3235`, `:3604`); the DDL emission instead reads
+    /// `dataStageParam_[numId_]` through the NON-CONST `operator[]`, with NO parametric guard
+    /// (`ddc/ddl/ddl_conversion.cpp:2974`, `:2998`, in the DFS at `:2951-3082`), and a parametric loop
+    /// always arrives with `-1` (minted `:1129-1130`, linked into the tree `:1162`) — so the key is
+    /// DEFAULT-INSERTED and the `else` branch runs on a stage named `""`. ⭐ [`DataStage::name`]
+    /// carries what that insert then makes true. `constraints_[loop->numId_]` (`ddc/ddcv1.cpp:610`,
+    /// `:649`) is the same `operator[]` shape, and `metadata.rs` records it as an `Option` KEY.
     pub num_id: Option<DataStageId>,
     /// Field: e031_LoopNode.denId_
     ///
@@ -5918,9 +5985,11 @@ pub struct ComputeCoreletView {
 /// `InheritWithClone<ScheduleNode, ComputeNode>` and its constructor tags the base with `COMPUTE`
 /// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. THREE field anchors stay OPEN,
 /// every one blocked on a type another agent owns and none on this class: `inputCoordinates_` and
-/// `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`), e012, and the third is
-/// `instrAttribute_.computeMaskLoopOffsets_` below. ⛔ `port.json` names this unit's ONE dep
-/// `e023_CoordinateType`, a renumbering artefact that is NOT satisfied.
+/// `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`) — e023 under the
+/// current numbering, whose own anchors in this file still read `e012` — and the third is
+/// `instrAttribute_.computeMaskLoopOffsets_` below. ⛔ THE ONE DEP `port.json` NAMES,
+/// `e023_CoordinateType`, IS GENUINELY UNSATISFIED: it is `std::map<PrimaryDimTypes,
+/// FoldManager<Dtype>>` (`dsc/dsc2.h:431`) and `FoldManager` has not landed.
 /// ⭐ `coreletViews_` AND ITS TWO SEPARATELY ANCHORED HALVES ARE PORTED HERE and were not portable
 /// when e024 ran: `ScheduleNode::UnitView` (`:943-947`) landed with e029 in `625e761da`.
 /// ⭐ AND `inputsLdsAndLoopOffsets_` / `outputsLdsAndLoopOffsets_` (`:937-938`) ARE CARRIED NOW: the
