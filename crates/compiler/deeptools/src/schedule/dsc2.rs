@@ -2710,6 +2710,54 @@ mod unit_tests {
         );
         assert!(!node.is_dst_labeled_ds());
     }
+
+    /// [`LoopCondOp`] IS `CondOp::COMPARISONS`, positionally and by spelling, and the narrowing is
+    /// total on both sides. Which operators make up that set is
+    /// [`only_the_six_relational_cond_ops_survive_both_ends_of_the_path`]'s job, not this one's.
+    #[test]
+    fn only_the_six_relational_operators_narrow_onto_a_loop_condition() {
+        for (i, op) in CondOp::COMPARISONS.into_iter().enumerate() {
+            let narrowed = LoopCondOp::from_cond_op(op);
+            assert_eq!(narrowed, Some(LoopCondOp::ALL[i]), "{}", op.name());
+            assert_eq!(CondOp::from(LoopCondOp::ALL[i]), op);
+            assert_eq!(LoopCondOp::ALL[i].name(), op.name());
+        }
+        for op in [
+            CondOp::Toggle,
+            CondOp::Always,
+            CondOp::Never,
+            CondOp::Const,
+            CondOp::Default,
+        ] {
+            assert_eq!(LoopCondOp::from_cond_op(op), None, "{}", op.name());
+        }
+    }
+
+    /// The fused value reproduces both JSON fields (`dsc/dsc2.cpp:464-468`) and survives the
+    /// importer's join (`:1444-1449`) — plus the one wire pair the fusion deliberately collapses.
+    #[test]
+    fn a_first_or_last_condition_value_derives_the_authoritys_minus_one() {
+        assert_eq!(CondVal::First.val_type(), CondValType::First);
+        assert_eq!(CondVal::Last.val_type(), CondValType::Last);
+        assert_eq!(CondVal::First.val_int(), CondVal::ABSENT_VAL_INT);
+        assert_eq!(CondVal::Last.val_int(), CondVal::ABSENT_VAL_INT);
+        assert_eq!(CondVal::ABSENT_VAL_INT, -1);
+
+        for val in [
+            CondVal::First,
+            CondVal::Last,
+            CondVal::Iteration(IterationIdx(0)),
+            CondVal::Iteration(IterationIdx(7)),
+            // ⭐ a literal `-1` under `INT` stays an iteration index, not the absent marker
+            CondVal::Iteration(IterationIdx(CondVal::ABSENT_VAL_INT)),
+        ] {
+            assert_eq!(CondVal::from_wire(val.val_type(), val.val_int()), val);
+        }
+
+        // ⛔ THE ONE DIVERGENCE: an integer beside `FIRST`/`LAST` is discarded, because every reader
+        // of those two forms already ignores it and no producer writes one.
+        assert_eq!(CondVal::from_wire(CondValType::Last, 4), CondVal::Last);
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -3552,8 +3600,14 @@ impl CondOp {
 ///
 /// ⛔ AND `condValInt_` IS EXPORTED UNCONDITIONALLY (`dsc/dsc2.cpp:468`) then imported field by field
 /// into a default-constructed `LoopCond` (`:1438-1449`), so the `-1` an unparsed `FIRST`/`LAST`
-/// carries (`ddc/ddl/ddl_conversion.cpp:267`) has to round-trip. A Rust `CondVal` that fused the form
-/// and the integer into one enum would still have to hold that `-1` to reproduce the JSON.
+/// carries (`ddc/ddl/ddl_conversion.cpp:267`) has to round-trip.
+///
+/// ⛔ THE REVERSAL: this doc used to say a fused `CondVal` "would still have to hold that `-1`". It
+/// does not, and [`CondVal`] is that fusion — it answers the `-1` FROM THE FORM, because `-1` is
+/// `condValInt_`'s own initialiser (`dsc/dsc2.h:663`) and the one mint of an unparsed `FIRST`/`LAST`
+/// passes exactly it (`ddc/ddl/ddl_conversion.cpp:267`). Holding the integer would reproduce the
+/// JSON; deriving it reproduces the JSON AND makes bridge 1's four `DT_CHECK(condValType_ == INT)`
+/// unspellable, which holding it does not.
 ///
 /// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE HERE, unlike [`NodeType`]'s: both maps are
 /// `std::unordered_map` (`dsc/dsc2.h:656-657`), neither is iterated, and the JSON round trip
@@ -3571,6 +3625,8 @@ impl CondValType {
     /// Every value form in the authority's declaration order (`dsc/dsc2.h:655`).
     pub const ALL: [Self; 3] = [Self::Int, Self::First, Self::Last];
 
+    /// Field: e039_LoopCond.condValTypeToString
+    ///
     /// The spelling `LoopCond::condValTypeToString` gives this form (`dsc/dsc2.h:656`, defined
     /// `dsc/dsc2.cpp:21-23`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
     pub fn name(self) -> &'static str {
@@ -3581,6 +3637,8 @@ impl CondValType {
         }
     }
 
+    /// Field: e039_LoopCond.stringToCondValType
+    ///
     /// `LoopCond::stringToCondValType`, the flip of the above (`dsc/dsc2.h:657`, built with
     /// `flipMap` at `dsc/dsc2.cpp:24-25`). ⭐ AN ABSENT SPELLING IS A LIVE ANSWER HERE, not an
     /// error: the DDL conversion treats the miss as "this is an integer expression"
@@ -3596,15 +3654,235 @@ impl CondValType {
     }
 }
 
+/// The comparison one [`LoopCond`] carries: [`CondOp`] narrowed to the six relational operators,
+/// which is the whole of that enum a loop condition can hold.
+///
+/// ⛔ THE NARROWING DELETES TWO LIVE REFUSALS ON OUR OWN LOWERING PATH. Bridge 1's
+/// `getCmpIPredicate_dup` maps exactly these six onto an `arith::CmpIPredicate` and FAILS THE WHOLE
+/// LOWERING on anything else (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:23-44`),
+/// refused at `:141-143` and again at `:251-253`; the DDL conversion's `is_any_of` over the same six
+/// (`ddc/ddl/ddl_conversion.cpp:260-264`) becomes the parse-time [`from_cond_op`](Self::from_cond_op)
+/// rather than a check a built condition can still fail.
+///
+/// ⛔ AND IT MAKES [`CondOp::Default`] UNSPELLABLE ON A CONDITION. It is `condOp_`'s declared
+/// initialiser (`dsc/dsc2.h:661`), yet every mint names a relational operator
+/// (`ddc/ddcv1.cpp:3643`, `ddc/ddc_transformation.cpp:1060-1062`, `dsc/dsc2.cpp:5095-5101`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811`, `ddc/ddl/ddl_conversion.cpp:317-319`), so
+/// `DEFAULT` on a `LoopCond` is a state only IBM's own default constructor reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopCondOp {
+    Eq = 0,
+    Ne = 1,
+    Lt = 2,
+    Le = 3,
+    Gt = 4,
+    Ge = 5,
+}
+
+/// ⛔ E0080 IF THE NARROWING EVER STOPS AGREEING WITH [`CondOp`] ON A DISCRIMINANT OR AN ORDER: the
+/// two are positional against each other, which is what lets [`LoopCondOp::name`] hand its operator
+/// straight to [`CondOp::name`] and keeps a container keyed by either one iterating the same way.
+const _: () = {
+    let mut i = 0;
+    while i < LoopCondOp::ALL.len() {
+        assert!(
+            LoopCondOp::ALL[i] as usize == CondOp::COMPARISONS[i] as usize,
+            "LoopCondOp is no longer CondOp::COMPARISONS"
+        );
+        i += 1;
+    }
+};
+
+impl LoopCondOp {
+    /// Every operator a loop condition can carry, in the authority's declaration order — the same
+    /// six as [`CondOp::COMPARISONS`], positionally.
+    pub const ALL: [Self; 6] = [Self::Eq, Self::Ne, Self::Lt, Self::Le, Self::Gt, Self::Ge];
+
+    /// The narrowing both readers of a `condOp_` already perform: the DDL conversion's `is_any_of`
+    /// (`ddc/ddl/ddl_conversion.cpp:260-264`) and bridge 1's predicate map
+    /// (`SNControlFlowLowering.cpp:23-44`). [`None`] is the state those two refuse.
+    pub fn from_cond_op(op: CondOp) -> Option<Self> {
+        match op {
+            CondOp::Eq => Some(Self::Eq),
+            CondOp::Ne => Some(Self::Ne),
+            CondOp::Lt => Some(Self::Lt),
+            CondOp::Le => Some(Self::Le),
+            CondOp::Gt => Some(Self::Gt),
+            CondOp::Ge => Some(Self::Ge),
+            CondOp::Toggle | CondOp::Always | CondOp::Never | CondOp::Const | CondOp::Default => {
+                None
+            }
+        }
+    }
+
+    /// The spelling `EnumsConversion::condOpToString` gives this operator — [`CondOp::name`]'s, which
+    /// is what the JSON exporter writes for a `condOp_` (`dsc/dsc2.cpp:464-466`).
+    pub fn name(self) -> &'static str {
+        CondOp::from(self).name()
+    }
+}
+
+impl From<LoopCondOp> for CondOp {
+    fn from(op: LoopCondOp) -> Self {
+        match op {
+            LoopCondOp::Eq => Self::Eq,
+            LoopCondOp::Ne => Self::Ne,
+            LoopCondOp::Lt => Self::Lt,
+            LoopCondOp::Le => Self::Le,
+            LoopCondOp::Gt => Self::Gt,
+            LoopCondOp::Ge => Self::Ge,
+        }
+    }
+}
+
+/// One iteration of a loop dim — the `int` of `LoopCond::condValInt_` (`dsc/dsc2.h:663`).
+///
+/// ⛔ ITS DIRECTION IS THE READER'S, NOT THE FIELD'S, and the authority's two readers disagree:
+/// bridge 1 compares the induction variable against this value verbatim, counting UP from the loop's
+/// lower bound (`SNControlFlowLowering.cpp:111-114`, `:132-134`), while the PCFG translator answers
+/// `loopCount - 1 - condValInt_`, counting DOWN from the last iteration (`dsc/dsc2Pcfg.cpp:788-806`).
+/// This newtype carries bridge 1's — an induction value on our own lowering path — and nothing here
+/// converts between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IterationIdx(pub i32);
+
+/// What the right-hand side of a loop condition IS: `LoopCond`'s `condValType_` and `condValInt_`
+/// (`dsc/dsc2.h:662-663`) as ONE value, since the integer exists only under [`CondValType::Int`].
+///
+/// ⛔ THIS EXISTS TO MAKE BRIDGE 1'S OWN `DT_CHECK` UNSPELLABLE. Every read of `condValInt_` on our
+/// path is guarded by `DT_CHECK(condValType_ == dsc2::LoopCond::INT)` — four of them, at
+/// `SNControlFlowLowering.cpp:110` and `:131`, then again at `:224` and `:243` on the single-`and`
+/// path — and the state they refuse is one this enum has no variant for. [`CondValType`] records why the merge is sound at
+/// all: `-1` is what `condValInt_` initialises to and what the only unparsed `FIRST`/`LAST` mint
+/// passes, so [`val_int`](Self::val_int) DERIVES the JSON's integer instead of storing it.
+///
+/// ⛔ AND `FIRST`/`LAST` ARE NOT ITERATION INDICES, so this is not an [`Option<IterationIdx>`]: both
+/// resolve against the loop's bounds at lowering time, `LAST` to `upperBound - 1` and `FIRST` to the
+/// lower bound (`SNControlFlowLowering.cpp:99-109`, `:121-130`), which are values no producer of a
+/// `LoopCond` knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CondVal {
+    /// `INT`, carrying the `condValInt_` that form is the only reader of.
+    Iteration(IterationIdx),
+    /// `FIRST` — the loop's first iteration, whatever its bounds turn out to be.
+    First,
+    /// `LAST` — its last, which is `upperBound - 1` and not the bound.
+    Last,
+}
+
+impl CondVal {
+    /// `condValInt_`'s declared initialiser (`dsc/dsc2.h:663`), which is also what the DDL conversion
+    /// leaves on a `FIRST`/`LAST` it never parses an integer for
+    /// (`ddc/ddl/ddl_conversion.cpp:267`) — so it is the value the JSON seam carries for both forms.
+    pub const ABSENT_VAL_INT: i32 = -1;
+
+    /// Which `condValType_` this form is (`dsc/dsc2.h:662`) — the half of the pair the JSON exporter
+    /// writes as a spelling (`dsc/dsc2.cpp:464-466`).
+    pub fn val_type(self) -> CondValType {
+        match self {
+            Self::Iteration(_) => CondValType::Int,
+            Self::First => CondValType::First,
+            Self::Last => CondValType::Last,
+        }
+    }
+
+    /// The `condValInt_` the JSON exporter writes for this form, unconditionally
+    /// (`dsc/dsc2.cpp:468`). A raw `i32` and not an [`IterationIdx`] deliberately: under
+    /// `FIRST`/`LAST` the number is [`ABSENT_VAL_INT`](Self::ABSENT_VAL_INT), which is not an
+    /// iteration of anything.
+    pub fn val_int(self) -> i32 {
+        match self {
+            Self::Iteration(idx) => idx.0,
+            Self::First | Self::Last => Self::ABSENT_VAL_INT,
+        }
+    }
+
+    /// The JSON importer's two fields joined (`dsc/dsc2.cpp:1444-1449`).
+    ///
+    /// ⛔ IT DISCARDS `val_int` UNDER `FIRST`/`LAST`, and that is the fusion's whole divergence: a
+    /// wire pair carrying anything but [`ABSENT_VAL_INT`](Self::ABSENT_VAL_INT) there does not
+    /// round-trip. No producer writes one, and every reader of those two forms already ignores the
+    /// integer (`SNControlFlowLowering.cpp:99-109`, `dsc/dsc2Pcfg.cpp:791-795`).
+    pub fn from_wire(val_type: CondValType, val_int: i32) -> Self {
+        match val_type {
+            CondValType::Int => Self::Iteration(IterationIdx(val_int)),
+            CondValType::First => Self::First,
+            CondValType::Last => Self::Last,
+        }
+    }
+}
+
+/// One term of a condition node's guard: WHICH iteration of one loop dim the guarded region applies
+/// to (`dsc/dsc2.h:654-673`).
+///
+/// ⛔ PARTIAL, AND `e018_LoopCond`/`e039_LoopCond` STAY OPEN BELOW: `loopComp_` is the `const
+/// LoopNode*` this term is a condition ON, used as pure pointer identity — compared against a loop
+/// (`ddc/ddc_transformation_util.cpp:266`, `:555`, `dsc/dsc2.cpp:2071`, `:2128`), inserted into a set
+/// (`:329`) and keyed into a map (`dsc/dsc2Pcfg.cpp:746`). Rust has no schedule-node identity yet
+/// because `ScheduleNode::prev_`, `BlockNode::next_` and `ScheduleTree::head_` are one unlanded
+/// cyclic unit, and an index or a name will not do for a pointer compare.
+///
+/// ⭐ THE VALUE HALF LANDS ANYWAY BECAUSE TWO READERS NEVER TOUCH THE LOOP: `convertCondValToInt`
+/// takes the loop's trip count as a parameter rather than following the pointer
+/// (`dsc/dsc2Pcfg.cpp:788-806`), and the reverse-DDL emitter writes a LITERAL `"label"` where the
+/// loop's name belongs (`ddc/ddl/ddl_conversion.cpp:3272-3281`).
+///
+/// ⛔ NO `Default`, unlike the authority's `LoopCond() = default` (`dsc/dsc2.h:672`): that
+/// constructor exists for the JSON importer, which overwrites all five fields before the value is
+/// used (`dsc/dsc2.cpp:1438-1449`), and its [`CondOp::Default`] operator is a state
+/// [`LoopCondOp`] has no variant for.
+///
+/// ```compile_fail
+/// // E0599, for the reader only: stable rustdoc parses the code an annotation names and ignores
+/// // it, so the annotation is documentation and the positive control below is the check.
+/// use deeptools::schedule::dsc2::LoopCond;
+/// let _ = LoopCond::default();
+/// ```
+///
+/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — the same path, reached the only way a
+/// value of this type exists. Without it the `compile_fail` above would pass just as happily on a
+/// misspelled module path or an item that stopped being `pub`:
+///
+/// ```
+/// use deeptools::schedule::dims::PrimaryDimTypes;
+/// use deeptools::schedule::dsc2::{CondVal, LoopCond, LoopCondOp};
+/// let _ = LoopCond {
+///     dim: PrimaryDimTypes::Y,
+///     cond_op: LoopCondOp::Eq,
+///     cond_val: CondVal::Last,
+/// };
+/// ```
+///
+/// ⛔ NO `PartialEq` EITHER, and the authority declares none: two terms agreeing on dim, operator and
+/// value are the same condition only on the same loop, and that is the field this type is missing.
+#[derive(Clone, Copy, Debug)]
+pub struct LoopCond {
+    /// Field: e039_LoopCond.dim_
+    /// Field: e018_LoopCond.dim_
+    ///
+    /// Which of `loopComp_`'s dims the term is on (`dsc/dsc2.h:660`) — a loop node carries several,
+    /// and bridge 1 resolves the pair to one MLIR loop (`SNControlFlowLowering.cpp:92-94`).
+    ///
+    /// ⭐ [`PrimaryDimTypes::Undefined`] IS THE AUTHORITY'S OWN INITIALISER, `PrimaryDimTypesCount`
+    /// (`dsc/dsc2.h:660`), so no [`Option`] is needed: the live "no dimension" key already spells it.
+    pub dim: PrimaryDimTypes,
+    /// Field: e039_LoopCond.condOp_
+    /// Field: e018_LoopCond.condOp_
+    ///
+    /// How the loop's iteration is compared against [`cond_val`](Self::cond_val)
+    /// (`dsc/dsc2.h:661`). See [`LoopCondOp`] for what the narrowing deletes.
+    pub cond_op: LoopCondOp,
+    /// Field: e039_LoopCond.condValType_
+    /// Field: e039_LoopCond.condValInt_
+    /// Field: e018_LoopCond.condValType_
+    /// Field: e018_LoopCond.condValInt_
+    ///
+    /// What it is compared AGAINST — the authority's two fields as one (`dsc/dsc2.h:662-663`). See
+    /// [`CondVal`].
+    pub cond_val: CondVal,
+}
+
 // crustify:todo: e018_LoopCond
-
-// crustify:todo: e018_LoopCond.condOp_
-
-// crustify:todo: e018_LoopCond.condValInt_
-
-// crustify:todo: e018_LoopCond.condValType_
-
-// crustify:todo: e018_LoopCond.dim_
 
 // crustify:todo: e018_LoopCond.loopComp_
 
@@ -7554,6 +7832,68 @@ mod equivalence {
             );
         }
     }
+
+    /// `DscPcfgTranslator::convertCondValToInt` transcribed over the authority's TWO fields
+    /// (`dsc/dsc2Pcfg.cpp:788-806`) — the one reader of a `LoopCond` that never follows `loopComp_`,
+    /// which is why the value half can land while the loop link cannot. ⭐ ITS `default:` ARM IS
+    /// `INT`, and it is the only arm that reads `condValInt_`.
+    fn convert_cond_val_to_int_over_two_fields(
+        val_type: CondValType,
+        val_int: i32,
+        loop_count: i32,
+    ) -> i32 {
+        match val_type {
+            CondValType::First => loop_count - 1,
+            CondValType::Last => 0,
+            CondValType::Int => loop_count - 1 - val_int,
+        }
+    }
+
+    /// The same switch driven by the fused [`CondVal`], which has no `condValInt_` to read on two of
+    /// its three arms.
+    fn convert_cond_val_to_int(val: CondVal, loop_count: i32) -> i32 {
+        match val {
+            CondVal::First => loop_count - 1,
+            CondVal::Last => 0,
+            CondVal::Iteration(idx) => loop_count - 1 - idx.0,
+        }
+    }
+
+    /// ⭐ THE FUSION LOSES NOTHING HERE, and the second loop is the evidence: the pair form admits
+    /// `(FIRST, n)` and `(LAST, n)` for every `n`, and IBM's switch answers those arms without ever
+    /// reading `n` — so the states [`CondVal`] cannot spell are states that had no distinct answer.
+    #[test]
+    fn the_fused_condition_value_converts_exactly_as_the_authoritys_two_fields_do() {
+        for loop_count in [1i32, 2, 8, 64] {
+            for val in [
+                CondVal::First,
+                CondVal::Last,
+                CondVal::Iteration(IterationIdx(0)),
+                CondVal::Iteration(IterationIdx(1)),
+                CondVal::Iteration(IterationIdx(loop_count - 1)),
+            ] {
+                assert_eq!(
+                    convert_cond_val_to_int(val, loop_count),
+                    convert_cond_val_to_int_over_two_fields(
+                        val.val_type(),
+                        val.val_int(),
+                        loop_count
+                    ),
+                    "{val:?} over {loop_count}"
+                );
+            }
+
+            for val_type in [CondValType::First, CondValType::Last] {
+                for val_int in [CondVal::ABSENT_VAL_INT, 0, 3] {
+                    assert_eq!(
+                        convert_cond_val_to_int_over_two_fields(val_type, val_int, loop_count),
+                        convert_cond_val_to_int(CondVal::from_wire(val_type, val_int), loop_count),
+                        "{val_type:?} {val_int} over {loop_count}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 // crustify:todo: e030_BlockNode
@@ -7621,3 +7961,25 @@ mod equivalence {
 // crustify:todo: e038_CoordPropInfoType.refNode
 
 // crustify:todo: e038_CoordPropInfoType.scaleDown
+
+// crustify:todo: e039_LoopCond
+
+// crustify:todo: e039_LoopCond.loopComp_
+
+// crustify:todo: e041_DistributionStatusInfo
+
+// crustify:todo: e041_DistributionStatusInfo.loopSplitDim
+
+// crustify:todo: e041_DistributionStatusInfo.loopSplitDimSizes
+
+// crustify:todo: e041_DistributionStatusInfo.loopToSplit
+
+// crustify:todo: e042_LoopDistributionInfo
+
+// crustify:todo: e042_LoopDistributionInfo.break
+
+// crustify:todo: e042_LoopDistributionInfo.cat
+
+// crustify:todo: e042_LoopDistributionInfo.dimAndKind
+
+// crustify:todo: e042_LoopDistributionInfo.loopNode
