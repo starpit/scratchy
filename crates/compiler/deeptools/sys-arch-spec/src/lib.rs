@@ -88,6 +88,27 @@ pub mod progir;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
 pub struct CoreId(pub u8);
 
+/// WHICH CORELET — the second key of every per-corelet tracker map
+/// (`sys-arch-spec/memtracker/mem_track_bundle.h:18-19`, "key: coreid, coreletid, rowid"), counted by
+/// `numCoreletsUsed_DSC2_` (`dsc/designSpaceConfig.h:104`).
+///
+/// ⛔ A DISTINCT TYPE FROM [`CoreId`] AND [`RowId`] BECAUSE THE C++ PASSES ALL THREE AS `int`:
+/// `getTracker(SenComponents comp, int core, int corelet, int row)` (`mem_track_bundle.h:34`) takes
+/// them in any order, so transposing two is a silently wrong tracker there and `E0308` here.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
+pub struct CoreletId(pub u8);
+
+/// WHICH REGISTER-FILE ROW — the third key of the XRF, PT-ARF and PT-IRF trackers
+/// (`mem_track_bundle.h:18`, `:31-32`), and what `senCompToRowId` maps a component to
+/// (`arch_enums.h:129`).
+///
+/// ⛔ NOT A [`SenComponent`](arch_enums::SenComponent): the row index and the row's component are the
+/// two halves of `genericCompToSenComp`'s key (`arch_enums.h:131-132`), never one value.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
+pub struct RowId(pub u8);
+
 /// A STICK IS 128 BYTES — `STICK_BYTESIZE`.
 ///
 /// ⛔ THE DECLARING HEADER IS `util/sendefs/dataType.h`, WHICH IS A FOURTH DIRECTORY. `util/` is its own library
