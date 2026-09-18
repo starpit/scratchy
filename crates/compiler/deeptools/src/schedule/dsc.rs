@@ -1,1 +1,1505 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
+
+use crate::schedule::dims::{self, DataStructDims, PrimaryDimTypes};
+use crate::schedule::dsc2::{
+    self, ConstantId, ConstantInfo, DataStage, DataStageId, GroupId, MaskSplit, SLICES_PER_STICK,
+    Size, VariableSymbol,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use sys_arch_spec::CoreId;
+
+/// How many cores this DSC's work is spread over — `numCoresUsed_` (`dsc/designSpaceConfig.h:73`),
+/// which the DDL constraint check compares against an op's minimum (`ddc/ddl/ddl_conversion.cpp:2559`)
+/// and the L3 scheduler multiplies flops by (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:2294`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumCoresUsed(pub u32);
+
+/// How many corelets of each core are used — `numCoreletsUsed_` (`dsc/designSpaceConfig.h:74`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumCoreletsUsed(pub u32);
+
+/// One loop's trip count, as `getLoopCount` divides one stage's dim by the next's — IBM's
+/// `int loopCount` (`dsc/designSpaceConfig.cpp:416-427`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopCount(pub i32);
+
+/// One stick dim's extent in ELEMENTS — the `double` of `PrimaryDsInfo::stickSize_`
+/// (`dsc/dscdefn.h:478`), which `getStickSizes` truncates to an `int` on the way out
+/// (`dsc/dsc2.cpp:4088`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct StickSize(pub f64);
+
+/// How many times one stick dim's data is replicated — `PrimaryDsInfo::stickRepl_`
+/// (`dsc/dscdefn.h:479`). ⛔ NOT A SIZE: `get_stick_srpdt` multiplies the two together
+/// (`dsc/designSpaceConfig.cpp:9483-9486`), so transposing them must not compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickRepl(pub i32);
+
+/// A stick dim's extent times its replication — what `get_stick_srpdt` returns
+/// (`dsc/designSpaceConfig.cpp:9483-9486`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct StickSizeWithRepl(pub f64);
+
+/// One loop's scale — `LoopProperties::scale_` (`dsc/dscdefn.h:317-319`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct LoopScale(pub f64);
+
+/// How many L0 slices one stick is cut into — `getStickSizes`' `numL0Slices` parameter
+/// (`dsc/dsc2.cpp:4069`).
+///
+/// ⛔ CONSTRUCTION REFUSES A NON-POSITIVE, which is IBM's
+/// `DT_CHECK_MSG(!l0SliceOnly || numL0Slices > 0, "If l0SliceOnly requested, numL0Sclides must be
+/// provided")` (`dsc/dsc2.cpp:4074-4075`) moved to the type: the `-1` default is unrepresentable
+/// inside [`StickSizeScope::L0SliceOnly`], so that check cannot be reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumL0Slices(i32);
+
+impl NumL0Slices {
+    /// A slice count, or absent for the non-positive IBM aborts on.
+    pub fn new(slices: i32) -> Option<Self> {
+        (slices > 0).then_some(Self(slices))
+    }
+
+    /// The stored count.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// A tensor's row count in HBM minus its zero padding — `getInpRowInHBM`
+/// (`dsc/designSpaceConfig.cpp:930-934`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct HbmRows(pub f64);
+
+/// A tensor's column count in HBM minus its zero padding — `getInpColInHBM`
+/// (`dsc/designSpaceConfig.cpp:936-940`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct HbmCols(pub f64);
+
+/// A tensor's element count in HBM — `getInpInHBM`, rows times columns (or `-1` when both are
+/// negative) (`dsc/designSpaceConfig.cpp:942-946`).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct HbmElements(pub f64);
+
+/// The role one labeled data structure plays in an op (`dsc/dscdefn.h:37-46`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DsTypes {
+    Input,
+    Output,
+    Kernel,
+    KernelIdx,
+    InputScale,
+    KernelScale,
+    Internal,
+    /// `LabeledDsInfo::dsType_`'s own initialiser (`dsc/dscdefn.h:327`).
+    #[default]
+    NotSet,
+}
+
+impl DsTypes {
+    /// The keys of `dsTypeToString`, in its order (`dsc/designSpaceConfig.cpp:9255-9263`).
+    pub const ALL: [Self; 8] = [
+        Self::Input,
+        Self::Output,
+        Self::Kernel,
+        Self::KernelIdx,
+        Self::Internal,
+        Self::InputScale,
+        Self::KernelScale,
+        Self::NotSet,
+    ];
+
+    /// `dsTypeToString` (`dsc/designSpaceConfig.cpp:9255-9263`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Input => "INPUT",
+            Self::Output => "OUTPUT",
+            Self::Kernel => "KERNEL",
+            Self::KernelIdx => "KERNEL_IDX",
+            Self::InputScale => "INPUT_SCALE",
+            Self::KernelScale => "KERNEL_SCALE",
+            Self::Internal => "INTERNAL",
+            Self::NotSet => "NOT_SET",
+        }
+    }
+
+    /// `stringToDsType`, which is `flipMap(dsTypeToString)` (`dsc/designSpaceConfig.cpp:9264-9265`) —
+    /// so an unknown spelling is absent, where IBM's `.at()` throws.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|ds| ds.name() == name)
+    }
+}
+
+/// Every loop the DSC language names, in the authority's order (`dsc/dscdefn.h:48-92`).
+///
+/// ⛔ THE DISCRIMINANTS ARE LOAD-BEARING. `checkLoopStage` answers by RANGE COMPARISON against the
+/// `FIRST_*`/`LAST_*` aliases (`dsc/designSpaceConfig.cpp:8302-8315`), so inserting or dropping a
+/// loop silently re-stages the ones after it — see [`LoopNames::is_stage`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopNames {
+    Inner = 0,
+    DbIn = 1,
+    DbOut,
+    DbIj,
+    DbI,
+    DbJ,
+    DbMb,
+    DbKij,
+    DbKi,
+    DbKj,
+    DbX,
+    DbY,
+    BtIn = 12,
+    BtOut,
+    BtIj,
+    BtI,
+    BtJ,
+    BtMb,
+    BtKij,
+    BtX,
+    BtY,
+    TpIn = 21,
+    TpOut,
+    TpIj,
+    TpI,
+    TpJ,
+    TpMb,
+    TpKij,
+    TpX,
+    TpY,
+    /// The special loop for const offsets (`dsc/dscdefn.h:90`).
+    Const = 30,
+    Invalid = 31,
+}
+
+/// ⛔ E0080 IF A LOOP IS INSERTED OR DROPPED: the DB block starts at 1 and `INVALID` closes the enum
+/// at 31 (`dsc/dscdefn.h:48-92`), and the stage ranges are read off those values.
+const _: [(); 1] = [(); LoopNames::DbIn as usize];
+const _: [(); 31] = [(); LoopNames::Invalid as usize];
+
+/// Which of the three loop stages a loop belongs to — `checkLoopStage`'s own `LoopStage` parameter
+/// and its comment, "LoopStage 0-tp | 1-bt | 2-db" (`dsc/designSpaceConfig.cpp:8301-8315`).
+///
+/// ⛔ AN ENUM, SO THE `default:` ARM IS UNREACHABLE: IBM answers `false` for every other `int` and
+/// then cannot reach its own `DT_ERROR_FMT("DSC-checkLoopStage, Bad LoopStage: %d")` (`:8313-8315`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoopStage {
+    Tp,
+    Bt,
+    Db,
+}
+
+impl LoopNames {
+    /// `FIRST_DB_LOOP` (`dsc/dscdefn.h:62`).
+    pub const FIRST_DB_LOOP: Self = Self::DbIn;
+    /// `LAST_DB_LOOP` (`dsc/dscdefn.h:63`).
+    pub const LAST_DB_LOOP: Self = Self::DbY;
+    /// `FIRST_BT_LOOP` (`dsc/dscdefn.h:75`).
+    pub const FIRST_BT_LOOP: Self = Self::BtIn;
+    /// `LAST_BT_LOOP` (`dsc/dscdefn.h:76`).
+    pub const LAST_BT_LOOP: Self = Self::BtY;
+    /// `FIRST_TP_LOOP` (`dsc/dscdefn.h:88`).
+    pub const FIRST_TP_LOOP: Self = Self::TpIn;
+    /// `LAST_TP_LOOP` (`dsc/dscdefn.h:89`).
+    pub const LAST_TP_LOOP: Self = Self::TpY;
+
+    /// The keys of `loopNameToString`, in the enum's order (`dsc/designSpaceConfig.cpp:9222-9238`).
+    pub const ALL: [Self; 32] = [
+        Self::Inner,
+        Self::DbIn,
+        Self::DbOut,
+        Self::DbIj,
+        Self::DbI,
+        Self::DbJ,
+        Self::DbMb,
+        Self::DbKij,
+        Self::DbKi,
+        Self::DbKj,
+        Self::DbX,
+        Self::DbY,
+        Self::BtIn,
+        Self::BtOut,
+        Self::BtIj,
+        Self::BtI,
+        Self::BtJ,
+        Self::BtMb,
+        Self::BtKij,
+        Self::BtX,
+        Self::BtY,
+        Self::TpIn,
+        Self::TpOut,
+        Self::TpIj,
+        Self::TpI,
+        Self::TpJ,
+        Self::TpMb,
+        Self::TpKij,
+        Self::TpX,
+        Self::TpY,
+        Self::Const,
+        Self::Invalid,
+    ];
+
+    /// `loopNameToString` (`dsc/designSpaceConfig.cpp:9222-9238`).
+    ///
+    /// ⛔ THE SPELLING IS PARSED, NOT JUST PRINTED: [`loop_count`](DesignSpaceConfig::loop_count)
+    /// cuts this string into a numerator stage, a denominator stage and a dim
+    /// (`dsc/designSpaceConfig.cpp:417-424`), which is why `INNER`'s odd capital `"Inner"` matters
+    /// and why `DBKI`/`DBKJ` have no BT or TP twin.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Inner => "Inner",
+            Self::DbIn => "dbin",
+            Self::DbOut => "dbout",
+            Self::DbIj => "dbij",
+            Self::DbI => "dbi",
+            Self::DbJ => "dbj",
+            Self::DbMb => "dbmb",
+            Self::DbKij => "dbkij",
+            Self::DbKi => "dbki",
+            Self::DbKj => "dbkj",
+            Self::DbX => "dbx",
+            Self::DbY => "dby",
+            Self::BtIn => "btin",
+            Self::BtOut => "btout",
+            Self::BtIj => "btij",
+            Self::BtI => "bti",
+            Self::BtJ => "btj",
+            Self::BtMb => "btmb",
+            Self::BtKij => "btkij",
+            Self::BtX => "btx",
+            Self::BtY => "bty",
+            Self::TpIn => "tpin",
+            Self::TpOut => "tpout",
+            Self::TpIj => "tpij",
+            Self::TpI => "tpi",
+            Self::TpJ => "tpj",
+            Self::TpMb => "tpmb",
+            Self::TpKij => "tpkij",
+            Self::TpX => "tpx",
+            Self::TpY => "tpy",
+            Self::Const => "const",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    /// `stringToLoopName`, which is `flipMap(loopNameToString)`
+    /// (`dsc/designSpaceConfig.cpp:9239-9240`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|loop_name| loop_name.name() == name)
+    }
+
+    /// `stringToLoopNameDm`, the DM's own spellings — a SEPARATE table, not the flip of
+    /// [`name`](Self::name) (`dsc/designSpaceConfig.cpp:9241-9254`).
+    ///
+    /// ⛔ IT NAMES NEITHER `DBI`/`DBJ`/`DBKI`/`DBKJ` NOR THEIR BT/TP TWINS, and it maps TWO
+    /// spellings — `"pcompute"` and `"Inner"` — onto [`Inner`](Self::Inner), so it is not
+    /// invertible.
+    pub fn from_name_dm(name: &str) -> Option<Self> {
+        Some(match name {
+            "pcompute" | "Inner" => Self::Inner,
+            "din" => Self::DbIn,
+            "dout" => Self::DbOut,
+            "dij" => Self::DbIj,
+            "dmb" => Self::DbMb,
+            "dkij" => Self::DbKij,
+            "dx" => Self::DbX,
+            "dy" => Self::DbY,
+            "bin" => Self::BtIn,
+            "bout" => Self::BtOut,
+            "bij" => Self::BtIj,
+            "bmb" => Self::BtMb,
+            "bkij" => Self::BtKij,
+            "bx" => Self::BtX,
+            "by" => Self::BtY,
+            "tin" => Self::TpIn,
+            "tout" => Self::TpOut,
+            "tij" => Self::TpIj,
+            "tmb" => Self::TpMb,
+            "tkij" => Self::TpKij,
+            "tx" => Self::TpX,
+            "ty" => Self::TpY,
+            _ => return None,
+        })
+    }
+
+    /// Whether this loop is one of the given stage's — `DesignSpaceConfig::checkLoopStage`
+    /// (`dsc/designSpaceConfig.cpp:8302-8315`), which reads no field and so lives on the loop.
+    pub fn is_stage(self, stage: LoopStage) -> bool {
+        let (first, last) = match stage {
+            LoopStage::Tp => (Self::FIRST_TP_LOOP, Self::LAST_TP_LOOP),
+            LoopStage::Bt => (Self::FIRST_BT_LOOP, Self::LAST_BT_LOOP),
+            LoopStage::Db => (Self::FIRST_DB_LOOP, Self::LAST_DB_LOOP),
+        };
+        first <= self && self <= last
+    }
+}
+
+/// Whether the primary data structures share their reuse (`dsc/dscdefn.h:470-472`). DSI branches on
+/// it (`dsi/dsi.cpp:1789`, `:2095`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimaryDsRelationInfo {
+    /// `isPdsReuse` (`dsc/dscdefn.h:471`), whose member initialiser is `true`.
+    pub is_pds_reuse: bool,
+}
+
+impl Default for PrimaryDsRelationInfo {
+    /// `dsc/dscdefn.h:471`: reuse is the default, so this is NOT [`bool::default`].
+    fn default() -> Self {
+        Self { is_pds_reuse: true }
+    }
+}
+
+/// One loop's properties (`dsc/dscdefn.h:317-319`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LoopProperties {
+    /// `scale_` (`dsc/dscdefn.h:318`). ⛔ ABSENT UNTIL WRITTEN: the authority declares a bare
+    /// `double scale_;` with no member initialiser, so a default-constructed one holds an
+    /// indeterminate value; DM assigns it per loop (`dm/dm.cpp:1446`).
+    pub scale: Option<LoopScale>,
+}
+
+/// How one primary data structure is laid out and sticked (`dsc/dscdefn.h:474-480`).
+///
+/// ⛔ THE FOUR VECTORS ARE INDEX-PARALLEL, and every reader relies on it: `get_stick` and
+/// `get_stick_repl` refuse a length mismatch (`dsc/designSpaceConfig.cpp:9452-9455`, `:9469-9473`)
+/// and `getStickSizes` reads `stickSize_.at(i)` for each `stickDimOrder_[i]` (`dsc/dsc2.cpp:4088`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrimaryDsInfo {
+    /// `layoutDimOrder_` (`dsc/dscdefn.h:476`) — the dim order of the allocation, which
+    /// [`dim_index_in_layout_order`](DesignSpaceConfig::dim_index_in_layout_order) positions a dim in.
+    pub layout_dim_order: Vec<PrimaryDimTypes>,
+    /// `stickDimOrder_` (`dsc/dscdefn.h:477`) — the dims INSIDE one stick, outermost first.
+    pub stick_dim_order: Vec<PrimaryDimTypes>,
+    /// `stickSize_` (`dsc/dscdefn.h:478`), one extent per entry of
+    /// [`stick_dim_order`](Self::stick_dim_order).
+    pub stick_size: Vec<StickSize>,
+    /// `stickRepl_` (`dsc/dscdefn.h:479`), one replication factor per entry of
+    /// [`stick_dim_order`](Self::stick_dim_order).
+    pub stick_repl: Vec<StickRepl>,
+}
+
+impl PrimaryDsInfo {
+    /// The product of one dim's stick extents — `DesignSpaceConfig::get_stick`
+    /// (`dsc/designSpaceConfig.cpp:9451-9464`). A dim that is not in the stick answers `1.0`, as
+    /// IBM's empty product does; absent is its length-mismatch `DT_ERROR`.
+    pub fn stick(&self, stick_dim: PrimaryDimTypes) -> Option<StickSize> {
+        if self.stick_size.len() != self.stick_dim_order.len() {
+            return None;
+        }
+        let mut total = 1.0;
+        for (dim, size) in self.stick_dim_order.iter().zip(&self.stick_size) {
+            if *dim == stick_dim {
+                total *= size.0;
+            }
+        }
+        Some(StickSize(total))
+    }
+
+    /// The product of one dim's replication factors — `DesignSpaceConfig::get_stick_repl`
+    /// (`dsc/designSpaceConfig.cpp:9466-9481`), absent on its length-mismatch `DT_ERROR`.
+    pub fn stick_repl(&self, stick_dim: PrimaryDimTypes) -> Option<StickRepl> {
+        if self.stick_repl.len() != self.stick_dim_order.len() {
+            return None;
+        }
+        let mut repl = 1;
+        for (dim, r) in self.stick_dim_order.iter().zip(&self.stick_repl) {
+            if *dim == stick_dim {
+                repl *= r.0;
+            }
+        }
+        Some(StickRepl(repl))
+    }
+
+    /// [`stick`](Self::stick) times [`stick_repl`](Self::stick_repl) —
+    /// `DesignSpaceConfig::get_stick_srpdt` (`dsc/designSpaceConfig.cpp:9483-9486`).
+    pub fn stick_srpdt(&self, stick_dim: PrimaryDimTypes) -> Option<StickSizeWithRepl> {
+        let size = self.stick(stick_dim)?;
+        let repl = self.stick_repl(stick_dim)?;
+        Some(StickSizeWithRepl(size.0 * f64::from(repl.0)))
+    }
+}
+
+/// Which part of a stick [`stick_sizes`](DesignSpaceConfig::stick_sizes) reports — IBM's three
+/// mutually exclusive `bool` parameters plus the slice count the third needs (`dsc/dsc2.cpp:4066-4070`).
+///
+/// ⛔ THE EXCLUSIVITY IS THE TYPE, so `DT_CHECK_MSG((stickSliceOnly + stickWithoutSlice +
+/// l0SliceOnly) < 2, "... can not be true at same time")` (`dsc/dsc2.cpp:4071-4074`) cannot be
+/// reached: the four combinations IBM accepts are the four variants and the rest do not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickSizeScope {
+    /// All three flags false: every stick dim with its full extent.
+    WholeStick,
+    /// `stickSliceOnly`: only the dims that fit inside one of the stick's eight slices.
+    SliceOnly,
+    /// `stickWithoutSlice`: only what is left once one slice is filled.
+    WithoutSlice,
+    /// `l0SliceOnly` with its `numL0Slices`, which replaces the eight
+    /// (`dsc/dsc2.cpp:4082`).
+    L0SliceOnly(NumL0Slices),
+}
+
+/// The twelve `DataStructDims` prefixes `paramNameToVal`'s keys are built from, LONGEST FIRST
+/// (`dsc/designSpaceConfig.h:358-608`). They are exactly `getDsdFromStr`'s twelve spellings
+/// (`:267-345`), which are exactly the names the constructor assigns
+/// (`dsc/designSpaceConfig.cpp:16-28`).
+const DSD_PREFIXES: [&str; 12] = [
+    "chipletd", "coreletd", "unpadn", "chipd", "dscn", "tel", "pel", "b", "d", "n", "p", "t",
+];
+
+/// The twenty dim names `paramNameToVal` pairs with every prefix (`dsc/designSpaceConfig.h:358-608`).
+///
+/// ⛔ `x1` IS NOT ONE OF THEM, though `DataStructDims` has the field and its own
+/// `param_name_to_val` accepts the name (`dsc/dims.cpp:437-482`): 12 x 20 = 240 keys, and no
+/// `<dsd>x1` key exists. A resolver that fell through to the dim table would answer for `"nx1"`
+/// where IBM's `.at()` throws.
+const PARAM_DIM_NAMES: [&str; 20] = [
+    "in", "out", "mb", "i", "j", "ij", "ki", "kj", "kij", "x", "y", "r", "c", "rc", "si", "sj",
+    "sij", "zi", "zj", "zij",
+];
+
+/// One `paramNameToVal` key cut into its prefix and its dim (`dsc/designSpaceConfig.h:358-608`).
+/// Longest prefix first, and a prefix whose remainder is not a dim name is not the split.
+fn split_param_name(name: &str) -> Option<(&'static str, &'static str)> {
+    DSD_PREFIXES.into_iter().find_map(|prefix| {
+        let rest = name.strip_prefix(prefix)?;
+        PARAM_DIM_NAMES
+            .into_iter()
+            .find(|dim| *dim == rest)
+            .map(|dim| (prefix, dim))
+    })
+}
+
+/// The dim one of [`PARAM_DIM_NAMES`] selects, read (`dsc/designSpaceConfig.h:358-608`).
+fn dim_val_by_name(dsd: &DataStructDims, dim: &str) -> Option<dims::DimSize> {
+    match dim {
+        "in" => dsd.r#in,
+        "out" => dsd.out,
+        "mb" => dsd.mb,
+        "i" => dsd.i,
+        "j" => dsd.j,
+        "ij" => dsd.ij,
+        "ki" => dsd.ki,
+        "kj" => dsd.kj,
+        "kij" => dsd.kij,
+        "x" => dsd.x,
+        "y" => dsd.y,
+        "r" => dsd.r,
+        "c" => dsd.c,
+        "rc" => dsd.rc,
+        "si" => dsd.si,
+        "sj" => dsd.sj,
+        "sij" => dsd.sij,
+        "zi" => dsd.zi,
+        "zj" => dsd.zj,
+        "zij" => dsd.zij,
+        _ => None,
+    }
+}
+
+/// IBM's `isFractional` (`dsc/designSpaceConfig.cpp:7812`).
+///
+/// ⛔ THE NAME IS INVERTED FROM ITS MEANING: it is `floor(val) == val`, so it answers TRUE for a
+/// whole number, and every caller negates it to mean "has a fraction". An absent dim is IBM's `-1`,
+/// whose floor is itself, so it answers true as well.
+fn is_fractional(val: Option<dims::DimSize>) -> bool {
+    match val {
+        None => true,
+        Some(val) => val.get().floor() == val.get(),
+    }
+}
+
+/// What the program frame is filled for (`util/sendefs/sendefs.h:177-188`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SenTargets {
+    /// `DesignSpaceConfig::target_`'s own initialiser (`dsc/designSpaceConfig.h:121`).
+    #[default]
+    Undefined,
+    Sentient,
+    Senulator,
+    SenPcfg,
+    SenTf,
+    SystemC,
+    R5ss,
+    Host,
+    Invalid,
+    Nop,
+}
+
+/// `dsc/designSpaceConfig.h:51-705`. One op's design space configuration: the data structures it
+/// moves, the memory-hierarchy stages it moves them through, the loop nest that drives them and the
+/// schedule tree the DDC and the L3 scheduler build into it.
+///
+/// ⛔ SEVEN OF THE THIRTY-SIX DECLARED FIELDS ARE NOT CARRIED, and their anchors below stay open.
+/// Each one needs a type this campaign has not scheduled:
+/// * `labeledDs_` (`:86`) — `std::vector<LabeledDsInfo>`, and `LabeledDsInfo` is a 25-field cluster
+///   over `DtInfo`, `MemOrg`, `CoreDsInfo` and `MxInfo` (`dsc/dscdefn.h:321-468`), none of them a
+///   unit in `crustify-scheduler/UNITS.tsv`.
+/// * `computeOp_` (`:89`) — `std::vector<ComputeOpInfo>`, four of whose members are
+///   `std::vector<LabeledDsInfo*>` held as pointer identity INTO `labeledDs_`
+///   (`dsc/dscdefn.h:506-511`).
+/// * `auxLoopOrder_` (`:114`) — `AuxLoopSetInfo` holds two raw `DataStructDims*` aliasing this
+///   object's own members (`dsc/dscdefn.h:126-127`); no in-scope file reads it.
+/// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e007_ScheduleTree` anchor.
+///   [`is_dsc2`](Self::is_dsc2) is the one method blocked on it alone.
+/// * `pcfg_` (`:120`) — `std::vector<SenPcfg>`, and DCG/PCFG is off this campaign's path
+///   (`crustify-scheduler/AGENT-BRIEF.md`, decided 2026-09-09).
+/// * `ProgramFrame::ptr_`/`size_` (`:130-131`) — a `std::shared_ptr<void>` and its byte count, whose
+///   only writer is `fillPcfgProgramFrame` on the `SENPCFG` key (`dsc/designSpaceConfig.cpp:1020-1027`)
+///   and which no in-scope file reads. ⛔ NOT the `ProgramFrame` `SuperDsc` uses: that one is
+///   sendefs' three-member struct with `st_address` (`util/sendefs/sendefs.h:190`).
+///
+/// ⛔ AND `paramNameToVal` (`:358-608`) IS PORTED AS A RESOLVER, NOT A TABLE. IBM's 240 entries are
+/// `double*` INTO this object's own `DataStructDims` members, so a copy leaves every pointer aimed at
+/// the SOURCE object; `updateParamNameToVal()` (`:614`) exists to re-point them and it re-points only
+/// 62 of the 240 — and it has ZERO callers tree-wide. [`param_name_to_val`](Self::param_name_to_val)
+/// resolves the name on each call, so there is nothing to go stale and nothing for that method to fix.
+#[derive(Clone, Debug)]
+pub struct DesignSpaceConfig {
+    /// Field: e031_DesignSpaceConfig.name_
+    ///
+    /// The op's name (`dsc/designSpaceConfig.h:72`), filled by DSM.
+    pub name: String,
+    /// Field: e031_DesignSpaceConfig.numCoresUsed_
+    ///
+    /// How many cores this DSC uses (`dsc/designSpaceConfig.h:73`).
+    ///
+    /// ⛔ ABSENT UNTIL DSM WRITES IT: the authority declares a bare `int` with no member
+    /// initialiser, so a default-constructed DSC's value is indeterminate — and `0` would be a real
+    /// count, which is why this is an [`Option`] rather than a zero.
+    pub num_cores_used: Option<NumCoresUsed>,
+    /// Field: e031_DesignSpaceConfig.numCoreletsUsed_
+    ///
+    /// How many corelets per core this DSC uses (`dsc/designSpaceConfig.h:74`), absent on the same
+    /// terms as [`num_cores_used`](Self::num_cores_used).
+    ///
+    /// ⛔ NOT THE SAME FIELD AS [`num_corelets_used_dsc2`](Self::num_corelets_used_dsc2): this one is
+    /// DSM's and carries no absent encoding of its own, that one is DM's and starts at `-1`.
+    pub num_corelets_used: Option<NumCoreletsUsed>,
+    /// Field: e031_DesignSpaceConfig.coreIdsUsed_
+    ///
+    /// Which cores, by id (`dsc/designSpaceConfig.h:75`). The DDC iterates it to place per-core
+    /// allocations (`ddc/ddcv1.cpp:193`, `ddc/ddc_transformation.cpp:1310`).
+    pub core_ids_used: Vec<CoreId>,
+    /// Field: e031_DesignSpaceConfig.dimToSymbolMapping_
+    ///
+    /// Per dim, the symbols standing in for its extent: one for a pure symbolic or pivot dim, several
+    /// (max-pivot) for an irregular one (`dsc/designSpaceConfig.h:76-78`). Round-tripped through JSON
+    /// with the DSC2 fields (`dsc/dsc2.cpp:50-52`, `:1120`).
+    pub dim_to_symbol_mapping: BTreeMap<PrimaryDimTypes, Vec<VariableSymbol>>,
+    /// Field: e031_DesignSpaceConfig.N_
+    ///
+    /// The whole op's dims, padded (`dsc/designSpaceConfig.h:81`), named `"n"` by the constructor.
+    pub n: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.unpadN_
+    ///
+    /// The same dims before padding (`dsc/designSpaceConfig.h:82`), named `"unpadn"`.
+    pub unpad_n: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.dscN_
+    ///
+    /// The parameters THIS DSC performs, which is a share of [`n`](Self::n) when an op is split
+    /// across DSCs (`dsc/designSpaceConfig.h:83`), named `"dscn"`. It is what the coordinate-masking
+    /// writers subtract the valid extent from (`dsm/dsm.cpp:17532`, `:17573`).
+    pub dsc_n: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.constantInfo_
+    ///
+    /// Every constant this op needs, by id (`dsc/designSpaceConfig.h:90`).
+    pub constant_info: BTreeMap<ConstantId, ConstantInfo>,
+    /// Field: e031_DesignSpaceConfig.primaryDsInfo_
+    ///
+    /// Per data-structure role, its layout and stick order (`dsc/designSpaceConfig.h:93`). It is what
+    /// [`stick_sizes`](Self::stick_sizes), [`layout_dim_set`](Self::layout_dim_set) and
+    /// [`dim_index_in_layout_order`](Self::dim_index_in_layout_order) all read.
+    pub primary_ds_info: BTreeMap<DsTypes, PrimaryDsInfo>,
+    /// Field: e031_DesignSpaceConfig.pdsRelation_
+    ///
+    /// Whether the primary data structures reuse each other (`dsc/designSpaceConfig.h:94`).
+    pub pds_relation: PrimaryDsRelationInfo,
+    /// Field: e031_DesignSpaceConfig.ChipD_
+    ///
+    /// The dims one chip handles (`dsc/designSpaceConfig.h:95`), named `"chipd"`.
+    pub chip_d: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.ChipletD_
+    ///
+    /// The dims one chiplet handles (`dsc/designSpaceConfig.h:96`), named `"chipletd"`.
+    pub chiplet_d: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.CoreD_
+    ///
+    /// The dims one CORE handles (`dsc/designSpaceConfig.h:97`).
+    ///
+    /// ⛔ ITS NAME IS `"d"`, NOT `"cored"` (`dsc/designSpaceConfig.cpp:22`), and that bare `d` is the
+    /// prefix of twenty `paramNameToVal` keys and of `getLoopCount`'s numerator for every DB loop.
+    pub core_d: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.CoreletD_
+    ///
+    /// The dims one corelet handles (`dsc/designSpaceConfig.h:98`), named `"coreletd"`.
+    pub corelet_d: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.coordinateMasking_
+    ///
+    /// Per dim, each masked stretch as a `<unmasked, masked>` pair of ELEMENT COUNTS
+    /// (`dsc/designSpaceConfig.h:99-100`) — DSM writes `(valid, dscN_.j_ - valid)`
+    /// (`dsm/dsm.cpp:17532`, `:17573`), and `constructSAMVNodes` turns it into the SAMV
+    /// [`StickMaskNode`](crate::schedule::dsc2::StickMaskNode) (`ddc/ddcv1.cpp:3485-3600`).
+    /// Round-tripped with the DSC2 fields (`dsc/dsc2.cpp:36-38`, `:1101-1105`).
+    pub coordinate_masking: BTreeMap<PrimaryDimTypes, Vec<MaskSplit>>,
+    /// Field: e031_DesignSpaceConfig.maskingConstId_
+    ///
+    /// The constant holding the value masked elements read, shared by every tensor of the op
+    /// (`dsc/designSpaceConfig.h:101`). ⛔ ITS `-1` IS ABSENT: the SAMV node copies it and both
+    /// readers test `>= 0` before indexing `constantInfo_` (`ddc/ddcv1.cpp:3531`,
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNStickMaskLowering.cpp:32-36`).
+    pub masking_const_id: Option<ConstantId>,
+    /// Field: e031_DesignSpaceConfig.numCoreletsUsed_DSC2_
+    ///
+    /// DM's corelet count, which is what the DSC2 path iterates (`dsc/designSpaceConfig.h:104`;
+    /// `ddc/ddcv1.cpp:207`, `:1755`, `:1769`, `ddc/ddc_transformation_util.cpp:519`). ⛔ ITS `-1` IS
+    /// ABSENT, and IBM's `for (cl = 0; cl < -1; cl++)` simply does not run.
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, though it is a declared field of the class; the
+    /// anchor list carries `numCoreletsUsed_` only.
+    pub num_corelets_used_dsc2: Option<NumCoreletsUsed>,
+    /// Field: e031_DesignSpaceConfig.dataStageParam_
+    ///
+    /// Each data stage by id (`dsc/designSpaceConfig.h:105`) — the stage a loop's numerator and
+    /// denominator name, and where `parametricIterCount` reads its padding from
+    /// (`dsc/dsc2.cpp:4155`).
+    pub data_stage_param: BTreeMap<DataStageId, DataStage>,
+    /// Field: e031_DesignSpaceConfig.B_
+    ///
+    /// The block-transfer stage's dims (`dsc/designSpaceConfig.h:106`), named `"b"`.
+    pub b: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.T_
+    ///
+    /// The tile stage's dims (`dsc/designSpaceConfig.h:107`), named `"t"`.
+    pub t: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.Tel_
+    ///
+    /// The tile stage's element-level dims (`dsc/designSpaceConfig.h:108`), named `"tel"`.
+    pub tel: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.P_
+    ///
+    /// The processing stage's dims (`dsc/designSpaceConfig.h:109`), named `"p"`.
+    pub p: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.Pel_
+    ///
+    /// The processing stage's element-level dims (`dsc/designSpaceConfig.h:110`), named `"pel"`.
+    pub pel: DataStructDims,
+    /// Field: e031_DesignSpaceConfig.sc_
+    ///
+    /// The auxiliary loop sets' dims (`dsc/designSpaceConfig.h:111`).
+    ///
+    /// ⛔ ZERO READS AND ZERO WRITES TREE-WIDE: the only occurrence of `sc_` in the authority is this
+    /// declaration. `getDsdFromStr` does not name it and `paramNameToVal` has no `sc` prefix, so
+    /// nothing can even reach it by name; `AuxLoopSetInfo::scDimOrder_` (`dsc/dscdefn.h:128`) is a
+    /// different field.
+    pub sc: Vec<DataStructDims>,
+    /// Field: e031_DesignSpaceConfig.loopOrder_
+    ///
+    /// The loop nest, outermost first (`dsc/designSpaceConfig.h:112`). Filled by DM/DSI
+    /// (`dsi/test/psum_test.cpp:70`); no in-scope file reads it.
+    pub loop_order: Vec<LoopNames>,
+    /// Field: e031_DesignSpaceConfig.loopProperties_
+    ///
+    /// Per loop, its properties (`dsc/designSpaceConfig.h:113`). DM copies the map wholesale and then
+    /// overwrites single entries (`dm/dm.cpp:470`, `:1446`).
+    pub loop_properties: BTreeMap<LoopNames, LoopProperties>,
+    /// Field: e031_DesignSpaceConfig.gtrIdsUsed_
+    ///
+    /// Which group tag registers this DSC occupies (`dsc/designSpaceConfig.h:116`), round-tripped
+    /// with the DSC2 fields (`dsc/dsc2.cpp:111-113`, `:1151-1154`).
+    pub gtr_ids_used: BTreeSet<GroupId>,
+    /// Field: e031_DesignSpaceConfig.l0TetheredMode_
+    ///
+    /// Whether L0 is tethered (`dsc/designSpaceConfig.h:117`), which the DDC's allocation walk
+    /// branches on (`ddc/ddcv1.cpp:299`, `:324`) and JSON carries (`dsc/dsc2.cpp:364`, `:1156`).
+    pub l0_tethered_mode: bool,
+    /// Field: e031_DesignSpaceConfig.target_
+    ///
+    /// What this DSC is being compiled for (`dsc/designSpaceConfig.h:121`); it selects which tool
+    /// fills the program frame (`:123-128`) and is the key `fillPcfgProgramFrame` writes under
+    /// (`dsc/designSpaceConfig.cpp:1020-1027`).
+    pub target: SenTargets,
+}
+
+impl Default for DesignSpaceConfig {
+    /// The constructor, whose whole body is the twelve `DataStructDims` names
+    /// (`dsc/designSpaceConfig.cpp:16-28`).
+    ///
+    /// ⛔ THOSE NAMES ARE THE ONES `getDsdFromStr` MATCHES, so they are not labels: renaming one
+    /// silently unhooks [`dsd_from_str`](Self::dsd_from_str) and every `paramNameToVal` key built on
+    /// its prefix. And `CoreD_` is `"d"`, not `"cored"` (`:22`).
+    fn default() -> Self {
+        fn named(name: &str) -> DataStructDims {
+            DataStructDims {
+                name: name.to_owned(),
+                ..DataStructDims::default()
+            }
+        }
+
+        Self {
+            name: String::new(),
+            num_cores_used: None,
+            num_corelets_used: None,
+            core_ids_used: Vec::new(),
+            dim_to_symbol_mapping: BTreeMap::new(),
+            n: named("n"),
+            unpad_n: named("unpadn"),
+            dsc_n: named("dscn"),
+            constant_info: BTreeMap::new(),
+            primary_ds_info: BTreeMap::new(),
+            pds_relation: PrimaryDsRelationInfo::default(),
+            chip_d: named("chipd"),
+            chiplet_d: named("chipletd"),
+            core_d: named("d"),
+            corelet_d: named("coreletd"),
+            coordinate_masking: BTreeMap::new(),
+            masking_const_id: None,
+            num_corelets_used_dsc2: None,
+            data_stage_param: BTreeMap::new(),
+            b: named("b"),
+            t: named("t"),
+            tel: named("tel"),
+            p: named("p"),
+            pel: named("pel"),
+            sc: Vec::new(),
+            loop_order: Vec::new(),
+            loop_properties: BTreeMap::new(),
+            gtr_ids_used: BTreeSet::new(),
+            l0_tethered_mode: false,
+            target: SenTargets::Undefined,
+        }
+    }
+}
+
+impl DesignSpaceConfig {
+    /// The `DataStructDims` one of the twelve spellings names (`dsc/designSpaceConfig.h:267-345`).
+    /// The match is case-insensitive, as IBM's `tolower` makes it; an unknown spelling is absent,
+    /// where IBM `DT_ERROR`s "Unknow string input to getDsdFromStr()".
+    pub fn dsd_from_str(&self, dsdstr: &str) -> Option<&DataStructDims> {
+        Some(match dsdstr.to_ascii_lowercase().as_str() {
+            "n" => &self.n,
+            "d" => &self.core_d,
+            "b" => &self.b,
+            "t" => &self.t,
+            "p" => &self.p,
+            "coreletd" => &self.corelet_d,
+            "tel" => &self.tel,
+            "pel" => &self.pel,
+            "unpadn" => &self.unpad_n,
+            "chipd" => &self.chip_d,
+            "chipletd" => &self.chiplet_d,
+            "dscn" => &self.dsc_n,
+            _ => return None,
+        })
+    }
+
+    /// The same dispatch as a handle to assign through — IBM's `getDsdFromStr` returns a
+    /// `DataStructDims&` and its callers write through it (`dsc/designSpaceConfig.h:267-345`).
+    pub fn dsd_from_str_mut(&mut self, dsdstr: &str) -> Option<&mut DataStructDims> {
+        Some(match dsdstr.to_ascii_lowercase().as_str() {
+            "n" => &mut self.n,
+            "d" => &mut self.core_d,
+            "b" => &mut self.b,
+            "t" => &mut self.t,
+            "p" => &mut self.p,
+            "coreletd" => &mut self.corelet_d,
+            "tel" => &mut self.tel,
+            "pel" => &mut self.pel,
+            "unpadn" => &mut self.unpad_n,
+            "chipd" => &mut self.chip_d,
+            "chipletd" => &mut self.chiplet_d,
+            "dscn" => &mut self.dsc_n,
+            _ => return None,
+        })
+    }
+
+    /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-608`). A key
+    /// outside the table is absent, where IBM's `.at()` throws; an unfilled dim is absent too, where
+    /// IBM hands back its `-1`.
+    pub fn param_name_to_val(&self, name: &str) -> Option<dims::DimSize> {
+        let (prefix, dim) = split_param_name(name)?;
+        dim_val_by_name(self.dsd_from_str(prefix)?, dim)
+    }
+
+    /// The same key as a handle to assign through — the table's values are `double*` for that reason
+    /// (`dsc/designSpaceConfig.h:358-608`).
+    pub fn param_name_to_val_mut(&mut self, name: &str) -> Option<&mut Option<dims::DimSize>> {
+        let (prefix, dim) = split_param_name(name)?;
+        self.dsd_from_str_mut(prefix)?.param_name_to_val_mut(dim)
+    }
+
+    /// One loop's trip count: its numerator stage's dim divided by its denominator stage's
+    /// (`dsc/designSpaceConfig.cpp:416-427`).
+    ///
+    /// ⛔ IT IS COMPUTED BY CUTTING UP THE LOOP'S SPELLING, not by any stage field: `dbin` becomes
+    /// `din` over `bin`, i.e. [`core_d`](Self::core_d)`.in` over [`b`](Self::b)`.in`. So `INNER`
+    /// (IBM's `DT_CHECK`), `CONST` and `INVALID` have no count, and neither does a loop whose two
+    /// keys are outside the table.
+    ///
+    /// ⛔ A ZERO DENOMINATOR IS ABSENT HERE, where IBM's `int(x / 0.0)` is undefined behaviour.
+    pub fn loop_count(&self, loop_name: LoopNames) -> Option<LoopCount> {
+        let name = loop_name.name();
+        if name.len() < 3 {
+            return None;
+        }
+        let (stage_num, rest) = name.split_at(1);
+        let (stage_den, dim) = rest.split_at(1);
+        let numerator = self.param_name_to_val(&format!("{stage_num}{dim}"))?.get();
+        let denominator = self.param_name_to_val(&format!("{stage_den}{dim}"))?.get();
+        (denominator != 0.0).then(|| LoopCount((numerator / denominator) as i32))
+    }
+
+    /// Where one dim sits in a role's layout order (`dsc/designSpaceConfig.cpp:429-438`).
+    /// ⛔ IBM'S `-1` AND ITS `.at()` THROW COLLAPSE INTO ONE ABSENT: a dim outside the order and a
+    /// role outside `primaryDsInfo_` are both [`None`], and no reader distinguishes them.
+    pub fn dim_index_in_layout_order(
+        &self,
+        ds_type: DsTypes,
+        dim: PrimaryDimTypes,
+    ) -> Option<usize> {
+        self.primary_ds_info
+            .get(&ds_type)?
+            .layout_dim_order
+            .iter()
+            .position(|d| *d == dim)
+    }
+
+    /// A role's layout dims as a set (`dsc/dsc2.cpp:4027-4031`).
+    pub fn layout_dim_set(&self, ds_type: DsTypes) -> Option<BTreeSet<PrimaryDimTypes>> {
+        Some(
+            self.primary_ds_info
+                .get(&ds_type)?
+                .layout_dim_order
+                .iter()
+                .copied()
+                .collect(),
+        )
+    }
+
+    /// A role's stick dims, in order (`dsc/designSpaceConfig.h:241-243`).
+    pub fn stick_dims(&self, ds_type: DsTypes) -> Option<&[PrimaryDimTypes]> {
+        Some(&self.primary_ds_info.get(&ds_type)?.stick_dim_order)
+    }
+
+    /// The same dims as a set (`dsc/dsc2.cpp:4033-4037`).
+    pub fn stick_dim_set(&self, ds_type: DsTypes) -> Option<BTreeSet<PrimaryDimTypes>> {
+        Some(self.stick_dims(ds_type)?.iter().copied().collect())
+    }
+
+    /// Each stick dim with the extent the requested scope leaves it (`dsc/dsc2.cpp:4066-4104`).
+    ///
+    /// ⛔ THE SCOPE SPLITS ONE STICK AT ITS SLICE BOUNDARY: `elemInSlice` is the product of every
+    /// stick extent divided by the slice count, and the walk stops, truncates or skips a dim
+    /// depending on whether it fits inside that many elements. A stick whose element count is not a
+    /// multiple of the slice count is absent, where IBM `DT_CHECK`s.
+    ///
+    /// ⭐ THE `int` MULTIPLY IS TRUNCATING AT EVERY STEP: `elemInSlice *= size` with `size` a
+    /// `double` truncates back to `int` per dim, so a fractional stick extent is not merely rounded
+    /// once at the end.
+    pub fn stick_sizes(&self, ds_type: DsTypes, scope: StickSizeScope) -> Option<Vec<Size>> {
+        let pdsi = self.primary_ds_info.get(&ds_type)?;
+        let mut elem_in_slice: i32 = 1;
+        for size in &pdsi.stick_size {
+            elem_in_slice = (f64::from(elem_in_slice) * size.0) as i32;
+        }
+        let num_slices = match scope {
+            StickSizeScope::L0SliceOnly(slices) => slices.get(),
+            _ => SLICES_PER_STICK,
+        };
+        if elem_in_slice <= 0 || elem_in_slice % num_slices != 0 {
+            return None;
+        }
+        elem_in_slice /= num_slices;
+
+        let mut result = Vec::new();
+        let mut elem_so_far: i32 = 1;
+        for (i, dim) in pdsi.stick_dim_order.iter().enumerate() {
+            let mut size = pdsi.stick_size.get(i)?.0 as i32;
+            match scope {
+                StickSizeScope::SliceOnly | StickSizeScope::L0SliceOnly(_) => {
+                    // Can not fit more elements into the slice.
+                    if elem_so_far >= elem_in_slice {
+                        break;
+                    }
+                    elem_so_far *= size;
+                    if elem_so_far > elem_in_slice {
+                        size /= elem_so_far / elem_in_slice;
+                    }
+                }
+                StickSizeScope::WithoutSlice => {
+                    let new_elem_so_far = elem_so_far * size;
+                    if elem_so_far < elem_in_slice && new_elem_so_far > elem_in_slice {
+                        size /= elem_in_slice / elem_so_far;
+                    }
+                    elem_so_far = new_elem_so_far;
+                    if elem_so_far <= elem_in_slice {
+                        // dim included in slice
+                        continue;
+                    }
+                }
+                StickSizeScope::WholeStick => {}
+            }
+            result.push(Size::new(*dim, dsc2::DimSize(size)));
+        }
+        Some(result)
+    }
+
+    /// [`stick_sizes`](Self::stick_sizes) folded per dim, multiplying a dim that appears twice
+    /// (`dsc/dsc2.cpp:4106-4122`).
+    pub fn cumulative_stick_sizes(
+        &self,
+        ds_type: DsTypes,
+        scope: StickSizeScope,
+    ) -> Option<BTreeMap<PrimaryDimTypes, dsc2::DimSize>> {
+        let mut result: BTreeMap<PrimaryDimTypes, dsc2::DimSize> = BTreeMap::new();
+        for size in self.stick_sizes(ds_type, scope)? {
+            result
+                .entry(size.dim)
+                .and_modify(|total| total.0 *= size.size.0)
+                .or_insert(size.size);
+        }
+        Some(result)
+    }
+
+    /// One labeled input's HBM row count, less the zero padding on both sides
+    /// (`dsc/designSpaceConfig.cpp:930-934`).
+    pub fn inp_row_in_hbm(&self, label: &str) -> Option<HbmRows> {
+        let r = self.param_name_to_val(&format!("{label}r"))?.get();
+        let zi = self.param_name_to_val("nzi")?.get();
+        Some(HbmRows(r - zi * 2.0))
+    }
+
+    /// One labeled input's HBM column count, less the zero padding on both sides
+    /// (`dsc/designSpaceConfig.cpp:936-940`).
+    pub fn inp_col_in_hbm(&self, label: &str) -> Option<HbmCols> {
+        let c = self.param_name_to_val(&format!("{label}c"))?.get();
+        let zj = self.param_name_to_val("nzj")?.get();
+        Some(HbmCols(c - zj * 2.0))
+    }
+
+    /// Rows times columns, or `-1` when BOTH are negative
+    /// (`dsc/designSpaceConfig.cpp:942-946`). ⛔ IF ONLY ONE IS NEGATIVE THE PRODUCT IS RETURNED
+    /// NEGATIVE — the authority's `&&` is not an `||`, and no caller re-checks the sign.
+    pub fn inp_in_hbm(&self, label: &str) -> Option<HbmElements> {
+        let r = self.inp_row_in_hbm(label)?.0;
+        let c = self.inp_col_in_hbm(label)?.0;
+        Some(HbmElements(if r < 0.0 && c < 0.0 { -1.0 } else { r * c }))
+    }
+
+    /// Whether `d1` covers `d2` dim for dim, with the reason it does not
+    /// (`dsc/designSpaceConfig.cpp:7814-7874`). The primary dims must all be at least as large; the
+    /// auxiliary ones must be at least as large OR unfilled; and none may carry a fraction.
+    ///
+    /// ⛔ THE LAST BLOCK SETS `auxiliaryCheck = true` WHERE IT PLAINLY MEANS `false` (`:7869-7871`),
+    /// while its primary twin sets `false` (`:7840`). So a fractional auxiliary dim PASSES this
+    /// check and merely appends its message — reproduced here, because it is the behaviour every
+    /// caller sees.
+    ///
+    /// ⛔ AND IT ONLY REQUIRES `ij_`/`kij_` WHEN SOME ROLE'S LAYOUT USES THAT DIM (`:7821-7829`), so
+    /// the answer depends on [`primary_ds_info`](Self::primary_ds_info), not on the two arguments
+    /// alone.
+    pub fn check_data_struct_dims(
+        &self,
+        d1: &DataStructDims,
+        d2: &DataStructDims,
+    ) -> (bool, String) {
+        let mut primary_check = false;
+        let mut auxiliary_check = false;
+        let mut msg = String::new();
+
+        let mut dim_used = BTreeSet::new();
+        for pdsi in self.primary_ds_info.values() {
+            dim_used.extend(pdsi.layout_dim_order.iter().copied());
+        }
+        let check_ij = dim_used.contains(&PrimaryDimTypes::Ij);
+        let check_kij = dim_used.contains(&PrimaryDimTypes::Kij);
+
+        if d1.r#in >= d2.r#in
+            && d1.out >= d2.out
+            && d1.mb >= d2.mb
+            && (d1.ij >= d2.ij || !check_ij)
+            && (d1.kij >= d2.kij || !check_kij)
+            && d1.x >= d2.x
+            && d1.y >= d2.y
+        {
+            primary_check = true;
+        } else {
+            msg.push_str("all of values in primary fields should be equal or greater");
+        }
+
+        let primary = [
+            d1.r#in, d1.out, d1.mb, d1.ij, d1.kij, d1.x, d1.y, d2.r#in, d2.out, d2.mb, d2.ij,
+            d2.kij, d2.x, d2.y,
+        ];
+        if !primary.into_iter().all(is_fractional) {
+            primary_check = false;
+            msg.push_str("all of values in primary fields should have no fraction");
+        }
+
+        let auxiliary = [
+            (d1.rc, d2.rc),
+            (d1.sij, d2.sij),
+            (d1.zij, d2.zij),
+            (d1.i, d2.i),
+            (d1.j, d2.j),
+            (d1.r, d2.r),
+            (d1.c, d2.c),
+            (d1.ki, d2.ki),
+            (d1.kj, d2.kj),
+            (d1.si, d2.si),
+            (d1.sj, d2.sj),
+            (d1.zi, d2.zi),
+            (d1.zj, d2.zj),
+        ];
+        if auxiliary
+            .into_iter()
+            .all(|(one, two)| one.is_none() || one >= two)
+        {
+            auxiliary_check = true;
+        } else {
+            msg.push_str(
+                "all of values in auxiliary fields should be equal, greater or un-initialized (-1)",
+            );
+        }
+
+        let auxiliary_values = auxiliary
+            .into_iter()
+            .flat_map(|(one, two)| [one, two])
+            .collect::<Vec<_>>();
+        if !auxiliary_values.into_iter().all(is_fractional) {
+            auxiliary_check = true;
+            msg.push_str("all of values in auxiliary fields should have no fraction");
+        }
+
+        (primary_check && auxiliary_check, msg)
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn dim(size: f64) -> Option<dims::DimSize> {
+        dims::DimSize::new(size)
+    }
+
+    /// `dsc/designSpaceConfig.cpp:16-28`: the constructor's whole body is these twelve names, and
+    /// `CoreD_`'s is the bare `"d"` (`:22`) that twenty `paramNameToVal` keys are built on.
+    #[test]
+    fn the_constructor_names_all_twelve_data_struct_dims_and_core_d_is_just_d() {
+        let dsc = DesignSpaceConfig::default();
+        let names: Vec<&str> = [
+            &dsc.n,
+            &dsc.unpad_n,
+            &dsc.dsc_n,
+            &dsc.chip_d,
+            &dsc.chiplet_d,
+            &dsc.core_d,
+            &dsc.corelet_d,
+            &dsc.b,
+            &dsc.t,
+            &dsc.p,
+            &dsc.tel,
+            &dsc.pel,
+        ]
+        .iter()
+        .map(|dsd| dsd.name.as_str())
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "n", "unpadn", "dscn", "chipd", "chipletd", "d", "coreletd", "b", "t", "p", "tel",
+                "pel"
+            ]
+        );
+
+        // The other initialisers of `dsc/designSpaceConfig.h:72-121`.
+        assert_eq!(dsc.num_cores_used, None);
+        assert_eq!(dsc.masking_const_id, None);
+        assert_eq!(dsc.num_corelets_used_dsc2, None);
+        assert!(!dsc.l0_tethered_mode);
+        assert!(dsc.pds_relation.is_pds_reuse);
+        assert_eq!(dsc.target, SenTargets::Undefined);
+    }
+
+    /// `dsc/designSpaceConfig.h:267-345`: every spelling the twelve-way selector accepts, lowercased
+    /// on the way in, and nothing else.
+    #[test]
+    fn dsd_from_str_selects_the_twelve_named_dims_case_insensitively() {
+        let mut dsc = DesignSpaceConfig::default();
+        for spelling in [
+            "n", "d", "b", "t", "p", "coreletd", "tel", "pel", "unpadn", "chipd", "chipletd",
+            "dscn",
+        ] {
+            assert_eq!(
+                dsc.dsd_from_str(spelling).map(|dsd| dsd.name.as_str()),
+                Some(if spelling == "d" { "d" } else { spelling })
+            );
+        }
+        assert_eq!(
+            dsc.dsd_from_str("ChipletD").map(|dsd| dsd.name.as_str()),
+            Some("chipletd")
+        );
+
+        // IBM's DT_ERROR arm, and `sc_`, which the selector never named.
+        assert!(dsc.dsd_from_str("cored").is_none());
+        assert!(dsc.dsd_from_str("sc").is_none());
+
+        dsc.dsd_from_str_mut("t").unwrap().i = dim(4.0);
+        assert_eq!(dsc.t.i, dim(4.0));
+    }
+
+    /// `dsc/designSpaceConfig.h:358-608`: 12 prefixes x 20 dims, resolved by longest prefix — and no
+    /// `<dsd>x1` key exists even though `DataStructDims` has the field (`dsc/dims.cpp:437-482`).
+    #[test]
+    fn param_name_to_val_resolves_all_240_keys_and_no_x1_key() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.core_d.r#in = dim(8.0);
+        dsc.dsc_n.ij = dim(3.0);
+        dsc.pel.zij = dim(1.5);
+
+        assert_eq!(dsc.param_name_to_val("din"), dim(8.0));
+        assert_eq!(dsc.param_name_to_val("dscnij"), dim(3.0));
+        assert_eq!(dsc.param_name_to_val("pelzij"), dim(1.5));
+
+        let mut resolved = 0;
+        for prefix in DSD_PREFIXES {
+            if dsc.dsd_from_str(prefix).is_none() {
+                continue;
+            }
+            for dim_name in PARAM_DIM_NAMES {
+                assert!(split_param_name(&format!("{prefix}{dim_name}")).is_some());
+                resolved += 1;
+            }
+        }
+        assert_eq!(resolved, 240);
+
+        assert!(dsc.param_name_to_val("nx1").is_none());
+        assert!(dsc.param_name_to_val("nq").is_none());
+
+        *dsc.param_name_to_val_mut("telmb").unwrap() = dim(6.0);
+        assert_eq!(dsc.tel.mb, dim(6.0));
+    }
+
+    /// `dsc/designSpaceConfig.cpp:416-427`: `dbin` is `din` over `bin`, i.e. `CoreD_.in_` over
+    /// `B_.in_`, and the three loops whose spelling does not decompose have no count.
+    #[test]
+    fn loop_count_divides_the_numerator_stage_by_the_denominator_stage() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.core_d.r#in = dim(64.0);
+        dsc.b.r#in = dim(16.0);
+        dsc.t.ij = dim(12.0);
+        dsc.p.ij = dim(5.0);
+
+        assert_eq!(dsc.loop_count(LoopNames::DbIn), Some(LoopCount(4)));
+        // Truncating, as IBM's `int loopCount = double / double` is.
+        assert_eq!(dsc.loop_count(LoopNames::TpIj), Some(LoopCount(2)));
+
+        // IBM's `DT_CHECK(loop != INNER)`, and the two spellings that decompose to no key.
+        assert_eq!(dsc.loop_count(LoopNames::Inner), None);
+        assert_eq!(dsc.loop_count(LoopNames::Const), None);
+        assert_eq!(dsc.loop_count(LoopNames::Invalid), None);
+        // An unfilled stage: `BtIn` wants `bin` over `tin`, and `T_.in_` is unset.
+        assert_eq!(dsc.loop_count(LoopNames::BtIn), None);
+    }
+
+    /// `dsc/designSpaceConfig.cpp:9222-9254`: the printed spellings, their flip, and the DM table
+    /// that is NOT that flip and maps two spellings onto `INNER`.
+    #[test]
+    fn loop_names_round_trip_and_the_dm_table_is_a_separate_one() {
+        for loop_name in LoopNames::ALL {
+            assert_eq!(LoopNames::from_name(loop_name.name()), Some(loop_name));
+        }
+        assert_eq!(LoopNames::ALL.len(), 32);
+
+        assert_eq!(LoopNames::from_name_dm("pcompute"), Some(LoopNames::Inner));
+        assert_eq!(LoopNames::from_name_dm("Inner"), Some(LoopNames::Inner));
+        assert_eq!(LoopNames::from_name_dm("din"), Some(LoopNames::DbIn));
+        // The DM table names no `dbi`/`dbj`/`dbki`/`dbkj`, and no `dbin` either.
+        assert_eq!(LoopNames::from_name_dm("dbin"), None);
+        assert_eq!(LoopNames::from_name_dm("di"), None);
+
+        for ds_type in DsTypes::ALL {
+            assert_eq!(DsTypes::from_name(ds_type.name()), Some(ds_type));
+        }
+        assert_eq!(DsTypes::from_name("SCRATCH"), None);
+    }
+
+    /// `dsc/designSpaceConfig.cpp:8302-8315`: the three stages are contiguous discriminant ranges,
+    /// and `INNER`, `CONST` and `INVALID` are in none of them.
+    #[test]
+    fn each_loop_belongs_to_exactly_one_stage_and_the_three_specials_to_none() {
+        for loop_name in LoopNames::ALL {
+            let stages = [LoopStage::Tp, LoopStage::Bt, LoopStage::Db]
+                .into_iter()
+                .filter(|stage| loop_name.is_stage(*stage))
+                .count();
+            let expected = match loop_name {
+                LoopNames::Inner | LoopNames::Const | LoopNames::Invalid => 0,
+                _ => 1,
+            };
+            assert_eq!(stages, expected, "{loop_name:?}");
+        }
+        assert!(LoopNames::DbKj.is_stage(LoopStage::Db));
+        assert!(!LoopNames::DbKj.is_stage(LoopStage::Bt));
+        assert!(LoopNames::BtY.is_stage(LoopStage::Bt));
+        assert!(LoopNames::TpIn.is_stage(LoopStage::Tp));
+    }
+
+    /// `dsc/dsc2.cpp:4007-4037` and `dsc/designSpaceConfig.cpp:429-438`: the layout order positions a
+    /// dim, and a role with no entry answers absent rather than throwing.
+    #[test]
+    fn layout_and_stick_dims_come_from_the_role_and_an_absent_role_is_none() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.primary_ds_info.insert(
+            DsTypes::Input,
+            PrimaryDsInfo {
+                layout_dim_order: vec![PrimaryDimTypes::Mb, PrimaryDimTypes::Ij],
+                stick_dim_order: vec![PrimaryDimTypes::Out, PrimaryDimTypes::Ij],
+                stick_size: vec![StickSize(32.0), StickSize(8.0)],
+                stick_repl: vec![StickRepl(1), StickRepl(2)],
+            },
+        );
+
+        assert_eq!(
+            dsc.dim_index_in_layout_order(DsTypes::Input, PrimaryDimTypes::Ij),
+            Some(1)
+        );
+        // IBM's -1: the dim is not in this layout.
+        assert_eq!(
+            dsc.dim_index_in_layout_order(DsTypes::Input, PrimaryDimTypes::X),
+            None
+        );
+        // IBM's `.at()` throw: the role has no entry.
+        assert_eq!(
+            dsc.dim_index_in_layout_order(DsTypes::Kernel, PrimaryDimTypes::Ij),
+            None
+        );
+
+        assert_eq!(
+            dsc.layout_dim_set(DsTypes::Input),
+            Some(BTreeSet::from([PrimaryDimTypes::Mb, PrimaryDimTypes::Ij]))
+        );
+        assert_eq!(
+            dsc.stick_dims(DsTypes::Input),
+            Some([PrimaryDimTypes::Out, PrimaryDimTypes::Ij].as_slice())
+        );
+        assert_eq!(
+            dsc.stick_dim_set(DsTypes::Input),
+            Some(BTreeSet::from([PrimaryDimTypes::Out, PrimaryDimTypes::Ij]))
+        );
+        assert!(dsc.stick_dims(DsTypes::Output).is_none());
+    }
+
+    /// `dsc/designSpaceConfig.cpp:9451-9486`: each is a PRODUCT over the entries naming that dim, a
+    /// dim outside the stick is the empty product `1`, and a length mismatch is IBM's `DT_ERROR`.
+    #[test]
+    fn stick_queries_multiply_every_entry_naming_the_dim() {
+        let pdsi = PrimaryDsInfo {
+            layout_dim_order: Vec::new(),
+            stick_dim_order: vec![
+                PrimaryDimTypes::Ij,
+                PrimaryDimTypes::Out,
+                PrimaryDimTypes::Ij,
+            ],
+            stick_size: vec![StickSize(4.0), StickSize(32.0), StickSize(2.0)],
+            stick_repl: vec![StickRepl(1), StickRepl(1), StickRepl(3)],
+        };
+        assert_eq!(pdsi.stick(PrimaryDimTypes::Ij), Some(StickSize(8.0)));
+        assert_eq!(pdsi.stick_repl(PrimaryDimTypes::Ij), Some(StickRepl(3)));
+        assert_eq!(
+            pdsi.stick_srpdt(PrimaryDimTypes::Ij),
+            Some(StickSizeWithRepl(24.0))
+        );
+        assert_eq!(pdsi.stick(PrimaryDimTypes::X), Some(StickSize(1.0)));
+
+        let ragged = PrimaryDsInfo {
+            stick_size: vec![StickSize(4.0)],
+            ..pdsi
+        };
+        assert_eq!(ragged.stick(PrimaryDimTypes::Ij), None);
+    }
+
+    /// `dsc/dsc2.cpp:4066-4122`: 32 x 8 elements over eight slices leaves 32 in a slice, so the slice
+    /// scope stops after the first dim and the without-slice scope reports only what is left.
+    #[test]
+    fn stick_sizes_split_the_stick_at_its_slice_boundary() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.primary_ds_info.insert(
+            DsTypes::Input,
+            PrimaryDsInfo {
+                layout_dim_order: vec![PrimaryDimTypes::Mb],
+                stick_dim_order: vec![PrimaryDimTypes::Out, PrimaryDimTypes::Ij],
+                stick_size: vec![StickSize(32.0), StickSize(8.0)],
+                stick_repl: vec![StickRepl(1), StickRepl(1)],
+            },
+        );
+
+        let whole = dsc.stick_sizes(DsTypes::Input, StickSizeScope::WholeStick);
+        assert_eq!(
+            whole,
+            Some(vec![
+                Size::new(PrimaryDimTypes::Out, dsc2::DimSize(32)),
+                Size::new(PrimaryDimTypes::Ij, dsc2::DimSize(8)),
+            ])
+        );
+        assert_eq!(
+            dsc.stick_sizes(DsTypes::Input, StickSizeScope::SliceOnly),
+            Some(vec![Size::new(PrimaryDimTypes::Out, dsc2::DimSize(32))])
+        );
+        assert_eq!(
+            dsc.stick_sizes(DsTypes::Input, StickSizeScope::WithoutSlice),
+            Some(vec![Size::new(PrimaryDimTypes::Ij, dsc2::DimSize(8))])
+        );
+        // Four L0 slices leave 64 in a slice, which swallows the second dim too.
+        assert_eq!(
+            dsc.stick_sizes(
+                DsTypes::Input,
+                StickSizeScope::L0SliceOnly(NumL0Slices::new(4).unwrap())
+            ),
+            Some(vec![
+                Size::new(PrimaryDimTypes::Out, dsc2::DimSize(32)),
+                Size::new(PrimaryDimTypes::Ij, dsc2::DimSize(2)),
+            ])
+        );
+        // IBM's `DT_CHECK(elemInSlice > 0 && elemInSlice % numSlices == 0)`.
+        assert_eq!(NumL0Slices::new(0), None);
+        assert_eq!(NumL0Slices::new(-1), None);
+        assert_eq!(
+            dsc.stick_sizes(
+                DsTypes::Input,
+                StickSizeScope::L0SliceOnly(NumL0Slices::new(7).unwrap())
+            ),
+            None
+        );
+
+        assert_eq!(
+            dsc.cumulative_stick_sizes(DsTypes::Input, StickSizeScope::WholeStick),
+            Some(BTreeMap::from([
+                (PrimaryDimTypes::Out, dsc2::DimSize(32)),
+                (PrimaryDimTypes::Ij, dsc2::DimSize(8)),
+            ]))
+        );
+    }
+
+    /// `dsc/dsc2.cpp:4106-4122`: a dim appearing twice in the stick has its extents MULTIPLIED, which
+    /// is the whole difference between this and `getStickSizes`.
+    #[test]
+    fn cumulative_stick_sizes_multiply_a_repeated_dim() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.primary_ds_info.insert(
+            DsTypes::Kernel,
+            PrimaryDsInfo {
+                layout_dim_order: Vec::new(),
+                stick_dim_order: vec![
+                    PrimaryDimTypes::Ij,
+                    PrimaryDimTypes::Out,
+                    PrimaryDimTypes::Ij,
+                ],
+                stick_size: vec![StickSize(4.0), StickSize(2.0), StickSize(8.0)],
+                stick_repl: vec![StickRepl(1), StickRepl(1), StickRepl(1)],
+            },
+        );
+        assert_eq!(
+            dsc.cumulative_stick_sizes(DsTypes::Kernel, StickSizeScope::WholeStick),
+            Some(BTreeMap::from([
+                (PrimaryDimTypes::Out, dsc2::DimSize(2)),
+                (PrimaryDimTypes::Ij, dsc2::DimSize(32)),
+            ]))
+        );
+    }
+
+    /// `dsc/designSpaceConfig.cpp:930-946`: rows and columns each lose twice their zero padding, and
+    /// the `-1` answer needs BOTH to be negative.
+    #[test]
+    fn inp_in_hbm_subtracts_twice_the_zero_padding_from_each_axis() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.n.r = dim(10.0);
+        dsc.n.c = dim(20.0);
+        dsc.n.zi = dim(1.0);
+        dsc.n.zj = dim(2.0);
+
+        assert_eq!(dsc.inp_row_in_hbm("n"), Some(HbmRows(8.0)));
+        assert_eq!(dsc.inp_col_in_hbm("n"), Some(HbmCols(16.0)));
+        assert_eq!(dsc.inp_in_hbm("n"), Some(HbmElements(128.0)));
+
+        // Only one axis negative: the product is returned, negative.
+        dsc.n.r = dim(1.0);
+        assert_eq!(dsc.inp_in_hbm("n"), Some(HbmElements(-16.0)));
+        // Both negative: IBM's -1.
+        dsc.n.c = dim(1.0);
+        assert_eq!(dsc.inp_in_hbm("n"), Some(HbmElements(-1.0)));
+        // An unfilled key: IBM's `.at()` throw.
+        assert_eq!(dsc.inp_row_in_hbm("chipd"), None);
+    }
+
+    /// `dsc/designSpaceConfig.cpp:7814-7874`: the primary dims must cover, the auxiliary ones may be
+    /// unfilled, `ij_` is only required when a layout uses it, and a fractional auxiliary dim still
+    /// PASSES because that block sets `true` where it means `false` (`:7869-7871`).
+    #[test]
+    fn check_data_struct_dims_covers_primary_dims_and_lets_a_fractional_aux_dim_pass() {
+        let mut dsc = DesignSpaceConfig::default();
+        let mut big = DataStructDims::default();
+        big.r#in = dim(8.0);
+        big.out = dim(8.0);
+        big.mb = dim(2.0);
+        big.x = dim(4.0);
+        big.y = dim(4.0);
+        let mut small = big.clone();
+        small.r#in = dim(4.0);
+
+        let (ok, msg) = dsc.check_data_struct_dims(&big, &small);
+        assert!(ok, "{msg}");
+        assert_eq!(msg, "");
+
+        let (ok, msg) = dsc.check_data_struct_dims(&small, &big);
+        assert!(!ok);
+        assert_eq!(
+            msg,
+            "all of values in primary fields should be equal or greater"
+        );
+
+        // `ij_` is unset on both sides, so it only matters once a layout names it.
+        let mut with_ij = big.clone();
+        with_ij.ij = dim(4.0);
+        assert!(dsc.check_data_struct_dims(&big, &with_ij).0);
+        dsc.primary_ds_info.insert(
+            DsTypes::Input,
+            PrimaryDsInfo {
+                layout_dim_order: vec![PrimaryDimTypes::Ij],
+                ..PrimaryDsInfo::default()
+            },
+        );
+        assert!(!dsc.check_data_struct_dims(&big, &with_ij).0);
+
+        // A fractional PRIMARY dim fails; a fractional AUXILIARY one passes with a message.
+        let mut fractional_primary = big.clone();
+        fractional_primary.mb = dim(2.5);
+        assert!(!dsc.check_data_struct_dims(&fractional_primary, &small).0);
+        let mut fractional_aux = big.clone();
+        fractional_aux.zi = dim(1.5);
+        let (ok, msg) = dsc.check_data_struct_dims(&fractional_aux, &small);
+        assert!(ok);
+        assert_eq!(
+            msg,
+            "all of values in auxiliary fields should have no fraction"
+        );
+    }
+}
+
+// crustify:todo: e031_DesignSpaceConfig
+
+// crustify:todo: e031_DesignSpaceConfig.auxLoopOrder_
+
+// crustify:todo: e031_DesignSpaceConfig.computeOp_
+
+// crustify:todo: e031_DesignSpaceConfig.labeledDs_
+
+// crustify:todo: e031_DesignSpaceConfig.pcfg_
+
+// crustify:todo: e031_DesignSpaceConfig.ptr_
+
+// crustify:todo: e031_DesignSpaceConfig.scheduleTree_
+
+// crustify:todo: e031_DesignSpaceConfig.size_
