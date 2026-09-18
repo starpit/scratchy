@@ -1967,17 +1967,84 @@ mod unit_tests {
     }
 
     /// `dsc/dsc2.h:47-51`: a fresh constant is INVALID, unnamed and not symbolic. ⛔ ITS FORMAT IS
-    /// NOT [`DataFormats::default()`], which is `SEN169_FP16` (`dsc/dsc2.h:934`), and `INVALID` has
-    /// no bit width — the entry `replicationFactor_` divides by (`ddc/ddcv1.cpp:455-457`) and the one
-    /// the op-const unpacker builds its mask from (`dsc/dsc2.cpp:5260-5265`).
+    /// NOT [`DataFormats::default()`], which is `SEN169_FP16` (`dsc/dsc2.h:934`). ⛔ AND THE
+    /// AUTHORITY'S TABLE DOES NOT REFUSE THAT INITIALISER: `INVALID` maps to `-1`
+    /// (`util/sendefs/sendefs.cpp:131`), so both sites that divide by this field's width answer a
+    /// NEGATIVE count instead of stopping — `1024 / width` for a `CONSTANT_TO_CONSTANT` transfer
+    /// (`dsc/dsc2.cpp:3486-3492`) and `bitsPerElem * numElems`, which then slips UNDER the `> 4 * 32`
+    /// gate that exists to bound it (`ddc/ddl/ddl_conversion.cpp:697-704`). [`None`] is this port's
+    /// boundary because no reader can divide by it.
     #[test]
-    fn constant_info_starts_invalid_and_an_invalid_format_has_no_bit_width_to_divide_by() {
+    fn a_fresh_constants_invalid_format_has_no_width_and_the_authority_divides_by_minus_one() {
         let constant = ConstantInfo::default();
         assert_eq!(constant.data_format, DataFormats::Invalid);
         assert_ne!(constant.data_format, DataFormats::default());
-        assert_eq!(constant.data_format.bit_width(), None);
         assert!(constant.name.is_empty());
         assert!(!constant.is_data_symbolic);
+        assert_eq!(constant.data_format.bit_width(), None);
+
+        // The authority's entry, and neither reader refuses it.
+        let authority_width = -1;
+        assert_eq!(1024 / authority_width, -1024);
+        let num_elems = 16;
+        assert!(authority_width * num_elems <= 4 * 32);
+
+        // A STATED format is what makes either quantity a bound at all.
+        let stated = DataFormats::Sen169Fp16.bit_width().unwrap().0;
+        assert_eq!(1024 / stated, 64);
+        assert!(stated * num_elems > 4 * 32);
+    }
+
+    /// ⛔ THE PAD PATH WRITES THIS FIELD FROM THE LABELED DS AND NEVER READS IT BACK FOR A WIDTH:
+    /// `transformLxZeroPadInfoInScheduleTree` unpacks the op-const with `lds.dataFormat_`
+    /// (`dsc/dsc2.cpp:5260-5265`, over the `lds` bound at `:4773`), mints the entry with that same
+    /// format under the reserved name (`:5281-5283`), and on a REUSED `padval` entry `DT_CHECK`s
+    /// that the two agree (`:5229-5235`). So the constant's format equals the labeled DS's by
+    /// construction, and a disagreeing entry is what that check refuses.
+    #[test]
+    fn the_padval_entry_carries_the_labeled_dss_format_and_a_disagreement_is_what_is_refused() {
+        let lds_data_format = DataFormats::Sen143Fp8;
+        let minted = ConstantInfo {
+            data_format: lds_data_format,
+            name: "padval".to_string(),
+            ..ConstantInfo::default()
+        };
+        assert_eq!(minted.data_format, lds_data_format);
+
+        // `:5229-5230`: the reuse arm keys on the name, then requires the format to agree.
+        let constants = BTreeMap::from([(ConstantId(0), minted)]);
+        let reused = constants.values().find(|c| c.name == "padval").unwrap();
+        assert_eq!(reused.data_format, lds_data_format);
+        assert_ne!(reused.data_format, DataFormats::Sen169Fp16);
+
+        // The mask the unpacker builds is the LABELED DS's width, which this entry only mirrors.
+        assert_eq!(lds_data_format.bit_width(), Some(BitWidth(8)));
+    }
+
+    /// ⛔ ONE FLAG, TWO OPPOSITE VERDICTS: bridge 1 emits `is_symbol` exactly when it is set
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:514-516`) and the PCFG
+    /// translator `DT_CHECK`s that it is NOT (`dsc/dsc2Pcfg.cpp:1366`, `:1945`), so `stzJumpAddr`
+    /// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1151-1154`) is a constant one consumer
+    /// emits and the other refuses.
+    #[test]
+    fn the_symbolic_flag_is_bridge_ones_attribute_and_the_pcfg_paths_refusal() {
+        let stz_jump_addr = ConstantInfo {
+            name: "stzJumpAddr".to_string(),
+            is_data_symbolic: true,
+            ..ConstantInfo::default()
+        };
+        let padval = ConstantInfo {
+            name: "padval".to_string(),
+            ..ConstantInfo::default()
+        };
+
+        let emits_is_symbol = |constant: &ConstantInfo| constant.is_data_symbolic;
+        let pcfg_admits = |constant: &ConstantInfo| !constant.is_data_symbolic;
+
+        assert!(emits_is_symbol(&stz_jump_addr));
+        assert!(!pcfg_admits(&stz_jump_addr));
+        assert!(!emits_is_symbol(&padval));
+        assert!(pcfg_admits(&padval));
     }
 
     /// `dsc/dsc2.h:54-60` against `:46`: the copy ASSIGNMENT never touches `isDataSymbolic_`, while
@@ -3617,10 +3684,12 @@ impl DataFormats {
     ///
     /// ⛔ `SENINT24` IS 16 BITS IN THE AUTHORITY'S TABLE (`:135`), not 24. Every caller reads the
     /// table, so this reproduces the table.
-    /// ⛔ `INVALID`'S ENTRY IS `-1` (`:131`) — not a width, so it is ABSENT here. Its one arithmetic
-    /// reader divides by it: `getComputeOperandSizes` computes `1024 / bitWidth`
-    /// (`dsc/dsc2.cpp:2295`), which on `INVALID` yields -1024 elements in the authority, and a
-    /// negative operand size is not one — see [`ComputeNode::operand_sizes`].
+    /// ⛔ `INVALID`'S ENTRY IS `-1` (`:131`) — not a width, so it is ABSENT here. FOUR readers in
+    /// `dsc/dsc2.cpp` alone divide by it: `getComputeOperandSizes` twice (`:2295`, `:2310`),
+    /// `getBlockTransferSizePerDim`'s constant transfer (`:3490`) and the pad unpacker (`:5261`), and
+    /// `replicationFactor_` divides by a CONSTANT's width outside this file (`ddc/ddcv1.cpp:457`). On
+    /// `INVALID` each yields a NEGATIVE count in the authority rather than refusing, and a negative
+    /// operand size is not one — see [`ComputeNode::operand_sizes`] and [`ConstantInfo::data_format`].
     pub fn bit_width(self) -> Option<BitWidth> {
         let bits = match self {
             Self::Invalid => return None,
@@ -4891,14 +4960,31 @@ impl Default for AllocateNode {
 /// blocker e008 and e012 are already held by. `allocations_` (`:52`) is a
 /// `std::map<SenComponents, AllocateNode*>` of NON-OWNING aliases into the schedule tree: the DDL
 /// conversion hangs the minted node on its parent block and aliases it here in the same breath
-/// (`ddc/ddl/ddl_conversion.cpp:826-832`), and `fillDataInfo` reads that node's PLACED address back
-/// through the alias (`ddc/ddcv1.cpp:2386-2388`). Carrying it as an owned
+/// (`ddc/ddl/ddl_conversion.cpp:826-832`), and the PE/SFP work split clones a node into a second
+/// component the same way, refusing a component that already has one
+/// (`ddc/ddc_transformation_util.cpp:1407-1417`). What blocks it is that this port has no node
+/// IDENTITY to alias WITH: there is no `ScheduleNode` base, no parent or child link, and
+/// [`AllocateNode`]'s own pointer fields are open anchors above. An owned
 /// `BTreeMap<SenComponent, AllocateNode>` would give the constant a second copy of a node the tree
-/// owns, and the placement written through the tree would not be visible here. The authority's JSON
-/// exporter writes the alias as the node's NAME and its importer has no arm for it at all
-/// (`dsc/dsc2.cpp:95-102`, `:1134-1150`), and a constant may legitimately have none — "Keep
+/// owns, and the placement written through the tree would not be visible here — which is exactly
+/// what its readers draw back out of it: `fillDataInfo` (`ddc/ddcv1.cpp:2386-2388`) and the L3
+/// scheduler's own copy of that loop (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5810-5817`) clone
+/// the node's PLACED address and its symbolic flag through the alias, `getAllocation` hands the node
+/// itself back (`dsc/dsc2.cpp:2632`), and the DDL conversion resolves a data connect's allocation
+/// through it (`ddc/ddl/ddl_conversion.cpp:2861`).
+///
+/// ⛔ THE ALIAS IS DERIVED AND THE ROUND TRIP IS NOT LOSSY: the JSON exporter writes it as the node's
+/// NAME and the importer's `constantInfo_` arm has no case for it (`dsc/dsc2.cpp:95-102`,
+/// `:1134-1150`), but importing the schedule tree RELINKS it —
+/// `constantInfo_[an->constIdx_].allocations_[an->component_] = an` for every ALLOCATE node, beside
+/// the labeled DS's own link (`:1831-1837`). `SdscHasher`'s walk of it is commented out
+/// (`dsc/superdsc.cpp:1515-1521`), so it is not part of the fingerprint either.
+///
+/// ⛔ AND ABSENT IS NOT NULL: a constant may legitimately have no entry — "Keep
 /// constInfo.allocations_ empty because we do not need to allocate a data structure to store this
-/// constant" (`dsc/dsc2.cpp:5301-5302`).
+/// constant" (`dsc/dsc2.cpp:5301-5302`) — deallocation ERASES the key (`:2518`), and `getAllocation`
+/// tests the two states separately, `!count(storage) || !at(storage)` (`:2618-2619`), returning
+/// `nullptr` for both under `allowMissingAlloc` and `DT_ERROR`ing otherwise.
 ///
 /// ⛔ ITS ONE METHOD STAYS OUT WITH THOSE TWO FIELDS: the copy assignment's four member assignments
 /// are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)` (`:54-60`), so two of the
@@ -4918,11 +5004,27 @@ pub struct ConstantInfo {
     /// The format the datum's values are encoded in — the field's own comment says so, "values
     /// encoded in the specified format" (`dsc/dsc2.h:47`, `:50`).
     ///
-    /// ⛔ [`DataFormats::Invalid`] IS THE INITIALISER AND IT HAS NO BIT WIDTH, which every reader
-    /// looks up with `dataFormatsToBitWidth.at()`: `replicationFactor_` divides by it
-    /// (`ddc/ddcv1.cpp:455-457`) and the op-const unpacker builds its mask from it
-    /// (`dsc/dsc2.cpp:5260-5265`). The DDL conversion rejects the format at parse instead, "Invalid
-    /// type name" (`ddc/ddl/ddl_conversion.cpp:652-656`).
+    /// ⛔ [`DataFormats::Invalid`] IS THE INITIALISER AND THREE READERS DIVIDE BY ITS WIDTH:
+    /// `replicationFactor_` (`ddc/ddcv1.cpp:455-457`), the external-constant path's `bitsPerElem`
+    /// (`ddc/ddl/ddl_conversion.cpp:697-698`), and `getBlockTransferSizePerDim`'s
+    /// `CONSTANT_TO_CONSTANT` dummy dim, `1024 / width`, in this very file
+    /// (`dsc/dsc2.cpp:3486-3492`); bridge 1 takes it whole as the destination precision
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2712`) and `SdscHasher` pushes
+    /// its raw ORDINAL into the SDSC's identity (`dsc/superdsc.cpp:1514`, compared and hashed at
+    /// `dsc/superdsc.h:172`, `:187`).
+    ///
+    /// ⛔ AND THE TABLE DOES NOT REFUSE THE INITIALISER: `INVALID`'S ENTRY IS `-1`
+    /// (`util/sendefs/sendefs.cpp:131`), so `1024 / -1` is -1024 loads and `bitsPerElem * numElems`
+    /// goes NEGATIVE, slipping under the very gate that bounds it, "NumElements larger than opconst
+    /// size" (`ddc/ddl/ddl_conversion.cpp:702-704`). The one guard that stops `INVALID` is the parse
+    /// check, "Invalid type name" (`:654-656`) — which is why [`DataFormats::bit_width`] answers
+    /// [`None`] rather than a width no reader can use.
+    ///
+    /// ⛔ THE OP-CONST UNPACKER IS NOT A READER OF THIS FIELD: its mask comes from the LABELED DS's
+    /// same-named field (`dsc/dsc2.cpp:5260-5265` reads `lds.dataFormat_`, and `lds` is
+    /// `dsc.labeledDs_.at(ldsIdx)` at `:4773`). That path WRITES this field from it (`:5282`) and
+    /// `DT_CHECK`s that the two agree when it reuses the entry (`:5231`), so they hold the same
+    /// value — but the lookup is on `LabeledDsInfo`, a type this port does not carry.
     ///
     /// ⛔ ONE WRITER REWRITES IT WHILE CONVERTING THE VALUE: a `SEN169_FP16` constant feeding an
     /// `IEEE_FP32` compute op is stored as `IEEE_FP32` with its datum put through `Fp16BinToFloat`
@@ -4932,7 +5034,10 @@ pub struct ConstantInfo {
     ///
     /// The constant's name (`dsc/dsc2.h:48`) — the DDL's own for a defined constant
     /// (`ddc/ddl/ddl_conversion.cpp:694-695`) or the external constant's (`:700`) — which is also
-    /// the name of the allocation that holds it (`ddc/ddcv1.cpp:25-26`).
+    /// the name of the allocation that holds it, in `Ddc::getLdsOrConstNameOfAllocNode`
+    /// (`ddc/ddcv1.cpp:25-26`) and again in the L3 scheduler's own copy of that function
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5500`), so stage 2a names allocations by this
+    /// field too.
     ///
     /// ⛔ IT IS AN IDENTITY AND A BEHAVIOUR SWITCH, NOT A LABEL. An external constant is matched
     /// against the container BY NAME and its other properties are then required to agree, else
@@ -4955,10 +5060,17 @@ pub struct ConstantInfo {
     /// it on each base-address byte from its metadata's `is_base_addr_symbolic`
     /// (`dbo/src/Transforms/sdsc_bundle/GatherIndexConversion.cpp:176-231`).
     ///
-    /// ⭐ BRIDGE 1 IS ITS READER: it becomes the `is_symbol` attribute on the emitted
+    /// ⭐ BRIDGE 1 IS ONE READER: it becomes the `is_symbol` attribute on the emitted
     /// `ConstantBitstreamOp`, on the single-fold path and on every per-fold one
-    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:515-516`, reached from
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:514-516`, reached from
     /// `SNTransferLowering.cpp:2492-2496`).
+    ///
+    /// ⛔ AND IT IS A REFUSAL PREDICATE, NOT ONLY AN ATTRIBUTE: the PCFG translator `DT_CHECK`s
+    /// `!constInfo.isDataSymbolic_` before cloning the datum, on the transfer-to-constant path and
+    /// again on the compute-transfer one (`dsc/dsc2Pcfg.cpp:1366`, `:1945`). Those are the only
+    /// other readers in the authority, and they are off our path by the campaign's own decision —
+    /// so `stzJumpAddr` is a constant bridge 1 emits and PCFG refuses, which is a property of this
+    /// flag and not of either consumer.
     ///
     /// ⛔ THE AUTHORITY'S COPY ASSIGNMENT DROPS IT: `operator=` assigns the other four members and
     /// never touches this one (`dsc/dsc2.h:54-60`), so an assignment leaves the destination's flag
