@@ -747,14 +747,15 @@ mod unit_tests {
         assert_eq!(PropStateType::default(), PropStateType::NotProcessed);
     }
 
-    /// The two shapes `ddc/ddl/ddl_conversion.cpp:1076-1164` mints, against the declared defaults
-    /// (`dsc/dsc2.h:573-578`, `:617-618`) and the dummy loop at
+    /// The three shapes `ddc/ddl/ddl_conversion.cpp:1076-1164` mints plus the head `ScheduleTree()`
+    /// leaves behind (`dsc/dsc2.h:629`), against the declared defaults (`dsc/dsc2.h:573-578`,
+    /// `:617-618`) and the dummy loop at
     /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:734`.
     #[test]
-    fn a_minted_loop_is_either_a_datastage_loop_or_a_parametric_one_and_never_both() {
+    fn the_minted_loop_shapes_are_four_independent_fields_and_none_excludes_another() {
         use crate::schedule::dims::MetaDimKind;
 
-        // `new dsc2::LoopNode()` (`ddl_conversion.cpp:1077`): every id and index absent, no dims.
+        // `new dsc2::LoopNode()` (`ddl_conversion.cpp:1076`): every id and index absent, no dims.
         let fresh = LoopNode::default();
         assert_eq!(
             (fresh.num_id, fresh.den_id, fresh.parametric_lds_idx()),
@@ -786,9 +787,25 @@ mod unit_tests {
         assert_eq!(parametric.dims.len(), 1);
         assert_eq!(parametric.parametric_lds_idx(), Some(LdsIdx(3)));
 
-        // The importer feeds the exported `-1` back through the same setter (`dsc/dsc2.cpp:1414`).
-        parametric.set_parametric_lds_idx(None);
-        assert_eq!(parametric.parametric_lds_idx(), None);
+        // ⛔ The head carries `denId_` ALONE. This is the shape behind every `>= 0` guard on a
+        // climbed parent (`ddc/ddcv1.cpp:634`, `:645`), and the shape that makes the unguarded
+        // `dataStageParam_.at(numId_)` reads (`dsc/dsc2.cpp:2995`) a throw rather than a branch.
+        let head = LoopNode {
+            den_id: Some(DataStageId(0)),
+            ..LoopNode::default()
+        };
+        assert_eq!((head.num_id, head.den_id), (None, Some(DataStageId(0))));
+        assert!(head.dims.is_empty());
+
+        // ⛔ NO SHAPE EXCLUDES ANOTHER. The four fields are independent, so the state a tagged enum
+        // would have to reject IS representable here — the importer builds exactly this one entry at
+        // a time (`dsc/dsc2.cpp:1405-1426`): marked parametric, both ids still set, no lds index.
+        let mut mixed = ds_loop.clone();
+        mixed.mark_as_parametric_loop();
+        assert!(mixed.is_parametric_loop());
+        assert_eq!(mixed.num_id, Some(DataStageId(0)));
+        assert_eq!(mixed.den_id, Some(DataStageId(2)));
+        assert_eq!(mixed.parametric_lds_idx(), None);
 
         // `SNTransferLowering.cpp:734`, `LoopNode(-1, -1, {dim})`: a bare dim means it unpadded.
         let dummy = LoopNode::new(None, None, vec![PrimaryDimTypes::In.into()], false);
@@ -803,10 +820,41 @@ mod unit_tests {
         assert_eq!(dummy.parametric_lds_idx(), None);
     }
 
-    /// `dsc/dsc2.h:575` and `:595-597` against `dsc/dsc2.cpp:4223-4228`, and against the two things
-    /// bridge 1 reads them for (`SNControlFlowLowering.cpp:898-923`).
+    /// `dsc/dsc2.h:592` against `dsc/dsc2.cpp:4223-4228`. The constructor keeps the order it is
+    /// handed — inner to outer (`dsc/dsc2.h:575`, `dsc/dsc2Pcfg.cpp:517`), which is why bridge 1
+    /// opens index `size() - 1` first and reads that one back as the outermost
+    /// (`SNControlFlowLowering.cpp:893`, `:898`) — and `hasLoopDim` matches the dim ALONE.
     #[test]
-    fn dims_run_inner_to_outer_and_a_dim_with_an_empty_symbol_list_still_reads_symbolic() {
+    fn the_ctor_keeps_the_dim_order_it_is_given_and_has_loop_dim_matches_the_dim_alone() {
+        use crate::schedule::dims::MetaDimKind;
+
+        // `dsc2.h:592` inserts at `begin()` of an empty vector, so the order survives unchanged.
+        let dims = vec![
+            PrimaryDimAndKind::new(PrimaryDimTypes::Ij, MetaDimKind::Unpadded),
+            PrimaryDimAndKind::new(PrimaryDimTypes::Mb, MetaDimKind::WindowDim),
+            PrimaryDimAndKind::new(PrimaryDimTypes::In, MetaDimKind::PadBack),
+        ];
+        let loop_node = LoopNode::new(
+            Some(DataStageId(0)),
+            Some(DataStageId(1)),
+            dims.clone(),
+            false,
+        );
+        assert_eq!(loop_node.dims, dims);
+
+        // ⛔ THE KIND IS IGNORED. `Mb` and `In` are carried under kinds that are NOT the default one
+        // `From<PrimaryDimTypes>` supplies, so an implementation comparing whole
+        // `PrimaryDimAndKind`s answers no here where the authority's dim-only compare answers yes.
+        assert!(loop_node.has_loop_dim(PrimaryDimTypes::Ij));
+        assert!(loop_node.has_loop_dim(PrimaryDimTypes::Mb));
+        assert!(loop_node.has_loop_dim(PrimaryDimTypes::In));
+        assert!(!loop_node.has_loop_dim(PrimaryDimTypes::Ki));
+    }
+
+    /// `dsc/dsc2.h:595-597` against the one site that fills the map (`dsc/dsc2.cpp:2992-3010`) and
+    /// the one that reads a bound out of it (`SNControlFlowLowering.cpp:921-923`).
+    #[test]
+    fn a_symbolic_dim_is_the_map_alone_and_an_empty_symbol_list_still_reads_symbolic() {
         let mut loop_node = LoopNode::new(
             Some(DataStageId(0)),
             Some(DataStageId(1)),
@@ -814,27 +862,21 @@ mod unit_tests {
             false,
         );
 
-        // Inner to outer, so the LAST entry is the loop bridge 1 emits OUTERMOST.
-        assert_eq!(
-            loop_node.dims.first().map(|d| d.dim),
-            Some(PrimaryDimTypes::Ij)
-        );
-        assert_eq!(
-            loop_node.dims.last().map(|d| d.dim),
-            Some(PrimaryDimTypes::Mb)
-        );
-
-        // `hasLoopDim` ignores the kind and answers for the dim alone.
-        assert!(loop_node.has_loop_dim(PrimaryDimTypes::Mb));
-        assert!(!loop_node.has_loop_dim(PrimaryDimTypes::Ki));
-
-        // Nothing is symbolic until `finalizeScheduleTree` fills the map (`dsc/dsc2.cpp:2992-3010`).
+        // Nothing is symbolic until `finalizeScheduleTree` fills the map.
         assert!(!loop_node.is_dim_symbolic(PrimaryDimTypes::Ij));
         loop_node
             .loop_count_symbol_ids
             .insert(PrimaryDimTypes::Ij, vec![VariableSymbol(7)]);
         assert!(loop_node.is_dim_symbolic(PrimaryDimTypes::Ij));
         assert!(!loop_node.is_dim_symbolic(PrimaryDimTypes::Mb));
+
+        // ⛔ IT IS `count(dim)` ON THE MAP AND NOTHING ELSE, so it is independent of `hasLoopDim`: a
+        // dim this loop does not even iterate reads symbolic once it has an entry.
+        assert!(!loop_node.has_loop_dim(PrimaryDimTypes::Ki));
+        loop_node
+            .loop_count_symbol_ids
+            .insert(PrimaryDimTypes::Ki, vec![VariableSymbol(9)]);
+        assert!(loop_node.is_dim_symbolic(PrimaryDimTypes::Ki));
 
         // ⛔ The `operator[]` write at `:3001` leaves an EMPTY vector for a dim with no mapping, and
         // `isDimSymbolic` still answers yes — bridge 1's `DT_CHECK(size() == 1)` is what then fails.
@@ -843,6 +885,72 @@ mod unit_tests {
             .insert(PrimaryDimTypes::Mb, Vec::new());
         assert!(loop_node.is_dim_symbolic(PrimaryDimTypes::Mb));
         assert!(loop_node.loop_count_symbol_ids[&PrimaryDimTypes::Mb].is_empty());
+    }
+
+    /// `util/utils.h:105-107`: `clone()` is the copy constructor, so all six declared fields come
+    /// across and the two containers are copies, not shares. Each field is moved on the copy ALONE
+    /// and one at a time — a `Clone` that dropped or shared any single one of them fails here, which
+    /// a whole-object compare would not show.
+    #[test]
+    fn cloning_a_loop_carries_all_six_declared_fields_and_shares_none() {
+        use crate::schedule::dims::MetaDimKind;
+
+        let mut original = LoopNode::new(
+            Some(DataStageId(4)),
+            Some(DataStageId(5)),
+            vec![PrimaryDimAndKind::new(
+                PrimaryDimTypes::Ij,
+                MetaDimKind::PadValid,
+            )],
+            true,
+        );
+        original.set_parametric_lds_idx(Some(LdsIdx(6)));
+        original
+            .loop_count_symbol_ids
+            .insert(PrimaryDimTypes::Ij, vec![VariableSymbol(11)]);
+
+        let copy = original.clone();
+        assert_eq!(copy.num_id, Some(DataStageId(4)));
+        assert_eq!(copy.den_id, Some(DataStageId(5)));
+        assert_eq!(copy.dims, original.dims);
+        assert_eq!(copy.loop_count_symbol_ids, original.loop_count_symbol_ids);
+        assert!(copy.is_parametric_loop());
+        assert_eq!(copy.parametric_lds_idx(), Some(LdsIdx(6)));
+
+        let mut moved = copy.clone();
+        moved.num_id = Some(DataStageId(40));
+        assert_eq!(moved.num_id, Some(DataStageId(40)));
+        assert_eq!(original.num_id, Some(DataStageId(4)));
+
+        let mut moved = copy.clone();
+        moved.den_id = None;
+        assert_eq!(moved.den_id, None);
+        assert_eq!(original.den_id, Some(DataStageId(5)));
+
+        let mut moved = copy.clone();
+        moved.dims.push(PrimaryDimTypes::Mb.into());
+        assert_eq!(moved.dims.len(), 2);
+        assert_eq!(original.dims.len(), 1);
+
+        let mut moved = copy.clone();
+        moved
+            .loop_count_symbol_ids
+            .insert(PrimaryDimTypes::Mb, vec![VariableSymbol(12)]);
+        assert_eq!(moved.loop_count_symbol_ids.len(), 2);
+        assert_eq!(original.loop_count_symbol_ids.len(), 1);
+
+        let mut moved = copy.clone();
+        moved.set_parametric_lds_idx(None);
+        assert_eq!(moved.parametric_lds_idx(), None);
+        assert_eq!(original.parametric_lds_idx(), Some(LdsIdx(6)));
+
+        // `isParametricLoop_` is one-way (`dsc/dsc2.h:600`), so the only move available is marking a
+        // loop the copy was taken from before.
+        let mut unmarked = LoopNode::default();
+        let unmarked_copy = unmarked.clone();
+        unmarked.mark_as_parametric_loop();
+        assert!(unmarked.is_parametric_loop());
+        assert!(!unmarked_copy.is_parametric_loop());
     }
 
     /// The eleven operators in the authority's declaration order (`dsc/dscdefn.h:95-107`) paired
@@ -1772,28 +1880,40 @@ pub enum PropStateType {
 ///  * the tree's head has `denId_` alone — `ScheduleTree()` writes the core stage into it and
 ///    leaves `numId_` absent (`dsc/dsc2.h:629`).
 ///
-/// ⛔ NO `PartialEq`: IBM declares none, and the node identity every consumer uses is the POINTER —
-/// `loop_labels_`, `dsc_loops_to_mlir_loops_map_` and `LoopDistributionParamPerLoopType` are all
-/// keyed by `const LoopNode*` (`dsc/dsc2.h:1118`).
+/// ⛔ NO `PartialEq`: IBM declares none, and the node identity every consumer uses is the POINTER.
+/// `dsc_loops_to_mlir_loops_map_` (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.hpp:168-169`)
+/// and `LoopDistributionParamPerNodeType` (`dsc/dsc2.h:1118-1119`) are keyed by `const LoopNode*`,
+/// and `loop_labels_` holds one as its VALUE under the DDL's label string
+/// (`ddc/ddl/ddl_conversion.h:409-410`). ⛔ TRAP: `LoopDistributionParamPerLoopType`, declared three
+/// lines above the per-node one, is NOT a loop key at all — it is keyed by `const PrimaryDimTypes`
+/// (`dsc/dsc2.h:1115-1116`).
 #[derive(Clone, Debug, Default)]
 pub struct LoopNode {
     /// Field: e017_LoopNode.numId_
     ///
-    /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, NOT A STAGE, and readers test for
-    /// it: `exploreAssignDataStages` guards every use with `parent->denId_ >= 0`
-    /// (`ddc/ddcv1.cpp:634`, `:645`) and `parametricIterCount` errors out on a parent whose id is
-    /// negative (`dsc/dsc2.cpp:4144-4147`).
+    /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, NOT A STAGE, AND NO READER TESTS
+    /// FOR IT: every one indexes straight through, `dataStageParam_.at(numId_)`
+    /// (`dsc/dsc2.cpp:2995`, `:6104`, `ddc/ddcv1.cpp:2496`, `:2835`, `ddc/ddc_fold.cpp:2349`,
+    /// `:3235`, `:3604`) or `constraints_[loop->numId_]` (`ddc/ddcv1.cpp:610`, `:649`), so an absent
+    /// numerator is an out-of-range throw and never a branch. The `>= 0` guards belong to
+    /// [`den_id`](Self::den_id) alone.
     pub num_id: Option<DataStageId>,
     /// Field: e017_LoopNode.denId_
     ///
-    /// The denominator stage (`dsc/dsc2.h:574`), absent on the same terms as [`num_id`](Self::num_id).
+    /// The denominator stage (`dsc/dsc2.h:574`). ⛔ NOT SYMMETRIC WITH [`num_id`](Self::num_id):
+    /// this is the id with absence guards, and all three sit where the reader has climbed
+    /// `getOwnerLoop()` to a PARENT loop and can therefore reach the head — `exploreAssignDataStages`
+    /// at `ddc/ddcv1.cpp:634` and `:645`, and `parametricIterCount` at `dsc/dsc2.cpp:4144-4147`. Its
+    /// other uses in that same function are unguarded (`ddc/ddcv1.cpp:607`, `:694`, `:701`,
+    /// `:727-729`), so the guard marks the climb, not the field.
     pub den_id: Option<DataStageId>,
     /// Field: e017_LoopNode.dims_
     ///
-    /// ⛔ ORDERED INNER TO OUTER (`dsc/dsc2.h:575`), and bridge 1 depends on that: it walks
-    /// `dim_idx` from `dims_.size() - 1` down to 0 and opens each MLIR loop inside the one before,
-    /// so the LAST entry becomes the OUTERMOST loop of the emitted nest
-    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:898-957`).
+    /// ⛔ ORDERED INNER TO OUTER (`dsc/dsc2.h:575`, and `dsc/dsc2Pcfg.cpp:517` says `// Inner to
+    /// outer` verbatim over a front-to-back walk), and bridge 1 depends on that: it walks `dim_idx`
+    /// from `dims_.size() - 1` down to 0, and the loop it opens FIRST is the one it later retrieves
+    /// as `.at(0)` = outermost, so the LAST entry becomes the OUTERMOST loop of the emitted nest
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:893`, `:898-957`).
     pub dims: Vec<PrimaryDimAndKind>,
     /// Field: e017_LoopNode.loopCountSymbolIds_
     ///
@@ -1810,10 +1930,12 @@ pub struct LoopNode {
     pub loop_count_symbol_ids: BTreeMap<PrimaryDimTypes, Vec<VariableSymbol>>,
     /// Field: e017_LoopNode.isParametricLoop_
     ///
-    /// Private in IBM's declaration (`dsc/dsc2.h:617`); every friend reaches it through
-    /// [`is_parametric_loop`](Self::is_parametric_loop) or
-    /// [`mark_as_parametric_loop`](Self::mark_as_parametric_loop), the JSON exporter included
-    /// (`dsc/dsc2.cpp:413-414`).
+    /// Private in IBM's declaration (`dsc/dsc2.h:617`) and ONE-WAY: `markAsParametricLoop` is the
+    /// only writer tree-wide (`ddc/ddl/ddl_conversion.cpp:1128`, `dsc/dsc2.cpp:1412`) and nothing
+    /// clears it. Readers go through `isParametricLoop()` (`ddc/ddcv1.cpp:2830`,
+    /// `dsc/dsc2.cpp:2994`, `:4129`) except the JSON exporter, which reaches the field itself
+    /// through friendship (`dsc/dsc2.cpp:414`, `:416`) — a read, so the getter below still covers it
+    /// and this stays private.
     is_parametric_loop: bool,
     /// Field: e017_LoopNode.parametricLdsIdx_
     ///
@@ -1848,7 +1970,8 @@ impl LoopNode {
     }
 
     /// `dsc/dsc2.h:595-597`. Whether this loop's count for `dim` comes from a symbol rather than
-    /// from the two stages' dims.
+    /// from the two stages' dims. ⛔ It is `count(dim)` on the map and nothing else: the dim need
+    /// not be one of [`dims`](Self::dims) for this to answer yes.
     pub fn is_dim_symbolic(&self, dim: PrimaryDimTypes) -> bool {
         self.loop_count_symbol_ids.contains_key(&dim)
     }
@@ -1869,14 +1992,15 @@ impl LoopNode {
     }
 
     /// `dsc/dsc2.h:604`. It takes the absent case because the JSON importer feeds back the `-1`
-    /// that every non-parametric loop exports (`dsc/dsc2.cpp:421-422`, `:1414-1415`).
+    /// that every non-parametric loop exports (`dsc/dsc2.cpp:420-421`, `:1414-1415`).
     pub fn set_parametric_lds_idx(&mut self, idx: Option<LdsIdx>) {
         self.parametric_lds_idx = idx;
     }
 
-    /// `dsc/dsc2.cpp:4223-4228`. Whether `dim` is one of this loop's, the kind ignored. Its one
-    /// caller is `ScheduleNode::getParentDimLoop`, which climbs owner loops until one answers yes
-    /// (`dsc/dsc2.cpp:1905-1913`).
+    /// `dsc/dsc2.cpp:4223-4228`. Whether `dim` is one of this loop's, THE KIND IGNORED — the
+    /// authority destructures `dims_` and compares `loopDim` alone. Its one caller is
+    /// `ScheduleNode::getParentDimLoop`, which climbs owner loops until one answers yes
+    /// (`dsc/dsc2.cpp:1906-1914`).
     pub fn has_loop_dim(&self, dim: PrimaryDimTypes) -> bool {
         self.dims.iter().any(|d| d.dim == dim)
     }
