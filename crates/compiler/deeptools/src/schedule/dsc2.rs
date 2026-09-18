@@ -1887,8 +1887,9 @@ mod unit_tests {
         assert_eq!(node.const_idx, None);
         assert_eq!(node.component, SenComponent::NoComponent);
         assert_eq!(node.padding, PaddingFormType::default());
+        // One empty `Vec` is both `layoutDimOrder_` and `maxDimSizes_` empty — the `resize` every
+        // producer performs (`ddc/ddl/ddl_conversion.cpp:803`) has nothing left to do.
         assert!(node.layout_dim_order.is_empty());
-        assert!(node.max_dim_sizes.is_empty());
         assert_eq!(node.num_buffers, NumBuffers(1));
         assert_ne!(node.num_buffers, NumBuffers::STREAMING);
         assert!(!node.is_start_addr_symbolic);
@@ -1953,28 +1954,31 @@ mod unit_tests {
         assert_eq!(out_gaps.values().next(), Some(&DimSize(4)));
     }
 
-    /// `ForceInnermostDimensionsOp` inserting at `begin()` on both vectors
-    /// (`ddc/ddl/ddl_conversion.cpp:1900-1901`, `:1904-1905`), over an allocation the DDL conversion
-    /// sized with `-1`s (`:803`). The pass refuses to run twice by testing `any_of(maxDimSizes_,
+    /// `ForceInnermostDimensionsOp` inserting at `begin()` (`ddc/ddl/ddl_conversion.cpp:1900-1905`),
+    /// over an allocation the DDL conversion sized with `-1`s (`:803`). ⭐ THE AUTHORITY INSERTS INTO
+    /// TWO VECTORS AND THIS IS ONE INSERT, which is the whole point of the merge: it cannot insert
+    /// the dim and forget the size. The pass refuses to run twice by testing `any_of(maxDimSizes_,
     /// >= 0)` (`:1879-1885`), which is [`Option::is_some`] here — and the entry that separates that
     /// predicate from `buildUnitView`'s cap is pinned below, in
     /// `a_zero_max_dim_size_is_filled_to_every_writer_and_absent_to_the_only_cap`.
     #[test]
-    fn forcing_inner_dims_prepends_to_both_vectors_and_is_refused_twice() {
+    fn forcing_an_inner_dim_prepends_one_pair_and_is_refused_twice() {
         let mut node = AllocateNode {
-            layout_dim_order: vec![PrimaryDimTypes::Y, PrimaryDimTypes::Out],
+            layout_dim_order: vec![(PrimaryDimTypes::Y, None), (PrimaryDimTypes::Out, None)],
             ..AllocateNode::default()
         };
-        node.max_dim_sizes.resize(node.layout_dim_order.len(), None);
-        assert!(!node.max_dim_sizes.iter().any(Option::is_some));
+        assert!(!node.layout_dim_order.iter().any(|(_, max)| max.is_some()));
 
         // `:1900-1905`: the forced dim becomes the innermost, and it carries a data stage index —
         // not an extent — until `finalizeAllocateLayouts` overwrites it (`ddc/ddcv1.cpp:1710-1732`).
-        node.layout_dim_order.insert(0, PrimaryDimTypes::In);
-        node.max_dim_sizes.insert(0, Some(MaxDimSize(2)));
-        assert_eq!(node.layout_dim_order[0], PrimaryDimTypes::In);
-        assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
-        assert!(node.max_dim_sizes.iter().any(Option::is_some));
+        node.layout_dim_order
+            .insert(0, (PrimaryDimTypes::In, Some(MaxDimSize(2))));
+        assert_eq!(
+            node.layout_dim_order[0],
+            (PrimaryDimTypes::In, Some(MaxDimSize(2)))
+        );
+        assert_eq!(node.layout_dim_order.len(), 3);
+        assert!(node.layout_dim_order.iter().any(|(_, max)| max.is_some()));
     }
 
     /// ⛔ THE THREE READERS OF ONE `maxDimSizes_` ENTRY DRAW THREE DIFFERENT BOUNDARIES, and a ZERO
@@ -1990,55 +1994,132 @@ mod unit_tests {
     fn a_zero_max_dim_size_is_filled_to_every_writer_and_absent_to_the_only_cap() {
         let node = AllocateNode {
             layout_dim_order: vec![
-                PrimaryDimTypes::Y,
-                PrimaryDimTypes::Out,
-                PrimaryDimTypes::In,
+                (PrimaryDimTypes::Y, None),
+                (PrimaryDimTypes::Out, Some(MaxDimSize(0))),
+                (PrimaryDimTypes::In, Some(MaxDimSize(4))),
             ],
-            max_dim_sizes: vec![None, Some(MaxDimSize(0)), Some(MaxDimSize(4))],
+            indirect_alloc_type: IndirectAllocType::ValueTensor,
             ..AllocateNode::default()
         };
-        assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
 
         // `getPageSize`'s `maxSize < 0`: only the absent entry leaves its dim unbounded.
         let unbounded = node
             .layout_dim_order
             .iter()
-            .zip(&node.max_dim_sizes)
-            .filter(|(_, max)| max.is_none())
-            .map(|(dim, _)| *dim)
+            .filter_map(|&(dim, max)| max.is_none().then_some(dim))
             .collect::<Vec<_>>();
         assert_eq!(unbounded, [PrimaryDimTypes::Y]);
 
         // The writers' `>= 0`: the zero counts as ALREADY WRITTEN, so the DDL pass refuses to run a
         // second time over it and `finalizeAllocateLayouts` overwrites it in place.
         let filled = node
-            .max_dim_sizes
+            .layout_dim_order
             .iter()
-            .filter(|max| max.is_some())
+            .filter(|(_, max)| max.is_some())
             .count();
-        assert!(node.max_dim_sizes.iter().any(Option::is_some));
+        assert!(node.layout_dim_order.iter().any(|(_, max)| max.is_some()));
         assert_eq!(filled, 2);
 
         // `buildUnitView`'s `> 0`: the zero is NOT a cap, and it is `is_some` all the same.
         let caps = node
-            .max_dim_sizes
-            .iter()
-            .filter(|max| max.is_some_and(|MaxDimSize(size)| size > 0))
-            .copied()
-            .collect::<Vec<_>>();
-        assert_eq!(caps, [Some(MaxDimSize(4))]);
-        assert_eq!(caps.len(), 1);
-
-        // And the entry that cap ignored is a bound of ZERO downstream, not an absence: one dim's
-        // page size is the product of its own entries (`dsc/dsc2.cpp:4507-4508`).
-        let page_size_of_out = node
             .layout_dim_order
             .iter()
-            .zip(&node.max_dim_sizes)
-            .filter(|(dim, max)| **dim == PrimaryDimTypes::Out && max.is_some())
-            .map(|(_, max)| max.unwrap().0)
-            .product::<i32>();
-        assert_eq!(page_size_of_out, 0);
+            .filter_map(|&(dim, max)| max.is_some_and(|MaxDimSize(size)| size > 0).then_some(dim))
+            .collect::<Vec<_>>();
+        assert_eq!(caps, [PrimaryDimTypes::In]);
+
+        // And the entry that cap ignored is a bound of ZERO downstream, not an absence: one dim's
+        // page size is the product of its own entries (`dsc/dsc2.cpp:4507-4508`), read out of
+        // [`AllocateNode::page_size`] itself rather than recomputed here.
+        let page_size = node.page_size(&node);
+        assert_eq!(page_size[&PrimaryDimTypes::Out], PageSize(0));
+        assert_eq!(page_size[&PrimaryDimTypes::In], PageSize(4));
+        assert_eq!(page_size.get(&PrimaryDimTypes::Y), None);
+    }
+
+    /// `getPageSize`'s two arms that read this node (`dsc/dsc2.cpp:4483-4488`): a direct allocation
+    /// has no page at all, and a value tensor's page is the product of its own layout's entries per
+    /// dim (`:4507-4508`). ⭐ NEITHER ARM READS `relatedIndirectAccessAlloc_`, so passing the node as
+    /// its own link is not a fixture cheat here — the arm that reads it is pinned next.
+    #[test]
+    fn a_direct_allocation_has_no_page_and_a_value_tensors_page_is_its_own_layout() {
+        let direct = AllocateNode {
+            layout_dim_order: vec![
+                (PrimaryDimTypes::In, Some(MaxDimSize(4))),
+                (PrimaryDimTypes::Out, Some(MaxDimSize(3))),
+                (PrimaryDimTypes::In, Some(MaxDimSize(5))),
+            ],
+            ..AllocateNode::default()
+        };
+        assert_eq!(direct.indirect_alloc_type, IndirectAllocType::NoIndirection);
+        assert!(direct.page_size(&direct).is_empty());
+
+        let value = AllocateNode {
+            indirect_alloc_type: IndirectAllocType::ValueTensor,
+            ..direct.clone()
+        };
+        // A repeated dim multiplies, so `In` is 4 * 5 and neither entry alone (`:4507-4508`).
+        assert_eq!(
+            value.page_size(&value),
+            BTreeMap::from([
+                (PrimaryDimTypes::In, PageSize(20)),
+                (PrimaryDimTypes::Out, PageSize(3)),
+            ])
+        );
+    }
+
+    /// ⛔ THE ANSWER FOR AN INDEX TENSOR IS THE VALUE TENSOR'S LAYOUT, read through
+    /// `relatedIndirectAccessAlloc_` after `DT_CHECK`ing it non-null (`dsc/dsc2.cpp:4489-4492`) —
+    /// which is why that link is [`AllocateNode::page_size`]'s parameter. Both layouts are filled and
+    /// they disagree, so an answer taken from the index allocation's own layout would be a plausible
+    /// wrong number rather than an empty map; it is pinned here as the number NOT to answer.
+    #[test]
+    fn an_index_tensors_page_size_is_the_value_tensors_and_never_its_own() {
+        let value = AllocateNode {
+            indirect_alloc_type: IndirectAllocType::ValueTensor,
+            layout_dim_order: vec![(PrimaryDimTypes::In, Some(MaxDimSize(64)))],
+            ..AllocateNode::default()
+        };
+        let index = AllocateNode {
+            indirect_alloc_type: IndirectAllocType::IndexTensor,
+            index_tensor_type: IndexTensorType::Address,
+            layout_dim_order: vec![(PrimaryDimTypes::Out, Some(MaxDimSize(2)))],
+            ..AllocateNode::default()
+        };
+        assert_eq!(
+            index.page_size(&value),
+            BTreeMap::from([(PrimaryDimTypes::In, PageSize(64))])
+        );
+        // The wrong answer, spelled out: `self`'s own layout is a different dim and a different size.
+        assert_eq!(
+            index.page_size(&index),
+            BTreeMap::from([(PrimaryDimTypes::Out, PageSize(2))])
+        );
+    }
+
+    /// ⛔ ONE ABSENT ENTRY UNBOUNDS ITS DIM IN BOTH DIRECTIONS: `pageSize.erase(dim)` throws away
+    /// what earlier positions of that dim accumulated ("safe even if key not present",
+    /// `dsc/dsc2.cpp:4503`) and `unboundedDims` blocks every later one (`:4505`). Both directions are
+    /// pinned because only the second is a plain skip, and a dim may repeat.
+    #[test]
+    fn one_absent_entry_unbounds_its_dim_before_and_after_itself() {
+        let node = AllocateNode {
+            indirect_alloc_type: IndirectAllocType::ValueTensor,
+            layout_dim_order: vec![
+                // Accumulated, then erased by the absent entry that follows it (`:4503`).
+                (PrimaryDimTypes::In, Some(MaxDimSize(4))),
+                (PrimaryDimTypes::In, None),
+                // Blocked by `unboundedDims` rather than multiplied in (`:4505`).
+                (PrimaryDimTypes::In, Some(MaxDimSize(7))),
+                // A different dim is untouched by either.
+                (PrimaryDimTypes::Out, Some(MaxDimSize(9))),
+            ],
+            ..AllocateNode::default()
+        };
+        assert_eq!(
+            node.page_size(&node),
+            BTreeMap::from([(PrimaryDimTypes::Out, PageSize(9))])
+        );
     }
 
     /// `allocAllMem`'s buffer arithmetic end to end (`ddc/ddcv1.cpp:224-226`, `:244`, `:317-328`,
@@ -5911,6 +5992,8 @@ impl IndirectAllocType {
     /// Every role in the authority's declaration order (`dsc/dsc2.h:990-994`).
     pub const ALL: [Self; 3] = [Self::NoIndirection, Self::ValueTensor, Self::IndexTensor];
 
+    /// Field: e037_AllocateNode.indirectAllocTypeToString
+    ///
     /// The spelling `indirectAllocTypeToString` gives this role (`dsc/dsc2.h:1049-1050`, filled
     /// `dsc/dsc2.cpp:2423-2427`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
     pub fn name(self) -> &'static str {
@@ -5921,6 +6004,8 @@ impl IndirectAllocType {
         }
     }
 
+    /// Field: e037_AllocateNode.stringToIndirectAllocType
+    ///
     /// `stringToIndirectAllocType`, the `flipMap` of the above (`dsc/dsc2.h:1051-1052`, built
     /// `dsc/dsc2.cpp:2428-2430`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
     /// (`dsc/dsc2.cpp:1793-1794`), so [`None`] here is that throw's input, never a live answer.
@@ -5961,6 +6046,8 @@ impl IndexTensorType {
     /// Both forms in the authority's declaration order (`dsc/dsc2.h:995-998`).
     pub const ALL: [Self; 2] = [Self::Address, Self::Index];
 
+    /// Field: e037_AllocateNode.indexTensorTypeToString
+    ///
     /// The spelling `indexTensorTypeToString` gives this form (`dsc/dsc2.h:1053-1054`, filled
     /// `dsc/dsc2.cpp:2432-2435`).
     pub fn name(self) -> &'static str {
@@ -5970,6 +6057,8 @@ impl IndexTensorType {
         }
     }
 
+    /// Field: e037_AllocateNode.stringToIndexTensorType
+    ///
     /// `stringToIndexTensorType`, the `flipMap` of the above (`dsc/dsc2.h:1055-1056`, built
     /// `dsc/dsc2.cpp:2436-2438`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
     /// (`dsc/dsc2.cpp:1796-1797`).
@@ -6019,8 +6108,9 @@ impl NumBuffers {
     pub const STREAMING: Self = Self(-1);
 }
 
-/// One entry of `AllocateNode::maxDimSizes_` (`dsc/dsc2.h:983`), positionally paired with
-/// [`layout_dim_order`](AllocateNode::layout_dim_order).
+/// The size limit on one dim of an allocation's layout — one entry of
+/// `AllocateNode::maxDimSizes_` (`dsc/dsc2.h:983`), carried inside
+/// [`layout_dim_order`](AllocateNode::layout_dim_order) beside the dim it limits.
 ///
 /// ⛔⛔ IT HOLDS TWO DIFFERENT CURRENCIES AND THE PASS ORDER IS WHAT SAYS WHICH, which is why it is
 /// neither a [`DataStageId`] nor a [`DimSize`]. The DDL conversion stores a DATA-STAGE INDEX here —
@@ -6033,6 +6123,11 @@ impl NumBuffers {
 /// ⛔ AND THE JSON IMPORTER CANNOT TELL THEM APART: it pushes the bare integer
 /// (`dsc/dsc2.cpp:1761-1764`), so a dump taken before that pass reimports stage indices into the
 /// same slots an extent would occupy.
+///
+/// ⭐ NEITHER CURRENCY IS EVER NEGATIVE, so this is `u32` and the authority's negative is the [`None`]
+/// beside the dim: a data-stage index is an index, and `finalizeAllocateLayouts` writes an extent
+/// divided by a stick size (`ddc/ddcv1.cpp:1723-1729`). ⛔ THAT MAKES `Some` OF A NEGATIVE
+/// UNSPELLABLE, which is the whole boundary three readers disagree about below.
 ///
 /// ⛔⛔ AND ITS READERS DO NOT AGREE ON WHERE ABSENCE STOPS. [`None`] here is the authority's
 /// NEGATIVE entry, which is the boundary `getPageSize` draws (`maxSize < 0` is the unbounded dim,
@@ -6053,15 +6148,34 @@ impl NumBuffers {
 /// different predicates over the same [`Option`], and [`Option::is_some`] is the writers' test, NEVER
 /// `buildUnitView`'s cap test.
 ///
-/// ⭐ NEITHER OTHER CURRENCY CAN REACH THE VECTOR:
+/// ⭐ NEITHER OTHER CURRENCY CAN REACH THE LAYOUT:
 ///
 /// ```compile_fail
+/// use deeptools::schedule::dims::PrimaryDimTypes;
 /// use deeptools::schedule::dsc2::{AllocateNode, DimSize};
 /// let mut node = AllocateNode::default();
-/// node.max_dim_sizes.push(Some(DimSize(8)));
+/// node.layout_dim_order.push((PrimaryDimTypes::In, Some(DimSize(8))));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MaxDimSize(pub i32);
+pub struct MaxDimSize(pub u32);
+
+/// How many of one dim's elements one page of an indirect access holds — one value of
+/// `getPageSize`'s answer (`dsc/dsc2.cpp:4480`, the local `pageSize`), built as the product of that
+/// dim's [`MaxDimSize`] entries (`:4507-4508`) and therefore in whichever currency those entries
+/// were in.
+///
+/// ⛔ NOT A [`DimSize`] EVEN THOUGH ITS READERS COMPARE IT WITH ONE: they compare it with a dim size
+/// only after dividing or clamping — `std::ceil(float(dimSize) / pageSize.at(dim))` under
+/// `INDEX_TENSOR` and `DT_CHECK_MSG(dimSize <= pageSize.at(dim), "A transfer cannot move more than
+/// one page at time")` under `VALUE_TENSOR` (`dsc/dsc2.cpp:3568-3574`, `:3893-3919`), so a value of
+/// this type is a page GRANULARITY and the transfer size it bounds is the [`DimSize`].
+///
+/// ⛔ ZERO IS A LEGAL VALUE OF IT, and it is the numerator's undoing: a single zero entry of the dim
+/// makes the product zero (`:4508`) and that division is in `float`, so the dim size becomes INF
+/// before `std::ceil` truncates it back into an `int`. The authority guards neither, and neither can
+/// this type — see [`MaxDimSize`] for why the zero cannot be excluded upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PageSize(pub u32);
 
 /// The distance in bytes between one buffer of an allocation and the next — one value of
 /// `AllocateNode::bufferOffsetCoreCorelet_` (`dsc/dsc2.h:988`).
@@ -6107,34 +6221,37 @@ pub struct StickSpread(pub i32);
 /// the L3 scheduler reads its addresses back
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4926-4950`).
 ///
-/// ⛔ THIS CARRIES 15 OF ALLOCATENODE'S 21 FIELDS, so the `e028_AllocateNode` anchor below stays
-/// open. Three are schedule-node pointer identity, e013's `name_` and the tree it hangs on:
-/// `tempStorageForCompute_` (`:978`), the `ComputeNode` whose temporary this region is;
-/// `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of an indirect access; and
-/// `allocUsers_` (`:1007`), the reference-counted list of nodes that read or write the region. All
-/// three serialize by node name and re-resolve through `nodeNamePtrMap` (`dsc/dsc2.cpp:840-843`,
-/// `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`). The other three need types
-/// this campaign has not scoped: `startAddressCoreCorelet_` (`:985-986`) is a
-/// `FoldManager<int64_t>`, and `allocateCoordinates_` and `sliceViewCoordinates_` (`:1008-1009`) are
-/// `CoordinateType`, e012, which is built on the same `util/foldManager/` — and the authority's own
-/// JSON round trip leaves the slice view a "TO DO" on both sides (`dsc/dsc2.cpp:1828`).
+/// ⛔ THIS CARRIES 15 OF ALLOCATENODE'S 21 FIELDS, so the `e028_AllocateNode` and
+/// `e037_AllocateNode` anchors below stay open. Three are schedule-node pointer identity, e013's
+/// `name_` and the tree it hangs on: `tempStorageForCompute_` (`:978`), the `ComputeNode` whose
+/// temporary this region is; `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of an
+/// indirect access; and `allocUsers_` (`:1007`), the reference-counted list of nodes that read or
+/// write the region. All three serialize by node name and re-resolve through `nodeNamePtrMap`
+/// (`dsc/dsc2.cpp:840-843`, `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`). The
+/// other three need types this campaign has not scoped: `startAddressCoreCorelet_` (`:985-986`) is
+/// a `FoldManager<int64_t>`, and `allocateCoordinates_` and `sliceViewCoordinates_` (`:1008-1009`)
+/// are `CoordinateType`, e012, which is built on the same `util/foldManager/` — and the authority's
+/// own JSON round trip leaves the slice view a "TO DO" on both sides (`dsc/dsc2.cpp:1828`).
 ///
-/// ⛔ AND ITS SEVEN METHODS STAY OUT WITH THOSE FIELDS — but only ONE OF `getPageSize`'S THREE ARMS
-/// IS WHAT HOLDS IT OUT (`:1011`, defined `dsc/dsc2.cpp:4480-4513`). `NO_INDIRECTION` answers the
-/// empty map (`:4483-4485`) and `VALUE_TENSOR` reads `this` (`:4486-4488`), so both are total in the
-/// fields carried here; it is `INDEX_TENSOR` that takes the page extents out of
-/// `relatedIndirectAccessAlloc_`'s layout, through the pointer it `DT_CHECK`s non-null
-/// (`:4489-4492`), and an answer computed from this node's own layout instead would be silently
-/// wrong for exactly the index allocations the paged path mints.
+/// ⛔ NAME IDENTITY WOULD NOT SUBSTITUTE FOR THE POINTER IN `allocUsers_`, and one pass proves it:
+/// `cloneComputeForOffsetAdjustment` pushes a `clone()`d compute straight onto the list
+/// (`ddc/ddc_transformation.cpp:1373`, bypassing `addAllocUser`) while the original is still on it,
+/// and the clone carries the original's `name_` because `finalizeScheduleTree` uniquifies names only
+/// later (`dsc/dsc2.cpp:2988-2992`). Keyed by name, the two users would collapse into one, and the
+/// live-range walk that reads this list would then span one clone instead of both
+/// (`ddc/ddcv1.cpp:48-56`). ⛔ THE AUTHORITY'S OWN JSON ROUND TRIP ALREADY COLLAPSES THEM: the
+/// exporter `emplace`s into a `std::map<std::string, int>` keyed by name, so the colliding second
+/// refcount is DROPPED and the list comes back in NAME order (`dsc/dsc2.cpp:934-944`, `:1811-1823`)
+/// — which changes who `allocUsers_.begin()->first` is, and that reader `static_cast`s it to a
+/// `TransferNode*` unchecked (`ddc/ddcv1.cpp:2139-2140`).
 ///
-/// ⛔ AND IT IS NOT AN L3-ONLY METHOD: of its eleven callers, TWO ARE IN THIS SAME FILE — both
-/// `DesignSpaceConfig` methods, which divide a per-dim size by the page size under `INDEX_TENSOR`
-/// and bound-check it under `VALUE_TENSOR` (`dsc/dsc2.cpp:3557` and `:3566-3576` in
-/// `getBlockTransferSizePerDimCustomLocation`, `:3806` and `:3893-3902` in
-/// `getBufferCapacityForNodePerDimCustomLocation`) — and five more are in the L3 scheduler
-/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1647`, `:5893`, `:5994`, `:6692`, `:6721`).
-/// `addAllocUser`, `removeAllocUser`, `hasAllocUsers`, `hasAllocUser` and `clearAllocUsers`
-/// (`:1012-1046`) are that list's five operations, and `print` (`:1048`) streams both.
+/// ⭐ `getPageSize` IS PORTED AND TOTAL (`:1011`, defined `dsc/dsc2.cpp:4480-4513`) — see
+/// [`page_size`](Self::page_size), which takes the one unported field it reads as a parameter. Its
+/// six remaining methods stay out with `allocUsers_`: `addAllocUser`, `removeAllocUser`,
+/// `hasAllocUsers`, `hasAllocUser` and `clearAllocUsers` (`:1012-1046`) are that list's five
+/// operations, all four of the first three comparing `node == userNode` BY POINTER; and `print`
+/// (`:1048`, defined `dsc/dsc2.cpp:4514-4573`) streams `this`, recurses into
+/// `tempStorageForCompute_` and prints every `allocUsers_` name.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and `allocUsers_` and
 /// `relatedIndirectAccessAlloc_` compare by it. `Clone` is IBM's own, through `InheritWithClone`
@@ -6142,6 +6259,8 @@ pub struct StickSpread(pub i32);
 #[derive(Clone, Debug)]
 pub struct AllocateNode {
     /// Field: e028_AllocateNode.ldsIdx_
+    ///
+    /// Field: e037_AllocateNode.ldsIdx_
     ///
     /// The labeled data structure this region holds, or [`None`] for the authority's `-1`
     /// (`dsc/dsc2.h:976`). The DDL conversion sets it for a tensor allocation
@@ -6157,12 +6276,16 @@ pub struct AllocateNode {
     pub lds_idx: Option<LdsIdx>,
     /// Field: e028_AllocateNode.constIdx_
     ///
+    /// Field: e037_AllocateNode.constIdx_
+    ///
     /// The constant this region holds, or [`None`] for the authority's `-1` (`dsc/dsc2.h:977`). It
     /// indexes `DesignSpaceConfig::constantInfo_`, whose entry supplies the region's name
     /// (`ddc/ddcv1.cpp:26-27`), and the DDL conversion names such a node
     /// `allocate_const<idx>_<component>` (`ddc/ddl/ddl_conversion.cpp:836-838`).
     pub const_idx: Option<ConstantId>,
     /// Field: e028_AllocateNode.component_
+    ///
+    /// Field: e037_AllocateNode.component_
     ///
     /// Which memory the region is in (`dsc/dsc2.h:979`), taken from the `AllocateOp`'s storage
     /// (`ddc/ddl/ddl_conversion.cpp:806`).
@@ -6176,14 +6299,46 @@ pub struct AllocateNode {
     pub component: SenComponent,
     /// Field: e028_AllocateNode.padding_
     ///
+    /// Field: e037_AllocateNode.padding_
+    ///
     /// The padding form of each dim of the region (`dsc/dsc2.h:981`), written from the `AllocateOp`
     /// (`ddc/ddl/ddl_conversion.cpp:793`). `getSizeDataStageForNode` passes it on to size the
     /// allocation (`dsc/dsc2.cpp:3613`).
     pub padding: PaddingFormType,
     /// Field: e028_AllocateNode.layoutDimOrder_
     ///
-    /// The dims the region is laid out over, positionally paired with
-    /// [`max_dim_sizes`](Self::max_dim_sizes) (`dsc/dsc2.h:982`).
+    /// Field: e028_AllocateNode.maxDimSizes_
+    ///
+    /// Field: e037_AllocateNode.layoutDimOrder_
+    ///
+    /// Field: e037_AllocateNode.maxDimSizes_
+    ///
+    /// The dims the region is laid out over, each with its own size limit — [`None`] for the
+    /// authority's negative "no limit" (`dsc/dsc2.h:982-983`). Read [`MaxDimSize`] before touching a
+    /// filled one: the integer means a data-stage index before `finalizeAllocateLayouts` and an
+    /// extent after.
+    ///
+    /// ⛔⛔ TWO OF THE AUTHORITY'S FIELDS ARE ONE FIELD HERE, BECAUSE THEIR EQUAL LENGTH IS AN
+    /// INVARIANT AND THE AUTHORITY CHECKS IT AT RUNTIME THREE TIMES. Every producer `resize`s the
+    /// sizes to `layoutDimOrder_.size()` with `-1` (`ddc/ddl/ddl_conversion.cpp:803`, `:1641`,
+    /// `ddc/ddc_transformation_util.cpp:52`, `ddc/ddc_transformation.cpp:2116`, `:2347`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:561`) and `ForceInnermostDimensionsOp` inserts
+    /// into both at `begin()` (`ddc/ddl/ddl_conversion.cpp:1900-1905`); against that,
+    /// `finalizeAllocateLayouts` raises `DT_ERROR("Mismatch in allocate layout vectors")`
+    /// (`ddc/ddcv1.cpp:1715-1717`), `getPageSize` `DT_CHECK`s the same lengths
+    /// (`dsc/dsc2.cpp:4496`), and `SdscCoreletSplit` skips checking at all — it `std::find`s the dim
+    /// in the layout and indexes the SIZES by that distance, unchecked
+    /// (`dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:76-80`). One `Vec` of pairs is what deletes
+    /// all three: the mismatch is unconstructible, and that third read becomes one `find` that
+    /// cannot leave the vector.
+    ///
+    /// ⭐ AND NEITHER OF THE TWO READS THAT WANT THE VECTORS SEPARATELY NEEDS THEM TO BE:
+    /// `SdscCoreletSplit`'s is a search on the dim answering the size beside it, and the SuperDsc
+    /// fingerprint linearizes the dims as one run and the sizes as another
+    /// (`dsc/superdsc.cpp:1451-1452`) — two passes over one `Vec`, in the same index order, since a
+    /// pair `Vec` preserves exactly the positional pairing the two runs are read back in
+    /// (`dsc/superdsc.cpp:1446-1456`). `print` streams them as two runs the same way
+    /// (`dsc/dsc2.cpp:4531-4539`).
     ///
     /// ⛔ INDEX 0 IS THE INNERMOST DIM: `ForceInnermostDimensionsOp` `insert`s at `begin()`
     /// (`ddc/ddl/ddl_conversion.cpp:1900-1901`), the masked-compute pass puts its stick spread on
@@ -6197,35 +6352,40 @@ pub struct AllocateNode {
     /// "Handling of external allocations with repeated dimensions is not yet implemented" (`:798-802`)
     /// — the repeats the readers above tolerate are the ones `ForceInnermostDimensionsOp` prepends,
     /// which it inserts without ever testing whether the layout already holds that dim (`:1886-1906`).
-    pub layout_dim_order: Vec<PrimaryDimTypes>,
-    /// Field: e028_AllocateNode.maxDimSizes_
-    ///
-    /// One entry per [`layout_dim_order`](Self::layout_dim_order) dim, [`None`] for the authority's
-    /// negative "no limit" (`dsc/dsc2.h:983`). Read [`MaxDimSize`] before touching a filled one: the
-    /// integer means a data-stage index before `finalizeAllocateLayouts` and an extent after.
-    ///
-    /// ⛔ ITS LENGTH IS AN INVARIANT, NOT A COINCIDENCE: every producer `resize`s it to
-    /// `layoutDimOrder_.size()` with `-1` (`ddc/ddl/ddl_conversion.cpp:803`, `:1641`,
-    /// `ddc/ddc_transformation_util.cpp:52`, `ddc/ddc_transformation.cpp:2116`, `:2347`,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:561`), `finalizeAllocateLayouts` raises
-    /// `DT_ERROR("Mismatch in allocate layout vectors")` when the two differ
-    /// (`ddc/ddcv1.cpp:1715-1717`), and `getPageSize` `DT_CHECK`s the same (`dsc/dsc2.cpp:4496`).
-    ///
-    /// ⛔ A `Vec` OF PAIRS WOULD NOT DO INSTEAD: `SdscCoreletSplit` finds a dim in the layout and
-    /// indexes THIS vector by that distance
-    /// (`dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:79`), and the two are linearized as separate
-    /// runs into the SuperDsc fingerprint (`dsc/superdsc.cpp:1451-1452`).
     ///
     /// ⛔ A NEGATIVE ENTRY IS ALSO WHAT MAKES A DIM UNBOUNDED IN `getPageSize`, and it wins over
     /// every other entry of the same dim, erasing what earlier positions accumulated
-    /// (`dsc/dsc2.cpp:4498-4509`).
-    pub max_dim_sizes: Vec<Option<MaxDimSize>>,
+    /// (`dsc/dsc2.cpp:4498-4509`); see [`page_size`](Self::page_size).
+    ///
+    /// ⭐ THE PAIRING IS THE GUARD, AND THE CONTROL IS THE SAME PUSH ONE FIELD APART:
+    ///
+    /// ```
+    /// use deeptools::schedule::dims::PrimaryDimTypes;
+    /// use deeptools::schedule::dsc2::{AllocateNode, MaxDimSize};
+    /// let mut node = AllocateNode::default();
+    /// node.layout_dim_order.push((PrimaryDimTypes::In, Some(MaxDimSize(8))));
+    /// node.layout_dim_order.push((PrimaryDimTypes::Out, None));
+    /// assert_eq!(node.layout_dim_order.len(), 2);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use deeptools::schedule::dims::PrimaryDimTypes;
+    /// use deeptools::schedule::dsc2::AllocateNode;
+    /// let mut node = AllocateNode::default();
+    /// node.layout_dim_order.push(PrimaryDimTypes::In);
+    /// ```
+    pub layout_dim_order: Vec<(PrimaryDimTypes, Option<MaxDimSize>)>,
     /// Field: e028_AllocateNode.numBuffers_
     ///
     /// How many buffers the region holds (`dsc/dsc2.h:984`); see [`NumBuffers`] for the encoding and
     /// [`NumBuffers::STREAMING`] for the one value bridge 1 tests.
+    ///
+    /// ⚠️ E037 LISTED NO ANCHOR FOR IT, nor for [`back_gap_core`](Self::back_gap_core), though e028
+    /// listed both.
     pub num_buffers: NumBuffers,
     /// Field: e028_AllocateNode.isStartAddrSymbolic_
+    ///
+    /// Field: e037_AllocateNode.isStartAddrSymbolic_
     ///
     /// Whether the region's start address is a symbol rather than a placed address
     /// (`dsc/dsc2.h:987`).
@@ -6235,6 +6395,8 @@ pub struct AllocateNode {
     /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5882`).
     pub is_start_addr_symbolic: bool,
     /// Field: e028_AllocateNode.bufferOffsetCoreCorelet_
+    ///
+    /// Field: e037_AllocateNode.bufferOffsetCoreCorelet_
     ///
     /// The buffer stride per core and corelet (`dsc/dsc2.h:988`), written by `allocAllMem` beside
     /// the start address (`ddc/ddcv1.cpp:351-356`) and read as `.at(coord.at(0)).at(corelet0Id)`
@@ -6268,15 +6430,21 @@ pub struct AllocateNode {
     pub back_gap_core: BTreeMap<PrimaryDimTypes, BTreeMap<Option<CoreId>, DimSize>>,
     /// Field: e028_AllocateNode.indirectAllocType_
     ///
+    /// Field: e037_AllocateNode.indirectAllocType_
+    ///
     /// Which half of an indirect access this region is (`dsc/dsc2.h:990-994`); see
-    /// [`IndirectAllocType`].
+    /// [`IndirectAllocType`]. It is what [`page_size`](Self::page_size) dispatches on.
     pub indirect_alloc_type: IndirectAllocType,
     /// Field: e028_AllocateNode.indexTensorType_
+    ///
+    /// Field: e037_AllocateNode.indexTensorType_
     ///
     /// What an index tensor's entries hold (`dsc/dsc2.h:995-998`); see [`IndexTensorType`]. It is
     /// only meaningful under [`IndirectAllocType::IndexTensor`].
     pub index_tensor_type: IndexTensorType,
     /// Field: e028_AllocateNode.gapStickSpread_
+    ///
+    /// Field: e037_AllocateNode.gapStickSpread_
     ///
     /// Per dim, how many sticks that dim's data is spread across (`dsc/dsc2.h:1006`); see
     /// [`StickSpread`] for the multiplier/divisor split between its two readers.
@@ -6295,7 +6463,7 @@ pub struct AllocateNode {
     /// handled" (`dsc/dsc2.cpp:3939-3940`). Its in-scope writer copies it from a reference
     /// allocation (`dsc/designSpaceConfig.cpp:129-130`).
     ///
-    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, and none for
+    /// ⚠️ NEITHER WAVE'S SCHEDULER LISTED AN ANCHOR FOR IT, and none for
     /// [`non_unified_alloc_in_hbm`](Self::non_unified_alloc_in_hbm) either: both are declared across
     /// two lines with the initialiser on the second. Both have in-scope readers.
     pub ignore_symbolic_volume_limits: bool,
@@ -6324,7 +6492,6 @@ impl Default for AllocateNode {
             component: SenComponent::NoComponent,
             padding: PaddingFormType::default(),
             layout_dim_order: Vec::new(),
-            max_dim_sizes: Vec::new(),
             num_buffers: NumBuffers(1),
             is_start_addr_symbolic: false,
             buffer_offset_core_corelet: BTreeMap::new(),
@@ -6335,6 +6502,72 @@ impl Default for AllocateNode {
             ignore_symbolic_volume_limits: false,
             non_unified_alloc_in_hbm: false,
         }
+    }
+}
+
+impl AllocateNode {
+    /// `getPageSize()` (`dsc/dsc2.h:1011`, defined `dsc/dsc2.cpp:4480-4513`): per dim, how many of
+    /// that dim's elements one page holds, and absent for a dim that is not paged at all. ⭐ TOTAL —
+    /// both of the authority's runtime refusals are types here.
+    ///
+    /// ⛔ THE ANSWER IS OFTEN NOT THIS NODE'S OWN LAYOUT: an `INDEX_TENSOR` allocation pages over
+    /// the VALUE tensor's, reached through `relatedIndirectAccessAlloc_` (`dsc/dsc2.h:999-1001`) —
+    /// schedule-node pointer identity, not carried here — so that link is this method's PARAMETER,
+    /// and `DT_CHECK(relatedIndirectAccessAlloc_)` (`dsc/dsc2.cpp:4491`) is its type. It is taken
+    /// unconditionally because the authority holds it non-null on EVERY allocation whose type is not
+    /// `NO_INDIRECTION`, `DT_CHECK`ing exactly that before exporting one (`dsc/dsc2.cpp:916-921`);
+    /// a `VALUE_TENSOR` reads `this` (`:4486-4488`) and a direct allocation reads neither
+    /// (`:4483-4485`), so on those two arms the argument is unread and a caller holding only one
+    /// allocation passes it as both.
+    ///
+    /// ⛔ AND AN ANSWER COMPUTED FROM `self` ON THE INDEX ARM WOULD BE SILENTLY WRONG for exactly
+    /// the index allocations the paged path mints — which is why the link is a parameter rather than
+    /// this method being the two total arms only.
+    ///
+    /// ⛔ `DT_ERROR("Unhandled indirect alloc type")` (`:4494`) is a fourth arm of a three-value
+    /// enum, and an exhaustive `match` is where it goes. Both `DesignSpaceConfig` readers repeat
+    /// that same unreachable arm over the ANSWER (`dsc/dsc2.cpp:3575`, `:3920`).
+    pub fn page_size(
+        &self,
+        related_indirect_access_alloc: &Self,
+    ) -> BTreeMap<PrimaryDimTypes, PageSize> {
+        match self.indirect_alloc_type {
+            IndirectAllocType::NoIndirection => BTreeMap::new(),
+            IndirectAllocType::ValueTensor => self.page_size_of_layout(),
+            IndirectAllocType::IndexTensor => related_indirect_access_alloc.page_size_of_layout(),
+        }
+    }
+
+    /// `getPageSize`'s walk over the reference allocation's layout (`dsc/dsc2.cpp:4496-4512`), whose
+    /// `DT_CHECK` of the two vectors' equal lengths (`:4496`) is gone into
+    /// [`layout_dim_order`](Self::layout_dim_order)'s pairing.
+    ///
+    /// ⛔ ONE ABSENT ENTRY UNBOUNDS ITS DIM IN BOTH DIRECTIONS: it erases what earlier positions of
+    /// that dim accumulated ("safe even if key not present", `:4503`) and blocks every later one
+    /// (`:4505`), so a dim reaches the answer only when EVERY entry of it is filled — and the layout
+    /// may repeat a dim.
+    ///
+    /// ⛔ ZERO IS NOT ABSENCE HERE: a filled zero multiplies its dim's page size to zero (`:4508`),
+    /// and both in-file readers then divide a dim size by it in `float` (`dsc/dsc2.cpp:3569`,
+    /// `:3899`). That INF is the authority's, not this port's, and it cannot be typed away from
+    /// here: `finalizeAllocateLayouts` reaches zero by integer division on any extent below one
+    /// stick (`ddc/ddcv1.cpp:1723-1729`), so [`MaxDimSize`] cannot exclude it.
+    fn page_size_of_layout(&self) -> BTreeMap<PrimaryDimTypes, PageSize> {
+        let mut page_size = BTreeMap::new();
+        let mut unbounded_dims = BTreeSet::new();
+        for &(dim, max_size) in &self.layout_dim_order {
+            match max_size {
+                None => {
+                    unbounded_dims.insert(dim);
+                    page_size.remove(&dim);
+                }
+                Some(MaxDimSize(max_size)) if !unbounded_dims.contains(&dim) => {
+                    page_size.entry(dim).or_insert(PageSize(1)).0 *= max_size;
+                }
+                Some(_) => {}
+            }
+        }
+        page_size
     }
 }
 
@@ -7238,6 +7471,89 @@ mod equivalence {
             );
         }
     }
+
+    /// `getPageSize`'s loop transcribed as the authority writes it — two independent vectors walked
+    /// by one index, with the `DT_CHECK` on their lengths it needs to be safe
+    /// (`dsc/dsc2.cpp:4496-4511`).
+    fn page_size_over_two_vectors(
+        layout_dim_order: &[PrimaryDimTypes],
+        max_dim_sizes: &[i32],
+    ) -> BTreeMap<PrimaryDimTypes, i32> {
+        assert_eq!(layout_dim_order.len(), max_dim_sizes.len(), "`:4496`");
+        let mut page_size = BTreeMap::new();
+        let mut unbounded_dims = BTreeSet::new();
+        for i in 0..layout_dim_order.len() {
+            let dim = layout_dim_order[i];
+            let max_size = max_dim_sizes[i];
+            if max_size < 0 {
+                unbounded_dims.insert(dim);
+                page_size.remove(&dim);
+            } else if !unbounded_dims.contains(&dim) {
+                *page_size.entry(dim).or_insert(1) *= max_size;
+            }
+        }
+        page_size
+    }
+
+    /// [`AllocateNode::page_size`] over the merged pairs against that transcription, on the cases the
+    /// merge has to survive: a dim repeated with two filled entries, an absent entry with filled
+    /// entries of the same dim on BOTH sides of it, a zero, and the empty layout. ⭐ THE CURRENCY MAP
+    /// IS THE FIXTURE'S OWN CONVERSION — a negative `int` becomes [`None`] through
+    /// [`u32::try_from`], which is the boundary `maxSize < 0` draws (`dsc/dsc2.cpp:4501`).
+    #[test]
+    fn the_merged_layout_answers_the_page_size_the_authoritys_two_vectors_do() {
+        const CASES: [(&[PrimaryDimTypes], &[i32]); 4] = [
+            (
+                &[
+                    PrimaryDimTypes::In,
+                    PrimaryDimTypes::Out,
+                    PrimaryDimTypes::In,
+                ],
+                &[4, 3, 5],
+            ),
+            (
+                &[
+                    PrimaryDimTypes::In,
+                    PrimaryDimTypes::In,
+                    PrimaryDimTypes::In,
+                    PrimaryDimTypes::Out,
+                ],
+                &[4, -1, 7, 9],
+            ),
+            (
+                &[
+                    PrimaryDimTypes::Y,
+                    PrimaryDimTypes::Out,
+                    PrimaryDimTypes::In,
+                ],
+                &[-1, 0, 4],
+            ),
+            (&[], &[]),
+        ];
+
+        for (case, (layout_dim_order, max_dim_sizes)) in CASES.into_iter().enumerate() {
+            let node = AllocateNode {
+                indirect_alloc_type: IndirectAllocType::ValueTensor,
+                layout_dim_order: layout_dim_order
+                    .iter()
+                    .copied()
+                    .zip(max_dim_sizes.iter().copied())
+                    .map(|(dim, size)| (dim, u32::try_from(size).ok().map(MaxDimSize)))
+                    .collect(),
+                ..AllocateNode::default()
+            };
+            let ported = node
+                .page_size(&node)
+                .into_iter()
+                .map(|(dim, PageSize(size))| (dim, i32::try_from(size).expect("`int`")))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                ported,
+                page_size_over_two_vectors(layout_dim_order, max_dim_sizes),
+                "case {case}"
+            );
+        }
+    }
 }
 
 // crustify:todo: e030_BlockNode
@@ -7279,3 +7595,29 @@ mod equivalence {
 // crustify:todo: e033_DataInfo.loopEleOffsets_
 
 // crustify:todo: e033_DataInfo.startAddr_
+
+// crustify:todo: e037_AllocateNode
+
+// crustify:todo: e037_AllocateNode.allocUsers_
+
+// crustify:todo: e037_AllocateNode.allocateCoordinates_
+
+// crustify:todo: e037_AllocateNode.sliceViewCoordinates_
+
+// crustify:todo: e037_AllocateNode.tempStorageForCompute_
+
+// crustify:todo: e038_CoordPropInfoType
+
+// crustify:todo: e038_CoordPropInfoType.dataConnect
+
+// crustify:todo: e038_CoordPropInfoType.dimsToPropagate
+
+// crustify:todo: e038_CoordPropInfoType.nodeToFold
+
+// crustify:todo: e038_CoordPropInfoType.propState
+
+// crustify:todo: e038_CoordPropInfoType.refIsProducer
+
+// crustify:todo: e038_CoordPropInfoType.refNode
+
+// crustify:todo: e038_CoordPropInfoType.scaleDown
