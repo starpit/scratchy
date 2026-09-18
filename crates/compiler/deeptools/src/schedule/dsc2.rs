@@ -672,12 +672,15 @@ mod unit_tests {
         assert_eq!(chunk_size, vec![entry(PrimaryDimTypes::In, 4, 0)]);
     }
 
-    /// `dsc/dsc2.h:43` against the four sites that write `el_.name_ = ss_.name_ + "el"`
-    /// (`ddc/ddcv1.cpp:1236-1237`, `ddc/ddc_transformation.cpp:1018-1019`,
-    /// `ddc/ddc_transformation_util.cpp:121-122`, `:131-132`) and against `fillLoopLatchSdsc`, which
-    /// names both halves `"core"` (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`).
+    /// `dsc/dsc2.h:43` against BOTH naming conventions: the `+ "el"` suffix the DDC gives the stages
+    /// it mints by number (`ddc/ddc_transformation_util.cpp:121-122`, `:131-132`,
+    /// `ddc/ddc_transformation.cpp:1018-1019`, `ddc/ddcv1.cpp:1236-1237`) and the shared name all
+    /// three NAMED stages carry in both halves — `"core"` (`fillLoopLatchSdsc`,
+    /// `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`) and `"chunk"`
+    /// (`addOrUpdateDataStageParam` called with one name for both,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1419-1420`, `:1477-1480`).
     #[test]
-    fn a_data_stages_name_is_its_steady_states_and_the_epilogue_carries_its_own() {
+    fn a_data_stages_name_is_its_steady_states_and_the_el_suffix_is_not_an_invariant() {
         // `dsc2::DataStage newDstg;` (`dsc/dsc2.cpp:3619`) and `emplace(index, dsc2::DataStage())`
         // (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:731`): both halves start empty and unnamed.
         let mut stage = DataStage::default();
@@ -702,24 +705,36 @@ mod unit_tests {
 
         // The suffix is not an invariant: `fillLoopLatchSdsc` names both halves "core", and
         // `getSizeDataStageForNode` checks only the steady state's (`dsc/dsc2.cpp:3638-3639`).
-        let core = DataStage {
+        let named = |name: &str| DataStage {
             ss: DataStructDims {
-                name: "core".to_string(),
+                name: name.to_string(),
                 ..DataStructDims::default()
             },
             el: DataStructDims {
-                name: "core".to_string(),
+                name: name.to_string(),
                 ..DataStructDims::default()
             },
         };
+        let core = named("core");
         assert_eq!(core.name(), "core");
         assert_eq!(core.el.name, core.name());
+
+        // ⛔ THE CHUNK STAGE IS THE ONE THAT BITES, and it is on this campaign's own port path: both
+        // callers of `addOrUpdateDataStageParam` pass one `chunkDsName` for `ssName` AND `elName`
+        // (`L3DlOpsScheduler.cpp:1419-1420`, `:1477-1480`), so the stage that
+        // `attachToPrefilledSchedule` requires to be named "chunk" (`ddc/ddcv1.cpp:2285`) has an
+        // epilogue named "chunk" too. A port deriving the epilogue's name would write "chunkel".
+        let chunk = named("chunk");
+        assert_eq!(chunk.name(), "chunk");
+        assert_eq!(chunk.el.name, "chunk");
+        assert_ne!(chunk.el.name, format!("{}el", chunk.name()));
     }
 
-    /// `dsc/dsc2.h:1088`: the declared order, the field's `NOT_PROCESSED` initialiser (`:1093`), and
-    /// the two states the queue actually writes (`ddc/ddc.h:468-469`, `:485-486`).
+    /// `dsc/dsc2.h:1088`: the declared order and the field's `NOT_PROCESSED` initialiser (`:1093`).
+    /// Which states the authority ever writes is a C++ fact this cannot reach; it is recorded on
+    /// [`PropStateType`] with its evidence.
     #[test]
-    fn the_prop_state_discriminants_are_the_authoritys_and_overridden_is_never_entered() {
+    fn the_prop_state_discriminants_are_the_authoritys_and_the_default_is_not_processed() {
         let declared = [
             PropStateType::NotProcessed,
             PropStateType::RolledBack,
@@ -730,7 +745,6 @@ mod unit_tests {
             assert_eq!(state as usize, i, "{state:?} moved");
         }
         assert_eq!(PropStateType::default(), PropStateType::NotProcessed);
-        assert_ne!(PropStateType::Complete, PropStateType::RolledBack);
     }
 
     /// The two shapes `ddc/ddl/ddl_conversion.cpp:1076-1164` mints, against the declared defaults
@@ -1643,12 +1657,21 @@ mod unit_tests {
 /// (`dsc/designSpaceConfig.h:105`); id 0 is the core stage, whose name `getSizeDataStageForNode`
 /// `DT_CHECK`s to be `"core"` (`dsc/dsc2.cpp:3638-3639`).
 ///
-/// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and the epilogue carries a different
-/// one. Four ddc sites write `el_.name_ = ss_.name_ + "el"` (`ddc/ddcv1.cpp:1236-1237`,
-/// `ddc/ddc_transformation.cpp:1018-1019`, `ddc/ddc_transformation_util.cpp:121-122`, `:131-132`)
-/// while `fillLoopLatchSdsc` writes `"core"` into both halves
-/// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`), so the suffix is a ddc convention
-/// and not an invariant of this type.
+/// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and WHETHER THE EPILOGUE CARRIES A
+/// DIFFERENT ONE DEPENDS ON WHO MINTED THE STAGE. The `+ "el"` suffix belongs to the stages the DDC
+/// mints by NUMBER — `constructDatastage` writes `to_string(id)` and `to_string(id) + "el"`
+/// (`ddc/ddc_transformation_util.cpp:121-122`, `:131-132`, and the L3 scheduler's own copy at
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7730-7731`), the chunk split does the same from `ss_`
+/// (`ddc/ddc_transformation.cpp:1018-1019`), and `calculateEpilogues` copies `ss_` and appends to
+/// the copy's name (`ddc/ddcv1.cpp:1236-1237`). ⛔ ALL THREE **NAMED** STAGES CARRY THE SAME NAME IN
+/// BOTH HALVES, and two of the three are written by the L3 scheduler this campaign ports: `"core"`
+/// (`fillLoopLatchSdsc`, `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`), `"chunk"`
+/// (both callers of `addOrUpdateDataStageParam` pass one `chunkDsName` for BOTH names,
+/// `L3DlOpsScheduler.cpp:1419-1420`, `:1477-1480`) and `"superchunk"` (`ss_.name_ = el_.name_`,
+/// `:2815`). So deriving the epilogue's name from the steady state's is wrong: the chunk stage that
+/// `attachToPrefilledSchedule` requires to be named `"chunk"` (`ddc/ddcv1.cpp:2285`) has an epilogue
+/// named `"chunk"`, not `"chunkel"`. Nothing relates the two — `addOrUpdateDataStageParam` takes
+/// `ssName` and `elName` as independent parameters (`:721-726`).
 ///
 /// ⛔ NO `PartialEq`: IBM declares none (`dsc/dsc2.h:40-44` has no `operator==` and no `tie()`), and
 /// a derive would compare the two halves through `DataStructDims`' own equality, which deliberately
@@ -1664,7 +1687,7 @@ pub struct DataStage {
     /// Field: e014_DataStage.el_
     ///
     /// The epilogue: the dims of the last, short trip. `calculateEpilogues` seeds it from `ss_` and
-    /// then shrinks only the dims the metadata calls relevant (`ddc/ddcv1.cpp:1230-1327`), so an
+    /// then shrinks only the dims the metadata calls relevant (`ddc/ddcv1.cpp:1230-1330`), so an
     /// untouched epilogue equals the steady state rather than being empty.
     pub el: DataStructDims,
 }
@@ -1689,11 +1712,22 @@ impl DataStage {
 ///
 /// `dsc/dsc2.h:1088`. How far one coordinate-propagation work item got. The queue pushes
 /// `NOT_PROCESSED` (`ddc/ddc.h:424-427`, `:438-441`), `getCurrItem` marks the item it hands out
-/// `COMPLETE` (`:468-469`) and `rollbackToPos` marks `ROLLED_BACK` (`:485-486`).
+/// `COMPLETE` (`:468-469`) and `rollbackToPos` writes `ROLLED_BACK` (`:485-486`).
 ///
-/// ⛔ `OVERRIDDEN` IS A STATE THE SCHEDULER NEVER ENTERS: `dsc/dsc2.h:1088` is its only occurrence
-/// tree-wide, with no writer and no reader. It is ported because it holds the discriminant
-/// `COMPLETE` sits behind.
+/// ⛔ THE WHOLE `propState` FIELD IS WRITE-ONLY IN THE AUTHORITY, not just the one dead state.
+/// `propState` occurs exactly three times tree-wide — its declaration (`dsc/dsc2.h:1093`) and those
+/// two writes — so NOTHING READS IT, and `CoordPropInfoType::print` does not print it either
+/// (`dsc/dsc2.h:1098-1107`). A port must not grow a reader: no propagation decision is taken on this
+/// value anywhere. `OVERRIDDEN` is deader still — `dsc/dsc2.h:1088` is its ONLY occurrence, with no
+/// writer at all — and is ported because it holds the discriminant `COMPLETE` sits behind.
+///
+/// ⛔ `rollbackToPos` DOES NOT MARK THE RANGE IT ROLLS BACK, and this is an authority defect: the
+/// loop runs `for (int i = newPos; i <= currItemToProcess_; ++i)` and clears each `[i]`'s
+/// coordinates, but the `propState` write on the same iterations indexes
+/// `itemsToProcess_.at(currItemToProcess_)` — `currItemToProcess_`, NOT `i` (`ddc/ddc.h:484-486`).
+/// Only the last item is marked, once per iteration, and every other rolled-back item keeps
+/// `COMPLETE` from `getCurrItem`. Inert today because nothing reads the field; do not reproduce the
+/// aliasing when porting it, and do not "fix" it into a reader either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropStateType {
     /// The field's own initialiser (`dsc/dsc2.h:1093`) and what both push sites state.
@@ -1717,6 +1751,17 @@ pub enum PropStateType {
 /// `parametricIterCount` (`dsc/dsc2.cpp:4126`) and `parametricStride` (`:4197`) read
 /// `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb `getOwnerLoop()`, and `print`
 /// (`:4284`) prints `name_`.
+///
+/// ⛔ WHEN `next_` LANDS, THE `Clone` DERIVE BELOW BECOMES A DIVERGENCE. IBM's `clone()` is
+/// `new Derived(static_cast<Derived const&>(*this))` (`util/utils.h:105-107`), i.e. the copy
+/// constructor, and `BlockNode::next_`'s copy constructor is EMPTY ON PURPOSE
+/// (`VectorOfChildren(const VectorOfChildren&) {}`, `dsc/dsc2.h:533-536`) — so cloning a loop,
+/// block or condition yields a node with NO CHILDREN and the caller re-inserts them. Both
+/// BlockNode-derived clone sites rely on it: `ddc/ddc_transformation.cpp:984-986` clones a loop and
+/// then `addChildNode`s one cloned child, and `ddc/ddc_transformation_util.cpp:580-588` clones a
+/// `ConditionNode` and then `addThenRegion`s a fresh block — which `DT_ERROR`s outright if `next_`
+/// is non-empty (`dsc/dsc2.cpp:2152-2155`). A derived deep `Clone` over an owning child list would
+/// therefore turn a working DDC path into a fatal error, not merely copy too much.
 ///
 /// ⛔ THE THREE SHAPES BELOW ARE DISJOINT AND THIS TYPE CANNOT ENFORCE IT — IBM declares four
 /// independent fields and the JSON importer writes them one entry at a time
