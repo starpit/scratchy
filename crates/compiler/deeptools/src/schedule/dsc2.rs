@@ -120,7 +120,7 @@ pub struct DimSize(pub i32);
 /// ⛔ THE SECOND DDC WRITER IS NEITHER LIVE NOR NON-NEGATIVE, so it is not evidence for that
 /// choice and must not be cited as such. `sizeIdx = getDimIndexInLayoutOrder(dsType, IN)
 /// + tensorSizes.size()` (`ddc/ddcv1.cpp:1588-1591`, pushed at `:1597-1598`) sits inside the
-/// lambda `checkAndResetUnitTimeTransfer` (`:1557-1645`) whose only callsite is commented out
+/// lambda `checkAndResetUnitTimeTransfer` (`:1560-1645`) whose only callsite is commented out
 /// (`:1649-1650`), and `getDimIndexInLayoutOrder` returns `-1` for a dim absent from
 /// `layoutDimOrder_` (`dsc/designSpaceConfig.cpp:429-438`) — so that expression is `-1 + n`, and
 /// is `-1` itself whenever `getStickSizes` came back empty. Were the callsite ever restored, this
@@ -1465,6 +1465,10 @@ mod unit_tests {
         // ⛔ EMPTY, AND IT STAYS EMPTY ON EVERY PATH BUT THE JSON IMPORTER'S: the one C++ writer is
         // inside a lambda whose only callsite is commented out (`ddc/ddcv1.cpp:1640`, `:1649-1650`).
         assert!(node.unit_time_transfer_chunk_stride.is_empty());
+
+        // ⛔ EMPTY ONLY AS AN INITIALISER — THE JUSTIFICATION ABOVE DOES NOT EXTEND TO THIS FIELD.
+        // It has a live writer, `populateUnitTimeTransfers` (`ddc/ddcv1.cpp:524-525`), and three
+        // live rewriters; what stays empty is the default, not the field.
         assert!(node.unit_time_transfer_chunk_size.is_empty());
     }
 
@@ -2979,6 +2983,91 @@ mod unit_tests {
             "a default `DataInfo` still makes the list non-empty"
         );
         assert!(!node.is_dst_labeled_ds());
+    }
+
+    /// ⭐ THE COUPLING THE THREE FIELDS' DOCS NAME, AS A PROPERTY RATHER THAN A SPOT CHECK. The
+    /// element count bridge 1 reassembles — `Π extents × numChunks × replicationFactor_`
+    /// (`SNTransferLowering.cpp:32-38`, `:963-965`) — is what each DDC writer preserves; the extent
+    /// product ALONE is not. One input, the stick sizes `getStickSizes` hands
+    /// `populateUnitTimeTransfers`, through every writer the authority applies to this vector.
+    #[test]
+    fn e034_the_chunk_extents_and_the_replication_factor_are_one_load_size() {
+        // The stick sizes of one 256-element load (`ddc/ddcv1.cpp:513`, `dsc/dsc2.h:835-836`).
+        let stick_sizes = [(PrimaryDimTypes::In, 4), (PrimaryDimTypes::Ij, 64)];
+        let entry = |(dim, size): (PrimaryDimTypes, i32), idx| SizeAndIndex {
+            size_dim: Size::new(dim, DimSize(size)),
+            src_size_idx: Some(SizeIdx(idx)),
+            dst_size_idx: Some(SizeIdx(idx)),
+        };
+        let extents = |node: &TransferNode| -> i32 {
+            node.unit_time_transfer_chunk_size
+                .iter()
+                .map(|chunk| chunk.size_dim.size.0)
+                .product()
+        };
+        // One `agen` access's element count (`SNTransferLowering.cpp:32-38`, `:963-965`).
+        let elements = |node: &TransferNode| {
+            extents(node) * node.unit_time_transfer_num_chunks * node.replication_factor
+        };
+
+        // `:510-525` with `do2BSplat == false`: one entry per stick size, at its own position.
+        let plain = TransferNode {
+            unit_time_transfer_chunk_size: stick_sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| entry(size, i as u32))
+                .collect(),
+            ..TransferNode::default()
+        };
+        assert_eq!(elements(&plain), 256);
+        assert_eq!(extents(&plain), 256);
+
+        // `:525` with `do2BSplat == true` pushes extent 1 for every dim, and `:532-535` puts the
+        // product of the stick sizes in the factor instead — the same load, on the OTHER field.
+        let mut splat = TransferNode {
+            unit_time_transfer_chunk_size: stick_sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &(dim, _))| entry((dim, 1), i as u32))
+                .collect(),
+            replication_factor: stick_sizes.iter().map(|&(_, size)| size).product(),
+            ..TransferNode::default()
+        };
+        assert_eq!(elements(&splat), 256);
+        assert_eq!(extents(&splat), 1, "the extents alone lost the whole load");
+
+        // `:544-548`, the fp32 fixup: a 4 moves BACK out of the factor into entry 0.
+        splat.unit_time_transfer_chunk_size[0].size_dim.size = DimSize(4);
+        splat.replication_factor /= 4;
+        assert_eq!(splat.replication_factor, 64);
+        assert_eq!(elements(&splat), 256);
+        assert_eq!(extents(&splat), 4);
+
+        // `:1549-1552`, the data-stage shrink of entry 0 from 4 to `dsDim = 2`, in place, with
+        // `replicationFactor_ *= size / dsDim`.
+        let mut shrunk = plain.clone();
+        shrunk.unit_time_transfer_chunk_size[0].size_dim.size = DimSize(2);
+        shrunk.replication_factor *= 2;
+        assert_eq!(elements(&shrunk), 256);
+        assert_eq!(extents(&shrunk), 128);
+
+        // `:1669-1677`, the `reduce2B` tail WITH `doSplat`: every extent to 1, each folded in.
+        let mut reduced = splat.clone();
+        let mut factor = reduced.replication_factor;
+        for chunk in &mut reduced.unit_time_transfer_chunk_size {
+            factor *= chunk.size_dim.size.0;
+            chunk.size_dim.size = DimSize(1);
+        }
+        reduced.replication_factor = factor;
+        assert_eq!(elements(&reduced), 256);
+
+        // ⛔ AND WITHOUT `doSplat` THAT SAME LOOP DISCARDS IT (`:1673`) — the transfer really did get
+        // smaller, which is why the product is an invariant of the SPLAT path alone.
+        let mut dropped = splat.clone();
+        for chunk in &mut dropped.unit_time_transfer_chunk_size {
+            chunk.size_dim.size = DimSize(1);
+        }
+        assert_eq!(elements(&dropped), 64);
     }
 
     /// [`LoopCondOp`] IS `CondOp::COMPARISONS`, positionally and by spelling, and the narrowing is
@@ -5091,33 +5180,57 @@ pub struct TransferNode {
     /// Field: e034_TransferNode.replicationFactor_
     ///
     /// How many times the loaded chunk is splatted, `1` for no splat (`dsc/dsc2.h:834`). Bridge 1
-    /// divides the recorded stick and element counts by it, and refuses an LXLU splat it cannot
-    /// express (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:728-729`, `:963-971`).
+    /// multiplies one `agen` access's element count by it, refusing an LXLU splat it cannot express
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:963-971`), and divides the
+    /// recorded `OUT` stick and element counts by it (`:727-729`).
+    ///
+    /// ⛔ IT IS THE OTHER HALF OF
+    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size) AND NOT AN
+    /// INDEPENDENT COUNT — every DDC writer moves magnitude between the two. Read that field's doc
+    /// before reading either alone.
     pub replication_factor: i32,
     /// Field: e034_TransferNode.unitTimeTransferChunkSize_
     ///
     /// "Continuous elements within a stick" (`dsc/dsc2.h:835-836`) — the contiguous dims of one
-    /// unit-time transfer, ONE PER STICK SIZE AND IN STICK ORDER, which is all the one live producer
-    /// emits (`ddc/ddcv1.cpp:524-525`). Bridge 1 multiplies the extents into the element count of
-    /// one `agen` access (`SNTransferLowering.cpp:33-38`).
+    /// unit-time transfer, in stick order, each entry's index equal to its own position, minted by
+    /// `e126_populateUnitTimeTransfers` (`ddc/ddcv1.cpp:524-525`).
     ///
-    /// ⛔ IT IS NEVER "EXTENDED WITH LAYOUT DIMS" ON A LIVE PATH, as recorded before. The append of
-    /// an out-of-stick `IN` entry (`:1597-1598`) and the erase that truncates this vector
-    /// (`:1642-1643`) both sit inside `checkAndResetUnitTimeTransfer` (`:1557-1645`) — the same dead
-    /// lambda that owns [`unit_time_transfer_chunk_stride`](Self::unit_time_transfer_chunk_stride)'s
-    /// only writer, whose callsite is commented out at `:1649-1650`. So live, this vector's length
-    /// is the stick count, each entry's index equals its own position, and the two invariants the
-    /// lambda would break — that length, and `DT_CHECK(uttChunkSize.size() == tensorSizes.size())`
-    /// at `:1568` — are unreachable. After minting, the 4B-splat mutation of entry 0 (`:544-546`) is
-    /// the only DDC write that reaches it.
+    /// ⛔ THE EXTENTS ARE NOT THE STICK SIZES AND THIS VECTOR ALONE IS NOT THE LOAD. What bridge 1
+    /// reassembles is `Π extents × unitTimeTransferNumChunks_` (`SNTransferLowering.cpp:32-38`)
+    /// `× replicationFactor_` (`:963-965`), and every DDC writer moves magnitude between the extents
+    /// and [`replication_factor`](Self::replication_factor) rather than setting either alone: a
+    /// `do2BSplat` mint pushes extent `1` per dim and the product of the stick sizes into the factor
+    /// (`ddc/ddcv1.cpp:510-525`, `:527-535`), the fp32 fixup hands 4 of it back to entry 0
+    /// (`:544-548`), `e307_exploreAssignDataStages` shrinks each entry IN PLACE to its data-stage
+    /// extent with `replicationFactor_ *= size / dsDim; size = dsDim` (`:1549-1552`), and its
+    /// `reduce2B` tail sets EVERY extent to `1` (`:1669-1677`). ⛔ Both shrinks DISCARD the
+    /// magnitude when `!doSplat` (`:1549`, `:1673`) — there the transfer really did get smaller — so
+    /// the product holds for a splat only. A reader that takes the extents for the stick geometry
+    /// reads a transfer already reduced; one that drops the factor loses the splat.
+    ///
+    /// ⛔ NOR IS THE LENGTH ALWAYS THE STICK COUNT, as recorded before: minting stops as soon as
+    /// `elemSoFar >= numElemLimit`, dividing the extent it is pushing when it oversteps
+    /// (`:510-522`), `numElemLimit` being the metadata's `force_num_elements_` (`:443-446`). What
+    /// cannot change the length again is the DEAD writer — the out-of-stick `IN` append
+    /// (`:1597-1598`) and the erase (`:1642-1643`) both sit inside `checkAndResetUnitTimeTransfer`
+    /// (`:1560-1645`), the same lambda that owns
+    /// [`unit_time_transfer_chunk_stride`](Self::unit_time_transfer_chunk_stride)'s only writer and
+    /// whose callsite is commented out (`:1649-1650`), which is also why the
+    /// `DT_CHECK(uttChunkSize.size() == tensorSizes.size())` at `:1568` is unreachable.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
     /// Field: e034_TransferNode.unitTimeTransferNumChunks_
     ///
     /// How many chunks one unit-time transfer covers, `1` for a single contiguous chunk
-    /// (`dsc/dsc2.h:837`). It is the product of the extents the hole split moved out of
-    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size)
-    /// (`ddc/ddcv1.cpp:1633-1642`), which bridge 1 multiplies back in
-    /// (`SNTransferLowering.cpp:33-38`).
+    /// (`dsc/dsc2.h:837`), which bridge 1 multiplies into the element count
+    /// (`SNTransferLowering.cpp:32-38`) — the third factor of
+    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size)'s product.
+    ///
+    /// ⛔ NO LIVE C++ PRODUCER SETS IT EITHER, and the citation recorded here before hid that. Both
+    /// writers — the `= 1` and the product of the extents the hole split moves out of the chunk
+    /// sizes (`ddc/ddcv1.cpp:1633-1643`) — are inside the same dead `checkAndResetUnitTimeTransfer`
+    /// as [`unit_time_transfer_chunk_stride`](Self::unit_time_transfer_chunk_stride)'s
+    /// (`:1649-1650`), so outside the JSON importer (`dsc/dsc2.cpp:1571-1572`) it holds the
+    /// initialiser `1` and `loadSize *= unitTimeTransferNumChunks_` at `:1663` multiplies by one.
     pub unit_time_transfer_num_chunks: i32,
     /// Field: e034_TransferNode.unitTimeTransferChunkStride_
     ///
