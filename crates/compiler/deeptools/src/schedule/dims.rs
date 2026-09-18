@@ -469,16 +469,19 @@ impl Default for SymbolicDimInfo {
 /// value (`dsc/dims.h:162-193`).
 ///
 /// ⛔ CONSTRUCTION REFUSES A NEGATIVE, so IBM's `>= 0` test (`dsc/dims.cpp:85`) is `is_some` and its
-/// `-1` is `None` — `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:111` skips a dim on exactly that.
+/// `-1` is `None`. NOT `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:111`, which skips on the `int`
+/// `primaryDimToVal_st` returns being `== -1` — that one is a value, and it is not this absence.
+/// ⛔ AND REFUSES THE NON-FINITE, which IBM's `double` admits and nothing in it guards: a compiled
+/// authority stores a NaN dim, calls `empty()` false on it and writes it back out as `nan`.
 /// ⭐ `f64` BECAUSE `zi_`/`zj_` ARE HALF-INTEGERS: `x.5` pads `floor(x.5)` at top/left and
 /// `ceil(x.5)` at bottom/right (`dsc/dims.h:187-193`).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct DimSize(f64);
 
 impl DimSize {
-    /// A size, or absent for the negative IBM stores while a dim is unfilled.
+    /// A finite size, or absent for the negative IBM stores while a dim is unfilled.
     pub fn new(size: f64) -> Option<Self> {
-        (size >= 0.0).then_some(Self(size))
+        (size.is_finite() && size >= 0.0).then_some(Self(size))
     }
 
     /// The stored `double`.
@@ -520,7 +523,7 @@ impl DimDensity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SymbolicVolume(pub i32);
 
-/// Replaces: e011_DataStructDims
+/// Replaces: e012_DataStructDims
 ///
 /// `dsc/dims.h:158-303`. Every dimension of one data structure or op: the primary dims, the derived
 /// halves they compound from, which of them are symbolic and at what granularity, how each is split
@@ -530,112 +533,112 @@ pub struct SymbolicVolume(pub i32);
 /// `:283`), and `empty()` is that comparison against a default (`dsc/dims.cpp:112-115`).
 #[derive(Clone, Debug, Default)]
 pub struct DataStructDims {
-    /// Field: e011_DataStructDims.name_
+    /// Field: e012_DataStructDims.name_
     pub name: String,
-    /// Field: e011_DataStructDims.in_
+    /// Field: e012_DataStructDims.in_
     ///
     /// Input features (or channels).
     pub r#in: Option<DimSize>,
-    /// Field: e011_DataStructDims.out_
+    /// Field: e012_DataStructDims.out_
     ///
     /// Output features (or channels).
     pub out: Option<DimSize>,
-    /// Field: e011_DataStructDims.mb_
+    /// Field: e012_DataStructDims.mb_
     ///
     /// Minibatch size.
     pub mb: Option<DimSize>,
-    /// Field: e011_DataStructDims.ij_
+    /// Field: e012_DataStructDims.ij_
     ///
     /// Output image dimensions (rows/cols) — `compound` writes it from `i_` and `j_`.
     pub ij: Option<DimSize>,
-    /// Field: e011_DataStructDims.rc_
+    /// Field: e012_DataStructDims.rc_
     ///
     /// Input image (rows/cols) with zero padding — `compound` writes it from `r_` and `c_`.
     pub rc: Option<DimSize>,
-    /// Field: e011_DataStructDims.kij_
+    /// Field: e012_DataStructDims.kij_
     ///
     /// Kernel dimensions (rows/cols) — `compound` writes it from `ki_` and `kj_`.
     pub kij: Option<DimSize>,
-    /// Field: e011_DataStructDims.y_
+    /// Field: e012_DataStructDims.y_
     ///
     /// A kernel reuse dimension (e.g. timestep).
     pub y: Option<DimSize>,
-    /// Field: e011_DataStructDims.x_
+    /// Field: e012_DataStructDims.x_
     ///
     /// A repeat dim that does not add reuse (e.g. attention heads).
     pub x: Option<DimSize>,
-    /// Field: e011_DataStructDims.x1_
+    /// Field: e012_DataStructDims.x1_
     ///
     /// A second repeat dim that does not add reuse.
     pub x1: Option<DimSize>,
-    /// Field: e011_DataStructDims.sij_
+    /// Field: e012_DataStructDims.sij_
     ///
     /// Stride dimensions (rows/cols). To be removed in future (`dsc/dims.h:174-176`).
     pub sij: Option<DimSize>,
-    /// Field: e011_DataStructDims.zij_
+    /// Field: e012_DataStructDims.zij_
     ///
     /// Zero pad dimensions (rows/cols). To be removed in future (`dsc/dims.h:174-176`).
     pub zij: Option<DimSize>,
-    /// Field: e011_DataStructDims.i_
+    /// Field: e012_DataStructDims.i_
     ///
     /// Output image rows.
     pub i: Option<DimSize>,
-    /// Field: e011_DataStructDims.j_
+    /// Field: e012_DataStructDims.j_
     ///
     /// Output image cols.
     pub j: Option<DimSize>,
-    /// Field: e011_DataStructDims.r_
+    /// Field: e012_DataStructDims.r_
     ///
     /// Input image rows with zero padding.
     pub r: Option<DimSize>,
-    /// Field: e011_DataStructDims.c_
+    /// Field: e012_DataStructDims.c_
     ///
     /// Input image cols with zero padding.
     pub c: Option<DimSize>,
-    /// Field: e011_DataStructDims.ki_
+    /// Field: e012_DataStructDims.ki_
     ///
     /// Kernel rows.
     pub ki: Option<DimSize>,
-    /// Field: e011_DataStructDims.kj_
+    /// Field: e012_DataStructDims.kj_
     ///
     /// Kernel cols.
     pub kj: Option<DimSize>,
-    /// Field: e011_DataStructDims.si_
+    /// Field: e012_DataStructDims.si_
     ///
     /// Stride along rows.
     pub si: Option<DimSize>,
-    /// Field: e011_DataStructDims.sj_
+    /// Field: e012_DataStructDims.sj_
     ///
     /// Stride along cols.
     pub sj: Option<DimSize>,
-    /// Field: e011_DataStructDims.zi_
+    /// Field: e012_DataStructDims.zi_
     ///
     /// Zero pad rows, at each side: top and bottom (`dsc/dims.h:187-193`).
     pub zi: Option<DimSize>,
-    /// Field: e011_DataStructDims.zj_
+    /// Field: e012_DataStructDims.zj_
     ///
     /// Zero pad cols, at each side: left and right (`dsc/dims.h:187-193`).
     pub zj: Option<DimSize>,
-    /// Field: e011_DataStructDims.symbolicDimInfo_
+    /// Field: e012_DataStructDims.symbolicDimInfo_
     ///
     /// The max and granularity of each symbolic dim. Presence here IS symbolic-ness, and when a dim
     /// is symbolic its main size above is set to the max (`dsc/dims.h:195-197`).
     pub symbolic_dim_info: BTreeMap<PrimaryDimTypes, SymbolicDimInfo>,
-    /// Field: e011_DataStructDims.maxSymbolicVolume_
+    /// Field: e012_DataStructDims.maxSymbolicVolume_
     ///
     /// A joint limit over several symbolic dims, usually below the product of their maxes.
     pub max_symbolic_volume: BTreeMap<BTreeSet<PrimaryDimTypes>, SymbolicVolume>,
-    /// Field: e011_DataStructDims.coreletSplit_
+    /// Field: e012_DataStructDims.coreletSplit_
     ///
     /// For each split dim, the amount of work per corelet, indexed by corelet id
     /// (`dsc/dims.cpp:633`).
     pub corelet_split: BTreeMap<PrimaryDimTypes, Vec<DimVal>>,
-    /// Field: e011_DataStructDims.rowSplit_
+    /// Field: e012_DataStructDims.rowSplit_
     ///
     /// For each split dim and corelet, the amount of work per PT row, indexed by row id
     /// (`dsc/dims.cpp:669`).
     pub row_split: BTreeMap<PrimaryDimTypes, BTreeMap<CoreletId, Vec<DimVal>>>,
-    /// Field: e011_DataStructDims.peSfpSplit_
+    /// Field: e012_DataStructDims.peSfpSplit_
     ///
     /// For each split dim and corelet, the amount of work for PE and for SFP.
     ///
@@ -643,7 +646,7 @@ pub struct DataStructDims {
     /// observable only as the key order of this one object inside `exportJson`.
     pub pe_sfp_split:
         BTreeMap<PrimaryDimTypes, BTreeMap<CoreletId, BTreeMap<SenComponent, DimVal>>>,
-    /// Field: e011_DataStructDims.paddingSizes_
+    /// Field: e012_DataStructDims.paddingSizes_
     ///
     /// For each primary dim that has a padded version, everything contributing to that padded size.
     pub padding_sizes: BTreeMap<PrimaryDimTypes, DimPaddingSizes>,
@@ -792,16 +795,22 @@ impl DataStructDims {
 
     /// The counterpart of `write` (`dsc/dims.cpp:131-150`), consuming sixteen whitespace-separated
     /// tokens from a shared cursor. The two-argument overload (`:126-130`) is the single-token
-    /// `std::stod` inlined here, and it is what is absent when a token is missing or unparsable.
+    /// `std::stod` inlined here.
     ///
-    /// ⛔ NOTHING IS WRITTEN UNLESS EVERY TOKEN PARSES, where IBM clears first and leaves the value
-    /// half-read; a negative token is the unfilled dim it encodes, not a parse failure.
+    /// ⛔ ONLY `-1` OR A FINITE NON-NEGATIVE SIZE IS TAKEN. A compiled authority stores `-5` and
+    /// `nan` as themselves and writes them back, takes `5abc` as 5 and `0x10` as 16, and terminates
+    /// on `1e400`; refusing all five is the alternative to rewriting the token as an unfilled dim.
+    /// ⛔ NOTHING IS WRITTEN UNLESS EVERY TOKEN PARSES, where IBM clears first and half-reads.
     #[must_use]
     pub fn read(&mut self, tokens: &mut std::str::SplitWhitespace<'_>) -> Option<()> {
         let mut dims = [None; 16];
         for slot in &mut dims {
             let value: f64 = tokens.next()?.parse().ok()?;
-            *slot = DimSize::new(value);
+            *slot = if value == -1.0 {
+                None
+            } else {
+                Some(DimSize::new(value)?)
+            };
         }
         self.clear();
         [
@@ -891,9 +900,12 @@ impl DataStructDims {
         );
     }
 
-    /// IBM's JSON dump, key order and spacing included (`dsc/dims.cpp:186-308`).
+    /// IBM's JSON dump, spacing and key order included (`dsc/dims.cpp:186-308`).
     /// `skip_deprecated_fields` drops the derived halves and the two to-be-removed compounds.
     ///
+    /// ⛔ EXCEPT THE `peSfpSplit_` INNER ORDER, WHICH NO TOTAL ORDER REPRODUCES: it is an
+    /// `unordered_map` (`dsc/dims.h:212-214`), and a compiled authority emits `{"sfp", "pe"}` for
+    /// one corelet and `{"pe", "sfp"}` for the next in the same object with the same two keys.
     /// ⛔ AN ABSENT `totalSize_` PRINTS `-1`, which is what IBM prints when the dim is unfilled
     /// (`dsc/dims.cpp:567-568`); where IBM instead `DT_ERROR`s there is no JSON to compare with.
     pub fn export_json(&self, skip_deprecated_fields: bool) -> String {
@@ -1078,8 +1090,9 @@ impl DataStructDims {
     /// The same field read rather than written — the second copy of that dispatch, which
     /// `primaryDimToVal_base_st` writes out again (`dsc/dims.cpp:526-551`).
     ///
-    /// ⭐ AN UNFILLED DIM AND `Undefined` ARE BOTH ABSENT HERE, which loses nothing: IBM's `-1` and
-    /// its `DT_ERROR` both leave `primaryDimToVal_st` with no value.
+    /// ⛔ AN UNFILLED DIM AND `Undefined` ARE BOTH ABSENT HERE AND IBM DISTINGUISHES THEM: its `-1`
+    /// is a value `primaryDimToVal_st` reports and its `DT_ERROR` is not. `own_dim_val` is the seam
+    /// that splits the two apart again.
     pub fn primary_dim_to_val_handler(&self, d: PrimaryDimTypes) -> Option<DimSize> {
         match d {
             PrimaryDimTypes::In => self.r#in,
@@ -1115,20 +1128,31 @@ impl DataStructDims {
                     info.max_size
                 }
             }
-            None => self
-                .primary_dim_to_val_handler(d)
-                .map_or(-1, |size| size.get() as i32),
+            None => self.own_dim_val(d)?.0,
         };
         let val = DimVal((f64::from(val) * dim_density.get()) as i32);
         self.calculate_padded(d, val, padded, get_symbolic_granularity)
     }
 
+    /// One dim's own field as IBM's if-chain reads it (`dsc/dims.cpp:530-556`): the stored size
+    /// truncated to an `int`, `-1` while the dim is unfilled, and absent only for the sentinel IBM
+    /// `DT_ERROR`s on.
+    fn own_dim_val(&self, d: PrimaryDimTypes) -> Option<DimVal> {
+        match self.primary_dim_to_val_handler(d) {
+            Some(size) => Some(DimVal(size.get() as i32)),
+            None if matches!(d, PrimaryDimTypes::Undefined) => None,
+            None => Some(DimVal(-1)),
+        }
+    }
+
     /// One dim's padded size (`dsc/dims.cpp:563-616`): unfilled stays unfilled, an unpadded dim is
     /// itself, and a padded one spans its window, stride and pads.
     ///
-    /// ⛔ ABSENT IS ALSO IBM'S FIVE `DT_ERROR`s: a compound dim, a padded dim with no
-    /// `paddingSizes_` entry, a negative pad, a pad type the branch does not support, and a window
-    /// dim whose own size is below 1.
+    /// ⛔ A NEGATIVE VALUE RETURNS `-1` AND IS NOT AN ABSENCE (`dsc/dims.cpp:567-568`). It
+    /// short-circuits every branch below — compound dims and a missing `paddingSizes_` entry
+    /// included — and it is the answer every caller asking after an unfilled dim gets.
+    /// ⛔ ABSENT IS IBM'S FIVE `DT_ERROR`s: a compound dim, a padded dim with no `paddingSizes_`
+    /// entry, a negative pad, a pad type the branch does not support, and a window dim below 1.
     pub fn calculate_padded(
         &self,
         d: PrimaryDimTypes,
@@ -1138,7 +1162,7 @@ impl DataStructDims {
     ) -> Option<DimVal> {
         let pad_type = padding.padding(d);
         if val.0 < 0 {
-            return None;
+            return Some(DimVal(-1));
         }
         if pad_type == PadType::NoPad {
             return Some(val);
@@ -1446,8 +1470,8 @@ impl DataStructDims {
     /// (`dsc/dims.cpp:781-804`). A dim that is not symbolic is left alone.
     ///
     /// ⛔ IBM ERASES THE SYMBOLIC ENTRY BEFORE IT READS THE DIM, so the value it divides is the
-    /// plain field and not the max — with no split, no padding and full density that is exactly what
-    /// `primaryDimToValHandler_st` holds (`dsc/dims.cpp:787-792`).
+    /// plain field and not the max — with no split, no padding and full density that is `-1` while
+    /// the dim is unfilled, which a ratio of one carries straight back (`dsc/dims.cpp:787-792`).
     /// ⛔ ABSENT IS IBM'S `DT_CHECK`s: max a whole number of granules, ratio non-zero, and every
     /// value divisible by it. Nothing is written in that case.
     #[must_use]
@@ -1469,7 +1493,7 @@ impl DataStructDims {
                 None
             }
         };
-        let value = divide(DimVal(self.primary_dim_to_val_handler(dim)?.get() as i32))?;
+        let value = divide(self.own_dim_val(dim)?)?;
         let corelet = match self.corelet_split.get(&dim) {
             Some(split) => Some(
                 split
@@ -1905,13 +1929,14 @@ mod unit_tests {
         dims
     }
 
-    /// A negative dim is the unfilled encoding, never a value, and NaN is not a size either.
+    /// A negative dim is the unfilled encoding, never a value, and the non-finite is not a size.
     #[test]
     fn a_dim_size_refuses_the_unfilled_encoding() {
         assert_eq!(size(64.0).map(DimSize::get), Some(64.0));
         assert_eq!(size(0.0).map(DimSize::get), Some(0.0));
         assert_eq!(size(-1.0), None);
         assert_eq!(size(f64::NAN), None);
+        assert_eq!(size(f64::INFINITY), None, "an infinite dim is not a size");
         assert_eq!(DimDensity::new(1.0), Some(DimDensity::FULL));
         assert_eq!(DimDensity::new(0.0), None);
         assert_eq!(DimDensity::new(1.5), None);
@@ -1958,6 +1983,11 @@ mod unit_tests {
 
     /// The DGP line is sixteen dims at `std::ostream`'s six significant digits, an empty object
     /// writes nothing, and `read` takes them back and recompounds.
+    ///
+    /// ⛔ THE EIGHT REFUSED TOKENS ARE MEASURED AGAINST A COMPILED AUTHORITY, and it agrees on only
+    /// three: `abc`, `-` and `1e400` terminate it, while `-5`, `nan` and `inf` are stored and
+    /// written straight back and `std::stod` reads `5abc` as 5 and `0x10` as 16. The first three of
+    /// those five are what this port used to take and silently rewrite as an unfilled dim.
     #[test]
     fn write_states_sixteen_dims_and_read_takes_them_back() {
         let mut text = String::new();
@@ -1979,9 +2009,17 @@ mod unit_tests {
         let mut read_back = DataStructDims::default();
         assert_eq!(read_back.read(&mut line.split_whitespace()), Some(()));
         assert_eq!(read_back, source, "the compound dims are recomputed");
+        const REST: &str = " 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1";
+        for token in ["abc", "-", "1e400", "-5", "nan", "inf", "5abc", "0x10"] {
+            let line = format!("{token}{REST}");
+            let mut refused = DataStructDims::default();
+            assert_eq!(refused.read(&mut line.split_whitespace()), None, "{token}");
+            assert!(refused.empty(), "{token} left nothing behind");
+        }
         assert_eq!(
-            DataStructDims::default().read(&mut "64 nan-a-number".split_whitespace()),
-            None
+            DataStructDims::default().read(&mut "1 2 3".split_whitespace()),
+            None,
+            "a short line is sixteen tokens short of one"
         );
     }
 
@@ -2039,7 +2077,8 @@ mod unit_tests {
         }
     }
 
-    /// IBM's JSON text, key order, spacing and the integer set key included.
+    /// IBM's JSON text, spacing and the integer set key included — the `peSfpSplit_` inner order
+    /// excepted, which is an `unordered_map`'s and not a function of its keys at all.
     #[test]
     fn export_json_is_the_authoritys_text() {
         let mut dims = filled();
@@ -2161,8 +2200,8 @@ mod unit_tests {
         assert_eq!(unfilled.primary_dim_to_val_handler(D::Undefined), None);
         assert_eq!(
             unfilled.primary_dim_to_val(D::Mb),
-            None,
-            "an unfilled dim has no value, which is what L3DlOpsScheduler.cpp:111 skips on"
+            Some(DimVal(-1)),
+            "`L3DlOpsScheduler.cpp:111` skips on `== -1`, so -1 is a value and not an absence"
         );
     }
 
@@ -2241,6 +2280,10 @@ mod unit_tests {
     }
 
     /// The padded size of a windowed dim, of a full-span one, and the four cases that have none.
+    ///
+    /// ⛔ A NEGATIVE VALUE IS `-1`, NOT AN ABSENCE. The assertion below read `None` and passed,
+    /// which is how a green test pinned the divergence: a compiled authority returns `-1` from
+    /// `dsc/dims.cpp:567-568` before it has looked at the pad type at all.
     #[test]
     fn calculate_padded_spans_the_window_and_refuses_what_ibm_refuses() {
         let mut dims = DataStructDims::default();
@@ -2282,7 +2325,11 @@ mod unit_tests {
             Some(DimVal(16))
         );
         assert_eq!(padded(D::In, 10, PadType::PaddedWZeroPad), None);
-        assert_eq!(padded(D::J, -1, PadType::PaddedWZeroPad), None);
+        assert_eq!(
+            padded(D::J, -1, PadType::PaddedWZeroPad),
+            Some(DimVal(-1)),
+            "an unfilled dim stays unfilled"
+        );
         assert_eq!(
             padded(D::Ij, 49, PadType::PaddedFullSpan),
             None,
@@ -2293,6 +2340,51 @@ mod unit_tests {
             None,
             "a padded dim with no padding sizes has none either"
         );
+    }
+
+    /// An unfilled dim answers `-1` and is not an absence: IBM returns it from `calculate_padded`
+    /// ahead of every other branch (`dsc/dims.cpp:567-568`), so it reaches `primaryDimToVal_st` and
+    /// the ratio-of-one divide in `makeDimNotSymbolic` as a value.
+    ///
+    /// ⛔ THE SENTINEL IS THE NEGATIVE CONTROL: it is the one absence, because IBM `DT_ERROR`s on it
+    /// (`dsc/dims.cpp:554-556`). A compiled authority answers `-1` to every other row here, and
+    /// `makeDimNotSymbolic` on an unfilled dim with a ratio of one returns having erased the entry.
+    #[test]
+    fn an_unfilled_dim_is_minus_one_and_only_the_sentinel_is_absent() {
+        const EVERY_PAD: [PadType; 6] = [
+            PadType::NoPad,
+            PadType::LoweredPadded,
+            PadType::PaddedNoZeroPad,
+            PadType::PaddedWZeroPad,
+            PadType::PaddedFullSpan,
+            PadType::PaddedFullSpanWUnneeded,
+        ];
+        let unfilled = DataStructDims::default();
+        assert_eq!(unfilled.primary_dim_to_val(D::Mb), Some(DimVal(-1)));
+        assert_eq!(unfilled.primary_dim_to_val(D::Undefined), None);
+        for pad in EVERY_PAD {
+            assert_eq!(
+                unfilled.calculate_padded(
+                    D::J,
+                    DimVal(-1),
+                    &PaddingFormType::new(D::J, pad),
+                    false
+                ),
+                Some(DimVal(-1)),
+                "{pad:?} is short-circuited"
+            );
+        }
+        let mut symbolic = DataStructDims::default();
+        symbolic.symbolic_dim_info.insert(
+            D::In,
+            SymbolicDimInfo {
+                max_size: 64,
+                granularity: 64,
+            },
+        );
+        assert_eq!(symbolic.make_dim_not_symbolic(D::In), Some(()));
+        assert_eq!(symbolic.r#in, None, "-1 divided by one is still unfilled");
+        assert!(!symbolic.symbolic_dim_info.contains_key(&D::In));
     }
 
     /// A named row reads `rowSplit_`, a PE or SFP reads `peSfpSplit_`, and with no corelet named the
