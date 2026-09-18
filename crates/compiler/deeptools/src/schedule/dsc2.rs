@@ -90,9 +90,19 @@ pub struct DimSize(pub i32);
 /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:333-348`) — which is why a chunk
 /// entry carries an index AND a dim, and why the two are not interchangeable.
 ///
-/// ⭐ UNSIGNED BECAUSE EVERY PRODUCER IS: the two DDC writers pass the stick-size loop counter
-/// (`ddc/ddcv1.cpp:524-525`) or a layout position offset past the stick dims (`:1591-1598`), and
-/// bridge 1 passes `i` (`SNTransferLowering.cpp:631`). The authority's `-1` initialiser is [`None`].
+/// ⭐ UNSIGNED BECAUSE THE ONE LIVE PRODUCER IS: `populateUnitTimeTransfers` pushes the stick-size
+/// loop counter (`ddc/ddcv1.cpp:524-525`) and bridge 1 assigns `i`
+/// (`SNTransferLowering.cpp:631`). The authority's `-1` initialiser is [`None`].
+///
+/// ⛔ THE SECOND DDC WRITER IS NEITHER LIVE NOR NON-NEGATIVE, so it is not evidence for that
+/// choice and must not be cited as such. `sizeIdx = getDimIndexInLayoutOrder(dsType, IN)
+/// + tensorSizes.size()` (`ddc/ddcv1.cpp:1588-1591`, pushed at `:1597-1598`) sits inside the
+/// lambda `checkAndResetUnitTimeTransfer` (`:1557-1645`) whose only callsite is commented out
+/// (`:1649-1650`), and `getDimIndexInLayoutOrder` returns `-1` for a dim absent from
+/// `layoutDimOrder_` (`dsc/designSpaceConfig.cpp:429-438`) — so that expression is `-1 + n`, and
+/// is `-1` itself whenever `getStickSizes` came back empty. Were the callsite ever restored, this
+/// type would have to tell that computed `-1` apart from the initialiser's absent one, which
+/// [`Option<SizeIdx>`](Option) cannot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SizeIdx(pub u32);
 
@@ -1744,6 +1754,47 @@ mod unit_tests {
         );
         assert!(constants.values().any(|c| c.name == "useZeroMean"));
     }
+
+    /// ⛔ BOTH OF A TRANSFER NODE'S MAPS ARE ITERATED BY THE JSON EXPORTER, so their key order is
+    /// observable output and not an implementation detail: `coreIdToGTRInfo_` emits one object per
+    /// core keyed by `std::to_string(coreId)` (`dsc/dsc2.cpp:627-629`) and `transferSize_` emits
+    /// `primaryDimToString.at(dim)` keys inline (`:641-647`). This pins the two [`BTreeMap`]s to the
+    /// `std::map` order the authority writes — insertion order must NOT survive.
+    #[test]
+    fn a_transfer_nodes_two_maps_emit_their_keys_in_the_authoritys_order() {
+        let mut node = TransferNode::default();
+
+        // Inserted in neither key order nor reverse key order, so passing means the map reordered.
+        for dim in [
+            PrimaryDimTypes::X1,
+            PrimaryDimTypes::In,
+            PrimaryDimTypes::Kij,
+            PrimaryDimTypes::Undefined,
+            PrimaryDimTypes::Mb,
+        ] {
+            node.transfer_size.insert(dim, DimSize(dim as i32));
+        }
+        // The spelling and the sequence the exporter's `for` loop writes, verbatim.
+        assert_eq!(
+            node.transfer_size
+                .keys()
+                .map(|dim| dim.name())
+                .collect::<Vec<_>>(),
+            ["in", "mb", "kij", "x1", "undefined"],
+            "transferSize_ must emit in the authority's discriminant order (`dsc/dims.h:34-48`)"
+        );
+
+        for core in [CoreId(9), CoreId(0), CoreId(4)] {
+            node.core_id_to_gtr_info
+                .insert(core, GroupTagRegInfo::default());
+        }
+        // `std::to_string(coreId)` over an ascending `int` key, which is `CoreId`'s derived `Ord`.
+        assert_eq!(
+            node.core_id_to_gtr_info.keys().copied().collect::<Vec<_>>(),
+            [CoreId(0), CoreId(4), CoreId(9)],
+            "coreIdToGTRInfo_ must emit in ascending core id order"
+        );
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -2389,9 +2440,13 @@ impl LoopDistributionCat {
 /// of [`TransferNode`]'s memory questions are `memories.count(x.storage_) == 0`
 /// (`dsc/dsc2.cpp:4364-4383`). Both halves hold the same enum, so only the callsite says which.
 ///
-/// ⛔ `nonCoreletMemories` AND `directAddressableMemories` ARE DIFFERENT, SMALLER SETS declared
-/// beside it (`dsc/dscdefn.h:519-520`, filled `dsc/dscdefn.cpp:145-150`) — no unit on this worklist
-/// reads either, so neither is ported here and neither may be substituted for this one.
+/// ⛔ `nonCoreletMemories` (five components) AND `directAddressableMemories` (seven) ARE DIFFERENT,
+/// SMALLER SETS declared beside it (`dsc/dscdefn.h:519-520`, filled `dsc/dscdefn.cpp:145-146` and
+/// `:149-150`), AND BOTH ARE READ BY IN-SCOPE UNITS — not, as recorded before, by none:
+/// `e307_exploreAssignDataStages` reads `directAddressableMemories` (`ddc/ddcv1.cpp:677`) and
+/// `e260_fillLoopOffsetsAndAddresses` reads `nonCoreletMemories` (`:2415`). Each gets its own
+/// constant when its unit lands. Neither may be substituted for this one, and this one may not be
+/// substituted for either.
 ///
 /// ⛔ NOT `ddc::memories`, WHICH IS A DIFFERENT AND SMALLER SET — eight components, without
 /// `L0_SCALE`, `LRFREG`, `L3LUIBR`, `L3SUIBR`, `PESTATE`, `SFPSTATE`, `LXLUSCALEREG` or `QGI`
@@ -2505,9 +2560,9 @@ pub struct SizeAndIndex {
     /// ⛔ THE DDC'S TWO WRITES ARE NOT THE SAME SHAPE, AND ONLY ONE IS IN PLACE. The 4B-splat path
     /// mutates the STORED entry: `unitTimeTransferChunkSize_[0].sizeDim_.size_ *= 4`, guarded by a
     /// `DT_CHECK` that it was 1 (`ddc/ddcv1.cpp:544-546`). The hole split does not: it takes a COPY
-    /// (`auto sizeDim = uttChunkSize[i]`, `:1638`), accumulates `unitTimeTransferNumChunks_` from
+    /// (`auto sizeDim = uttChunkSize[i]`, `:1637`), accumulates `unitTimeTransferNumChunks_` from
     /// it, sets THE COPY's extent to 1, appends that to `unitTimeTransferChunkStride_`
-    /// (`:1639-1641`), and then ERASES the source entries from `unitTimeTransferChunkSize_`
+    /// (`:1638-1640`), and then ERASES the source entries from `unitTimeTransferChunkSize_`
     /// (`:1642-1643`) — so nothing in the chunk-size vector is ever left holding the 1.
     pub size_dim: Size,
     /// Field: e023_TransferNode.srcSizeIdx_
@@ -2531,13 +2586,17 @@ pub struct SizeAndIndex {
 ///
 /// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE: no map is keyed by this enum, it has no spelling, the
 /// JSON round trip does not carry it, and every use is an `==` or `!=` against a named enumerator
-/// (`ddc/ddcv1.cpp:448`, `:471-475`, `:1050`, `:2325-2327`,
+/// (`ddc/ddcv1.cpp:448`, `:471-477`, `:1050`, `:2325-2329`,
 /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4135`, `:7108`, `:7886`, `dsc/dsc2.cpp:3483-3501`).
 ///
-/// ⛔ `INVALID_TRANSFER_TYPE` IS REACHABLE AND MEANS "NEITHER END IS A TENSOR": it is the
-/// fallthrough of the five tests (`dsc/dsc2.h:895`), and
-/// `getBlockTransferSizePerDimCustomLocation` answers with an empty size map on it rather than
-/// refusing (`dsc/dsc2.cpp:3483-3485`).
+/// ⛔ `INVALID_TRANSFER_TYPE` MEANS "NEITHER END IS A TENSOR", AND IT IS A REFUSAL — NOT, as
+/// recorded before, a handled case answered with an empty size map. It is the fallthrough of the
+/// five tests (`dsc/dsc2.h:895`), and the one reader that can see it,
+/// `getBlockTransferSizePerDimCustomLocation` (`dsc/dsc2.cpp:3471-3472`), answers it with
+/// `DT_ERROR("Transfer must have lds or constant id set")` at the very lines cited before,
+/// `:3483-3484`, before it puts anything into its size map. So the variant exists to be MATCHED AND
+/// REJECTED: a port of that function must refuse here and must not fabricate an empty map. The
+/// other six `getTransferType` readers compare against a named enumerator and take no branch for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransferType {
     ConstantToConstant = 0,
@@ -2626,9 +2685,19 @@ pub struct TransferNode {
     /// Field: e023_TransferNode.unitTimeTransferChunkSize_
     ///
     /// "Continuous elements within a stick" (`dsc/dsc2.h:835-836`) — the contiguous dims of one
-    /// unit-time transfer, ordered as the stick sizes are and then extended with layout dims
-    /// (`ddc/ddcv1.cpp:524-525`, `:1597-1598`). Bridge 1 multiplies the extents into the element
-    /// count of one `agen` access (`SNTransferLowering.cpp:33-38`).
+    /// unit-time transfer, ONE PER STICK SIZE AND IN STICK ORDER, which is all the one live producer
+    /// emits (`ddc/ddcv1.cpp:524-525`). Bridge 1 multiplies the extents into the element count of
+    /// one `agen` access (`SNTransferLowering.cpp:33-38`).
+    ///
+    /// ⛔ IT IS NEVER "EXTENDED WITH LAYOUT DIMS" ON A LIVE PATH, as recorded before. The append of
+    /// an out-of-stick `IN` entry (`:1597-1598`) and the erase that truncates this vector
+    /// (`:1642-1643`) both sit inside `checkAndResetUnitTimeTransfer` (`:1557-1645`) — the same dead
+    /// lambda that owns [`unit_time_transfer_chunk_stride`](Self::unit_time_transfer_chunk_stride)'s
+    /// only writer, whose callsite is commented out at `:1649-1650`. So live, this vector's length
+    /// is the stick count, each entry's index equals its own position, and the two invariants the
+    /// lambda would break — that length, and `DT_CHECK(uttChunkSize.size() == tensorSizes.size())`
+    /// at `:1568` — are unreachable. After minting, the 4B-splat mutation of entry 0 (`:544-546`) is
+    /// the only DDC write that reaches it.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
     /// Field: e023_TransferNode.unitTimeTransferNumChunks_
     ///
@@ -2642,14 +2711,14 @@ pub struct TransferNode {
     ///
     /// The dims the chunks stride over — the entries the hole split removed from
     /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size), each with its extent
-    /// set to 1 (`dsc/dsc2.h:838`, `ddc/ddcv1.cpp:1635-1642`).
+    /// set to 1 (`dsc/dsc2.h:838`, `ddc/ddcv1.cpp:1636-1643`).
     ///
     /// ⛔ NO LIVE C++ PRODUCER FILLS THIS. Its one writer is inside the lambda
     /// `checkAndResetUnitTimeTransfer` (`ddc/ddcv1.cpp:1640`), whose sole callsite is commented out
-    /// (`:1648-1650`), so outside the JSON importer (`dsc/dsc2.cpp:1573-1584`) it is always empty —
+    /// (`:1649-1650`), so outside the JSON importer (`dsc/dsc2.cpp:1573-1584`) it is always empty —
     /// which is why the `size() <= 1` check at `dsc/dsc2.cpp:3555` never fires and why bridge 1's
     /// own refusal of more than one stride dim (`SNTransferLowering.cpp:324-331`) is never reached.
-    /// It is carried rather than dropped because bridge 1 reads it in eight places (`:930`, `:1270`,
+    /// It is carried rather than dropped because bridge 1 reads it in seven places (`:930`, `:1270`,
     /// `:1713`, `:1723`, `:2227`, `:2256`, `:2454`) and a JSON-imported tree can carry it.
     pub unit_time_transfer_chunk_stride: Vec<SizeAndIndex>,
     /// Field: e023_TransferNode.rotateNumElements_
@@ -2662,6 +2731,11 @@ pub struct TransferNode {
     /// The group tag register each core uses for this transfer — L3 only, as the authority's own
     /// comment says (`dsc/dsc2.h:840`). The L3 scheduler writes it one core at a time and refuses to
     /// overwrite an entry (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4836`, `:5249-5260`).
+    ///
+    /// ⛔ AND ITS KEY ORDER IS OBSERVABLE, WHICH IS WHY IT IS A [`BTreeMap`] AND NOT A HASH MAP: the
+    /// JSON exporter ITERATES it and emits one object per core (`dsc/dsc2.cpp:627-629`), so the
+    /// `std::map`'s ascending-core-id order reaches the emitted DSC. [`CoreId`]'s derived [`Ord`] is
+    /// that same numeric order over the `int` key `std::stoi` reads back (`dsc/dsc2.cpp:1599`).
     pub core_id_to_gtr_info: BTreeMap<CoreId, GroupTagRegInfo>,
     /// Field: e023_TransferNode.transferSize_
     ///
@@ -2671,6 +2745,14 @@ pub struct TransferNode {
     /// `count(dim)` says so (`dsc/dsc2.cpp:3561-3562`), while two fill sites require the map to be
     /// EMPTY first (`dsc/dsc2.cpp:4776-4777`,
     /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7897-7905`).
+    ///
+    /// ⛔ BUT `count`/`at` ARE NOT ITS ONLY READERS, AND THE ONE THAT WAS MISSED IS THE ORDER-BEARING
+    /// ONE: the JSON exporter iterates this map too and emits `primaryDimToString.at(dim)` keys in
+    /// `std::map` order (`dsc/dsc2.cpp:641-647`). [`BTreeMap`] reproduces that order only because
+    /// [`PrimaryDimTypes`]'s Rust discriminants are the authority's (`dsc/dims.h:34-48`), so the
+    /// derived [`Ord`] and `operator<` on the C++ enum agree. A hash map here — or a reordering of
+    /// that enum — would silently reorder emitted JSON, which is why the enum's own discriminant
+    /// guard and this container are one decision and not two.
     pub transfer_size: BTreeMap<PrimaryDimTypes, DimSize>,
 }
 
@@ -3611,6 +3693,34 @@ impl ComputeNode {
 /// ⛔ THIS CARRIES ONE OF CONDITIONNODE'S TWO GUARDS, so the `e025_ConditionNode` anchor below stays
 /// open. `loopCond_` (`:690`) is a `LoopCondComposite` — e022, blocked behind e018's
 /// `const LoopNode* loopComp_`, which is schedule-node pointer identity.
+///
+/// ⛔ AND THAT BLOCK IS IDENTITY AND NOT EQUALITY, which is what a port must supply before e022 can
+/// land: `LoopCondComposite::adjustConditionForSplitLoop` selects a term by
+/// `loopComp_ != origLoop` and rewrites it to `newLoops.at(0)` (`dsc/dsc2.cpp:2071-2076`), then
+/// rebuilds the enclosing conjunction by comparing every term against `newLoops.at(0)` AGAIN
+/// (`:2126-2132`) — so two terms of one conjunction that both named `origLoop` are
+/// indistinguishable once the first has been substituted, and the rebuild replaces BOTH. Nothing in
+/// that function reads a loop's contents, so an index or a name will not do.
+///
+/// ⛔ AND E022 HAS TWO CARRIERS, NOT ONE: besides `loopCond_` here, `DdlInterface::CondProp` holds
+/// one (`ddc/ddl/ddl_conversion.h:418-420`), and it is that copy the DDL front end toggles and then
+/// refuses on (`ddc/ddl/ddl_conversion.cpp:326`, `:381-394`). Both must reach the same Rust type.
+///
+/// ⛔ `negated_` IS A PARITY TOGGLE AT BOTH WRITERS AND IS NEVER SET: `^= true` when the else branch
+/// carries the condition (`ddc/ddc_transformation_util.cpp:592`) and `= !` under a `condNot`
+/// (`ddc/ddl/ddl_conversion.cpp:326`). ⭐ THAT SECOND ONE IS GUARDED BY THE SAME DISCRIMINATOR AS
+/// `hasCoreClCond()` — `!twoLevelOrOfAnds_.empty()` (`:325`) — so a `condNot` over an EMPTY
+/// composite negates `coreClCond_` instead and leaves this flag alone. A port that toggles
+/// unconditionally inverts a core/corelet condition twice.
+///
+/// ⛔ AND THE SPLIT DISPATCH IS CLOSED, WITH FOUR REFUSALS, none of which is a branch a caller can
+/// take: an empty `newLoops` (`dsc/dsc2.cpp:2064`), a `condValType_` outside `FIRST`/`LAST`
+/// (`:2082-2084`), the four always-true/always-false pairings `(GT,LAST)`, `(LT,FIRST)`,
+/// `(LE,LAST)`, `(GE,FIRST)` (`:2087-2099`), and anything outside `EQ` / `NE` / `(GT,FIRST)` /
+/// `(LT,LAST)` (`:2136`). The first two are total over closed enums and belong in the type; the
+/// always-true/false four are a `(CondOp, CondValType)` PAIR, and the authority's own comment says
+/// the DDL parser was supposed to simplify them away (`:2097-2098`), so they are a guard on the
+/// pairing and not on either enum alone.
 ///
 /// ⛔ AND THE DISCRIMINATOR IS THAT MISSING FIELD, NOT THIS ONE: `hasCoreClCond()` answers
 /// `loopCond_.twoLevelOrOfAnds_.empty()` (`:693-695`) and never looks at `coreClCond_`. A node with
