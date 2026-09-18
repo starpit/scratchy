@@ -156,7 +156,7 @@ pub struct Constraints {
     /// Field: e029_Metadata.loopDimKind_
     ///
     /// Which quantity of the dim the relative multiple applies to (`ddc/ddc_metadata.h:36`);
-    /// `Padded` makes the check use the padded size (`ddc/ddcv1.cpp:865-880`).
+    /// `Padded` makes the check use the padded size (`ddc/ddcv1.cpp:867-880`).
     ///
     /// ⛔ NOT AN `Option`: the authority's not-set IS `MetaDimKind::Count`, which
     /// [`MetaDimKind::Undefined`] carries, and both readers compare against it by hand
@@ -232,8 +232,9 @@ impl Constraints {
     /// [`DataStructDims::export_json`](crate::schedule::dims::DataStructDims::export_json) is.
     ///
     /// ⛔ FLOATS ARE SPELLED RUST'S WAY: `{}` is shortest-round-trip where C++'s `operator<<` gives
-    /// six significant digits, so a third prints `0.33333334` and not `0.333333`. Nothing parses
-    /// this text back.
+    /// six significant digits, so a third prints `0.33333334` and not `0.333333`. C++ also switches
+    /// to exponent form at and above `1e6` and below `1e-4` (`1e+06`, `1e-05`) where `{}` never
+    /// does. Nothing parses this text back.
     pub fn dump(&self) -> String {
         let mut text = String::from(if self.must_be_multiple {
             "mustBeMultiple_= T "
@@ -270,7 +271,7 @@ impl Constraints {
 ///
 /// ⭐ ITS ABSENCE FROM [`Metadata::datastages`] IS WHAT "EXTERNAL" MEANS: every loop over the sorted
 /// stages skips the ids the map does not hold, `// external` in the authority's own comment
-/// (`ddc/ddcv1.cpp:747-750`, `:1231-1232`, `:1345`).
+/// (`ddc/ddcv1.cpp:688`, `:742`, `:751-752`, `:1232-1233`, `:1342`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Datastage {
     /// Field: e029_Metadata.constraints_
@@ -343,7 +344,10 @@ pub type TransferAccessPatternPerDim = BTreeMap<PrimaryDimTypes, TransferAccessP
 /// (`ddc/ddc_metadata.h:88-118`). Its own eight fields plus the access-pattern list behind them.
 ///
 /// ⭐ ITS READER IS `fillLoopOffsetsAndAddresses`, which picks exactly ONE of the offset branches
-/// per transfer, in this field order (`ddc/ddcv1.cpp:2879-3040`).
+/// per transfer, and ⛔ NOT IN DECLARATION ORDER: the chain is `apply_row_offset_src_` (`:2881`),
+/// `apply_row_offset_dst_` (`:2895`), `replicated_` (`:2913`), `apply_pe_sfp_split_offset_src_`
+/// (`:2967`), `apply_pe_sfp_split_offset_dest_` (`:2999`), so `replicated_` outranks both PE/SFP
+/// fields declared above it (`ddc/ddcv1.cpp:2879-3040`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DataTransfer {
     /// Field: e029_Metadata.apply_row_offset_src_
@@ -365,9 +369,11 @@ pub struct DataTransfer {
     pub apply_pe_sfp_split_offset_src: bool,
     /// Field: e029_Metadata.apply_pe_sfp_split_offset_dest_
     ///
-    /// The destinations that take that offset, by INDEX into `dstVias_`
-    /// (`ddc/ddc_metadata.h:93`, pushed at `ddc/ddc_transformation_util.cpp:1642`, indexed at
-    /// `ddc/ddcv1.cpp:2999-3040`). `usize` makes a negative destination unrepresentable.
+    /// The destinations that take that offset, by INDEX into `dstLdsAndLoopOffsets_` — the vector
+    /// that bounds the push (`ddc/ddc_transformation_util.cpp:1637`, pushed at `:1642`) and the one
+    /// the reader indexes (`dstLdsAndLoopOffsets_.at(destInd)`, `ddc/ddcv1.cpp:3027`). `dstVias_` is
+    /// only what the push TESTS (`:1638-1640`). `ddc/ddc_metadata.h:93`; `usize` makes a negative
+    /// destination unrepresentable.
     pub apply_pe_sfp_split_offset_dest: Vec<usize>,
     /// Field: e029_Metadata.replicated_
     ///
@@ -568,18 +574,32 @@ impl Default for DdcTransformationConfig {
 /// (`:193-194`, written at `L3DlOpsScheduler.cpp:6420-6421`), it has one `apply_row_offset_` where
 /// this has two, and it has no `Constraints::cannotBeSymbolic_`. It is not a scheduled unit.
 ///
+/// ⛔ NOT `Clone`: THE AUTHORITY DELETES THE COPY TWICE OVER — the `const int core_dstgid` and
+/// `chunk_dstgid` (`ddc/ddc_metadata.h:211-212`) delete copy- AND move-ASSIGNMENT, and the
+/// `std::vector<ExternalTransfer>` of `unique_ptr`s (`:130-137`) deletes copy-CONSTRUCTION. Hence
+/// `clear()` destroys in place (`:224-228`) where the near-duplicate, whose ids are mutable, gets
+/// away with `*this = {}` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.h:197`).
+/// ```compile_fail
+/// let _ = deeptools::schedule::metadata::Metadata::default().clone();
+/// ```
+/// [`Datastage`] declares neither (`ddc/ddc_metadata.h:32-81`) and does copy — the control that
+/// proves the block above fails on the missing `Clone` and not on the doctest's shape:
+/// ```
+/// let _ = deeptools::schedule::metadata::Datastage::default().clone();
+/// ```
+///
 /// A data-stage id is not a labelled-DS index, so keying the wrong map is a compile error:
 /// ```compile_fail
 /// use deeptools::schedule::dsc2::LdsIdx;
 /// use deeptools::schedule::metadata::Metadata;
 /// let _ = Metadata::default().datastages.get(&LdsIdx(0));
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Metadata {
     /// Field: e029_Metadata.datastages_
     ///
     /// The INTERNAL data stages, by id (`ddc/ddc_metadata.h:82`). An id the map does not hold is an
-    /// external stage and every loop over the sorted stages skips it (`ddc/ddcv1.cpp:747-750`).
+    /// external stage and every loop over the sorted stages skips it (`ddc/ddcv1.cpp:742`, `:1342`).
     pub datastages: BTreeMap<DataStageId, Datastage>,
     /// Field: e029_Metadata.rowSplitDim
     ///
@@ -596,8 +616,9 @@ pub struct Metadata {
     /// The dims split across corelets (`ddc/ddc_metadata.h:214`), copied from the core stage's
     /// `coreletSplit_` (`ddc/ddcv1.cpp:2093-2096`).
     ///
-    /// ⛔ IT IS PASSED EMPTY TO `finalizeExternalDataStage` THREE LINES BEFORE IT IS FILLED
-    /// (`ddc/ddcv1.cpp:2086-2088` against `:2093-2096`), so that callee sees no corelet split.
+    /// ⛔ IT IS PASSED EMPTY TO `finalizeExternalDataStage`, FROM THE LOOP THAT RUNS TO COMPLETION
+    /// BEFORE IT IS FILLED (`ddc/ddcv1.cpp:2085-2091` against `:2093-2096`), so that callee sees no
+    /// corelet split.
     pub cl_split_dims: BTreeSet<PrimaryDimTypes>,
     /// Field: e029_Metadata.peSfpSplitDims_
     ///
@@ -657,8 +678,9 @@ impl Default for Metadata {
 }
 
 impl Metadata {
-    /// The core data stage's id — `const int core_dstgid = 0` (`ddc/ddc_metadata.h:211`). `run_v1`
-    /// checks that stage 0 is really named `"core"` (`ddc/ddcv1.cpp:2282-2285`).
+    /// The core data stage's id — `const int core_dstgid = 0` (`ddc/ddc_metadata.h:211`).
+    /// `attachToPrefilledSchedule`, not `run_v1`, checks that stage 0 is really named `"core"` and
+    /// stage 1 `"chunk"` (`ddc/ddcv1.cpp:2280-2286`).
     pub const CORE_DSTGID: DataStageId = DataStageId(0);
 
     /// The chunk data stage's id — `const int chunk_dstgid = 1` (`ddc/ddc_metadata.h:212`). A loop
@@ -868,26 +890,29 @@ mod unit_tests {
         );
     }
 
-    /// `ddc/ddl/ddl_conversion.cpp:1656-1667`: a name ending in `_unroll` costs one more register
-    /// per unroll step, and `ddc/ddcv1.cpp:267-269` charges `regs + (unroll - 1) * unrollRegs`.
+    /// `ddc/ddc_metadata.h:198-199`: the unroll-register count is a SEPARATE field from the register
+    /// list, because only the names ending in `_unroll` are charged again per step
+    /// (`ddc/ddl/ddl_conversion.cpp:1663-1665`, spent at `ddc/ddcv1.cpp:267-269`). Both counts are
+    /// carried; the charge itself belongs to `exploreOpMapping`, which no ported method owns yet, so
+    /// nothing here re-derives it.
     #[test]
-    fn an_opaque_op_counts_only_the_unroll_registers_again_per_step() {
+    fn an_opaque_ops_unroll_register_count_is_not_its_register_count() {
         let mut opaque = OpaqueOp::default();
         assert_eq!(opaque.max_unroll, 1);
         assert_eq!(opaque.lds_idx, None);
+        assert!(opaque.internal_regs.is_empty());
+        assert_eq!(opaque.internal_regs_with_unroll, 0);
 
-        for name in ["acc", "tmp_unroll"] {
-            if name.ends_with("_unroll") {
-                opaque.internal_regs_with_unroll += 1;
-            }
-            opaque.internal_regs.push(String::from(name));
-        }
+        opaque.internal_regs.push(String::from("acc"));
+        opaque.internal_regs.push(String::from("tmp_unroll"));
+        opaque.internal_regs_with_unroll = 1;
         opaque.max_unroll = 4;
         opaque.lds_idx = Some(LdsIdx(7));
 
-        let unroll = 3;
-        let regs = opaque.internal_regs.len() as i32 + (unroll - 1) * opaque.internal_regs_with_unroll;
-        assert_eq!(regs, 4);
+        assert_eq!(opaque.internal_regs.len(), 2);
+        assert_eq!(opaque.internal_regs_with_unroll, 1);
+        assert_eq!(opaque.max_unroll, 4);
+        assert_eq!(opaque.lds_idx, Some(LdsIdx(7)));
     }
 
     /// `ddc/ddc_metadata.h:224-228` — `clear()` re-constructs the table, so every carried field goes

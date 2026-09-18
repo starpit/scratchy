@@ -200,7 +200,11 @@ fn ddc_coord_env_option() -> Option<String> {
 /// use deeptools::schedule::ddc::{Ddc, TransformationReportLevel, Verbosity};
 /// let _ = Ddc::new(TransformationReportLevel(0), false, Verbosity(0), "");
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// ⛔ NOT `Clone`, AND NEITHER IS `class Ddc`: [`Ddc::metadata`] alone deletes its copy-construction
+/// (`ddc/ddc_metadata.h:130-137`) and its copy-assignment (`:211-212`), and the `const
+/// DesignSpaceConfigGlobal&` at `ddc/ddc.h:37` deletes copy-assignment a second time over.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Ddc {
     /// Field: e032_Ddc.verbose_
     ///
