@@ -319,29 +319,54 @@ impl NodeType {
 ///
 /// `dsc/dsc2.h:486-498`. One dimension paired with its extent — an entry of a unit view's
 /// `sizesNoGaps_`/`sizesWithGaps_` (`:506`, `:509`), of `StickMaskNode::stickLayout_` (`:1063`),
-/// and the whole of one unit-time transfer chunk's `sizeDim_` (`:821`).
+/// and the whole of one unit-time transfer chunk's `sizeDim_` (`:821`). Those three are every
+/// `Size`-typed declaration in the authority.
 ///
 /// ⛔ NO DEFAULT, DELIBERATELY, AND THE AUTHORITY'S ONE IS A HAZARD. `Size` is the only
 /// dim-carrying struct in this header whose `dim_` has no member initialiser (`:487`) — the
 /// `LoopInfo` beside it initialises its own to `PrimaryDimTypesCount` (`:502`). So `Size() =
 /// default` (`:490`) leaves `dim_` indeterminate under default-initialisation and zero — the `in`
 /// dim, *not* `PrimaryDimTypesCount` — under the value-initialisation that
-/// `sizesNoGaps_.emplace_back()` performs. Its only uses are that JSON-import placeholder
-/// (`dsc/dsc2.cpp:1304`, `:1321`, `:1849`), overwritten field by field by `importSize` on the same
-/// call. Every site that means a value calls the two-argument form (`dsc/dsc2.cpp:2780`, `:2816`),
-/// so the placeholder is not ported and this cannot be spelled:
+/// `sizesNoGaps_.emplace_back()` performs. FIVE sites construct one that way, not the three this
+/// anchor used to name: `sizesNoGaps_`, `sizesWithGaps_` and `stickLayout_` on the JSON import path
+/// (`dsc/dsc2.cpp:1304`, `:1321`, `:1849`), a transfer chunk's `sizeDim_` on the same path
+/// (`:1563`, `:1578`), and bridge 1's own `SizeAndIndex dim;`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:630`, filled at `:632-633`). Every
+/// site that means a value calls the two-argument form (`dsc/dsc2.cpp:2780`, `:2816`), so the
+/// placeholder CONSTRUCTOR is not ported:
 ///
 /// ```compile_fail
+/// // E0599, for the reader only: stable rustdoc parses the code an annotation names and ignores
+/// // it, so the annotation is documentation and the positive control below is the check.
 /// use deeptools::schedule::dsc2::Size;
 /// let _ = Size::default();
 /// ```
 ///
+/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — the same path and the same construct
+/// with the intended constructor. Without it the `compile_fail` above would pass just as happily on
+/// a misspelled module path or an item that stopped being `pub`, i.e. exactly when it had stopped
+/// testing anything:
+///
+/// ```
+/// use deeptools::schedule::dims::PrimaryDimTypes;
+/// use deeptools::schedule::dsc2::{DimSize, Size};
+/// let _ = Size::new(PrimaryDimTypes::Ij, DimSize(64));
+/// ```
+///
 /// ⛔ AND `size_ = -1` IS NOT A SIZE. Every reader multiplies it — `newDimSizeSoFar *= size_`
 /// (`dsc/dsc2.cpp:2739`), `loopStride *= size_` (`:2962`), `elements *= dim_size.sizeDim_.size_`
-/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:34`) — so the declared `-1` is
-/// only ever the placeholder's, and no live `Size` carries it. That is why it is a plain
-/// [`DimSize`] and not an `Option`: unlike `e006`'s and `e010`'s `-1`s there is no absent state to
-/// carry, because there is no constructible absent `Size`.
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:34`) — not one of them tests it. So
+/// it is a plain [`DimSize`] and not an `Option`: unlike `e006`'s and `e010`'s `-1`s there is no
+/// absent state for one to carry.
+///
+/// ⛔ AND THE GUARANTOR OF THAT IS THE EXPORTER, NOT `importSize`. `importSize` is a per-field `if`
+/// chain that assigns only the keys the JSON object carries (`dsc/dsc2.cpp:1029-1038`), so a size
+/// object written without `"size_"` would keep the `-1` and reach `calculateSizeIdxAndOffset` as a
+/// negative multiplier (`:2739`). What keeps that out of the authority's own round trip is
+/// `exportSize`, which writes `dim_` AND `size_` unconditionally (`:202-206`). ⚠️ And the port does
+/// not exclude the VALUE either: `Size::new(PrimaryDimTypes::In, DimSize(-1))` spells the C++
+/// value-initialised placeholder exactly. What is absent from the port is the constructor, not the
+/// value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
     /// Field: e013_ScheduleNode.dim_
@@ -611,6 +636,40 @@ mod unit_tests {
         ];
         assert_eq!(layout, [layout[0], layout[1]]);
         assert_ne!(layout, [layout[1], layout[0]]);
+    }
+
+    /// `ddc/ddcv1.cpp:544-546` and `:1637-1643`: the DDC's two writes to a chunk's [`Size`] are
+    /// different shapes. The splat mutates the STORED entry; the hole split mutates a COPY, sends
+    /// that to the strides and erases the source — so the chunk-size vector never holds the 1.
+    #[test]
+    fn the_splat_mutates_the_stored_chunk_extent_and_the_hole_split_mutates_a_copy() {
+        let entry = |dim, size, idx| SizeAndIndex {
+            size_dim: Size::new(dim, DimSize(size)),
+            src_size_idx: Some(SizeIdx(idx)),
+            dst_size_idx: Some(SizeIdx(idx)),
+        };
+        let mut chunk_size = vec![entry(PrimaryDimTypes::In, 1, 0), entry(PrimaryDimTypes::Ij, 8, 1)];
+
+        // `:544-546`, in place on the first entry, from the 1 its `DT_CHECK` requires.
+        chunk_size[0].size_dim.size = DimSize(chunk_size[0].size_dim.size.0 * 4);
+        assert_eq!(chunk_size[0], entry(PrimaryDimTypes::In, 4, 0));
+
+        // `:1637-1643`: copy, accumulate, set the COPY to 1, append to the strides, erase the source.
+        let hole_end_pos = 1;
+        let mut num_chunks = 1;
+        let mut chunk_stride = Vec::new();
+        for stored in &chunk_size[hole_end_pos..] {
+            let mut size_dim = *stored;
+            num_chunks *= size_dim.size_dim.size.0;
+            size_dim.size_dim.size = DimSize(1);
+            chunk_stride.push(size_dim);
+        }
+        chunk_size.truncate(hole_end_pos);
+
+        assert_eq!(num_chunks, 8);
+        assert_eq!(chunk_stride, vec![entry(PrimaryDimTypes::Ij, 1, 1)]);
+        // The 1 lives in the strides only; the entry it was copied from is gone, not set to 1.
+        assert_eq!(chunk_size, vec![entry(PrimaryDimTypes::In, 4, 0)]);
     }
 
     /// `dsc/dsc2.h:43` against the four sites that write `el_.name_ = ss_.name_ + "el"`
@@ -2188,9 +2247,15 @@ impl Default for DstVia {
 pub struct SizeAndIndex {
     /// Field: e023_TransferNode.sizeDim_
     ///
-    /// The dim and how much of it this chunk covers (`dsc/dsc2.h:821`). ⛔ MUTATED IN PLACE by the
-    /// DDC: the 4B-splat path multiplies the first entry's extent by 4 (`ddc/ddcv1.cpp:544-546`) and
-    /// the hole split sets an entry's extent to 1 before moving it to the strides (`:1637-1640`).
+    /// The dim and how much of it this chunk covers (`dsc/dsc2.h:821`).
+    ///
+    /// ⛔ THE DDC'S TWO WRITES ARE NOT THE SAME SHAPE, AND ONLY ONE IS IN PLACE. The 4B-splat path
+    /// mutates the STORED entry: `unitTimeTransferChunkSize_[0].sizeDim_.size_ *= 4`, guarded by a
+    /// `DT_CHECK` that it was 1 (`ddc/ddcv1.cpp:544-546`). The hole split does not: it takes a COPY
+    /// (`auto sizeDim = uttChunkSize[i]`, `:1638`), accumulates `unitTimeTransferNumChunks_` from
+    /// it, sets THE COPY's extent to 1, appends that to `unitTimeTransferChunkStride_`
+    /// (`:1639-1641`), and then ERASES the source entries from `unitTimeTransferChunkSize_`
+    /// (`:1642-1643`) — so nothing in the chunk-size vector is ever left holding the 1.
     pub size_dim: Size,
     /// Field: e023_TransferNode.srcSizeIdx_
     ///
