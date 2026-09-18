@@ -1,10 +1,10 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
 use crate::schedule::dims::{DataStructDims, PrimaryDimAndKind, PrimaryDimTypes};
-use std::collections::BTreeMap;
-use sys_arch_spec::CoreId;
+use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 use sys_arch_spec::fields::Gen;
+use sys_arch_spec::{CoreId, CoreletId, SFP_SLICES};
 
 /// A group tag register's group id — `gtrIdsUsed_` holds the set of them (`dsc/dsc2.h:35`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1120,6 +1120,148 @@ mod unit_tests {
         ] {
             assert!(MEMORIES.contains(&extra), "{extra:?}");
         }
+    }
+
+    /// `dsc/dsc2.cpp:2667-2683` INTERSECTS `coreClCond_` into the "then" region's components, so a
+    /// core listed with no corelets and a core not listed at all are different conditions — the
+    /// distinction a flattened set of core/corelet pairs would lose.
+    #[test]
+    fn a_condition_nodes_listed_core_with_no_corelets_is_not_an_absent_core() {
+        let mut node = ConditionNode::default();
+        assert!(node.core_cl_cond.is_empty());
+        node.core_cl_cond.insert(CoreId(0), BTreeSet::new());
+        node.core_cl_cond
+            .insert(CoreId(1), BTreeSet::from([CoreletId(0)]));
+        assert_eq!(
+            node.core_cl_cond.get(&CoreId(0)).map(BTreeSet::len),
+            Some(0)
+        );
+        assert_eq!(node.core_cl_cond.get(&CoreId(2)), None);
+    }
+
+    /// `dsc/dsc2.h:964-972`, and the ordering divergence on `units_`: the node's JSON array
+    /// (`dsc/dsc2.cpp:814-819`) and the DDL export (`ddc/ddl/ddl_conversion.cpp:3319-3325`) print
+    /// this set in libstdc++ bucket order, and in `SenComponent` declaration order here.
+    #[test]
+    fn sync_node_units_iterate_in_component_declaration_order() {
+        let node = SyncNode {
+            units: BTreeSet::from([
+                SenComponent::L3lu,
+                SenComponent::Sfp,
+                SenComponent::Ring,
+                SenComponent::Pt,
+            ]),
+            ..SyncNode::default()
+        };
+        assert!(!node.is_receive);
+        assert!(!node.is_soft);
+        assert_eq!(
+            node.units.iter().copied().collect::<Vec<_>>(),
+            [
+                SenComponent::Sfp,
+                SenComponent::Pt,
+                SenComponent::Ring,
+                SenComponent::L3lu
+            ]
+        );
+    }
+
+    /// A SAMV node whose stick is `layout` and whose first masked coordinate per dim is
+    /// `first_masked` (`ddc/ddcv1.cpp:3546-3547`, `:3589-3597`).
+    fn samv(
+        layout: &[(PrimaryDimTypes, i32)],
+        first_masked: &[(PrimaryDimTypes, i32)],
+    ) -> StickMaskNode {
+        StickMaskNode {
+            stick_layout: layout
+                .iter()
+                .map(|&(dim, size)| Size::new(dim, DimSize(size)))
+                .collect(),
+            first_stick_coord_to_mask_per_dim: first_masked
+                .iter()
+                .map(|&(dim, coord)| (dim, StickCoord(coord)))
+                .collect(),
+            ..StickMaskNode::default()
+        }
+    }
+
+    /// `dsc/dsc2.cpp:2440-2491` over a two-dim stick — `Out` within the slice, `In` across the eight.
+    /// Masking `In` from coordinate 5 transitions in slice 2 and scales maskB by the wsl extent;
+    /// masking `Out` instead leaves the cross-slice dim whole, so maskB masks nothing and the
+    /// transition is the last slice.
+    #[test]
+    fn stick_mask_view_splits_the_masked_dim_and_scales_it_by_the_other() {
+        let layout = [(PrimaryDimTypes::Out, 4), (PrimaryDimTypes::In, 16)];
+        assert_eq!(
+            samv(&layout, &[(PrimaryDimTypes::In, 5)]).view(),
+            Some(StickMaskView {
+                mask_a: MaskSplit {
+                    unmasked: MaskElements(4),
+                    masked: MaskElements(0),
+                },
+                mask_b: MaskSplit {
+                    unmasked: MaskElements(4),
+                    masked: MaskElements(4),
+                },
+                transition_slice: SliceId(2),
+            })
+        );
+        assert_eq!(
+            samv(&layout, &[(PrimaryDimTypes::Out, 3)]).view(),
+            Some(StickMaskView {
+                mask_a: MaskSplit {
+                    unmasked: MaskElements(3),
+                    masked: MaskElements(1),
+                },
+                mask_b: MaskSplit {
+                    unmasked: MaskElements(8),
+                    masked: MaskElements(0),
+                },
+                transition_slice: SliceId(SLICES_PER_STICK - 1),
+            })
+        );
+    }
+
+    /// The three "SAMV not possible with current stick layout" refusals — over three dims, a second
+    /// within-slice dim, and a cross-slice extent under eight (`dsc/dsc2.cpp:2442-2463`) — plus the
+    /// empty layout the authority reads off the end of (`:2446`).
+    #[test]
+    fn stick_mask_view_is_absent_where_the_layout_defeats_masking() {
+        let unmasked: [(PrimaryDimTypes, i32); 0] = [];
+        assert_eq!(samv(&[], &unmasked).view(), None);
+        assert_eq!(
+            samv(
+                &[
+                    (PrimaryDimTypes::Mb, 2),
+                    (PrimaryDimTypes::Out, 2),
+                    (PrimaryDimTypes::Y, 2),
+                    (PrimaryDimTypes::In, 16),
+                ],
+                &unmasked,
+            )
+            .view(),
+            None
+        );
+        assert_eq!(
+            samv(
+                &[
+                    (PrimaryDimTypes::Out, 4),
+                    (PrimaryDimTypes::Mb, 2),
+                    (PrimaryDimTypes::In, 16),
+                ],
+                &unmasked,
+            )
+            .view(),
+            None
+        );
+        assert_eq!(
+            samv(
+                &[(PrimaryDimTypes::Out, 4), (PrimaryDimTypes::In, 4)],
+                &unmasked,
+            )
+            .view(),
+            None
+        );
     }
 }
 
@@ -2870,3 +3012,330 @@ impl ComputeNode {
 // crustify:todo: e024_ComputeNode.outputsLdsAndLoopOffsets_
 
 // crustify:todo: e024_ComputeNode.outputsLoopsAndSizes_
+
+/// Replaces: e025_ConditionNode
+///
+/// `dsc/dsc2.h:685-719`. A two-way branch in the schedule tree: a `BlockNode` whose at most two
+/// children are the "then" and the "else" region (`:687-688`, `:697-699`).
+///
+/// ⛔ THIS CARRIES ONE OF CONDITIONNODE'S TWO GUARDS, so the `e025_ConditionNode` anchor below stays
+/// open. `loopCond_` (`:690`) is a `LoopCondComposite` — e022, blocked behind e018's
+/// `const LoopNode* loopComp_`, which is schedule-node pointer identity.
+///
+/// ⛔ AND THE DISCRIMINATOR IS THAT MISSING FIELD, NOT THIS ONE: `hasCoreClCond()` answers
+/// `loopCond_.twoLevelOrOfAnds_.empty()` (`:693-695`) and never looks at `coreClCond_`. A node with
+/// both guards empty therefore reads as a core/corelet condition selecting NO core, not as an
+/// unconditional region — nothing in the authority enforces the header's "only one is filled"
+/// (`:688-689`).
+///
+/// ⛔ ITS EIGHT METHODS ALL REACH `next_`, e015's field, blocked on e013: `addChildNode` (which
+/// refuses anything but a `BLOCK` and any third child, `dsc/dsc2.cpp:2143-2150`), `addThenRegion`,
+/// `addElseRegion`, `getThenBranchNode`, `getElseBranchNode`, `getThenCoreCl`, `getElseCoreCl` and
+/// `getNextView`, which widens the base view to `ALL, -1, -1` whenever the guard is a loop condition
+/// (`dsc/dsc2.cpp:1995-2001`).
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
+/// `InheritWithClone` (`:685`).
+#[derive(Clone, Debug, Default)]
+pub struct ConditionNode {
+    /// Field: e025_ConditionNode.coreClCond_
+    ///
+    /// The cores and corelets the "then" region applies to (`dsc/dsc2.h:691-692`).
+    ///
+    /// ⛔ AN ABSENT CORE IS AN EXCLUDED ONE, NOT AN UNCONSTRAINED ONE: `setRelevantCompCoreCl`
+    /// INTERSECTS this map into the "then" region's inherited `relevantComps_` and hands the
+    /// complement to the "else" region (`dsc/dsc2.cpp:2647-2685`), so an empty map excludes every
+    /// core from the "then" side. That is why the corelets are a set per core rather than the pairs
+    /// flattened: a core present with no corelets is a different condition from a core absent.
+    pub core_cl_cond: BTreeMap<CoreId, BTreeSet<CoreletId>>,
+}
+
+// crustify:todo: e025_ConditionNode
+
+// crustify:todo: e025_ConditionNode.loopCond_
+
+/// Replaces: e026_SyncNode
+///
+/// `dsc/dsc2.h:964-972`. One end of a signal: which units it signals to or waits on, and which end
+/// it is. The DDL conversion mints one per `SyncOp` (`ddc/ddl/ddl_conversion.cpp:1708-1732`) and the
+/// L3 scheduler mints them in send/receive pairs
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:640-660`).
+///
+/// ⛔ THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the `e026_SyncNode` anchor below stays open.
+/// Both of the others are schedule-node pointer identity: `implicitSyncRefTransfer_` (`:968`) is a
+/// `const TransferNode*` whose reader dereferences it for that transfer's destination
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:180`) and whose JSON round trip goes
+/// through the node's `name_` (`dsc/dsc2.cpp:823-826`), e013's field; `otherEndOfTheSignals_`
+/// (`:969`) is the `vector<const SyncNode*>` linking the two ends.
+///
+/// ⛔ AND `getComponentsFromOtherEnds` STAYS OUT WITH THEM: it walks those pointers and unions each
+/// other end's `relevantComps_` (`dsc/dsc2.cpp:2408-2421`), e013's field, which has no ported
+/// writer. ⛔ THAT, NOT [`units`](Self::units), is where bridge 1 gets the units it emits a
+/// `sync_send`/`sync_recv` against (`SNSyncLowering.cpp:20-42`).
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and here it is what links the
+/// ends. `Clone` is IBM's own, through `InheritWithClone` (`:964`).
+#[derive(Clone, Debug, Default)]
+pub struct SyncNode {
+    /// Field: e026_SyncNode.units_
+    ///
+    /// "all to all signals" (`dsc/dsc2.h:966`): every unit this end signals to or waits on.
+    ///
+    /// ⛔ ORDERED HERE, HASH-ORDERED IN THE AUTHORITY, where it is an `unordered_set` (`:966`). Two
+    /// consumers put that order in their output — the node's JSON array (`dsc/dsc2.cpp:814-819`) and
+    /// the `SyncOp` unit-name `ArrayAttr` of the DSC-to-DDL export
+    /// (`ddc/ddl/ddl_conversion.cpp:3319-3325`) — so their text follows libstdc++ bucket order there
+    /// and [`SenComponent`]'s declaration order here. Every other reader asks for membership only
+    /// (`dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2650-2651`, `ddc/ddc_transformation.cpp:1531`).
+    pub units: BTreeSet<SenComponent>,
+    /// Field: e026_SyncNode.isReceive_
+    ///
+    /// Which end this is (`dsc/dsc2.h:967`): bridge 1 emits a `sync_send` when it is false and a
+    /// `sync_recv` when it is true (`SNSyncLowering.cpp:208-239`).
+    pub is_receive: bool,
+    /// Field: e026_SyncNode.isSoft_
+    ///
+    /// Whether the send may run ahead of the transfers it covers (`dsc/dsc2.h:967`): bridge 1 sets
+    /// the emitted send's `wait_immediately_for_async_transfers` to its NEGATION
+    /// (`SNSyncLowering.cpp:210-211`). Its only writer is the L3 scheduler's minter
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:658`).
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT: it is declared on the same line as
+    /// [`is_receive`](Self::is_receive), and that bridge-1 read is on this campaign's path.
+    pub is_soft: bool,
+}
+
+// crustify:todo: e026_SyncNode
+
+// crustify:todo: e026_SyncNode.implicitSyncRefTransfer_
+
+// crustify:todo: e026_SyncNode.otherEndOfTheSignals_
+
+/// A constant container the mask value is read out of — an index into
+/// `DesignSpaceConfig::constantInfo_` (`dsc/designSpaceConfig.h:90`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstantId(pub i32);
+
+/// A coordinate INSIDE one stick, counted in elements: the DDC stores
+/// `cumulative stick size - masked elements` (`ddc/ddcv1.cpp:3589-3597`), so it is the first
+/// coordinate the mask covers along that dim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StickCoord(pub i32);
+
+/// A count of ELEMENTS on one side of a stick-mask split — not a coordinate: bridge 1 emits these as
+/// `agen.set_transfer_mask_state`'s two offset arrays (`SNStickMaskLowering.cpp:25-30`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MaskElements(pub i32);
+
+/// Which of a stick's slices the mask changes at.
+///
+/// ⛔ SIGNED, AND `-1` IS REACHABLE: masking a whole dim leaves remainder 0 in slice 0, and the
+/// authority then names the PREVIOUS slice (`dsc/dsc2.cpp:2481-2483`). Bridge 1 compares against it
+/// per slice (`SNStickMaskLowering.cpp:47-63`), so `-1` means every slice takes the masked case; it
+/// is not an absent value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SliceId(pub i32);
+
+/// A stick spans the SFP's eight slices — [`SFP_SLICES`], the `numSlicesPerStick` of
+/// `sys-arch-spec/sysdef.cpp:229`, which `getView` and `getStickSizes` both spell as a literal `8`
+/// (`dsc/dsc2.cpp:2460`, `:4080`).
+pub const SLICES_PER_STICK: i32 = SFP_SLICES as i32;
+
+/// One half of a stick mask: how many elements it leaves valid and how many it masks. IBM declares
+/// each half as a `std::pair<int, int>` commented `<unmasked, masked>` (`dsc/dsc2.h:1068`); naming
+/// them is what makes bridge 1's two parallel offset arrays impossible to transpose
+/// (`SNStickMaskLowering.cpp:25-30`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaskSplit {
+    pub unmasked: MaskElements,
+    pub masked: MaskElements,
+}
+
+/// Replaces: StickMaskNode::View
+///
+/// `dsc/dsc2.h:1067-1070`. What one SAMV node programs: a mask for the within-slice dim, one for the
+/// cross-slice dim, and the slice the second takes effect at. Derived by
+/// [`StickMaskNode::view`](StickMaskNode::view), never stored and never serialized.
+///
+/// ⛔ NO `Default`, BECAUSE THE AUTHORITY'S HAS NO VALUE: `View view;` (`dsc/dsc2.cpp:2441`)
+/// default-initializes, leaving `transitionSliceId_` indeterminate until one of the two branches
+/// assigns it. Every field of every value we hand out comes from [`StickMaskNode::view`].
+///
+/// ```compile_fail
+/// let _ = deeptools::schedule::dsc2::StickMaskView::default();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StickMaskView {
+    /// Field: e027_StickMaskNode.maskA_
+    ///
+    /// The within-slice (wsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2463-2472`).
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, only for its `maskB_` twin; the two are declared on
+    /// one line and bridge 1 reads both halves of both (`SNStickMaskLowering.cpp:25-30`).
+    pub mask_a: MaskSplit,
+    /// Field: e027_StickMaskNode.maskB_
+    ///
+    /// The cross-slice (xsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2473-2489`).
+    pub mask_b: MaskSplit,
+    /// Field: e027_StickMaskNode.transitionSliceId_
+    ///
+    /// The slice `mask_b` transitions at (`dsc/dsc2.h:1069`): bridge 1 applies `mask_a` alone before
+    /// it, both masks at it, and no masking after (`SNStickMaskLowering.cpp:47-63`).
+    pub transition_slice: SliceId,
+}
+
+/// Replaces: e027_StickMaskNode
+///
+/// `dsc/dsc2.h:1059-1072`. A SAMV node: the mask an LXLU transfer applies to the tail of a stick so
+/// that the elements past the tensor's real extent read the mask value instead. `constructSAMVNodes`
+/// mints one reference node out of `DesignSpaceConfig::coordinateMasking_`, clones it into the "then"
+/// region of a [`ConditionNode`], and clones a RESET copy — same fields, an empty
+/// [`first_stick_coord_to_mask_per_dim`](Self::first_stick_coord_to_mask_per_dim) — into the "else"
+/// region (`ddc/ddcv1.cpp:3527-3665`).
+///
+/// ⛔ THIS CARRIES FOUR OF STICKMASKNODE'S FIVE FIELDS, so the `e027_StickMaskNode` anchor below
+/// stays open. `affectedTransfers_` (`:1065`) is a `vector<const dsc2::TransferNode*>` held as
+/// schedule-node pointer identity, and its JSON round trip goes through each transfer's `name_`
+/// (`dsc/dsc2.cpp:980-987`), e013's field.
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
+/// `InheritWithClone` (`:1059`), and the DDC leans on it for the reset copy (`ddc/ddcv1.cpp:3663`).
+#[derive(Clone, Debug)]
+pub struct StickMaskNode {
+    /// Field: e027_StickMaskNode.maskValConstId_
+    ///
+    /// The constant holding the value written into the masked elements (`dsc/dsc2.h:1061`), taken
+    /// from `DesignSpaceConfig::maskingConstId_` (`ddc/ddcv1.cpp:3531`).
+    ///
+    /// ⛔ THE AUTHORITY'S `-1` IS ABSENT, and both readers refuse it rather than indexing with it:
+    /// bridge 1 checks `>= 0` before `constantInfo_.at` (`SNStickMaskLowering.cpp:32-36`) and the
+    /// PCFG translator repeats the check (`dsc/dsc2Pcfg.cpp:2202-2203`).
+    pub mask_val_const_id: Option<ConstantId>,
+    /// Field: e027_StickMaskNode.dataFormat_
+    ///
+    /// The precision of the masked tensor (`dsc/dsc2.h:1062`), copied from the affected transfer's
+    /// labeled data structure (`ddc/ddcv1.cpp:3578`).
+    ///
+    /// ⛔ ITS INITIALISER IS NOT [`DataFormats`]' OWN DEFAULT: this field starts `INVALID` (`:1062`)
+    /// where [`ComputeNode::data_format`] starts at fp16, so a node minted without a transfer
+    /// carries no width at all — see [`StickMaskNode::default`].
+    pub data_format: DataFormats,
+    /// Field: e027_StickMaskNode.stickLayout_
+    ///
+    /// What one stick is made of: each dim inside it with its extent in elements (`dsc/dsc2.h:1063`),
+    /// range-built out of `getStickSizes` (`ddc/ddcv1.cpp:3546-3547`) — the conversion [`Size`]
+    /// carries a [`From`] impl for.
+    ///
+    /// ⛔ ITS LAST ENTRY IS THE CROSS-SLICE DIM (`dsc/dsc2.cpp:2445-2446`), which is the whole reason
+    /// this is a `Vec` and not a map: [`view`](Self::view) reads the layout's order and its length.
+    pub stick_layout: Vec<Size>,
+    /// Field: e027_StickMaskNode.firstStickCoordToMaskPerDim_
+    ///
+    /// Per dim, the first coordinate inside the stick the mask covers (`dsc/dsc2.h:1064`).
+    ///
+    /// ⛔ EMPTY MEANS "MASK NOTHING", AND THAT IS THE RESET NODE: the else-region clone clears it
+    /// (`ddc/ddcv1.cpp:3663`) and the PCFG translator checks the else node's map IS empty
+    /// (`dsc/dsc2Pcfg.cpp:2167`). ⛔ AND THE DDC MINTS AT MOST ONE ENTRY — "Cannot currently mask
+    /// more than one dim at a time" (`ddc/ddcv1.cpp:3629-3631`) — while [`view`](Self::view) reads
+    /// two dims out of it and scales one mask by the other's extent.
+    pub first_stick_coord_to_mask_per_dim: BTreeMap<PrimaryDimTypes, StickCoord>,
+}
+
+/// `dsc/dsc2.h:1061-1062`: the mask value is absent and the precision is `INVALID`, unlike
+/// [`DataFormats`]' own default.
+impl Default for StickMaskNode {
+    fn default() -> Self {
+        Self {
+            mask_val_const_id: None,
+            data_format: DataFormats::Invalid,
+            stick_layout: Vec::new(),
+            first_stick_coord_to_mask_per_dim: BTreeMap::new(),
+        }
+    }
+}
+
+impl StickMaskNode {
+    /// `dsc/dsc2.cpp:2440-2491`. The two masks and the transition slice this node programs, derived
+    /// from [`stick_layout`](Self::stick_layout) and
+    /// [`first_stick_coord_to_mask_per_dim`](Self::first_stick_coord_to_mask_per_dim). Bridge 1 turns
+    /// the result into `agen.set_transfer_mask_state`'s offsets and its per-slice mask map
+    /// (`SNStickMaskLowering.cpp:22-74`).
+    ///
+    /// ⛔ ABSENT WHERE THE AUTHORITY REFUSES — "SAMV not possible with current stick layout", three
+    /// times: over three dims in the stick (`:2442-2444`), a second dim outside the cross-slice one
+    /// (`:2455-2457`), and a cross-slice extent under [`SLICES_PER_STICK`], where no whole element
+    /// falls in a slice (`:2460-2463`).
+    ///
+    /// ⛔ AND ABSENT ON AN EMPTY LAYOUT, where the authority reads `stickLayout_.back()` off the end
+    /// (`:2446`) — undefined behaviour there, [`None`] here, and reachable through the JSON importer,
+    /// which fills the vector entry by entry (`dsc/dsc2.cpp:1847-1851`).
+    pub fn view(&self) -> Option<StickMaskView> {
+        if self.stick_layout.len() > 3 {
+            return None;
+        }
+        let xsl_dim = self.stick_layout.last()?.dim;
+        // `:2445`. ⛔ THE "NO WSL DIM YET" SENTINEL IS A LIVE DIM VALUE, the authority's
+        // `PrimaryDimTypesCount`: a layout entry carrying it is a second wsl dim to the loop below,
+        // and an `Option` here would silently accept what the authority refuses.
+        let mut wsl_dim = PrimaryDimTypes::Undefined;
+        let (mut wsl_size, mut xsl_size) = (1, 1);
+        for entry in &self.stick_layout {
+            if entry.dim == xsl_dim {
+                xsl_size *= entry.size.0;
+            } else {
+                wsl_size *= entry.size.0;
+                if wsl_dim == PrimaryDimTypes::Undefined {
+                    wsl_dim = entry.dim;
+                } else if wsl_dim != entry.dim {
+                    return None;
+                }
+            }
+        }
+        let xsl_per_slice = xsl_size / SLICES_PER_STICK;
+        if xsl_per_slice == 0 {
+            return None;
+        }
+
+        // `:2464-2472`: maskA covers the within-slice dim's tail. An unmasked dim's first masked
+        // coordinate is its whole extent, so nothing is masked.
+        let first_coord = self
+            .first_stick_coord_to_mask_per_dim
+            .get(&wsl_dim)
+            .map_or(wsl_size, |coord| coord.0);
+        // `:2469`, `:2486`: with three dims the cross-slice dim is the inner one, and each mask is
+        // scaled by the other's extent.
+        let xsl_inner = self.stick_layout.len() == 3;
+        let scale_a = if xsl_inner { xsl_per_slice } else { 1 };
+        let mask_a = MaskSplit {
+            unmasked: MaskElements(first_coord * scale_a),
+            masked: MaskElements((wsl_size - first_coord) * scale_a),
+        };
+
+        // `:2473-2485`: maskB covers the cross-slice dim.
+        let (unmasked, transition_slice) =
+            match self.first_stick_coord_to_mask_per_dim.get(&xsl_dim) {
+                // No masking in this dim: transition at the last slice, and mask nothing there.
+                None => (xsl_per_slice, SliceId(SLICES_PER_STICK - 1)),
+                // ⛔ REMAINDER 0 MEANS THE WHOLE SLICE IS VALID, so the PREVIOUS slice transitions.
+                Some(coord) => {
+                    let (quot, rem) = (coord.0 / xsl_per_slice, coord.0 % xsl_per_slice);
+                    (rem, SliceId(if rem == 0 { quot - 1 } else { quot }))
+                }
+            };
+        let scale_b = if xsl_inner { 1 } else { wsl_size };
+        let mask_b = MaskSplit {
+            unmasked: MaskElements(unmasked * scale_b),
+            masked: MaskElements((xsl_per_slice - unmasked) * scale_b),
+        };
+
+        Some(StickMaskView {
+            mask_a,
+            mask_b,
+            transition_slice,
+        })
+    }
+}
+
+// crustify:todo: e027_StickMaskNode
+
+// crustify:todo: e027_StickMaskNode.affectedTransfers_
