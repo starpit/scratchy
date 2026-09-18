@@ -320,15 +320,12 @@ remainders
 # calling a fused wrapper at a non-fused site and a `DT_CHECK` recovery that kept the LARGER bound
 # where the reference aborts the compile. Dropping them to go faster would be trading the only pass
 # that reads the authority for wall-clock.
-stage sc1-node-hierarchy/port-remainder.json       port   sc1-port
+stage sc1-dsc-data-model/port.json    port   sc1-port
 gate sc1
-stage sc2-designspaceconfig/port-remainder.json    port   sc2-port
-gate sc2
 
-stage sc1-node-hierarchy/review.json               review sc1-review
-stage sc2-designspaceconfig/review.json            review sc2-review
+stage sc1-dsc-data-model/review.json  review sc1-review
 gate reviews
-say "CAMPAIGN DRIVER DONE — THE TYPES ARE THIS CAMPAIGN'S SCOPE, AND THE TYPES ARE NOT THE BRIDGE."
+say "CAMPAIGN DRIVER DONE — sc1 is the dsc/ DATA MODEL. The scheduler bodies and bridge 1 follow."
 # ⛔⛔ WHAT THIS CAMPAIGN DELIBERATELY DOES NOT DO, SO NOBODY READS "DONE" AS "BRIDGE 1 IS PORTED":
 # de-severing `run_v1(sdsc: &mut SuperDsc, sites: &mut P, ..)` (ddc/v1.rs:6532) back to the ONE
 # object the reference mutates, and DELETING schedule/stages/{ddc_store,ddc_store2,ddc_state,
@@ -336,4 +333,4 @@ say "CAMPAIGN DRIVER DONE — THE TYPES ARE THIS CAMPAIGN'S SCOPE, AND THE TYPES
 # crustify-types/scope-config.json's _comment_acceptance) and it CANNOT be scheduled from this
 # campaign's oracle target: `Ddc::run_v1` lives in ddc/ddcv1.cpp, which is not in the `dsc` target's
 # impl_files. It needs the types to land FIRST, then its own campaign over ddc/.
-say "NEXT, AND NOT DONE HERE: de-sever run_v1 to one &mut SuperDsc and DELETE the eight carrier files"
+say "NEXT: L3DlOpsScheduler + Ddc::run_v1 bodies, then dsc-based-utils/DSC2ToDataflowIR (bridge 1 proper)"
