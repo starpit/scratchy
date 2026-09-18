@@ -56,8 +56,12 @@ pub struct FoldDimProp {
     factor: FoldDimSize,
     /// Field: e009_FoldDimProp.label_
     ///
-    /// An open set, never matched against: only forwarded into
-    /// [`FoldParamInfoType::fold_dim_label`](crate::schedule::dsc2::FoldParamInfoType) and printed.
+    /// An open set, never matched against: `foldDimLabel` (`dsc/dsc2.h:1084`) is assigned,
+    /// forwarded and printed at every one of its sites and compared at none. Read into
+    /// [`FoldParamInfoType::fold_dim_label`](crate::schedule::dsc2::FoldParamInfoType)
+    /// (`ddc/ddc_fold.cpp:2234`), into `addFold` (`dsc/dsc2.h:177`), by the copy that rebuilds a
+    /// prop out of `getSize()` and `Label()` (`dsc/superdsc.cpp:60-67` — that is [`Clone`]), and by
+    /// [`print`](Self::print).
     /// "optinal" (`:154`) — the authority's default argument is `""` (`:123`).
     label: String,
 }
@@ -94,8 +98,9 @@ impl FoldDimProp {
 
     /// `print()` (`:131-135`) — appends one fold dim's JSON fragment.
     ///
-    /// ⛔ No braces and no trailing separator: the caller supplies both (`:2216-2219`,
-    /// `dsc/dsc2.h:372`).
+    /// ⛔ No braces and no trailing separator. `dim_prop_attr` supplies both around each fragment
+    /// (`:2216-2219`); `debugPrint` supplies NEITHER, printing it straight after
+    /// `"\n  Fold dimension= "` (`dsc/dsc2.h:371-372`).
     pub fn print(&self, out: &mut String) {
         out.push_str("\"factor_\" : ");
         out.push_str(&self.factor.0.to_string());
@@ -145,7 +150,7 @@ const _: () = {
 /// fold function carries, plus its two predicates. The seven kinds (e013-e019) carry it and add
 /// their own data; element-type-free because `type_` is the base's only state.
 ///
-/// ⛔ WHERE THE BASE'S OTHER 14 MEMBERS GO, so none reads as dropped: `getData`/`insertData`
+/// ⛔ WHERE THE BASE'S OTHER 15 MEMBERS GO, so none reads as dropped: `getData`/`insertData`
 /// (`:200`, `:230`) are PURE VIRTUAL, per kind; their variadic overloads (`:195`, `:225`) only pack
 /// coordinates into a `deque`, which one Rust slice already is; the ten `DT_ERROR` stubs
 /// (`:203-256`) belong to the kinds that override them, where absence is a compile error instead of
@@ -1237,73 +1242,6 @@ impl<D> MapFoldFunctionNonLeaf<D> {
 mod unit_tests {
     use super::*;
 
-    /// IBM's own props (`util/foldManager/test/test_fold_infrastructure.cpp:324-336`), the setter
-    /// order of `buildTransferFoldDim` (`dsc/dsc2.cpp:4669-4675`), and `print`'s exact bytes
-    /// (`foldInfrastructure.h:131-135`). ⛔ The label is part of equality (`:148-150`).
-    #[test]
-    fn a_fold_dim_prop_carries_its_extent_and_its_label_and_prints_both() {
-        let mut core = FoldDimProp::new(FoldDimSize(32), "core_fold_dim");
-        assert_eq!(core.size(), FoldDimSize(32));
-        assert_eq!(core.label(), "core_fold_dim");
-
-        let mut out = String::new();
-        core.print(&mut out);
-        assert_eq!(out, "\"factor_\" : 32, \"label_\" : \"core_fold_dim\"");
-
-        // An unfolded dim is 1, not 0, and the default label is empty.
-        let mut out = String::new();
-        FoldDimProp::new(FoldDimSize(1), "").print(&mut out);
-        assert_eq!(out, "\"factor_\" : 1, \"label_\" : \"\"");
-
-        core.set_size(FoldDimSize(64));
-        core.set_label("loop_3_dim");
-        assert_eq!(core, FoldDimProp::new(FoldDimSize(64), "loop_3_dim"));
-
-        assert_ne!(
-            FoldDimProp::new(FoldDimSize(1), "loop_1_dim"),
-            FoldDimProp::new(FoldDimSize(1), "loop_2_dim"),
-            "`operator==` compares the label too"
-        );
-        assert_ne!(
-            FoldDimProp::new(FoldDimSize(1), "loop_1_dim"),
-            FoldDimProp::new(FoldDimSize(2), "loop_1_dim"),
-            "and the extent"
-        );
-    }
-
-    /// The negative: ⛔ the two predicates are NOT complements and do not cover the kinds
-    /// (`foldInfrastructure.h:182-190`) — `WkSplit_leaf` is absent from BOTH lists, so the one kind
-    /// that exists only as a leaf answers false to `isLeaf()`.
-    #[test]
-    fn the_two_leaf_predicates_are_not_complements_and_wksplit_is_in_neither() {
-        // (kind, isLeaf, isNonLeaf), read off `:183-189`.
-        let expected = [
-            (FuncType::ConstantLeaf, true, false),
-            (FuncType::MapLeaf, true, false),
-            (FuncType::AffineLeaf, true, false),
-            (FuncType::ConstantNonLeaf, false, true),
-            (FuncType::MapNonLeaf, false, true),
-            (FuncType::AffineNonLeaf, false, true),
-            (FuncType::WkSplitLeaf, false, false),
-            (FuncType::Unknown, false, false),
-        ];
-        for (ty, is_leaf, is_non_leaf) in expected {
-            let ff = FoldFunction::new(ty);
-            assert_eq!(ff.ty(), ty, "the tag is fixed by the constructor");
-            assert_eq!(ff.is_leaf(), is_leaf, "isLeaf({ty:?})");
-            assert_eq!(ff.is_non_leaf(), is_non_leaf, "isNonLeaf({ty:?})");
-        }
-
-        assert_eq!(
-            expected
-                .iter()
-                .filter(|(_, leaf, non_leaf)| !leaf && !non_leaf)
-                .count(),
-            2,
-            "`WkSplit_leaf` and `Unknown` are in neither list"
-        );
-    }
-
     /// The vendor's two eight-core work splits, transcribed from its own `build` arguments
     /// (`util/foldManager/test/test_fold_infrastructure.cpp:161-165`): `ij` shares each of two
     /// ten-element slices across four cores, `out` gives each of four four-element slices one core
@@ -1942,6 +1880,89 @@ mod equivalence {
             FoldFunc::MapLeaf(MapFoldFunctionLeaf::new(vec![3i64, 4]).unwrap()),
         ]));
         assert_eq!(map.get_data(&[FoldDimIndex(1), FoldDimIndex(1)]), Some(4));
+    }
+
+    /// `e009.print_core = ["factor_" : 32, "label_" : "core_fold_dim"]`,
+    /// `e009.print_unfolded = ["factor_" : 1, "label_" : ""]`,
+    /// `e009.print_after_setters = ["factor_" : 64, "label_" : "loop_3_dim"]`,
+    /// `e009.eq_after_setters = 1`, `e009.eq_same_size_diff_label = 0`,
+    /// `e009.eq_same_label_diff_size = 0`, `e009.eq_identical = 1`, `e009.copy_roundtrip_eq = 1`.
+    ///
+    /// The props are IBM's own (`util/foldManager/test/test_fold_infrastructure.cpp:324-336`) and the
+    /// setter order is `buildTransferFoldDim`'s (`dsc/dsc2.cpp:4669-4675`).
+    /// ⛔ THE LABEL IS PART OF EQUALITY (`:148-150`), so each `assert_ne!` below moves ONE field.
+    #[test]
+    fn e009_a_fold_dim_prop_carries_its_extent_and_its_label_and_prints_both() {
+        let mut core = FoldDimProp::new(FoldDimSize(32), "core_fold_dim");
+        assert_eq!(core.size(), FoldDimSize(32));
+        assert_eq!(core.label(), "core_fold_dim");
+
+        let mut out = String::new();
+        core.print(&mut out);
+        assert_eq!(out, "\"factor_\" : 32, \"label_\" : \"core_fold_dim\"");
+
+        // An unfolded dim is 1, not 0, and the default label is empty.
+        let mut out = String::new();
+        FoldDimProp::new(FoldDimSize(1), "").print(&mut out);
+        assert_eq!(out, "\"factor_\" : 1, \"label_\" : \"\"");
+
+        core.set_size(FoldDimSize(64));
+        core.set_label("loop_3_dim");
+        assert_eq!(core, FoldDimProp::new(FoldDimSize(64), "loop_3_dim"));
+
+        assert_ne!(
+            FoldDimProp::new(FoldDimSize(1), "loop_1_dim"),
+            FoldDimProp::new(FoldDimSize(1), "loop_2_dim"),
+            "`operator==` compares the label too"
+        );
+        assert_ne!(
+            FoldDimProp::new(FoldDimSize(1), "loop_1_dim"),
+            FoldDimProp::new(FoldDimSize(2), "loop_1_dim"),
+            "and the extent"
+        );
+
+        // `dsc/superdsc.cpp:60-67` copies a prop by rebuilding it out of its two getters.
+        let src = FoldDimProp::new(FoldDimSize(8), "dims");
+        assert_eq!(FoldDimProp::new(src.size(), src.label()), src);
+        assert_eq!(src.clone(), src, "and `Clone` is that same copy");
+    }
+
+    /// `e010.Constant_leaf = { Type=0, isLeaf=1, isNonLeaf=0 }`, `Map_leaf = { 1, 1, 0 }`,
+    /// `Affine_leaf = { 2, 1, 0 }`, `Constant_nonleaf = { 3, 0, 1 }`, `Map_nonleaf = { 4, 0, 1 }`,
+    /// `Affine_nonleaf = { 5, 0, 1 }`, `WkSplit_leaf = { 6, 0, 0 }`, `Unknown = { 7, 0, 0 }`.
+    ///
+    /// All eight rows came off ONE instance: `type_` is public (`:180`), so the probe reassigned it
+    /// per row — the only way to reach a tag no constructor produces, `Unknown` being the one.
+    /// ⛔ THE TWO PREDICATES ARE NEITHER COMPLEMENTS NOR A COVER (`:182-190`): `WkSplit_leaf` is
+    /// absent from BOTH lists, so the one kind that exists only as a leaf answers false to `isLeaf`.
+    #[test]
+    fn e010_the_two_leaf_predicates_are_not_complements_and_wksplit_is_in_neither() {
+        // (kind, isLeaf, isNonLeaf), read off `:183-189`.
+        let expected = [
+            (FuncType::ConstantLeaf, true, false),
+            (FuncType::MapLeaf, true, false),
+            (FuncType::AffineLeaf, true, false),
+            (FuncType::ConstantNonLeaf, false, true),
+            (FuncType::MapNonLeaf, false, true),
+            (FuncType::AffineNonLeaf, false, true),
+            (FuncType::WkSplitLeaf, false, false),
+            (FuncType::Unknown, false, false),
+        ];
+        for (ty, is_leaf, is_non_leaf) in expected {
+            let ff = FoldFunction::new(ty);
+            assert_eq!(ff.ty(), ty, "the tag is fixed by the constructor");
+            assert_eq!(ff.is_leaf(), is_leaf, "isLeaf({ty:?})");
+            assert_eq!(ff.is_non_leaf(), is_non_leaf, "isNonLeaf({ty:?})");
+        }
+
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(_, leaf, non_leaf)| !leaf && !non_leaf)
+                .count(),
+            2,
+            "`WkSplit_leaf` and `Unknown` are in neither list"
+        );
     }
 }
 
