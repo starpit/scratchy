@@ -53,11 +53,31 @@ pub struct Verbosity(pub i32);
 
 /// `transformationReportLevel_` (`ddc/ddc.h:40`).
 ///
-/// ⛔ NOT A CLOSED LEVEL SET, unlike [`CoordReportLevel`]: its readers test `> 0`, `> 1` and `> 2`
-/// but nothing ever ASSIGNS it a literal — it comes straight from `atoi` on the standalone's `-r`, so
-/// a 4 or a -1 stays representable here because it is representable there.
+/// ⛔ NOT A CLOSED LEVEL SET, unlike [`CoordReportLevel`]: `atoi` on the standalone's `-r` reaches
+/// the constructor unchecked (`ddc/ddc_standalone.cpp:43`, `:69`), so a 4 or a -1 stays
+/// representable here because it is representable there. The other writer DOES assign a literal,
+/// and it is the one on our path: `runDdc` passes `0`
+/// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:35`).
+///
+/// ⛔ AND ITS READERS ARE NOT ALL `>`. Forty-one lines under `ddc/` test `> 0`, `> 1` or `> 2`; the
+/// remaining two, `ddc/ddc_transformation.cpp:87` and `:463`, test `!transformationReportLevel_` —
+/// a ZERO test, and it selects the ternary arm that EAGERLY concatenates two `getNodeDescription`
+/// calls. At a negative level `!x` is false, so the authority BUILDS that message, while a porter
+/// who writes the idiomatic `level > TransformationReportLevel(0)` there skips it. The guard below
+/// pins the value the two readings disagree on, so narrowing this to a `u32` or to an `Off..` enum
+/// cannot land silently.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TransformationReportLevel(pub i32);
+
+/// ⛔ `ddc/ddc_transformation.cpp:87` and `:463` branch on `x != 0`, NOT on `x > 0`. This fails to
+/// build the moment the type stops representing a level on which those two readings differ.
+const _: () = {
+    let level = TransformationReportLevel(-1).0;
+    assert!(
+        (level != 0) != (level > 0),
+        "ddc_transformation.cpp:87 reads `!transformationReportLevel_`, which is not `> 0`"
+    );
+};
 
 /// One LATCH's producer/consumer link id, as `latchDataId_` carries it (`dsc/dsc2.h:725`). The `-1`
 /// that field defaults to is "not latched" and is not one of these: the counter only counts up.
@@ -177,17 +197,18 @@ fn parse_env_token(value: &str) -> Option<&str> {
 /// (`ddc/ddc.h:72`).
 ///
 /// ⛔ DIVERGES ON s390x, IN THE ONE DIRECTION WE CAN BUILD. `dtGetEnv` asks `canParseEnvVar` first
-/// (`util/dtgetenv.hpp:65-110`), whose `#if PRODUCTION_MODE` branch answers only for its own
+/// (`util/dtgetenv.hpp:65-112`), whose `#if PRODUCTION_MODE` branch answers only for its own
 /// allowlist plus the `AIU_WORLD_RANK_` prefix; `DDCCOORD` is on neither, so on a production build
 /// this variable is invisible and `verify_coordinate_based_loop_elem_off` can never become true. This
-/// is the `#else return true` branch (`:108`).
+/// is the `#else return true` branch (`:109-110`); `:108` is the PRODUCTION_MODE arm's
+/// `return canParse;`.
 ///
 /// ⛔ AND DIVERGES ON A NON-UTF-8 VALUE. `std::env::var` answers `Err(NotUnicode)` where `getenv`
 /// hands `std::stringstream` the raw bytes, so a whitespace-free token that is not valid UTF-8 and
 /// CONTAINS `verify_loopelemoff` sets the flag in the authority and leaves it false here. Closing it
 /// wants `std::env::var_os` and a byte search; it is left open because the variable is invisible on
 /// the one target that ships (above), so no shipped run reaches the difference.
-fn ddc_coord_env_option() -> Option<String> {
+pub fn ddc_coord_env_option() -> Option<String> {
     let value = std::env::var("DDCCOORD").ok()?;
     parse_env_token(&value).map(str::to_owned)
 }
@@ -387,14 +408,17 @@ pub struct Ddc {
     /// sentinel, then the FIRST key of the core stage's `coreletSplit_` if non-empty
     /// (`ddc/ddcv1.cpp:3673-3681`).
     ///
-    /// ⛔ ONLY TWO OF ITS FOUR READERS TEST THE SENTINEL. `ddc/ddc_fold.cpp:2480` and `:3121` do.
-    /// `:2543` compares it to a real dim, but is reached only where `:2480` already excluded the
-    /// sentinel. `:3105` DOES NOT TEST IT: `is_any_of(coreletSplitDim, coordPropInfo.dimsToPropagate)`
-    /// puts the sentinel through ordinary comparison against a list of real dims, and a match raises
-    /// `DT_ERROR` (`:3109-3115`) — reached BEFORE `:3121`. It survives only because no
-    /// `dimsToPropagate` carries the sentinel, which is an invariant of the CALLER and not of this
-    /// field. ⚠️ `ddc/ddcv1.cpp:1933-1949` is NOT a reader: `:1933` declares a LOCAL `coreletSplitDim`
-    /// that shadows the member.
+    /// ⛔ SIX MEMBER READS AT FOUR SITES, AND ONLY TWO SITES TEST THE SENTINEL.
+    /// `ddc/ddc_fold.cpp:2480` and `:3121` do. `:2543` compares it to a real dim, but is reached
+    /// only where `:2480` already excluded the sentinel. The fourth site DOES NOT TEST IT:
+    /// `is_any_of(coreletSplitDim, coordPropInfo.dimsToPropagate)` (`:3105`) puts the sentinel
+    /// through ordinary comparison against a list of real dims, and a match raises `DT_ERROR`
+    /// (`:3109-3114`), whose condition and message read the field twice more at `:3108` and
+    /// `:3112` — all of it BEFORE `:3121`. It survives only because no `dimsToPropagate` carries
+    /// the sentinel, which is an invariant of the CALLER and not of this field. (`:3112`'s
+    /// `primaryDimToString.at` would not itself throw on the sentinel: it IS a key of that map,
+    /// spelled `"undefined"`, `dsc/dims.cpp:23`.) ⚠️ `ddc/ddcv1.cpp:1933-1949` is NOT a reader:
+    /// `:1933` declares a LOCAL `coreletSplitDim` that shadows the member.
     pub corelet_split_dim: PrimaryDimTypes,
 
     /// Field: e025_Ddc.dataStageExplorationDone_
@@ -455,7 +479,7 @@ impl Ddc {
 }
 
 /// `Ddc::printFoldParams` (`ddc/ddc.h:611-616`), appending to a `String` rather than writing to a
-/// stream, as [`crate::schedule::dims::PrimaryDimTypes::print`] does. A free function because the
+/// stream, as [`crate::schedule::dims::DataStructDims::print`] does. A free function because the
 /// authority's member reads no field of `Ddc` — only its argument and `std::cout`.
 ///
 /// ⛔ ZERO CALLERS IN THE AUTHORITY: declared, defined inline and never invoked anywhere in the tree.
@@ -800,6 +824,24 @@ mod unit_tests {
                 "No-Bundling"
             ]
         );
+    }
+
+    /// ⛔ `ddc/ddc_transformation.cpp:87` and `:463` test `!transformationReportLevel_`; the other
+    /// forty-one reader lines under `ddc/` test `> 0`, `> 1` or `> 2`. The two readings agree on
+    /// every level `runDdc` can supply (`SchedulerStages.cpp:35` passes `0`) and disagree on every
+    /// level only the standalone's `-r` can reach.
+    #[test]
+    fn the_zero_test_at_transformation_cpp_87_is_not_a_greater_than() {
+        let off = TransformationReportLevel(0);
+        for raw in 0..4 {
+            let level = TransformationReportLevel(raw);
+            assert_eq!(level.0 != 0, level > off, "{level:?}");
+        }
+        for raw in -4..0 {
+            let level = TransformationReportLevel(raw);
+            assert!(level.0 != 0, "the authority builds the message at {level:?}");
+            assert!(!(level > off), "a `> Off` reading skips it at {level:?}");
+        }
     }
 }
 
