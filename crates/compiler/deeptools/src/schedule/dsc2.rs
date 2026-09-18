@@ -1701,6 +1701,67 @@ mod unit_tests {
         );
     }
 
+    /// `dsc/dsc2.cpp:2469-2472`, `:2486-2489`: a THREE-entry layout is the "xsl inner" case, which
+    /// scales maskA by the per-slice cross-slice extent instead of scaling maskB by the whole
+    /// within-slice one. Same masked dim and same coordinate as the two-dim vector above, so
+    /// transposing the two scales would answer with that test's `{4, 0}` / `{4, 4}` and fail here.
+    #[test]
+    fn stick_mask_view_scales_mask_a_when_the_cross_slice_dim_is_inner() {
+        let layout = [
+            (PrimaryDimTypes::In, 4),
+            (PrimaryDimTypes::Out, 4),
+            (PrimaryDimTypes::In, 4),
+        ];
+        assert_eq!(
+            samv(&layout, &[(PrimaryDimTypes::In, 5)]).view(),
+            Some(StickMaskView {
+                mask_a: MaskSplit {
+                    unmasked: MaskElements(8),
+                    masked: MaskElements(0),
+                },
+                mask_b: MaskSplit {
+                    unmasked: MaskElements(1),
+                    masked: MaskElements(1),
+                },
+                transition_slice: SliceId(2),
+            })
+        );
+    }
+
+    /// `dsc/dsc2.cpp:2478-2484`: a cross-slice coordinate ON a slice boundary leaves remainder 0, so
+    /// maskB spans the whole slice and the transition names the slice BEFORE the quotient. That is
+    /// the encoding the DCC decodes by reading a fully-valid count back out of a zero
+    /// (`dcc/src/Conversion/AgenToSentient/Helper.cpp:2679-2700`), not an off-by-one.
+    ///
+    /// ⛔ AND AT COORDINATE 0 IT IS `-1`, which bridge 1 turns into the eight `(1)` slices of the
+    /// full-mask pattern (`SNStickMaskLowering.cpp:51-58`) while still attaching both masks
+    /// (`:74-75`) — and the DCC's full-mask path accepts it only with no masks attached
+    /// (`Helper.cpp:2607-2612`). Reachable: the DDC refuses only `numMaskedElem > size`, so an
+    /// entirely masked dim mints coordinate 0 (`ddc/ddcv1.cpp:3589-3596`).
+    #[test]
+    fn stick_mask_view_puts_a_boundary_coordinate_on_the_previous_slice() {
+        let layout = [(PrimaryDimTypes::Out, 4), (PrimaryDimTypes::In, 16)];
+        let at_slice = |slice: i32| StickMaskView {
+            mask_a: MaskSplit {
+                unmasked: MaskElements(4),
+                masked: MaskElements(0),
+            },
+            mask_b: MaskSplit {
+                unmasked: MaskElements(0),
+                masked: MaskElements(8),
+            },
+            transition_slice: SliceId(slice),
+        };
+        assert_eq!(
+            samv(&layout, &[(PrimaryDimTypes::In, 4)]).view(),
+            Some(at_slice(1))
+        );
+        assert_eq!(
+            samv(&layout, &[(PrimaryDimTypes::In, 0)]).view(),
+            Some(at_slice(-1))
+        );
+    }
+
     /// `dsc/dsc2.h:976-1005`: every declared initialiser at once. ⛔ `numBuffers_` STARTS AT ONE, NOT
     /// AT [`NumBuffers::STREAMING`] — a default-constructed allocation is unbuffered, and bridge 1
     /// reads mode 1 for it (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:58-64`).
@@ -3848,7 +3909,8 @@ impl ComputeNode {
 /// Replaces: e025_ConditionNode
 ///
 /// `dsc/dsc2.h:685-719`. A two-way branch in the schedule tree: a `BlockNode` whose at most two
-/// children are the "then" and the "else" region (`:687-688`, `:697-699`).
+/// children are the "then" and the "else" region (`:688`, `:698-699`) — in THAT order, because
+/// `getThenBranchNode` is `next_[0]` and `getElseBranchNode` is `next_[1]` (`:707-718`).
 ///
 /// ⛔ THIS CARRIES ONE OF CONDITIONNODE'S TWO GUARDS, so the `e025_ConditionNode` anchor below stays
 /// open. `loopCond_` (`:690`) is a `LoopCondComposite` — e022, blocked behind e018's
@@ -3863,8 +3925,9 @@ impl ComputeNode {
 /// that function reads a loop's contents, so an index or a name will not do.
 ///
 /// ⛔ AND E022 HAS TWO CARRIERS, NOT ONE: besides `loopCond_` here, `DdlInterface::CondProp` holds
-/// one (`ddc/ddl/ddl_conversion.h:418-420`), and it is that copy the DDL front end toggles and then
-/// refuses on (`ddc/ddl/ddl_conversion.cpp:326`, `:381-394`). Both must reach the same Rust type.
+/// one (`ddc/ddl/ddl_conversion.h:419-424`, the composite at `:421`), and it is that copy the DDL
+/// front end toggles and then refuses on (`ddc/ddl/ddl_conversion.cpp:326`, `:381-394`). Both must
+/// reach the same Rust type.
 ///
 /// ⛔ `negated_` IS A PARITY TOGGLE AT BOTH WRITERS AND IS NEVER SET: `^= true` when the else branch
 /// carries the condition (`ddc/ddc_transformation_util.cpp:592`) and `= !` under a `condNot`
@@ -3923,10 +3986,11 @@ pub struct ConditionNode {
 ///
 /// ⛔ THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the `e026_SyncNode` anchor below stays open.
 /// Both of the others are schedule-node pointer identity: `implicitSyncRefTransfer_` (`:968`) is a
-/// `const TransferNode*` whose reader dereferences it for that transfer's destination
-/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:180`) and whose JSON round trip goes
-/// through the node's `name_` (`dsc/dsc2.cpp:823-826`), e013's field; `otherEndOfTheSignals_`
-/// (`:969`) is the `vector<const SyncNode*>` linking the two ends.
+/// `const TransferNode*` its reader dereferences for that transfer's TILE SIZE and for its SOURCE
+/// labeled DS's precision (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:156-158`,
+/// `:179-184`) — never its destination, which is the lowering's own component (`:144-145`); its JSON
+/// round trip goes through the node's `name_` (`dsc/dsc2.cpp:823-826`), e013's field;
+/// `otherEndOfTheSignals_` (`:969`) is the `vector<const SyncNode*>` linking the two ends.
 ///
 /// ⛔ AND `getComponentsFromOtherEnds` STAYS OUT WITH THEM: it walks those pointers and unions each
 /// other end's `relevantComps_` (`dsc/dsc2.cpp:2408-2421`), e013's field, which has no ported
@@ -3941,24 +4005,38 @@ pub struct SyncNode {
     ///
     /// "all to all signals" (`dsc/dsc2.h:966`): every unit this end signals to or waits on.
     ///
-    /// ⛔ ORDERED HERE, HASH-ORDERED IN THE AUTHORITY, where it is an `unordered_set` (`:966`). Two
-    /// consumers put that order in their output — the node's JSON array (`dsc/dsc2.cpp:814-819`) and
-    /// the `SyncOp` unit-name `ArrayAttr` of the DSC-to-DDL export
-    /// (`ddc/ddl/ddl_conversion.cpp:3319-3325`) — so their text follows libstdc++ bucket order there
-    /// and [`SenComponent`]'s declaration order here. Every other reader asks for membership only
-    /// (`dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2650-2651`, `ddc/ddc_transformation.cpp:1531`).
+    /// ⛔ ORDERED HERE, HASH-ORDERED IN THE AUTHORITY, where it is an `unordered_set` (`:966`). THREE
+    /// consumers put that order in their output — the node's JSON array (`dsc/dsc2.cpp:814-819`), the
+    /// `SyncOp` unit-name `ArrayAttr` of the DSC-to-DDL export
+    /// (`ddc/ddl/ddl_conversion.cpp:3319-3325`), and the ordered `dstUnits` vector the PCFG's
+    /// `createSyncNode` receives (`dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2687-2690`) — so all three follow
+    /// libstdc++ bucket order there and [`SenComponent`]'s declaration order here. A fourth site puts
+    /// it in a diagnostic, naming whichever colliding unit it reaches first
+    /// (`ddc/ddl/ddl_conversion.cpp:2806-2810`).
+    ///
+    /// ⚠️ THE REMAINING READS ARE ORDER-FREE, and only two of them are the membership test this
+    /// anchor used to claim for all of them: two more iterate but accumulate into sets
+    /// (`dsc/dsc2.cpp:2702-2704`, `dsc/dsc2Pcfg.cpp:2050-2053`), and the last two ask an any-of and a
+    /// `count` (`ddc/ddc_transformation.cpp:1531-1535`,
+    /// `dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2650-2651`).
     pub units: BTreeSet<SenComponent>,
     /// Field: e026_SyncNode.isReceive_
     ///
     /// Which end this is (`dsc/dsc2.h:967`): bridge 1 emits a `sync_send` when it is false and a
-    /// `sync_recv` when it is true (`SNSyncLowering.cpp:208-239`).
+    /// `sync_recv` when it is true (`SNSyncLowering.cpp:209`, `:239`).
+    ///
+    /// ⛔ BOTH ARMS ARE ALSO GATED ON A NULL `implicitSyncRefTransfer_`, so this flag selects NEITHER
+    /// when one is set: `is_implicit_sync` is that pointer against `nullptr` (`:208`), both arms carry
+    /// `&& !is_implicit_sync`, and the third arm reads this field not at all (`:264-269`).
     pub is_receive: bool,
     /// Field: e026_SyncNode.isSoft_
     ///
     /// Whether the send may run ahead of the transfers it covers (`dsc/dsc2.h:967`): bridge 1 sets
     /// the emitted send's `wait_immediately_for_async_transfers` to its NEGATION
-    /// (`SNSyncLowering.cpp:210-211`). Its only writer is the L3 scheduler's minter
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:658`).
+    /// (`SNSyncLowering.cpp:210-211`). TWO sites write it — the L3 scheduler's minter
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:658`) and the JSON importer
+    /// (`dsc/dsc2.cpp:1721-1722`) — and the PCFG translator carries it onto both syncs it mints
+    /// (`dsc/dsc2Pcfg.cpp:2056-2058`).
     ///
     /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT: it is declared on the same line as
     /// [`is_receive`](Self::is_receive), and that bridge-1 read is on this campaign's path.
@@ -3990,9 +4068,17 @@ pub struct MaskElements(pub i32);
 /// Which of a stick's slices the mask changes at.
 ///
 /// ⛔ SIGNED, AND `-1` IS REACHABLE: masking a whole dim leaves remainder 0 in slice 0, and the
-/// authority then names the PREVIOUS slice (`dsc/dsc2.cpp:2481-2483`). Bridge 1 compares against it
-/// per slice (`SNStickMaskLowering.cpp:47-63`), so `-1` means every slice takes the masked case; it
-/// is not an absent value.
+/// authority then names the PREVIOUS slice (`dsc/dsc2.cpp:2481-2483`). It is not an absent value —
+/// bridge 1 compares against it per slice and emits `(1)` for every slice past it
+/// (`SNStickMaskLowering.cpp:51-58`), so `-1` yields `(1)(1)(1)(1)(1)(1)(1)(1)`.
+///
+/// ⛔ AND THAT STRING IS THE ONE THE DCC REFUSES, so `-1` is reachable here and unlowerable there. It
+/// matches `isFullMask()` rather than the generic SAMV pattern
+/// `^(\(A\)){0,7}(\(A\|B\))(\(1\)){0,7}$` (`dialect_utils/Agen/Utils.cpp:36-51`, and `isFullMask` at
+/// `dataflow-scheduler/external/dataflow-scheduler-dialects/lib/Dialect/Agen/Agen.cpp:2737-2740`),
+/// and the full-mask path requires that NO mask attributes be attached
+/// (`dcc/src/Conversion/AgenToSentient/Helper.cpp:2607-2612`) while bridge 1 always attaches both
+/// (`SNStickMaskLowering.cpp:74-75`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SliceId(pub i32);
 
@@ -4022,7 +4108,20 @@ pub struct MaskSplit {
 /// assigns it. Every field of every value we hand out comes from [`StickMaskNode::view`].
 ///
 /// ```compile_fail
-/// let _ = deeptools::schedule::dsc2::StickMaskView::default();
+/// // E0599, for the reader only: stable rustdoc parses the code an annotation names and ignores
+/// // it, so the annotation is documentation and the positive control below is the check.
+/// use deeptools::schedule::dsc2::StickMaskView;
+/// let _ = StickMaskView::default();
+/// ```
+///
+/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — the same path, reached the only way a
+/// value of this type exists. Without it the `compile_fail` above would pass just as happily on a
+/// misspelled module path or an item that stopped being `pub`, i.e. exactly when it had stopped
+/// testing anything:
+///
+/// ```
+/// use deeptools::schedule::dsc2::{StickMaskNode, StickMaskView};
+/// let _: Option<StickMaskView> = StickMaskNode::default().view();
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StickMaskView {
@@ -4039,8 +4138,15 @@ pub struct StickMaskView {
     pub mask_b: MaskSplit,
     /// Field: e027_StickMaskNode.transitionSliceId_
     ///
-    /// The slice `mask_b` transitions at (`dsc/dsc2.h:1069`): bridge 1 applies `mask_a` alone before
-    /// it, both masks at it, and no masking after (`SNStickMaskLowering.cpp:47-63`).
+    /// The slice `mask_b` transitions at (`dsc/dsc2.h:1069`): bridge 1 emits `(A)` for every slice
+    /// before it, `(A|B)` at it, and `(1)` after (`SNStickMaskLowering.cpp:51-58`).
+    ///
+    /// ⛔ `(1)` IS FULLY MASKED, NOT UNMASKED. `(0)` is the token for no masking, and the op's own
+    /// documentation reads `(1)` as "will be fully masked", with an example IR of exactly this shape:
+    /// `"(A)(A)(A)(A)(A)(A|B)(1)(1)"` for a transition at slice 5. Both are in the op's TableGen
+    /// definition, `Agen.td:1058-1072` and `:1090`, under
+    /// `dataflow-scheduler/external/dataflow-scheduler-dialects/include/dataflow-scheduler/Dialect/Agen/`.
+    /// The slices PAST the transition are the masked tail, which is what a SAMV is for.
     pub transition_slice: SliceId,
 }
 
@@ -4074,7 +4180,7 @@ pub struct StickMaskNode {
     /// Field: e027_StickMaskNode.dataFormat_
     ///
     /// The precision of the masked tensor (`dsc/dsc2.h:1062`), copied from the affected transfer's
-    /// labeled data structure (`ddc/ddcv1.cpp:3578`).
+    /// labeled data structure (`ddc/ddcv1.cpp:3577`).
     ///
     /// ⛔ ITS INITIALISER IS NOT [`DataFormats`]' OWN DEFAULT: this field starts `INVALID` (`:1062`)
     /// where [`ComputeNode::data_format`] starts at fp16, so a node minted without a transfer
