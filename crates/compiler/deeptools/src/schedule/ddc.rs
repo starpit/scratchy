@@ -44,7 +44,7 @@ const _: () = {
 };
 
 /// The `int verbose` the constructor takes (`ddc/ddc.h:49`). Open-ended: it arrives from `atoi` on
-/// the standalone's `-v` and is handed on to `DdlConvertInterface` (`ddc/ddcv1.cpp:3722`).
+/// the standalone's `-v` and is handed on to `DdlConvertInterface` (`ddc/ddcv1.cpp:3723`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Verbosity(pub i32);
 
@@ -63,8 +63,28 @@ pub struct LatchDataId(pub i32);
 
 /// Which execution step's memory-tracker snapshot to work against — `exphase` (`ddc/ddc.h:101`), set
 /// from `runDdc`'s `executionStep` (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:38`).
+///
+/// ⛔ UNSIGNED BECAUSE A NEGATIVE PHASE IS THE THROW, NOT A PHASE. `epsToListIter` is keyed only by
+/// `0..exPhases` (`util/memtracker/mem_track.cpp:128-130`), and the unguarded `.at(currEp)` calls
+/// [`Ddc::exphase`] enumerates make any other key `std::out_of_range`. Both writers in the authority
+/// already supply a member of that domain — `0` (`ddc/ddc_standalone.cpp:72`) and `execStepOf`, a
+/// phase index defaulting to `0` (`dbo/src/ProgramAttrs.h:97-104`, via `SchedulerStages.cpp:38`) — so
+/// the authority's `-1` is spelled `None` here and NOWHERE ELSE:
+/// ```compile_fail
+/// let _ = deeptools::schedule::ddc::ExPhase(-1);
+/// ```
+/// ⛔ AND ITS CONTROL, because `compile_fail` passes on any error at all: constructing a phase that IS
+/// in the domain compiles by the same path, so the block above fails on the SIGN and nothing else:
+/// `E0600`, "cannot apply unary operator `-` to type `u32`", read from `rustc` against the built rlib
+/// because rustdoc checks no error code even when one is written.
+/// ```
+/// let _ = deeptools::schedule::ddc::ExPhase(0);
+/// ```
+/// ⚠️ RESIDUAL, NOT CLOSED: `exPhases` is a runtime count, so a phase at or above it is equally
+/// `std::out_of_range` and stays representable here. This type rules out the one value the authority
+/// actually writes as "unset"; it does not bound the phase count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ExPhase(pub i32);
+pub struct ExPhase(pub u32);
 
 /// The type of `coordFoldReportLevel_` and `coordPropReportLevel_` (`ddc/ddc.h:41-42`), named after
 /// the authority's own parameter `int coordReportLevel = 0` (`dsc/dsc2.h:1183`, `:1230`, `:1238`).
@@ -141,7 +161,7 @@ fn is_stream_space(c: char) -> bool {
 /// extractor skips leading whitespace, stops at the first whitespace AFTER the token, and sets
 /// `eofbit` only when it stopped by running out of input. So `" verify_loopelemoff"` parses and
 /// `"verify_loopelemoff "` does NOT — one trailing space discards the whole option silently. An empty
-/// value never reaches here; `dtGetEnv` rejects it at `'\0' == ptr[0]` (`:129`).
+/// value never reaches here; `dtGetEnv` rejects it at `'\0' == ptr[0]` (`:126`).
 fn parse_env_token(value: &str) -> Option<&str> {
     let rest = value.trim_start_matches(is_stream_space);
     if rest.is_empty() || rest.contains(is_stream_space) {
@@ -151,13 +171,19 @@ fn parse_env_token(value: &str) -> Option<&str> {
 }
 
 /// The one `dtGetEnv` call the constructor makes — `dtGetEnv<std::string>("DDCCOORD")`
-/// (`ddc/ddc.h:71`).
+/// (`ddc/ddc.h:72`).
 ///
 /// ⛔ DIVERGES ON s390x, IN THE ONE DIRECTION WE CAN BUILD. `dtGetEnv` asks `canParseEnvVar` first
 /// (`util/dtgetenv.hpp:65-110`), whose `#if PRODUCTION_MODE` branch answers only for its own
 /// allowlist plus the `AIU_WORLD_RANK_` prefix; `DDCCOORD` is on neither, so on a production build
 /// this variable is invisible and `verify_coordinate_based_loop_elem_off` can never become true. This
 /// is the `#else return true` branch (`:108`).
+///
+/// ⛔ AND DIVERGES ON A NON-UTF-8 VALUE. `std::env::var` answers `Err(NotUnicode)` where `getenv`
+/// hands `std::stringstream` the raw bytes, so a whitespace-free token that is not valid UTF-8 and
+/// CONTAINS `verify_loopelemoff` sets the flag in the authority and leaves it false here. Closing it
+/// wants `std::env::var_os` and a byte search; it is left open because the variable is invisible on
+/// the one target that ships (above), so no shipped run reaches the difference.
 fn ddc_coord_env_option() -> Option<String> {
     let value = std::env::var("DDCCOORD").ok()?;
     parse_env_token(&value).map(str::to_owned)
@@ -166,8 +192,8 @@ fn ddc_coord_env_option() -> Option<String> {
 /// The Deep Dataflow Constructor — `class Ddc` (`ddc/ddc.h:34-802`), the pass that turns a
 /// `SuperDsc`'s design space configurations into a schedule tree.
 ///
-/// ⛔ THIRTEEN OF THE CLASS'S TWENTY-ONE DECLARED FIELDS, plus the static `registerComponents` as
-/// [`REGISTER_COMPONENTS`], so the `e032_Ddc` anchor below stays open. All eight left out are a
+/// ⛔ THIRTEEN OF THE CLASS'S TWENTY DECLARED FIELDS, plus the static `registerComponents` as
+/// [`REGISTER_COMPONENTS`], so the `e032_Ddc` anchor below stays open. All seven left out are a
 /// pointer or a pointer-keyed container, under two blockers.
 ///
 /// Types that are not scheduled units in `crustify-scheduler/UNITS.tsv` at all:
@@ -176,10 +202,10 @@ fn ddc_coord_env_option() -> Option<String> {
 ///    a `Ddc` whose caller forgets it holds an indeterminate pointer; both real construction sites
 ///    assign it at once (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:36`,
 ///    `ddc/ddc_standalone.cpp:71`);
-///  * `sdsc_` (`ddc/ddc.h:106`) — `SuperDsc*`, set to `run_v1`'s argument (`ddc/ddcv1.cpp:3692`);
+///  * `sdsc_` (`ddc/ddc.h:106`) — `SuperDsc*`, set to `run_v1`'s argument (`ddc/ddcv1.cpp:3693`);
 ///  * `currDsc` (`ddc/ddc.h:107`) — `DesignSpaceConfig*`; the target type IS ported
 ///    ([`crate::schedule::dsc::DesignSpaceConfig`]) but it points INTO `sdsc.dscs_`
-///    (`ddc/ddcv1.cpp:3699`), so it cannot be represented without `SuperDsc`.
+///    (`ddc/ddcv1.cpp:3700`), so it cannot be represented without `SuperDsc`.
 ///
 /// Fields needing `dsc2::ScheduleNode` identity, the blocker e013, e016, e018 and e023 also report:
 ///  * `loopsBelowChunkBoundary` (`ddc/ddc.h:108`) — `unordered_set<const dsc2::LoopNode*>`, filled by
@@ -189,16 +215,29 @@ fn ddc_coord_env_option() -> Option<String> {
 ///    `ScheduleNode*` (`dsc/dsc2.h:1089-1090`) and is itself an open anchor in `schedule/dsc2.rs`;
 ///    `refsAdded_` is keyed by `ScheduleNode*` twice over; and `currItemToProcess_` is a CURSOR INTO
 ///    `itemsToProcess_`, so its `int` alone would be a field no ported reader could honour;
-///  * `loopDistributionParamInfo` (`ddc/ddc.h:550-553`) — a `ScheduleNode*`-keyed map of
-///    `ScheduleNode*`-keyed maps;
-///  * and the nested `struct RowGroupInfo` (`ddc/ddc.h:555-609`), whose `commonGroupAncestor` is a
-///    `dsc2::BlockNode*` and whose every `RowGroupNodeInfo` holds a `ScheduleNode*`.
+///  * and `loopDistributionParamInfo` (`ddc/ddc.h:550-553`) — a `ScheduleNode*`-keyed map of
+///    `ScheduleNode*`-keyed maps.
+///
+/// ⛔ AND ONE NESTED TYPE THAT IS NOT A FIELD, WHICH IS WHY THE CENSUS SAYS TWENTY AND NOT
+/// TWENTY-ONE: `struct RowGroupInfo` (`ddc/ddc.h:555-609`) declares no member of itself. The class's
+/// last data member is `loopDistributionParamInfo` at `:550-553`; everything from `:555` on is a type
+/// or a method, and `RowGroupInfo` reaches `Ddc` only as a `RowGroupInfo&` parameter. It is blocked
+/// the same way — `commonGroupAncestor` is a `dsc2::BlockNode*` and every `RowGroupNodeInfo` holds a
+/// `ScheduleNode*` — but it is not a field left out.
 ///
 /// Transposing the constructor's two `int` parameters is a compile error, which is why neither is a
 /// bare scalar:
 /// ```compile_fail
 /// use deeptools::schedule::ddc::{Ddc, TransformationReportLevel, Verbosity};
 /// let _ = Ddc::new(TransformationReportLevel(0), false, Verbosity(0), "");
+/// ```
+/// ⛔ AND THAT BLOCK NEEDS THIS CONTROL TO MEAN ANYTHING: `compile_fail` passes on ANY error, a wrong
+/// path or a private item included, and rustdoc checks no error code even when one is written. The
+/// same call with the arguments the right way round compiles, so the block above fails on the
+/// TRANSPOSITION (`error[E0308]`, read from `rustc` against the built rlib) and on nothing else:
+/// ```
+/// use deeptools::schedule::ddc::{Ddc, TransformationReportLevel, Verbosity};
+/// let _ = Ddc::new(Verbosity(0), false, TransformationReportLevel(0), "");
 /// ```
 ///
 /// ⛔ NOT `Clone`, AND NEITHER IS `class Ddc`: [`Ddc::metadata`] alone deletes its copy-construction
@@ -208,7 +247,10 @@ fn ddc_coord_env_option() -> Option<String> {
 pub struct Ddc {
     /// Field: e032_Ddc.verbose_
     ///
-    /// `ddc/ddc.h:38` — the one field with no member initialiser that the constructor always sets.
+    /// `ddc/ddc.h:38`. One of TWO fields with no member initialiser that the constructor does set:
+    /// the other is the `dscGlobal` reference (`:37`), bound in the same init list (`:52-53`). A THIRD
+    /// has none and the constructor does NOT set it — `memTrackers` (`:102`), which is why the type
+    /// doc calls it an indeterminate pointer on a caller that forgets it.
     pub verbose: Verbosity,
 
     /// Field: e032_Ddc.latchDataIdCounter_
@@ -225,13 +267,15 @@ pub struct Ddc {
     /// Field: e032_Ddc.coordFoldReportLevel_
     ///
     /// `ddc/ddc.h:41`, from the option string's `content_*` spelling ([`CoordReportLevel::content`]).
-    /// Read by the fold pass; `coordinateCapture` (`ddc/ddc_fold.cpp:1538-1622`) is representative.
+    /// `Ddc::coordinateCapture` (`ddc/ddc_fold.cpp:1538-1623`) is its ONLY reader and all eight reads
+    /// are inside it (`:1543`, `:1555`, `:1559`, `:1577`, `:1581`, `:1606`, `:1615`, `:1619`).
     pub coord_fold_report_level: CoordReportLevel,
 
     /// Field: e032_Ddc.coordPropReportLevel_
     ///
-    /// `ddc/ddc.h:42`, from the SAME string's `prop_*` spelling ([`CoordReportLevel::prop`]). Around
-    /// forty sites in `ddc/ddc_fold.cpp` read it, which is why it is a second level and not one knob.
+    /// `ddc/ddc.h:42`, from the SAME string's `prop_*` spelling ([`CoordReportLevel::prop`]).
+    /// SIXTY-FIVE lines of `ddc/ddc_fold.cpp` read it (`:503` through `:4680`) against the eight of
+    /// [`Ddc::coord_fold_report_level`], which is why it is a second level and not one knob.
     pub coord_prop_report_level: CoordReportLevel,
 
     /// Field: e032_Ddc.verifyCoordinateBasedLoopElemOff
@@ -246,7 +290,11 @@ pub struct Ddc {
     /// `ddc/ddc.h:44`. NOT a constructor parameter: `run_v1` latches it true per `SuperDsc`, never
     /// back to false, when any compute op is a `ReStickifyOpLx` or `ReStickifyOpHBM`, and MIRRORS it
     /// onto `sdsc.datastageBasedElemOff` in the same breath (`ddc/ddcv1.cpp:3709-3715`) so
-    /// `dsc/dsc2.cpp:3034` can read it. Ten sites switch element-offset derivation on it.
+    /// `dsc/dsc2.cpp:3034` can read it — and that read is of `SuperDsc`'s own copy
+    /// (`dsc/superdsc.h:116`), a DIFFERENT field. EIGHT sites read THIS one, all in `ddc/ddcv1.cpp`:
+    /// `:2308`, `:2454`, `:2465`, `:2469`, `:2597`, `:2687` and `:3049` switch element-offset
+    /// derivation, and `:3785` switches `coordinateCapture()` off outright, which is a whole pass and
+    /// not an offset.
     pub datastage_based_elem_off: bool,
 
     /// Field: e032_Ddc.dscToDdl_
@@ -258,43 +306,70 @@ pub struct Ddc {
     /// Field: e032_Ddc.trueLXTracker_
     ///
     /// `ddc/ddc.h:46-47`. Set true only by `runDdc` (`SchedulerStages.cpp:37`), never by the
-    /// standalone, and read once: `trueLXTracker_ || comp != SenComponents::LX` decides whether LX
-    /// participates in memory tracking (`ddc/ddcv1.cpp:186`). So the standalone tracks LX differently
-    /// from the real bundle path.
+    /// standalone (`ddc/ddc_standalone.cpp:69-72`), and read once.
+    ///
+    /// ⛔ THAT READER IS A REFUSAL, NOT A MODE SELECTOR. `trueLXTracker_ || comp != SenComponents::LX`
+    /// is the CONDITION OF A `DT_CHECK_MSG` (`ddc/ddcv1.cpp:185-188`), which throws `DtException` when
+    /// it is false (`util/dt_exception.hpp:110-118`) and is caught one frame out as a pass failure
+    /// (`dbo/src/Transforms/sdsc_bundle/SchedulerPasses.cpp:154-160`). It is the FIRST statement of
+    /// `tryAlloc`'s loop over `metadata.newAllocations_` (`ddc/ddcv1.cpp:183-184`), so with this false
+    /// the first LX entry aborts allocation with "DDC is currently being passed ephemeral mem
+    /// trackers, it can't use those for LX allocations". The standalone does not track LX differently
+    /// — it cannot allocate LX at all.
     pub true_lx_tracker: bool,
 
     /// Field: e032_Ddc.exphase
     ///
     /// `ddc/ddc.h:101`; `None` is the authority's `-1`.
     ///
-    /// ⛔ `-1` IS SILENTLY INERT, NOT OUT OF RANGE, WHICH IS WHY THIS IS AN `Option`: every tracker
-    /// call keyed by it opens with a lookup-miss guard, so `backupEps`
-    /// (`util/memtracker/mem_track.cpp:566`) returns an EMPTY vector and `restoreEps` (`:580`)
-    /// returns at once. A `Ddc` left at the default backs up and restores nothing and still
-    /// completes, so the unset case has to be one a reader cannot forget.
+    /// ⛔ `-1` IS NOT INERT — IT THROWS, which is why this is an `Option` AND why [`ExPhase`] cannot
+    /// spell it. `allocAllMem` widens the field to `std::vector<int> seps(1, exphase)`
+    /// (`ddc/ddcv1.cpp:278`) and hands `seps` to SEVEN tracker calls. FIVE ARE UNGUARDED: `removeDs`
+    /// (`util/memtracker/mem_track.cpp:441-442`, called `ddc/ddcv1.cpp:280`) and `addDsAtStartAddr`
+    /// (`:380-382`, called `ddc/ddcv1.cpp:288`, `:290`, `:307`, `:310`) index
+    /// `epsToListIter.at(currEp)` with no lookup guard, and that map only ever holds keys
+    /// `0..exPhases` (`:128-130`, grown at `:116-118`), so `-1` raises `std::out_of_range`. The
+    /// `removeDs` at `:280` runs FIRST, so the throw is what a caller sees. The other two —
+    /// `checkAndAddDsAtAddr` and `checkAndAddDs` (`ddc/ddcv1.cpp:335`, `:340`) — do not throw and do
+    /// not rescue it either: `checkIfDsFits`'s miss branch answers `fits = false`
+    /// (`util/memtracker/mem_track.cpp:151-154`), so every allocation returns `DOESNT_FIT`, `allDsFit`
+    /// goes false (`ddc/ddcv1.cpp:344-349`), and `runDdc` raises "Scheduler failed to find a suitable
+    /// op mapping" (`SchedulerStages.cpp:40-42`). Only `backupEps`
+    /// (`util/memtracker/mem_track.cpp:566-568`, called `ddc/ddcv1.cpp:218`) and `restoreEps`
+    /// (`:580-582`, called `ddc/ddcv1.cpp:433`) are the guarded no-ops an earlier reading of this
+    /// field generalised from two calls to nine.
     pub exphase: Option<ExPhase>,
 
     /// Field: e032_Ddc.metadata
     ///
     /// `ddc/ddc.h:105`. Per-DSC scratch: `run_v1` clears it at the top of every DSC iteration
-    /// (`ddc/ddcv1.cpp:3705`), which is [`Metadata::clear`].
+    /// (`ddc/ddcv1.cpp:3706`), which is [`Metadata::clear`].
     pub metadata: Metadata,
 
     /// Field: e032_Ddc.coreletSplitDim
     ///
     /// `ddc/ddc.h:109`. [`PrimaryDimTypes::Undefined`] is the authority's `PrimaryDimTypesCount`
-    /// initialiser and means "no corelet split", exactly as its readers test it
-    /// (`ddc/ddc_fold.cpp:2480`, `:3121`). `initGlobalData` recomputes it per DSC: back to the
+    /// initialiser and means "no corelet split". `initGlobalData` recomputes it per DSC: back to the
     /// sentinel, then the FIRST key of the core stage's `coreletSplit_` if non-empty
     /// (`ddc/ddcv1.cpp:3673-3681`).
+    ///
+    /// ⛔ ONLY TWO OF ITS FOUR READERS TEST THE SENTINEL. `ddc/ddc_fold.cpp:2480` and `:3121` do.
+    /// `:2543` compares it to a real dim, but is reached only where `:2480` already excluded the
+    /// sentinel. `:3105` DOES NOT TEST IT: `is_any_of(coreletSplitDim, coordPropInfo.dimsToPropagate)`
+    /// puts the sentinel through ordinary comparison against a list of real dims, and a match raises
+    /// `DT_ERROR` (`:3109-3115`) — reached BEFORE `:3121`. It survives only because no
+    /// `dimsToPropagate` carries the sentinel, which is an invariant of the CALLER and not of this
+    /// field. ⚠️ `ddc/ddcv1.cpp:1933-1949` is NOT a reader: `:1933` declares a LOCAL `coreletSplitDim`
+    /// that shadows the member.
     pub corelet_split_dim: PrimaryDimTypes,
 
     /// Field: e032_Ddc.dataStageExplorationDone_
     ///
     /// `ddc/ddc.h:112`. A one-way phase latch WITHIN one DSC: false at the top of each
     /// (`ddc/ddcv1.cpp:3707`), true once `exploreAssignDataStages` finishes (`ddc/ddcv1.cpp:556`).
-    /// Seven sites in `ddc/ddc_transformation{,_util}.cpp` branch on it, so the same transformation
-    /// behaves differently before and after — a phase, not a flag.
+    /// SIX sites branch on it (`ddc/ddc_transformation_util.cpp:294`, `:637`, `:761` and
+    /// `ddc/ddc_transformation.cpp:256`, `:296`, `:675`), so the same transformation behaves
+    /// differently before and after — a phase, not a flag.
     pub data_stage_exploration_done: bool,
 }
 
@@ -343,7 +418,7 @@ impl Ddc {
     }
 }
 
-/// `Ddc::printFoldParams` (`ddc/ddc.h:611-617`), appending to a `String` rather than writing to a
+/// `Ddc::printFoldParams` (`ddc/ddc.h:611-616`), appending to a `String` rather than writing to a
 /// stream, as [`crate::schedule::dims::PrimaryDimTypes::print`] does. A free function because the
 /// authority's member reads no field of `Ddc` — only its argument and `std::cout`.
 ///
@@ -493,7 +568,7 @@ mod unit_tests {
         }
     }
 
-    /// One token, leading whitespace skipped, extracted to end of input (`util/dtgetenv.hpp:132`).
+    /// One token, leading whitespace skipped, extracted to end of input (`util/dtgetenv.hpp:129`).
     #[test]
     fn one_token_parses_and_leading_whitespace_is_skipped() {
         assert_eq!(
@@ -507,7 +582,7 @@ mod unit_tests {
     }
 
     /// ⛔ A TRAILING SPACE DISCARDS THE WHOLE OPTION: the extractor stops at it without setting
-    /// `eofbit`, so `(ss >> parsed) && ss.eof()` is false (`util/dtgetenv.hpp:132`). An all-blank or
+    /// `eofbit`, so `(ss >> parsed) && ss.eof()` is false (`util/dtgetenv.hpp:129`). An all-blank or
     /// empty value extracts no token at all.
     #[test]
     fn a_second_token_a_trailing_space_or_a_blank_value_yields_nothing() {
@@ -518,7 +593,7 @@ mod unit_tests {
         assert_eq!(parse_env_token("   "), None);
     }
 
-    /// `ddc/ddc.h:71-76`: the flag is a SUBSTRING test on the parsed token, so a token that merely
+    /// `ddc/ddc.h:72-76`: the flag is a SUBSTRING test on the parsed token, so a token that merely
     /// contains the word sets it and a truncated one does not.
     #[test]
     fn the_env_flag_matches_the_word_inside_one_token() {
@@ -544,7 +619,7 @@ mod unit_tests {
         assert_eq!(ddc.next_latch_data_id(), LatchDataId(0));
     }
 
-    /// `ddc/ddc.h:613-616` — four comma-separated values per level, trailing space and all; an empty
+    /// `ddc/ddc.h:613-614` — four comma-separated values per level, trailing space and all; an empty
     /// vector prints nothing because the loop body never runs.
     #[test]
     fn fold_params_print_as_the_authority_writes_them() {
