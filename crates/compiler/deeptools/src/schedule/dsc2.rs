@@ -1362,6 +1362,74 @@ mod unit_tests {
         assert_eq!(node.max_dim_sizes.len(), node.layout_dim_order.len());
         assert!(node.max_dim_sizes.iter().any(Option::is_some));
     }
+
+    /// `dsc/dsc2.h:47-51`: a fresh constant is INVALID, unnamed and not symbolic. ⛔ ITS FORMAT IS
+    /// NOT [`DataFormats::default()`], which is `SEN169_FP16` (`dsc/dsc2.h:934`), and `INVALID` has
+    /// no bit width — the entry `replicationFactor_` divides by (`ddc/ddcv1.cpp:455-457`) and the one
+    /// the op-const unpacker builds its mask from (`dsc/dsc2.cpp:5260-5265`).
+    #[test]
+    fn constant_info_starts_invalid_and_an_invalid_format_has_no_bit_width_to_divide_by() {
+        let constant = ConstantInfo::default();
+        assert_eq!(constant.data_format, DataFormats::Invalid);
+        assert_ne!(constant.data_format, DataFormats::default());
+        assert_eq!(constant.data_format.bit_width(), None);
+        assert!(constant.name.is_empty());
+        assert!(!constant.is_data_symbolic);
+    }
+
+    /// `dsc/dsc2.h:54-60` against `:46`: the copy ASSIGNMENT never touches `isDataSymbolic_`, while
+    /// the copy CONSTRUCTOR carries every field — and the constructor is what
+    /// `emplace(myId, std::move(myConstInfo))` resolves to, because declaring that assignment
+    /// operator suppresses the implicit move constructor (`ddc/ddl/ddl_conversion.cpp:725`).
+    /// [`Clone`] is that constructor, so `stzJumpAddr`'s flag travels
+    /// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1151-1154`).
+    #[test]
+    fn cloning_a_symbolic_constant_carries_the_flag_the_authoritys_assignment_drops() {
+        let symbolic = ConstantInfo {
+            data_format: DataFormats::Sen169Fp16,
+            name: "stzJumpAddr".to_string(),
+            is_data_symbolic: true,
+        };
+        let copied = symbolic.clone();
+        assert_eq!(copied.data_format, DataFormats::Sen169Fp16);
+        assert_eq!(copied.name, "stzJumpAddr");
+        assert!(copied.is_data_symbolic);
+    }
+
+    /// The two in-scope readers that key on the name, over `constantInfo_`'s own shape
+    /// (`dsc/designSpaceConfig.h:90`): the padding path reuses the entry named `padval` and requires
+    /// its format to agree with the labeled ds's (`dsc/dsc2.cpp:5228-5235`), and a constant named
+    /// `useZeroMean` turns an `EXX2` op into `EXX2_ZEROMEAN` (`ddc/ddcv1.cpp:2064-2072`) — that
+    /// second one also tests the datum, which is `data_`, unported.
+    #[test]
+    fn a_constants_name_is_the_key_both_in_scope_readers_match_on() {
+        let constants = BTreeMap::from([
+            (
+                ConstantId(0),
+                ConstantInfo {
+                    data_format: DataFormats::Sen143Fp8,
+                    name: "useZeroMean".to_string(),
+                    is_data_symbolic: false,
+                },
+            ),
+            (
+                ConstantId(1),
+                ConstantInfo {
+                    data_format: DataFormats::Sen169Fp16,
+                    name: "padval".to_string(),
+                    is_data_symbolic: false,
+                },
+            ),
+        ]);
+
+        let padval = constants.iter().find(|(_, c)| c.name == "padval");
+        assert_eq!(padval.map(|(id, _)| *id), Some(ConstantId(1)));
+        assert_eq!(
+            padval.map(|(_, c)| c.data_format),
+            Some(DataFormats::Sen169Fp16)
+        );
+        assert!(constants.values().any(|c| c.name == "useZeroMean"));
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -3868,3 +3936,113 @@ impl Default for AllocateNode {
 // crustify:todo: e028_AllocateNode.startAddressCoreCorelet_
 
 // crustify:todo: e028_AllocateNode.tempStorageForCompute_
+
+/// One constant the program supplies as data rather than reading it out of a tensor —
+/// `dsc2::ConstantInfo` (`dsc/dsc2.h:46-61`). It is one entry of
+/// `DesignSpaceConfig::constantInfo_`, keyed by the [`ConstantId`] an
+/// [`AllocateNode::const_idx`] points back at (`dsc/designSpaceConfig.h:90`).
+///
+/// ⛔ THIS CARRIES 3 OF CONSTANTINFO'S 5 FIELDS, so the `e030_ConstantInfo` anchor below stays open.
+/// `data_` (`:49-50`) is a `FoldManager<std::vector<int64_t>>`, and `util/foldManager/` is the
+/// blocker e008 and e012 are already held by. `allocations_` (`:52`) is a
+/// `std::map<SenComponents, AllocateNode*>` of NON-OWNING aliases into the schedule tree: the DDL
+/// conversion hangs the minted node on its parent block and aliases it here in the same breath
+/// (`ddc/ddl/ddl_conversion.cpp:826-832`), and `fillDataInfo` reads that node's PLACED address back
+/// through the alias (`ddc/ddcv1.cpp:2386-2388`). Carrying it as an owned
+/// `BTreeMap<SenComponent, AllocateNode>` would give the constant a second copy of a node the tree
+/// owns, and the placement written through the tree would not be visible here. The authority's JSON
+/// exporter writes the alias as the node's NAME and its importer has no arm for it at all
+/// (`dsc/dsc2.cpp:95-102`, `:1134-1150`), and a constant may legitimately have none — "Keep
+/// constInfo.allocations_ empty because we do not need to allocate a data structure to store this
+/// constant" (`dsc/dsc2.cpp:5301-5302`).
+///
+/// ⛔ ITS ONE METHOD STAYS OUT WITH THOSE TWO FIELDS: the copy assignment's four member assignments
+/// are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)` (`:54-60`), so two of the
+/// four are unported. It calls `clone` rather than `data_ = rhs.data_` because `FoldManager`'s own
+/// assignment `DT_ERROR`s unless the two fold spaces already agree in dimensionality and cardinality
+/// (`util/foldManager/foldInfrastructure.h:922-933`), which a fresh destination never does; `clone`
+/// destroys the destination's fold space and rebuilds it (`:987`). See
+/// [`is_data_symbolic`](Self::is_data_symbolic) for the field that assignment drops.
+///
+/// ⛔ NO `PartialEq`: the authority's own duplicate test compares `name_`, `dataFormat_` AND the
+/// datum's element count (`ddc/ddl/ddl_conversion.cpp:706-714`), so an equality over the carried
+/// fields alone would answer "the same constant" for two constants holding different values.
+#[derive(Clone, Debug)]
+pub struct ConstantInfo {
+    /// Field: e030_ConstantInfo.dataFormat_
+    ///
+    /// The format the datum's values are encoded in — the field's own comment says so, "values
+    /// encoded in the specified format" (`dsc/dsc2.h:47`, `:50`).
+    ///
+    /// ⛔ [`DataFormats::Invalid`] IS THE INITIALISER AND IT HAS NO BIT WIDTH, which every reader
+    /// looks up with `dataFormatsToBitWidth.at()`: `replicationFactor_` divides by it
+    /// (`ddc/ddcv1.cpp:455-457`) and the op-const unpacker builds its mask from it
+    /// (`dsc/dsc2.cpp:5260-5265`). The DDL conversion rejects the format at parse instead, "Invalid
+    /// type name" (`ddc/ddl/ddl_conversion.cpp:652-656`).
+    ///
+    /// ⛔ ONE WRITER REWRITES IT WHILE CONVERTING THE VALUE: a `SEN169_FP16` constant feeding an
+    /// `IEEE_FP32` compute op is stored as `IEEE_FP32` with its datum put through `Fp16BinToFloat`
+    /// (`ddc/ddl/ddl_conversion.cpp:667-673`), so this is not simply the DDL's declared type.
+    pub data_format: DataFormats,
+    /// Field: e030_ConstantInfo.name_
+    ///
+    /// The constant's name (`dsc/dsc2.h:48`) — the DDL's own for a defined constant
+    /// (`ddc/ddl/ddl_conversion.cpp:694-695`) or the external constant's (`:700`) — which is also
+    /// the name of the allocation that holds it (`ddc/ddcv1.cpp:25-26`).
+    ///
+    /// ⛔ IT IS AN IDENTITY AND A BEHAVIOUR SWITCH, NOT A LABEL. An external constant is matched
+    /// against the container BY NAME and its other properties are then required to agree, else
+    /// "Constant found in DSC but properties do not match", and a name with no entry is
+    /// "Missing external constant in DSC" (`ddc/ddl/ddl_conversion.cpp:706-720`). The padding path
+    /// reuses the entry named `padval` and `DT_CHECK`s its format (`dsc/dsc2.cpp:5228-5235`), and a
+    /// constant named `useZeroMean` holding 1 turns an `EXX2` compute op into `EXX2_ZEROMEAN`
+    /// (`ddc/ddcv1.cpp:2064-2072`).
+    ///
+    /// ⭐ A `String` AND NOT AN ENUM, because the set is open: it is whatever attribute the DDL
+    /// carries (`ddc/ddl/ddl_conversion.cpp:694-695`), and those three literals are compared against
+    /// it rather than enumerating it.
+    pub name: String,
+    /// Field: e030_ConstantInfo.isDataSymbolic_
+    ///
+    /// Whether the datum holds a [`VariableSymbol`] still to be resolved rather than a value
+    /// (`dsc/dsc2.h:51`). `stzJumpAddr` is the worked example: its datum is the reserved dynamic
+    /// execution address symbol and this is set beside it
+    /// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1031`, `:1151-1154`); the gather path sets
+    /// it on each base-address byte from its metadata's `is_base_addr_symbolic`
+    /// (`dbo/src/Transforms/sdsc_bundle/GatherIndexConversion.cpp:176-231`).
+    ///
+    /// ⭐ BRIDGE 1 IS ITS READER: it becomes the `is_symbol` attribute on the emitted
+    /// `ConstantBitstreamOp`, on the single-fold path and on every per-fold one
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNDSCLowering.cpp:479-480`, `:515-516`, reached from
+    /// `SNTransferLowering.cpp:2492-2496`).
+    ///
+    /// ⛔ THE AUTHORITY'S COPY ASSIGNMENT DROPS IT: `operator=` assigns the other four members and
+    /// never touches this one (`dsc/dsc2.h:54-60`), so an assignment leaves the destination's flag
+    /// standing. The copy CONSTRUCTOR does carry it, and that is what
+    /// `emplace(myId, std::move(myConstInfo))` resolves to, because declaring a copy assignment
+    /// operator suppresses the implicit move constructor (`ddc/ddl/ddl_conversion.cpp:725`);
+    /// [`Clone`] here is that constructor. The one in-scope assignment writes onto a freshly
+    /// default-constructed entry whose flag is already `false` (`dsc/dsc2.cpp:5307`), so nothing on
+    /// our path turns on the omission today, and the JSON round trip carries the flag on both sides
+    /// (`dsc/dsc2.cpp:93-94`, `:1146-1147`).
+    pub is_data_symbolic: bool,
+}
+
+impl Default for ConstantInfo {
+    /// The authority's member initialisers (`dsc/dsc2.h:47-51`). ⛔ THE FORMAT IS `INVALID`, not
+    /// [`DataFormats::default()`] — that is `ComputeNode::dataFormat_`'s initialiser
+    /// (`dsc/dsc2.h:934`), a different field's.
+    fn default() -> Self {
+        Self {
+            data_format: DataFormats::Invalid,
+            name: String::new(),
+            is_data_symbolic: false,
+        }
+    }
+}
+
+// crustify:todo: e030_ConstantInfo
+
+// crustify:todo: e030_ConstantInfo.allocations_
+
+// crustify:todo: e030_ConstantInfo.data_
