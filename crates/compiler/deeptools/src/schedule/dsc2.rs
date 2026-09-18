@@ -1,6 +1,12 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
 use crate::schedule::dims::{DataStructDims, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes};
+use crate::schedule::fold::{
+    AffineFoldFunctionLeaf, AffineFoldFunctionNonLeaf, FoldDimIndex, FoldDimProp, FoldDimSize,
+    FoldFunc,
+};
+use core::num::Wrapping;
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
 use sys_arch_spec::fields::Gen;
@@ -143,12 +149,6 @@ pub struct GroupTagRegInfo {
 // crustify:todo: e007_ScheduleTree
 
 // crustify:todo: e007_ScheduleTree.head_
-
-// crustify:todo: e008_TransferPadInfo
-
-// crustify:todo: e008_TransferPadInfo.transferPadBackSize_
-
-// crustify:todo: e008_TransferPadInfo.transferPadFrontSize_
 
 /// Replaces: e009_FoldParamInfoType
 ///
@@ -2141,6 +2141,54 @@ mod unit_tests {
             "coreIdToGTRInfo_ must emit in ascending core id order"
         );
     }
+
+    /// ⛔ A DELIBERATE DIVERGENCE, AND THE AUTHORITY'S SIDE IS UNDEFINED BEHAVIOUR.
+    /// `TransferPadInfo(TransferPadInfo&&) = default` (`dsc/dsc2.h:763`) moves the two maps but
+    /// bitwise-copies `MapWithFMHelper`, whose only member is a REFERENCE to the sibling map
+    /// (`util/mapWithFMHelper.h:36-38`) — so the moved-TO object's helper still refers to the
+    /// moved-FROM object's storage. Measured on the authority: `dst.isEmpty = 0` with
+    /// `dst.frontKeys = 0` and every helper-routed query throwing, `dst.frontKeys = 1` again after
+    /// rebuilding on the SOURCE, and `heap-use-after-free` under AddressSanitizer inside `getAllKeys`
+    /// once the source was destroyed. A Rust move carries the storage, so all four of these answer
+    /// from the moved-to object — there is no reference to leave behind.
+    #[test]
+    fn a_moved_transfer_pad_info_carries_its_own_storage_where_the_authoritys_aliases_the_source() {
+        let mut src = TransferPadInfo::default();
+        src.build_pad_sizes(
+            PadEnd::Front,
+            PrimaryDimTypes::X,
+            [FoldDimSize(2), FoldDimSize(3)],
+            [PadSize(-40), PadSize(-10)],
+            [PadSize(25), PadSize(0)],
+        );
+        let moved = src;
+
+        assert!(!moved.is_empty(), "`dst.isEmpty = 0`, as in C++");
+        assert_eq!(
+            moved.pad_dims(PadEnd::Front).collect::<Vec<_>>(),
+            [PrimaryDimTypes::X],
+            "C++ answers 0 keys here"
+        );
+        assert_eq!(
+            moved.transfer_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(0),
+                ChunkIdx(0),
+                ChunkSizePadded(10)
+            ),
+            Some(PadSize(10)),
+            "C++ throws here"
+        );
+
+        // The two `FoldDimProp`s the fold was built over — `wkslice_index` outer, `chunk_index`
+        // inner (`dsc/dsc2.cpp:4662-4670`).
+        let props = &moved.front[&PrimaryDimTypes::X].props;
+        assert_eq!(props[0].size(), FoldDimSize(2));
+        assert_eq!(props[0].label(), "wkslice_index");
+        assert_eq!(props[1].size(), FoldDimSize(3));
+        assert_eq!(props[1].label(), "chunk_index");
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -2977,8 +3025,8 @@ impl TransferType {
 ///    `dstLdsAndLoopOffsets_`, `dstIndirectLdsAndLoopOffsets_` (`:833`) are `DataInfo` — e019;
 ///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
 ///    `const LoopNode*` held as POINTER IDENTITY, which needs e013's `name_`, exactly as e018 does;
-///  * `paddingInfo_` (`:845`) is `TransferPadInfo` — e008, blocked on the unscoped
-///    `util/foldManager/`;
+///  * `paddingInfo_` (`:845`) is [`TransferPadInfo`], ported at the end of this file — carrying it
+///    is e023_TransferNode's own remaining work, not a block;
 ///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) — e013;
 ///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012;
 ///  * `repetition_` (`:826-829`) is an UNNAMED struct with no reader tree-wide. Its only writers are
@@ -5102,3 +5150,572 @@ impl Default for ConstantInfo {
 // crustify:todo: e030_ConstantInfo.allocations_
 
 // crustify:todo: e030_ConstantInfo.data_
+
+/// A transfer's zero-pad size in elements — the `int` a `FoldManager<int>` level carries
+/// (`dsc/dsc2.h:810-811`), and the currency of both readers as well as of the `alphas` and `betas`
+/// the builder takes.
+///
+/// ⛔ SIGNED, AND NEGATIVE VALUES ARE PRODUCED ON PURPOSE: the one production builder passes
+/// `-coreOffset` and `-chunkOffset` as alphas and a beta that subtracts both again
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5388-5451`), which is why both readers clamp at 0
+/// rather than trust the fold (`dsc/dsc2.cpp:4707-4708`, `:4729-4731`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PadSize(pub i32);
+
+/// A work-slice index — the coordinate of the OUTER of the two folded dims
+/// (`dsc/dsc2.cpp:4651-4665`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WkSliceIdx(pub i64);
+
+/// A chunk index within one work slice — the coordinate of the INNER folded dim (`:4669-4670`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkIdx(pub i64);
+
+/// How many chunks one work-slice pad walk may visit — `numChunks` (`dsc/dsc2.cpp:4686`).
+///
+/// ⛔ NOT THE STORED `chunk_index` EXTENT, and the walk does not clamp it to one: the caller derives
+/// it per dim (`dsc/dsc2.cpp:4823`), and measured, a value past the extent makes the reader throw
+/// unless the walk breaks first — immediately on the back end, whose first coordinate is
+/// `numChunks - 1`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumChunks(pub u32);
+
+/// The element offset one fully padded chunk contributes to a work slice's pad (`:4830-4832`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkOffset(pub i32);
+
+/// A chunk's padded extent — both the cap a pad size is legal up to and the threshold that ends the
+/// work-slice walk (`dsc/dsc2.cpp:4705-4710`, `:4718-4731`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkSizePadded(pub i32);
+
+/// Which end of a transfer's data a pad sits at — the authority's `const bool isPadFront`
+/// (`dsc/dsc2.h:784`, `:794`, `:806`, `:809`), which selects one of two parallel field pairs at
+/// every one of its six sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PadEnd {
+    /// `isPadFront == true`, and the walk visits chunk 0 first (`dsc/dsc2.cpp:4696-4697`).
+    Front,
+    /// `isPadFront == false`, and the walk visits `numChunks - 1` first.
+    Back,
+}
+
+/// `TransferPadInfo::FoldDimPosition` (`dsc/dsc2.h:772`) — the two folded dims, outer first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FoldDimPosition {
+    /// `WORK_SLICE_FOLDDIM`, labelled `wkslice_index` (`dsc/dsc2.cpp:4662-4665`).
+    WorkSlice = 0,
+    /// `CHUNK_FOLDDIM`, labelled `chunk_index` (`:4669-4670`).
+    Chunk = 1,
+}
+
+impl FoldDimPosition {
+    /// `TOTAL_FOLDDIM_NUM` — the arity `buildPadSizes` `DT_CHECK`s on all three of its vectors
+    /// (`dsc/dsc2.cpp:4612-4615`), here an array length, so the check is E0308.
+    pub const COUNT: usize = 2;
+
+    /// Outer to inner, which is the order `buildFoldSpace` nests the levels in.
+    pub const ALL: [Self; Self::COUNT] = [Self::WorkSlice, Self::Chunk];
+}
+
+/// ⛔ E0308 IF A POSITION IS EVER ADDED: `COUNT` is the array length every caller's `sizes`,
+/// `alphas` and `betas` are checked against.
+const _: [(); FoldDimPosition::COUNT] = [(); FoldDimPosition::Chunk as usize + 1];
+
+/// One dim's pad-size fold: the two `FoldDimProp`s the authority stores plus the two-level affine
+/// tree its manager builds over them (`dsc/dsc2.cpp:4651-4681`).
+///
+/// ⛔ THE PROPS AND THE TREE ARE ONE OWNER HERE BECAUSE IN C++ THEY ALIAS: `FoldManager::dim_prop_`
+/// holds `const FoldDimProp*` INTO `transferPadFrontFoldProps`
+/// (`util/foldManager/foldInfrastructure.h:888`), so `DT_CHECK_MSG(!foldProps.count(dim))`
+/// (`dsc/dsc2.cpp:4658`) is the only thing standing between a rebuild's `resize` and a dangling
+/// pointer. Co-owning them makes the pointer unnecessary rather than safe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PadSizeFold {
+    props: [FoldDimProp; FoldDimPosition::COUNT],
+    fold: FoldFunc<i32>,
+}
+
+impl PadSizeFold {
+    /// `buildTransferFoldDim` (`dsc/dsc2.cpp:4651-4681`) and the four `insert*ForKey` calls that
+    /// follow it (`:4624-4635`), which are one construction: `buildFoldSpace` nests two affine
+    /// levels with `alpha_{}`/`beta_{}` at zero and each `insertAlphaForKey(.., pos)` then writes the
+    /// level `collectFoldFunctionAtLevel(pos)` reaches — 0 the non-leaf, 1 its leaf.
+    fn new(
+        sizes: [FoldDimSize; FoldDimPosition::COUNT],
+        alphas: [PadSize; FoldDimPosition::COUNT],
+        betas: [PadSize; FoldDimPosition::COUNT],
+    ) -> Self {
+        let outer = FoldDimPosition::WorkSlice as usize;
+        let inner = FoldDimPosition::Chunk as usize;
+        Self {
+            props: [
+                FoldDimProp::new(sizes[outer], "wkslice_index"),
+                FoldDimProp::new(sizes[inner], "chunk_index"),
+            ],
+            fold: FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::new(
+                alphas[outer].0,
+                betas[outer].0,
+                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::new(alphas[inner].0, betas[inner].0)),
+            )),
+        }
+    }
+
+    /// `MapWithFMHelper::getDataForKey` past the key check (`util/mapWithFMHelper.h:143-147`) — the
+    /// manager's `isLegal` range test (`util/foldManager/foldInfrastructure.h:1666-1681`) and then
+    /// the walk.
+    ///
+    /// ⛔ THE RANGE TEST IS SIGNED AND THAT IS NOT A BUG TO FIX: `getSize() <= idx` widens a
+    /// `uint32_t` extent to `int64_t` (`:1677`), so a NEGATIVE coordinate is LEGAL and computes.
+    /// Measured on the authority: work slice -1 answers 30 where work slice 2 of 2 throws.
+    /// ⛔ The count half of `isLegal` is gone instead of ported — two coordinates is the signature.
+    fn data(&self, wk_slice: WkSliceIdx, chunk: ChunkIdx) -> Option<PadSize> {
+        let coords = [FoldDimIndex(wk_slice.0), FoldDimIndex(chunk.0)];
+        for (prop, coord) in self.props.iter().zip(coords) {
+            if i64::from(prop.size().0) <= coord.0 {
+                return None;
+            }
+        }
+        self.fold.get_data(&coords).map(PadSize)
+    }
+}
+
+/// Replaces: e024_TransferPadInfo
+///
+/// Replaces: e008_TransferPadInfo
+///
+/// A transfer's LX zero-pad sizes, one two-level affine fold per padded dim per end
+/// (`dsc/dsc2.h:755-812`) — what `L3DlOpsScheduler` writes onto a `TransferNode` so that
+/// `dsc/dsc2.cpp:4768-4990` can turn padding into condition and transfer nodes. e008 is this same
+/// class under the superseded numbering, which listed two of its six fields.
+///
+/// ⛔ NO [`Clone`], AND THE ABSENCE IS THE `DT_CHECK`: the authority's copy constructor is
+/// "Do nothing on purpose" (`dsc/dsc2.h:764-767`) — it rebuilds the two helper references and copies
+/// NOTHING, so a copy is EMPTY. `dsc/dsc2.cpp:5700` clones a padded transfer node and `:5792`
+/// `DT_CHECK_MSG`s the clone `isEmpty()`; measured, source non-empty and copy empty. A `Clone` that
+/// silently dropped the folds would be the astonishing one, so the only way to spell that copy here
+/// is [`Default`], which makes IBM's runtime check a fact of the type.
+/// ⛔ AND ITS DEFAULTED MOVE CONSTRUCTOR (`dsc/dsc2.h:763`) IS A USE-AFTER-FREE, unrepresentable
+/// here: `MapWithFMHelper`'s only member is a REFERENCE to the sibling map
+/// (`util/mapWithFMHelper.h:36-38`), so a move copies a reference that still points into the
+/// moved-FROM object. Measured — the moved-to object reported `isEmpty() == 0` with zero keys,
+/// answered the moved-FROM object's data after that object was rebuilt, and destroying the source
+/// gave a `heap-use-after-free` under AddressSanitizer inside `getAllKeys`. A Rust move carries the
+/// storage, so the [`unit_tests`] case for that is a deliberate divergence.
+///
+/// The control is what makes the `compile_fail` case evidence — stable rustdoc does not check the
+/// annotated error code:
+/// ```compile_fail,E0599
+/// let _ = deeptools::schedule::dsc2::TransferPadInfo::default().clone();
+/// ```
+/// ```
+/// use deeptools::schedule::dsc2::TransferPadInfo;
+/// assert!(TransferPadInfo::default().is_empty(), "`TransferPadInfo(const TransferPadInfo&)`");
+/// ```
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TransferPadInfo {
+    /// Field: e024_TransferPadInfo.transferPadFrontFoldProps
+    ///
+    /// Field: e024_TransferPadInfo.transferPadFrontSize_
+    ///
+    /// Field: e024_TransferPadInfo.transferPadFrontSizeHelper
+    ///
+    /// Field: e008_TransferPadInfo.transferPadFrontSize_
+    ///
+    /// ⛔ THREE OF THE AUTHORITY'S FIELDS ARE ONE FIELD HERE, and the helper is not a field at all:
+    /// `transferPadFrontSizeHelper` is a `MapWithFMHelper` whose ONLY member is
+    /// `std::map<Dkey, FoldManager<Dval>>& key_val_` (`util/mapWithFMHelper.h:36-38`) bound to
+    /// `transferPadFrontSize_` in every constructor (`dsc/dsc2.h:759-767`) — a facade over the
+    /// sibling map, holding no state of its own. `transferPadFrontFoldProps` is then the storage that
+    /// map's `dim_prop_` pointers point INTO; see [`PadSizeFold`].
+    front: BTreeMap<PrimaryDimTypes, PadSizeFold>,
+    /// Field: e024_TransferPadInfo.transferPadBackFoldProps
+    ///
+    /// Field: e024_TransferPadInfo.transferPadBackSize_
+    ///
+    /// Field: e024_TransferPadInfo.transferPadBackSizeHelper
+    ///
+    /// Field: e008_TransferPadInfo.transferPadBackSize_
+    ///
+    /// The same three fields at the other end, and independent of [`front`](Self::front): measured,
+    /// building only the front leaves every back query throwing.
+    back: BTreeMap<PrimaryDimTypes, PadSizeFold>,
+}
+
+impl TransferPadInfo {
+    /// `isEmpty()` (`dsc/dsc2.h:774-776`) — the predicate two schedulers gate the whole
+    /// padding-to-schedule-tree transformation on (`ddc/ddcv1.cpp:2860`, `dsc/dsc2.cpp:4761`).
+    pub fn is_empty(&self) -> bool {
+        self.front.is_empty() && self.back.is_empty()
+    }
+
+    /// `buildPadFrontSizes` and `buildPadBackSizes` (`dsc/dsc2.cpp:4638-4650`), which are
+    /// `buildPadSizes(.., isPadFront)` (`:4607-4636`) with the flag fixed — one function with
+    /// [`PadEnd`] as an argument.
+    ///
+    /// ⛔ [`None`] IS `DT_CHECK_MSG(!foldProps.count(dim), "Expect empty fold properties.")`
+    /// (`:4658`) — a dim can be built once per end, and the authority throws on the second attempt
+    /// rather than rebuilding. Its other three checks are gone into the array lengths, and a negative
+    /// extent — `setSize(int)` onto a `uint32_t` (`util/foldManager/foldInfrastructure.h:129`, `:153`)
+    /// — is unspellable in [`FoldDimSize`].
+    pub fn build_pad_sizes(
+        &mut self,
+        end: PadEnd,
+        dim: PrimaryDimTypes,
+        sizes: [FoldDimSize; FoldDimPosition::COUNT],
+        alphas: [PadSize; FoldDimPosition::COUNT],
+        betas: [PadSize; FoldDimPosition::COUNT],
+    ) -> Option<()> {
+        let folds = match end {
+            PadEnd::Front => &mut self.front,
+            PadEnd::Back => &mut self.back,
+        };
+        match folds.entry(dim) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                slot.insert(PadSizeFold::new(sizes, alphas, betas));
+                Some(())
+            }
+        }
+    }
+
+    /// `getPadFrontOrBackDimsSet` (`dsc/dsc2.h:783-788`) through `MapWithFMHelper::getAllKeys`
+    /// (`util/mapWithFMHelper.h:51-57`).
+    ///
+    /// ⛔ AN ORDERED ITERATOR RATHER THAN A `std::set` BY VALUE, WHICH IS WHAT THE ONE CALLER WANTS:
+    /// it `std::set_union`s the two ends into a vector (`dsc/dsc2.cpp:4813-4819`), so it needs the
+    /// ascending order a `std::set` gave it and never the container. A [`BTreeMap`]'s keys are
+    /// already in that order, so this allocates nothing.
+    pub fn pad_dims(&self, end: PadEnd) -> impl Iterator<Item = PrimaryDimTypes> + '_ {
+        let folds = match end {
+            PadEnd::Front => &self.front,
+            PadEnd::Back => &self.back,
+        };
+        folds.keys().copied()
+    }
+
+    /// `getWkSlicePadSizeFrontOrBack` (`dsc/dsc2.cpp:4684-4716`) — one work slice's total pad, walked
+    /// chunk by chunk from the padded end until the first chunk that is not fully padded.
+    ///
+    /// ⛔ `chunkSizePadded` IS THE ONLY THING THAT ENDS THE WALK EARLY, so a 0 or negative one visits
+    /// every chunk: measured, `chunkSizePadded = 0` over three chunks answers `3 * chunkOffset`.
+    /// ⛔ [`None`] IS THE READER THROWING MID-WALK, on an unknown dim (`util/mapWithFMHelper.h:144`)
+    /// or a coordinate past its extent — reachable exactly when [`NumChunks`] exceeds the stored
+    /// `chunk_index` extent and no chunk breaks the walk first.
+    pub fn wk_slice_pad_size(
+        &self,
+        end: PadEnd,
+        dim: PrimaryDimTypes,
+        wk_slice: WkSliceIdx,
+        num_chunks: NumChunks,
+        chunk_offset: ChunkOffset,
+        chunk_size_padded: ChunkSizePadded,
+    ) -> Option<PadSize> {
+        let fold = match end {
+            PadEnd::Front => self.front.get(&dim)?,
+            PadEnd::Back => self.back.get(&dim)?,
+        };
+        let mut num_chunks_visited = 0u32;
+        let mut partial_pad_size = 0i32;
+        while num_chunks_visited < num_chunks.0 {
+            let curr_chunk_idx = match end {
+                PadEnd::Front => num_chunks_visited,
+                PadEnd::Back => num_chunks.0 - num_chunks_visited - 1,
+            };
+            // "the agreement is that negative pad size is treated as zero" (`:4705-4708`).
+            let curr_pad_size = fold
+                .data(wk_slice, ChunkIdx(i64::from(curr_chunk_idx)))?
+                .0
+                .max(0);
+            if curr_pad_size < chunk_size_padded.0 {
+                partial_pad_size = curr_pad_size;
+                break;
+            }
+            num_chunks_visited += 1;
+        }
+        // `int` arithmetic on `int` inputs (`:4715`), so it wraps where the authority's does.
+        Some(PadSize(
+            (Wrapping(chunk_offset.0) * Wrapping(num_chunks_visited as i32)
+                + Wrapping(partial_pad_size))
+            .0,
+        ))
+    }
+
+    /// `getTransferPadSizeFrontOrBack` (`dsc/dsc2.cpp:4718-4732`) — one chunk's pad, clamped into
+    /// `[0, chunkSizePadded]`.
+    ///
+    /// ⛔ NOT [`Ord::clamp`]: it panics when `min > max`, and a negative [`ChunkSizePadded`] reaches
+    /// this. `std::min(std::max(v, 0), chunkSizePadded)` (`:4729-4731`) answers the CAP there —
+    /// measured, a cap of -5 returns -5, outside the range the comment above it claims.
+    pub fn transfer_pad_size(
+        &self,
+        end: PadEnd,
+        dim: PrimaryDimTypes,
+        wk_slice: WkSliceIdx,
+        chunk: ChunkIdx,
+        chunk_size_padded: ChunkSizePadded,
+    ) -> Option<PadSize> {
+        let fold = match end {
+            PadEnd::Front => self.front.get(&dim)?,
+            PadEnd::Back => self.back.get(&dim)?,
+        };
+        Some(PadSize(
+            fold.data(wk_slice, chunk)?
+                .0
+                .max(0)
+                .min(chunk_size_padded.0),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod equivalence {
+    use super::*;
+
+    /// The shape every case below builds — the one production builder's, with its own signs:
+    /// `sizes = {numWkSlice, numChunks}`, `alphasPadFront = {-coreOffset, -chunkOffset}`,
+    /// `betasPadBack` subtracting both again
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5388-5451`).
+    const SIZES: [FoldDimSize; FoldDimPosition::COUNT] = [FoldDimSize(2), FoldDimSize(3)];
+    const ALPHAS_FRONT: [PadSize; FoldDimPosition::COUNT] = [PadSize(-40), PadSize(-10)];
+    const BETAS_FRONT: [PadSize; FoldDimPosition::COUNT] = [PadSize(25), PadSize(0)];
+    const ALPHAS_BACK: [PadSize; FoldDimPosition::COUNT] = [PadSize(40), PadSize(10)];
+    const BETAS_BACK: [PadSize; FoldDimPosition::COUNT] = [PadSize(-53), PadSize(0)];
+
+    fn both_ends() -> TransferPadInfo {
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                SIZES,
+                ALPHAS_FRONT,
+                BETAS_FRONT
+            ),
+            Some(())
+        );
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Back,
+                PrimaryDimTypes::X,
+                SIZES,
+                ALPHAS_BACK,
+                BETAS_BACK
+            ),
+            Some(())
+        );
+        info
+    }
+
+    /// `empty.isEmpty = 1`, `empty.frontKeys = 0`, `empty.backKeys = 0`, `built.isEmpty = 0`,
+    /// `built.frontKeys = 1`, `built.backKey0 = 4`, `raw.front.w0.{c0,c1,c2} = 25, 15, 5`,
+    /// `raw.front.w1.* = 0`, `raw.back.w0.* = 0`, `raw.back.w1.{c0,c1,c2} = 0, 0, 7`,
+    /// `neg.wkslice = 65`, `neg.chunk = 35`, `oob.wkslice = THROW`, `oob.chunk = THROW`,
+    /// `unknown.dim = THROW`, `rebuild.same_dim = THROW`, `frontOnly.backKeys = 0`,
+    /// `frontOnly.backQuery = THROW`.
+    ///
+    /// ⛔ A NEGATIVE COORDINATE IS LEGAL AND COMPUTES while an out-of-range one throws: `isLegal`'s
+    /// range test widens a `uint32_t` extent to signed (`util/foldManager/foldInfrastructure.h:1677`).
+    /// ⛔ AND THE TWO ENDS ARE INDEPENDENT: `frontOnly` proves a back query throws on an object whose
+    /// front is built, so they are two maps and not one keyed by end.
+    #[test]
+    fn e024_a_pad_fold_is_two_affine_levels_over_the_wk_slice_and_chunk_coordinates() {
+        let empty = TransferPadInfo::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.pad_dims(PadEnd::Front).count(), 0);
+        assert_eq!(empty.pad_dims(PadEnd::Back).count(), 0);
+
+        let info = both_ends();
+        assert!(!info.is_empty());
+        assert_eq!(
+            info.pad_dims(PadEnd::Front).collect::<Vec<_>>(),
+            [PrimaryDimTypes::X]
+        );
+        assert_eq!(
+            info.pad_dims(PadEnd::Back).collect::<Vec<_>>(),
+            [PrimaryDimTypes::X]
+        );
+        assert_eq!(PrimaryDimTypes::X as usize, 4, "`built.frontKey0 = 4`");
+
+        // `max(getDataForKey(..), 0)` alone: the cap is the identity at `INT_MAX`.
+        let raw = |end, w: i64, c: i64| {
+            info.transfer_pad_size(
+                end,
+                PrimaryDimTypes::X,
+                WkSliceIdx(w),
+                ChunkIdx(c),
+                ChunkSizePadded(i32::MAX),
+            )
+        };
+        for (chunk, front) in [(0, 25), (1, 15), (2, 5)] {
+            assert_eq!(raw(PadEnd::Front, 0, chunk), Some(PadSize(front)));
+            assert_eq!(raw(PadEnd::Front, 1, chunk), Some(PadSize(0)));
+            assert_eq!(raw(PadEnd::Back, 0, chunk), Some(PadSize(0)));
+        }
+        assert_eq!(raw(PadEnd::Back, 1, 0), Some(PadSize(0)));
+        assert_eq!(raw(PadEnd::Back, 1, 1), Some(PadSize(0)));
+        assert_eq!(raw(PadEnd::Back, 1, 2), Some(PadSize(7)));
+
+        assert_eq!(
+            raw(PadEnd::Front, -1, 0),
+            Some(PadSize(65)),
+            "`neg.wkslice`"
+        );
+        assert_eq!(raw(PadEnd::Front, 0, -1), Some(PadSize(35)), "`neg.chunk`");
+        assert_eq!(raw(PadEnd::Front, 2, 0), None, "`oob.wkslice`");
+        assert_eq!(raw(PadEnd::Front, 0, 3), None, "`oob.chunk`");
+
+        assert_eq!(
+            info.transfer_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::Y,
+                WkSliceIdx(0),
+                ChunkIdx(0),
+                ChunkSizePadded(10)
+            ),
+            None,
+            "`unknown.dim`"
+        );
+
+        let mut rebuilt = both_ends();
+        assert_eq!(
+            rebuilt.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                SIZES,
+                ALPHAS_FRONT,
+                BETAS_FRONT
+            ),
+            None,
+            "`rebuild.same_dim`"
+        );
+
+        let mut front_only = TransferPadInfo::default();
+        front_only.build_pad_sizes(
+            PadEnd::Front,
+            PrimaryDimTypes::X,
+            SIZES,
+            ALPHAS_FRONT,
+            BETAS_FRONT,
+        );
+        assert!(!front_only.is_empty());
+        assert_eq!(front_only.pad_dims(PadEnd::Back).count(), 0);
+        assert_eq!(
+            front_only.transfer_pad_size(
+                PadEnd::Back,
+                PrimaryDimTypes::X,
+                WkSliceIdx(0),
+                ChunkIdx(0),
+                ChunkSizePadded(10)
+            ),
+            None,
+            "`frontOnly.backQuery`"
+        );
+    }
+
+    /// `wk.front.w0 = 25`, `wk.front.w1 = 0`, `wk.back.w0 = 0`, `wk.back.w1 = 7`,
+    /// `wk.numChunksZero = 0`, `wk.chunkSizeZero = 30`, `wk.negWkSlice = 30`,
+    /// `wk.oobWkSlice = THROW`, `wk.beyond_extent_cap10 = 25`,
+    /// `wk.beyond_extent_capzero = THROW`, `wk.back_beyond_extent = THROW`,
+    /// `wk.capEqualsPad = 205`.
+    ///
+    /// ⛔ `chunkSizePadded` IS THE ONLY EARLY EXIT: at 0 no chunk is "partial", so the walk visits all
+    /// three and answers `3 * chunkOffset` — and past the stored extent it then throws, immediately on
+    /// the back end whose first coordinate is `numChunks - 1`.
+    #[test]
+    fn e024_the_wk_slice_walk_stops_at_the_first_chunk_that_is_not_fully_padded() {
+        let info = both_ends();
+        let wk = |end, w: i64, num_chunks: u32, cap: i32| {
+            info.wk_slice_pad_size(
+                end,
+                PrimaryDimTypes::X,
+                WkSliceIdx(w),
+                NumChunks(num_chunks),
+                ChunkOffset(10),
+                ChunkSizePadded(cap),
+            )
+        };
+
+        // Front, work slice 0: chunks 0 and 1 are fully padded (25, 15 >= 10), chunk 2 is partial at
+        // 5, so `10 * 2 + 5`.
+        assert_eq!(wk(PadEnd::Front, 0, 3, 10), Some(PadSize(25)));
+        assert_eq!(wk(PadEnd::Front, 1, 3, 10), Some(PadSize(0)));
+        assert_eq!(wk(PadEnd::Back, 0, 3, 10), Some(PadSize(0)));
+        assert_eq!(wk(PadEnd::Back, 1, 3, 10), Some(PadSize(7)));
+
+        assert_eq!(
+            wk(PadEnd::Front, 0, 0, 10),
+            Some(PadSize(0)),
+            "`numChunksZero`"
+        );
+        assert_eq!(
+            wk(PadEnd::Front, 0, 3, 0),
+            Some(PadSize(30)),
+            "`chunkSizeZero`"
+        );
+        assert_eq!(
+            wk(PadEnd::Front, -1, 3, 10),
+            Some(PadSize(30)),
+            "`negWkSlice`"
+        );
+        assert_eq!(wk(PadEnd::Front, 2, 3, 10), None, "`oobWkSlice`");
+
+        assert_eq!(
+            wk(PadEnd::Front, 0, 5, 10),
+            Some(PadSize(25)),
+            "`beyond_extent_cap10`"
+        );
+        assert_eq!(wk(PadEnd::Front, 0, 5, 0), None, "`beyond_extent_capzero`");
+        assert_eq!(wk(PadEnd::Back, 0, 5, 0), None, "`back_beyond_extent`");
+
+        // `wk.capEqualsPad = 205`: chunk 1's pad is EXACTLY `chunkSizePadded`, and
+        // `currPadSize < chunkSizePadded` (`:4709`) calls that FULLY padded — so the walk carries on
+        // to chunk 2 and answers `100 * 2 + 5`, not `100 * 1 + 15`.
+        assert_eq!(
+            info.wk_slice_pad_size(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                WkSliceIdx(0),
+                NumChunks(3),
+                ChunkOffset(100),
+                ChunkSizePadded(15)
+            ),
+            Some(PadSize(205))
+        );
+    }
+
+    /// `clamp.front.w0.{c0,c1,c2} = 10, 10, 5`, `clamp.front.w1.* = 0`, `clamp.back.w0.* = 0`,
+    /// `clamp.back.w1.{c0,c1,c2} = 0, 0, 7`, `clamp.negCap = -5`, `clamp.oobWkSlice = THROW`.
+    ///
+    /// ⛔ `clamp.negCap = -5` IS WHY THIS IS NOT [`Ord::clamp`]: `min(max(v, 0), cap)` answers the CAP
+    /// when the cap is negative, which is outside the `[0, chunk_param_with_zero_pad]` range the
+    /// authority's own comment claims (`dsc/dsc2.cpp:4721-4728`), and [`Ord::clamp`] would panic.
+    #[test]
+    fn e024_a_chunks_pad_size_is_clamped_into_the_padded_chunk_and_the_cap_wins() {
+        let info = both_ends();
+        let clamp = |end, w: i64, c: i64, cap: i32| {
+            info.transfer_pad_size(
+                end,
+                PrimaryDimTypes::X,
+                WkSliceIdx(w),
+                ChunkIdx(c),
+                ChunkSizePadded(cap),
+            )
+        };
+        for (chunk, front) in [(0, 10), (1, 10), (2, 5)] {
+            assert_eq!(clamp(PadEnd::Front, 0, chunk, 10), Some(PadSize(front)));
+            assert_eq!(clamp(PadEnd::Front, 1, chunk, 10), Some(PadSize(0)));
+            assert_eq!(clamp(PadEnd::Back, 0, chunk, 10), Some(PadSize(0)));
+        }
+        assert_eq!(clamp(PadEnd::Back, 1, 0, 10), Some(PadSize(0)));
+        assert_eq!(clamp(PadEnd::Back, 1, 1, 10), Some(PadSize(0)));
+        assert_eq!(clamp(PadEnd::Back, 1, 2, 10), Some(PadSize(7)));
+
+        assert_eq!(
+            clamp(PadEnd::Front, 0, 0, -5),
+            Some(PadSize(-5)),
+            "`negCap`"
+        );
+        assert_eq!(clamp(PadEnd::Front, 2, 0, 10), None, "`oobWkSlice`");
+    }
+}
