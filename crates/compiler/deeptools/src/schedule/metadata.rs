@@ -168,8 +168,7 @@ impl Ord for ConstraintValue {
 /// (`ddc/ddc_metadata.h:33-72`).
 ///
 /// ⭐ ONE FUNCTION READS EVERY FIELD: the `checkConstraints` lambda of
-/// `Ddc::exploreAssignDataStages` (`ddc/ddcv1.cpp:792-923`), already ported as
-/// `e001_checkConstraints`.
+/// `Ddc::exploreAssignDataStages` (`ddc/ddcv1.cpp:792-923`), which no ported function owns yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Constraints {
     /// Field: e026_Metadata.mustBeMultiple_
@@ -309,6 +308,9 @@ pub struct Datastage {
     /// (`ddc/ddl/ddl_conversion.cpp:1800`), written as `constraints_[-1]` (`ddc/ddcv1.cpp:689`) and
     /// read as `refDsId < 0 ? nullptr : ...` (`:796-798`). The relative keys come from the loop that
     /// divides this stage, `constraints_[loop->numId_]` (`:610`).
+    /// ⛔ SO [`None`] IS THE ONLY SPELLING OF THAT KEY, never `Some(DataStageId(-1))`: the writer at
+    /// `:610` cannot produce one, because `numId_` is `-1` only on a parametric loop
+    /// (`ddc/ddl/ddl_conversion.cpp:1129`) and `:599` skips those before reaching it.
     pub constraints: BTreeMap<Option<DataStageId>, BTreeMap<BTreeSet<PrimaryDimTypes>, Constraints>>,
     /// Field: e026_Metadata.strategyMinimize_
     ///
@@ -371,6 +373,27 @@ pub struct TransferAccessPattern {
 /// [`TransferAccessPattern`] per dimension, and a `std::map`, so ordered and not a hash map.
 pub type TransferAccessPatternPerDim = BTreeMap<PrimaryDimTypes, TransferAccessPattern>;
 
+/// A forced element count on a stick-replicated dim — what `force_num_elements_` holds
+/// (`ddc/ddc_metadata.h:97`), `8` in the authority's own template
+/// (`ddc/ddl_templates/exx2_32.ddl:162`).
+///
+/// ⛔ `u32`, BECAUSE THE SIGN IS NOT A VALUE HERE: every negative `int` behaves exactly as the `-1`
+/// initialiser at all four reader predicates (`ddc/ddcv1.cpp:458`, `:511`, `:515`, `:529`), so
+/// absence is spelled by [`Option`] and a negative count must not be a second spelling of it.
+///
+/// ```
+/// use deeptools::schedule::metadata::{DataTransfer, ForcedNumElements};
+/// let mut transfer = DataTransfer::default();
+/// transfer.force_num_elements = Some(ForcedNumElements(8));
+/// assert_eq!(transfer.force_num_elements, Some(ForcedNumElements(8)));
+/// ```
+/// ```compile_fail,E0600
+/// use deeptools::schedule::metadata::ForcedNumElements;
+/// let _ = ForcedNumElements(-1);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ForcedNumElements(pub u32);
+
 /// What stage 2b knows about one transfer node — `Metadata::DataTransfer`
 /// (`ddc/ddc_metadata.h:88-118`). Its own eight fields plus the access-pattern list behind them.
 ///
@@ -428,11 +451,15 @@ pub struct DataTransfer {
     pub offset_dest: BTreeMap<usize, i32>,
     /// Field: e026_Metadata.force_num_elements_
     ///
-    /// The DDL's element cap on a stick-replicated dim, absent for the authority's `-1`
-    /// (`ddc/ddc_metadata.h:97`, written at `ddc/ddl/ddl_conversion.cpp:1235-1238`). Both readers
-    /// gate on `> 0`, so absence and "not forced" are the same state
-    /// (`ddc/ddcv1.cpp:442-446`, `ddc/ddl/ddl_conversion.cpp:3216-3220`).
-    pub force_num_elements: Option<i32>,
+    /// The DDL's element cap on a stick-replicated dim, absent for any NEGATIVE authority value
+    /// (`ddc/ddc_metadata.h:97`, written at `ddc/ddl/ddl_conversion.cpp:1235-1238`).
+    ///
+    /// ⛔ NOT ONE `> 0` GATE, AND `0` IS ON THE FORCED SIDE OF IT: `populateUnitTimeTransfers` tests
+    /// this one value with `> 0` (`ddc/ddcv1.cpp:458`), `< 0` (`:511`) and `>= 0` (`:515`, `:529`),
+    /// so at `0` the chunk loop never runs — `unitTimeTransferChunkSize_` is left EMPTY and `:530`
+    /// writes `replicationFactor_ = 0` — where a negative value takes every stick size and computes
+    /// the factor from them (`:531-535`). Only the DDL's reader gates on `> 0` alone (`:3217`).
+    pub force_num_elements: Option<ForcedNumElements>,
     /// Field: e026_Metadata.accessPatternPerDim_
     ///
     /// The per-dim padding pair (`ddc/ddc_metadata.h:117`), private as the authority declares it.
@@ -626,8 +653,9 @@ impl ExternalTransfer {
 ///  * `newAllocations_` (`:127`) and `shadowAllocations_` (`:128`) hold `dsc2::AllocateNode*`, as do
 ///    all three maps of the `Allocation` struct they use (`:121-125`);
 ///  * `prefilledExternalTransferToDataConnectToFill_` (`:138-139`) is an INTERIOR pointer into a
-///    tree-owned node: it stores `&tn->srcLdsAndLoopOffsets_.dataConnect_`, or the `dstVias_` variant
-///    (`ddc/ddcv1.cpp:2311`, `:2322`, keyed at `:2334-2336`), and the DDL conversion WRITES THROUGH
+///    tree-owned node: it stores `&tn->srcLdsAndLoopOffsets_.dataConnect_`, or the
+///    `dstLdsAndLoopOffsets_[0]` one (`ddc/ddcv1.cpp:2312`, `:2322`; `dstVias_` supplies only the
+///    `storage` half of the key, `:2320`, and the map is keyed at `:2334-2336`) — the DDL WRITES THROUGH
 ///    it — `*prefilledIt->second = myExtAlloc.getDataConnect()` (`ddc/ddl/ddl_conversion.cpp:939`),
 ///    after rekeying the same entries in place (`:573-576`, `:2270-2277`). Naming a FIELD inside
 ///    another type's node is strictly more than naming the node;
@@ -735,6 +763,9 @@ pub struct Metadata {
     ///
     /// ⛔ NOT AN `Option`: [`OpFunc::None`] IS the authority's `OpFuncs::NONE` sentinel and the
     /// restore compares against it directly (`ddc/ddcv1.cpp:2273-2274`).
+    /// ⛔ AND IT CAN HOLD THE REWRITE: both save sites sit in ONE `if` on `EXX2` and the `break` at
+    /// `ddc/ddcv1.cpp:2070` leaves only the inner `for`, so `:2075` runs after `:2069` has already
+    /// written `EXX2_ZEROMEAN` and backs THAT up — leaving `restoreDsc` to restore the rewrite.
     pub op_func_backup: OpFunc,
     /// Field: e026_Metadata.transformationConfig_
     ///
@@ -942,6 +973,26 @@ mod unit_tests {
             datastage.constraints[&None][&BTreeSet::from([PrimaryDimTypes::Mb])].max,
             None
         );
+    }
+
+    /// `ddc/ddcv1.cpp:443-535` — the same forced count is read through THREE predicates, and `0` is
+    /// on the forced side of two of them: at `0` the chunk loop at `:510-512` skips every stick, so
+    /// `unitTimeTransferChunkSize_` stays empty and `:530` writes `replicationFactor_ = 0`, where
+    /// absence takes the whole product instead (`:531-535`). The authority's own templates force `8`
+    /// (`ddc/ddl_templates/exx2_32.ddl:162`).
+    ///
+    /// ⛔ A NEGATIVE COUNT IS NOT A THIRD STATE — it is unrepresentable, and the `compile_fail` block
+    /// on [`ForcedNumElements`] is what pins that.
+    #[test]
+    fn a_forced_element_count_of_zero_is_not_an_absent_one() {
+        let mut transfer = DataTransfer::default();
+        assert_eq!(transfer.force_num_elements, None);
+
+        transfer.force_num_elements = Some(ForcedNumElements(0));
+        assert_eq!(transfer.force_num_elements, Some(ForcedNumElements(0)));
+
+        transfer.force_num_elements = Some(ForcedNumElements(8));
+        assert_eq!(transfer.force_num_elements, Some(ForcedNumElements(8)));
     }
 
     /// `ddc/ddl/ddl_conversion.cpp:1226` fills the list through the mutable handle, and
