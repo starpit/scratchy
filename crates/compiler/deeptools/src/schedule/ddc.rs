@@ -3,9 +3,12 @@
 use crate::schedule::dims::PrimaryDimTypes;
 use crate::schedule::dsc2::FoldParamInfoType;
 use crate::schedule::metadata::Metadata;
+use sys_arch_spec::RowId;
 use sys_arch_spec::arch_enums::SenComponent;
 
 /// Replaces: Ddc::registerComponents
+///
+/// Field: e025_Ddc.registerComponents
 ///
 /// The seven components whose storage is a register file (`ddc/ddcv1.cpp:17-18`, declared
 /// `ddc/ddc.h:36`). All three readers ask only for membership, to decide whether a transfer result
@@ -193,8 +196,8 @@ fn ddc_coord_env_option() -> Option<String> {
 /// `SuperDsc`'s design space configurations into a schedule tree.
 ///
 /// ⛔ THIRTEEN OF THE CLASS'S TWENTY DECLARED FIELDS, plus the static `registerComponents` as
-/// [`REGISTER_COMPONENTS`], so the `e032_Ddc` anchor below stays open. All seven left out are a
-/// pointer or a pointer-keyed container, under two blockers.
+/// [`REGISTER_COMPONENTS`], so the `e025_Ddc` and `e032_Ddc` anchors below stay open. All seven
+/// left out are a pointer or a pointer-keyed container, under two blockers.
 ///
 /// Types that are not scheduled units in `crustify-scheduler/UNITS.tsv` at all:
 ///  * `dscGlobal` (`ddc/ddc.h:37`) — `const DesignSpaceConfigGlobal&`;
@@ -221,9 +224,11 @@ fn ddc_coord_env_option() -> Option<String> {
 /// ⛔ AND ONE NESTED TYPE THAT IS NOT A FIELD, WHICH IS WHY THE CENSUS SAYS TWENTY AND NOT
 /// TWENTY-ONE: `struct RowGroupInfo` (`ddc/ddc.h:555-609`) declares no member of itself. The class's
 /// last data member is `loopDistributionParamInfo` at `:550-553`; everything from `:555` on is a type
-/// or a method, and `RowGroupInfo` reaches `Ddc` only as a `RowGroupInfo&` parameter. It is blocked
-/// the same way — `commonGroupAncestor` is a `dsc2::BlockNode*` and every `RowGroupNodeInfo` holds a
-/// `ScheduleNode*` — but it is not a field left out.
+/// or a method, and `RowGroupInfo` reaches `Ddc` only as a `RowGroupInfo&` parameter. Its `cat` and
+/// `activeRow` are ported as [`RowGroupCategory`]; its other three members are blocked —
+/// `commonGroupAncestor` is a `dsc2::BlockNode*`, every `RowGroupNodeInfo` holds a `ScheduleNode*`,
+/// and `ascendingOrder` (`ddc/ddc.h:578`) is DEAD, one hit tree-wide, its order re-derived from
+/// `nodeInfo` at `ddc/ddc_fold.cpp:2192`.
 ///
 /// Transposing the constructor's two `int` parameters is a compile error, which is why neither is a
 /// bare scalar:
@@ -245,6 +250,8 @@ fn ddc_coord_env_option() -> Option<String> {
 /// DesignSpaceConfigGlobal&` at `ddc/ddc.h:37` deletes copy-assignment a second time over.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Ddc {
+    /// Field: e025_Ddc.verbose_
+    ///
     /// Field: e032_Ddc.verbose_
     ///
     /// `ddc/ddc.h:38`. One of TWO fields with no member initialiser that the constructor does set:
@@ -253,17 +260,23 @@ pub struct Ddc {
     /// doc calls it an indeterminate pointer on a caller that forgets it.
     pub verbose: Verbosity,
 
+    /// Field: e025_Ddc.latchDataIdCounter_
+    ///
     /// Field: e032_Ddc.latchDataIdCounter_
     ///
     /// `ddc/ddc.h:39`. Holds the NEXT id to hand out, not the last one handed out. `run_v1` resets it
     /// per DSC (`ddc/ddcv1.cpp:3708`); [`Ddc::next_latch_data_id`] is its only consumer.
     pub latch_data_id_counter: LatchDataId,
 
+    /// Field: e025_Ddc.transformationReportLevel_
+    ///
     /// Field: e032_Ddc.transformationReportLevel_
     ///
     /// `ddc/ddc.h:40` — a constructor parameter, never derived from the coordinate option string.
     pub transformation_report_level: TransformationReportLevel,
 
+    /// Field: e025_Ddc.coordFoldReportLevel_
+    ///
     /// Field: e032_Ddc.coordFoldReportLevel_
     ///
     /// `ddc/ddc.h:41`, from the option string's `content_*` spelling ([`CoordReportLevel::content`]).
@@ -271,6 +284,8 @@ pub struct Ddc {
     /// are inside it (`:1543`, `:1555`, `:1559`, `:1577`, `:1581`, `:1606`, `:1615`, `:1619`).
     pub coord_fold_report_level: CoordReportLevel,
 
+    /// Field: e025_Ddc.coordPropReportLevel_
+    ///
     /// Field: e032_Ddc.coordPropReportLevel_
     ///
     /// `ddc/ddc.h:42`, from the SAME string's `prop_*` spelling ([`CoordReportLevel::prop`]).
@@ -278,6 +293,8 @@ pub struct Ddc {
     /// [`Ddc::coord_fold_report_level`], which is why it is a second level and not one knob.
     pub coord_prop_report_level: CoordReportLevel,
 
+    /// Field: e025_Ddc.verifyCoordinateBasedLoopElemOff
+    ///
     /// Field: e032_Ddc.verifyCoordinateBasedLoopElemOff
     ///
     /// `ddc/ddc.h:43` — the ONLY field driven by an environment variable rather than a parameter
@@ -285,6 +302,8 @@ pub struct Ddc {
     /// element-offset path when this OR `datastage_based_elem_off` is set.
     pub verify_coordinate_based_loop_elem_off: bool,
 
+    /// Field: e025_Ddc.datastageBasedElemOff
+    ///
     /// Field: e032_Ddc.datastageBasedElemOff
     ///
     /// `ddc/ddc.h:44`. NOT a constructor parameter: `run_v1` latches it true per `SuperDsc`, never
@@ -297,12 +316,16 @@ pub struct Ddc {
     /// not an offset.
     pub datastage_based_elem_off: bool,
 
+    /// Field: e025_Ddc.dscToDdl_
+    ///
     /// Field: e032_Ddc.dscToDdl_
     ///
     /// `ddc/ddc.h:45`. Constructor parameter; its one reader dumps the converted DDL to stdout at the
     /// end of `run_v1` (`ddc/ddcv1.cpp:3796`). `runDdc` passes false (`SchedulerStages.cpp:35`).
     pub dsc_to_ddl: bool,
 
+    /// Field: e025_Ddc.trueLXTracker_
+    ///
     /// Field: e032_Ddc.trueLXTracker_
     ///
     /// `ddc/ddc.h:46-47`. Set true only by `runDdc` (`SchedulerStages.cpp:37`), never by the
@@ -318,6 +341,8 @@ pub struct Ddc {
     /// — it cannot allocate LX at all.
     pub true_lx_tracker: bool,
 
+    /// Field: e025_Ddc.exphase
+    ///
     /// Field: e032_Ddc.exphase
     ///
     /// `ddc/ddc.h:101`; `None` is the authority's `-1`.
@@ -340,12 +365,16 @@ pub struct Ddc {
     /// field generalised from two calls to nine.
     pub exphase: Option<ExPhase>,
 
+    /// Field: e025_Ddc.metadata
+    ///
     /// Field: e032_Ddc.metadata
     ///
     /// `ddc/ddc.h:105`. Per-DSC scratch: `run_v1` clears it at the top of every DSC iteration
     /// (`ddc/ddcv1.cpp:3706`), which is [`Metadata::clear`].
     pub metadata: Metadata,
 
+    /// Field: e025_Ddc.coreletSplitDim
+    ///
     /// Field: e032_Ddc.coreletSplitDim
     ///
     /// `ddc/ddc.h:109`. [`PrimaryDimTypes::Undefined`] is the authority's `PrimaryDimTypesCount`
@@ -363,6 +392,8 @@ pub struct Ddc {
     /// that shadows the member.
     pub corelet_split_dim: PrimaryDimTypes,
 
+    /// Field: e025_Ddc.dataStageExplorationDone_
+    ///
     /// Field: e032_Ddc.dataStageExplorationDone_
     ///
     /// `ddc/ddc.h:112`. A one-way phase latch WITHIN one DSC: false at the top of each
@@ -435,6 +466,77 @@ pub fn print_fold_params(fold_params: &[FoldParamInfoType], out: &mut String) {
         out.push_str(", ");
         out.push_str(&fp_info.fold_dim_label);
         out.push_str(") ");
+    }
+}
+
+/// Field: e025_Ddc.Category
+///
+/// Field: e025_Ddc.cat
+///
+/// Field: e025_Ddc.activeRow
+///
+/// How a coordinate propagation relates the reference node's PT row to the working node's —
+/// `RowGroupInfo::Category` (`ddc/ddc.h:556-562`), carrying `activeRow` (`:577`).
+///
+/// ⭐ TWO C++ FIELDS, ONE TYPE, BECAUSE `activeRow` IS ONLY EVER A `ROW_TO_SAME_ROW` FACT. Both of
+/// its writes are the statement after `cat = ROW_TO_SAME_ROW` in the same block
+/// (`ddc/ddc_fold.cpp:1189-1190`, `:1211-1212`), and its one read sits inside `if (cat ==
+/// ROW_TO_SAME_ROW)` (`:1234-1237`). Neither of those two paths calls `gatherRelatedPTRowsBase`,
+/// the only function that rewrites a category after the fact and only ever to `NO_BUNDLING`
+/// (`:745`, `:788`, `:804`, `:817`, `:842`, `:850`, `:869`, `:877`), so no path sets a row and then
+/// moves off this variant. Both writers take the row from a `getCompRowId` they have already tested
+/// `!= -1` (`:1181-1183`, `:1208-1210`), so the `-1` default is never stored either.
+///
+/// ⛔ THE DEFAULT IS THE LAST ENUMERATOR, NOT THE FIRST. `} cat = NO_BUNDLING;` (`ddc/ddc.h:562`)
+/// is a member initialiser, and seven sites construct a `RowGroupInfo` by declaration alone and
+/// rely on it (`ddc/ddc_fold.cpp:2428`, `:3750`, `:3789`, `:3837`, `:4610`, `:4647`, `:4676`).
+///
+/// A row therefore cannot be spelled without the category that owns it:
+/// ```compile_fail
+/// use deeptools::schedule::ddc::RowGroupCategory;
+/// let _ = RowGroupCategory::NoBundling { active_row: sys_arch_spec::RowId(3) };
+/// ```
+/// ⛔ AND THAT NEEDS THIS CONTROL, because `compile_fail` passes on ANY error and rustdoc checks no
+/// error code even when one is written: the same field on the variant that owns it compiles, so the
+/// block above fails on the CATEGORY (`error[E0559]`) and on nothing else.
+/// ```
+/// use deeptools::schedule::ddc::RowGroupCategory;
+/// let _ = RowGroupCategory::RowToSameRow { active_row: sys_arch_spec::RowId(3) };
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RowGroupCategory {
+    /// `ROW_TO_SAME_ROW` (`ddc/ddc.h:557`): reference and working node share one PT row, so the
+    /// rowsplit fold is that row alone (`ddc/ddc_fold.cpp:2175-2188`).
+    RowToSameRow {
+        /// The one row the group requires (`ddc/ddc.h:577`).
+        active_row: RowId,
+    },
+    /// `NONROW_TO_ROW` (`ddc/ddc.h:558`): UN-bundling, gathered from the reversed propagation
+    /// (`ddc/ddc_fold.cpp:1221-1231`).
+    NonRowToRow,
+    /// `ROW_TO_NONROW` (`ddc/ddc.h:559`): the rows must be bundled (`ddc/ddc_fold.cpp:1177`).
+    RowToNonRow,
+    /// `ROW_NORTH_SOUTH` (`ddc/ddc.h:560`): adjacent rows — the `DT_CHECK` at
+    /// `ddc/ddc_fold.cpp:1184` is what keeps them adjacent.
+    RowNorthSouth,
+    /// `NO_BUNDLING` (`ddc/ddc.h:561`), and the member initialiser at `:562`.
+    #[default]
+    NoBundling,
+}
+
+impl RowGroupCategory {
+    /// The spelling `RowGroupInfo::print` gives this category (`ddc/ddc.h:583-599`).
+    ///
+    /// ⛔ ITS `default:` ARM (`ddc/ddc.h:599-600`) PRINTS NOTHING and is unreachable — the switch
+    /// already covers all five enumerators — so there is no sixth spelling to reproduce.
+    pub fn print(self) -> &'static str {
+        match self {
+            Self::RowToSameRow { .. } => "Row-to-SameRow",
+            Self::NonRowToRow => "NonRow-to-Row",
+            Self::RowToNonRow => "Row-to-NonRow",
+            Self::RowNorthSouth => "Row-North-South",
+            Self::NoBundling => "No-Bundling",
+        }
     }
 }
 
@@ -662,4 +764,80 @@ mod unit_tests {
             assert!(MEMORIES.contains(&component), "{component:?}");
         }
     }
+
+    /// `} cat = NO_BUNDLING;` (`ddc/ddc.h:562`) is a member initialiser, so the seven sites that
+    /// declare a `RowGroupInfo` and nothing else start at the LAST enumerator, not the first.
+    #[test]
+    fn the_row_group_category_default_is_no_bundling() {
+        assert_eq!(RowGroupCategory::default(), RowGroupCategory::NoBundling);
+    }
+
+    /// The spellings `RowGroupInfo::print` gives the five categories (`ddc/ddc.h:583-599`); they
+    /// differ from the enumerator names in all five arms.
+    #[test]
+    fn the_category_print_spellings_are_the_authoritys() {
+        let same_row = RowGroupCategory::RowToSameRow {
+            active_row: RowId(3),
+        };
+        assert_eq!(
+            [
+                same_row.print(),
+                RowGroupCategory::NonRowToRow.print(),
+                RowGroupCategory::RowToNonRow.print(),
+                RowGroupCategory::RowNorthSouth.print(),
+                RowGroupCategory::NoBundling.print(),
+            ],
+            [
+                "Row-to-SameRow",
+                "NonRow-to-Row",
+                "Row-to-NonRow",
+                "Row-North-South",
+                "No-Bundling"
+            ]
+        );
+    }
 }
+
+// crustify:todo: e025_Ddc
+
+// crustify:todo: e025_Ddc.COMPLETE
+
+// crustify:todo: e025_Ddc.ROLLED_BACK
+
+// crustify:todo: e025_Ddc.ascendingOrder
+
+// crustify:todo: e025_Ddc.beta
+
+// crustify:todo: e025_Ddc.break
+
+// crustify:todo: e025_Ddc.commonGroupAncestor
+
+// crustify:todo: e025_Ddc.continue
+
+// crustify:todo: e025_Ddc.coordPropTracker
+
+// crustify:todo: e025_Ddc.currDsc
+
+// crustify:todo: e025_Ddc.currItemToProcess_
+
+// crustify:todo: e025_Ddc.itemsToProcess_
+
+// crustify:todo: e025_Ddc.loopDistributionParamInfo
+
+// crustify:todo: e025_Ddc.loopsBelowChunkBoundary
+
+// crustify:todo: e025_Ddc.memTrackers
+
+// crustify:todo: e025_Ddc.node
+
+// crustify:todo: e025_Ddc.nodeInfo
+
+// crustify:todo: e025_Ddc.refsAdded_
+
+// crustify:todo: e025_Ddc.retryCount
+
+// crustify:todo: e025_Ddc.row
+
+// crustify:todo: e025_Ddc.sdsc_
+
+// crustify:todo: e025_Ddc.unseenDims
