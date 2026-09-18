@@ -24,6 +24,13 @@ UNITS = ROOT / "crustify-scheduler" / "UNITS.tsv"
 # One Rust module per C++ header: the header's classes land together, as they are declared
 # together. No module exists for a header with no scheduled class.
 HOME = {
+    # util/foldManager/ was UNSCOPED in the first sc1 and three agents correctly reported BLOCKED
+    # rather than invent FoldManager: CoordinateType's `coordinates_` is
+    # std::map<PrimaryDimTypes, FoldManager<Dtype>> and ~13 of its ~20 methods route through it, so
+    # via it the whole eight-kind node union was unportable without breaking Rule 1 or Rule 2.
+    "foldInfrastructure.h": "schedule/fold.rs",
+    "mapWithFMHelper.h": "schedule/fold_helper.rs",
+    "wkDivisionParams.h": "schedule/wk_division.rs",
     "dsc2.h": "schedule/dsc2.rs",
     "designSpaceConfig.h": "schedule/dsc.rs",
     "dims.h": "schedule/dims.rs",
@@ -32,7 +39,7 @@ HOME = {
 }
 BUDGETS = {"max_syms": 8, "max_loc": 320, "max_types": 5, "min_fields": 20}
 MIN_BODY = 4          # a 3-line class is a tag or a typedef, not a unit of work
-FIELD = re.compile(r"\b([a-zA-Z][a-zA-Z0-9]*_)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;")
+FIELD = re.compile(r"\b([a-zA-Z][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;\s*$")
 
 
 def classes():
@@ -59,12 +66,20 @@ def classes():
             # ACCESSES in the class's own inline methods — `&N_.i_`, `primaryDsInfo_.at(x).f_` —
             # which belong to NESTED types. That inflated DesignSpaceConfig 36 -> 49 and the
             # campaign total 171 -> 197, and was quoted as a real gap for a whole session.
+            # ⛔ AND A PARAMETER CONTINUATION IS NOT A FIELD. Dropping the trailing-underscore
+            # requirement let `const bool isPadFront = true);` — the tail of a method signature
+            # wrapped across lines — contribute `isPadFront`, and `const` besides. A parameter list's
+            # continuation ends in `);` or `,`; a member declaration does not.
+            KW = {"const", "static", "inline", "return", "struct", "class", "using", "typedef",
+                  "public", "private", "protected", "virtual", "explicit", "friend", "template"}
             flds = []
             for bl in body.splitlines():
                 if re.search(r"return|\(|\.|->|&|\[\"", bl) or bl.lstrip().startswith("//"):
                     continue
+                if re.search(r"\)\s*;?\s*$|,\s*$", bl):
+                    continue
                 fm = FIELD.search(bl)
-                if fm:
+                if fm and fm.group(1) not in KW:
                     flds.append(fm.group(1))
             out[m.group(2)] = {
                 "name": m.group(2), "header": h.name, "kind": m.group(1),
@@ -119,40 +134,33 @@ def main():
                 acc.append(txt[start:j + 1])
         return "\n".join(acc)
 
+    # ⛔⛔ AN ORDER-FORCING EDGE IS **STRUCTURAL**, NOT ANY MENTION. Folding every `Ret Class::method`
+    # body into the edges made the graph nearly complete: Tarjan then found ONE strongly-connected
+    # component of NINETEEN classes — the whole node hierarchy plus DesignSpaceConfig, Ddc and
+    # Metadata — which is true of the C++ and useless as a batch.
+    #
+    # ⭐ What actually constrains a Rust port is narrower: types in the SAME MODULE may reference each
+    # other freely, so a method mentioning a type forces nothing. Only a BASE CLASS and a FIELD's TYPE
+    # do — a base because the derived type cannot exist without it, a field because the struct cannot
+    # be written without the type it holds. Method-body mentions still matter for scope (they are why
+    # foldManager had to be scoped at all), but they are not an ordering signal.
     for c in cs.values():
-        code = re.sub(r"/\*.*?\*/", " ", c["body"] + "\n" + method_bodies(c["name"]), flags=re.S)
-        code = "\n".join(re.sub(r"//.*", "", bl) for bl in code.splitlines())
-        c["code"] = code
-        c["impl_loc"] = len(method_bodies(c["name"]).splitlines())
+        decl_lines = []
+        for bl in c["body"].splitlines():
+            if re.search(r"return|\(|\.|->|\[\"", bl) or bl.lstrip().startswith("//"):
+                continue
+            if re.search(r"\)\s*;?\s*$|,\s*$", bl):
+                continue
+            if re.search(r"\b[a-zA-Z][A-Za-z0-9_]*\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;\s*$", bl):
+                decl_lines.append(bl)
+        c["code"] = "\n".join(decl_lines)
         c["deps"] = sorted(
             n for n in names
-            if n != c["name"] and re.search(rf"\b{re.escape(n)}\b", code)
+            if n != c["name"] and re.search(rf"\b{re.escape(n)}\b", c["code"])
         )
 
-    # Longest-path depth over those edges. Mutual references are common and real here — a node names
-    # the config and the config's methods take the node — so a cycle is broken by BODY SIZE: the
-    # bigger class is the container and lands later.
-    #
-    # ⛔ The first version broke ties on the declaration line `first`, which compares line numbers
-    # across DIFFERENT headers and is therefore meaningless. It put DesignSpaceConfig
-    # (designSpaceConfig.h:51, 650 lines, holds the schedule tree) at L4, five layers BEFORE the
-    # AllocateNode (dsc2.h:974, 84 lines) that its own getBufferCapacityForNode takes — handing an
-    # agent a class whose methods need a type that does not exist yet, in a campaign whose Rule 2
-    # forbids inventing one. Size is not a guess: a container is larger than the thing it contains.
-    def heavier(a, b):
-        return (cs[a]["loc"], a) > (cs[b]["loc"], b)
-
-    # ⛔ BREAK THE CYCLES FIRST, THEN MEASURE DEPTH. Deciding inside the recursion does not work:
-    # the `x in seen` guard fires before any size test, so which member of a cycle lands first
-    # depends on which node the walk happened to enter from. That is how DesignSpaceConfig kept
-    # coming out at L4, five layers ahead of the AllocateNode its own methods take, no matter what
-    # tie-break was written. For each mutual pair keep only heavy -> light, so the container is the
-    # consumer and lands strictly later; the result is a DAG and depth is then just longest path.
     # ⛔ AN INHERITANCE EDGE IS NEVER BROKEN. The base is named on the `class X : public Base…` line,
-    # and a derived class cannot land before it. Size is the wrong signal here — a base is usually
-    # LARGER than what derives from it, so the heuristic put BlockNode (36 lines) at L1 and the
-    # ScheduleNode (81 lines) it derives from at L3. The previous campaign hit exactly this: BlockNode
-    # scheduled in the same wave as its base, which hands an agent a type whose parent does not exist.
+    # and a derived class cannot land before it.
     for c in cs.values():
         decl = c["body"].splitlines()[0]
         colon = decl.find(":")
@@ -163,25 +171,62 @@ def main():
             if b not in c["deps"]:
                 c["deps"].append(b)
 
-    for a in cs:
-        for b in list(cs[a]["deps"]):
-            if b in cs[a]["bases"]:
-                continue                                   # inheritance: keep, always
-            if a in cs[b]["deps"] and a not in cs[b]["bases"] and not heavier(a, b):
-                cs[a]["deps"].remove(b)
+    # ⛔⛔ A MUTUALLY RECURSIVE CLUSTER IS **ONE BATCH**, NOT AN ORDERING PROBLEM. Breaking its cycles
+    # to pick a winner is the wrong answer twice over: whichever member lands first is written against
+    # types that do not exist yet, and the tie-break has no honest signal. Body size was tried and is
+    # actively wrong — ScheduleTree (32 lines) CONTAINS ScheduleNode (81), so "the container is bigger"
+    # put the tree first. Three review agents said it plainly: e007/e013/e015/e017 are one cluster the
+    # plan "wrongly split across four waves". So: condense each strongly-connected component to a
+    # single scheduling node, give it one layer and one batch, and let one agent write the members
+    # together — which is what mutual recursion actually requires.
+    index, stack, on, low, num, sccs = [0], [], set(), {}, {}, []
 
-    depth: dict[str, int] = {}
-
-    def d(n, seen=()):
-        if n in depth:
-            return depth[n]
-        if n in seen:                      # a cycle of three or more; rare here, and harmless
-            return 0
-        depth[n] = max((d(x, seen + (n,)) + 1 for x in cs[n]["deps"]), default=0)
-        return depth[n]
+    def strong(v):                                    # Tarjan, iterative-safe depth here (≤ 44 nodes)
+        low[v] = num[v] = index[0]; index[0] += 1
+        stack.append(v); on.add(v)
+        for w in cs[v]["deps"]:
+            if w not in num:
+                strong(w); low[v] = min(low[v], low[w])
+            elif w in on:
+                low[v] = min(low[v], num[w])
+        if low[v] == num[v]:
+            comp = []
+            while True:
+                w = stack.pop(); on.discard(w); comp.append(w)
+                if w == v:
+                    break
+            sccs.append(sorted(comp))
 
     for n in cs:
-        d(n)
+        if n not in num:
+            strong(n)
+
+    comp_of = {n: i for i, comp in enumerate(sccs) for n in comp}
+    comp_deps = {i: set() for i in range(len(sccs))}
+    for n, c in cs.items():
+        for d_ in c["deps"]:
+            if comp_of[d_] != comp_of[n]:
+                comp_deps[comp_of[n]].add(comp_of[d_])
+
+    cdepth: dict[int, int] = {}
+
+    def cd(i):
+        if i not in cdepth:
+            cdepth[i] = 0                             # set before recursing: the condensation is a DAG
+            cdepth[i] = max((cd(j) + 1 for j in comp_deps[i]), default=0)
+        return cdepth[i]
+
+    for i in range(len(sccs)):
+        cd(i)
+    for n in cs:
+        cs[n]["scc"] = comp_of[n]
+
+    depth = {n: cdepth[comp_of[n]] for n in cs}
+    multi = [c for c in sccs if len(c) > 1]
+    if multi:
+        print("  mutually recursive clusters, each ONE batch:")
+        for c in multi:
+            print(f"    L{cdepth[comp_of[c[0]]]}: " + ", ".join(c))
 
     order = sorted(cs.values(), key=lambda c: (depth[c["name"]], c["header"], c["first"]))
     rows = ["\t".join(["entry", "level", "loc", "authority", "extract_lines", "rust_home",
@@ -189,6 +234,7 @@ def main():
     for i, c in enumerate(order, 1):
         e = f"e{i:03d}_{c['name']}"
         c["entry"] = e
+        c["home"] = HOME[c["header"]]
         note = (f"{c['kind']} {c['name']}, {c['loc']} lines, {len(c['fields'])} declared fields. "
                 f"PORT ITS FIELDS AND ITS METHODS TOGETHER — every method defined in the header and "
                 f"every method defined in the matching .cpp. A fact a method needs is a FIELD on "
@@ -277,6 +323,42 @@ def main():
     out.mkdir(exist_ok=True)
     for obj in ("port", "review"):
         (out / f"{obj}.json").write_text(json.dumps(doc, indent=1) + "\n")
+
+    # ⭐ AND A REMAINDER, or a re-run re-ports what already landed. The driver's stage() sees a .done
+    # marker beside a non-empty schedule and calls the marker stale, so pointing it at port.json would
+    # hand 21 finished units back to agents. Drop any unit whose `/// Replaces:` anchor is already in
+    # its home.
+    # ⛔ AN ANCHOR IS NOT A PORT — it is only the signal crustify can consume. The gate stays: zero
+    # todo!, zero traits, a real caller, and nodes minted on a real program.
+    landed = set()
+    for home in {c["home"] for c in order}:
+        f = ROOT / "crates/compiler/deeptools/src" / home
+        if f.exists():
+            # ⛔ MATCH ON THE CLASS NAME, NOT THE eNNN NUMBER. Scoping foldManager inserted 12 units
+            # and renumbered every later one, so wave 1's anchors stopped identifying their units —
+            # only 13 of the 21 landed types still matched, and those by coincidence. The number is an
+            # ordering artefact; the class name is the identity.
+            landed |= {a.split("_", 1)[1] for a in
+                       re.findall(r"/// Replaces: (e\d{3}_[A-Za-z0-9_]+)", f.read_text())}
+    rem_waves = []
+    for w in doc["waves"]:
+        bs = []
+        for b in w["batches"]:
+            keep = [i for i in b["items"] if i["name"].split("_", 1)[1] not in landed]   # not `items`: that shadowed
+            if keep:                                                     # the outer list and made the
+                bs.append(dict(b, items=keep))                           # summary report 4 anchors
+        if bs:
+            rem_waves.append({"unit_count": sum(len(b["items"]) for b in bs), "batches": bs})
+    ritems = [i for w in rem_waves for b in w["batches"] for i in b["items"]]
+    rdoc = dict(doc, waves=rem_waves, summary={
+        "unit_count": len(ritems),
+        "layer_count": len({i["layer"] for i in ritems}),
+        "batch_count": sum(len(w["batches"]) for w in rem_waves),
+        "file_count": len({b["source_file"] for w in rem_waves for b in w["batches"]}),
+    })
+    (out / "port-remainder.json").write_text(json.dumps(rdoc, indent=1) + "\n")
+    print(f"  remainder: {len(ritems)} units left ({len(landed)} anchored), "
+          f"{rdoc['summary']['batch_count']} batches, {rdoc['summary']['layer_count']} layers")
     s = doc["summary"]
     print(f"  UNITS.tsv: {len(order)} classes")
     print(f"  sc1-dsc-data-model: {s['unit_count']} units, {len(waves)} waves, "

@@ -326,7 +326,7 @@ remainders
 # calling a fused wrapper at a non-fused site and a `DT_CHECK` recovery that kept the LARGER bound
 # where the reference aborts the compile. Dropping them to go faster would be trading the only pass
 # that reads the authority for wall-clock.
-stage sc1-dsc-data-model/port.json    port   sc1-port
+stage sc1-dsc-data-model/port-remainder.json  port   sc1-port
 gate sc1
 
 stage sc1-dsc-data-model/review.json  review sc1-review

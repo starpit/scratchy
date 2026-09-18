@@ -178,7 +178,7 @@
        ],
        "members": {
         "types": [
-         "e032_Ddc"
+         "e025_Ddc"
         ]
        }
       }
@@ -198,7 +198,7 @@
          "e003_PaddingFormType",
          "e004_DimPaddingSizes",
          "e005_SymbolicDimInfo",
-         "e011_DataStructDims"
+         "e012_DataStructDims"
         ]
        }
       }
@@ -214,7 +214,7 @@
        ],
        "members": {
         "types": [
-         "e031_DesignSpaceConfig"
+         "e027_DesignSpaceConfig"
         ]
        }
       }
@@ -231,28 +231,69 @@
        "members": {
         "types": [
          "e006_GroupTagRegInfo",
-         "e007_ScheduleTree",
-         "e008_TransferPadInfo",
-         "e009_FoldParamInfoType",
-         "e010_LoopDistributionParamType",
-         "e012_CoordinateType",
-         "e013_ScheduleNode",
-         "e014_DataStage",
-         "e015_BlockNode",
-         "e016_CoordPropInfoType",
-         "e017_LoopNode",
-         "e018_LoopCond",
-         "e019_DataInfo",
-         "e020_DistributionStatusInfo",
-         "e021_LoopDistributionInfo",
-         "e022_LoopCondComposite",
-         "e023_TransferNode",
-         "e024_ComputeNode",
-         "e025_ConditionNode",
-         "e026_SyncNode",
-         "e027_StickMaskNode",
-         "e028_AllocateNode",
-         "e030_ConstantInfo"
+         "e007_FoldParamInfoType",
+         "e008_LoopDistributionParamType",
+         "e022_DataStage",
+         "e023_CoordinateType",
+         "e024_TransferPadInfo",
+         "e028_ConstantInfo",
+         "e029_ScheduleNode",
+         "e030_BlockNode",
+         "e031_LoopNode",
+         "e032_ScheduleTree",
+         "e033_DataInfo",
+         "e034_TransferNode",
+         "e035_ComputeNode",
+         "e036_SyncNode",
+         "e037_AllocateNode",
+         "e038_CoordPropInfoType",
+         "e039_LoopCond",
+         "e040_StickMaskNode",
+         "e041_DistributionStatusInfo",
+         "e042_LoopDistributionInfo",
+         "e043_LoopCondComposite",
+         "e044_ConditionNode"
+        ]
+       }
+      }
+     }
+    },
+    "fold": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/fold.rs": {
+       "tu": "crustify-scheduler/cpp/foldInfrastructure.h",
+       "headers": [
+        "util/foldManager/foldInfrastructure.h"
+       ],
+       "members": {
+        "types": [
+         "e009_FoldDimProp",
+         "e010_FoldFunction",
+         "e013_ConstFoldFunction_NonLeaf",
+         "e014_ConstFoldFunction_Leaf",
+         "e015_AffineFoldFunction_NonLeaf",
+         "e016_AffineFoldFunction_Leaf",
+         "e017_MapFoldFunction_NonLeaf",
+         "e018_MapFoldFunction_Leaf",
+         "e019_WkSplitFoldFunction_Leaf",
+         "e020_FoldManager"
+        ]
+       }
+      }
+     }
+    },
+    "fold_helper": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/fold_helper.rs": {
+       "tu": "crustify-scheduler/cpp/mapWithFMHelper.h",
+       "headers": [
+        "util/foldManager/mapWithFMHelper.h"
+       ],
+       "members": {
+        "types": [
+         "e021_MapWithFMHelper"
         ]
        }
       }
@@ -269,7 +310,23 @@
        "members": {
         "types": [
          "e001_FailedAlloc",
-         "e029_Metadata"
+         "e026_Metadata"
+        ]
+       }
+      }
+     }
+    },
+    "wk_division": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/wk_division.rs": {
+       "tu": "crustify-scheduler/cpp/wkDivisionParams.h",
+       "headers": [
+        "util/foldManager/wkDivisionParams.h"
+       ],
+       "members": {
+        "types": [
+         "e011_WkSplitParam"
         ]
        }
       }
