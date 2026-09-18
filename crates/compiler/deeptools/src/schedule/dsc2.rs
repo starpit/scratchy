@@ -1364,6 +1364,119 @@ mod unit_tests {
         );
     }
 
+    /// ⛔ THE AUTHORITY'S OWN PACK/MERGE TABLE AND WHAT ITS EXPANSION DOES TO THE -1 SLOTS. `pack12`
+    /// is `{0, -1, 1, -1, ...}` (`ddc/transformations/automatic_shuffle/shuffle.cpp:34-35`) and
+    /// reaches `insert_packmerge` through `unary_op`, which omits the expand argument and so takes
+    /// its `true` default (`:434`, `:438`, `:167`, `shuffle.h:194`). `expand_indices` then scales
+    /// EVERY entry as `compact_indices[i] * scale + j` with no -1 guard
+    /// (`ddc/ddc_transformation.cpp:1947-1952`). At 4-bit elements `scale` is 2, so ONE -1 slot
+    /// becomes TWO DIFFERENT negative entries — which is why [`InstrAttribute::indices`] is a plain
+    /// [`PackMergeIndex`] and not an `Option`.
+    #[test]
+    fn a_packmerge_index_is_not_a_sentinel_because_the_expansion_scales_it() {
+        let pack12 = [0, -1, 1, -1, 2, -1, 3, -1, 4, -1, 5, -1, 6, -1, 7, -1];
+
+        // `ddc/ddc_transformation.cpp:1941-1947`: 128 bits per slice over the entry count, then
+        // over the input element's width.
+        let entry_bits = 128 / pack12.len() as i32;
+        let scale = entry_bits / DataFormats::Senint4.bit_width().unwrap().0;
+        assert_eq!(scale, 2);
+
+        let attr = InstrAttribute {
+            indices: pack12
+                .iter()
+                .flat_map(|index| (0..scale).map(move |j| PackMergeIndex(index * scale + j)))
+                .collect(),
+            ..InstrAttribute::default()
+        };
+
+        // ⛔ THE HOLE EXPANDED INTO TWO UNEQUAL HOLES, and an `Option` cannot hold either of them.
+        assert_eq!(attr.indices.len(), 32);
+        assert_eq!(attr.indices[0], PackMergeIndex(0));
+        assert_eq!(attr.indices[1], PackMergeIndex(1));
+        assert_eq!(attr.indices[2], PackMergeIndex(-2));
+        assert_eq!(attr.indices[3], PackMergeIndex(-1));
+        assert_ne!(attr.indices[2], attr.indices[3]);
+
+        // ⭐ AND THE LENGTH IS LOAD-BEARING: `expand_indices` reads it back to derive the width
+        // (`:1942`), so a representation that dropped or merged slots would change every entry.
+        assert_eq!(128 / attr.indices.len() as i32, 4);
+    }
+
+    /// `dsc/dsc2.cpp:2297-2332`, every row of both size tables at both sides of the RCUDD1A split —
+    /// the PTWEST rows straight, the memory rows also through the `MACC` format pairing that shares
+    /// each row, and PELRF/SFPLRF proving the exclusion at `:2315`.
+    #[test]
+    fn every_operand_size_row_holds_at_both_sides_of_the_rcudd1a_split() {
+        // `:2298-2307`. FMA4 is the one row with no split — "only available from SEN1P5".
+        let ptwest = [
+            (ComputeOpType::Fma16, 8, 32),
+            (ComputeOpType::Fma8, 16, 128),
+            (ComputeOpType::Ima8, 32, 128),
+            (ComputeOpType::Fma4, 256, 256),
+            (ComputeOpType::Ima4, 64, 256),
+        ];
+        for (r#type, below, above) in ptwest {
+            let node = ComputeNode {
+                r#type,
+                inputs: vec![SenComponent::Ptwest],
+                ..ComputeNode::default()
+            };
+            let output = OperandSize(64);
+            for (arch, want) in [
+                (Gen::Mpw2, below),
+                (Gen::Rcudd1a, below),
+                (Gen::Sen1p5, above),
+            ] {
+                assert_eq!(
+                    node.operand_sizes(arch),
+                    Some(vec![OperandSize(want), output]),
+                    "PTWEST {:?} at {:?}",
+                    r#type,
+                    arch
+                );
+            }
+        }
+
+        // `:2316-2331`. Each row is reached BOTH by its op and by `MACC` at the row's format, and
+        // every `above` here differs from the `1024 / bit_width` default the row displaces.
+        let memory = [
+            (ComputeOpType::Fma8, DataFormats::Sen143Fp8, 128, 1024),
+            (ComputeOpType::Ima8, DataFormats::Senint8, 256, 1024),
+            (ComputeOpType::Ima4, DataFormats::Senint4, 512, 2048),
+            (ComputeOpType::Fma16, DataFormats::Sen169Fp16, 64, 256),
+            (ComputeOpType::Fma4, DataFormats::Sen121Fp4, 2048, 2048),
+        ];
+        for (r#type, format, below, above) in memory {
+            let default = OperandSize(1024 / format.bit_width().unwrap().0);
+            assert_ne!(
+                OperandSize(above),
+                default,
+                "{:?} row is the default",
+                r#type
+            );
+            for op in [r#type, ComputeOpType::Macc] {
+                let node = ComputeNode {
+                    r#type: op,
+                    data_format: format,
+                    inputs: vec![SenComponent::Lx, SenComponent::Pelrf, SenComponent::Sfplrf],
+                    ..ComputeNode::default()
+                };
+                // ⛔ PELRF AND SFPLRF ARE MEMORIES THE ROW EXCLUDES, so they take the default.
+                for (arch, want) in [(Gen::Rcudd1a, below), (Gen::Sen1p5, above)] {
+                    assert_eq!(
+                        node.operand_sizes(arch),
+                        Some(vec![OperandSize(want), default, default, OperandSize(64)]),
+                        "{:?}/{:?} at {:?}",
+                        op,
+                        format,
+                        arch
+                    );
+                }
+            }
+        }
+    }
+
     /// `dsc/dscdefn.h:134-207` against `dsc/dscdefn.cpp:33-107`: 70 of the 71 ops have a spelling,
     /// and `flipMap` makes each one a round trip.
     #[test]
@@ -2886,8 +2999,15 @@ pub struct BitWidth(pub i32);
 /// A compute instruction's general SRC1/IMM field — `InstrAttribute::mode_` (`dsc/dsc2.h:915`).
 ///
 /// ⛔ AN OPCODE-SPECIFIC ENCODING, NOT A CLOSED SET: bridge 1 reads it as an FMUL divide selector at
-/// 11 (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`) and as a FEST flavour at 0
-/// through 9 (`:1317-1385`), and the DDL states it verbatim (`ddc/ddl/ddl_conversion.cpp:1368-1370`).
+/// 11 (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`), as a FEST flavour at 0
+/// through 9 (`:1317-1385`) and as a convert flavour at 1, 8, 10, 12 and 14 (`:1454-1462`), and the
+/// DDL states it verbatim (`ddc/ddl/ddl_conversion.cpp:1368-1370`).
+///
+/// ⛔ AND -1 IS EMITTED, NOT ELIDED: two writers put the field on the wire whatever it holds —
+/// `ddc/ddl/ddl_conversion.cpp:3145` builds `APInt(64, mode_)` for the DataflowIR `ComputeOp`, and
+/// `dsc/dsc2.cpp:169` writes `"mode_" : -1` into the JSON its own importer reads straight back
+/// (`:1196-1197`). So [`InstrAttribute::mode`]'s `None` denotes BOTH "matches no encoding" to the
+/// branching readers above and the integer -1 to those two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Mode(pub i32);
 
@@ -2906,9 +3026,16 @@ pub struct ComputeMask(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Repetition(pub i32);
 
-/// One entry of a PACK/MERGE mapping — a source element position within the 128-bit slice
-/// (`dsc/dsc2.h:906`), scaled by `expand_indices` as `compact_indices[i] * scale + j`
-/// (`ddc/ddc_transformation.cpp:1939-1956`).
+/// One entry of a PACK/MERGE mapping (`dsc/dsc2.h:906`) — a source element position within the
+/// 128-bit slice, or a negative value standing for a zero/sign-extended slot.
+///
+/// ⛔ THE NEGATIVE ENTRIES ARE NOT ONE SENTINEL. The authority's own tables spell an extend slot -1
+/// (`ddc/transformations/automatic_shuffle/shuffle.cpp:19-41` — `pack24`, `pack8`, `pack9` and
+/// `pack12`-`pack15`), and `expand_indices` then scales EVERY entry with no -1 guard,
+/// `compact_indices[i] * scale + j` (`ddc/ddc_transformation.cpp:1952`). `scale` is
+/// `128 / indices.size() / element_bit_width` (`:1941-1947`), so a 4-bit `pack12` expands at scale 2
+/// and its one -1 slot becomes the PAIR -2, -1 before it is stored (`:1969-1970`). See
+/// [`InstrAttribute::indices`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PackMergeIndex(pub i32);
 
@@ -3365,10 +3492,20 @@ impl DataFormats {
 pub struct InstrAttribute {
     /// Field: e024_ComputeNode.indices_
     ///
-    /// The PACK/MERGE mapping (`dsc/dsc2.h:906`). ⛔ `-1` IS NOT A POSITION: the authority's own
-    /// comment reads "-1 for zero/sign extend" (`dsc/dsc2.h:903`), so an absent entry is an
-    /// extension slot rather than a source element.
-    pub indices: Vec<Option<PackMergeIndex>>,
+    /// The PACK/MERGE mapping (`dsc/dsc2.h:906`), one entry per slot of the instruction word. The
+    /// LENGTH is load-bearing: `expand_indices` derives each entry's width from it as
+    /// `128 / indices.size()` (`ddc/ddc_transformation.cpp:1941-1942`).
+    ///
+    /// ⛔ NOT `Option`, THOUGH `dsc/dsc2.h:903` INVITES IT. That comment — "-1 for zero/sign
+    /// extend" — says what the hardware does with the slot, and NOTHING IN THE TREE BRANCHES ON -1:
+    /// all five readers emit the entry verbatim as an integer (`getI32ArrayAttr` at
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1126` and `:1495`,
+    /// `getI64IntegerAttr` at `ddc/ddl/ddl_conversion.cpp:3136`, the JSON exporter at
+    /// `dsc/dsc2.cpp:126` and its importer at `:1176`, and `dsc/dsc2Pcfg.cpp:1640`). The one writer
+    /// that computes rather than copies multiplies the sentinel like any other index, turning one -1
+    /// into -2, -1 at scale 2 (`ddc/ddc_transformation.cpp:1952`) — and a hole cannot expand into
+    /// two unequal holes. See [`PackMergeIndex`].
+    pub indices: Vec<PackMergeIndex>,
     /// Field: e024_ComputeNode.repetition_
     ///
     /// `dsc/dsc2.h:907` — "default 8 slices works the same".
@@ -3394,10 +3531,13 @@ pub struct InstrAttribute {
     pub param_map: BTreeMap<String, String>,
     /// Field: e024_ComputeNode.mode_
     ///
-    /// `dsc/dsc2.h:915`. ⛔ `-1` IS ABSENT — the DDL writes it only when it states one
-    /// (`ddc/ddl/ddl_conversion.cpp:1368-1370`), and every bridge-1 reader tests it against a
-    /// specific encoding (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`,
-    /// `:1317-1385`), which -1 never is.
+    /// `dsc/dsc2.h:915`. `-1` IS ABSENT TO EVERY BRANCHING READER — the DDL writes the field only
+    /// when it states one (`ddc/ddl/ddl_conversion.cpp:1368-1370`), and each bridge-1 reader tests
+    /// it against a specific non-negative encoding
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`, `:1317-1385`, `:1454-1462`),
+    /// which -1 never is. ⛔ IT IS STILL AN INTEGER ON THE WIRE, so `None` MUST re-serialize as -1
+    /// and not be skipped — unlike [`Self::indices`], where the same "-1 means absent" reading is
+    /// wrong outright. See [`Mode`] for both wire writers.
     pub mode: Option<Mode>,
     /// Field: e024_ComputeNode.compute_mask_
     ///
@@ -3444,11 +3584,16 @@ impl Default for InstrAttribute {
 /// every `inputs_`/`outputs_` entry it appends (`ddc/ddl/ddl_conversion.cpp:1385-1406`), and both
 /// readers index it with an operand position (`ddc/ddcv1.cpp:3059`,
 /// `ddc/ddc_transformation.cpp:1358-1379`).
+///
+/// ⛔ AND BOTH OF THOSE READERS READ `forOutputs_`. `forInputs_` HAS NO READER AT ALL: tree-wide its
+/// only mention outside the declaration is the DDL's `push_back`
+/// (`ddc/ddl/ddl_conversion.cpp:1393-1394`), so it is carried because the node declares it, not
+/// because a pass consults it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepetitionWithOffset {
     /// Field: e024_ComputeNode.forInputs_
     ///
-    /// `dsc/dsc2.h:951`.
+    /// `dsc/dsc2.h:951`. ⛔ WRITTEN AND NEVER READ — see the type's note above.
     pub for_inputs: Vec<Repetition>,
     /// Field: e024_ComputeNode.forOutputs_
     ///
@@ -3479,8 +3624,15 @@ pub struct RepetitionWithOffset {
 /// (`dsc/dsc2.cpp:2348-2357`), which needs e019 and `DesignSpaceConfig`; `print` prints the base's
 /// `name_` and each `DataInfo` (`dsc/dsc2.cpp:4443-4477`).
 ///
-/// ⛔ NO `PartialEq`: node identity in the authority is the POINTER — `allocUsers_` and the fold
-/// pass hold `ScheduleNode*` and compare nodes by address (`ddc/ddc_fold.cpp:1698`).
+/// ⭐ IT IS ONE BRANCH OF TWO THAT BLOCKS THE FORMER, not the body: past the PACKMERGE early return
+/// the rest reads only `type_`, `dataFormat_` and `inputs_.size()` (`dsc/dsc2.cpp:2358-2394`), all
+/// carried here. The method stays whole rather than shipping a half that answers for 70 ops and not
+/// the 71st.
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the POINTER. `AllocateNode::allocUsers_` is
+/// a `std::vector<std::pair<const ScheduleNode*, int>>` and all three of its operations match a user
+/// with `node == userNode`, an ADDRESS compare (`dsc/dsc2.h:1007`, `:1014`, `:1023`, `:1039`); the
+/// fold pass then walks that pointer-keyed list (`ddc/ddc_fold.cpp:1688`).
 #[derive(Clone, Debug)]
 pub struct ComputeNode {
     /// Field: e024_ComputeNode.exUnit_
@@ -3496,8 +3648,16 @@ pub struct ComputeNode {
     /// Field: e024_ComputeNode.dataFormat_
     ///
     /// The precision the op runs at (`dsc/dsc2.h:934`). ⛔ IT IS THE OP'S PRECISION FOR `MACC`
-    /// ALONE — every other op names its own width, and `dataFormat_` then only says what the
-    /// operands hold (`ddc/ddl/ddl_conversion.cpp:1410-1430`, and see [`Self::operand_sizes`]).
+    /// ALONE, which is why [`Self::operand_sizes`] dispatches on it for that one op: a `"macc"` in
+    /// the DDL picks the FMA/IMA variant from the stated precision and then keeps it
+    /// (`ddc/ddl/ddl_conversion.cpp:1410-1430`).
+    ///
+    /// ⛔ FOR EVERY OTHER OP IT IS ONE OF EXACTLY TWO VALUES, NOT WHAT THE OPERANDS HOLD. The DDL
+    /// does scan the operands' labelled-DS formats (`:1441-1466`) and then THROWS THE SCANNED VALUE
+    /// AWAY: `dataFormat_` is left `IEEE_FP32` if that is what it reached and overwritten with
+    /// `SEN169_FP16` otherwise (`:1467-1468`). So `INVALID` never survives onto a DDL-minted node,
+    /// and the `1024 / bit_width` default in [`Self::operand_sizes`] only ever divides by 32 or 16
+    /// there.
     pub data_format: DataFormats,
     /// Field: e024_ComputeNode.inputs_
     ///
