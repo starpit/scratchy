@@ -23,6 +23,35 @@ pub struct NumCoreletsUsed(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LoopCount(pub i32);
 
+/// One `paramNameToVal` value as its callers read it: the map holds `double*` INTO this object's own
+/// `DataStructDims` members (`dsc/designSpaceConfig.h:358-609`), and every dim member is born `-1`
+/// (`dsc/dims.h:160-193`).
+///
+/// ⛔ AN UNFILLED DIM IS THE VALUE `-1`, NOT AN ABSENCE. Measured on a default-constructed
+/// `DesignSpaceConfig`, all 240 keys read `-1` and none throws — so `getLoopCount` answers
+/// `int(-1 / -1) == 1` for all 29 stage loops and `getInpInHBM` answers `1` for all twelve labels.
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct ParamVal(pub f64);
+
+impl ParamVal {
+    /// What a dim reads before anyone fills it (`dsc/dims.h:160-193`).
+    pub const UNFILLED: Self = Self(-1.0);
+}
+
+/// What `getLoopCount` answers (`dsc/designSpaceConfig.cpp:416-427`), keeping IBM's three outcomes
+/// apart the way [`LayoutOrderPosition`] does for `getDimIndexInLayoutOrder`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopTripCount {
+    /// The quotient IBM computes and truncates towards zero (`:425-426`).
+    Is(LoopCount),
+    /// The denominator stage's dim is `0`, where IBM's `int(x / 0.0)` is UNDEFINED — measured as
+    /// `2147483647`, which is not a trip count.
+    UndefinedZeroDenominator,
+    /// Neither key the loop's spelling builds is in `paramNameToVal`, so IBM stopped before
+    /// dividing: `INNER` on its own `DT_CHECK` (`:417`), `CONST` and `INVALID` on `.at()`.
+    NoSuchLoop,
+}
+
 /// One stick dim's extent in ELEMENTS — the `double` of `PrimaryDsInfo::stickSize_`
 /// (`dsc/dscdefn.h:478`), which `getStickSizes` truncates to an `int` on the way out
 /// (`dsc/dsc2.cpp:4088`).
@@ -554,14 +583,14 @@ pub enum StickSizeScope {
 }
 
 /// The twelve `DataStructDims` prefixes `paramNameToVal`'s keys are built from, LONGEST FIRST
-/// (`dsc/designSpaceConfig.h:358-608`). They are exactly `getDsdFromStr`'s twelve spellings
-/// (`:267-345`), which are exactly the names the constructor assigns
+/// (`dsc/designSpaceConfig.h:358-609`). They are exactly `getDsdFromStr`'s twelve spellings
+/// (`:317-346`), which are exactly the names the constructor assigns
 /// (`dsc/designSpaceConfig.cpp:16-28`).
 const DSD_PREFIXES: [&str; 12] = [
     "chipletd", "coreletd", "unpadn", "chipd", "dscn", "tel", "pel", "b", "d", "n", "p", "t",
 ];
 
-/// The twenty dim names `paramNameToVal` pairs with every prefix (`dsc/designSpaceConfig.h:358-608`).
+/// The twenty dim names `paramNameToVal` pairs with every prefix (`dsc/designSpaceConfig.h:358-609`).
 ///
 /// ⛔ `x1` IS NOT ONE OF THEM, though `DataStructDims` has the field and its own
 /// `param_name_to_val` accepts the name (`dsc/dims.cpp:437-482`): 12 x 20 = 240 keys, and no
@@ -572,7 +601,7 @@ const PARAM_DIM_NAMES: [&str; 20] = [
     "sij", "zi", "zj", "zij",
 ];
 
-/// One `paramNameToVal` key cut into its prefix and its dim (`dsc/designSpaceConfig.h:358-608`).
+/// One `paramNameToVal` key cut into its prefix and its dim (`dsc/designSpaceConfig.h:358-609`).
 /// Longest prefix first, and a prefix whose remainder is not a dim name is not the split.
 fn split_param_name(name: &str) -> Option<(&'static str, &'static str)> {
     DSD_PREFIXES.into_iter().find_map(|prefix| {
@@ -584,9 +613,10 @@ fn split_param_name(name: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-/// The dim one of [`PARAM_DIM_NAMES`] selects, read (`dsc/designSpaceConfig.h:358-608`).
-fn dim_val_by_name(dsd: &DataStructDims, dim: &str) -> Option<dims::DimSize> {
-    match dim {
+/// The dim one of [`PARAM_DIM_NAMES`] selects, read (`dsc/designSpaceConfig.h:358-609`) — unfilled
+/// or not, because IBM reads it through a `double*` that cannot be absent.
+fn dim_val_by_name(dsd: &DataStructDims, dim: &str) -> Option<ParamVal> {
+    let filled = match dim {
         "in" => dsd.r#in,
         "out" => dsd.out,
         "mb" => dsd.mb,
@@ -607,8 +637,9 @@ fn dim_val_by_name(dsd: &DataStructDims, dim: &str) -> Option<dims::DimSize> {
         "zi" => dsd.zi,
         "zj" => dsd.zj,
         "zij" => dsd.zij,
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(filled.map_or(ParamVal::UNFILLED, |size| ParamVal(size.get())))
 }
 
 /// IBM's `isFractional` (`dsc/designSpaceConfig.cpp:7812`).
@@ -893,11 +924,11 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 /// moves, the memory-hierarchy stages it moves them through, the loop nest that drives them and the
 /// schedule tree the DDC and the L3 scheduler build into it.
 ///
-/// ⛔ SIX OF THE THIRTY-SIX DECLARED FIELDS ARE NOT CARRIED, and SEVEN anchors below stay open for
-/// them, because the scheduler flattened the nested `ProgramFrame` (`:129-132`) into a `.ptr_` and a
-/// `.size_` anchor of its own. Thirty carried plus seven open anchors therefore does not close on
-/// thirty-six; the field count is the one that does. Each uncarried field needs a type this campaign
-/// has not scheduled:
+/// ⛔ SIX OF THE THIRTY-SIX DECLARED FIELDS (`:72-133`) ARE NOT CARRIED, and EIGHT anchors below stay
+/// open for them: the scheduler flattened the nested `ProgramFrame` (`:129-132`) into a `.ptr_` and a
+/// `.size_` anchor of its own, so `prog_frame_ptr_` costs three. Thirty carried plus six uncarried
+/// closes on thirty-six; the ANCHOR count is the one that does not. Each uncarried field needs a type
+/// this campaign has not scheduled:
 /// * `labeledDs_` (`:86`) — `std::vector<LabeledDsInfo>`, and `LabeledDsInfo` is a 25-field cluster
 ///   over `DtInfo`, `MemOrg`, `CoreDsInfo` and `MxInfo` (`dsc/dscdefn.h:321-468`), none of them a
 ///   unit in `crustify-scheduler/UNITS.tsv`.
@@ -911,7 +942,8 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 ///   matching the string against the `name_` of eight named members PLUS every [`sc`](Self::sc)
 ///   entry (`:6927-6931`, `:7511-7515`).
 /// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e032_ScheduleTree` anchor.
-///   [`is_dsc2`](Self::is_dsc2) is the one method blocked on it alone.
+///   `isDSC2` — `return !scheduleTree_.empty()` (`dsc/designSpaceConfig.cpp:30`) — is the one method
+///   blocked on it alone, and is NOT ported here.
 /// * `pcfg_` (`:120`) — `std::vector<SenPcfg>`, and DCG/PCFG is off this campaign's path
 ///   (`crustify-scheduler/AGENT-BRIEF.md`, decided 2026-09-09).
 /// * `prog_frame_ptr_` (`:133`) — a `std::map<SenTargets, ProgramFrame>` whose two members
@@ -920,7 +952,7 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 ///   `ProgramFrame` `SuperDsc` uses: that one is sendefs' three-member struct with `st_address`
 ///   (`util/sendefs/sendefs.h:190-194`).
 ///
-/// ⛔ AND `paramNameToVal` (`:358-608`) IS PORTED AS A RESOLVER, NOT A TABLE. IBM's 240 entries are
+/// ⛔ AND `paramNameToVal` (`:358-609`) IS PORTED AS A RESOLVER, NOT A TABLE. IBM's 240 entries are
 /// `double*` INTO this object's own `DataStructDims` members, so a copy leaves every pointer aimed at
 /// the SOURCE object; `updateParamNameToVal()` (`:614`) exists to re-point them and it re-points only
 /// 62 of the 240 — and it has ZERO callers tree-wide. [`param_name_to_val`](Self::param_name_to_val)
@@ -1032,9 +1064,6 @@ pub struct DesignSpaceConfig {
     /// DM's corelet count, which is what the DSC2 path iterates (`dsc/designSpaceConfig.h:104`;
     /// `ddc/ddcv1.cpp:207`, `:1755`, `:1769`, `ddc/ddc_transformation_util.cpp:519`). ⛔ ITS `-1` IS
     /// ABSENT, and IBM's `for (cl = 0; cl < -1; cl++)` simply does not run.
-    ///
-    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, though it is a declared field of the class; the
-    /// anchor list carries `numCoreletsUsed_` only.
     pub num_corelets_used_dsc2: Option<NumCoreletsUsed>,
     /// Field: e027_DesignSpaceConfig.dataStageParam_
     ///
@@ -1167,7 +1196,7 @@ impl Default for DesignSpaceConfig {
 }
 
 impl DesignSpaceConfig {
-    /// The `DataStructDims` one of the twelve spellings names (`dsc/designSpaceConfig.h:267-345`).
+    /// The `DataStructDims` one of the twelve spellings names (`dsc/designSpaceConfig.h:317-346`).
     /// The match is case-insensitive, as IBM's `tolower` makes it; an unknown spelling is absent,
     /// where IBM `DT_ERROR`s "Unknow string input to getDsdFromStr()".
     pub fn dsd_from_str(&self, dsdstr: &str) -> Option<&DataStructDims> {
@@ -1189,7 +1218,7 @@ impl DesignSpaceConfig {
     }
 
     /// The same dispatch as a handle to assign through — IBM's `getDsdFromStr` returns a
-    /// `DataStructDims&` and its callers write through it (`dsc/designSpaceConfig.h:267-345`).
+    /// `DataStructDims&` and its callers write through it (`dsc/designSpaceConfig.h:317-346`).
     pub fn dsd_from_str_mut(&mut self, dsdstr: &str) -> Option<&mut DataStructDims> {
         Some(match dsdstr.to_ascii_lowercase().as_str() {
             "n" => &mut self.n,
@@ -1208,11 +1237,13 @@ impl DesignSpaceConfig {
         })
     }
 
-    /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-608`), or one of
-    /// the twenty an [`sc`](Self::sc) entry adds under its own `name_` (`dm/dm.cpp:980-983`). A key
-    /// outside both is absent, where IBM's `.at()` throws; an unfilled dim is absent too, where IBM
-    /// hands back its `-1`.
-    pub fn param_name_to_val(&self, name: &str) -> Option<dims::DimSize> {
+    /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-609`), or one of
+    /// the twenty an [`sc`](Self::sc) entry adds under its own `name_` (`dm/dm.cpp:980-983`).
+    ///
+    /// ⛔ ABSENT MEANS ONLY THAT THE KEY IS NOT IN THE TABLE, which is IBM's `.at()` throw. An
+    /// UNFILLED dim is [`ParamVal::UNFILLED`], because IBM reads through a `double*` at a member born
+    /// `-1` — measured: all 240 keys answer `-1` on a default-constructed DSC and none throws.
+    pub fn param_name_to_val(&self, name: &str) -> Option<ParamVal> {
         if let Some((entry, dim)) = self.sc_param_name(name) {
             return dim_val_by_name(&self.sc[entry], dim);
         }
@@ -1221,7 +1252,7 @@ impl DesignSpaceConfig {
     }
 
     /// The same key as a handle to assign through — the table's values are `double*` for that reason
-    /// (`dsc/designSpaceConfig.h:358-608`).
+    /// (`dsc/designSpaceConfig.h:358-609`).
     pub fn param_name_to_val_mut(&mut self, name: &str) -> Option<&mut Option<dims::DimSize>> {
         if let Some((entry, dim)) = self.sc_param_name(name) {
             return self.sc[entry].param_name_to_val_mut(dim);
@@ -1247,21 +1278,27 @@ impl DesignSpaceConfig {
     /// (`dsc/designSpaceConfig.cpp:416-427`).
     ///
     /// ⛔ IT IS COMPUTED BY CUTTING UP THE LOOP'S SPELLING, not by any stage field: `dbin` becomes
-    /// `din` over `bin`, i.e. [`core_d`](Self::core_d)`.in` over [`b`](Self::b)`.in`. So `INNER`
-    /// (IBM's `DT_CHECK`), `CONST` and `INVALID` have no count, and neither does a loop whose two
-    /// keys are outside the table.
+    /// `din` over `bin`, i.e. [`core_d`](Self::core_d)`.in` over [`b`](Self::b)`.in`.
     ///
-    /// ⛔ A ZERO DENOMINATOR IS ABSENT HERE, where IBM's `int(x / 0.0)` is undefined behaviour.
-    pub fn loop_count(&self, loop_name: LoopNames) -> Option<LoopCount> {
+    /// ⛔ AN UNFILLED STAGE STILL HAS A COUNT: both keys read [`ParamVal::UNFILLED`], and measured
+    /// against the authority `bin = 16` over an unset `tin` is `int(16 / -1) == -16`, not absence.
+    pub fn loop_count(&self, loop_name: LoopNames) -> LoopTripCount {
         let name = loop_name.name();
-        if name.len() < 3 {
-            return None;
+        let (Some(stage_num), Some(stage_den), Some(dim)) =
+            (name.get(..1), name.get(1..2), name.get(2..))
+        else {
+            return LoopTripCount::NoSuchLoop;
+        };
+        let (Some(numerator), Some(denominator)) = (
+            self.param_name_to_val(&format!("{stage_num}{dim}")),
+            self.param_name_to_val(&format!("{stage_den}{dim}")),
+        ) else {
+            return LoopTripCount::NoSuchLoop;
+        };
+        if denominator.0 == 0.0 {
+            return LoopTripCount::UndefinedZeroDenominator;
         }
-        let (stage_num, rest) = name.split_at(1);
-        let (stage_den, dim) = rest.split_at(1);
-        let numerator = self.param_name_to_val(&format!("{stage_num}{dim}"))?.get();
-        let denominator = self.param_name_to_val(&format!("{stage_den}{dim}"))?.get();
-        (denominator != 0.0).then(|| LoopCount((numerator / denominator) as i32))
+        LoopTripCount::Is(LoopCount((numerator.0 / denominator.0) as i32))
     }
 
     /// Where one dim sits in a role's layout order (`dsc/designSpaceConfig.cpp:429-438`), as a
@@ -1303,7 +1340,7 @@ impl DesignSpaceConfig {
         Some(self.stick_dims(ds_type)?.iter().copied().collect())
     }
 
-    /// Each stick dim with the extent the requested scope leaves it (`dsc/dsc2.cpp:4066-4104`).
+    /// Each stick dim with the extent the requested scope leaves it (`dsc/dsc2.cpp:4066-4106`).
     ///
     /// ⛔ THE SCOPE SPLITS ONE STICK AT ITS SLICE BOUNDARY: `elemInSlice` is the product of every
     /// stick extent divided by the slice count, and the walk stops, truncates or skips a dim
@@ -1362,7 +1399,7 @@ impl DesignSpaceConfig {
     }
 
     /// [`stick_sizes`](Self::stick_sizes) folded per dim, multiplying a dim that appears twice
-    /// (`dsc/dsc2.cpp:4106-4122`).
+    /// (`dsc/dsc2.cpp:4108-4124`).
     pub fn cumulative_stick_sizes(
         &self,
         ds_type: DsTypes,
@@ -1379,18 +1416,20 @@ impl DesignSpaceConfig {
     }
 
     /// One labeled input's HBM row count, less the zero padding on both sides
-    /// (`dsc/designSpaceConfig.cpp:930-934`).
+    /// (`dsc/designSpaceConfig.cpp:930-934`). Absent only where `<label>r` is no key at all — the
+    /// twelve `DataStructDims` names all are, so `"cored"` is absent and `"chipd"` is not.
     pub fn inp_row_in_hbm(&self, label: &str) -> Option<HbmRows> {
-        let r = self.param_name_to_val(&format!("{label}r"))?.get();
-        let zi = self.param_name_to_val("nzi")?.get();
+        let r = self.param_name_to_val(&format!("{label}r"))?.0;
+        let zi = self.param_name_to_val("nzi")?.0;
         Some(HbmRows(r - zi * 2.0))
     }
 
     /// One labeled input's HBM column count, less the zero padding on both sides
-    /// (`dsc/designSpaceConfig.cpp:936-940`).
+    /// (`dsc/designSpaceConfig.cpp:936-940`), absent on the same terms as
+    /// [`inp_row_in_hbm`](Self::inp_row_in_hbm).
     pub fn inp_col_in_hbm(&self, label: &str) -> Option<HbmCols> {
-        let c = self.param_name_to_val(&format!("{label}c"))?.get();
-        let zj = self.param_name_to_val("nzj")?.get();
+        let c = self.param_name_to_val(&format!("{label}c"))?.0;
+        let zj = self.param_name_to_val("nzj")?.0;
         Some(HbmCols(c - zj * 2.0))
     }
 
@@ -1539,7 +1578,7 @@ mod unit_tests {
         assert_eq!(dsc.target, SenTargets::Undefined);
     }
 
-    /// `dsc/designSpaceConfig.h:267-345`: every spelling the twelve-way selector accepts, lowercased
+    /// `dsc/designSpaceConfig.h:317-346`: every spelling the twelve-way selector accepts, lowercased
     /// on the way in, and nothing else.
     #[test]
     fn dsd_from_str_selects_the_twelve_named_dims_case_insensitively() {
@@ -1566,7 +1605,7 @@ mod unit_tests {
         assert_eq!(dsc.t.i, dim(4.0));
     }
 
-    /// `dsc/designSpaceConfig.h:358-608`: 12 prefixes x 20 dims, resolved by longest prefix — and no
+    /// `dsc/designSpaceConfig.h:358-609`: 12 prefixes x 20 dims, resolved by longest prefix — and no
     /// `<dsd>x1` key exists even though `DataStructDims` has the field (`dsc/dims.cpp:437-482`).
     #[test]
     fn param_name_to_val_resolves_all_240_keys_and_no_x1_key() {
@@ -1575,27 +1614,38 @@ mod unit_tests {
         dsc.dsc_n.ij = dim(3.0);
         dsc.pel.zij = dim(1.5);
 
-        assert_eq!(dsc.param_name_to_val("din"), dim(8.0));
-        assert_eq!(dsc.param_name_to_val("dscnij"), dim(3.0));
-        assert_eq!(dsc.param_name_to_val("pelzij"), dim(1.5));
+        assert_eq!(dsc.param_name_to_val("din"), Some(ParamVal(8.0)));
+        assert_eq!(dsc.param_name_to_val("dscnij"), Some(ParamVal(3.0)));
+        assert_eq!(dsc.param_name_to_val("pelzij"), Some(ParamVal(1.5)));
 
+        // Measured against the authority: every one of the 240 keys ANSWERS on a default-constructed
+        // DSC, and every one answers the `-1` its `double*` points at. None of them throws.
+        let fresh = DesignSpaceConfig::default();
         let mut resolved = 0;
         for prefix in DSD_PREFIXES {
             if dsc.dsd_from_str(prefix).is_none() {
                 continue;
             }
             for dim_name in PARAM_DIM_NAMES {
-                assert!(split_param_name(&format!("{prefix}{dim_name}")).is_some());
+                let key = format!("{prefix}{dim_name}");
+                assert!(split_param_name(&key).is_some());
+                assert_eq!(
+                    fresh.param_name_to_val(&key),
+                    Some(ParamVal(-1.0)),
+                    "{key}"
+                );
                 resolved += 1;
             }
         }
         assert_eq!(resolved, 240);
 
-        assert!(dsc.param_name_to_val("nx1").is_none());
-        assert!(dsc.param_name_to_val("nq").is_none());
+        // IBM's `.at()` throw, which is the ONLY thing absence encodes here.
+        assert_eq!(dsc.param_name_to_val("nx1"), None);
+        assert_eq!(dsc.param_name_to_val("nq"), None);
 
         *dsc.param_name_to_val_mut("telmb").unwrap() = dim(6.0);
         assert_eq!(dsc.tel.mb, dim(6.0));
+        assert_eq!(dsc.param_name_to_val("telmb"), Some(ParamVal(6.0)));
     }
 
     /// `dsc/designSpaceConfig.cpp:416-427`: `dbin` is `din` over `bin`, i.e. `CoreD_.in_` over
@@ -1608,16 +1658,43 @@ mod unit_tests {
         dsc.t.ij = dim(12.0);
         dsc.p.ij = dim(5.0);
 
-        assert_eq!(dsc.loop_count(LoopNames::DbIn), Some(LoopCount(4)));
+        assert_eq!(
+            dsc.loop_count(LoopNames::DbIn),
+            LoopTripCount::Is(LoopCount(4))
+        );
         // Truncating, as IBM's `int loopCount = double / double` is.
-        assert_eq!(dsc.loop_count(LoopNames::TpIj), Some(LoopCount(2)));
+        assert_eq!(
+            dsc.loop_count(LoopNames::TpIj),
+            LoopTripCount::Is(LoopCount(2))
+        );
 
         // IBM's `DT_CHECK(loop != INNER)`, and the two spellings that decompose to no key.
-        assert_eq!(dsc.loop_count(LoopNames::Inner), None);
-        assert_eq!(dsc.loop_count(LoopNames::Const), None);
-        assert_eq!(dsc.loop_count(LoopNames::Invalid), None);
-        // An unfilled stage: `BtIn` wants `bin` over `tin`, and `T_.in_` is unset.
-        assert_eq!(dsc.loop_count(LoopNames::BtIn), None);
+        assert_eq!(dsc.loop_count(LoopNames::Inner), LoopTripCount::NoSuchLoop);
+        assert_eq!(dsc.loop_count(LoopNames::Const), LoopTripCount::NoSuchLoop);
+        assert_eq!(dsc.loop_count(LoopNames::Invalid), LoopTripCount::NoSuchLoop);
+
+        // Measured against the authority on THIS fixture: an unfilled stage still divides, by its
+        // `-1`. `BtIn` is `bin` over an unset `tin`, i.e. `int(16 / -1)`; `BtIj` is an unset `bij`
+        // over `tij`, i.e. `int(-1 / 12)`; and every loop neither stage filled reads `int(-1 / -1)`.
+        assert_eq!(
+            dsc.loop_count(LoopNames::BtIn),
+            LoopTripCount::Is(LoopCount(-16))
+        );
+        assert_eq!(
+            dsc.loop_count(LoopNames::BtIj),
+            LoopTripCount::Is(LoopCount(0))
+        );
+        assert_eq!(
+            dsc.loop_count(LoopNames::DbOut),
+            LoopTripCount::Is(LoopCount(1))
+        );
+
+        // A FILLED zero denominator is the one case with no answer: IBM's `int(x / 0.0)`.
+        dsc.t.r#in = dim(0.0);
+        assert_eq!(
+            dsc.loop_count(LoopNames::BtIn),
+            LoopTripCount::UndefinedZeroDenominator
+        );
     }
 
     /// `dsc/designSpaceConfig.cpp:9222-9254`: the printed spellings, their flip, and the DM table
@@ -1728,13 +1805,15 @@ mod unit_tests {
         *entry.param_name_to_val_mut("ij").unwrap() = dims::DimSize::new(48.0);
         dsc.sc.push(entry);
 
-        assert_eq!(dsc.param_name_to_val("sc_0ij"), dims::DimSize::new(48.0));
+        assert_eq!(dsc.param_name_to_val("sc_0ij"), Some(ParamVal(48.0)));
         // The name alone is not a key, and a dim outside the twenty is not one either.
         assert_eq!(dsc.param_name_to_val("sc_0"), None);
         assert_eq!(dsc.param_name_to_val("sc_0x1"), None);
+        // An entry's other nineteen keys answer their unfilled `-1`, as the twelve prefixes' do.
+        assert_eq!(dsc.param_name_to_val("sc_0mb"), Some(ParamVal(-1.0)));
         // The twelve-prefix table still answers for its own keys.
         *dsc.param_name_to_val_mut("nij").unwrap() = dims::DimSize::new(9.0);
-        assert_eq!(dsc.param_name_to_val("nij"), dims::DimSize::new(9.0));
+        assert_eq!(dsc.param_name_to_val("nij"), Some(ParamVal(9.0)));
     }
 
     /// `dm/dm.cpp:980-983`: entry 0 is registered before entry 1 and `map[key] = ptr` overwrites, so
@@ -1751,7 +1830,7 @@ mod unit_tests {
             dsc.sc.push(entry);
         }
 
-        assert_eq!(dsc.param_name_to_val("sc_0mb"), dims::DimSize::new(7.0));
+        assert_eq!(dsc.param_name_to_val("sc_0mb"), Some(ParamVal(7.0)));
     }
 
     /// `dsc/designSpaceConfig.cpp:9451-9486`: each is a PRODUCT over the entries naming that dim, a
@@ -1783,7 +1862,7 @@ mod unit_tests {
         assert_eq!(ragged.stick(PrimaryDimTypes::Ij), None);
     }
 
-    /// `dsc/dsc2.cpp:4066-4122`: 32 x 8 elements over eight slices leaves 32 in a slice, so the slice
+    /// `dsc/dsc2.cpp:4066-4106`: 32 x 8 elements over eight slices leaves 32 in a slice, so the slice
     /// scope stops after the first dim and the without-slice scope reports only what is left.
     #[test]
     fn stick_sizes_split_the_stick_at_its_slice_boundary() {
@@ -1845,7 +1924,7 @@ mod unit_tests {
         );
     }
 
-    /// `dsc/dsc2.cpp:4106-4122`: a dim appearing twice in the stick has its extents MULTIPLIED, which
+    /// `dsc/dsc2.cpp:4108-4124`: a dim appearing twice in the stick has its extents MULTIPLIED, which
     /// is the whole difference between this and `getStickSizes`.
     #[test]
     fn cumulative_stick_sizes_multiply_a_repeated_dim() {
@@ -1892,8 +1971,13 @@ mod unit_tests {
         // Both negative: IBM's -1.
         dsc.n.c = dim(1.0);
         assert_eq!(dsc.inp_in_hbm("n"), Some(HbmElements(-1.0)));
-        // An unfilled key: IBM's `.at()` throw.
-        assert_eq!(dsc.inp_row_in_hbm("chipd"), None);
+        // Measured against the authority: `chipdr` IS one of the 240 keys, so an UNFILLED `ChipD_`
+        // reads `-1` and the row count is `-1 - 1 * 2 == -3` — not a throw, and not absence.
+        assert_eq!(dsc.inp_row_in_hbm("chipd"), Some(HbmRows(-3.0)));
+        assert_eq!(dsc.inp_col_in_hbm("chipd"), Some(HbmCols(-5.0)));
+        assert_eq!(dsc.inp_in_hbm("chipd"), Some(HbmElements(-1.0)));
+        // The real `.at()` throw: `CoreD_` is named `"d"`, so `"coredr"` is no key.
+        assert_eq!(dsc.inp_row_in_hbm("cored"), None);
     }
 
     /// `dsc/designSpaceConfig.cpp:7814-7874`: the primary dims must cover, the auxiliary ones may be
