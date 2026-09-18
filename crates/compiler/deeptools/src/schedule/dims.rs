@@ -482,7 +482,7 @@ impl DimSize {
 pub struct DimVal(pub i32);
 
 /// The fraction of a dim one view covers — IBM's `double dimDensity` parameter, which every dim
-/// value is multiplied by (`dsc/dims.h:272`, `dsc/dims.cpp:556`).
+/// value is multiplied by (`dsc/dims.h:272`, `dsc/dims.cpp:559`).
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct DimDensity(f64);
 
@@ -492,8 +492,8 @@ impl DimDensity {
 
     /// A density, or absent unless `0.0 < density <= 1.0`.
     ///
-    /// ⛔ THIS IS IBM'S `DT_CHECK(dimDensity > 0.0 && dimDensity <= 1.0)` (`dsc/dims.cpp:555`,
-    /// `:639`, `:651`) MOVED TO CONSTRUCTION, so the three call sites cannot be reached with a
+    /// ⛔ THIS IS IBM'S `DT_CHECK(dimDensity > 0.0 && dimDensity <= 1.0)` (`dsc/dims.cpp:558`,
+    /// `:639`, `:656`) MOVED TO CONSTRUCTION, so the three call sites cannot be reached with a
     /// density that would have aborted and none of them re-checks it.
     pub fn new(density: f64) -> Option<Self> {
         (density > 0.0 && density <= 1.0).then_some(Self(density))
@@ -685,26 +685,26 @@ fn dim_text(dim: Option<DimSize>) -> String {
 ///
 /// ⛔ RUST'S `{}` IS NOT THAT — it would print `16777216`, and this text is the DGP serialization
 /// (`dsc/dims.h:245-248`) as well as every print routine's.
+///
+/// ⛔ THE FORM IS PICKED BY THE **ROUNDED** VALUE'S EXPONENT, NOT THE VALUE'S (C99 7.19.6.1): six
+/// significant digits carry 999999.6 to `1e+06` and 0.00009999999 to `0.0001` before the choice.
 fn ostream_double(value: f64) -> String {
     const SIGNIFICANT: i32 = 6;
+    if value.is_nan() {
+        return String::from("nan");
+    }
     if value.is_infinite() {
         return String::from(if value > 0.0 { "inf" } else { "-inf" });
     }
-    let exponent = if value == 0.0 {
-        0
-    } else {
-        value.abs().log10().floor() as i32
-    };
+    let rounded = format!("{value:.*e}", (SIGNIFICANT - 1) as usize);
+    let (mantissa, exponent) = rounded.split_once('e').unwrap_or((rounded.as_str(), "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
     if (-4..SIGNIFICANT).contains(&exponent) {
         let precision = (SIGNIFICANT - 1 - exponent) as usize;
         trim_trailing_zeros(&format!("{value:.precision$}"))
     } else {
-        let precision = (SIGNIFICANT - 1) as usize;
-        let text = format!("{value:.precision$e}");
-        let (mantissa, exp) = text.split_once('e').unwrap_or((text.as_str(), "0"));
-        let exp: i32 = exp.parse().unwrap_or(0);
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{sign}{:02}", trim_trailing_zeros(mantissa), exp.abs())
+        let sign = if exponent < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:02}", trim_trailing_zeros(mantissa), exponent.abs())
     }
 }
 
@@ -884,7 +884,7 @@ impl DataStructDims {
     /// `skip_deprecated_fields` drops the derived halves and the two to-be-removed compounds.
     ///
     /// ⛔ AN ABSENT `totalSize_` PRINTS `-1`, which is what IBM prints when the dim is unfilled
-    /// (`dsc/dims.cpp:565`); where IBM instead `DT_ERROR`s there is no JSON to compare with.
+    /// (`dsc/dims.cpp:567-568`); where IBM instead `DT_ERROR`s there is no JSON to compare with.
     pub fn export_json(&self, skip_deprecated_fields: bool) -> String {
         let mut json = format!("{{\"name_\" : \"{}\", ", self.name);
         for (key, dim) in [
@@ -1244,7 +1244,7 @@ impl DataStructDims {
     /// taken from the first corelet.
     ///
     /// ⛔ `PELRF` AND `SFPLRF` ARE MAPPED TO `PE` AND `SFP` FIRST, so a memory component selects the
-    /// compute component's split (`dsc/dims.cpp:657-661`).
+    /// compute component's split (`dsc/dims.cpp:659-663`).
     #[expect(
         clippy::too_many_arguments,
         reason = "IBM's parameter list (`dsc/dims.h:269-273`), defaults included"
@@ -1301,7 +1301,7 @@ impl DataStructDims {
     }
 
     /// Rescale, apply the density and pad a split size — the three lines both split branches end
-    /// with (`dsc/dims.cpp:673-678`, `:697-702`).
+    /// with (`dsc/dims.cpp:677-682`, `:697-702`).
     fn finish_split_val(
         &self,
         d: PrimaryDimTypes,
@@ -1436,7 +1436,7 @@ impl DataStructDims {
     ///
     /// ⛔ IBM ERASES THE SYMBOLIC ENTRY BEFORE IT READS THE DIM, so the value it divides is the
     /// plain field and not the max — with no split, no padding and full density that is exactly what
-    /// `primaryDimToValHandler_st` holds (`dsc/dims.cpp:788`).
+    /// `primaryDimToValHandler_st` holds (`dsc/dims.cpp:787-792`).
     /// ⛔ ABSENT IS IBM'S `DT_CHECK`s: max a whole number of granules, ratio non-zero, and every
     /// value divisible by it. Nothing is written in that case.
     #[must_use]
@@ -1956,6 +1956,35 @@ mod unit_tests {
         assert_eq!(empty, "Empty");
     }
 
+    /// `std::ostream <<`'s own text for a `double`, both `%g` form boundaries included. Every pair
+    /// below was measured against `std::ostringstream() << d`.
+    #[test]
+    fn a_double_prints_as_the_streams_own_text() {
+        for (value, text) in [
+            (64.0, "64"),
+            (0.5, "0.5"),
+            (-1.0, "-1"),
+            (0.0, "0"),
+            (123456.0, "123456"),
+            (1234567.0, "1.23457e+06"),
+            (4194304.0, "4.1943e+06"),
+            (16777216.0, "1.67772e+07"),
+            (0.00012345678, "0.000123457"),
+            (1e-5, "1e-05"),
+            (1e300, "1e+300"),
+            // Six significant digits first, and only then the choice of form.
+            (999999.4999, "999999"),
+            (999999.5, "1e+06"),
+            (9.999995e-5, "0.0001"),
+            (0.00009999999, "0.0001"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ] {
+            assert_eq!(ostream_double(value), text, "{value}");
+        }
+    }
+
     /// IBM's JSON text, key order, spacing and the integer set key included.
     #[test]
     fn export_json_is_the_authoritys_text() {
@@ -2013,27 +2042,33 @@ mod unit_tests {
         assert!(skipped.contains(r#""y_" : -1, "symbolicDimInfo_""#));
     }
 
-    /// All twenty-one parameter names reach a distinct dim, and nothing else reaches one.
+    /// All twenty-one parameter names reach their own named field, and nothing else reaches one.
+    ///
+    /// ⭐ EVERY NAME IS WRITTEN THROUGH THE DISPATCH INTO ONE OBJECT, then the fields are read BY
+    /// NAME in IBM's own chain order (`dsc/dims.cpp:437-482`): a name that reaches another name's
+    /// field leaves two of them holding the wrong value.
     #[test]
     fn every_param_name_selects_its_own_dim() {
         const NAMES: [&str; 21] = [
             "in", "out", "mb", "i", "j", "ij", "ki", "kj", "kij", "x", "x1", "y", "r", "c", "rc",
             "si", "sj", "sij", "zi", "zj", "zij",
         ];
+        let mut dims = DataStructDims::default();
         for (index, name) in NAMES.into_iter().enumerate() {
-            let mut dims = DataStructDims::default();
-            let slot = dims
+            *dims
                 .param_name_to_val_mut(name)
-                .unwrap_or_else(|| panic!("{name} has no dim"));
-            *slot = size(index as f64);
-            let mut expected = DataStructDims::default();
-            *expected.param_name_to_val_mut(name).unwrap() = size(index as f64);
-            assert_eq!(dims, expected);
-            assert_eq!(
-                dims.param_name_to_val_mut(name).copied(),
-                Some(size(index as f64))
-            );
+                .unwrap_or_else(|| panic!("{name} has no dim")) = size(index as f64 + 1.0);
         }
+        let expected: [Option<DimSize>; 21] =
+            std::array::from_fn(|index| size(index as f64 + 1.0));
+        assert_eq!(
+            [
+                dims.r#in, dims.out, dims.mb, dims.i, dims.j, dims.ij, dims.ki, dims.kj, dims.kij,
+                dims.x, dims.x1, dims.y, dims.r, dims.c, dims.rc, dims.si, dims.sj, dims.sij,
+                dims.zi, dims.zj, dims.zij,
+            ],
+            expected
+        );
         assert!(
             DataStructDims::default()
                 .param_name_to_val_mut("in_")
@@ -2041,20 +2076,37 @@ mod unit_tests {
         );
     }
 
-    /// Every real dim has a field to assign through and to read back; only the sentinel has none.
+    /// Every real dim assigns through to its own named field; only the sentinel has none.
     #[test]
     fn every_dim_but_the_sentinel_has_a_field() {
-        for (index, dim) in PrimaryDimTypes::ALL.into_iter().enumerate() {
-            let mut dims = DataStructDims::default();
-            *dims.primary_dim_to_val_handler_mut(dim).unwrap() = size(index as f64);
-            assert_eq!(dims.primary_dim_to_val_handler(dim), size(index as f64));
-            assert_eq!(dims.primary_dim_to_val(dim), Some(DimVal(index as i32)));
-        }
         let mut dims = DataStructDims::default();
-        assert!(dims.primary_dim_to_val_handler_mut(D::Undefined).is_none());
-        assert_eq!(dims.primary_dim_to_val_handler(D::Undefined), None);
+        for dim in PrimaryDimTypes::ALL {
+            *dims.primary_dim_to_val_handler_mut(dim).unwrap() = size(dim as usize as f64 + 1.0);
+        }
+        // The dims in discriminant order beside the field each one names (`dsc/dims.cpp:485-514`),
+        // so a swapped pair of arms is two wrong fields here.
+        let expected: [Option<DimSize>; 12] =
+            std::array::from_fn(|index| size(index as f64 + 1.0));
         assert_eq!(
-            dims.primary_dim_to_val(D::Mb),
+            [
+                dims.r#in, dims.out, dims.ij, dims.mb, dims.x, dims.y, dims.kij, dims.i, dims.j,
+                dims.ki, dims.kj, dims.x1,
+            ],
+            expected
+        );
+        // The read dispatch is IBM's second copy of that table (`dsc/dims.cpp:526-551`).
+        for dim in PrimaryDimTypes::ALL {
+            assert_eq!(dims.primary_dim_to_val(dim), Some(DimVal(dim as i32 + 1)));
+        }
+        let mut unfilled = DataStructDims::default();
+        assert!(
+            unfilled
+                .primary_dim_to_val_handler_mut(D::Undefined)
+                .is_none()
+        );
+        assert_eq!(unfilled.primary_dim_to_val_handler(D::Undefined), None);
+        assert_eq!(
+            unfilled.primary_dim_to_val(D::Mb),
             None,
             "an unfilled dim has no value, which is what L3DlOpsScheduler.cpp:111 skips on"
         );
