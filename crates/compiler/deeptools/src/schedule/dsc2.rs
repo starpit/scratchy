@@ -2503,12 +2503,12 @@ mod unit_tests {
     }
 
     /// ⛔ A DELIBERATE DIVERGENCE, AND THE AUTHORITY'S SIDE IS UNDEFINED BEHAVIOUR.
-    /// `TransferPadInfo(TransferPadInfo&&) = default` (`dsc/dsc2.h:763`) moves the two maps but
+    /// `TransferPadInfo(TransferPadInfo&&) = default` (`dsc/dsc2.h:760`) moves the two maps but
     /// bitwise-copies `MapWithFMHelper`, whose only member is a REFERENCE to the sibling map
-    /// (`util/mapWithFMHelper.h:36-38`) — so the moved-TO object's helper still refers to the
+    /// (`util/foldManager/mapWithFMHelper.h:829-831`) — so the moved-TO helper still refers to the
     /// moved-FROM object's storage. Measured on the authority: `dst.isEmpty = 0` with
     /// `dst.frontKeys = 0` and every helper-routed query throwing, `dst.frontKeys = 1` again after
-    /// rebuilding on the SOURCE, and `heap-use-after-free` under AddressSanitizer inside `getAllKeys`
+    /// rebuilding on the SOURCE, and an AddressSanitizer use-after-scope inside `getAllKeys`
     /// once the source was destroyed. A Rust move carries the storage, so all four of these answer
     /// from the moved-to object — there is no reference to leave behind.
     #[test]
@@ -2542,7 +2542,7 @@ mod unit_tests {
         );
 
         // The two `FoldDimProp`s the fold was built over — `wkslice_index` outer, `chunk_index`
-        // inner (`dsc/dsc2.cpp:4662-4670`).
+        // inner (`dsc/dsc2.cpp:4669-4675`).
         let props = &moved.front[&PrimaryDimTypes::X].props;
         assert_eq!(props[0].size(), FoldDimSize(2));
         assert_eq!(props[0].label(), "wkslice_index");
@@ -7454,24 +7454,24 @@ impl Default for ConstantInfo {
 pub struct PadSize(pub i32);
 
 /// A work-slice index — the coordinate of the OUTER of the two folded dims
-/// (`dsc/dsc2.cpp:4651-4665`).
+/// (`dsc/dsc2.cpp:4669-4671`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WkSliceIdx(pub i64);
 
-/// A chunk index within one work slice — the coordinate of the INNER folded dim (`:4669-4670`).
+/// A chunk index within one work slice — the coordinate of the INNER folded dim (`:4674-4675`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkIdx(pub i64);
 
-/// How many chunks one work-slice pad walk may visit — `numChunks` (`dsc/dsc2.cpp:4686`).
+/// How many chunks one work-slice pad walk may visit — `numChunks` (`dsc/dsc2.cpp:4685`).
 ///
 /// ⛔ NOT THE STORED `chunk_index` EXTENT, and the walk does not clamp it to one: the caller derives
-/// it per dim (`dsc/dsc2.cpp:4823`), and measured, a value past the extent makes the reader throw
+/// it per dim (`dsc/dsc2.cpp:4827`), and measured, a value past the extent makes the reader throw
 /// unless the walk breaks first — immediately on the back end, whose first coordinate is
 /// `numChunks - 1`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NumChunks(pub u32);
 
-/// The element offset one fully padded chunk contributes to a work slice's pad (`:4830-4832`).
+/// The element offset one fully padded chunk contributes to a work slice's pad (`:4830-4831`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChunkOffset(pub i32);
 
@@ -7481,22 +7481,22 @@ pub struct ChunkOffset(pub i32);
 pub struct ChunkSizePadded(pub i32);
 
 /// Which end of a transfer's data a pad sits at — the authority's `const bool isPadFront`
-/// (`dsc/dsc2.h:784`, `:794`, `:806`, `:809`), which selects one of two parallel field pairs at
-/// every one of its six sites.
+/// (`dsc/dsc2.h:784`, `:792`, `:796`, `:800`, `:804`), which selects one of two parallel field
+/// pairs at every one of its five declaration sites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PadEnd {
-    /// `isPadFront == true`, and the walk visits chunk 0 first (`dsc/dsc2.cpp:4696-4697`).
+    /// `isPadFront == true`, and the walk visits chunk 0 first (`dsc/dsc2.cpp:4699-4700`).
     Front,
     /// `isPadFront == false`, and the walk visits `numChunks - 1` first.
     Back,
 }
 
-/// `TransferPadInfo::FoldDimPosition` (`dsc/dsc2.h:772`) — the two folded dims, outer first.
+/// `TransferPadInfo::FoldDimPosition` (`dsc/dsc2.h:768-772`) — the two folded dims, outer first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FoldDimPosition {
-    /// `WORK_SLICE_FOLDDIM`, labelled `wkslice_index` (`dsc/dsc2.cpp:4662-4665`).
+    /// `WORK_SLICE_FOLDDIM`, labelled `wkslice_index` (`dsc/dsc2.cpp:4669-4671`).
     WorkSlice = 0,
-    /// `CHUNK_FOLDDIM`, labelled `chunk_index` (`:4669-4670`).
+    /// `CHUNK_FOLDDIM`, labelled `chunk_index` (`:4674-4675`).
     Chunk = 1,
 }
 
@@ -7514,12 +7514,12 @@ impl FoldDimPosition {
 const _: [(); FoldDimPosition::COUNT] = [(); FoldDimPosition::Chunk as usize + 1];
 
 /// One dim's pad-size fold: the two `FoldDimProp`s the authority stores plus the two-level affine
-/// tree its manager builds over them (`dsc/dsc2.cpp:4651-4681`).
+/// tree its manager builds over them (`dsc/dsc2.cpp:4655-4682`).
 ///
 /// ⛔ THE PROPS AND THE TREE ARE ONE OWNER HERE BECAUSE IN C++ THEY ALIAS: `FoldManager::dim_prop_`
 /// holds `const FoldDimProp*` INTO `transferPadFrontFoldProps`
-/// (`util/foldManager/foldInfrastructure.h:888`), so `DT_CHECK_MSG(!foldProps.count(dim))`
-/// (`dsc/dsc2.cpp:4658`) is the only thing standing between a rebuild's `resize` and a dangling
+/// (`util/foldManager/foldInfrastructure.h:2909`, `:888`), so `DT_CHECK_MSG(!foldProps.count(dim))`
+/// (`dsc/dsc2.cpp:4662`) is the only thing standing between a rebuild's `resize` and a dangling
 /// pointer. Co-owning them makes the pointer unnecessary rather than safe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PadSizeFold {
@@ -7528,7 +7528,7 @@ struct PadSizeFold {
 }
 
 impl PadSizeFold {
-    /// `buildTransferFoldDim` (`dsc/dsc2.cpp:4651-4681`) and the four `insert*ForKey` calls that
+    /// `buildTransferFoldDim` (`dsc/dsc2.cpp:4655-4682`) and the four `insert*ForKey` calls that
     /// follow it (`:4624-4635`), which are one construction: `buildFoldSpace` nests two affine
     /// levels with `alpha_{}`/`beta_{}` at zero and each `insertAlphaForKey(.., pos)` then writes the
     /// level `collectFoldFunctionAtLevel(pos)` reaches — 0 the non-leaf, 1 its leaf.
@@ -7555,13 +7555,16 @@ impl PadSizeFold {
         }
     }
 
-    /// `MapWithFMHelper::getDataForKey` past the key check (`util/mapWithFMHelper.h:143-147`) — the
-    /// manager's `isLegal` range test (`util/foldManager/foldInfrastructure.h:1666-1681`) and then
-    /// the walk.
+    /// `MapWithFMHelper::getDataForKey` past the key check — its three-argument callers reach the
+    /// variadic overload (`util/foldManager/mapWithFMHelper.h:253-258`), which packs a
+    /// `std::deque<int64_t>` and delegates to `:206-209`; that is `DT_CHECK(key_val_.count(key))`
+    /// and then the manager's `isLegal` range test
+    /// (`util/foldManager/foldInfrastructure.h:1666-1681`) and the walk.
     ///
     /// ⛔ THE RANGE TEST IS SIGNED AND THAT IS NOT A BUG TO FIX: `getSize() <= idx` widens a
     /// `uint32_t` extent to `int64_t` (`:1677`), so a NEGATIVE coordinate is LEGAL and computes.
-    /// Measured on the authority: work slice -1 answers 30 where work slice 2 of 2 throws.
+    /// Measured on the authority: work slice -1 answers 65 where work slice 2 of 2 throws, and a
+    /// zero extent refuses coordinate 0 while still answering 65 for -1.
     /// ⛔ The count half of `isLegal` is gone instead of ported — two coordinates is the signature.
     fn data(&self, wk_slice: WkSliceIdx, chunk: ChunkIdx) -> Option<PadSize> {
         let coords = [FoldDimIndex(wk_slice.0), FoldDimIndex(chunk.0)];
@@ -7578,20 +7581,21 @@ impl PadSizeFold {
 ///
 /// A transfer's LX zero-pad sizes, one two-level affine fold per padded dim per end
 /// (`dsc/dsc2.h:755-812`) — what `L3DlOpsScheduler` writes onto a `TransferNode` so that
-/// `dsc/dsc2.cpp:4768-4990` can turn padding into condition and transfer nodes.
+/// `dsc/dsc2.cpp:4736-5817` can turn padding into condition and transfer nodes.
 ///
 /// ⛔ NO [`Clone`], AND THE ABSENCE IS THE `DT_CHECK`: the authority's copy constructor is
-/// "Do nothing on purpose" (`dsc/dsc2.h:764-767`) — it rebuilds the two helper references and copies
-/// NOTHING, so a copy is EMPTY. `dsc/dsc2.cpp:5700` clones a padded transfer node and `:5792`
+/// "Do nothing on purpose" (`dsc/dsc2.h:761-764`) — it rebuilds the two helper references and copies
+/// NOTHING, so a copy is EMPTY. `dsc/dsc2.cpp:5701-5702` clones a padded transfer node and `:5792`
 /// `DT_CHECK_MSG`s the clone `isEmpty()`; measured, source non-empty and copy empty. A `Clone` that
 /// silently dropped the folds would be the astonishing one, so the only way to spell that copy here
 /// is [`Default`], which makes IBM's runtime check a fact of the type.
-/// ⛔ AND ITS DEFAULTED MOVE CONSTRUCTOR (`dsc/dsc2.h:763`) IS A USE-AFTER-FREE, unrepresentable
+/// ⛔ AND ITS DEFAULTED MOVE CONSTRUCTOR (`dsc/dsc2.h:760`) IS A USE-AFTER-FREE, unrepresentable
 /// here: `MapWithFMHelper`'s only member is a REFERENCE to the sibling map
-/// (`util/mapWithFMHelper.h:36-38`), so a move copies a reference that still points into the
-/// moved-FROM object. Measured — the moved-to object reported `isEmpty() == 0` with zero keys,
-/// answered the moved-FROM object's data after that object was rebuilt, and destroying the source
-/// gave a `heap-use-after-free` under AddressSanitizer inside `getAllKeys`. A Rust move carries the
+/// (`util/foldManager/mapWithFMHelper.h:829-831`), so a move copies a reference that still points
+/// into the moved-FROM object. Measured — the moved-to object reported `isEmpty() == 0` with zero
+/// keys, answered the moved-FROM object's data after that object was rebuilt, and destroying the
+/// source made AddressSanitizer report a use-after-scope inside `getAllKeys`
+/// (`util/foldManager/mapWithFMHelper.h:53`). A Rust move carries the
 /// storage, so the [`unit_tests`] case for that is a deliberate divergence.
 ///
 /// The control is what makes the `compile_fail` case evidence — stable rustdoc does not check the
@@ -7613,9 +7617,9 @@ pub struct TransferPadInfo {
     ///
     /// ⛔ THREE OF THE AUTHORITY'S FIELDS ARE ONE FIELD HERE, and the helper is not a field at all:
     /// `transferPadFrontSizeHelper` is a `MapWithFMHelper` whose ONLY member is
-    /// `std::map<Dkey, FoldManager<Dval>>& key_val_` (`util/mapWithFMHelper.h:36-38`) bound to
-    /// `transferPadFrontSize_` in every constructor (`dsc/dsc2.h:759-767`) — a facade over the
-    /// sibling map, holding no state of its own. `transferPadFrontFoldProps` is then the storage that
+    /// `std::map<Dkey, FoldManager<Dval>>& key_val_` (`util/foldManager/mapWithFMHelper.h:829-831`)
+    /// bound to `transferPadFrontSize_` in every constructor (`dsc/dsc2.h:759-767`) — a facade over
+    /// the sibling map, holding no state of its own. `transferPadFrontFoldProps` is then the storage
     /// map's `dim_prop_` pointers point INTO; see [`PadSizeFold`].
     front: BTreeMap<PrimaryDimTypes, PadSizeFold>,
     /// Field: e024_TransferPadInfo.transferPadBackFoldProps
@@ -7641,10 +7645,17 @@ impl TransferPadInfo {
     /// [`PadEnd`] as an argument.
     ///
     /// ⛔ [`None`] IS `DT_CHECK_MSG(!foldProps.count(dim), "Expect empty fold properties.")`
-    /// (`:4658`) — a dim can be built once per end, and the authority throws on the second attempt
-    /// rather than rebuilding. Its other three checks are gone into the array lengths, and a negative
-    /// extent — `setSize(int)` onto a `uint32_t` (`util/foldManager/foldInfrastructure.h:129`, `:153`)
-    /// — is unspellable in [`FoldDimSize`].
+    /// (`:4662`) — a dim can be built once per end, and the authority throws on the second attempt
+    /// rather than rebuilding. Its other three checks are one `DT_CHECK_MSG` on the arity of all
+    /// three vectors (`:4612-4615`), gone into the array lengths.
+    ///
+    /// ⛔ AND A NEGATIVE SIZE IS NOT A NEGATIVE EXTENT THERE, IT IS A FOUR-BILLION ONE:
+    /// `setSize` takes a `uint32_t` (`util/foldManager/foldInfrastructure.h:129`, field `:153`) and
+    /// the caller hands it an `int` (`dsc/dsc2.cpp:4669`, `:4674`), so the conversion happens at the
+    /// call. Measured on the authority, `sizes = {-1, 3}` stores an extent of 4294967295 and
+    /// `isLegal`'s range test then admits EVERY `int` coordinate — work slice 1000000 answers
+    /// -39999975 instead of throwing. [`FoldDimSize`] is a `u32`, so the negative is unspellable
+    /// here, but 4294967295 is not: the vacuous guard is reachable and only reachable that way.
     pub fn build_pad_sizes(
         &mut self,
         end: PadEnd,
@@ -7667,10 +7678,10 @@ impl TransferPadInfo {
     }
 
     /// `getPadFrontOrBackDimsSet` (`dsc/dsc2.h:783-788`) through `MapWithFMHelper::getAllKeys`
-    /// (`util/mapWithFMHelper.h:51-57`).
+    /// (`util/foldManager/mapWithFMHelper.h:51-55`).
     ///
     /// ⛔ AN ORDERED ITERATOR RATHER THAN A `std::set` BY VALUE, WHICH IS WHAT THE ONE CALLER WANTS:
-    /// it `std::set_union`s the two ends into a vector (`dsc/dsc2.cpp:4813-4819`), so it needs the
+    /// it `std::set_union`s the two ends into a vector (`dsc/dsc2.cpp:4814-4820`), so it needs the
     /// ascending order a `std::set` gave it and never the container. A [`BTreeMap`]'s keys are
     /// already in that order, so this allocates nothing.
     pub fn pad_dims(&self, end: PadEnd) -> impl Iterator<Item = PrimaryDimTypes> + '_ {
@@ -7686,9 +7697,9 @@ impl TransferPadInfo {
     ///
     /// ⛔ `chunkSizePadded` IS THE ONLY THING THAT ENDS THE WALK EARLY, so a 0 or negative one visits
     /// every chunk: measured, `chunkSizePadded = 0` over three chunks answers `3 * chunkOffset`.
-    /// ⛔ [`None`] IS THE READER THROWING MID-WALK, on an unknown dim (`util/mapWithFMHelper.h:144`)
-    /// or a coordinate past its extent — reachable exactly when [`NumChunks`] exceeds the stored
-    /// `chunk_index` extent and no chunk breaks the walk first.
+    /// ⛔ [`None`] IS THE READER THROWING MID-WALK, on an unknown dim
+    /// (`util/foldManager/mapWithFMHelper.h:207`) or a coordinate past its extent — reachable exactly
+    /// when [`NumChunks`] exceeds the stored `chunk_index` extent and no chunk breaks the walk first.
     pub fn wk_slice_pad_size(
         &self,
         end: PadEnd,
@@ -7709,7 +7720,7 @@ impl TransferPadInfo {
                 PadEnd::Front => num_chunks_visited,
                 PadEnd::Back => num_chunks.0 - num_chunks_visited - 1,
             };
-            // "the agreement is that negative pad size is treated as zero" (`:4705-4708`).
+            // "the agreement is that negative pad size is treated as zero" (`:4702-4704`).
             let curr_pad_size = fold
                 .data(wk_slice, ChunkIdx(i64::from(curr_chunk_idx)))?
                 .0
@@ -7956,7 +7967,7 @@ mod equivalence {
         assert_eq!(wk(PadEnd::Back, 0, 5, 0), None, "`back_beyond_extent`");
 
         // `wk.capEqualsPad = 205`: chunk 1's pad is EXACTLY `chunkSizePadded`, and
-        // `currPadSize < chunkSizePadded` (`:4709`) calls that FULLY padded — so the walk carries on
+        // `currPadSize < chunkSizePadded` (`:4707`) calls that FULLY padded — so the walk carries on
         // to chunk 2 and answers `100 * 2 + 5`, not `100 * 1 + 15`.
         assert_eq!(
             info.wk_slice_pad_size(
@@ -7976,7 +7987,7 @@ mod equivalence {
     ///
     /// ⛔ `clamp.negCap = -5` IS WHY THIS IS NOT [`Ord::clamp`]: `min(max(v, 0), cap)` answers the CAP
     /// when the cap is negative, which is outside the `[0, chunk_param_with_zero_pad]` range the
-    /// authority's own comment claims (`dsc/dsc2.cpp:4721-4728`), and [`Ord::clamp`] would panic.
+    /// authority's own comment claims (`dsc/dsc2.cpp:4723-4728`), and [`Ord::clamp`] would panic.
     #[test]
     fn e024_a_chunks_pad_size_is_clamped_into_the_padded_chunk_and_the_cap_wins() {
         let info = both_ends();
@@ -8004,6 +8015,147 @@ mod equivalence {
             "`negCap`"
         );
         assert_eq!(clamp(PadEnd::Front, 2, 0, 10), None, "`oobWkSlice`");
+    }
+
+    /// `C.stored_wkslice_extent = 4294967295`, `C.stored_chunk_extent = 3`,
+    /// `C.wk_1000000 = -39999975`, `C.wk_int32max = 65`, `C.wk_4294967295 = THROW`.
+    ///
+    /// ⛔ THE RANGE GUARD GOES VACUOUS AT A FOUR-BILLION EXTENT, AND THE AUTHORITY'S OWN BUILDER
+    /// REACHES IT: an `int` size crosses `setSize(uint32_t)`
+    /// (`util/foldManager/foldInfrastructure.h:129`) at `dsc/dsc2.cpp:4669`, so `sizes = {-1, 3}`
+    /// stores 4294967295 and every `int` work slice is in range from then on. [`FoldDimSize`] is a
+    /// `u32`, so the `-1` cannot be spelled here — but the extent it produces can, and that is what
+    /// this pins, because the guard is the only thing between a query and the walk.
+    /// ⛔ AND `i32::MAX` IS WHY THE AFFINE WALK IS `Wrapping`: clang wraps `-40 * 2147483647 + 25`
+    /// to 65, where a checked multiply would panic in a debug build and diverge.
+    #[test]
+    fn e024_a_four_billion_extent_makes_the_range_guard_admit_every_int_work_slice() {
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                [FoldDimSize(u32::MAX), FoldDimSize(3)],
+                ALPHAS_FRONT,
+                BETAS_FRONT
+            ),
+            Some(())
+        );
+        let fold = &info.front[&PrimaryDimTypes::X];
+        assert_eq!(
+            fold.props[0].size(),
+            FoldDimSize(4_294_967_295),
+            "`C.stored_wkslice_extent`"
+        );
+        assert_eq!(
+            fold.props[1].size(),
+            FoldDimSize(3),
+            "`C.stored_chunk_extent`"
+        );
+
+        // The unclamped reader, because `transfer_pad_size` would `max(.., 0)` the negative away.
+        assert_eq!(
+            fold.data(WkSliceIdx(1_000_000), ChunkIdx(0)),
+            Some(PadSize(-39_999_975)),
+            "`C.wk_1000000`"
+        );
+        assert_eq!(
+            fold.data(WkSliceIdx(i64::from(i32::MAX)), ChunkIdx(0)),
+            Some(PadSize(65)),
+            "`C.wk_int32max`"
+        );
+        // The guard is `getSize() <= idx`, so the extent itself is the one value still out of range.
+        assert_eq!(
+            fold.data(WkSliceIdx(4_294_967_295), ChunkIdx(0)),
+            None,
+            "`C.wk_4294967295`"
+        );
+    }
+
+    /// `C.zero_extent_stored = 0`, `C.zero_extent_wk0 = THROW`, `C.zero_extent_wk_minus_1 = 65`.
+    ///
+    /// ⛔ AN EXTENT OF 0 REFUSES COORDINATE 0 AND STILL ANSWERS FOR -1. That is the signed range
+    /// test at its limit (`util/foldManager/foldInfrastructure.h:1677`) and NOT `hasZeroFoldDim`'s
+    /// "always legal" shortcut (`:1667`, `:2603`): that one reads the NUMBER of fold dims, never an
+    /// extent, so it cannot fire on a fold whose signature is two positions.
+    #[test]
+    fn e024_a_zero_extent_refuses_coordinate_zero_and_still_answers_for_minus_one() {
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                [FoldDimSize(0), FoldDimSize(3)],
+                ALPHAS_FRONT,
+                BETAS_FRONT
+            ),
+            Some(())
+        );
+        let fold = &info.front[&PrimaryDimTypes::X];
+        assert_eq!(
+            fold.props[0].size(),
+            FoldDimSize(0),
+            "`C.zero_extent_stored`"
+        );
+        assert_eq!(
+            fold.data(WkSliceIdx(0), ChunkIdx(0)),
+            None,
+            "`C.zero_extent_wk0`"
+        );
+        assert_eq!(
+            fold.data(WkSliceIdx(-1), ChunkIdx(0)),
+            Some(PadSize(65)),
+            "`C.zero_extent_wk_minus_1`"
+        );
+    }
+
+    /// `F.frontDims = 2 5 9`, `F.rebuild = THROW`, `F.frontDims_after = 2 5 9`.
+    ///
+    /// ⛔ EVERY OTHER CASE HERE BUILDS ONE DIM, SO NONE OF THEM CAN SEE ORDER — a [`Vec`] would pass
+    /// them all. `getAllKeys` walks a `std::map` into a `std::set`
+    /// (`util/foldManager/mapWithFMHelper.h:51-55`, `dsc/dsc2.h:783-788`) exactly because the one
+    /// caller `std::set_union`s the two ends (`dsc/dsc2.cpp:4814-4820`), which is an ordered merge.
+    /// Inserted 9, 2, 5 the authority answers 2 5 9.
+    /// ⛔ AND THE REFUSED REBUILD LEAVES THE LEVELS ALONE, not just the key set: the authority throws
+    /// at `DT_CHECK_MSG(!foldProps.count(dim))` (`dsc/dsc2.cpp:4662`) before it resizes anything.
+    #[test]
+    fn e024_pad_dims_is_ascending_and_a_refused_rebuild_leaves_the_fold_alone() {
+        let mut info = TransferPadInfo::default();
+        for dim in [PrimaryDimTypes::Ki, PrimaryDimTypes::Ij, PrimaryDimTypes::Y] {
+            assert_eq!(
+                info.build_pad_sizes(PadEnd::Front, dim, SIZES, ALPHAS_FRONT, BETAS_FRONT),
+                Some(())
+            );
+        }
+        let ascending = [PrimaryDimTypes::Ij, PrimaryDimTypes::Y, PrimaryDimTypes::Ki];
+        assert_eq!(ascending.map(|dim| dim as usize), [2, 5, 9]);
+        assert_eq!(
+            info.pad_dims(PadEnd::Front).collect::<Vec<_>>(),
+            ascending,
+            "`F.frontDims`"
+        );
+
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::Y,
+                SIZES,
+                ALPHAS_BACK,
+                BETAS_BACK
+            ),
+            None,
+            "`F.rebuild`"
+        );
+        assert_eq!(
+            info.pad_dims(PadEnd::Front).collect::<Vec<_>>(),
+            ascending,
+            "`F.frontDims_after`"
+        );
+        assert_eq!(
+            info.front[&PrimaryDimTypes::Y].data(WkSliceIdx(0), ChunkIdx(0)),
+            Some(PadSize(25)),
+            "the refusal did not write `BETAS_BACK`'s -53 over the level"
+        );
     }
 
     /// The one probe [`ComputeNode::operand_formats`] is measured at below. `SENINT8` is chosen
