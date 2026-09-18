@@ -44,11 +44,16 @@
 // The other eighteen are this type's fourteen declared fields (`:379-420`) plus the four of its
 // nested `StrWinPad` (`:21-26`), which the scheduler flattened onto the owner.
 
-/// One core index — IBM's `cid` (`:145`).
+/// One core index — IBM's `cid`, an `int32_t` at every declaration that takes one (`:145`, `:196`,
+/// `:235`, `:250`, `:428`).
 ///
-/// ⛔ NOT `sys_arch_spec::CoreId`, which is a `u8`: the sole consumer passes a fold dim index, an
-/// `int64_t` (`util/foldManager/foldInfrastructure.h:838`), and `adjustCID` is written to be
-/// reached with a negative (`:146`), so a `u8` would force a fallible narrowing at the seam.
+/// ⛔ NOT `sys_arch_spec::CoreId`, which is a `u8`: `adjustCID` is written to be reached with a
+/// negative (`:146`), so a `u8` would force a fallible narrowing at the seam.
+/// ⛔ WIDER THAN IBM'S OWN `cid`, AND THAT IS THE DIVERGENCE. The sole consumer passes a fold dim
+/// index, an `int64_t` (`util/foldManager/foldInfrastructure.h:838`, `:844`), which the `int32_t`
+/// parameter silently wraps — so a coordinate past `INT32_MAX` answers for a DIFFERENT core there.
+/// Keeping the caller's width leaves it out of range instead; the conversion happens in exactly one
+/// place, `WkSplitFoldFunctionLeaf::as_cid`, where it is named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cid(pub i64);
 
@@ -137,7 +142,7 @@ impl CoordRange {
     /// the one and only entry of the vector a gap core gets back (`:253-254`).
     ///
     /// ⛔ NOT AN ABSENCE THE CONSUMERS CAN IGNORE: the vendor's own goldens assert this pair on
-    /// nine of sixteen cores (`util/foldManager/test/test_fold_infrastructure.cpp:240-249`), so it
+    /// nine of sixteen cores (`util/foldManager/test/test_fold_infrastructure.cpp:245-253`), so it
     /// stays a named value rather than becoming an `Option`.
     pub const GAP: Self = Self {
         start: Coord(-1),

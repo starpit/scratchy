@@ -445,6 +445,12 @@ impl WkSplitFoldFunctionLeaf {
 
     /// The one reinterpretation of a fold coordinate as a core id, which is what `getFoldedData`
     /// does by passing `dim_index` into a `cid` parameter (`:838`, `:844`).
+    ///
+    /// ⛔ THE AUTHORITY NARROWS HERE AND THIS DOES NOT: `getFoldedData` takes an `int64_t` (`:837`,
+    /// `:843`), both readers take an `int32_t cid` (`util/foldManager/wkDivisionParams.h:235`,
+    /// `:250`), so a coordinate outside `int32_t` WRAPS ONTO ANOTHER CORE — a compiled
+    /// `getSize(1 << 32)` answers `10`, core 0's work, on a split whose cores stop at 15. [`Cid`]
+    /// keeps the caller's width, so here that coordinate is simply out of range.
     const fn as_cid(dim_index: FoldDimIndex) -> Cid {
         Cid(dim_index.0)
     }
@@ -1360,6 +1366,191 @@ mod unit_tests {
                 .wk_split_param_mut()
                 .is_none()
         );
+    }
+
+    /// The vendor's SIXTEEN-core split, transcribed from its own `build` arguments
+    /// (`util/foldManager/test/test_fold_infrastructure.cpp:223-226`): three unused cores after each
+    /// set of slices and two more at the end, which is where a gap core comes from.
+    fn vendor_split_16(
+        wk_ss: i32,
+        wk_epilogue: i32,
+        num_ss_slices: i32,
+        num_epilogue_slices: i32,
+        repeat_inner: i32,
+        outer_repeat: i32,
+    ) -> WkSplitParam {
+        use crate::schedule::wk_division::{
+            GapAfterAllSlices, GapAfterInnerRepeat, GapWithinInnerRepeat, MaxCores,
+            NumEpilogueSlices, NumSsSlices, OuterRepeatFactor, RepeatFactorInner, WkEpilogue, WkSs,
+        };
+        WkSplitParam::new(
+            WkSs(wk_ss),
+            WkEpilogue(wk_epilogue),
+            MaxCores(16),
+            Cid(0),
+            NumSsSlices(num_ss_slices),
+            NumEpilogueSlices(num_epilogue_slices),
+            GapWithinInnerRepeat::NONE,
+            RepeatFactorInner::new(repeat_inner).unwrap(),
+            GapAfterInnerRepeat::NONE,
+            GapAfterAllSlices(3),
+            OuterRepeatFactor::new(outer_repeat).unwrap(),
+            Vec::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// ⭐ THE VENDOR'S SECOND GOLDEN IS THE ONE WITH GAPS IN IT, and nothing reached it until now:
+    /// `constructor_test_wksplit2` asserts a work split over sixteen cores of which only seven do
+    /// work per outer repeat, so ⛔ A GAP CORE'S SIZE IS `Some(WkSize(0))` AND ITS RANGE IS ONE
+    /// [`CoordRange::GAP`] — the two claims [`WkSplitFoldFunctionLeaf::folded_size`] and
+    /// [`WkSplitFoldFunctionLeaf::folded_coord_vec`] make and neither could show. Nine of the
+    /// sixteen are gaps in `ij` and the same nine in `out`
+    /// (`util/foldManager/test/test_fold_infrastructure.cpp:239-253`).
+    ///
+    /// It is also the only fixture with an EPILOGUE slice: `out`'s fourth slice is two elements
+    /// where its first three are three, which is `getSize`'s `slice_id < num_ss_slices_` branch
+    /// (`util/foldManager/wkDivisionParams.h:241`).
+    #[test]
+    fn the_vendors_sixteen_core_split_gives_nine_gap_cores_a_size_and_a_range() {
+        use crate::schedule::wk_division::Coord;
+
+        let range = |start, end| {
+            Some(vec![CoordRange {
+                start: Coord(start),
+                end: Coord(end),
+            }])
+        };
+
+        let ij = WkSplitFoldFunctionLeaf::from(vendor_split_16(10, 0, 2, 0, 2, 2));
+        let out = WkSplitFoldFunctionLeaf::from(vendor_split_16(3, 2, 3, 1, 1, 2));
+
+        // `golden_vals_ij` and `golden_vals_out` (`:239-243`) — the zeros are the gap cores.
+        let golden_size_ij = [10, 10, 10, 10, 0, 0, 0, 10, 10, 10, 10, 0, 0, 0, 0, 0];
+        let golden_size_out = [3, 3, 3, 2, 0, 0, 0, 3, 3, 3, 2, 0, 0, 0, 0, 0];
+
+        // `golden_vals_coord_ij` and `golden_vals_coord_out` (`:245-253`), each pushed as the one
+        // entry of the vector the core gets back (`util/foldManager/wkDivisionParams.h:253-254`).
+        let golden_coord_ij = [
+            range(0, 9),
+            range(0, 9),
+            range(10, 19),
+            range(10, 19),
+            None,
+            None,
+            None,
+            range(0, 9),
+            range(0, 9),
+            range(10, 19),
+            range(10, 19),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let golden_coord_out = [
+            range(0, 2),
+            range(3, 5),
+            range(6, 8),
+            range(9, 10),
+            None,
+            None,
+            None,
+            range(0, 2),
+            range(3, 5),
+            range(6, 8),
+            range(9, 10),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+
+        for cid in 0..16_i64 {
+            let core = FoldDimIndex(cid);
+            let i = cid as usize;
+
+            assert_eq!(
+                ij.folded_size(core),
+                Some(WkSize(golden_size_ij[i])),
+                "`golden_vals_ij` at {cid}"
+            );
+            assert_eq!(
+                out.folded_size(core),
+                Some(WkSize(golden_size_out[i])),
+                "`golden_vals_out` at {cid}"
+            );
+
+            // A gap core answers ONE `{-1, -1}`, never an empty vector and never `None`.
+            let want_ij = golden_coord_ij[i]
+                .clone()
+                .unwrap_or_else(|| vec![CoordRange::GAP]);
+            let want_out = golden_coord_out[i]
+                .clone()
+                .unwrap_or_else(|| vec![CoordRange::GAP]);
+            assert_eq!(
+                ij.folded_coord_vec(core),
+                Some(want_ij),
+                "`golden_vals_coord_ij` at {cid}"
+            );
+            assert_eq!(
+                out.folded_coord_vec(core),
+                Some(want_out),
+                "`golden_vals_coord_out` at {cid}"
+            );
+        }
+    }
+
+    /// The negative for the one narrowing on this seam: ⛔ `getFoldedData` HANDS AN `int64_t` TO AN
+    /// `int32_t cid` (`foldInfrastructure.h:837`/`:843` into
+    /// `util/foldManager/wkDivisionParams.h:235`/`:250`), so a coordinate past `INT32_MAX` WRAPS
+    /// ONTO A WORKING CORE. Measured through the leaf itself, compiled against the fixture above:
+    /// `getData({1 << 32})` answers `10` over coordinates `(0, 9)` — core 0's — and
+    /// `getData({(1 << 32) + 3})` answers `10` over `(10, 19)`, core 3's.
+    ///
+    /// [`Cid`] keeps the caller's width, so neither coordinate is in the gang here and both get a
+    /// gap core's answer. The divergence is deliberate: handing back another core's elements for a
+    /// coordinate that has no core is worse than reporting no work.
+    #[test]
+    fn a_fold_coordinate_past_int32_does_not_wrap_onto_another_core() {
+        use crate::schedule::wk_division::Coord;
+
+        let ij = WkSplitFoldFunctionLeaf::from(vendor_split_16(10, 0, 2, 0, 2, 2));
+
+        // The two cores `1 << 32` and `(1 << 32) + 3` truncate onto, and what they really hold.
+        assert_eq!(ij.folded_size(FoldDimIndex(0)), Some(WkSize(10)));
+        assert_eq!(
+            ij.folded_coord_vec(FoldDimIndex(0)),
+            Some(vec![CoordRange {
+                start: Coord(0),
+                end: Coord(9),
+            }])
+        );
+        assert_eq!(
+            ij.folded_coord_vec(FoldDimIndex(3)),
+            Some(vec![CoordRange {
+                start: Coord(10),
+                end: Coord(19),
+            }])
+        );
+
+        // ⭐ `i64::MAX` IS NOT ONE OF THE DIVERGING CASES — it truncates to `-1`, which `adjustCID`
+        // (`util/foldManager/wkDivisionParams.h:145-147`) puts outside the gang as well, so the
+        // authority answers a gap core there too. It is here to show where the two ends do agree.
+        for past in [1_i64 << 32, (1 << 32) + 3, i64::MAX] {
+            assert_eq!(
+                ij.folded_size(FoldDimIndex(past)),
+                Some(WkSize(0)),
+                "no core {past}"
+            );
+            assert_eq!(
+                ij.folded_coord_vec(FoldDimIndex(past)),
+                Some(vec![CoordRange::GAP])
+            );
+        }
     }
 
     /// A map leaf IS its `data_vec_` (`:782`), one value per coordinate, and ⛔ IBM'S BOUNDS CHECK
