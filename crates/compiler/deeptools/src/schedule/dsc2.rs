@@ -943,13 +943,15 @@ mod unit_tests {
         assert_eq!(ddl_minted.el.name, "");
     }
 
-    /// `ddc/ddl/ddl_conversion.cpp:2974` and `:2998` read `dataStageParam_[loopnode->numId_]` through
-    /// the NON-CONST `operator[]`, and the DFS that reaches them (`:2951-3082`) has no parametric
-    /// guard — so the `-1` a `ParametricLoopOp` loop carries (`:1129-1130`, linked at `:1162`) is
-    /// INSERTED by the very test that asks whether its name is empty.
+    /// `ddc/ddl/ddl_conversion.cpp:2974` reads `dataStageParam_[loopnode->numId_]` and `:2998` reads
+    /// `[loopnode->denId_]`, both through the NON-CONST `operator[]`, and the DFS that reaches them
+    /// (`:2951-3082`) has no parametric guard — so the `-1` a `ParametricLoopOp` loop carries
+    /// (`:1129-1130`, linked at `:1162`) is INSERTED by the very test that asks whether its name is
+    /// empty, once per id.
     #[test]
     fn the_emissions_emptiness_test_mints_the_absent_stage_it_reads() {
         use crate::schedule::dims::DimVal;
+        use crate::schedule::metadata::Datastage;
 
         // `:1510-1511`: the id the DDL mints next starts from `dataStageParam_.size()`.
         let mut param: BTreeMap<DataStageId, DataStage> = BTreeMap::new();
@@ -977,6 +979,28 @@ mod unit_tests {
         );
         let count = ss.map(|DimVal(v)| (f64::from(v) / f64::from(v)).ceil());
         assert_eq!(count, Some(1.0));
+
+        // ⛔ AND THE BRANCH THAT EMPTY NAME SELECTS MINTS AGAIN, SOMEWHERE ELSE: `:2986-2988` reads
+        // `metadata_.datastages_[numId_].strategyMinimize_`, a SECOND default-inserting container
+        // (`ddc/ddc_metadata.h:82`), whose freshly minted value answers `true` (`:77`) — so the
+        // `DatastageOp` the emission creates for a parametric loop is spelled "minimize", never the
+        // "maximize" the line above it initialises. `denId_` repeats both reads at `:2998` and `:3011`.
+        let mut datastages: BTreeMap<DataStageId, Datastage> = BTreeMap::new();
+        let strategy = if datastages
+            .entry(DataStageId(-1))
+            .or_default()
+            .strategy_minimize
+        {
+            "minimize"
+        } else {
+            "maximize"
+        };
+        assert_eq!(strategy, "minimize");
+        assert_eq!(
+            datastages.len(),
+            1,
+            "one absent id, one insert per container"
+        );
     }
 
     /// `dsc/dsc2.h:1088`: the declared order and the field's `NOT_PROCESSED` initialiser (`:1093`).
@@ -2887,6 +2911,60 @@ mod unit_tests {
         );
     }
 
+    /// ⛔ A CONSTANT OPERAND GETS NO OFFSETS AT ALL, AND THIS TYPE CANNOT SAY SO. Both stages' fillers
+    /// return before the offset half for anything that is not a labeled ds — `if (di.myLdsIdx_ < 0)
+    /// return;  // no offsets for constants` (`ddc/ddcv1.cpp:2410`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5991`) — and the rewrite that turns a tensor source
+    /// into a constant one asserts that result with four `DT_CHECK`s in a row
+    /// (`dsc/dsc2.cpp:5386-5397`). Of those four fields this type carries two, and neither
+    /// [`LdsOrConst`] nor [`DataInfo::default`] refuses the state the authority checks for.
+    #[test]
+    fn e033_a_constant_operand_carries_no_offsets_and_this_type_cannot_refuse_one() {
+        // What `dsc/dsc2.cpp:5378-5397` produces and then checks: the constant source of a zero-pad
+        // transfer, every offset empty.
+        let checked = DataInfo {
+            lds_or_const: Some(LdsOrConst::Constant(ConstantId(4))),
+            ..DataInfo::default()
+        };
+        assert!(checked.is_constant());
+        assert!(checked.const_ele_offsets.is_empty());
+        assert!(checked.buffer_addr_offset.is_empty());
+
+        // ⛔ AND THE STATE THOSE FOUR `DT_CHECK`S EXIST TO CATCH IS REPRESENTABLE HERE.
+        // `transformLxZeroPadInfoInScheduleTree` rewrites the source of a DataInfo it copied from a
+        // TENSOR transfer (`dsc/dsc2.cpp:5379-5380`), so the offsets it asserts empty are the ones the
+        // old source left behind — which is why the authority checks instead of assuming, and the one
+        // assignment that makes this a constant here leaves both carried offsets standing.
+        let mut rewritten = DataInfo {
+            lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(2))),
+            ..DataInfo::default()
+        };
+        rewritten
+            .const_ele_offsets
+            .entry(CoreId(0))
+            .or_default()
+            .entry(CoreletId(0))
+            .or_default()
+            .insert(PrimaryDimTypes::In, ConstEleOffset(8));
+        rewritten
+            .buffer_addr_offset
+            .entry(CoreId(0))
+            .or_default()
+            .insert(CoreletId(0), BufferAddrOffset(512));
+        rewritten.lds_or_const = Some(LdsOrConst::Constant(ConstantId(4)));
+        assert!(rewritten.is_constant());
+        assert!(!rewritten.const_ele_offsets.is_empty());
+        assert!(!rewritten.buffer_addr_offset.is_empty());
+
+        // ⭐ AND ABSENT IS A THIRD CASE, NOT THE CONSTANT ONE: for it the fillers return before even the
+        // start address (`ddc/ddcv1.cpp:2364`, `L3DlOpsScheduler.cpp:5786`), so the whole address half
+        // of a `None` operand is the declared default and nothing else.
+        let neither = DataInfo::default();
+        assert!(!neither.is_constant() && !neither.is_labeled_ds());
+        assert!(!neither.is_start_addr_symbolic);
+        assert!(neither.const_ele_offsets.is_empty() && neither.buffer_addr_offset.is_empty());
+    }
+
     /// `dsc/dsc2.h:884-896`, every arm of the chain in its own order. ⛔ THE ORDER IS LOAD-BEARING
     /// AND THIS IS WHERE THAT SHOWS: a constant source with a constant destination matches the
     /// `CONSTANT_TO_TENSOR` test's first half too, and only the sequence decides.
@@ -3683,13 +3761,15 @@ pub enum PropStateType {
 /// `ddc/ddl/ddl_conversion.cpp:1076-1164`: a DDL `LoopOp` becomes a datastage loop and a
 /// `ParametricLoopOp` a parametric one.
 ///
-/// ⛔ THIS CARRIES ALL SIX OF LOOPNODE'S OWN DECLARED FIELDS AND NOTHING INHERITED, so the
-/// `e031_LoopNode` anchor at the end of this file is still open. `nodeType_`, `name_`, `prev_` and
-/// `relevantComps_` are `ScheduleNode`'s (`dsc/dsc2.h:460-461`, `:515-516`) and `next_` is
-/// `BlockNode`'s (`:538`) — e029_ScheduleNode and e030_BlockNode both. That also keeps three methods
-/// out: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and `parametricStride` (`:4197`) read
-/// `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb `getOwnerLoop()`, and `print`
-/// (`:4284`) prints `name_`.
+/// ⛔ THIS CARRIES ALL SIX OF LOOPNODE'S OWN DECLARED FIELDS AND NOTHING INHERITED. `nodeType_`,
+/// `name_`, `prev_` and `relevantComps_` are `ScheduleNode`'s (`dsc/dsc2.h:460-461`, `:515-516`) and
+/// `next_` is `BlockNode`'s (`:538`) — e029_ScheduleNode and e030_BlockNode both.
+///
+/// ⛔ AND IT IS THE METHODS, NOT THE FIELD COUNT, THAT KEEP THE `e031_LoopNode` ANCHOR AT THE END OF
+/// THIS FILE OPEN. A unit is its fields AND its methods together, and three of this class's nine
+/// cannot be written until those two owners land: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and
+/// `parametricStride` (`:4197`) read `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb
+/// `getOwnerLoop()` through `prev_`, and `print` (`:4284`) prints `name_`.
 ///
 /// ⚠️ THE FIVE REMAINING `e031_LoopNode.*` ANCHORS NAME NOTHING THIS TYPE CAN CARRY: `Ddc`,
 /// `DesignSpaceConfig`, `ScheduleTree` and `ScheduleNode` are the four `friend class` declarations
@@ -3732,20 +3812,45 @@ pub struct LoopNode {
     /// `!isParametricLoop()` at `:2994`; `:6104`, `ddc/ddcv1.cpp:2496`, `:2835`,
     /// `ddc/ddc_fold.cpp:2349`, `:3235`, `:3604`); the DDL emission instead reads
     /// `dataStageParam_[numId_]` through the NON-CONST `operator[]`, with NO parametric guard
-    /// (`ddc/ddl/ddl_conversion.cpp:2974`, `:2998`, in the DFS at `:2951-3082`), and a parametric loop
-    /// always arrives with `-1` (minted `:1129-1130`, linked into the tree `:1162`) — so the key is
+    /// (`ddc/ddl/ddl_conversion.cpp:2974`, in the DFS at `:2951-3082`), and a parametric loop always
+    /// arrives with `-1` (minted `:1129-1130`, linked into the tree `:1162`) — so the key is
     /// DEFAULT-INSERTED and the `else` branch runs on a stage named `""`. ⭐ [`DataStage::name`]
-    /// carries what that insert then makes true. `constraints_[loop->numId_]` (`ddc/ddcv1.cpp:610`,
-    /// `:649`) is the same `operator[]` shape, and `metadata.rs` records it as an `Option` KEY.
+    /// carries what that insert then makes true.
+    ///
+    /// ⛔ AND THAT `else` BRANCH MINTS IN A SECOND CONTAINER. It reads
+    /// `metadata_.datastages_[numId_].strategyMinimize_` (`:2987`), an `unordered_map<int, Datastage>`
+    /// (`ddc/ddc_metadata.h:82`), where the emptiness test above it read a
+    /// `map<int, dsc2::DataStage>` (`dsc/designSpaceConfig.h:105`) — so ONE parametric loop inserts
+    /// `-1` into BOTH, and the strategy the emission then attaches is decided by the value that insert
+    /// default-constructed: `strategyMinimize_ = true` (`ddc/ddc_metadata.h:77`), hence `"minimize"`,
+    /// never the `"maximize"` the line above it states. [`den_id`](Self::den_id) takes the same pair of
+    /// reads thirteen lines on (`:2998`, `:3011`).
+    ///
+    /// ⭐ AND `-1` IS NOT A SENTINEL EVERYWHERE IT IS A KEY. `constraints_[loop->numId_]`
+    /// (`ddc/ddcv1.cpp:610`, `:649`) is the same `operator[]` shape, but there `-1` is the DECLARED
+    /// key for "absolute constraints" (`ddc/ddc_metadata.h:74`), written as such directly at `:689` —
+    /// so a parametric loop's constraints land in the absolute bucket, and `metadata.rs` recording
+    /// that key as an `Option` is what keeps the two spellings one.
     pub num_id: Option<DataStageId>,
     /// Field: e031_LoopNode.denId_
     ///
     /// The denominator stage (`dsc/dsc2.h:574`). ⛔ NOT SYMMETRIC WITH [`num_id`](Self::num_id):
-    /// this is the id with absence guards, and all three sit where the reader has climbed
+    /// this is the id with `>= 0` guards, and all three sit where the reader has climbed
     /// `getOwnerLoop()` to a PARENT loop and can therefore reach the head — `exploreAssignDataStages`
     /// at `ddc/ddcv1.cpp:634` and `:645`, and `parametricIterCount` at `dsc/dsc2.cpp:4144-4147`. Its
-    /// other uses in that same function are unguarded (`ddc/ddcv1.cpp:607`, `:694`, `:701`,
-    /// `:727-729`), so the guard marks the climb, not the field.
+    /// other uses in that same function carry no such test (`ddc/ddcv1.cpp:694`, `:701`, `:727-729`),
+    /// so the guard marks the climb, not the field.
+    ///
+    /// ⛔ AND ABSENCE IS READ THREE WAYS, NOT TWO. Besides those guards and the `.at()` readers that
+    /// throw, `-1` ABORTS at `ddc/ddcv1.cpp:607-608`, where `metadata.datastages_.find(denId_)` is
+    /// followed by a `DT_CHECK` on the iterator — the same container the guarded site then tests with
+    /// `count` (`:646`) — and it MINTS in the DDL emission, which reads `dataStageParam_[denId_]` and
+    /// `metadata_.datastages_[denId_]` through the non-const `operator[]` in the SAME
+    /// parametric-guard-free DFS that does it to [`num_id`](Self::num_id)
+    /// (`ddc/ddl/ddl_conversion.cpp:2998`, `:3011`, in the walk at `:2951-3082`).
+    /// `ddc/ddc_transformation.cpp:988` and `:1023` are that same `operator[]` shape and go on to WRITE
+    /// the value they inserted, though both take their id from a stage the caller has just minted
+    /// rather than from a parametric loop.
     pub den_id: Option<DataStageId>,
     /// Field: e031_LoopNode.dims_
     ///
@@ -4623,11 +4728,36 @@ pub enum LdsOrConst {
 ///    by (`dsc/dsc2.cpp:251-256`). Its value currency is already here as [`TemporalStride`];
 ///  * `bufferSwitchPosition_` (`:738`) is a `const LoopNode*` for the same reason.
 ///
-/// ⛔ AND THOSE TWO POINTERS AND `bufferAddrOffset_` ARE ONE STATE, WRITTEN IN ONE BLOCK: everything
-/// at `ddc/ddcv1.cpp:2796-2807` is guarded by `allocation->numBuffers_ != 1`, so an empty
-/// [`buffer_addr_offset`](Self::buffer_addr_offset) and an absent buffer-switch loop mean the same
-/// thing — single-buffered — and a reader that finds one without the other is looking at a
-/// half-filled node.
+/// ⛔ AND THOSE TWO POINTERS AND `bufferAddrOffset_` ARE ONE STATE, WRITTEN IN ONE BLOCK PER STAGE.
+/// Both stages write the three together under `allocation->numBuffers_ != 1` — stage 2b at
+/// `ddc/ddcv1.cpp:2796-2807`, stage 2a at `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6262-6274` — so
+/// an empty [`buffer_addr_offset`](Self::buffer_addr_offset) and an absent buffer-switch loop mean the
+/// same thing, single-buffered, and a reader that finds one without the other is looking at a
+/// half-filled node. ⛔ IT IS NOT THE SOURCE MAP THAT IS EMPTY: `bufferOffsetCoreCorelet_` is filled
+/// for single-buffered allocations too, under a `DT_CHECK` that admits `numBuffers_ == 1` outright
+/// (`L3DlOpsScheduler.cpp:4966-4967`, written at `:4991`, `:5008`, `:5035`), so the emptiness here is
+/// made by the guard on the COPY and by nothing else.
+///
+/// ⛔ THE TWO STAGES REACH THAT OFFSET BY DIFFERENT ROUTES AND DIVERGE ON THE START ADDRESS. Stage 2b
+/// folds the L0LU row count into `addrScale` before anything uses it (`ddc/ddcv1.cpp:2392-2394`) and
+/// divides the buffer offset by the product (`:2804`); stage 2a takes `addrScale` without it
+/// (`L3DlOpsScheduler.cpp:5850-5852`) and divides by `numPTRows` separately, inside the block
+/// (`:6271`). Truncating division makes those two equal — but `startAddr_` is scaled by that same
+/// `addrScale` in both (`ddc/ddcv1.cpp:2398-2406`, `L3DlOpsScheduler.cpp:5854-5862`), so on L0LU
+/// stage 2b divides the start address by `numPTRows` and stage 2a does not. That is e020_FoldManager's
+/// to carry, and it is why one citation per stage is the minimum here.
+///
+/// ⛔ AND WHICH ADDRESS FIELDS GET FILLED AT ALL IS A THREE-WAY MATCH ON
+/// [`lds_or_const`](Self::lds_or_const), the same in both stages. [`None`] fills NOTHING — the filler
+/// returns before even the start address (`ddc/ddcv1.cpp:2364`, `L3DlOpsScheduler.cpp:5786`), as it
+/// also does for a non-memory storage (`ddcv1.cpp:2365`). [`LdsOrConst::Constant`] gets the start
+/// address and then returns, `// no offsets for constants` (`ddcv1.cpp:2410`,
+/// `L3DlOpsScheduler.cpp:5991`), leaving `constEleOffsets_`, `loopEleOffsets_`, `bufferAddrOffset_`
+/// and `bufferSwitchPosition_` empty — which is exactly what the rewrite that turns a tensor source
+/// into a constant one asserts next, four `DT_CHECK`s in a row (`dsc/dsc2.cpp:5386-5397`). Only
+/// [`LdsOrConst::LabeledDs`] reaches the offsets. ⛔ THIS TYPE DOES NOT ENFORCE THAT: a `Constant`
+/// holding a non-empty [`const_ele_offsets`](Self::const_ele_offsets) is representable here, and
+/// `e033_a_constant_operand_carries_no_offsets_and_this_type_cannot_refuse_one` pins it.
 ///
 /// ⛔ NO `PartialEq`, as no node type here has one: the authority declares no `operator==` for
 /// `DataInfo` and its consumers compare the parts they care about, `dataConnect_` above all
@@ -4647,8 +4777,13 @@ pub struct DataInfo {
     ///
     /// Whether `startAddr_` is a symbol to be resolved rather than a number (`dsc/dsc2.h:724`),
     /// copied from the backing allocation (`ddc/ddcv1.cpp:2397`,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5817`) and read immediately after to take the
-    /// symbolic branch (`ddc/ddcv1.cpp:2399`, `L3DlOpsScheduler.cpp:5833`, `:5855`).
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5817`) and read immediately after to branch on
+    /// (`ddc/ddcv1.cpp:2399`, `L3DlOpsScheduler.cpp:5855`).
+    ///
+    /// ⛔ ONE OF THOSE BRANCHES IS A REFUSAL, NOT A PATH. Stage 2a `DT_ERROR`s "Currently no support;
+    /// work in progress" when a symbolic start address meets cross-core reduction with a corelet split
+    /// (`L3DlOpsScheduler.cpp:5833-5834`). Stage 2b has no such gap (`ddc/ddcv1.cpp:2399-2405`), so the
+    /// flag means "resolve a symbol" in one stage and "abort the compile" in the other.
     pub is_start_addr_symbolic: bool,
     /// Field: e033_DataInfo.latchDataId_
     ///
@@ -4669,8 +4804,15 @@ pub struct DataInfo {
     ///
     /// A constant element offset per core, corelet and dim (`dsc/dsc2.h:727-729`).
     ///
-    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, nor for `loopEleOffsets_` or `bufferAddrOffset_`:
-    /// all three declarations wrap onto a second line and `plan.py` reads the name off the first.
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, nor for `startAddr_`, `latchDataId_`, `constantId_`,
+    /// `loopEleOffsets_` or `bufferAddrOffset_` — and the cause is a TRAILING COMMENT, not the wrapped
+    /// declaration. `plan.py`'s field pattern is anchored at `;\s*$`, so a declaration line ending in
+    /// `// …` never matches, and it scans EVERY line of the class body, which is why wrapping the type
+    /// onto its own line costs nothing. The six names it missed are exactly the six `DataInfo`
+    /// declarations carrying a trailing comment (`dsc/dsc2.h:723`, `:725`, `:726`, `:728`, `:732`,
+    /// `:736`); the four it anchored — `myLdsIdx_`, `isStartAddrSymbolic_`, `bufferSwitchPosition_`,
+    /// `dataConnect_` — are exactly the four carrying none (`:722`, `:724`, `:738`, `:739`), and
+    /// `bufferSwitchPosition_` wraps no more and no less than `bufferAddrOffset_` does.
     ///
     /// ⛔ EMPTY IS A DECISION, NOT AN ABSENCE OF ONE. `fillLoopOffsetsAndAddresses` remembers whether
     /// any offset existed before it starts broadcasting them across cores and corelets and CLEARS the
