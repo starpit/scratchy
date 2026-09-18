@@ -527,12 +527,44 @@ pub enum SenTargets {
     Nop,
 }
 
+/// Where one dim sits in one role's layout order, as
+/// [`dim_index_in_layout_order`](DesignSpaceConfig::dim_index_in_layout_order) answers it
+/// (`dsc/designSpaceConfig.cpp:429-438`).
+///
+/// ⛔ IBM'S ONE `int` CARRIES TWO OUTCOMES AND ITS TWENTY-EIGHT LIVE READERS DO NOT AGREE ON THE
+/// `-1`, so collapsing the two into a single absent loses a distinction the tree draws five ways.
+/// SIXTEEN substitute A SCALE OF `1` for it and carry straight on — `dimIdx < 0 ? 1 : scale_.at(..)`
+/// (`ddc/ddc_fold.cpp:1390-1391`, `:2297-2298`, `:2535-2536`, `:3000-3001`, `:3160-3161`,
+/// `:3365-3366`, `:3964-3965`, `:3980-3981`, `:4279-4280`, `:4289-4290`, `ddc/ddcv1.cpp:2450-2451`,
+/// `:2631-2632`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6032-6033`, `:6202-6203`, `:7399-7400`,
+/// `:7541-7542`). TWO abort on it (`L3DlOpsScheduler.cpp:68-71`, `:4271-4273`). TWO ask only whether
+/// it is negative (`ddc/ddl/ddl_conversion.cpp:1302-1305`, `ddc/ddc_transformation.cpp:1792-1793`).
+/// ONE adds it to a dim count and stores the sum as a position (`ddc/ddcv1.cpp:1588-1590`). And
+/// SEVEN hand it straight to `scale_.at()`, where it wraps to a huge `size_t` and throws exactly as
+/// the role lookup would (`ddc/ddcv1.cpp:500-501`, `:1502-1503`, `:1904-1905`,
+/// `ddc/ddc_transformation.cpp:929`, `:931`, `dsc/dsc2.cpp:3559`, `:3820`). The commented-out `== -2`
+/// compare (`ddc/ddcv1.cpp:1522-1532`) and the six `dvs/setupVariables/` fixtures are not counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutOrderPosition {
+    /// The position the search found (`dsc/designSpaceConfig.cpp:433-435`).
+    At(usize),
+    /// The search ran off the end of `layoutDimOrder_`, which is IBM's `return -1` (`:437`).
+    /// ⛔ A VALUE, NOT AN ABSENCE, at the sixteen sites that substitute a scale of `1` for it.
+    DimNotInOrder,
+    /// `primaryDsInfo_` has no entry for the role at all, so IBM's `.at(dstype)` (`:431`) threw
+    /// before the search began.
+    RoleHasNoLayout,
+}
+
 /// `dsc/designSpaceConfig.h:51-705`. One op's design space configuration: the data structures it
 /// moves, the memory-hierarchy stages it moves them through, the loop nest that drives them and the
 /// schedule tree the DDC and the L3 scheduler build into it.
 ///
-/// ⛔ SEVEN OF THE THIRTY-SIX DECLARED FIELDS ARE NOT CARRIED, and their anchors below stay open.
-/// Each one needs a type this campaign has not scheduled:
+/// ⛔ SIX OF THE THIRTY-SIX DECLARED FIELDS ARE NOT CARRIED, and SEVEN anchors below stay open for
+/// them, because the scheduler flattened the nested `ProgramFrame` (`:129-132`) into a `.ptr_` and a
+/// `.size_` anchor of its own. Thirty carried plus seven open anchors therefore does not close on
+/// thirty-six; the field count is the one that does. Each uncarried field needs a type this campaign
+/// has not scheduled:
 /// * `labeledDs_` (`:86`) — `std::vector<LabeledDsInfo>`, and `LabeledDsInfo` is a 25-field cluster
 ///   over `DtInfo`, `MemOrg`, `CoreDsInfo` and `MxInfo` (`dsc/dscdefn.h:321-468`), none of them a
 ///   unit in `crustify-scheduler/UNITS.tsv`.
@@ -540,15 +572,20 @@ pub enum SenTargets {
 ///   `std::vector<LabeledDsInfo*>` held as pointer identity INTO `labeledDs_`
 ///   (`dsc/dscdefn.h:506-511`).
 /// * `auxLoopOrder_` (`:114`) — `AuxLoopSetInfo` holds two raw `DataStructDims*` aliasing this
-///   object's own members (`dsc/dscdefn.h:126-127`); no in-scope file reads it.
+///   object's own members (`dsc/dscdefn.h:126-127`). ⛔ TWELVE IN-SCOPE USES IN THIS CLASS'S OWN TU:
+///   the loop walk descends into every aux set of each [`loop_order`](Self::loop_order) entry
+///   (`dsc/designSpaceConfig.cpp:1344-1346`) and the JSON importer resolves those two pointers by
+///   matching the string against the `name_` of eight named members PLUS every [`sc`](Self::sc)
+///   entry (`:6927-6931`, `:7511-7515`).
 /// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e007_ScheduleTree` anchor.
 ///   [`is_dsc2`](Self::is_dsc2) is the one method blocked on it alone.
 /// * `pcfg_` (`:120`) — `std::vector<SenPcfg>`, and DCG/PCFG is off this campaign's path
 ///   (`crustify-scheduler/AGENT-BRIEF.md`, decided 2026-09-09).
-/// * `ProgramFrame::ptr_`/`size_` (`:130-131`) — a `std::shared_ptr<void>` and its byte count, whose
-///   only writer is `fillPcfgProgramFrame` on the `SENPCFG` key (`dsc/designSpaceConfig.cpp:1020-1027`)
-///   and which no in-scope file reads. ⛔ NOT the `ProgramFrame` `SuperDsc` uses: that one is
-///   sendefs' three-member struct with `st_address` (`util/sendefs/sendefs.h:190`).
+/// * `prog_frame_ptr_` (`:133`) — a `std::map<SenTargets, ProgramFrame>` whose two members
+///   (`:130-131`) are a `std::shared_ptr<void>` and its byte count, and whose only writer is
+///   `fillPcfgProgramFrame` on the `SENPCFG` key (`dsc/designSpaceConfig.cpp:1020-1027`). ⛔ NOT the
+///   `ProgramFrame` `SuperDsc` uses: that one is sendefs' three-member struct with `st_address`
+///   (`util/sendefs/sendefs.h:190-194`).
 ///
 /// ⛔ AND `paramNameToVal` (`:358-608`) IS PORTED AS A RESOLVER, NOT A TABLE. IBM's 240 entries are
 /// `double*` INTO this object's own `DataStructDims` members, so a copy leaves every pointer aimed at
@@ -689,15 +726,32 @@ pub struct DesignSpaceConfig {
     ///
     /// The auxiliary loop sets' dims (`dsc/designSpaceConfig.h:111`).
     ///
-    /// ⛔ ZERO READS AND ZERO WRITES TREE-WIDE: the only occurrence of `sc_` in the authority is this
-    /// declaration. `getDsdFromStr` does not name it and `paramNameToVal` has no `sc` prefix, so
-    /// nothing can even reach it by name; `AuxLoopSetInfo::scDimOrder_` (`dsc/dscdefn.h:128`) is a
-    /// different field.
+    /// ⛔ EVERY ENTRY IS REACHABLE BY ITS OWN `name_`, AND THAT IS THE ONLY WAY IN. `getDsdFromStr`
+    /// does not name `sc_` and the 240 keys have no `sc` prefix, but each entry carries a runtime
+    /// name and both writers register `name_ + <dim>` as twenty MORE `paramNameToVal` keys per entry
+    /// (`dm/dm.cpp:971-983`, `dsi/test/psum_test.cpp:150-159`), which is why
+    /// [`param_name_to_val`](Self::param_name_to_val) resolves them and why a closed twelve-prefix
+    /// table alone would answer absent where IBM answers. ⛔ THE LAST MATCHING ENTRY WINS, because
+    /// `map[key] = ptr` overwrites and entry 0 is registered before entry 1.
+    ///
+    /// ⛔ AND IT IS BOTH READ AND WRITTEN IN THIS CLASS'S OWN IN-SCOPE TU, at five sites: the JSON
+    /// importer grows the vector from any key beginning `sc_` (`dsc/designSpaceConfig.cpp:6862`,
+    /// `:6891-6899`), the aux-loop pointer resolution matches `numerator_`/`denominator_` against
+    /// every entry's `name_` (`:6930-6931`, `:7514-7515`), and `printMed` (`:373-375`) and
+    /// `exportJson` (`:6235-6237`) both emit it. `AuxLoopSetInfo::scDimOrder_` (`dsc/dscdefn.h:128`)
+    /// is a different field.
     pub sc: Vec<DataStructDims>,
     /// Field: e031_DesignSpaceConfig.loopOrder_
     ///
     /// The loop nest, outermost first (`dsc/designSpaceConfig.h:112`). Filled by DM/DSI
-    /// (`dsi/test/psum_test.cpp:70`); no in-scope file reads it.
+    /// (`dsi/test/psum_test.cpp:70`).
+    ///
+    /// ⛔ EIGHTY-ONE USES IN THIS CLASS'S OWN IN-SCOPE TU, and one of them picks the key
+    /// [`param_name_to_val`](Self::param_name_to_val) is then asked for: `getDimPrefix4LxTransfer_lDs`
+    /// walks this order for the loop naming the dim and returns that loop's middle letter — `t`, `b`
+    /// or `d` (`dsc/designSpaceConfig.cpp:9063-9075`) — which its caller concatenates with the dim
+    /// name (`dm/dm.cpp:1120-1125`). So the loop order chooses WHICH stage's extent a
+    /// `paramNameToVal` lookup answers with.
     pub loop_order: Vec<LoopNames>,
     /// Field: e031_DesignSpaceConfig.loopProperties_
     ///
@@ -814,10 +868,14 @@ impl DesignSpaceConfig {
         })
     }
 
-    /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-608`). A key
-    /// outside the table is absent, where IBM's `.at()` throws; an unfilled dim is absent too, where
-    /// IBM hands back its `-1`.
+    /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-608`), or one of
+    /// the twenty an [`sc`](Self::sc) entry adds under its own `name_` (`dm/dm.cpp:980-983`). A key
+    /// outside both is absent, where IBM's `.at()` throws; an unfilled dim is absent too, where IBM
+    /// hands back its `-1`.
     pub fn param_name_to_val(&self, name: &str) -> Option<dims::DimSize> {
+        if let Some((entry, dim)) = self.sc_param_name(name) {
+            return dim_val_by_name(&self.sc[entry], dim);
+        }
         let (prefix, dim) = split_param_name(name)?;
         dim_val_by_name(self.dsd_from_str(prefix)?, dim)
     }
@@ -825,8 +883,24 @@ impl DesignSpaceConfig {
     /// The same key as a handle to assign through — the table's values are `double*` for that reason
     /// (`dsc/designSpaceConfig.h:358-608`).
     pub fn param_name_to_val_mut(&mut self, name: &str) -> Option<&mut Option<dims::DimSize>> {
+        if let Some((entry, dim)) = self.sc_param_name(name) {
+            return self.sc[entry].param_name_to_val_mut(dim);
+        }
         let (prefix, dim) = split_param_name(name)?;
         self.dsd_from_str_mut(prefix)?.param_name_to_val_mut(dim)
+    }
+
+    /// Which [`sc`](Self::sc) entry a key names, and the dim spelled after that entry's `name_`
+    /// (`dm/dm.cpp:980-983`). ⛔ THE LAST MATCHING ENTRY WINS, because both writers register entry 0
+    /// before entry 1 and `map[key] = ptr` overwrites.
+    fn sc_param_name(&self, name: &str) -> Option<(usize, &'static str)> {
+        self.sc.iter().enumerate().rev().find_map(|(entry, dsd)| {
+            let rest = name.strip_prefix(dsd.name.as_str())?;
+            PARAM_DIM_NAMES
+                .into_iter()
+                .find(|dim| *dim == rest)
+                .map(|dim| (entry, dim))
+        })
     }
 
     /// One loop's trip count: its numerator stage's dim divided by its denominator stage's
@@ -850,19 +924,21 @@ impl DesignSpaceConfig {
         (denominator != 0.0).then(|| LoopCount((numerator / denominator) as i32))
     }
 
-    /// Where one dim sits in a role's layout order (`dsc/designSpaceConfig.cpp:429-438`).
-    /// ⛔ IBM'S `-1` AND ITS `.at()` THROW COLLAPSE INTO ONE ABSENT: a dim outside the order and a
-    /// role outside `primaryDsInfo_` are both [`None`], and no reader distinguishes them.
+    /// Where one dim sits in a role's layout order (`dsc/designSpaceConfig.cpp:429-438`), as a
+    /// [`LayoutOrderPosition`] — which keeps IBM's in-band `-1` and its `.at()` throw APART, because
+    /// its readers do and sixteen of them treat that `-1` as a scale of `1` rather than as absence.
     pub fn dim_index_in_layout_order(
         &self,
         ds_type: DsTypes,
         dim: PrimaryDimTypes,
-    ) -> Option<usize> {
-        self.primary_ds_info
-            .get(&ds_type)?
-            .layout_dim_order
-            .iter()
-            .position(|d| *d == dim)
+    ) -> LayoutOrderPosition {
+        let Some(pdsi) = self.primary_ds_info.get(&ds_type) else {
+            return LayoutOrderPosition::RoleHasNoLayout;
+        };
+        match pdsi.layout_dim_order.iter().position(|d| *d == dim) {
+            Some(index) => LayoutOrderPosition::At(index),
+            None => LayoutOrderPosition::DimNotInOrder,
+        }
     }
 
     /// A role's layout dims as a set (`dsc/dsc2.cpp:4027-4031`).
@@ -1248,9 +1324,9 @@ mod unit_tests {
     }
 
     /// `dsc/dsc2.cpp:4007-4037` and `dsc/designSpaceConfig.cpp:429-438`: the layout order positions a
-    /// dim, and a role with no entry answers absent rather than throwing.
+    /// dim, and a role with no entry answers a DIFFERENT position from a dim the order does not hold.
     #[test]
-    fn layout_and_stick_dims_come_from_the_role_and_an_absent_role_is_none() {
+    fn layout_and_stick_dims_come_from_the_role_and_the_two_absences_stay_apart() {
         let mut dsc = DesignSpaceConfig::default();
         dsc.primary_ds_info.insert(
             DsTypes::Input,
@@ -1264,17 +1340,23 @@ mod unit_tests {
 
         assert_eq!(
             dsc.dim_index_in_layout_order(DsTypes::Input, PrimaryDimTypes::Ij),
-            Some(1)
+            LayoutOrderPosition::At(1)
         );
-        // IBM's -1: the dim is not in this layout.
+        // IBM's in-band `-1`: the dim is not in this layout, which sixteen readers turn into a scale
+        // of 1 and carry on with.
         assert_eq!(
             dsc.dim_index_in_layout_order(DsTypes::Input, PrimaryDimTypes::X),
-            None
+            LayoutOrderPosition::DimNotInOrder
         );
-        // IBM's `.at()` throw: the role has no entry.
+        // IBM's `.at()` throw: `primaryDsInfo_` has no entry for the role at all.
         assert_eq!(
             dsc.dim_index_in_layout_order(DsTypes::Kernel, PrimaryDimTypes::Ij),
-            None
+            LayoutOrderPosition::RoleHasNoLayout
+        );
+        // The point of the two variants: one absent would make these two equal.
+        assert_ne!(
+            dsc.dim_index_in_layout_order(DsTypes::Input, PrimaryDimTypes::X),
+            dsc.dim_index_in_layout_order(DsTypes::Kernel, PrimaryDimTypes::Ij)
         );
 
         assert_eq!(
@@ -1290,6 +1372,44 @@ mod unit_tests {
             Some(BTreeSet::from([PrimaryDimTypes::Out, PrimaryDimTypes::Ij]))
         );
         assert!(dsc.stick_dims(DsTypes::Output).is_none());
+    }
+
+    /// `dm/dm.cpp:971-983` and `dsc/designSpaceConfig.cpp:6930-6931`: an `sc_` entry's own `name_`
+    /// prefixes twenty more `paramNameToVal` keys, and that name is the only way into the vector.
+    #[test]
+    fn an_sc_entrys_own_name_prefixes_twenty_more_param_keys() {
+        let mut dsc = DesignSpaceConfig::default();
+        let mut entry = DataStructDims {
+            name: "sc_0".to_string(),
+            ..DataStructDims::default()
+        };
+        *entry.param_name_to_val_mut("ij").unwrap() = dims::DimSize::new(48.0);
+        dsc.sc.push(entry);
+
+        assert_eq!(dsc.param_name_to_val("sc_0ij"), dims::DimSize::new(48.0));
+        // The name alone is not a key, and a dim outside the twenty is not one either.
+        assert_eq!(dsc.param_name_to_val("sc_0"), None);
+        assert_eq!(dsc.param_name_to_val("sc_0x1"), None);
+        // The twelve-prefix table still answers for its own keys.
+        *dsc.param_name_to_val_mut("nij").unwrap() = dims::DimSize::new(9.0);
+        assert_eq!(dsc.param_name_to_val("nij"), dims::DimSize::new(9.0));
+    }
+
+    /// `dm/dm.cpp:980-983`: entry 0 is registered before entry 1 and `map[key] = ptr` overwrites, so
+    /// two entries sharing a `name_` leave the LATER one holding the twenty keys.
+    #[test]
+    fn the_last_sc_entry_sharing_a_name_holds_the_key() {
+        let mut dsc = DesignSpaceConfig::default();
+        for size in [3.0, 7.0] {
+            let mut entry = DataStructDims {
+                name: "sc_0".to_string(),
+                ..DataStructDims::default()
+            };
+            *entry.param_name_to_val_mut("mb").unwrap() = dims::DimSize::new(size);
+            dsc.sc.push(entry);
+        }
+
+        assert_eq!(dsc.param_name_to_val("sc_0mb"), dims::DimSize::new(7.0));
     }
 
     /// `dsc/designSpaceConfig.cpp:9451-9486`: each is a PRODUCT over the entries naming that dim, a
