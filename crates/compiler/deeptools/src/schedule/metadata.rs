@@ -16,15 +16,30 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 ///
 /// ⭐ THE FOUR FIELDS ARE `getTracker`'S ARGUMENT LIST, in its order
 /// (`sys-arch-spec/memtracker/mem_track_bundle.h:34`): `Ddc::allocAllMem` fills one the instant
-/// `checkAndAddDs` answers `DOESNT_FIT`, naming the tracker that refused (`ddc/ddcv1.cpp:344-369`).
+/// `checkAndAddDs` — or `checkAndAddDsAtAddr` on the PTXRF-scale path (`ddc/ddcv1.cpp:335`) —
+/// answers `DOESNT_FIT`, naming the tracker that refused (`ddc/ddcv1.cpp:344-369`).
 /// ⛔ NO METHODS AND NO INITIALIZERS TO PORT. `ddc/ddcv1.cpp:363` default-constructs the struct and
 /// assigns all four fields on the next four lines; the header declares no member function and no
 /// default, and no other file in the authority names the type. Its only reader is
 /// `failedAllocs.size() == 0` (`ddc/ddcv1.cpp:378`, `:436`).
+/// ⛔ ONE SLOT, NOT A LIST — DO NOT PORT `failedAllocs` AS A `Vec`. Its single `push_back` is
+/// immediately followed by `return false` (`:368-369`), `tryAlloc` runs exactly once (`:377`) and
+/// nothing clears the vector, so it holds AT MOST ONE element and `success` already implies
+/// `size() == 0`: the `&&` at `:378` and `:436` is redundant.
+/// ⛔ AND NOT THE CONVERSE. The other false exit (`:264` — an opaque op whose unroll is `0`, over
+/// `max_unroll_`, or not a power of two) records NO `FailedAlloc`, so a refused `allocAllMem`
+/// names a tracker key only when a tracker is what refused.
 /// ⭐ `Copy` because the fill site pushes it by value (`ddc/ddcv1.cpp:368`).
 ///
-/// Transposing the core and the corelet is `E0308`, not a silently wrong tracker:
-/// ```compile_fail
+/// Transposing two of the three `int` keys is `E0308` — four of them for the two literals below and
+/// nothing else — not a silently wrong tracker. The corelet/row pair is the one the C++ cannot
+/// catch here, because this fill site fixes both at `0` (`:205`, `:211`).
+/// ⛔ THE SECOND DOCTEST IS THE CONTROL, AND IT IS WHAT MAKES THE FIRST ONE EVIDENCE. Stable
+/// rustdoc accepts the `E0308` annotation WITHOUT CHECKING IT — annotating a deliberately wrong
+/// code still reports `ok` — so `compile_fail` alone would also pass on a misspelled path or a
+/// renamed variant. The control compiles the same literal untransposed through the same public
+/// path, so a failure above is attributable to the transposition.
+/// ```compile_fail,E0308
 /// use deeptools::schedule::metadata::FailedAlloc;
 /// use sys_arch_spec::arch_enums::SenComponent;
 /// use sys_arch_spec::{CoreId, CoreletId, RowId};
@@ -32,6 +47,23 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 ///     comp: SenComponent::Lx,
 ///     core: CoreletId(0),
 ///     corelet: CoreId(3),
+///     row: RowId(0),
+/// };
+/// let _ = FailedAlloc {
+///     comp: SenComponent::Lx,
+///     core: CoreId(3),
+///     corelet: RowId(0),
+///     row: CoreletId(0),
+/// };
+/// ```
+/// ```
+/// use deeptools::schedule::metadata::FailedAlloc;
+/// use sys_arch_spec::arch_enums::SenComponent;
+/// use sys_arch_spec::{CoreId, CoreletId, RowId};
+/// let _ = FailedAlloc {
+///     comp: SenComponent::Lx,
+///     core: CoreId(3),
+///     corelet: CoreletId(0),
 ///     row: RowId(0),
 /// };
 /// ```
