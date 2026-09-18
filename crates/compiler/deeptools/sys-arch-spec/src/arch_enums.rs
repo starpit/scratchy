@@ -2,6 +2,8 @@
 //!
 //! The register files, the LX segments, and the `{unit, storage}` pair every location is named by.
 
+use crate::RowId;
+
 /// 🛑🛑🛑 `MAX_VALUE` IS NOT THE MAXIMUM.
 ///
 /// ```text
@@ -1512,6 +1514,37 @@ impl SenComponent {
             | Self::L3luibr
             | Self::L3suibr
             | Self::L0Scale => return None,
+        })
+    }
+
+    /// The PT or L0LU row this component names — `EnumsConversion::senCompToRowId`
+    /// (`sys-arch-spec/arch_enums.cpp:296-320`), absent for the 59 components the map omits, which
+    /// is what `senCompToRowId.count(comp) ? .at(comp) : -1` asks (`dsc/dims.cpp:712-714`).
+    ///
+    /// ⭐ THE ROW IS THE DIGIT IN THE NAME AND THE CORELET SUFFIX IS NOT PART OF IT: `Ptrow3`,
+    /// `Ptrow3_0` and `Ptrow3_1` are all row 3, as are the three `L0lurow3` spellings.
+    /// ⛔ THE WILDCARD IS THE MAP'S OWN ANSWER, not a fallback: a component absent from it has no
+    /// row, and a new row component is not one until it is listed here.
+    #[must_use]
+    pub const fn row_id(self) -> Option<RowId> {
+        Some(match self {
+            Self::Ptrow0 | Self::Ptrow0_0 | Self::Ptrow0_1 => RowId(0),
+            Self::Ptrow1 | Self::Ptrow1_0 | Self::Ptrow1_1 => RowId(1),
+            Self::Ptrow2 | Self::Ptrow2_0 | Self::Ptrow2_1 => RowId(2),
+            Self::Ptrow3 | Self::Ptrow3_0 | Self::Ptrow3_1 => RowId(3),
+            Self::Ptrow4 | Self::Ptrow4_0 | Self::Ptrow4_1 => RowId(4),
+            Self::Ptrow5 | Self::Ptrow5_0 | Self::Ptrow5_1 => RowId(5),
+            Self::Ptrow6 | Self::Ptrow6_0 | Self::Ptrow6_1 => RowId(6),
+            Self::Ptrow7 | Self::Ptrow7_0 | Self::Ptrow7_1 => RowId(7),
+            Self::L0lurow0 | Self::L0lurow0_0 | Self::L0lurow0_1 => RowId(0),
+            Self::L0lurow1 | Self::L0lurow1_0 | Self::L0lurow1_1 => RowId(1),
+            Self::L0lurow2 | Self::L0lurow2_0 | Self::L0lurow2_1 => RowId(2),
+            Self::L0lurow3 | Self::L0lurow3_0 | Self::L0lurow3_1 => RowId(3),
+            Self::L0lurow4 | Self::L0lurow4_0 | Self::L0lurow4_1 => RowId(4),
+            Self::L0lurow5 | Self::L0lurow5_0 | Self::L0lurow5_1 => RowId(5),
+            Self::L0lurow6 | Self::L0lurow6_0 | Self::L0lurow6_1 => RowId(6),
+            Self::L0lurow7 | Self::L0lurow7_0 | Self::L0lurow7_1 => RowId(7),
+            _ => return None,
         })
     }
 }
