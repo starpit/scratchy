@@ -32,7 +32,7 @@ pub enum PrimaryDimTypes {
     Ki = 9,
     Kj = 10,
     X1 = 11,
-    /// The authority's `PrimaryDimTypesCount` (`dsc/dims.h:43`): no dimension. It is a live map key
+    /// The authority's `PrimaryDimTypesCount` (`dsc/dims.h:47`): no dimension. It is a live map key
     /// as well as a field value — `ddc/ddcv1.cpp:1803` skips it while iterating a keyed map — so it
     /// stays a variant, and stays last, rather than becoming an absent `Option`.
     #[default]
@@ -1711,61 +1711,118 @@ mod unit_tests {
         }
     }
 
-    /// Unpadded, unit stride and dilation, no window dim — and equality that sees all eight fields,
-    /// so swapping front for back is a difference.
+    /// Unpadded, unit stride and dilation, no window dim — and `operator==` (`dsc/dims.cpp:74-80`)
+    /// comparing all eight fields, one perturbation at a time: swapping front for back passes even
+    /// for an equality blind to `padBack_`, so each field is moved on its own here.
     #[test]
     fn dim_padding_sizes_defaults_to_unit_stride_and_compares_every_field() {
         let base = DimPaddingSizes::default();
         assert_eq!(
             (
                 base.pad_front,
+                base.pad_back,
                 base.unneeded_pad,
+                base.unneeded_pad_front,
+                base.unneeded_pad_back,
                 base.stride,
-                base.dilation
+                base.dilation,
             ),
-            (0, 0, 1, 1)
+            (0, 0, 0, 0, 0, 1, 1)
         );
         assert_eq!(base.window_dim, PrimaryDimTypes::Undefined);
+        assert_eq!(base, DimPaddingSizes::default());
 
-        let front = DimPaddingSizes {
-            pad_front: 1,
-            ..base
-        };
-        let back = DimPaddingSizes {
-            pad_back: 1,
-            ..base
-        };
-        assert_ne!(front, back);
-        assert_eq!(
-            front,
-            DimPaddingSizes {
-                pad_front: 1,
-                ..base
-            }
-        );
-        assert_ne!(
-            base,
-            DimPaddingSizes {
-                window_dim: PrimaryDimTypes::Ki,
-                ..base
-            }
-        );
+        let perturbed = [
+            (
+                "padFront_",
+                DimPaddingSizes {
+                    pad_front: 7,
+                    ..base
+                },
+            ),
+            (
+                "padBack_",
+                DimPaddingSizes {
+                    pad_back: 7,
+                    ..base
+                },
+            ),
+            (
+                "unneededPad_",
+                DimPaddingSizes {
+                    unneeded_pad: 7,
+                    ..base
+                },
+            ),
+            (
+                "unneededPadFront_",
+                DimPaddingSizes {
+                    unneeded_pad_front: 7,
+                    ..base
+                },
+            ),
+            (
+                "unneededPadBack_",
+                DimPaddingSizes {
+                    unneeded_pad_back: 7,
+                    ..base
+                },
+            ),
+            ("stride_", DimPaddingSizes { stride: 7, ..base }),
+            (
+                "dilation_",
+                DimPaddingSizes {
+                    dilation: 7,
+                    ..base
+                },
+            ),
+            (
+                "windowDim_",
+                DimPaddingSizes {
+                    window_dim: PrimaryDimTypes::Ki,
+                    ..base
+                },
+            ),
+        ];
+        for (field, other) in perturbed {
+            assert_ne!(base, other, "{field} is not compared");
+        }
     }
 
-    /// Both symbolic values start unfilled, and equality sees both.
+    /// Both symbolic values start unfilled, and `operator==` (`dsc/dims.h:152-154`) compares both —
+    /// one perturbation at a time, because swapping the two at once passes even for an equality
+    /// that reads only `maxSize_`.
     #[test]
     fn symbolic_dim_info_starts_unfilled_and_compares_both_fields() {
         let unset = SymbolicDimInfo::default();
         assert_eq!((unset.max_size, unset.granularity), (-1, -1));
-        assert_ne!(
+
+        let filled = SymbolicDimInfo {
+            max_size: 64,
+            granularity: 16,
+        };
+        assert_eq!(
+            filled,
             SymbolicDimInfo {
                 max_size: 64,
                 granularity: 16
-            },
-            SymbolicDimInfo {
-                max_size: 16,
-                granularity: 64
             }
+        );
+        assert_ne!(
+            filled,
+            SymbolicDimInfo {
+                granularity: 16,
+                ..unset
+            },
+            "maxSize_ is not compared"
+        );
+        assert_ne!(
+            filled,
+            SymbolicDimInfo {
+                max_size: 64,
+                ..unset
+            },
+            "granularity_ is not compared"
         );
     }
 
@@ -2384,5 +2441,66 @@ mod unit_tests {
             indivisible.symbolic_dim_info.contains_key(&D::Out),
             "nothing was written"
         );
+    }
+
+    /// `operator==` (`dsc/dims.cpp:832-835`) compares dim and kind, and `std::hash` keys an
+    /// `unordered_set` on the pair (`ddc/ddc_transformation_util.cpp:1147`), so a hash set must
+    /// separate pairs differing in either half and merge the two routes to the same pair.
+    #[test]
+    fn a_dim_and_kind_pair_compares_and_hashes_on_both_halves() {
+        let mb_unpadded = PrimaryDimAndKind::new(D::Mb, MetaDimKind::Unpadded);
+        assert_ne!(
+            mb_unpadded,
+            PrimaryDimAndKind::new(D::Mb, MetaDimKind::Padded),
+            "kind_ is not compared"
+        );
+        assert_ne!(
+            mb_unpadded,
+            PrimaryDimAndKind::new(D::Y, MetaDimKind::Unpadded),
+            "dim_ is not compared"
+        );
+
+        let mut set = std::collections::HashSet::new();
+        for dim in EVERY_DIM {
+            for kind in EVERY_KIND {
+                assert!(
+                    set.insert(PrimaryDimAndKind::new(dim, kind)),
+                    "{dim:?}/{kind:?} shares a slot"
+                );
+            }
+        }
+        assert_eq!(set.len(), EVERY_DIM.len() * EVERY_KIND.len());
+        assert!(
+            !set.insert(PrimaryDimAndKind::from(D::Mb)),
+            "the bare-dim route must land on the pair already there"
+        );
+        assert!(set.contains(&mb_unpadded));
+    }
+
+    /// The header line is streamed even for a form carrying no dims, level 0 — IBM's default
+    /// argument (`dsc/dims.h:116`) — indents by nothing, and the sentinel is a legal key that
+    /// `primaryDimToString` spells.
+    #[test]
+    fn an_empty_padding_form_still_prints_its_header() {
+        let mut out = String::new();
+        PaddingFormType::default().print(&mut out, 0);
+        assert_eq!(out, "\nPadding= ");
+
+        let mut out = String::new();
+        PaddingFormType::new(D::Undefined, PadType::PaddedFullSpan).print(&mut out, 1);
+        assert_eq!(out, "\n  Padding=  (undefined: padded_fullspan)");
+    }
+
+    /// `getPaddingAsStr` (`dsc/dims.cpp:815-817`) spells whatever `getPadding` returned, including
+    /// the `NOPAD` a dim with no entry falls back to while another dim does carry one.
+    #[test]
+    fn every_padding_form_is_spelled_through_the_accessor() {
+        for pad in PadType::ALL {
+            let form = PaddingFormType::new(D::Ki, pad);
+            assert_eq!(form.padding_as_str(D::Ki), pad.name());
+            assert_eq!(form.padding(D::Kj), PadType::NoPad);
+            assert_eq!(form.padding_as_str(D::Kj), "nopad");
+            assert!(form.has_padding_info());
+        }
     }
 }
