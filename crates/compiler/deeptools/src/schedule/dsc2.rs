@@ -1,6 +1,6 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
-use crate::schedule::dims::PrimaryDimTypes;
+use crate::schedule::dims::{DataStructDims, PrimaryDimTypes};
 
 /// A group tag register's group id — `gtrIdsUsed_` holds the set of them (`dsc/dsc2.h:35`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -472,6 +472,67 @@ mod unit_tests {
         assert_eq!(layout, [layout[0], layout[1]]);
         assert_ne!(layout, [layout[1], layout[0]]);
     }
+
+    /// `dsc/dsc2.h:43` against the four sites that write `el_.name_ = ss_.name_ + "el"`
+    /// (`ddc/ddcv1.cpp:1236-1237`, `ddc/ddc_transformation.cpp:1018-1019`,
+    /// `ddc/ddc_transformation_util.cpp:121-122`, `:131-132`) and against `fillLoopLatchSdsc`, which
+    /// names both halves `"core"` (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`).
+    #[test]
+    fn a_data_stages_name_is_its_steady_states_and_the_epilogue_carries_its_own() {
+        // `dsc2::DataStage newDstg;` (`dsc/dsc2.cpp:3619`) and `emplace(index, dsc2::DataStage())`
+        // (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:731`): both halves start empty and unnamed.
+        let mut stage = DataStage::default();
+        assert_eq!(stage.name(), "");
+        assert!(stage.ss.empty() && stage.el.empty());
+
+        // `ddc/ddc_transformation_util.cpp:117-124`: stage 7 is named "7", its epilogue "7el".
+        stage.ss.name = "7".to_string();
+        stage.el.name = format!("{}el", stage.ss.name);
+        assert_eq!(stage.name(), "7");
+        assert_eq!(stage.el.name, "7el");
+
+        // `ddc/ddcv1.cpp:1236-1237`: the epilogue starts as a copy of the steady state, and stays
+        // equal to it until a relevant dim shrinks — `DataStructDims`' equality omits `name_`.
+        stage.ss.out = crate::schedule::dims::DimSize::new(64.0);
+        stage.el = stage.ss.clone();
+        stage.el.name = format!("{}el", stage.ss.name);
+        assert_eq!(stage.el, stage.ss);
+        assert_ne!(stage.el.name, stage.ss.name);
+        stage.el.out = crate::schedule::dims::DimSize::new(16.0);
+        assert_ne!(stage.el, stage.ss);
+
+        // The suffix is not an invariant: `fillLoopLatchSdsc` names both halves "core", and
+        // `getSizeDataStageForNode` checks only the steady state's (`dsc/dsc2.cpp:3638-3639`).
+        let core = DataStage {
+            ss: DataStructDims {
+                name: "core".to_string(),
+                ..DataStructDims::default()
+            },
+            el: DataStructDims {
+                name: "core".to_string(),
+                ..DataStructDims::default()
+            },
+        };
+        assert_eq!(core.name(), "core");
+        assert_eq!(core.el.name, core.name());
+    }
+
+    /// `dsc/dsc2.h:1088`: the declared order, the field's `NOT_PROCESSED` initialiser (`:1093`), and
+    /// the two states the queue actually writes (`ddc/ddc.h:468-469`, `:485-486`).
+    #[test]
+    fn the_prop_state_discriminants_are_the_authoritys_and_overridden_is_never_entered() {
+        let declared = [
+            PropStateType::NotProcessed,
+            PropStateType::RolledBack,
+            PropStateType::Overridden,
+            PropStateType::Complete,
+        ];
+        for (i, state) in declared.into_iter().enumerate() {
+            assert_eq!(state as usize, i, "{state:?} moved");
+        }
+        assert_eq!(PropStateType::default(), PropStateType::NotProcessed);
+        assert_ne!(PropStateType::Complete, PropStateType::RolledBack);
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -513,3 +574,71 @@ mod unit_tests {
 // crustify:todo: e013_ScheduleNode.sizesNoGaps_
 
 // crustify:todo: e013_ScheduleNode.sizesWithGaps_
+
+/// Replaces: e014_DataStage
+///
+/// `dsc/dsc2.h:39-44`. One data stage's two halves — the steady-state dims and the epilogue dims of
+/// the same data structure. `DesignSpaceConfig::dataStageParam_` keys them by id
+/// (`dsc/designSpaceConfig.h:105`); id 0 is the core stage, whose name `getSizeDataStageForNode`
+/// `DT_CHECK`s to be `"core"` (`dsc/dsc2.cpp:3638-3639`).
+///
+/// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and the epilogue carries a different
+/// one. Four ddc sites write `el_.name_ = ss_.name_ + "el"` (`ddc/ddcv1.cpp:1236-1237`,
+/// `ddc/ddc_transformation.cpp:1018-1019`, `ddc/ddc_transformation_util.cpp:121-122`, `:131-132`)
+/// while `fillLoopLatchSdsc` writes `"core"` into both halves
+/// (`dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1074-1075`), so the suffix is a ddc convention
+/// and not an invariant of this type.
+///
+/// ⛔ NO `PartialEq`: IBM declares none (`dsc/dsc2.h:40-44` has no `operator==` and no `tie()`), and
+/// a derive would compare the two halves through `DataStructDims`' own equality, which deliberately
+/// omits `name_` (`dsc/dims.h:221-228`) — so two stages with different names would compare equal.
+#[derive(Clone, Debug, Default)]
+pub struct DataStage {
+    /// Field: e014_DataStage.ss_
+    ///
+    /// The steady state: the dims of every trip but the last. It is the half readers reach for by
+    /// default (`ddc/ddc_fold.cpp:2113`, `ddc/ddcv1.cpp:1924`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4848`).
+    pub ss: DataStructDims,
+    /// Field: e014_DataStage.el_
+    ///
+    /// The epilogue: the dims of the last, short trip. `calculateEpilogues` seeds it from `ss_` and
+    /// then shrinks only the dims the metadata calls relevant (`ddc/ddcv1.cpp:1230-1327`), so an
+    /// untouched epilogue equals the steady state rather than being empty.
+    pub el: DataStructDims,
+}
+
+impl DataStage {
+    /// `DataStage::name` (`dsc/dsc2.h:43`) — what `attachToPrefilledSchedule` tests against `"core"`
+    /// and `"chunk"` (`ddc/ddcv1.cpp:2283-2285`), what the DDL conversion tests for emptiness
+    /// (`ddc/ddl/ddl_conversion.cpp:2974`, `:2998`), and what a loop label is built from
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:953-954`).
+    pub fn name(&self) -> &str {
+        &self.ss.name
+    }
+}
+
+// crustify:todo: e015_BlockNode
+
+// crustify:todo: e015_BlockNode.next_
+
+// crustify:todo: e016_CoordPropInfoType
+
+/// Replaces: CoordPropInfoType::PropStateType
+///
+/// `dsc/dsc2.h:1088`. How far one coordinate-propagation work item got. The queue pushes
+/// `NOT_PROCESSED` (`ddc/ddc.h:424-427`, `:438-441`), `getCurrItem` marks the item it hands out
+/// `COMPLETE` (`:468-469`) and `rollbackToPos` marks `ROLLED_BACK` (`:485-486`).
+///
+/// ⛔ `OVERRIDDEN` IS A STATE THE SCHEDULER NEVER ENTERS: `dsc/dsc2.h:1088` is its only occurrence
+/// tree-wide, with no writer and no reader. It is ported because it holds the discriminant
+/// `COMPLETE` sits behind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PropStateType {
+    /// The field's own initialiser (`dsc/dsc2.h:1093`) and what both push sites state.
+    #[default]
+    NotProcessed = 0,
+    RolledBack = 1,
+    Overridden = 2,
+    Complete = 3,
+}
