@@ -1072,6 +1072,34 @@ mod unit_tests {
         assert_eq!(LoopDistributionCat::CoreletSlice.name(), "Corelet_slice");
     }
 
+    /// `dsc/dsc2.cpp:6612-6627` and `:6545-6561` against `dsc/dims.h:79-81`: the shape of the
+    /// synthetic `CORELET_SLICE` chain entry that `e021_LoopDistributionInfo` has to be able to hold.
+    #[test]
+    fn the_corelet_slice_chain_entry_carries_its_split_dim_unpadded() {
+        use crate::schedule::dims::MetaDimKind;
+
+        // ⛔ THE WRITER NEVER SPELLS A KIND — `dsc/dsc2.cpp:6620-6622` pushes a bare
+        // `PrimaryDimTypes` into a `PrimaryDimAndKind` slot — so the entry's kind is whatever IBM's
+        // non-`explicit` constructor supplies, and a port that had to name one at the callsite would
+        // be guessing.
+        let split_dim = PrimaryDimTypes::Mb;
+        assert_eq!(
+            PrimaryDimAndKind::from(split_dim),
+            PrimaryDimAndKind::new(split_dim, MetaDimKind::Unpadded)
+        );
+
+        // ⛔ AND `Unpadded` IS LOAD-BEARING: `isLoopDimRelated` matches on the dim alone
+        // (`dsc/dsc2.cpp:6550-6551`) EXCEPT for a `WindowDim` entry, which ALSO matches a different
+        // dim through the padding window of `loop->denId_` (`:6554-6559`). A synthetic entry minted
+        // `WindowDim` would be collected for dims it has nothing to do with, and
+        // `ddc/ddc_fold.cpp:2543-2557` searches exactly that collection for it — erroring out when
+        // it is missing.
+        assert_ne!(
+            PrimaryDimAndKind::from(split_dim),
+            PrimaryDimAndKind::new(split_dim, MetaDimKind::WindowDim)
+        );
+    }
+
     /// `dsc/dsc2.cpp:4364-4383` over the set at `dsc/dscdefn.cpp:142-144`.
     #[test]
     fn the_memory_questions_test_the_storage_half_and_take_the_first_non_memory_dst() {
@@ -2022,10 +2050,16 @@ impl LoopNode {
 /// conditional vocabulary, which is off this campaign's path, and `DEFAULT` is the field's own
 /// initialiser (`dsc/dsc2.h:661`) — no comparison chosen yet.
 ///
-/// ⛔ THE DISCRIMINANTS ARE THE AUTHORITY'S: `condOpToString` is a `std::map` keyed by this enum
-/// (`dsc/dscdefn.h:110`), so the declaration order is its iteration order. Neither map is iterated
-/// for output — every use is `.at()` or `.find()` (`dsc/dsc2.cpp:462`, `:1442`,
-/// `ddc/ddl/ddl_conversion.cpp:254`, `:3273`) — so only the mapping is ported.
+/// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE, so `ALL`'s order and the E0080 guard below are a SHAPE
+/// guard and not a wire guard: `condOpToString` is a `std::map` keyed by this enum
+/// (`dsc/dscdefn.h:110`), but neither map is ever iterated — every use is `.at()` or `.find()`
+/// (`dsc/dsc2.cpp:462`, `:1442`, `ddc/ddl/ddl_conversion.cpp:254`, `:3273`) — and nothing orders
+/// operators relationally: neither `LccrCond` (`dsc/dscdefn.h:114-119`) nor `PcfgLccrCond`
+/// (`dsc/pcfg.h:39-44`) declares a comparison operator at all.
+///
+/// ⛔ AND THE DERIVED `Default` IS `LoopCond::condOp_`'s INITIALISER, NOT AN ENUM-WIDE ONE: both of
+/// those other carriers of a `CondOp` leave the field UNINITIALISED (`dsc/dscdefn.h:117`,
+/// `dsc/pcfg.h:42`), so a port of either must not read its default out of this enum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CondOp {
     /// `==`
@@ -2051,9 +2085,9 @@ pub enum CondOp {
     Default = 10,
 }
 
-/// ⛔ E0080 IF AN OPERATOR IS EVER INSERTED, DROPPED, REORDERED OR LEFT OUT OF `ALL`: the
-/// discriminants are what `condOpToString`'s `std::map` orders by, and `ALL` is positional against
-/// them.
+/// ⛔ E0080 IF AN OPERATOR IS EVER INSERTED, DROPPED, REORDERED OR LEFT OUT OF `ALL`: `ALL` is
+/// positional against the discriminants, so this is what keeps it a faithful copy of
+/// `dsc/dscdefn.h:95-107` rather than a list that merely happens to be the right length.
 const _: () = {
     let mut i = 0;
     while i < CondOp::ALL.len() {
@@ -2150,6 +2184,16 @@ impl CondOp {
 /// looks the value expression up in `stringToCondValType` and, on a miss, parses it as an integer
 /// expression instead (`ddc/ddl/ddl_conversion.cpp:266-274`).
 ///
+/// ⛔ ON A DROPPED DIM `FIRST`/`LAST` NEVER REACH A `LoopCond` AT ALL: the dim is treated as a loop
+/// of size one, both forms collapse to `condVal = 0`, and the condition is resolved to a bool against
+/// 0 right there (`ddc/ddl/ddl_conversion.cpp:275-294`). So `LAST = upperBound - 1` is the real-loop
+/// rule; where the loop does not exist, first and last are the same iteration.
+///
+/// ⛔ AND `condValInt_` IS EXPORTED UNCONDITIONALLY (`dsc/dsc2.cpp:468`) then imported field by field
+/// into a default-constructed `LoopCond` (`:1438-1449`), so the `-1` an unparsed `FIRST`/`LAST`
+/// carries (`ddc/ddl/ddl_conversion.cpp:267`) has to round-trip. A Rust `CondVal` that fused the form
+/// and the integer into one enum would still have to hold that `-1` to reproduce the JSON.
+///
 /// ⛔ THE DISCRIMINANTS ARE NOT OBSERVABLE HERE, unlike [`NodeType`]'s: both maps are
 /// `std::unordered_map` (`dsc/dsc2.h:656-657`), neither is iterated, and the JSON round trip
 /// carries the spelling rather than the value (`dsc/dsc2.cpp:464-466`, `:1444-1447`).
@@ -2227,24 +2271,62 @@ impl CondValType {
 /// boundary, which is what decides whether that loop's fold is distributed over the element
 /// arrangement.
 ///
-/// ⛔ IT IS A SET MEMBERSHIP TEST, NOT A PROPERTY OF THE LOOP. `getEnclosingLoopsAndRelatedDims`
-/// tags a chain entry `BELOW_CHUNK` when the loop is in the caller's `loopsBelowChunkBoundary` set
-/// and `ABOVE_CHUNK` otherwise (`dsc/dsc2.cpp:6587`, the lambda at `:6593-6605` and its ternary at
-/// `:6601-6603`), and `ddc/ddc_fold.cpp:3512-3517` writes the same ternary again. The same loop can
-/// therefore be tagged either way in two different chains: the tag belongs to the chain, not the
-/// loop.
+/// ⛔ THE TAG IS PER-WRITER, AND ONLY TWO OF THE EIGHT WRITERS LOOK ANYTHING UP. Those two are
+/// `getEnclosingLoopsAndRelatedDims`'s lambda, which takes `BELOW_CHUNK` when the loop is in the
+/// caller's `loopsBelowChunkBoundary` and `ABOVE_CHUNK` otherwise (`dsc/dsc2.cpp:6598-6604`), and
+/// `ddc/ddc_fold.cpp:3513-3517`, which writes that ternary again. FIVE state a constant instead:
+/// `ddc/ddc_fold.cpp:3549-3551` tags every loop it re-distributes a transfer size over `BELOW_CHUNK`
+/// with NO membership test, and the L3 scheduler's four sites all write `ABOVE_CHUNK`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7316-7318`, `:7325-7327`, `:7586-7588`,
+/// `:7608-7610`). The eighth is `CORELET_SLICE` below, whose own set test (`dsc/dsc2.cpp:6616-6617`)
+/// gates whether the entry EXISTS, not which tag it gets.
 ///
-/// ⛔ `CORELET_SLICE` IS A SYNTHETIC CHAIN ENTRY, NOT A REAL LOOP'S TAG. Its one writer inserts an
-/// extra entry for the corelet-split dim at the first loop at or above the chunk boundary
-/// (`dsc/dsc2.cpp:6616-6623`), and every reader branches on it to take a different path from the one
-/// a real loop gets (`dsc/dsc2.cpp:6029`, `:6063`, `:6067`, `:6340`, `ddc/ddc_fold.cpp:2547`,
-/// `:3222`).
+/// ⛔ SO A PORT MUST NOT DERIVE THIS FIELD FROM THE SET — that would be right for two writers and
+/// wrong for six. Nor is the set chain-relative: `loopsBelowChunkBoundary` is one `Ddc` member
+/// (`ddc/ddc.h:108`) cleared and refilled ONCE PER DSC from the DFS LOOP subtree of the block named
+/// `"lx_below_schedule"` (`ddc/ddcv1.cpp:3683-3689`, block found at `:2343-2345`, called at `:3783`
+/// ahead of both consumers at `:3786-3787`), and all five DDC chain builders pass that same member
+/// (`ddc/ddc_fold.cpp:539-540`, `:2255-2256`, `:2476-2477`, `:2482-2483`, `:3122-3123`). Under those
+/// two writers the tag is a stable property of where the loop sits in the tree.
+///
+/// ⛔ AND `BELOW_CHUNK` IS UNREACHABLE ON THE L3 HALF — stage 2a of this campaign. That half's own
+/// `loopsBelowChunkBoundary` is a local declared EMPTY with its filler commented out and the comment
+/// "there are no loops below chunk boundary in ALxS"
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5765-5781`), and its four writers name `ABOVE_CHUNK`
+/// unconditionally, so every L3 chain entry means `coreletId = -1` at the reader below.
+///
+/// ⛔ WHAT THE TAG SELECTS IS A CORELET ID, and that reader is why the field exists: `ABOVE_CHUNK`
+/// → -1, `BELOW_CHUNK` → `targetCoreletId`, `CORELET_SLICE` → 0, and a fourth value is
+/// `DT_ERROR("Unsupported loop distribution category for loop " + loopNode->name_)`
+/// (`dsc/dsc2.cpp:6050-6061`). ⭐ THIS CLOSED ENUM IS WHAT MAKES THAT `else` ARM UNWRITABLE — the
+/// crate's no-runtime-refusal rule is discharged by the type, not by a check. The remaining readers
+/// branch `CORELET_SLICE` against the rest (`:6028-6031`, `:6062-6065`, `:6067`, `:6093-6099`,
+/// `:6340`, `ddc/ddc_fold.cpp:2546-2547`, `:3221-3228`).
+///
+/// ⛔ `CORELET_SLICE` IS A SYNTHETIC CHAIN ENTRY, NOT A REAL LOOP'S TAG — but it carries a real
+/// loop's pointer. Its one writer inserts it while climbing from the node's owner loop, at the first
+/// loop NOT below the chunk boundary and BEFORE that loop's own per-dim entries
+/// (`dsc/dsc2.cpp:6612-6627`); the chain runs innermost-first, so the entry sits inside the innermost
+/// chunk loop, which is what IBM's own comment says (`dsc/dsc2.h:1215-1217`). Its dim is the corelet
+/// split dim and is NEVER the `PrimaryDimTypesCount` seed of `:6607`: both callers that pass
+/// `includeCoreletSplit` require a non-empty `coreletSplit_` on data stage 0 first
+/// (`ddc/ddc_fold.cpp:2478-2483`, `:3119-3123` over `ddc/ddcv1.cpp:3673-3680`, whose
+/// `metadata.core_dstgid` is the same constant 0 as `dataStageCoreIdx` — `ddc/ddc_metadata.h:211`,
+/// `dsc/dsc2.cpp:18`). Its kind is `Unpadded`, supplied by IBM's non-`explicit` constructor rather
+/// than named at the callsite (`dsc/dims.h:79-81`), and that matters: a `WindowDim` entry would also
+/// match a DIFFERENT dim through the padding window of `loop->denId_` (`dsc/dsc2.cpp:6554-6559`).
+/// Its reader takes `loopNode->denId_` for BOTH halves of the size data stage, clears
+/// `coreletSplit_` on the numerator copy, counts `numCoreletsUsed_DSC2_` iterations and files the
+/// result under `nullptr` (`dsc/dsc2.cpp:6093-6099`, `ddc/ddc_fold.cpp:3223-3228`).
 ///
 /// ⛔ `UNKNOWN` IS UNREACHABLE BY CONSTRUCTION, so the `cat = UNKNOWN` initialiser at
-/// `dsc/dsc2.h:1144` is dead: `LoopDistributionInfo`'s only constructor takes the category
-/// (`:1139-1141`) and, being user-declared, suppresses the implicit default constructor — and
-/// `dsc/dsc2.h:1144` is the sole occurrence of the name `UNKNOWN` tree-wide. That is why this enum
-/// derives no `Default` even though the authority writes one, exactly as [`Size`] does not:
+/// `dsc/dsc2.h:1144` is dead: the only constructor takes the category (`:1139-1141`) and, being
+/// user-declared, suppresses the implicit default constructor; none of the eight writers names
+/// `UNKNOWN`; and `cat` is never assigned after construction — the only reads are
+/// `dsc/dsc2.cpp:6027`, `ddc/ddc_fold.cpp:2546` and the structured binding at `:3219`. (⛔ NOT
+/// because the name is rare: `UNKNOWN` occurs 54 times across 27 files tree-wide, twice in this enum
+/// alone.) That is why this enum derives no `Default` even though the authority writes one, exactly
+/// as [`Size`] does not:
 ///
 /// ```compile_fail
 /// use deeptools::schedule::dsc2::LoopDistributionCat;
@@ -2252,7 +2334,9 @@ impl CondValType {
 /// ```
 ///
 /// It is still ported as an enumerator, because it holds the discriminant the other three sit
-/// behind.
+/// behind. ⭐ AND NO E0080 ORDER GUARD BELOW, unlike [`CondOp`]'s: nothing serializes, parses,
+/// iterates or relationally compares a category, so the only load-bearing discriminant is
+/// `UNKNOWN`'s zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoopDistributionCat {
     Unknown = 0,
