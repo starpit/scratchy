@@ -1227,6 +1227,93 @@ mod unit_tests {
         assert!(node.unit_time_transfer_chunk_size.is_empty());
     }
 
+    /// `util/utils.h:105-106` reaching [`TransferPadInfo`]'s do-nothing copy constructor
+    /// (`dsc/dsc2.h:761-764`) — the three `DT_CHECK_MSG(newNode->paddingInfo_.isEmpty())` the
+    /// authority puts after its two `TransferNode::clone()` calls (`dsc/dsc2.cpp:5445`, `:5692`,
+    /// `:5792`), as a property of the type rather than a check at runtime.
+    #[test]
+    fn cloning_a_transfer_node_drops_its_padding_info_and_copies_everything_else() {
+        let mut node = TransferNode {
+            replication_factor: 8,
+            rotate_num_elements: 16,
+            dst_vias: vec![DstVia::default(), DstVia::default()],
+            repetition: TransferRepetition {
+                src: Some(Repetition(2)),
+                dsts: vec![Repetition(3), Repetition(4)],
+            },
+            ..TransferNode::default()
+        };
+        node.transfer_size.insert(PrimaryDimTypes::X, DimSize(64));
+        assert_eq!(
+            node.padding_info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                [FoldDimSize(2), FoldDimSize(3)],
+                [PadSize(-40), PadSize(-10)],
+                [PadSize(25), PadSize(0)],
+            ),
+            Some(())
+        );
+        assert!(!node.padding_info.is_empty());
+
+        let clone = node.clone();
+
+        // ⛔ THE ONE FIELD THE COPY CONSTRUCTOR DROPS, and the source keeps its own.
+        assert!(clone.padding_info.is_empty());
+        assert!(!node.padding_info.is_empty());
+
+        // Every other member is a plain member-wise copy.
+        assert_eq!(clone.replication_factor, 8);
+        assert_eq!(clone.rotate_num_elements, 16);
+        assert_eq!(clone.dst_vias, node.dst_vias);
+        assert_eq!(clone.repetition, node.repetition);
+        assert_eq!(clone.transfer_size, node.transfer_size);
+    }
+
+    /// `dsc/dsc2.h:826-829` and its only two writers, which append one `dstReps_` entry per
+    /// `dstVias_` entry in the same loop iteration (`ddc/ddl/ddl_conversion.cpp:1171-1189`).
+    #[test]
+    fn the_transfer_repetition_starts_absent_and_is_indexed_like_the_destinations() {
+        // ⛔ ABSENT, NOT `Repetition(1)`: `int srcRep_;` carries no member initialiser and
+        // `TransferNode()` does not name `repetition_`, so the authority's default-constructed node
+        // reads uninitialised storage here (`dsc/dsc2.h:827`, `:815`) — unlike `dstReps_`, whose
+        // `std::vector` default IS empty.
+        assert_eq!(
+            TransferNode::default().repetition,
+            TransferRepetition::default()
+        );
+        assert_eq!(TransferRepetition::default().src, None);
+        assert!(TransferRepetition::default().dsts.is_empty());
+
+        let landing_in = |storage| DstVia {
+            loc: DataLocation {
+                unit: SenComponent::Lxlu,
+                storage,
+            },
+            ..DstVia::default()
+        };
+        let node = TransferNode {
+            dst_vias: vec![
+                landing_in(SenComponent::Lx),
+                landing_in(SenComponent::Latch),
+            ],
+            repetition: TransferRepetition {
+                src: Some(Repetition(1)),
+                dsts: vec![Repetition(1), Repetition(4)],
+            },
+            ..TransferNode::default()
+        };
+
+        // ⭐ ONE POSITION SPEAKS FOR EVERY DESTINATION VECTOR: `non_memory_result_index` is an index
+        // into `dstVias_`, and `hoistTransfersUpForReuse` reads the vector emplaced beside it with
+        // that very index (`ddc/ddc_transformation.cpp:1570-1575`).
+        let fifo = node
+            .non_memory_result_index()
+            .expect("the LATCH destination");
+        assert_eq!(node.repetition.dsts.len(), node.dst_vias.len());
+        assert_eq!(node.repetition.dsts[fifo], Repetition(4));
+    }
+
     /// `dsc/dsc2.h:932-941` and `:950-954` — every default member initializer of a compute node,
     /// including the nested `InstrAttribute`'s eight slices and all-on compute mask.
     #[test]
@@ -2889,19 +2976,19 @@ const _: () = {
 /// and the units it routes through on the way (`dsc/dsc2.h:816-819`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DstVia {
-    /// Field: e023_TransferNode.loc_
+    /// Field: e034_TransferNode.loc_
     ///
     /// Where this destination writes (`dsc/dsc2.h:817`). Its `storage` is what decides whether the
     /// destination is a memory at all (`dsc/dsc2.cpp:4372-4383`).
     pub loc: DataLocation,
-    /// Field: e023_TransferNode.locIndirect_
+    /// Field: e034_TransferNode.locIndirect_
     ///
     /// The location holding the address when this destination is indirect, or
     /// [`DataLocation::UNSET`] when it is not —
     /// [`is_dst_indirect_at_index`](TransferNode::is_dst_indirect_at_index) tests the `unit` half
     /// against `NO_COMPONENT` (`dsc/dsc2.h:879-883`).
     pub loc_indirect: DataLocation,
-    /// Field: e023_TransferNode.via_
+    /// Field: e034_TransferNode.via_
     ///
     /// ⛔ ORDERED SOURCE TO DESTINATION, and bridge 1 walks it as a route: at the component it is
     /// lowering for, `via_[i + 1]` is the next hop and `via_[i - 1]` the previous
@@ -2947,7 +3034,7 @@ impl Default for DstVia {
 /// the load path matches `srcSizeIdx_` and the store path `dstSizeIdx_` (`:338-348`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SizeAndIndex {
-    /// Field: e023_TransferNode.sizeDim_
+    /// Field: e034_TransferNode.sizeDim_
     ///
     /// The dim and how much of it this chunk covers (`dsc/dsc2.h:821`).
     ///
@@ -2959,14 +3046,14 @@ pub struct SizeAndIndex {
     /// (`:1638-1640`), and then ERASES the source entries from `unitTimeTransferChunkSize_`
     /// (`:1642-1643`) — so nothing in the chunk-size vector is ever left holding the 1.
     pub size_dim: Size,
-    /// Field: e023_TransferNode.srcSizeIdx_
+    /// Field: e034_TransferNode.srcSizeIdx_
     ///
     /// This dim's position in the SOURCE's view sizes, absent as the authority's `-1`
     /// (`dsc/dsc2.h:822`). Bridge 1's load path searches for the entry whose index equals the
     /// position it is emitting (`SNTransferLowering.cpp:338-341`), so an absent index simply never
     /// matches — and the miss is a live answer there, not a refusal (`:349-370`).
     pub src_size_idx: Option<SizeIdx>,
-    /// Field: e023_TransferNode.dstSizeIdx_
+    /// Field: e034_TransferNode.dstSizeIdx_
     ///
     /// The same position in the DESTINATION's view sizes, read by the store path
     /// (`SNTransferLowering.cpp:344-347`).
@@ -3014,28 +3101,65 @@ impl TransferType {
     ];
 }
 
+/// `dsc/dsc2.h:826-829` — the DDL allocation's `replication` for each end of one transfer. IBM
+/// declares it as an UNNAMED struct member `repetition_`, so carrying it means naming it.
+///
+/// ⛔ WRITTEN ONCE, READ NOWHERE, AND NOT ON THE WIRE: `ddc/ddl/ddl_conversion.cpp:1171-1172` and
+/// `:1189` are the only two mentions tree-wide outside the declaration, and the JSON round trip
+/// carries neither member — the `"repetition_"` entries at `dsc/dsc2.cpp:132` and `:1172` are
+/// `ComputeNode::instrAttribute_.repetition_` (`dsc/dsc2.h:907`), a different field. Carried because
+/// the node declares it, and portable for exactly that reason: with no reader, ownership of the two
+/// counts is the whole contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransferRepetition {
+    /// Field: e034_TransferNode.srcRep_
+    ///
+    /// The source end's count, from `getRepetitionIfExists(transfer_op.getSource())`
+    /// (`ddc/ddl/ddl_conversion.cpp:1171-1172`).
+    ///
+    /// ⛔ [`None`] IS AN INDETERMINATE READ, NOT THE AUTHORITY'S `-1`. `int srcRep_;` carries no
+    /// member initialiser (`dsc/dsc2.h:827`) and `TransferNode()` does not name `repetition_` in its
+    /// mem-init list (`:815`), so on a default-constructed or JSON-imported node this storage is
+    /// uninitialised and IBM's own `clone()` copies whatever it holds. Everywhere else in this file
+    /// an [`Option`] spells the authority's `-1` sentinel; here it spells storage no writer has
+    /// touched, which is why it is not simply `Repetition(1)`.
+    pub src: Option<Repetition>,
+    /// Field: e034_TransferNode.dstReps_
+    ///
+    /// ⛔ INDEX-PARALLEL WITH [`TransferNode::dst_vias`], NOT KEYED: the minting loop pushes one
+    /// entry per `dstVias_.emplace_back()` in the same iteration
+    /// (`ddc/ddl/ddl_conversion.cpp:1176-1189`). Empty by default, and that IS faithful where
+    /// [`src`](Self::src) is absent — a `std::vector` member is default-constructed where an `int`
+    /// without an initialiser is not.
+    pub dsts: Vec<Repetition>,
+}
+
+/// Replaces: e034_TransferNode
+///
 /// `dsc/dsc2.h:814-898`. A transfer of one data stage from one source to one or more destinations —
 /// the node bridge 1 lowers into an `agen` load or store. Its minting site is
 /// `ddc/ddl/ddl_conversion.cpp:1166-1195`: a DDL `DataTransferOp` becomes one of these, with one
-/// [`DstVia`] per declared destination.
+/// [`DstVia`] per declared destination. e023_TransferNode is this same class under the superseded
+/// numbering, which listed ten of its fields; those are renumbered onto e034 below, and this batch
+/// adds `repetition_` and `paddingInfo_`.
 ///
-/// ⛔ THIS CARRIES TEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED, so the
-/// `e023_TransferNode` anchor at the end of this file is still open. The other ten, with the reason:
+/// ⛔ THIS CARRIES TWELVE OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED, so
+/// eight field anchors below stay open. Every one is blocked on a type another agent owns, none on
+/// this class:
 ///  * `srcLdsAndLoopOffsets_`, `srcIndirectLdsAndLoopOffsets_` (`:832`) and
 ///    `dstLdsAndLoopOffsets_`, `dstIndirectLdsAndLoopOffsets_` (`:833`) are `DataInfo` — e019;
 ///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
-///    `const LoopNode*` held as POINTER IDENTITY, which needs e013's `name_`, exactly as e018 does;
-///  * `paddingInfo_` (`:845`) is [`TransferPadInfo`], ported at the end of this file — carrying it
-///    is e023_TransferNode's own remaining work, not a block;
+///    `const LoopNode*` held as POINTER IDENTITY, which needs e013's `name_`, exactly as
+///    `SyncNode::implicitSyncRefTransfer_` does;
 ///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) — e013;
-///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012;
-///  * `repetition_` (`:826-829`) is an UNNAMED struct with no reader tree-wide. Its only writers are
-///    `repetition_.srcRep_ =` (`ddc/ddl/ddl_conversion.cpp:1171`) and
-///    `repetition_.dstReps_.push_back` (`:1189`); nothing reads either member, the JSON round trip
-///    does not carry them (the `"repetition_"` entries at `dsc/dsc2.cpp:132` and `:1172` are
-///    `ComputeNode::instrAttribute_.repetition_`, `dsc/dsc2.h:907`), and `srcRep_` has no member
-///    initialiser, so a default-constructed node's copy is indeterminate. Carrying it means naming
-///    C++'s unnamed struct, so it is named here instead.
+///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012.
+///
+/// ⚠️ AND FOUR OF THOSE EIGHT FIELDS HAVE NO ANCHOR AT ALL, so the open anchors undercount the
+/// remaining work: the scheduler's field scan takes one declarator per declaration, so
+/// `srcLdsAndLoopOffsets_` and `dstLdsAndLoopOffsets_` (`:832-833`) lost theirs to the `Indirect`
+/// twin sharing their line, and `CoreletView`'s `srcLoopsAndSize_` and `dstLoopsAndSizes_`
+/// (`:848-849`) lost theirs the same way. They are named here rather than anchored, since an invented
+/// anchor is indistinguishable from a scheduled one.
 ///
 /// ⛔ AND SEVEN METHODS STAY OUT WITH THEM: `isSrcLabeledDs`, `isDstLabeledDs`, `isSrcConstant`,
 /// `isDstConstant` and `isDstIndirect` are one-line reads of the `DataInfo` fields above
@@ -3047,36 +3171,43 @@ impl TransferType {
 /// same iteration (`ddc/ddl/ddl_conversion.cpp:1176-1177`), and `hoistTransfersUpForReuse` takes
 /// [`non_memory_result_index`](Self::non_memory_result_index) — an index into `dstVias_` — and
 /// indexes `dstLdsAndLoopOffsets_` with it (`ddc/ddc_transformation.cpp:1570-1575`).
+/// [`TransferRepetition::dsts`] is the THIRD vector on that same index and it IS carried.
 ///
-/// ⛔ NO `PartialEq`, as [`LoopNode`] has none: IBM declares no `operator==` and every consumer
-/// keys on the POINTER. `Clone` is IBM's own, through `InheritWithClone` (`dsc/dsc2.h:814`).
-#[derive(Clone, Debug)]
+/// ⛔ NO `PartialEq`, as [`LoopNode`] has none: IBM declares no `operator==` and every consumer keys
+/// on the POINTER. ⛔ AND NO `Clone` DERIVE either, now that `paddingInfo_` is carried — see
+/// [`clone`](Self::clone).
+#[derive(Debug)]
 pub struct TransferNode {
-    /// Field: e023_TransferNode.src_
+    /// Field: e034_TransferNode.src_
     ///
     /// Where the data comes from (`dsc/dsc2.h:824`), written by `setDataLocAndInfo`
     /// (`ddc/ddl/ddl_conversion.cpp:1169`).
     pub src: DataLocation,
-    /// Field: e023_TransferNode.srcIndirect_
+    /// Field: e034_TransferNode.srcIndirect_
     ///
     /// The location holding the source address when the read is indirect, or
     /// [`DataLocation::UNSET`] when it is direct (`dsc/dsc2.h:824`).
     /// [`is_src_indirect`](Self::is_src_indirect) is the test every reader applies before touching
     /// it (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
     pub src_indirect: DataLocation,
-    /// Field: e023_TransferNode.dstVias_
+    /// Field: e034_TransferNode.dstVias_
     ///
     /// One entry per destination, in the DDL's declaration order (`dsc/dsc2.h:825`,
     /// `ddc/ddl/ddl_conversion.cpp:1175-1190`). Several entries is a multicast; the row-expansion
     /// path rejects several destinations at once (`:1183-1187`).
     pub dst_vias: Vec<DstVia>,
-    /// Field: e023_TransferNode.replicationFactor_
+    /// Field: e034_TransferNode.repetition_
+    ///
+    /// The DDL allocation's replication for both ends (`dsc/dsc2.h:826-829`) — see
+    /// [`TransferRepetition`], which names IBM's unnamed struct.
+    pub repetition: TransferRepetition,
+    /// Field: e034_TransferNode.replicationFactor_
     ///
     /// How many times the loaded chunk is splatted, `1` for no splat (`dsc/dsc2.h:834`). Bridge 1
     /// divides the recorded stick and element counts by it, and refuses an LXLU splat it cannot
     /// express (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:728-729`, `:963-971`).
     pub replication_factor: i32,
-    /// Field: e023_TransferNode.unitTimeTransferChunkSize_
+    /// Field: e034_TransferNode.unitTimeTransferChunkSize_
     ///
     /// "Continuous elements within a stick" (`dsc/dsc2.h:835-836`) — the contiguous dims of one
     /// unit-time transfer, ONE PER STICK SIZE AND IN STICK ORDER, which is all the one live producer
@@ -3093,7 +3224,7 @@ pub struct TransferNode {
     /// at `:1568` — are unreachable. After minting, the 4B-splat mutation of entry 0 (`:544-546`) is
     /// the only DDC write that reaches it.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
-    /// Field: e023_TransferNode.unitTimeTransferNumChunks_
+    /// Field: e034_TransferNode.unitTimeTransferNumChunks_
     ///
     /// How many chunks one unit-time transfer covers, `1` for a single contiguous chunk
     /// (`dsc/dsc2.h:837`). It is the product of the extents the hole split moved out of
@@ -3101,7 +3232,7 @@ pub struct TransferNode {
     /// (`ddc/ddcv1.cpp:1633-1642`), which bridge 1 multiplies back in
     /// (`SNTransferLowering.cpp:33-38`).
     pub unit_time_transfer_num_chunks: i32,
-    /// Field: e023_TransferNode.unitTimeTransferChunkStride_
+    /// Field: e034_TransferNode.unitTimeTransferChunkStride_
     ///
     /// The dims the chunks stride over — the entries the hole split removed from
     /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size), each with its extent
@@ -3115,12 +3246,12 @@ pub struct TransferNode {
     /// It is carried rather than dropped because bridge 1 reads it in seven places (`:930`, `:1270`,
     /// `:1713`, `:1723`, `:2227`, `:2256`, `:2454`) and a JSON-imported tree can carry it.
     pub unit_time_transfer_chunk_stride: Vec<SizeAndIndex>,
-    /// Field: e023_TransferNode.rotateNumElements_
+    /// Field: e034_TransferNode.rotateNumElements_
     ///
     /// How far the LXLU rotates the loaded data, `0` for no rotation (`dsc/dsc2.h:839`). Every
     /// reader guards on `> 0` (`SNTransferLowering.cpp:991`, `:1097`, `:2239`, `:2277`).
     pub rotate_num_elements: i32,
-    /// Field: e023_TransferNode.coreIdToGTRInfo_
+    /// Field: e034_TransferNode.coreIdToGTRInfo_
     ///
     /// The group tag register each core uses for this transfer — L3 only, as the authority's own
     /// comment says (`dsc/dsc2.h:840`). The L3 scheduler writes it one core at a time and refuses to
@@ -3131,7 +3262,7 @@ pub struct TransferNode {
     /// `std::map`'s ascending-core-id order reaches the emitted DSC. [`CoreId`]'s derived [`Ord`] is
     /// that same numeric order over the `int` key `std::stoi` reads back (`dsc/dsc2.cpp:1599`).
     pub core_id_to_gtr_info: BTreeMap<CoreId, GroupTagRegInfo>,
-    /// Field: e023_TransferNode.transferSize_
+    /// Field: e034_TransferNode.transferSize_
     ///
     /// "Explicit transfer size. If filled, use this size rather than derived from data stage"
     /// (`dsc/dsc2.h:841-843`). ⛔ ABSENCE IS THE COMMON CASE AND IS TESTED PER DIM, never for the
@@ -3148,6 +3279,18 @@ pub struct TransferNode {
     /// that enum — would silently reorder emitted JSON, which is why the enum's own discriminant
     /// guard and this container are one decision and not two.
     pub transfer_size: BTreeMap<PrimaryDimTypes, DimSize>,
+    /// Field: e034_TransferNode.paddingInfo_
+    ///
+    /// "Zero padding sizes in L3 transfers" (`dsc/dsc2.h:844-845`) — what the L3 scheduler builds per
+    /// padded dim and end (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5359-5473`) and what
+    /// `dsc/dsc2.cpp:4761-4990` then turns into condition and transfer nodes.
+    ///
+    /// ⛔ EMPTY IS THE GATE, NOT A VALUE: every reader but that one transformation does nothing at
+    /// all unless [`TransferPadInfo::is_empty`] is false (`ddc/ddcv1.cpp:2860`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6298`, `dsc/dsc2.cpp:4761`).
+    ///
+    /// ⛔ AND IT IS WHY THIS TYPE HAS NO `Clone` DERIVE — see [`clone`](Self::clone).
+    pub padding_info: TransferPadInfo,
 }
 
 impl Default for TransferNode {
@@ -3156,11 +3299,15 @@ impl Default for TransferNode {
     ///
     /// ⛔ IT IS NOT `TransferNode()`: that constructor also passes `TRANSFER` to the base class
     /// (`dsc/dsc2.h:815`), and `nodeType_` is `ScheduleNode`'s, e013's to port.
+    ///
+    /// ⛔ AND ONE MEMBER HAS NO INITIALISER TO REPRODUCE: `repetition_.srcRep_` (`:827`) is left
+    /// uninitialised by that constructor, which is what [`TransferRepetition::src`]'s [`None`] spells.
     fn default() -> Self {
         Self {
             src: DataLocation::UNSET,
             src_indirect: DataLocation::UNSET,
             dst_vias: Vec::new(),
+            repetition: TransferRepetition::default(),
             replication_factor: 1,
             unit_time_transfer_chunk_size: Vec::new(),
             unit_time_transfer_num_chunks: 1,
@@ -3168,6 +3315,44 @@ impl Default for TransferNode {
             rotate_num_elements: 0,
             core_id_to_gtr_info: BTreeMap::new(),
             transfer_size: BTreeMap::new(),
+            padding_info: TransferPadInfo::default(),
+        }
+    }
+}
+
+impl Clone for TransferNode {
+    /// IBM's `clone()` is `new TransferNode(static_cast<TransferNode const&>(*this))` — the implicit
+    /// COPY CONSTRUCTOR, reached through `InheritWithClone` (`util/utils.h:105-106`,
+    /// `dsc/dsc2.h:814`).
+    ///
+    /// ⛔ SO A CLONED TRANSFER NODE HAS NO PADDING INFO, and that is load-bearing rather than a leak
+    /// this port may tidy up: [`TransferPadInfo`]'s copy constructor is "Do nothing on purpose"
+    /// (`dsc/dsc2.h:761-764`), and the authority CHECKS the consequence three times — `dsc/dsc2.cpp`
+    /// clones a padded transfer at `:5546` and `:5702` and then `DT_CHECK_MSG`s the clone `isEmpty()`
+    /// at `:5445`, `:5692` and `:5792`. A deep copy would turn all three into fatal errors.
+    /// [`TransferPadInfo`]'s own absent `Clone` is what makes the derive here impossible, so this is
+    /// a compile error the port cannot walk past rather than a convention.
+    ///
+    /// ⛔ AND C++ CANNOT ASSIGN ONE AT ALL, WHICH IS UNREPRESENTABLE HERE: `TransferPadInfo`'s copy
+    /// assignment is `= delete` (`dsc/dsc2.h:766`), which implicitly deletes `TransferNode`'s, so
+    /// `*a = b` does not compile there and always compiles here. Measured on a control reproducing
+    /// that shape — a do-nothing copy constructor plus a deleted copy assignment inside the same CRTP
+    /// `clone()` — the clone reported the pad empty with every other member copied, and the
+    /// assignment was rejected as "copy assignment operator is implicitly deleted".
+    fn clone(&self) -> Self {
+        Self {
+            src: self.src,
+            src_indirect: self.src_indirect,
+            dst_vias: self.dst_vias.clone(),
+            repetition: self.repetition.clone(),
+            replication_factor: self.replication_factor,
+            unit_time_transfer_chunk_size: self.unit_time_transfer_chunk_size.clone(),
+            unit_time_transfer_num_chunks: self.unit_time_transfer_num_chunks,
+            unit_time_transfer_chunk_stride: self.unit_time_transfer_chunk_stride.clone(),
+            rotate_num_elements: self.rotate_num_elements,
+            core_id_to_gtr_info: self.core_id_to_gtr_info.clone(),
+            transfer_size: self.transfer_size.clone(),
+            padding_info: TransferPadInfo::default(),
         }
     }
 }
@@ -3236,31 +3421,21 @@ impl TransferNode {
     }
 }
 
-// crustify:todo: e023_TransferNode
+// crustify:todo: e034_TransferNode.coreletViews_
 
-// crustify:todo: e023_TransferNode.coreletViews_
+// crustify:todo: e034_TransferNode.dstIndirectLdsAndLoopOffsets_
 
-// crustify:todo: e023_TransferNode.dstIndirectLdsAndLoopOffsets_
+// crustify:todo: e034_TransferNode.dstIndirectLoopsAndSizes_
 
-// crustify:todo: e023_TransferNode.dstIndirectLoopsAndSizes_
+// crustify:todo: e034_TransferNode.lastFusableParentLoopDst_
 
-// crustify:todo: e023_TransferNode.dstReps_
+// crustify:todo: e034_TransferNode.lastFusableParentLoopSrc_
 
-// crustify:todo: e023_TransferNode.lastFusableParentLoopDst_
+// crustify:todo: e034_TransferNode.srcIndirectLdsAndLoopOffsets_
 
-// crustify:todo: e023_TransferNode.lastFusableParentLoopSrc_
+// crustify:todo: e034_TransferNode.srcIndirectLoopsAndSize_
 
-// crustify:todo: e023_TransferNode.paddingInfo_
-
-// crustify:todo: e023_TransferNode.repetition_
-
-// crustify:todo: e023_TransferNode.srcIndirectLdsAndLoopOffsets_
-
-// crustify:todo: e023_TransferNode.srcIndirectLoopsAndSize_
-
-// crustify:todo: e023_TransferNode.srcRep_
-
-// crustify:todo: e023_TransferNode.transferCoordinates_
+// crustify:todo: e034_TransferNode.transferCoordinates_
 
 /// How many folds one compute node engages — `numFoldsEngaged` (`dsc/dsc2.h:940`, `int`), filled
 /// from `sysDef.numFoldsPerUnit` (`ddc/ddcv1.cpp:1887`).
@@ -3304,6 +3479,9 @@ pub struct ComputeMask(pub u64);
 /// instruction repeats over (`dsc/dsc2.h:907`), while a `RepetitionWithOffset` entry is the SPREAD
 /// of one operand — `ddc/ddc_transformation.cpp:1358-1379` clones the node `entry - 1` further
 /// times and leaves 1 behind.
+///
+/// ⭐ AND THAT SECOND ROLE HAS TWO HOLDERS, filled by the same lambda: `TransferNode::repetition_`
+/// takes one per transfer end (`ddc/ddl/ddl_conversion.cpp:1171-1189`) — see [`TransferRepetition`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Repetition(pub i32);
 
