@@ -20,7 +20,7 @@ use sys_arch_spec::{CoreId, CoreletId, SFP_SLICES};
 /// ⭐ NEVER THE OUT-OF-RANGE SEED. `getSharesAndGroupName` starts its group name at
 /// `sysDef.maxGroupID + 1` (`:4705`), one past the last legal id, but that seed survives only for a
 /// single sharer — the very case the producer answers -1 for — and on the shared path the name is
-/// `DT_CHECK`ed `<= maxGroupID` (`:4711`).
+/// `DT_CHECK`ed `<= maxGroupID` (`:4710-4711`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupId(pub u32);
 
@@ -62,14 +62,30 @@ pub struct TemporalStride(pub i64);
 /// An element-arrangement fold level, counted INNERMOST-FIRST as `currElemArrLevel`
 /// (`ddc/ddc_fold.cpp:2666-2689`).
 ///
-/// ⛔ NOT A FOLD INDEX, AND NOT OUTERMOST-FIRST. IBM's own diagram gives the conversion —
-/// `loop_elem_arr_level = foldNumDims - i - 1` over the absolute fold index `i`
-/// (`ddc/ddc_fold.cpp:2656-2660`) — and `dsc/dsc2.cpp:6728` inverts it the same way, so level 0 is
-/// the INNERMOST fold. The walk also starts at `origNumElemArrFoldsOfRefNode`, not 0 (`:2667`).
+/// ⛔ NOT A FOLD INDEX, AND NOT OUTERMOST-FIRST. The authority states it in prose — "Element
+/// arrangement at index 0 is the innermost and at index (size - 1) is the outermost"
+/// (`dsc/dsc2.cpp:6012-6013`). Over an OUTER-to-inner fold vector IBM's own diagram gives the
+/// conversion, `loop_elem_arr_level = foldNumDims - i - 1` over the absolute fold index `i`
+/// (`ddc/ddc_fold.cpp:2656-2660`), which `dsc/dsc2.cpp:6728` inverts the same way; over the
+/// inner-to-outer `elemArrParamsAfterDistribution` the level IS the index, assigned straight across
+/// (`dsc/dsc2.cpp:6074`, `:6352`). The walk also starts at `origNumElemArrFoldsOfRefNode`, not 0
+/// (`:2667`).
 ///
 /// ⭐ UNSIGNED IS SOUND: the writers are a `foldIdx` from a `foldIdx >= 0` loop
 /// (`dsc/dsc2.cpp:6016-6017`) and a `currElemArrLevel` that cannot go negative because
 /// `elemArrParamsAfterDistribution.at(nextFoldIdx)` throws first (`:6441-6443`).
+///
+/// ⛔ ONE AUTHORITY SITE IS OFF BY ONE IN THIS CURRENCY, so port it deliberately rather than
+/// transcribe it. `constructAllocElemArrLayout` inserts a fold at `begin() + currElemArrIndex + 1`
+/// (`ddc/ddc_fold.cpp:371-372`), which raises the level of every fold from `currElemArrIndex`
+/// OUTWARDS — every level `>= size - 1 - currElemArrIndex` — but it bumps only the loops whose level
+/// is `>= currElemArrLevel`, and `:341` fixed that at `size - currElemArrIndex` before the insertion
+/// (`:377-379`). The split fold's OWN level is the one level the threshold skips, so a loop related
+/// to it resolves (`dsc/dsc2.cpp:6728`) to the newly inserted inner fold instead of to the residue
+/// whose `alpha` is scaled for it (`ddc/ddc_fold.cpp:386`). Only the FIRST insertion is wrong; by the
+/// second the split fold's level has caught up with the stale threshold. Derived in
+/// `unit_tests::the_level_shift_guard_skips_the_split_folds_own_level`, and unreachable from this
+/// crate so far because the containing function is unported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ElemArrLevel(pub u32);
 
@@ -161,6 +177,11 @@ pub struct VariableSymbol(pub i64);
 /// so [`group_id`](Self::group_id) is [`Some`] exactly when `numSharers_ > 1`; `numSharers_` is
 /// never written -1 at all (`:4828`, `:5252`). The JSON round trip carries both verbatim
 /// (`dsc/dsc2.cpp:631-632`, `:1594-1597`), so neither field may be inferred from the other.
+///
+/// ⛔ AND THE PAIRING IS NOT ENFORCEABLE FROM ITS ONE CONSUMER, which is why both fields stay
+/// independently optional: `dsc/dsc2Pcfg.cpp:1258-1266` copies each straight onto `GTRAndBurst` and
+/// keeps the -1s, and that is DCG/PCFG — off this campaign's path. Nothing on our path reads either
+/// field yet, so `(Some(_), Some(NumSharers(1)))` is merely unproduced, not unsound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GroupTagRegInfo {
     /// Field: e006_GroupTagRegInfo.groupId_
@@ -169,7 +190,7 @@ pub struct GroupTagRegInfo {
     pub num_sharers: Option<NumSharers>,
 }
 
-/// Replaces: e009_FoldParamInfoType
+/// Replaces: e007_FoldParamInfoType
 ///
 /// One fold level's affine parameters, trip count and label (`dsc/dsc2.h:1081-1085`).
 /// TRAP: the declared default is the identity in NEITHER field, and `cardinality`'s 0 is not an
@@ -177,18 +198,26 @@ pub struct GroupTagRegInfo {
 /// [`Cardinality`]). The identity a caller actually wants is the one `getDefaultRowSplitFold`
 /// writes, `alpha = 0` with `cardinality = 1` (`ddc/ddc_fold.cpp:2154-2159`), which overrides BOTH
 /// declared initialisers.
+///
+/// ⭐ AGGREGATE-INITIALISED STRAIGHT OUT OF A [`LoopDistributionParamType`]'s `alpha` and `beta`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7654-7655`), which is why the two types share these
+/// newtypes instead of each declaring its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldParamInfoType {
-    /// Field: e009_FoldParamInfoType.alpha
+    /// Field: e007_FoldParamInfoType.alpha
     pub alpha: Alpha,
-    /// Field: e009_FoldParamInfoType.beta
+    /// Field: e007_FoldParamInfoType.beta
     pub beta: Beta,
-    /// Field: e009_FoldParamInfoType.cardinality
+    /// Field: e007_FoldParamInfoType.cardinality
     pub cardinality: Cardinality,
-    /// Field: e009_FoldParamInfoType.foldDimLabel
+    /// Field: e007_FoldParamInfoType.foldDimLabel
     ///
-    /// Open set, not a closed one: `"elem_arr_" + std::to_string(c)` is built per level
-    /// (`ddc/ddc_fold.cpp:2698`) and `FoldDimProp::importFromJson` reads it from JSON.
+    /// Open set, not a closed one: `FoldDimProp::importFromJson` reads it from JSON. ⭐ But where the
+    /// element arrangements are relabelled it is not free text — it is `"elem_arr_" +
+    /// std::to_string(<level>)`, and both producers spell the same [`ElemArrLevel`] over an
+    /// outer-to-inner fold vector: `c` counted up from the last index (`ddc/ddc_fold.cpp:2696-2698`)
+    /// and `foldParams.size() - 1 - i` written out
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7493-7497`).
     pub fold_dim_label: String,
 }
 
@@ -204,24 +233,32 @@ impl Default for FoldParamInfoType {
     }
 }
 
-/// Replaces: e010_LoopDistributionParamType
+/// Replaces: e008_LoopDistributionParamType
 ///
-/// One loop's affine parameters for one dimension after loop distribution (`dsc/dsc2.h:1110-1114`).
-/// TRAP: the authority's `= -1` on the last two fields is UNSET, not a value — nothing tests for
-/// -1. An unset `relatedElemArrLevel` is LOUD, not silent: `allocFm.getNumDims() - level - 1`
-/// (`dsc/dsc2.cpp:6728`) makes the position `getNumDims()`, which `FoldManager::getAlpha`
+/// One loop's affine parameters for one dimension after loop distribution (`dsc/dsc2.h:1110-1114`),
+/// filled in two goes: alpha, beta and the level together (`ddc/ddc_fold.cpp:2687-2689`), the stride
+/// afterwards (`dsc/dsc2.cpp:6748-6751`).
+/// TRAP: the authority's `= -1` on the last two fields is UNSET, not a value, and no reader compares
+/// against -1. An unset `relatedElemArrLevel` is LOUD, not silent: `allocFm.getNumDims() - level - 1`
+/// (`dsc/dsc2.cpp:6727-6728`) makes the position `getNumDims()`, which `FoldManager::getAlpha`
 /// `DT_CHECK`s (`util/foldManager/foldInfrastructure.h:2325-2329`). What IS silent is the opposite
 /// direction: `getAlpha` remaps a negative position to `size() + pos`, so a level past the last
 /// fold reads a DIFFERENT fold without complaint.
+///
+/// ⭐ THE ONE READER THAT ORDERS AGAINST THE LEVEL rather than indexing with it is
+/// `relatedElemArrLevel >= currElemArrLevel`, which then increments the field in place
+/// (`ddc/ddc_fold.cpp:377-379`); [`Option`] stays faithful to it because `None < Some(_)` and that
+/// `currElemArrLevel` is at least 1 (`:330-341`). ⛔ But the threshold itself is one level too high
+/// for the shift it guards — see [`ElemArrLevel`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoopDistributionParamType {
-    /// Field: e010_LoopDistributionParamType.alpha
+    /// Field: e008_LoopDistributionParamType.alpha
     pub alpha: Alpha,
-    /// Field: e010_LoopDistributionParamType.beta
+    /// Field: e008_LoopDistributionParamType.beta
     pub beta: Beta,
-    /// Field: e010_LoopDistributionParamType.temporalStridePostDistribution
+    /// Field: e008_LoopDistributionParamType.temporalStridePostDistribution
     pub temporal_stride_post_distribution: Option<TemporalStride>,
-    /// Field: e010_LoopDistributionParamType.relatedElemArrLevel
+    /// Field: e008_LoopDistributionParamType.relatedElemArrLevel
     pub related_elem_arr_level: Option<ElemArrLevel>,
 }
 
@@ -439,11 +476,9 @@ impl From<(PrimaryDimTypes, DimSize)> for Size {
 mod unit_tests {
     use super::*;
 
-    /// `dsc/dsc2.h:35-36`: both fields start absent, and a group id is present exactly when there
-    /// is more than one sharer — both producers verbatim
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4828-4832`, `:5252-5256`).
+    /// `dsc/dsc2.h:35-36`: both fields start absent.
     #[test]
-    fn group_tag_reg_info_carries_a_group_id_exactly_when_it_is_shared() {
+    fn group_tag_reg_info_starts_with_neither_field() {
         assert_eq!(
             GroupTagRegInfo::default(),
             GroupTagRegInfo {
@@ -451,22 +486,41 @@ mod unit_tests {
                 num_sharers: None
             }
         );
+    }
 
-        // `numSharers_ = shares; groupId_ = shares > 1 ? groupName : -1;` with `shares >= 1`
-        // guaranteed at `:4697` and `groupName <= maxGroupID` at `:4711`.
-        let produce = |shares: u32, group_name: u32| GroupTagRegInfo {
-            group_id: (shares > 1).then_some(GroupId(group_name)),
-            num_sharers: Some(NumSharers(shares)),
-        };
-        assert_eq!(produce(1, 7).group_id, None, "one sharer means no share");
-        assert_eq!(produce(4, 0).group_id, Some(GroupId(0)), "0 is a legal id");
-        for shares in 1..=4 {
-            assert_eq!(
-                produce(shares, 7).group_id.is_some(),
-                shares > 1,
-                "a group id is present iff numSharers_ > 1"
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4827-4836` and its twin `:5251-5260`, over the real
+    /// map and the real set: `gtrIdsUsed_` gains an id only from a record that HAS one (`:4833-4834`),
+    /// so two cores sharing one group contribute one id and the unshared core contributes none.
+    #[test]
+    fn only_a_present_group_id_reaches_gtr_ids_used() {
+        use crate::schedule::dsc::DesignSpaceConfig;
+
+        let mut node = TransferNode::default();
+        for (core, shares, group_name) in [(0, 2, 3), (1, 2, 3), (2, 1, 9)] {
+            // `numSharers_ = shares; groupId_ = shares > 1 ? groupName : -1;`, with `shares >= 1`
+            // guaranteed at `:4697` and the shared path's name `DT_CHECK`ed at `:4710-4711`.
+            node.core_id_to_gtr_info.insert(
+                CoreId(core),
+                GroupTagRegInfo {
+                    group_id: (shares > 1).then_some(GroupId(group_name)),
+                    num_sharers: Some(NumSharers(shares)),
+                },
             );
         }
+
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.gtr_ids_used.extend(
+            node.core_id_to_gtr_info
+                .values()
+                .filter_map(|info| info.group_id),
+        );
+
+        assert_eq!(dsc.gtr_ids_used, BTreeSet::from([GroupId(3)]));
+        assert_eq!(
+            node.core_id_to_gtr_info[&CoreId(2)].num_sharers,
+            Some(NumSharers(1)),
+            "the unshared core still records its one sharer"
+        );
     }
 
     /// `ddc/ddc_fold.cpp:2656-2660` — IBM's own diagram, seven folds `S S T T T T E`, with
@@ -489,6 +543,85 @@ mod unit_tests {
         for fold_index in 0..FOLD_NUM_DIMS {
             assert_eq!(fold_index_of(level_of(fold_index)), fold_index);
         }
+    }
+
+    /// `ddc/ddc_fold.cpp:2696-2698` and `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7493-7497`
+    /// relabel the element-arrangement folds independently — one counting `c` up from the innermost,
+    /// the other writing `foldParams.size() - 1 - i` — and both spell the same [`ElemArrLevel`].
+    #[test]
+    fn the_elem_arr_label_numbers_folds_by_their_level() {
+        // Outer to inner, the order both loops walk backwards over.
+        const NUM_ELEM_ARR_FOLDS: usize = 3;
+        let mut folds = vec![FoldParamInfoType::default(); 5];
+
+        // `for (int i = size - 1, c = 0; c < numElemArrFoldsOfAllocNode; --i, ++c)`.
+        for (c, i) in (0..NUM_ELEM_ARR_FOLDS).zip((0..folds.len()).rev()) {
+            folds[i].fold_dim_label = format!("elem_arr_{c}");
+        }
+        // `foldDimLabel = "elem_arr_" + std::to_string(foldParams.size() - 1 - i)`, same tail.
+        let l3_labels: Vec<String> = (folds.len() - NUM_ELEM_ARR_FOLDS..folds.len())
+            .map(|i| format!("elem_arr_{}", folds.len() - 1 - i))
+            .collect();
+        assert_eq!(
+            folds[folds.len() - NUM_ELEM_ARR_FOLDS..]
+                .iter()
+                .map(|fold| fold.fold_dim_label.clone())
+                .collect::<Vec<_>>(),
+            l3_labels
+        );
+
+        // The suffix IS the level, so the INNERMOST element arrangement is `elem_arr_0`.
+        let level_of = |i: usize| ElemArrLevel((folds.len() - 1 - i) as u32);
+        assert_eq!(level_of(4), ElemArrLevel(0));
+        assert_eq!(folds[4].fold_dim_label, "elem_arr_0");
+        assert_eq!(level_of(2), ElemArrLevel(2));
+        assert_eq!(folds[2].fold_dim_label, "elem_arr_2");
+        // The outer, non-element-arrangement folds keep the declared default's empty label.
+        assert_eq!(folds[0].fold_dim_label, String::new());
+    }
+
+    /// `ddc/ddc_fold.cpp:341` fixes the shift threshold at `foldParams.size() - currElemArrIndex`,
+    /// but the insertion at `:371-372` raises the level of every fold from `currElemArrIndex`
+    /// OUTWARDS, i.e. every level `>= size - 1 - currElemArrIndex`. ⛔ So `:377-379` skips exactly
+    /// one level — the split fold's own — and a loop related to it lands on the newly inserted inner
+    /// fold instead of the residue whose `alpha` `:386` scales. A derivation, not a port: the
+    /// containing function is unported, so nothing in this crate reaches it yet.
+    #[test]
+    fn the_level_shift_guard_skips_the_split_folds_own_level() {
+        // Outer to inner; `currElemArrIndex` is the innermost fold with cardinality != 1 (`:330-335`).
+        const SIZE: i64 = 5;
+        const CURR_ELEM_ARR_INDEX: i64 = 3;
+        let level_of = |index: i64, size: i64| ElemArrLevel((size - 1 - index) as u32);
+
+        // Which levels `insert(begin() + currElemArrIndex + 1, ..)` actually moves: a fold at index
+        // <= currElemArrIndex keeps its index while the size grows, so its level gains one.
+        let shifted = |index: i64| {
+            index <= CURR_ELEM_ARR_INDEX
+                && level_of(index, SIZE + 1) == ElemArrLevel(level_of(index, SIZE).0 + 1)
+        };
+        assert!(
+            (0..=CURR_ELEM_ARR_INDEX).all(shifted),
+            "the split fold and everything outside it move one level out"
+        );
+        let lowest_shifted_level = level_of(CURR_ELEM_ARR_INDEX, SIZE);
+
+        // What `:377-379` bumps instead, from the threshold `:341` fixed before the insertion.
+        let curr_elem_arr_level = ElemArrLevel((SIZE - CURR_ELEM_ARR_INDEX) as u32);
+        assert_eq!(curr_elem_arr_level.0, lowest_shifted_level.0 + 1);
+        let skipped: Vec<u32> = (lowest_shifted_level.0..curr_elem_arr_level.0).collect();
+        assert_eq!(
+            skipped,
+            vec![lowest_shifted_level.0],
+            "one level wide, and it is the split fold's own"
+        );
+
+        // A loop left on that level converts back (`dsc/dsc2.cpp:6728`) to the INSERTED fold, not to
+        // the residue at `currElemArrIndex` whose alpha `:386` scales for it.
+        let index_in_folds = |level: ElemArrLevel, size: i64| size - i64::from(level.0) - 1;
+        assert_eq!(
+            index_in_folds(lowest_shifted_level, SIZE + 1),
+            CURR_ELEM_ARR_INDEX + 1
+        );
     }
 
     /// `dsc/dsc2.cpp:6249-6253` and `:6359-6361`: a 0 `cardinality` is PRODUCED — "Parametric loops
@@ -567,18 +700,50 @@ mod unit_tests {
                 related_elem_arr_level: None,
             }
         );
+    }
 
-        // `ddc/ddc_fold.cpp:2687-2689` fills alpha, beta and the level from the fold params;
-        // `dsc/dsc2.cpp:6748-6751` fills the stride afterwards, and 0 is a legal stride there.
-        let distributed = LoopDistributionParamType {
-            alpha: Alpha(64),
-            beta: Beta(0),
-            temporal_stride_post_distribution: Some(TemporalStride(0)),
-            related_elem_arr_level: Some(ElemArrLevel(0)),
+    /// `dsc/dsc2.cpp:6727-6728` against `FoldManager::getAlpha`
+    /// (`util/foldManager/foldInfrastructure.h:2325-2329`): an unset `relatedElemArrLevel` indexes
+    /// ONE PAST the folds and trips the `DT_CHECK`, while a level past the OUTERMOST fold indexes
+    /// NEGATIVE and is silently remapped to the innermost one. ⛔ The two -1s fail differently.
+    #[test]
+    fn an_unset_related_elem_arr_level_indexes_off_the_end_of_the_folds() {
+        const NUM_DIMS: i64 = 4;
+        // `allocFm.getNumDims() - currLoopParam.relatedElemArrLevel - 1`, with the authority's -1
+        // for an unset level substituted verbatim.
+        let position_of = |param: LoopDistributionParamType| {
+            let level = param
+                .related_elem_arr_level
+                .map_or(-1, |level| i64::from(level.0));
+            NUM_DIMS - level - 1
         };
-        assert_ne!(
-            distributed.temporal_stride_post_distribution,
-            LoopDistributionParamType::default().temporal_stride_post_distribution
+        // `getAlpha(pos)`: `if (pos < 0) pos = size + pos;` then `DT_CHECK(0 <= pos < size)`.
+        let get_alpha_reads = |pos: i64| {
+            let pos = if pos < 0 { NUM_DIMS + pos } else { pos };
+            (0..NUM_DIMS).contains(&pos).then_some(pos)
+        };
+
+        let unset = LoopDistributionParamType::default();
+        assert_eq!(unset.related_elem_arr_level, None);
+        assert_eq!(position_of(unset), NUM_DIMS);
+        assert_eq!(get_alpha_reads(NUM_DIMS), None, "the DT_CHECK, loudly");
+
+        let innermost = LoopDistributionParamType {
+            related_elem_arr_level: Some(ElemArrLevel(0)),
+            ..Default::default()
+        };
+        assert_eq!(position_of(innermost), NUM_DIMS - 1);
+        assert_eq!(get_alpha_reads(NUM_DIMS - 1), Some(NUM_DIMS - 1));
+
+        let past_the_outermost = LoopDistributionParamType {
+            related_elem_arr_level: Some(ElemArrLevel(NUM_DIMS as u32)),
+            ..Default::default()
+        };
+        assert_eq!(position_of(past_the_outermost), -1);
+        assert_eq!(
+            get_alpha_reads(-1),
+            Some(NUM_DIMS - 1),
+            "silently the innermost fold, not a refusal"
         );
     }
 
@@ -7408,12 +7573,9 @@ impl PadSizeFold {
 
 /// Replaces: e024_TransferPadInfo
 ///
-/// Replaces: e008_TransferPadInfo
-///
 /// A transfer's LX zero-pad sizes, one two-level affine fold per padded dim per end
 /// (`dsc/dsc2.h:755-812`) — what `L3DlOpsScheduler` writes onto a `TransferNode` so that
-/// `dsc/dsc2.cpp:4768-4990` can turn padding into condition and transfer nodes. e008 is this same
-/// class under the superseded numbering, which listed two of its six fields.
+/// `dsc/dsc2.cpp:4768-4990` can turn padding into condition and transfer nodes.
 ///
 /// ⛔ NO [`Clone`], AND THE ABSENCE IS THE `DT_CHECK`: the authority's copy constructor is
 /// "Do nothing on purpose" (`dsc/dsc2.h:764-767`) — it rebuilds the two helper references and copies
@@ -7446,8 +7608,6 @@ pub struct TransferPadInfo {
     ///
     /// Field: e024_TransferPadInfo.transferPadFrontSizeHelper
     ///
-    /// Field: e008_TransferPadInfo.transferPadFrontSize_
-    ///
     /// ⛔ THREE OF THE AUTHORITY'S FIELDS ARE ONE FIELD HERE, and the helper is not a field at all:
     /// `transferPadFrontSizeHelper` is a `MapWithFMHelper` whose ONLY member is
     /// `std::map<Dkey, FoldManager<Dval>>& key_val_` (`util/mapWithFMHelper.h:36-38`) bound to
@@ -7460,8 +7620,6 @@ pub struct TransferPadInfo {
     /// Field: e024_TransferPadInfo.transferPadBackSize_
     ///
     /// Field: e024_TransferPadInfo.transferPadBackSizeHelper
-    ///
-    /// Field: e008_TransferPadInfo.transferPadBackSize_
     ///
     /// The same three fields at the other end, and independent of [`front`](Self::front): measured,
     /// building only the front leaves every back query throwing.
