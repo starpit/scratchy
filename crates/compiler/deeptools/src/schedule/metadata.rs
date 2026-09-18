@@ -20,25 +20,35 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// answers `DOESNT_FIT`, naming the tracker that refused (`ddc/ddcv1.cpp:344-369`).
 /// ⛔ NO METHODS AND NO INITIALIZERS TO PORT. `ddc/ddcv1.cpp:363` default-constructs the struct and
 /// assigns all four fields on the next four lines; the header declares no member function and no
-/// default, and no other file in the authority names the type. Its only reader is
-/// `failedAllocs.size() == 0` (`ddc/ddcv1.cpp:378`, `:436`).
+/// default, and no other file in the authority names the type.
+/// ⛔ AND NO READER AT ALL — THE FOUR FIELDS ARE WRITE-ONLY. `ddc/ddcv1.cpp:364-367` are the only
+/// mentions of any field tree-wide: nothing reads, prints or compares `comp`, `core`, `corelet` or
+/// `row`. What `:378` and `:436` read is the VECTOR's `size()`, never a field.
 /// ⛔ ONE SLOT, NOT A LIST — DO NOT PORT `failedAllocs` AS A `Vec`. Its single `push_back` is
 /// immediately followed by `return false` (`:368-369`), `tryAlloc` runs exactly once (`:377`) and
 /// nothing clears the vector, so it holds AT MOST ONE element and `success` already implies
-/// `size() == 0`: the `&&` at `:378` and `:436` is redundant.
+/// `size() == 0`: the `&&` at `:378` and `:436` is redundant — and with no field reader that makes
+/// `failedAllocs` PROVABLY DEAD IN THE AUTHORITY: deleting the vector changes nothing `allocAllMem`
+/// returns or commits. The record is a diagnostic nobody wired up, which is why the port carries the
+/// key and stops there.
 /// ⛔ AND NOT THE CONVERSE. The other false exit (`:264` — an opaque op whose unroll is `0`, over
 /// `max_unroll_`, or not a power of two) records NO `FailedAlloc`, so a refused `allocAllMem`
 /// names a tracker key only when a tracker is what refused.
 /// ⭐ `Copy` because the fill site pushes it by value (`ddc/ddcv1.cpp:368`).
 ///
-/// Transposing two of the three `int` keys is `E0308` — four of them for the two literals below and
-/// nothing else — not a silently wrong tracker. The corelet/row pair is the one the C++ cannot
-/// catch here, because this fill site fixes both at `0` (`:205`, `:211`).
-/// ⛔ THE SECOND DOCTEST IS THE CONTROL, AND IT IS WHAT MAKES THE FIRST ONE EVIDENCE. Stable
-/// rustdoc accepts the `E0308` annotation WITHOUT CHECKING IT — annotating a deliberately wrong
-/// code still reports `ok` — so `compile_fail` alone would also pass on a misspelled path or a
-/// renamed variant. The control compiles the same literal untransposed through the same public
-/// path, so a failure above is attributable to the transposition.
+/// Transposing any two of the three `int` keys is `E0308`, twice per block below — measured, by
+/// compiling each snippet by hand against the built rlibs, not inferred. It is what stops a
+/// transposition being a silently wrong tracker; the corelet/row pair is the one the C++ cannot
+/// catch even at runtime, because this fill site fixes both at `0` (`:205`, `:211`).
+/// ⛔ ONE TRANSPOSITION PER BLOCK. `compile_fail` asserts only that the block AS A WHOLE does not
+/// compile, so two wrong literals in one block pin NEITHER: measured 2026-09-18, correcting one of
+/// them and leaving the other wrong still reported `compile fail ... ok`, while that same correction
+/// alone in its own block FAILED. Three pairs, three blocks.
+/// ⛔ AND THE LAST DOCTEST IS THE CONTROL, WITHOUT WHICH NONE OF THEM IS EVIDENCE. Stable rustdoc
+/// accepts the `E0308` annotation WITHOUT CHECKING IT — annotating a deliberately wrong code still
+/// reports `ok` — so `compile_fail` alone would also pass on a misspelled path, a renamed variant or
+/// a field that stopped being `pub`. The control compiles the same literal untransposed through the
+/// same public path, so each failure above is attributable to its one transposition.
 /// ```compile_fail,E0308
 /// use deeptools::schedule::metadata::FailedAlloc;
 /// use sys_arch_spec::arch_enums::SenComponent;
@@ -49,11 +59,27 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 ///     corelet: CoreId(3),
 ///     row: RowId(0),
 /// };
+/// ```
+/// ```compile_fail,E0308
+/// use deeptools::schedule::metadata::FailedAlloc;
+/// use sys_arch_spec::arch_enums::SenComponent;
+/// use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// let _ = FailedAlloc {
 ///     comp: SenComponent::Lx,
 ///     core: CoreId(3),
 ///     corelet: RowId(0),
 ///     row: CoreletId(0),
+/// };
+/// ```
+/// ```compile_fail,E0308
+/// use deeptools::schedule::metadata::FailedAlloc;
+/// use sys_arch_spec::arch_enums::SenComponent;
+/// use sys_arch_spec::{CoreId, CoreletId, RowId};
+/// let _ = FailedAlloc {
+///     comp: SenComponent::Lx,
+///     core: RowId(0),
+///     corelet: CoreletId(0),
+///     row: CoreId(3),
 /// };
 /// ```
 /// ```
@@ -781,10 +807,15 @@ mod unit_tests {
     use crate::schedule::dsc2::NumBuffers;
 
     /// `ddc/ddcv1.cpp:362-369` — the LX tracker of a used core refuses, with the corelet and row at
-    /// the proxy `0` that `corelets(1, 0)` and `rows(1, 0)` fix for it (`:205`, `:211`). Every field
-    /// is part of the key, so moving the corelet alone names a different tracker.
+    /// the proxy `0` that `corelets(1, 0)` and `rows(1, 0)` fix for it (`:205`, `:211`).
+    ///
+    /// ⛔ ALL FOUR SINGLE-FIELD MOVES, NOT JUST THE CORELET. `getTracker` keys on all four
+    /// (`mem_track_bundle.h:34`), and the corelet move alone does not pin that: measured against a
+    /// four-field stand-in whose hand-written `PartialEq` dropped `row`, the corelet-only assertion
+    /// PASSED and the row move caught it. One field per move, never two — a move of two at once
+    /// pins neither.
     #[test]
-    fn carries_the_tracker_key_that_refused() {
+    fn every_field_is_part_of_the_tracker_key() {
         let failed = FailedAlloc {
             comp: SenComponent::Lx,
             core: CoreId(3),
@@ -795,13 +826,29 @@ mod unit_tests {
         assert_eq!(failed.core, CoreId(3));
         assert_eq!(failed.corelet, CoreletId(0));
         assert_eq!(failed.row, RowId(0));
-        assert_ne!(
-            failed,
+        for moved in [
+            FailedAlloc {
+                comp: SenComponent::L0,
+                ..failed
+            },
+            FailedAlloc {
+                core: CoreId(4),
+                ..failed
+            },
             FailedAlloc {
                 corelet: CoreletId(1),
                 ..failed
-            }
-        );
+            },
+            FailedAlloc {
+                row: RowId(1),
+                ..failed
+            },
+        ] {
+            assert_ne!(
+                failed, moved,
+                "a one-field move must name a different tracker"
+            );
+        }
     }
 
     /// A bound that no ordered set could place is not a bound (`ddc/ddc_metadata.h:38`).
