@@ -910,7 +910,7 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 ///   (`dsc/designSpaceConfig.cpp:1344-1346`) and the JSON importer resolves those two pointers by
 ///   matching the string against the `name_` of eight named members PLUS every [`sc`](Self::sc)
 ///   entry (`:6927-6931`, `:7511-7515`).
-/// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e007_ScheduleTree` anchor.
+/// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e032_ScheduleTree` anchor.
 ///   [`is_dsc2`](Self::is_dsc2) is the one method blocked on it alone.
 /// * `pcfg_` (`:120`) — `std::vector<SenPcfg>`, and DCG/PCFG is off this campaign's path
 ///   (`crustify-scheduler/AGENT-BRIEF.md`, decided 2026-09-09).

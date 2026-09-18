@@ -1,5 +1,6 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
+use crate::schedule::ddc::LatchDataId;
 use crate::schedule::dims::{DataStructDims, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes};
 use crate::schedule::fold::{
     AffineFoldFunctionLeaf, AffineFoldFunctionNonLeaf, FoldDimIndex, FoldDimProp, FoldDimSize,
@@ -167,10 +168,6 @@ pub struct GroupTagRegInfo {
     /// Field: e006_GroupTagRegInfo.numSharers_
     pub num_sharers: Option<NumSharers>,
 }
-
-// crustify:todo: e007_ScheduleTree
-
-// crustify:todo: e007_ScheduleTree.head_
 
 /// Replaces: e009_FoldParamInfoType
 ///
@@ -2461,6 +2458,177 @@ mod unit_tests {
         assert_eq!(composite_loops[0].elem_offset, None);
         assert_eq!(composite_loops[1].elem_offset, Some(ElemOffset(12)));
     }
+
+    /// `dsc/dsc2.h:741-750`. Neither predicate holds on a default-constructed `DataInfo` — IBM's
+    /// `-1`/`-1` — each holds for exactly its own variant, and the state both `DT_CHECK`s refuse has
+    /// no spelling at all.
+    ///
+    /// ⭐ THE ONE REWRITE THAT MOVES A SOURCE FROM A TENSOR TO A CONSTANT is two adjacent
+    /// assignments in the authority (`dsc/dsc2.cpp:5379-5380`) and ONE here, so the refused state is
+    /// not even momentarily reachable.
+    #[test]
+    fn e033_a_data_info_is_a_labeled_ds_or_a_constant_and_never_both() {
+        let neither = DataInfo::default();
+        assert!(!neither.is_labeled_ds());
+        assert!(!neither.is_constant());
+        assert_eq!(neither.latch_data_id, None);
+        assert_eq!(neither.data_connect, DataConnect(String::new()));
+        assert!(!neither.is_start_addr_symbolic);
+
+        let lds = DataInfo {
+            lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(3))),
+            ..DataInfo::default()
+        };
+        assert!(lds.is_labeled_ds());
+        assert!(!lds.is_constant());
+
+        let mut constant = lds.clone();
+        constant.lds_or_const = Some(LdsOrConst::Constant(ConstantId(7)));
+        assert!(!constant.is_labeled_ds());
+        assert!(constant.is_constant());
+    }
+
+    /// ⛔ PINS THE DIVERGENCE `const_ele_offsets`' own doc names. The outer two maps are `std::map`
+    /// in the authority and this reproduces their key order; the INNERMOST is `std::unordered_map`
+    /// whose iteration order reaches IBM's exported JSON (`dsc/dsc2.cpp:237-241`), so the dims come
+    /// out here in [`PrimaryDimTypes`] declaration order — `In` before `Ki` — where the reference
+    /// spells them in libstdc++ hash order. The reader that takes three `begin()`s
+    /// (`ddc/ddl/ddl_conversion.cpp:3105-3111`) therefore reads the LOWEST dim here and an arbitrary
+    /// one there.
+    #[test]
+    fn e033_the_const_element_offsets_walk_core_then_corelet_then_dim_in_key_order() {
+        let mut di = DataInfo::default();
+        for (core, corelet, dim) in [
+            (1u8, 1u8, PrimaryDimTypes::Ij),
+            (0, 1, PrimaryDimTypes::In),
+            (0, 0, PrimaryDimTypes::Ki),
+            (0, 0, PrimaryDimTypes::In),
+        ] {
+            di.const_ele_offsets
+                .entry(CoreId(core))
+                .or_default()
+                .entry(CoreletId(corelet))
+                .or_default()
+                .insert(dim, ConstEleOffset(1));
+        }
+
+        let walk: Vec<_> = di
+            .const_ele_offsets
+            .iter()
+            .flat_map(|(core, corelets)| {
+                corelets.iter().flat_map(move |(corelet, dims)| {
+                    dims.keys().map(move |dim| (*core, *corelet, *dim))
+                })
+            })
+            .collect();
+        assert_eq!(
+            walk,
+            [
+                (CoreId(0), CoreletId(0), PrimaryDimTypes::In),
+                (CoreId(0), CoreletId(0), PrimaryDimTypes::Ki),
+                (CoreId(0), CoreletId(1), PrimaryDimTypes::In),
+                (CoreId(1), CoreletId(1), PrimaryDimTypes::Ij),
+            ]
+        );
+    }
+
+    /// `dsc/dsc2.h:884-896`, every arm of the chain in its own order. ⛔ THE ORDER IS LOAD-BEARING
+    /// AND THIS IS WHERE THAT SHOWS: a constant source with a constant destination matches the
+    /// `CONSTANT_TO_TENSOR` test's first half too, and only the sequence decides.
+    ///
+    /// ⛔ AN EMPTY DESTINATION LIST IS NOT A NON-TENSOR DESTINATION, IT IS BOTH ANSWERS AT ONCE:
+    /// `isDstLabeledDs` and `isDstConstant` each open with `!dstLdsAndLoopOffsets_.empty()`
+    /// (`:868-876`), so a constant source with no destination falls all the way through to
+    /// `INVALID_TRANSFER_TYPE` while a TENSOR source with no destination is
+    /// `NO_TRANSFER_FROM_TENSOR`.
+    #[test]
+    fn e034_the_transfer_type_chain_is_ordered_and_a_constant_source_takes_the_first_two_arms() {
+        let lds = || DataInfo {
+            lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(0))),
+            ..DataInfo::default()
+        };
+        let constant = || DataInfo {
+            lds_or_const: Some(LdsOrConst::Constant(ConstantId(0))),
+            ..DataInfo::default()
+        };
+        let node = |src: DataInfo, dst: Vec<DataInfo>| TransferNode {
+            src_lds_and_loop_offsets: src,
+            dst_lds_and_loop_offsets: dst,
+            ..TransferNode::default()
+        };
+
+        assert_eq!(
+            node(constant(), vec![constant()]).transfer_type(),
+            TransferType::ConstantToConstant
+        );
+        assert_eq!(
+            node(constant(), vec![lds()]).transfer_type(),
+            TransferType::ConstantToTensor
+        );
+        assert_eq!(
+            node(lds(), vec![lds()]).transfer_type(),
+            TransferType::TensorToTensor
+        );
+        assert_eq!(
+            node(DataInfo::default(), vec![lds()]).transfer_type(),
+            TransferType::NoTransferToTensor
+        );
+        assert_eq!(
+            node(lds(), Vec::new()).transfer_type(),
+            TransferType::NoTransferFromTensor
+        );
+        assert_eq!(
+            node(lds(), vec![constant()]).transfer_type(),
+            TransferType::Invalid,
+            "`tensor -> constant` is INVALID: `isDstConstant` fails the fifth arm's second half"
+        );
+        assert_eq!(
+            node(DataInfo::default(), Vec::new()).transfer_type(),
+            TransferType::Invalid
+        );
+        assert_eq!(
+            node(constant(), Vec::new()).transfer_type(),
+            TransferType::Invalid,
+            "`constant -> nothing` is INVALID, not NO_TRANSFER_FROM_TENSOR"
+        );
+
+        // Only the FIRST destination is asked, though a multicast has several (`:868-870`).
+        assert_eq!(
+            node(lds(), vec![DataInfo::default(), lds()]).transfer_type(),
+            TransferType::NoTransferFromTensor
+        );
+    }
+
+    /// `dsc/dsc2.h:867-878`. The five predicates over the four `DataInfo` fields, each reading the
+    /// one field the authority names — and `isDstIndirect` reading EMPTINESS alone, never a
+    /// destination's contents.
+    #[test]
+    fn e034_the_data_info_predicates_each_read_their_own_operand() {
+        let lds = DataInfo {
+            lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(1))),
+            ..DataInfo::default()
+        };
+
+        let mut node = TransferNode::default();
+        assert!(!node.is_src_labeled_ds());
+        assert!(!node.is_dst_labeled_ds());
+        assert!(!node.is_src_constant());
+        assert!(!node.is_dst_constant());
+        assert!(!node.is_dst_indirect());
+
+        node.src_indirect_lds_and_loop_offsets = lds.clone();
+        assert!(
+            !node.is_src_labeled_ds(),
+            "the INDIRECT source is a different field (`:832`)"
+        );
+
+        node.dst_indirect_lds_and_loop_offsets = vec![DataInfo::default()];
+        assert!(
+            node.is_dst_indirect(),
+            "a default `DataInfo` still makes the list non-empty"
+        );
+        assert!(!node.is_dst_labeled_ds());
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -2496,8 +2664,8 @@ mod unit_tests {
 /// `nodePtr.get() == this`, and splices a loop into its slot (`:2169-2186`), and `moveNode` forwards
 /// the whole job to `prev_->moveChildNode` (`:1977-1982`). So the identity a Rust parent link would
 /// need is the one `ScheduleTree::head_` (`dsc/dsc2.h:623`) and `BlockNode::next_` have to define,
-/// and both of those anchors are open — `e030_BlockNode`/`e015_BlockNode` and
-/// `e032_ScheduleTree`/`e007_ScheduleTree`.
+/// and both of those anchors are open — `e030_BlockNode.next_` and `e032_ScheduleTree.head_`, whose
+/// superseded `e015_`/`e007_` duplicates this changeset removed.
 ///
 /// ⛔ AND `name_` IS NOT THAT IDENTITY IN MEMORY, ONLY ON THE JSON SEAM. Names are made unique by
 /// `finalizeScheduleTree`, which appends `__1`, `__2`, … as it walks and `DT_ERROR`s on a node with
@@ -2951,10 +3119,6 @@ impl DataStage {
     }
 }
 
-// crustify:todo: e015_BlockNode
-
-// crustify:todo: e015_BlockNode.next_
-
 // crustify:todo: e016_CoordPropInfoType
 
 /// Replaces: CoordPropInfoType::PropStateType
@@ -2993,13 +3157,18 @@ pub enum PropStateType {
 /// `ddc/ddl/ddl_conversion.cpp:1076-1164`: a DDL `LoopOp` becomes a datastage loop and a
 /// `ParametricLoopOp` a parametric one.
 ///
-/// ⛔ THIS CARRIES LOOPNODE'S OWN SIX DECLARED FIELDS AND NOTHING INHERITED, so the
-/// `e017_LoopNode` anchor at the end of this file is still open. `nodeType_`, `name_`, `prev_` and
+/// ⛔ THIS CARRIES ALL SIX OF LOOPNODE'S OWN DECLARED FIELDS AND NOTHING INHERITED, so the
+/// `e031_LoopNode` anchor at the end of this file is still open. `nodeType_`, `name_`, `prev_` and
 /// `relevantComps_` are `ScheduleNode`'s (`dsc/dsc2.h:460-461`, `:515-516`) and `next_` is
-/// `BlockNode`'s (`:538`) — e013 and e015 both. That also keeps three methods out:
-/// `parametricIterCount` (`dsc/dsc2.cpp:4126`) and `parametricStride` (`:4197`) read
+/// `BlockNode`'s (`:538`) — e029_ScheduleNode and e030_BlockNode both. That also keeps three methods
+/// out: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and `parametricStride` (`:4197`) read
 /// `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb `getOwnerLoop()`, and `print`
 /// (`:4284`) prints `name_`.
+///
+/// ⚠️ THE FIVE REMAINING `e031_LoopNode.*` ANCHORS NAME NOTHING THIS TYPE CAN CARRY: `Ddc`,
+/// `DesignSpaceConfig`, `ScheduleTree` and `ScheduleNode` are the four `friend class` declarations
+/// (`dsc/dsc2.h:611-614`), and `rowId` is `parametricIterCount`'s fourth PARAMETER, `int rowId = -1`
+/// (`:602`). They stay open because a deleted anchor cannot be told from a finished one.
 ///
 /// ⛔ WHEN `next_` LANDS, THE `Clone` DERIVE BELOW BECOMES A DIVERGENCE. IBM's `clone()` is
 /// `new Derived(static_cast<Derived const&>(*this))` (`util/utils.h:105-107`), i.e. the copy
@@ -3030,7 +3199,7 @@ pub enum PropStateType {
 /// (`dsc/dsc2.h:1115-1116`).
 #[derive(Clone, Debug, Default)]
 pub struct LoopNode {
-    /// Field: e017_LoopNode.numId_
+    /// Field: e031_LoopNode.numId_
     ///
     /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, NOT A STAGE, AND NO READER TESTS
     /// FOR IT: every one indexes straight through, `dataStageParam_.at(numId_)`
@@ -3039,7 +3208,7 @@ pub struct LoopNode {
     /// numerator is an out-of-range throw and never a branch. The `>= 0` guards belong to
     /// [`den_id`](Self::den_id) alone.
     pub num_id: Option<DataStageId>,
-    /// Field: e017_LoopNode.denId_
+    /// Field: e031_LoopNode.denId_
     ///
     /// The denominator stage (`dsc/dsc2.h:574`). ⛔ NOT SYMMETRIC WITH [`num_id`](Self::num_id):
     /// this is the id with absence guards, and all three sit where the reader has climbed
@@ -3048,7 +3217,7 @@ pub struct LoopNode {
     /// other uses in that same function are unguarded (`ddc/ddcv1.cpp:607`, `:694`, `:701`,
     /// `:727-729`), so the guard marks the climb, not the field.
     pub den_id: Option<DataStageId>,
-    /// Field: e017_LoopNode.dims_
+    /// Field: e031_LoopNode.dims_
     ///
     /// ⛔ ORDERED INNER TO OUTER (`dsc/dsc2.h:575`, and `dsc/dsc2Pcfg.cpp:517` says `// Inner to
     /// outer` verbatim over a front-to-back walk), and bridge 1 depends on that: it walks `dim_idx`
@@ -3056,7 +3225,7 @@ pub struct LoopNode {
     /// as `.at(0)` = outermost, so the LAST entry becomes the OUTERMOST loop of the emitted nest
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNControlFlowLowering.cpp:893`, `:898-957`).
     pub dims: Vec<PrimaryDimAndKind>,
-    /// Field: e017_LoopNode.loopCountSymbolIds_
+    /// Field: e031_LoopNode.loopCountSymbolIds_
     ///
     /// One entry per symbolic dim: a single symbol for a pure symbolic or pivot dim, several
     /// (max-pivot) for an irregular one (`dsc/dsc2.h:576-578`).
@@ -3069,7 +3238,7 @@ pub struct LoopNode {
     /// [`is_dim_symbolic`](Self::is_dim_symbolic) then answers yes while bridge 1's
     /// `DT_CHECK(size() == 1)` on the bound is what fails (`SNControlFlowLowering.cpp:921-923`).
     pub loop_count_symbol_ids: BTreeMap<PrimaryDimTypes, Vec<VariableSymbol>>,
-    /// Field: e017_LoopNode.isParametricLoop_
+    /// Field: e031_LoopNode.isParametricLoop_
     ///
     /// Private in IBM's declaration (`dsc/dsc2.h:617`) and ONE-WAY: `markAsParametricLoop` is the
     /// only writer tree-wide (`ddc/ddl/ddl_conversion.cpp:1128`, `dsc/dsc2.cpp:1412`) and nothing
@@ -3078,7 +3247,7 @@ pub struct LoopNode {
     /// through friendship (`dsc/dsc2.cpp:414`, `:416`) — a read, so the getter below still covers it
     /// and this stays private.
     is_parametric_loop: bool,
-    /// Field: e017_LoopNode.parametricLdsIdx_
+    /// Field: e031_LoopNode.parametricLdsIdx_
     ///
     /// The reference tensor whose cumulative stick size along the loop dim IS the parametric loop's
     /// stride (`dsc/dsc2.h:618`, read at `dsc/dsc2.cpp:4198-4210`). ⛔ `-1` IS ABSENT and
@@ -3146,8 +3315,6 @@ impl LoopNode {
         self.dims.iter().any(|d| d.dim == dim)
     }
 }
-
-// crustify:todo: e017_LoopNode
 
 /// Replaces: CondOp
 ///
@@ -3360,21 +3527,199 @@ impl CondValType {
 
 // crustify:todo: e018_LoopCond.loopComp_
 
-// crustify:todo: e019_DataInfo
+/// One constant element offset added on top of a start address — the `int` of `constEleOffsets_`
+/// (`dsc/dsc2.h:727-729`).
+///
+/// ⛔ ELEMENTS ALONG ONE DIM, NOT BYTES AND NOT A STICK COUNT, which is what the field's own comment
+/// says ("constant offset on top of the start address") and what every writer produces: a padding
+/// front size (`ddc/ddcv1.cpp:2655-2656`), a padded dim size less its back pad (`:2670-2673`), a
+/// row-split offset the L3 path stores under `metadata.rowSplitDim` (`:2887`, `:2905`) and a
+/// `factor * size` product (`:3076`). ⭐ IT IS THEREFORE NOT [`BufferAddrOffset`]'s currency: bridge 1
+/// scales this one by the operand's element size and adds that one to an address as it stands.
+///
+/// ⛔ SIGNED, AND THE NEGATIVES ARE THE ERROR PATH, NOT A SENTINEL: `:2657-2660` and `:2674-2677`
+/// `DT_ERROR` on a negative pad AFTER storing it, so a port that made this unsigned would move the
+/// refusal earlier than IBM's and lose the loop name it reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstEleOffset(pub i32);
 
-// crustify:todo: e019_DataInfo.bufferSwitchPosition_
+/// The address step from one buffer to the next, per core and corelet — `bufferAddrOffset_`
+/// (`dsc/dsc2.h:735-737`).
+///
+/// ⛔ NOT [`BufferOffset`], THOUGH IT IS COPIED FROM ONE: both writers take
+/// `allocation->bufferOffsetCoreCorelet_` and then DIVIDE every entry by the unit's
+/// `addressGranularityScalePerUnit` (`ddc/ddcv1.cpp:2801-2806`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6267-6272`), so [`BufferOffset`]'s bytes and this are
+/// two currencies and assigning one to the other is `E0308`. ⭐ THE PROOF THAT THIS IS THE SAME
+/// CURRENCY AS `startAddr_` is that bridge 1 ADDS THEM: `bufferAddrOffset_.at(core).at(corelet)
+/// + 2 * getSingleDataStrict(startAddr_, ...)`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:1174-1180`).
+///
+/// ⛔ IT SURVIVES THE JSON ROUND TRIP AS A QUOTED STRING, not a number: the export writes
+/// `QUOTE(std::to_string(...))` (`dsc/dsc2.cpp:279-280`) and the import reads `std::stoll` of a
+/// `string_value()` (`:1267-1268`) — because the value is 64-bit and the JSON reader's numbers are
+/// not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BufferAddrOffset(pub i64);
 
-// crustify:todo: e019_DataInfo.constantId_
+/// What a [`DataInfo`] IS: an entry in `DesignSpaceConfig::labeledDs_` or one in its
+/// `constantInfo_`. IBM spells the pair as two `int` fields, `myLdsIdx_` and `constantId_`
+/// (`dsc/dsc2.h:722`, `:726`), and the name is `getLdsOrConstNameOfAllocNode`'s
+/// (`ddc/ddcv1.cpp:20-29`).
+///
+/// ⛔ THIS EXISTS TO MAKE THE AUTHORITY'S OWN `DT_CHECK` UNSPELLABLE. Both `isLabeledDs` and
+/// `isConstant` open with `DT_CHECK_MSG(!(myLdsIdx_ >= 0 && constantId_ >= 0), "Cannot be both
+/// labeledDs and constant.")` (`dsc/dsc2.h:741-750`) — the state it refuses is one this enum has no
+/// variant for, and the one rewrite that moves a `DataInfo` from the first to the second sets both
+/// halves in adjacent statements (`dsc/dsc2.cpp:5379-5380`), which here is ONE assignment and so
+/// cannot be half-done.
+///
+/// ⛔ [`AllocateNode`] DELIBERATELY DOES NOT MERGE ITS OWN PAIR, and that is not an inconsistency:
+/// `getLdsOrConstNameOfAllocNode` tests `tempStorageForCompute_` FIRST and only then `ldsIdx_` and
+/// `constIdx_` (`ddc/ddcv1.cpp:20-29`), so an allocation has three states, no `DT_CHECK` holds its
+/// two indices apart, and merging them there would delete a reachable combination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LdsOrConst {
+    /// `myLdsIdx_ >= 0` — an index into `DesignSpaceConfig::labeledDs_`, which is what
+    /// `getComputeOperandFormats` and `parametricStride` look the operand's format and stride up
+    /// with (`dsc/dsc2.cpp:2348-2357`, `:4203`).
+    LabeledDs(LdsIdx),
+    /// `constantId_ >= 0` — an index into `DesignSpaceConfig::constantInfo_`, taken when the
+    /// transfer's source is zero padding rather than a tensor (`dsc/dsc2.cpp:5375-5380`).
+    Constant(ConstantId),
+}
 
-// crustify:todo: e019_DataInfo.dataConnect_
+/// Replaces: e033_DataInfo
+///
+/// `dsc/dsc2.h:721-753`. WHICH data one operand of a node refers to and HOW its address is formed —
+/// the struct [`TransferNode`] holds four of and [`ComputeNode`] a vector of per operand
+/// (`dsc/dsc2.h:832-833`, `:937-938`). `fillLoopOffsetsAndAddresses` is what fills the address half,
+/// walking the enclosing loops of the allocation that backs the operand (`ddc/ddcv1.cpp:2360-2807`,
+/// and again for stage 2a at `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5780-6272`).
+///
+/// ⛔ SEVEN OF TEN DECLARED FIELDS ARE HERE. The three that are not, with the reason:
+///  * `startAddr_` (`:723`) is a `FoldManager<int64_t>`, e020_FoldManager, whose own dependencies
+///    are in `util/foldManager/` and unscoped;
+///  * `loopEleOffsets_` (`:730-734`) is keyed by `const LoopNode*` — POINTER IDENTITY, needing
+///    e029_ScheduleNode's `name_`, which is also the only thing the JSON export can order those keys
+///    by (`dsc/dsc2.cpp:251-256`). Its value currency is already here as [`TemporalStride`];
+///  * `bufferSwitchPosition_` (`:738`) is a `const LoopNode*` for the same reason.
+///
+/// ⛔ AND THOSE TWO POINTERS AND `bufferAddrOffset_` ARE ONE STATE, WRITTEN IN ONE BLOCK: everything
+/// at `ddc/ddcv1.cpp:2796-2807` is guarded by `allocation->numBuffers_ != 1`, so an empty
+/// [`buffer_addr_offset`](Self::buffer_addr_offset) and an absent buffer-switch loop mean the same
+/// thing — single-buffered — and a reader that finds one without the other is looking at a
+/// half-filled node.
+///
+/// ⛔ NO `PartialEq`, as no node type here has one: the authority declares no `operator==` for
+/// `DataInfo` and its consumers compare the parts they care about, `dataConnect_` above all
+/// (`ddc/ddc_fold.cpp:435`, `:1794`, `ddc/ddc_transformation_util.cpp:891`, `:997`).
+#[derive(Clone, Debug)]
+pub struct DataInfo {
+    /// Field: e033_DataInfo.myLdsIdx_
+    ///
+    /// Field: e033_DataInfo.constantId_
+    ///
+    /// The two `-1`-initialised indices of `dsc/dsc2.h:722` and `:726` as the one thing they encode.
+    /// [`None`] is IBM's `-1`/`-1`: a `DataInfo` that is neither, which is what
+    /// [`is_labeled_ds`](Self::is_labeled_ds) and [`is_constant`](Self::is_constant) both answer
+    /// `false` for. See [`LdsOrConst`] for why they are one field.
+    pub lds_or_const: Option<LdsOrConst>,
+    /// Field: e033_DataInfo.isStartAddrSymbolic_
+    ///
+    /// Whether `startAddr_` is a symbol to be resolved rather than a number (`dsc/dsc2.h:724`),
+    /// copied from the backing allocation (`ddc/ddcv1.cpp:2397`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5817`) and read immediately after to take the
+    /// symbolic branch (`ddc/ddcv1.cpp:2399`, `L3DlOpsScheduler.cpp:5833`, `:5855`).
+    pub is_start_addr_symbolic: bool,
+    /// Field: e033_DataInfo.latchDataId_
+    ///
+    /// The LATCH link between a producer and a consumer (`dsc/dsc2.h:725`). [`None`] is the field's
+    /// `-1` — "not latched" — exactly as [`LatchDataId`]'s own doc states, and the counter that
+    /// mints these only counts up (`ddc/ddc_transformation_util.cpp:967`).
+    ///
+    /// ⛔ THE `Option` IS WHERE FIVE `DT_CHECK`S GO. `latch_id != -1` is asserted at
+    /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:724`, `:903` and
+    /// `SNTransferLowering.cpp:957`, `:1660`, `:2154`, all with "latch id cannot be negative" — a
+    /// bridge that has to unwrap this cannot reach any of them.
+    ///
+    /// ⭐ ONE REWRITE WRITES ALL THREE HALVES OF A LATCH: `currLatchDataId` goes onto the producing
+    /// transfer's destination, the consuming transfer's source and every consuming compute's input in
+    /// one walk (`ddc/ddc_transformation_util.cpp:965-1010`).
+    pub latch_data_id: Option<LatchDataId>,
+    /// Field: e033_DataInfo.constEleOffsets_
+    ///
+    /// A constant element offset per core, corelet and dim (`dsc/dsc2.h:727-729`).
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, nor for `loopEleOffsets_` or `bufferAddrOffset_`:
+    /// all three declarations wrap onto a second line and `plan.py` reads the name off the first.
+    ///
+    /// ⛔ EMPTY IS A DECISION, NOT AN ABSENCE OF ONE. `fillLoopOffsetsAndAddresses` remembers whether
+    /// any offset existed before it starts broadcasting them across cores and corelets and CLEARS the
+    /// whole map again if none did (`ddc/ddcv1.cpp:2689`, `:2793`), and four readers test
+    /// `constEleOffsets_.empty()` to decide whether to write their own (`:2883`, `:2897`, `:2968`,
+    /// `:3001`).
+    ///
+    /// ⛔ THE INNERMOST MAP IS `std::unordered_map` IN C++ AND ITS ITERATION ORDER REACHES IBM'S
+    /// EXPORTED JSON (`dsc/dsc2.cpp:237-241`), so a [`BTreeMap`] here spells the dims in
+    /// [`PrimaryDimTypes`] declaration order where the reference spells them in libstdc++ hash order.
+    /// That is a text divergence in the exported node and it is deliberate: the outer two maps ARE
+    /// `std::map` and ordered, and one live reader takes `constEleOffsets_.begin()->second.begin()
+    /// ->second.begin()->second` (`ddc/ddl/ddl_conversion.cpp:3105-3111`, `:3167-3174`), which is
+    /// unordered in the authority and lowest-dim-first here.
+    pub const_ele_offsets:
+        BTreeMap<CoreId, BTreeMap<CoreletId, BTreeMap<PrimaryDimTypes, ConstEleOffset>>>,
+    /// Field: e033_DataInfo.bufferAddrOffset_
+    ///
+    /// The step to the next buffer, per core and corelet (`dsc/dsc2.h:735-737`). Ordered for the
+    /// same reason [`AllocateNode::buffer_offset_core_corelet`] is: both keys are `int` in the
+    /// authority, both are exported in key order (`dsc/dsc2.cpp:273-286`), and no writer uses a
+    /// negative pseudo-key. See [`BufferAddrOffset`]: it is NOT the allocation's byte stride.
+    pub buffer_addr_offset: BTreeMap<CoreId, BTreeMap<CoreletId, BufferAddrOffset>>,
+    /// Field: e033_DataInfo.dataConnect_
+    ///
+    /// The DDL wire name of this operand (`dsc/dsc2.h:739`) — the key under which the DDC indexes
+    /// producers and consumers (`ddc/ddcv1.cpp:3293-3308`) and the name it reports when it cannot
+    /// place an allocation (`:2424`, `:2627`).
+    ///
+    /// ⛔ NOT STABLE AND NOT UNIQUE: cloning a node for reuse APPENDS a suffix to it in place
+    /// (`ddc/ddc_transformation_util.cpp:1593-1594`), and the empty string is the ordinary "no data
+    /// connect" state that same line tests for — which is why this is a [`DataConnect`] and not an
+    /// [`Option`] of one.
+    pub data_connect: DataConnect,
+}
 
-// crustify:todo: e019_DataInfo.isStartAddrSymbolic_
+impl Default for DataInfo {
+    /// The authority's member initialisers (`dsc/dsc2.h:722-739`). ⛔ NOT `#[derive(Default)]`:
+    /// [`DataConnect`] wraps a [`String`] and deliberately derives no [`Default`], because a data
+    /// connect is a name the DDL authored and only a default-constructed node has none.
+    fn default() -> Self {
+        Self {
+            lds_or_const: None,
+            is_start_addr_symbolic: false,
+            latch_data_id: None,
+            const_ele_offsets: BTreeMap::new(),
+            buffer_addr_offset: BTreeMap::new(),
+            data_connect: DataConnect(String::new()),
+        }
+    }
+}
 
-// crustify:todo: e019_DataInfo.latchDataId_
+impl DataInfo {
+    /// `dsc/dsc2.h:741-745`. Whether this operand is an entry of `DesignSpaceConfig::labeledDs_`.
+    ///
+    /// ⭐ THE `DT_CHECK` THE AUTHORITY OPENS WITH IS DISCHARGED BY THE TYPE, so this is a total
+    /// function where IBM's throws — see [`LdsOrConst`].
+    pub fn is_labeled_ds(&self) -> bool {
+        matches!(self.lds_or_const, Some(LdsOrConst::LabeledDs(_)))
+    }
 
-// crustify:todo: e019_DataInfo.myLdsIdx_
-
-// crustify:todo: e019_DataInfo.startAddr_
+    /// `dsc/dsc2.h:746-750`. Whether this operand is an entry of `DesignSpaceConfig::constantInfo_`,
+    /// on the same terms as [`is_labeled_ds`](Self::is_labeled_ds).
+    pub fn is_constant(&self) -> bool {
+        matches!(self.lds_or_const, Some(LdsOrConst::Constant(_)))
+    }
+}
 
 // crustify:todo: e020_DistributionStatusInfo
 
@@ -3722,37 +4067,37 @@ pub struct TransferRepetition {
 /// `ddc/ddl/ddl_conversion.cpp:1166-1195`: a DDL `DataTransferOp` becomes one of these, with one
 /// [`DstVia`] per declared destination. e023_TransferNode is this same class under the superseded
 /// numbering, which listed ten of its fields; those are renumbered onto e034 below, and this batch
-/// adds `repetition_` and `paddingInfo_`.
+/// adds `repetition_`, `paddingInfo_` and the four `DataInfo` operands.
 ///
-/// ⛔ THIS CARRIES TWELVE OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED, so
-/// eight field anchors below stay open. Every one is blocked on a type another agent owns, none on
-/// this class:
-///  * `srcLdsAndLoopOffsets_`, `srcIndirectLdsAndLoopOffsets_` (`:832`) and
-///    `dstLdsAndLoopOffsets_`, `dstIndirectLdsAndLoopOffsets_` (`:833`) are `DataInfo` — e019;
+/// ⛔ THIS CARRIES SIXTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED. The
+/// other four, with the reason:
 ///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
-///    `const LoopNode*` held as POINTER IDENTITY, which needs e013's `name_`, exactly as
-///    `SyncNode::implicitSyncRefTransfer_` does;
-///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) — e013;
+///    `const LoopNode*` held as POINTER IDENTITY, which needs e029_ScheduleNode's `name_`, exactly as
+///    `DataInfo::bufferSwitchPosition_` does;
+///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) —
+///    e029_ScheduleNode;
 ///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012.
 ///
-/// ⚠️ AND FOUR OF THOSE EIGHT FIELDS HAVE NO ANCHOR AT ALL, so the open anchors undercount the
-/// remaining work: the scheduler's field scan takes one declarator per declaration, so
-/// `srcLdsAndLoopOffsets_` and `dstLdsAndLoopOffsets_` (`:832-833`) lost theirs to the `Indirect`
-/// twin sharing their line, and `CoreletView`'s `srcLoopsAndSize_` and `dstLoopsAndSizes_`
-/// (`:848-849`) lost theirs the same way. They are named here rather than anchored, since an invented
-/// anchor is indistinguishable from a scheduled one.
+/// ⚠️ AND THE OPEN ANCHORS DO NOT MATCH THAT SET, in both directions, because the scheduler's field
+/// scan takes one declarator per declaration:
+///  * `srcLdsAndLoopOffsets_` and `dstLdsAndLoopOffsets_` (`:832-833`) never got an anchor at all —
+///    each lost it to the `Indirect` twin sharing its line — yet both are now CARRIED, so they are
+///    anchored here with that fact noted on the field;
+///  * `srcIndirectLoopsAndSize_` and `dstIndirectLoopsAndSizes_` ARE anchored as if they were this
+///    class's, but they are `CoreletView`'s (`:848-849`); they stay open with `coreletViews_`, and
+///    their line-sharing twins `srcLoopsAndSize_` and `dstLoopsAndSizes_` have no anchor either.
 ///
-/// ⛔ AND SEVEN METHODS STAY OUT WITH THEM: `isSrcLabeledDs`, `isDstLabeledDs`, `isSrcConstant`,
-/// `isDstConstant` and `isDstIndirect` are one-line reads of the `DataInfo` fields above
-/// (`dsc/dsc2.h:867-878`), `getTransferType` is built from four of those five (`:884-896`), and
-/// `print` prints `name_` and each `DataInfo` (`dsc/dsc2.cpp:4385-4441`).
+/// ⭐ THE FIVE `DataInfo` PREDICATES AND `getTransferType` ARE HERE, because the four [`DataInfo`]
+/// fields they read landed with e033_DataInfo (`dsc/dsc2.h:867-896`). ⛔ ONLY `print` STAYS OUT: it
+/// prints `name_` (`dsc/dsc2.cpp:4385-4441`), which is e029_ScheduleNode's.
 ///
-/// ⛔ `dstVias_` AND `dstLdsAndLoopOffsets_` ARE PARALLEL VECTORS IN THE AUTHORITY, and this type
-/// cannot say so until e019 lands: the DDL conversion emplaces one of each per destination in the
-/// same iteration (`ddc/ddl/ddl_conversion.cpp:1176-1177`), and `hoistTransfersUpForReuse` takes
-/// [`non_memory_result_index`](Self::non_memory_result_index) — an index into `dstVias_` — and
-/// indexes `dstLdsAndLoopOffsets_` with it (`ddc/ddc_transformation.cpp:1570-1575`).
-/// [`TransferRepetition::dsts`] is the THIRD vector on that same index and it IS carried.
+/// ⛔ `dstVias_`, `dstLdsAndLoopOffsets_` AND [`TransferRepetition::dsts`] ARE THREE PARALLEL VECTORS
+/// ON ONE INDEX, and all three are now carried: the DDL conversion emplaces one of each per
+/// destination in the same iteration (`ddc/ddl/ddl_conversion.cpp:1176-1189`), and
+/// `hoistTransfersUpForReuse` takes [`non_memory_result_index`](Self::non_memory_result_index) — an
+/// index into `dstVias_` — and indexes `dstLdsAndLoopOffsets_` with it
+/// (`ddc/ddc_transformation.cpp:1570-1575`). Nothing in the type keeps their lengths equal, because
+/// nothing in the authority does.
 ///
 /// ⛔ NO `PartialEq`, as [`LoopNode`] has none: IBM declares no `operator==` and every consumer keys
 /// on the POINTER. ⛔ AND NO `Clone` DERIVE either, now that `paddingInfo_` is carried — see
@@ -3782,6 +4127,42 @@ pub struct TransferNode {
     /// The DDL allocation's replication for both ends (`dsc/dsc2.h:826-829`) — see
     /// [`TransferRepetition`], which names IBM's unnamed struct.
     pub repetition: TransferRepetition,
+    /// Field: e034_TransferNode.srcLdsAndLoopOffsets_
+    ///
+    /// What the source operand IS and how it is addressed (`dsc/dsc2.h:832`). `setDataLocAndInfo`
+    /// fills it from the DDL's source operand (`ddc/ddl/ddl_conversion.cpp:1169`) and
+    /// `fillLoopOffsetsAndAddresses` puts the addresses in (`ddc/ddcv1.cpp:2360-2806`).
+    ///
+    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, nor for
+    /// [`dst_lds_and_loop_offsets`](Self::dst_lds_and_loop_offsets): both are declared two-per-line
+    /// (`:832-833`) and `plan.py` takes only the first name of such a declaration, which is why the
+    /// two `Indirect` halves were anchored and these two were not.
+    pub src_lds_and_loop_offsets: DataInfo,
+    /// Field: e034_TransferNode.srcIndirectLdsAndLoopOffsets_
+    ///
+    /// The same, for the operand that HOLDS THE SOURCE ADDRESS when the read is indirect
+    /// (`dsc/dsc2.h:832`). [`is_src_indirect`](Self::is_src_indirect) is the test every reader applies
+    /// before touching it (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
+    pub src_indirect_lds_and_loop_offsets: DataInfo,
+    /// Field: e034_TransferNode.dstLdsAndLoopOffsets_
+    ///
+    /// One entry per destination (`dsc/dsc2.h:833`).
+    ///
+    /// ⛔ PARALLEL TO [`dst_vias`](Self::dst_vias), AND THE PAIRING IS BY INDEX: the DDL conversion
+    /// emplaces one of each per destination in the same iteration
+    /// (`ddc/ddl/ddl_conversion.cpp:1176-1177`), `hoistTransfersUpForReuse` takes
+    /// [`non_memory_result_index`](Self::non_memory_result_index) — an index into `dstVias_` — and
+    /// indexes THIS vector with it (`ddc/ddc_transformation.cpp:1570-1575`), and bridge 1 walks both
+    /// under one `dst_idx` (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2150-2153`).
+    /// They are two vectors here because IBM declares two and every writer pushes to them separately;
+    /// nothing in the type keeps their lengths equal.
+    pub dst_lds_and_loop_offsets: Vec<DataInfo>,
+    /// Field: e034_TransferNode.dstIndirectLdsAndLoopOffsets_
+    ///
+    /// The operands that hold the destination addresses when the writes are indirect
+    /// (`dsc/dsc2.h:833`). ⛔ ITS EMPTINESS IS THE WHOLE OF
+    /// [`is_dst_indirect`](Self::is_dst_indirect) (`dsc/dsc2.h:878`).
+    pub dst_indirect_lds_and_loop_offsets: Vec<DataInfo>,
     /// Field: e034_TransferNode.replicationFactor_
     ///
     /// How many times the loaded chunk is splatted, `1` for no splat (`dsc/dsc2.h:834`). Bridge 1
@@ -3879,7 +4260,7 @@ impl Default for TransferNode {
     /// [`DataLocation`]'s own (`sys-arch-spec/arch_enums.h:390-391`).
     ///
     /// ⛔ IT IS NOT `TransferNode()`: that constructor also passes `TRANSFER` to the base class
-    /// (`dsc/dsc2.h:815`), and `nodeType_` is `ScheduleNode`'s, e013's to port.
+    /// (`dsc/dsc2.h:815`), and `nodeType_` is `ScheduleNode`'s, e029_ScheduleNode's to port.
     ///
     /// ⛔ AND ONE MEMBER HAS NO INITIALISER TO REPRODUCE: `repetition_.srcRep_` (`:827`) is left
     /// uninitialised by that constructor, which is what [`TransferRepetition::src`]'s [`None`] spells.
@@ -3889,6 +4270,10 @@ impl Default for TransferNode {
             src_indirect: DataLocation::UNSET,
             dst_vias: Vec::new(),
             repetition: TransferRepetition::default(),
+            src_lds_and_loop_offsets: DataInfo::default(),
+            src_indirect_lds_and_loop_offsets: DataInfo::default(),
+            dst_lds_and_loop_offsets: Vec::new(),
+            dst_indirect_lds_and_loop_offsets: Vec::new(),
             replication_factor: 1,
             unit_time_transfer_chunk_size: Vec::new(),
             unit_time_transfer_num_chunks: 1,
@@ -3926,6 +4311,10 @@ impl Clone for TransferNode {
             src_indirect: self.src_indirect,
             dst_vias: self.dst_vias.clone(),
             repetition: self.repetition.clone(),
+            src_lds_and_loop_offsets: self.src_lds_and_loop_offsets.clone(),
+            src_indirect_lds_and_loop_offsets: self.src_indirect_lds_and_loop_offsets.clone(),
+            dst_lds_and_loop_offsets: self.dst_lds_and_loop_offsets.clone(),
+            dst_indirect_lds_and_loop_offsets: self.dst_indirect_lds_and_loop_offsets.clone(),
             replication_factor: self.replication_factor,
             unit_time_transfer_chunk_size: self.unit_time_transfer_chunk_size.clone(),
             unit_time_transfer_num_chunks: self.unit_time_transfer_num_chunks,
@@ -4000,19 +4389,89 @@ impl TransferNode {
     pub fn is_dst_indirect_at_index(&self, dst_vias_idx: usize) -> bool {
         self.dst_vias[dst_vias_idx].loc_indirect.unit != SenComponent::NoComponent
     }
+
+    /// `dsc/dsc2.h:866`. Whether the source is a labeled data structure. Its callers gate every
+    /// `labeledDs_.at(srcLdsAndLoopOffsets_.myLdsIdx_)` on it (`ddc/ddc_transformation.cpp:728`,
+    /// `ddc/ddcv1.cpp:1441`).
+    pub fn is_src_labeled_ds(&self) -> bool {
+        self.src_lds_and_loop_offsets.is_labeled_ds()
+    }
+
+    /// `dsc/dsc2.h:867-870`. Whether the FIRST destination is a labeled data structure — the
+    /// authority's `!dstLdsAndLoopOffsets_.empty() && front().isLabeledDs()`, which is what
+    /// [`Option::is_some_and`] over [`slice::first`] states.
+    ///
+    /// ⛔ IT ASKS ONLY THE FIRST DESTINATION THOUGH A MULTICAST HAS SEVERAL, so a transfer whose
+    /// SECOND destination is the tensor answers no. Verbatim, and
+    /// [`transfer_type`](Self::transfer_type) inherits it.
+    pub fn is_dst_labeled_ds(&self) -> bool {
+        self.dst_lds_and_loop_offsets
+            .first()
+            .is_some_and(DataInfo::is_labeled_ds)
+    }
+
+    /// `dsc/dsc2.h:871`. Whether the source is a constant container
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:2683-2687` reads the id it
+    /// promises).
+    pub fn is_src_constant(&self) -> bool {
+        self.src_lds_and_loop_offsets.is_constant()
+    }
+
+    /// `dsc/dsc2.h:872-875`. Whether the FIRST destination is a constant, on the same terms and with
+    /// the same first-only reach as [`is_dst_labeled_ds`](Self::is_dst_labeled_ds).
+    pub fn is_dst_constant(&self) -> bool {
+        self.dst_lds_and_loop_offsets
+            .first()
+            .is_some_and(DataInfo::is_constant)
+    }
+
+    /// `dsc/dsc2.h:878`. Whether ANY destination is addressed indirectly.
+    ///
+    /// ⛔ IT TESTS A VECTOR'S EMPTINESS, NOT A LOCATION, which is why it does not mirror
+    /// [`is_src_indirect`](Self::is_src_indirect): that one reads `srcIndirect_.unit_`, and the
+    /// per-destination form is [`is_dst_indirect_at_index`](Self::is_dst_indirect_at_index), which
+    /// reads `dstVias_[i].locIndirect_`. So the three are three different questions and the
+    /// authority answers them from three different fields.
+    pub fn is_dst_indirect(&self) -> bool {
+        !self.dst_indirect_lds_and_loop_offsets.is_empty()
+    }
+
+    /// `dsc/dsc2.h:884-896`. Which ends of the transfer are tensors, derived from the four predicates
+    /// above and from nothing else.
+    ///
+    /// ⛔ THE TESTS ARE ORDERED AND THE ORDER IS LOAD-BEARING: constant-to-constant is asked before
+    /// constant-to-tensor, so it wins where both hold. [`TransferType::Invalid`] is the fallthrough
+    /// and it is a REFUSAL rather than a case — read that variant's own doc before matching it.
+    ///
+    /// ⛔ TENSOR-TO-CONSTANT AND CONSTANT-TO-NOTHING BOTH FALL THROUGH TO THE REFUSAL. There is no
+    /// arm for a constant DESTINATION other than the first, so a tensor source writing one fails the
+    /// fifth arm on `!isDstConstant()` and a constant source with an empty destination list fails
+    /// every arm that asks about a destination at all — the enum names five forms of transfer and
+    /// this is a five-way chain, not a matrix.
+    pub fn transfer_type(&self) -> TransferType {
+        match (
+            self.is_src_labeled_ds(),
+            self.is_src_constant(),
+            self.is_dst_labeled_ds(),
+            self.is_dst_constant(),
+        ) {
+            (_, true, _, true) => TransferType::ConstantToConstant,
+            (_, true, true, _) => TransferType::ConstantToTensor,
+            (true, _, true, _) => TransferType::TensorToTensor,
+            (false, false, true, _) => TransferType::NoTransferToTensor,
+            (true, _, false, false) => TransferType::NoTransferFromTensor,
+            _ => TransferType::Invalid,
+        }
+    }
 }
 
 // crustify:todo: e034_TransferNode.coreletViews_
-
-// crustify:todo: e034_TransferNode.dstIndirectLdsAndLoopOffsets_
 
 // crustify:todo: e034_TransferNode.dstIndirectLoopsAndSizes_
 
 // crustify:todo: e034_TransferNode.lastFusableParentLoopDst_
 
 // crustify:todo: e034_TransferNode.lastFusableParentLoopSrc_
-
-// crustify:todo: e034_TransferNode.srcIndirectLdsAndLoopOffsets_
 
 // crustify:todo: e034_TransferNode.srcIndirectLoopsAndSize_
 
@@ -4679,15 +5138,17 @@ pub struct ComputeCoreletView {
 ///
 /// ⛔ THIS CARRIES COMPUTENODE'S OWN DECLARED FIELDS AND NOTHING INHERITED — IBM derives it from
 /// `InheritWithClone<ScheduleNode, ComputeNode>` and its constructor tags the base with `COMPUTE`
-/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. FIVE field anchors stay OPEN,
-/// every one blocked on a type another agent owns and none on this class: `inputsLdsAndLoopOffsets_`
-/// and `outputsLdsAndLoopOffsets_` are `std::vector<DataInfo>` (`:937-938`), e019; `inputCoordinates_`
-/// and `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`), e012. ⛔ `port.json`
-/// names this unit's ONE dep `e023_CoordinateType`, a renumbering artefact that is NOT satisfied.
+/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. THREE field anchors stay OPEN,
+/// every one blocked on a type another agent owns and none on this class: `inputCoordinates_` and
+/// `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`), e012, and the third is
+/// `instrAttribute_.computeMaskLoopOffsets_` below. ⛔ `port.json` names this unit's ONE dep
+/// `e023_CoordinateType`, a renumbering artefact that is NOT satisfied.
 /// ⭐ `coreletViews_` AND ITS TWO SEPARATELY ANCHORED HALVES ARE PORTED HERE and were not portable
 /// when e024 ran: `ScheduleNode::UnitView` (`:943-947`) landed with e029 in `625e761da`.
+/// ⭐ AND `inputsLdsAndLoopOffsets_` / `outputsLdsAndLoopOffsets_` (`:937-938`) ARE CARRIED NOW: the
+/// `std::vector<DataInfo>` that blocked them is ported as e033_DataInfo in this same changeset.
 ///
-/// ⛔ AND THE FIFTH, `instrAttribute_.computeMaskLoopOffsets_`, IS KEYED BY A `const LoopNode*` WHOSE
+/// ⛔ AND `instrAttribute_.computeMaskLoopOffsets_` IS KEYED BY A `const LoopNode*` WHOSE
 /// KEY MAY BE NULL (`:923-925`), which is a TREE fact and not a node fact. Its wire form keys by the
 /// loop's `ScheduleNode::name_` — the exporter substitutes `""` for a null key and re-sorts that
 /// level by name (`dsc/dsc2.cpp:172-190`), the importer resolves it through a `nodeNamePtrMap` seeded
@@ -4699,8 +5160,13 @@ pub struct ComputeCoreletView {
 /// MLIR loop's induction variable and refuses more than one entry
 /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:60-80`, from `:997-1008`).
 ///
-/// ⛔ `print` IS THE ONE METHOD LEFT OUT, and e019 alone still blocks it — it prints the base's
-/// `name_`, which has landed, and then each `DataInfo`'s own `print` (`dsc/dsc2.cpp:4443-4477`).
+/// ⛔ `print` IS THE ONE METHOD LEFT OUT, and what blocks it is now inside [`DataInfo`] rather than
+/// `DataInfo` itself: it prints the base's `name_`, which has landed, and then each `DataInfo`'s own
+/// `print` (`dsc/dsc2.cpp:4443-4477`), which walks `loopEleOffsets_` — dereferencing every
+/// `const LoopNode*` key for its `name_` — and then `bufferSwitchPosition_->print`
+/// (`dsc/dsc2.cpp:4335-4356`). Those are two of the three fields e033_DataInfo left open; the third,
+/// `startAddr_`, is not a blocker at all, because its section of that function is COMMENTED OUT
+/// (`:4315-4321`).
 ///
 /// ⚠️ AND ELEVEN OF THE 24 FILLED ANCHORS NAME A FIELD THE e035 LIST DOES NOT CARRY, so the
 /// scheduled count undercounts this class: `instrAttribute_`, and all ten `InstrAttribute` members
@@ -4748,6 +5214,27 @@ pub struct ComputeNode {
     /// Where each output goes (`dsc/dsc2.h:936`), on the same terms
     /// (`ddc/ddl/ddl_conversion.cpp:1396-1407`).
     pub outputs: Vec<SenComponent>,
+    /// Field: e035_ComputeNode.inputsLdsAndLoopOffsets_
+    ///
+    /// One [`DataInfo`] per input, pushed in lockstep with [`inputs`](Self::inputs) and
+    /// `repetitionWithOffset_.forInputs_` (`dsc/dsc2.h:937`,
+    /// `ddc/ddl/ddl_conversion.cpp:1385-1395`).
+    ///
+    /// ⛔ THE FOLD PASS INDEXES THIS AND [`inputs`](Self::inputs) WITH THE SAME `i`
+    /// (`ddc/ddc_fold.cpp:170-172`, `:2044`, `:2089`), and the latch rewrite writes both halves in one
+    /// walk (`ddc/ddc_transformation_util.cpp:995-1010`) — so the two vectors are parallel and a
+    /// reader that shortens one has broken the other.
+    pub inputs_lds_and_loop_offsets: Vec<DataInfo>,
+    /// Field: e035_ComputeNode.outputsLdsAndLoopOffsets_
+    ///
+    /// One [`DataInfo`] per output, on the same terms (`dsc/dsc2.h:938`,
+    /// `ddc/ddl/ddl_conversion.cpp:1396-1407`).
+    ///
+    /// ⛔ ENTRY 0 IS THE ONE `getComputeOperandFormats` READS FOR A PACKMERGE
+    /// (`dsc/dsc2.cpp:2348-2357`), and it reads it as `labeledDs_.at(myLdsIdx_).dataFormat_` — which
+    /// is why [`operand_formats`](Self::operand_formats) takes the resolved format as its argument:
+    /// `DesignSpaceConfig::labeledDs_`, not this field, is the hop still missing.
+    pub outputs_lds_and_loop_offsets: Vec<DataInfo>,
     /// Field: e035_ComputeNode.instrAttribute_
     ///
     /// `dsc/dsc2.h:939`.
@@ -4784,7 +5271,7 @@ pub struct ComputeNode {
 impl Default for ComputeNode {
     /// The authority's default member initializers (`dsc/dsc2.h:932-941`, `:950-954`). ⛔ WHAT IT
     /// CANNOT SET IS THE BASE'S TAG: `ComputeNode()` passes `COMPUTE` to `ScheduleNode`
-    /// (`dsc/dsc2.h:901`), and that field is e013's.
+    /// (`dsc/dsc2.h:901`), and that field is e029_ScheduleNode's.
     fn default() -> Self {
         Self {
             ex_unit: SenComponent::NoComponent,
@@ -4792,6 +5279,8 @@ impl Default for ComputeNode {
             data_format: DataFormats::Sen169Fp16,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            inputs_lds_and_loop_offsets: Vec::new(),
+            outputs_lds_and_loop_offsets: Vec::new(),
             instr_attribute: InstrAttribute::default(),
             num_folds_engaged: NumFoldsEngaged(1),
             is_opaque_op: false,
@@ -4925,8 +5414,11 @@ impl ComputeNode {
     /// OUT OF IT — `dsc.labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).dataFormat_`
     /// (`:2352-2353`), and only for `PACKMERGE` — the same narrowing
     /// [`operand_sizes`](Self::operand_sizes) performs on `const SenSystemDef&`. It is what keeps
-    /// this method WHOLE, since both hops of that lookup are unported: e019's `DataInfo`, and
-    /// [`DesignSpaceConfig`](crate::schedule::dsc::DesignSpaceConfig) carries no `labeledDs_`.
+    /// this method WHOLE, and only ONE of that lookup's two hops is unported now: the first is here
+    /// as [`outputs_lds_and_loop_offsets`](Self::outputs_lds_and_loop_offsets)`[0].lds_or_const`,
+    /// since e033_DataInfo lands in this changeset, but
+    /// [`DesignSpaceConfig`](crate::schedule::dsc::DesignSpaceConfig) carries no `labeledDs_` to
+    /// resolve the format with.
     /// ⛔ SO THE ARGUMENT IS IGNORED ON EVERY OTHER OP, exactly as IBM's `dsc` is.
     ///
     /// ⛔ FOUR INPUTS YIELD FEWER FORMATS THAN THREE (`:2372-2373`, `:2392-2393`), and every caller
@@ -4986,11 +5478,7 @@ impl ComputeNode {
 
 // crustify:todo: e035_ComputeNode.inputCoordinates_
 
-// crustify:todo: e035_ComputeNode.inputsLdsAndLoopOffsets_
-
 // crustify:todo: e035_ComputeNode.outputCoordinate_
-
-// crustify:todo: e035_ComputeNode.outputsLdsAndLoopOffsets_
 
 /// Replaces: e025_ConditionNode
 ///
@@ -6751,3 +7239,43 @@ mod equivalence {
         }
     }
 }
+
+// crustify:todo: e030_BlockNode
+
+// crustify:todo: e030_BlockNode.BaseClass
+
+// crustify:todo: e030_BlockNode.Ddc
+
+// crustify:todo: e030_BlockNode.DesignSpaceConfig
+
+// crustify:todo: e030_BlockNode.L3DlOpsScheduler
+
+// crustify:todo: e030_BlockNode.ScheduleNode
+
+// crustify:todo: e030_BlockNode.ScheduleTree
+
+// crustify:todo: e030_BlockNode.coreId
+
+// crustify:todo: e030_BlockNode.next_
+
+// crustify:todo: e031_LoopNode
+
+// crustify:todo: e031_LoopNode.Ddc
+
+// crustify:todo: e031_LoopNode.DesignSpaceConfig
+
+// crustify:todo: e031_LoopNode.ScheduleNode
+
+// crustify:todo: e031_LoopNode.ScheduleTree
+
+// crustify:todo: e031_LoopNode.rowId
+
+// crustify:todo: e032_ScheduleTree
+
+// crustify:todo: e032_ScheduleTree.head_
+
+// crustify:todo: e033_DataInfo.bufferSwitchPosition_
+
+// crustify:todo: e033_DataInfo.loopEleOffsets_
+
+// crustify:todo: e033_DataInfo.startAddr_
