@@ -248,7 +248,12 @@ fn ddc_coord_env_option() -> Option<String> {
 /// ⛔ NOT `Clone`, AND NEITHER IS `class Ddc`: [`Ddc::metadata`] alone deletes its copy-construction
 /// (`ddc/ddc_metadata.h:130-137`) and its copy-assignment (`:211-212`), and the `const
 /// DesignSpaceConfigGlobal&` at `ddc/ddc.h:37` deletes copy-assignment a second time over.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// ⛔ AND NOT `PartialEq` EITHER, FOR THE SAME REASON ONE STEP DOWN: [`Metadata`] carries the
+/// `std::vector<ExternalTransfer>` of OWNED nodes (`ddc/ddc_metadata.h:130-137`), and neither that
+/// entry nor either node type declares an `operator==` — a node's identity in the authority is its
+/// address, not its value. Assert on the field you mean.
+#[derive(Debug)]
 pub struct Ddc {
     /// Field: e025_Ddc.verbose_
     ///
