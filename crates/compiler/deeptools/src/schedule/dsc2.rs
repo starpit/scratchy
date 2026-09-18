@@ -4532,7 +4532,7 @@ impl DataFormats {
 /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1542-1550`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstrAttribute {
-    /// Field: e024_ComputeNode.indices_
+    /// Field: e035_ComputeNode.indices_
     ///
     /// The PACK/MERGE mapping (`dsc/dsc2.h:906`), one entry per slot of the instruction word. The
     /// LENGTH is load-bearing: `expand_indices` derives each entry's width from it as
@@ -4548,30 +4548,30 @@ pub struct InstrAttribute {
     /// into -2, -1 at scale 2 (`ddc/ddc_transformation.cpp:1952`) — and a hole cannot expand into
     /// two unequal holes. See [`PackMergeIndex`].
     pub indices: Vec<PackMergeIndex>,
-    /// Field: e024_ComputeNode.repetition_
+    /// Field: e035_ComputeNode.repetition_
     ///
     /// `dsc/dsc2.h:907` — "default 8 slices works the same".
     pub repetition: Repetition,
-    /// Field: e024_ComputeNode.sign_extend_
+    /// Field: e035_ComputeNode.sign_extend_
     ///
     /// Whether a PACK/MERGE extends signed (`dsc/dsc2.h:908`), read as a bool attribute by bridge 1
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1124`).
     pub sign_extend: bool,
-    /// Field: e024_ComputeNode.read_write_reg_map_
+    /// Field: e035_ComputeNode.read_write_reg_map_
     ///
     /// An OPAQUE op's read/write register alias map (`dsc/dsc2.h:909-910`); `Ddc::finalizeOps` sizes
     /// its register window from it (`ddc/ddcv1.cpp:3376-3377`).
     pub read_write_reg_map: BTreeMap<String, String>,
-    /// Field: e024_ComputeNode.read_only_reg_map_
+    /// Field: e035_ComputeNode.read_only_reg_map_
     ///
     /// The read-only half of the same (`dsc/dsc2.h:911-912`, `ddc/ddcv1.cpp:3391`).
     pub read_only_reg_map: BTreeMap<String, String>,
-    /// Field: e024_ComputeNode.param_map_
+    /// Field: e035_ComputeNode.param_map_
     ///
     /// An OPAQUE op's parameter alias map (`dsc/dsc2.h:913-914`). ⛔ THE SCHEDULER WRITES INTO IT:
     /// `Ddc::finalizeOps` sets `"unroll"` and `"prec"` (`ddc/ddcv1.cpp:3343`, `:3395-3397`).
     pub param_map: BTreeMap<String, String>,
-    /// Field: e024_ComputeNode.mode_
+    /// Field: e035_ComputeNode.mode_
     ///
     /// `dsc/dsc2.h:915`. `-1` IS ABSENT TO EVERY BRANCHING READER — the DDL writes the field only
     /// when it states one (`ddc/ddl/ddl_conversion.cpp:1368-1370`), and each bridge-1 reader tests
@@ -4581,19 +4581,19 @@ pub struct InstrAttribute {
     /// and not be skipped — unlike [`Self::indices`], where the same "-1 means absent" reading is
     /// wrong outright. See [`Mode`] for both wire writers.
     pub mode: Option<Mode>,
-    /// Field: e024_ComputeNode.compute_mask_
+    /// Field: e035_ComputeNode.compute_mask_
     ///
     /// `dsc/dsc2.h:916`, all eight slices unless the DDL states a mask
     /// (`ddc/ddl/ddl_conversion.cpp:1371-1373`).
     pub compute_mask: ComputeMask,
-    // crustify:todo: e024_ComputeNode.computeMaskLoopOffsets_
-    /// Field: e024_ComputeNode.input_data_connects_
+    // crustify:todo: e035_ComputeNode.computeMaskLoopOffsets_
+    /// Field: e035_ComputeNode.input_data_connects_
     ///
     /// One name per input of an OPAQUE op (`dsc/dsc2.h:926-927`), index-parallel with
     /// [`ComputeNode::inputs`] where the fold pass reads them together
     /// (`ddc/ddc_fold.cpp:1632`, `:1856`).
     pub input_data_connects: Vec<DataConnect>,
-    /// Field: e024_ComputeNode.output_data_connects_
+    /// Field: e035_ComputeNode.output_data_connects_
     ///
     /// The output half of the same (`dsc/dsc2.h:928-929`, `ddc/ddc_fold.cpp:4202-4226`).
     pub output_data_connects: Vec<DataConnect>,
@@ -4633,11 +4633,11 @@ impl Default for InstrAttribute {
 /// because a pass consults it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepetitionWithOffset {
-    /// Field: e024_ComputeNode.forInputs_
+    /// Field: e035_ComputeNode.forInputs_
     ///
     /// `dsc/dsc2.h:951`. ⛔ WRITTEN AND NEVER READ — see the type's note above.
     pub for_inputs: Vec<Repetition>,
-    /// Field: e024_ComputeNode.forOutputs_
+    /// Field: e035_ComputeNode.forOutputs_
     ///
     /// `dsc/dsc2.h:952`. ⛔ A SPREAD THE TRANSFORMATION CONSUMES: it clones the node
     /// `for_outputs[idx] - 1` further times and writes 1 back into the clone
@@ -4645,31 +4645,67 @@ pub struct RepetitionWithOffset {
     pub for_outputs: Vec<Repetition>,
 }
 
+/// `ComputeNode::CoreletView` (`dsc/dsc2.h:943-947`) — what ONE corelet sees of this instruction's
+/// operands. Named for its owner because [`TransferNode`]'s nested `CoreletView` (`:847-851`) is a
+/// different type with different members.
+///
+/// ⛔ BOTH VECTORS ARE INDEX-PARALLEL WITH THE OPERAND LIST THEY DESCRIBE, and bridge 1 depends on
+/// that: it reads `inputsLoopsAndSizes_[index]` for input `index`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:552-553`, `:571-572`) — EXCEPT that an
+/// input arriving on `NFWD0`/`NFWD2` reads `outputsLoopsAndSizes_.front()` instead (`:548-550`,
+/// `:568-570`), a forwarded operand being the output's own view.
+#[derive(Clone, Debug, Default)]
+pub struct ComputeCoreletView {
+    /// Field: e035_ComputeNode.inputsLoopsAndSizes_
+    ///
+    /// One view per entry of [`ComputeNode::inputs`], built from that input's own `DataInfo`
+    /// (`dsc/dsc2.cpp:3021-3025`).
+    pub inputs_loops_and_sizes: Vec<UnitView>,
+    /// Field: e035_ComputeNode.outputsLoopsAndSizes_
+    ///
+    /// One view per entry of [`ComputeNode::outputs`], on the same terms (`dsc/dsc2.cpp:3026-3031`).
+    pub outputs_loops_and_sizes: Vec<UnitView>,
+}
+
+/// Replaces: e035_ComputeNode
+///
 /// `dsc/dsc2.h:900-962`. One compute instruction in the schedule tree: the unit it issues on, the
 /// op, the operand components and the instruction attributes.
 ///
+/// `e024_ComputeNode` is this same class under the superseded numbering; its 21 filled field anchors
+/// are RENUMBERED onto e035 here, not deleted — each has an e035 counterpart. It came back for the
+/// reason `0aa459e2e` records: `plan.py` matches `/// Replaces: (e\d{3}_[A-Za-z0-9_]+)` on the class
+/// name, so a port emitting only `/// Field:` anchors is never in the set.
+///
 /// ⛔ THIS CARRIES COMPUTENODE'S OWN DECLARED FIELDS AND NOTHING INHERITED — IBM derives it from
 /// `InheritWithClone<ScheduleNode, ComputeNode>` and its constructor tags the base with `COMPUTE`
-/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e013's. So the `e024_ComputeNode`
-/// anchor at the end of this file is still open, and these five fields stay with it:
-///  * `inputsLdsAndLoopOffsets_` and `outputsLdsAndLoopOffsets_` are `std::vector<DataInfo>`
-///    (`:937-938`) — e019, still unported;
-///  * `coreletViews_` is a per-corelet `CoreletView`, and both of its halves are
-///    `std::vector<ScheduleNode::UnitView>` (`:943-947`) — e013's nested type;
-///  * `inputCoordinates_` and `outputCoordinate_` are `CoordinateType<CoordinateBaseType>`
-///    (`:948-949`) — e012, still unported;
-///  * `instrAttribute_.computeMaskLoopOffsets_` is keyed by `const LoopNode*` (`:923-925`), the
-///    pointer identity that `dsc/dsc2.cpp:1165-1216` round-trips through a node-name map.
+/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. FIVE field anchors stay OPEN,
+/// every one blocked on a type another agent owns and none on this class: `inputsLdsAndLoopOffsets_`
+/// and `outputsLdsAndLoopOffsets_` are `std::vector<DataInfo>` (`:937-938`), e019; `inputCoordinates_`
+/// and `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`), e012. ⛔ `port.json`
+/// names this unit's ONE dep `e023_CoordinateType`, a renumbering artefact that is NOT satisfied.
+/// ⭐ `coreletViews_` AND ITS TWO SEPARATELY ANCHORED HALVES ARE PORTED HERE and were not portable
+/// when e024 ran: `ScheduleNode::UnitView` (`:943-947`) landed with e029 in `625e761da`.
 ///
-/// ⛔ AND TWO OF THE THREE METHODS STAY OUT WITH THEM: `getComputeOperandFormats` reads
-/// `dsc.labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).dataFormat_` for a PACKMERGE
-/// (`dsc/dsc2.cpp:2348-2357`), which needs e019 and `DesignSpaceConfig`; `print` prints the base's
-/// `name_` and each `DataInfo` (`dsc/dsc2.cpp:4443-4477`).
+/// ⛔ AND THE FIFTH, `instrAttribute_.computeMaskLoopOffsets_`, IS KEYED BY A `const LoopNode*` WHOSE
+/// KEY MAY BE NULL (`:923-925`), which is a TREE fact and not a node fact. Its wire form keys by the
+/// loop's `ScheduleNode::name_` — the exporter substitutes `""` for a null key and re-sorts that
+/// level by name (`dsc/dsc2.cpp:172-190`), the importer resolves it through a `nodeNamePtrMap` seeded
+/// `{"", nullptr}` (`:1198-1205`, `:1369`) — and `name_` has landed, so the blocker is no longer the
+/// name. It stays open because the CHOICE is the campaign's and e029 made it the other way: that port
+/// left `e029_ScheduleNode.loop_`, the `const LoopNode*` inside [`LoopInfo`], open rather than
+/// substituting a name, and this key must agree with that one. The pointer is load-bearing at the far
+/// end rather than mere identity: bridge 1 hands it to `getMLIRLoopFromLoopNode` for the enclosing
+/// MLIR loop's induction variable and refuses more than one entry
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:60-80`, from `:997-1008`).
 ///
-/// ⭐ IT IS ONE BRANCH OF TWO THAT BLOCKS THE FORMER, not the body: past the PACKMERGE early return
-/// the rest reads only `type_`, `dataFormat_` and `inputs_.size()` (`dsc/dsc2.cpp:2358-2394`), all
-/// carried here. The method stays whole rather than shipping a half that answers for 70 ops and not
-/// the 71st.
+/// ⛔ `print` IS THE ONE METHOD LEFT OUT, and e019 alone still blocks it — it prints the base's
+/// `name_`, which has landed, and then each `DataInfo`'s own `print` (`dsc/dsc2.cpp:4443-4477`).
+///
+/// ⚠️ AND ELEVEN OF THE 24 FILLED ANCHORS NAME A FIELD THE e035 LIST DOES NOT CARRY, so the
+/// scheduled count undercounts this class: `instrAttribute_`, and all ten `InstrAttribute` members
+/// but `computeMaskLoopOffsets_` (`:906-929`). No rule for that is derived here — `type_`, `inputs_`
+/// and `outputs_` are listed and equally plain. They keep anchors because the fields are carried.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the POINTER. `AllocateNode::allocUsers_` is
 /// a `std::vector<std::pair<const ScheduleNode*, int>>` and all three of its operations match a user
@@ -4677,17 +4713,17 @@ pub struct RepetitionWithOffset {
 /// fold pass then walks that pointer-keyed list (`ddc/ddc_fold.cpp:1688`).
 #[derive(Clone, Debug)]
 pub struct ComputeNode {
-    /// Field: e024_ComputeNode.exUnit_
+    /// Field: e035_ComputeNode.exUnit_
     ///
     /// The execution unit the instruction issues on (`dsc/dsc2.h:932`). ⛔ A COMPUTE WHOSE OWN
     /// `exUnit_` APPEARS IN ITS OPERANDS IS ILLEGAL DDL (`ddc/ddl/ddl_conversion.cpp:1478-1487`).
     pub ex_unit: SenComponent,
-    /// Field: e024_ComputeNode.type_
+    /// Field: e035_ComputeNode.type_
     ///
     /// The op (`dsc/dsc2.h:933`). Its `COUNT` initialiser means "not chosen yet"; the DDL conversion
     /// always overwrites it (`ddc/ddl/ddl_conversion.cpp:1410-1437`).
     pub r#type: ComputeOpType,
-    /// Field: e024_ComputeNode.dataFormat_
+    /// Field: e035_ComputeNode.dataFormat_
     ///
     /// The precision the op runs at (`dsc/dsc2.h:934`). ⛔ IT IS THE OP'S PRECISION FOR `MACC`
     /// ALONE, which is why [`Self::operand_sizes`] dispatches on it for that one op: a `"macc"` in
@@ -4701,33 +4737,45 @@ pub struct ComputeNode {
     /// and the `1024 / bit_width` default in [`Self::operand_sizes`] only ever divides by 32 or 16
     /// there.
     pub data_format: DataFormats,
-    /// Field: e024_ComputeNode.inputs_
+    /// Field: e035_ComputeNode.inputs_
     ///
     /// Where each input comes from (`dsc/dsc2.h:935`), pushed in lockstep with
     /// `inputsLdsAndLoopOffsets_` and `repetitionWithOffset_.forInputs_`
     /// (`ddc/ddl/ddl_conversion.cpp:1385-1395`).
     pub inputs: Vec<SenComponent>,
-    /// Field: e024_ComputeNode.outputs_
+    /// Field: e035_ComputeNode.outputs_
     ///
     /// Where each output goes (`dsc/dsc2.h:936`), on the same terms
     /// (`ddc/ddl/ddl_conversion.cpp:1396-1407`).
     pub outputs: Vec<SenComponent>,
-    /// Field: e024_ComputeNode.instrAttribute_
+    /// Field: e035_ComputeNode.instrAttribute_
     ///
     /// `dsc/dsc2.h:939`.
     pub instr_attribute: InstrAttribute,
-    /// Field: e024_ComputeNode.numFoldsEngaged
+    /// Field: e035_ComputeNode.numFoldsEngaged
     ///
     /// `dsc/dsc2.h:940`. ⛔ IT SCALES EVERY OPERAND SIZE (`dsc/dsc2.cpp:2333`, `:2344`); `Ddc` sets
     /// it from the unit's fold count (`ddc/ddcv1.cpp:1887`).
     pub num_folds_engaged: NumFoldsEngaged,
-    /// Field: e024_ComputeNode.isOpaqueOp_
+    /// Field: e035_ComputeNode.isOpaqueOp_
     ///
     /// Whether the DDL supplied the instruction verbatim (`dsc/dsc2.h:941`). ⛔ THE FOLD AND
     /// TRANSFORMATION PASSES BRANCH ON IT before reading the data connects
     /// (`ddc/ddc_fold.cpp:1630`, `:1853`, `ddc/ddc_transformation_util.cpp:1466`).
     pub is_opaque_op: bool,
-    /// Field: e024_ComputeNode.repetitionWithOffset_
+    /// Field: e035_ComputeNode.coreletViews_
+    ///
+    /// One [`ComputeCoreletView`] per corelet (`dsc/dsc2.h:948`), filled for every corelet in
+    /// `0..numCoreletsUsed_DSC2_` by `finalizeScheduleTree` (`dsc/dsc2.cpp:3019-3032`).
+    ///
+    /// ⛔ KEYED BY CORELET ALONE, AND EVERY CORELET'S VIEWS ARE BUILT FROM ONE CORE: the writer
+    /// iterates `coreIdsUsed_.front()` only, and says why — "do not insert view for each core until
+    /// we have expanded coreletViews to coreCoreletViews" (`dsc/dsc2.cpp:3015-3018`), an assumption
+    /// bridge 1 restates where it takes `.begin()` for the uniform case
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:546-547`). The per-core answer
+    /// comes from [`UnitView::sizes_for_core`] inside the view, not from a second key.
+    pub corelet_views: BTreeMap<CoreletId, ComputeCoreletView>,
+    /// Field: e035_ComputeNode.repetitionWithOffset_
     ///
     /// `dsc/dsc2.h:954`.
     pub repetition_with_offset: RepetitionWithOffset,
@@ -4747,6 +4795,7 @@ impl Default for ComputeNode {
             instr_attribute: InstrAttribute::default(),
             num_folds_engaged: NumFoldsEngaged(1),
             is_opaque_op: false,
+            corelet_views: BTreeMap::new(),
             repetition_with_offset: RepetitionWithOffset::default(),
         }
     }
@@ -4869,23 +4918,79 @@ impl ComputeNode {
         sizes.push(OperandSize(output * self.num_folds_engaged.0));
         Some(sizes)
     }
+
+    /// `dsc/dsc2.cpp:2348-2396`. Every operand's FORMAT, inputs in order and the output LAST.
+    ///
+    /// ⭐ THE PARAMETER IS IBM'S `const DesignSpaceConfig&` NARROWED TO THE ONE VALUE THE BODY READS
+    /// OUT OF IT — `dsc.labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).dataFormat_`
+    /// (`:2352-2353`), and only for `PACKMERGE` — the same narrowing
+    /// [`operand_sizes`](Self::operand_sizes) performs on `const SenSystemDef&`. It is what keeps
+    /// this method WHOLE, since both hops of that lookup are unported: e019's `DataInfo`, and
+    /// [`DesignSpaceConfig`](crate::schedule::dsc::DesignSpaceConfig) carries no `labeledDs_`.
+    /// ⛔ SO THE ARGUMENT IS IGNORED ON EVERY OTHER OP, exactly as IBM's `dsc` is.
+    ///
+    /// ⛔ FOUR INPUTS YIELD FEWER FORMATS THAN THREE (`:2372-2373`, `:2392-2393`), and every caller
+    /// indexes by operand position (`.../V3/SNComputeLowering.cpp:766`, `:789`, `:1058`, `:1207`,
+    /// `:1291`, `:1484`), so a fourth input reads the OUTPUT's format as its own in the authority.
+    /// ⛔ AND `FMA16` IS IN THE ACCUMULATOR CHAIN BUT NOT THE INPUT ONE (`:2360-2371`, `:2385`), so
+    /// its inputs stay at `dataFormat_`. That accumulator is the DDL's `%ptsum_fp`/`%ptsum_int` pair
+    /// seen from the C++ side (`ddc/ddl_templates/bmm.ddl:47-48`, aliased at `:107`).
+    pub fn operand_formats(&self, packmerge_output_format: DataFormats) -> Vec<DataFormats> {
+        // `:2351-2357`. The one branch that consults the design space config, and the one that does
+        // not answer per operand: three copies whatever the operand count is.
+        if self.r#type == ComputeOpType::Packmerge {
+            return vec![packmerge_output_format; 3];
+        }
+
+        // `:2360-2371`.
+        let input_format = match self.r#type {
+            ComputeOpType::Fma8 => DataFormats::Sen143Fp8,
+            ComputeOpType::Fma4 => DataFormats::Sen121Fp4,
+            ComputeOpType::Ima8 => DataFormats::Senint8,
+            ComputeOpType::Ima4 => DataFormats::Senint4,
+            ComputeOpType::Fma32 => DataFormats::IeeeFp32,
+            _ => self.data_format,
+        };
+
+        // `:2377-2391`, in the authority's order — a `match` is first-arm-wins like its `else if`
+        // chain, so `IMA8`/`IMA4` reach `SENINT24` before the FMA arm can claim them.
+        let accumulator_format = match (self.r#type, self.data_format) {
+            (ComputeOpType::Ima8 | ComputeOpType::Ima4, _)
+            | (ComputeOpType::Macc, DataFormats::Senint8 | DataFormats::Senint4) => {
+                DataFormats::Senint24
+            }
+            (ComputeOpType::Fma32, _) | (ComputeOpType::Macc, DataFormats::IeeeFp32) => {
+                DataFormats::IeeeFp32
+            }
+            (ComputeOpType::Fma4 | ComputeOpType::Fma8 | ComputeOpType::Fma16, _)
+            | (
+                ComputeOpType::Macc,
+                DataFormats::Sen121Fp4
+                | DataFormats::Sen143Fp8
+                | DataFormats::Sen152Fp8
+                | DataFormats::Sen169Fp16
+                | DataFormats::Bfloat16,
+            ) => DataFormats::Sen169Fp16,
+            _ => self.data_format,
+        };
+
+        // `:2372-2393`.
+        let mut formats = vec![input_format; self.inputs.len().min(2)];
+        if self.inputs.len() == 3 {
+            formats.push(accumulator_format);
+        }
+        formats.push(accumulator_format);
+        formats
+    }
 }
 
-// crustify:todo: e024_ComputeNode
+// crustify:todo: e035_ComputeNode.inputCoordinates_
 
-// crustify:todo: e024_ComputeNode.coreletViews_
+// crustify:todo: e035_ComputeNode.inputsLdsAndLoopOffsets_
 
-// crustify:todo: e024_ComputeNode.inputCoordinates_
+// crustify:todo: e035_ComputeNode.outputCoordinate_
 
-// crustify:todo: e024_ComputeNode.inputsLdsAndLoopOffsets_
-
-// crustify:todo: e024_ComputeNode.inputsLoopsAndSizes_
-
-// crustify:todo: e024_ComputeNode.outputCoordinate_
-
-// crustify:todo: e024_ComputeNode.outputsLdsAndLoopOffsets_
-
-// crustify:todo: e024_ComputeNode.outputsLoopsAndSizes_
+// crustify:todo: e035_ComputeNode.outputsLdsAndLoopOffsets_
 
 /// Replaces: e025_ConditionNode
 ///
@@ -6485,5 +6590,164 @@ mod equivalence {
             "`negCap`"
         );
         assert_eq!(clamp(PadEnd::Front, 2, 0, 10), None, "`oobWkSlice`");
+    }
+
+    /// The one probe [`ComputeNode::operand_formats`] is measured at below. `SENINT8` is chosen
+    /// because it is in `MACC`'s integer list, so the `MACC` arm fires rather than falling through.
+    const PROBE: DataFormats = DataFormats::Senint8;
+
+    /// The stand-in for `dsc.labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).dataFormat_`
+    /// (`dsc/dsc2.cpp:2352-2353`). Deliberately a format NO branch of the method can produce, so a
+    /// slot holding it can only have come from the argument.
+    const PACKMERGE_ARG: DataFormats = DataFormats::Sen153Fp9;
+
+    fn compute(r#type: ComputeOpType, data_format: DataFormats, inputs: usize) -> Vec<DataFormats> {
+        ComputeNode {
+            r#type,
+            data_format,
+            inputs: vec![SenComponent::Ptnorth; inputs],
+            ..ComputeNode::default()
+        }
+        .operand_formats(PACKMERGE_ARG)
+    }
+
+    /// 63 of the 71 ops carry `dataFormat_` into every slot, `PACKMERGE` answers from the argument
+    /// alone, and exactly SEVEN move a slot — of which `FMA16` moves its ACCUMULATOR ONLY, since the
+    /// input chain (`dsc/dsc2.cpp:2360-2371`) names FMA8, FMA4, IMA8, IMA4 and FMA32 and not FMA16
+    /// while the accumulator chain (`:2385`) does name it.
+    ///
+    /// ⭐ AND `MACC` IS THE ONE OP WHOSE ACCUMULATOR COMES FROM `dataFormat_` (`:2377-2391`), for
+    /// exactly SIX of the 22 formats — the DDL's two accumulators, four floats onto `%ptsum_fp`'s
+    /// `SEN169_FP16` and two ints onto `%ptsum_int`'s `SENINT24` (`ddc/ddl_templates/bmm.ddl:47-48`).
+    #[test]
+    fn e035_seven_ops_and_six_macc_formats_move_an_operand_format() {
+        // Measured: `op\t<type>\t8\t3\t...` for every op, at three inputs.
+        let moved = [
+            (
+                ComputeOpType::Macc,
+                [PROBE, PROBE, DataFormats::Senint24, DataFormats::Senint24],
+            ),
+            (ComputeOpType::Fma32, [DataFormats::IeeeFp32; 4]),
+            (
+                ComputeOpType::Fma16,
+                [
+                    PROBE,
+                    PROBE,
+                    DataFormats::Sen169Fp16,
+                    DataFormats::Sen169Fp16,
+                ],
+            ),
+            (
+                ComputeOpType::Fma8,
+                [
+                    DataFormats::Sen143Fp8,
+                    DataFormats::Sen143Fp8,
+                    DataFormats::Sen169Fp16,
+                    DataFormats::Sen169Fp16,
+                ],
+            ),
+            (
+                ComputeOpType::Fma4,
+                [
+                    DataFormats::Sen121Fp4,
+                    DataFormats::Sen121Fp4,
+                    DataFormats::Sen169Fp16,
+                    DataFormats::Sen169Fp16,
+                ],
+            ),
+            (
+                ComputeOpType::Ima8,
+                [PROBE, PROBE, DataFormats::Senint24, DataFormats::Senint24],
+            ),
+            (
+                ComputeOpType::Ima4,
+                [
+                    DataFormats::Senint4,
+                    DataFormats::Senint4,
+                    DataFormats::Senint24,
+                    DataFormats::Senint24,
+                ],
+            ),
+        ];
+        assert_eq!(moved.len(), 7);
+        assert_eq!(ComputeOpType::ALL.len(), 71);
+
+        let mut carried = 0;
+        for op in ComputeOpType::ALL {
+            let got = compute(op, PROBE, 3);
+            if op == ComputeOpType::Packmerge {
+                assert_eq!(got, vec![PACKMERGE_ARG; 3], "{op:?}");
+                continue;
+            }
+            match moved.iter().find(|(moved_op, _)| *moved_op == op) {
+                Some((_, want)) => assert_eq!(got, want.to_vec(), "{op:?}"),
+                None => {
+                    assert_eq!(got, vec![PROBE; 4], "{op:?}");
+                    carried += 1;
+                }
+            }
+        }
+        assert_eq!(carried, 71 - moved.len() - 1);
+
+        // Measured: `macc\t<format>\t...` for every format, at three inputs.
+        let moved = [
+            (DataFormats::Sen143Fp8, DataFormats::Sen169Fp16),
+            (DataFormats::Sen152Fp8, DataFormats::Sen169Fp16),
+            (DataFormats::Bfloat16, DataFormats::Sen169Fp16),
+            (DataFormats::Sen121Fp4, DataFormats::Sen169Fp16),
+            (DataFormats::Senint4, DataFormats::Senint24),
+            (DataFormats::Senint8, DataFormats::Senint24),
+        ];
+        assert_eq!(moved.len(), 6);
+        assert_eq!(DataFormats::ALL.len(), 22);
+
+        for format in DataFormats::ALL {
+            let accumulator = moved
+                .iter()
+                .find(|(from, _)| *from == format)
+                .map_or(format, |(_, to)| *to);
+            assert_eq!(
+                compute(ComputeOpType::Macc, format, 3),
+                vec![format, format, accumulator, accumulator],
+                "{format:?}"
+            );
+        }
+    }
+
+    /// ⛔ THE FORMAT COUNT IS NOT THE OPERAND COUNT, AND FOUR INPUTS YIELD FEWER FORMATS THAN THREE:
+    /// `min(2, inputs_.size())` inputs, a third slot only at exactly three, then the output
+    /// (`dsc/dsc2.cpp:2372-2373`, `:2392-2393`). `PACKMERGE` answers three at every arity (`:2354`).
+    #[test]
+    fn e035_the_format_count_is_not_the_operand_count() {
+        // FMA8, so the input format (`SEN143_FP8`) is distinguishable from the accumulator's
+        // (`SEN169_FP16`) and each slot's origin is visible.
+        let input = DataFormats::Sen143Fp8;
+        let accumulator = DataFormats::Sen169Fp16;
+        let measured = [
+            vec![accumulator],
+            vec![input, accumulator],
+            vec![input, input, accumulator],
+            vec![input, input, accumulator, accumulator],
+            vec![input, input, accumulator],
+        ];
+        for (inputs, want) in measured.iter().enumerate() {
+            assert_eq!(
+                compute(ComputeOpType::Fma8, PROBE, inputs),
+                *want,
+                "{inputs}"
+            );
+        }
+        assert!(
+            measured[4].len() < measured[3].len(),
+            "four inputs, three formats"
+        );
+
+        for inputs in 0..=4 {
+            assert_eq!(
+                compute(ComputeOpType::Packmerge, PROBE, inputs),
+                vec![PACKMERGE_ARG; 3],
+                "PACKMERGE at {inputs}"
+            );
+        }
     }
 }
