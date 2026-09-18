@@ -4,6 +4,7 @@ use crate::schedule::dims::{DataStructDims, PrimaryDimAndKind, PrimaryDimTypes};
 use std::collections::BTreeMap;
 use sys_arch_spec::CoreId;
 use sys_arch_spec::arch_enums::{DataLocation, SenComponent};
+use sys_arch_spec::fields::Gen;
 
 /// A group tag register's group id — `gtrIdsUsed_` holds the set of them (`dsc/dsc2.h:35`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -901,6 +902,225 @@ mod unit_tests {
         assert!(node.unit_time_transfer_chunk_stride.is_empty());
         assert!(node.unit_time_transfer_chunk_size.is_empty());
     }
+
+    /// `dsc/dsc2.h:932-941` and `:950-954` — every default member initializer of a compute node,
+    /// including the nested `InstrAttribute`'s eight slices and all-on compute mask.
+    #[test]
+    fn compute_node_defaults_are_the_authoritys_initializers() {
+        let node = ComputeNode::default();
+        assert_eq!(node.ex_unit, SenComponent::NoComponent);
+        assert_eq!(node.r#type, ComputeOpType::Count);
+        assert_eq!(node.data_format, DataFormats::Sen169Fp16);
+        assert_eq!(node.num_folds_engaged, NumFoldsEngaged(1));
+        assert!(!node.is_opaque_op);
+        assert!(node.inputs.is_empty());
+        assert!(node.outputs.is_empty());
+
+        // `dsc/dsc2.h:907`, `:915-916`.
+        assert_eq!(node.instr_attribute.repetition, Repetition(8));
+        assert_eq!(node.instr_attribute.compute_mask, ComputeMask(255));
+        assert_eq!(node.instr_attribute.mode, None);
+        assert!(!node.instr_attribute.sign_extend);
+        assert!(node.instr_attribute.indices.is_empty());
+        assert!(node.instr_attribute.param_map.is_empty());
+        assert!(node.instr_attribute.input_data_connects.is_empty());
+        assert_eq!(node.repetition_with_offset, RepetitionWithOffset::default());
+    }
+
+    /// `dsc/dsc2.cpp:2291-2346`. The vendor's own dispatch: PTWEST and the memories split at
+    /// RCUDD1A, PTNORTH does not, PELRF is a memory this rule excludes, `MACC` alone reads the data
+    /// format, and the output element count comes LAST.
+    #[test]
+    fn operand_sizes_split_at_rcudd1a_and_the_output_comes_last() {
+        let fma16 = ComputeNode {
+            r#type: ComputeOpType::Fma16,
+            inputs: vec![
+                SenComponent::Ptwest,
+                SenComponent::Lx,
+                SenComponent::Ptnorth,
+                SenComponent::Pelrf,
+            ],
+            num_folds_engaged: NumFoldsEngaged(2),
+            ..ComputeNode::default()
+        };
+
+        // PTWEST 8, LX 64, PTNORTH 64, PELRF the 1024/16 default, output 64 — all doubled by the
+        // two folds (`:2333`, `:2344`).
+        assert_eq!(
+            fma16.operand_sizes(Gen::Rcudd1a),
+            Some(vec![
+                OperandSize(16),
+                OperandSize(128),
+                OperandSize(128),
+                OperandSize(128),
+                OperandSize(128)
+            ])
+        );
+        // SEN1P5 lifts PTWEST to 32 and LX to 256; PTNORTH and the default do not move.
+        assert_eq!(
+            fma16.operand_sizes(Gen::Sen1p5),
+            Some(vec![
+                OperandSize(64),
+                OperandSize(512),
+                OperandSize(128),
+                OperandSize(128),
+                OperandSize(128)
+            ])
+        );
+
+        // ⛔ `MACC` IS DISPATCHED BY ITS FORMAT (`:2317-2331`): fp8 takes the FMA8 sizes.
+        let macc_fp8 = ComputeNode {
+            r#type: ComputeOpType::Macc,
+            data_format: DataFormats::Sen143Fp8,
+            inputs: vec![SenComponent::Lx],
+            ..ComputeNode::default()
+        };
+        assert_eq!(
+            macc_fp8.operand_sizes(Gen::Rcudd1a),
+            Some(vec![OperandSize(128), OperandSize(64)])
+        );
+        assert_eq!(
+            macc_fp8.operand_sizes(Gen::Sen1p5),
+            Some(vec![OperandSize(1024), OperandSize(64)])
+        );
+
+        // An fp32 `MACC` matches no size rule, so the input takes the 1024/32 default and the
+        // output is 32 rather than 64 (`:2295-2296`, `:2338-2342`).
+        let macc_fp32 = ComputeNode {
+            r#type: ComputeOpType::Macc,
+            data_format: DataFormats::IeeeFp32,
+            inputs: vec![SenComponent::Lx],
+            ..ComputeNode::default()
+        };
+        assert_eq!(
+            macc_fp32.operand_sizes(Gen::Sen1p5),
+            Some(vec![OperandSize(32), OperandSize(32)])
+        );
+    }
+
+    /// The two places the authority stops: a PTWEST input it cannot size (`dsc/dsc2.cpp:2308-2312`)
+    /// and the -1 bit width of `INVALID` (`:2295`).
+    #[test]
+    fn operand_sizes_are_absent_where_the_authority_refuses() {
+        // ⛔ "This case is not correctly handled at the moment" — a PTWEST `MACC`.
+        let ptwest_macc = ComputeNode {
+            r#type: ComputeOpType::Macc,
+            inputs: vec![SenComponent::Ptwest],
+            ..ComputeNode::default()
+        };
+        assert_eq!(ptwest_macc.operand_sizes(Gen::Rcudd1a), None);
+        assert_eq!(ptwest_macc.operand_sizes(Gen::Sen1p5), None);
+
+        // ⛔ "Unexpected PT operation in view calculation" — anything outside the five FMA/IMA ops.
+        let ptwest_fcmp = ComputeNode {
+            r#type: ComputeOpType::Fcmp,
+            inputs: vec![SenComponent::Ptwest],
+            ..ComputeNode::default()
+        };
+        assert_eq!(ptwest_fcmp.operand_sizes(Gen::Sen1p5), None);
+
+        // ⛔ `INVALID` divides 1024 by -1 in the authority; a negative operand size is not one.
+        let invalid_format = ComputeNode {
+            r#type: ComputeOpType::Fmul,
+            data_format: DataFormats::Invalid,
+            inputs: vec![SenComponent::Lx],
+            ..ComputeNode::default()
+        };
+        assert_eq!(invalid_format.operand_sizes(Gen::Sen1p5), None);
+
+        // ⭐ WITH NO INPUTS THE AUTHORITY NEVER DIVIDES, so the output alone survives even on
+        // `INVALID` — the bit width is read per input (`:2294-2295`).
+        let no_inputs = ComputeNode {
+            data_format: DataFormats::Invalid,
+            ..ComputeNode::default()
+        };
+        assert_eq!(
+            no_inputs.operand_sizes(Gen::Sen1p5),
+            Some(vec![OperandSize(64)])
+        );
+    }
+
+    /// `dsc/dscdefn.h:134-207` against `dsc/dscdefn.cpp:33-107`: 70 of the 71 ops have a spelling,
+    /// and `flipMap` makes each one a round trip.
+    #[test]
+    fn compute_op_type_spellings_round_trip_and_only_fcvt_has_none() {
+        let mut unspelled = Vec::new();
+        for op in ComputeOpType::ALL {
+            match op.name() {
+                Some(name) => assert_eq!(ComputeOpType::from_name(name), Some(op), "{name}"),
+                None => unspelled.push(op),
+            }
+        }
+        // ⛔ `computeTypeToString.at(FCVT)` throws; it is the map's one hole.
+        assert_eq!(unspelled, vec![ComputeOpType::Fcvt]);
+        assert_eq!(ComputeOpType::from_name("fcvt"), None);
+
+        // ⛔ The authority spells `EQUALTO` `"equal"` (`dsc/dscdefn.cpp:85`).
+        assert_eq!(ComputeOpType::Equalto.name(), Some("equal"));
+        assert_eq!(ComputeOpType::from_name("equalto"), None);
+
+        // `COUNT` is `type_`'s initialiser and a spelled value, not a count sentinel.
+        assert_eq!(ComputeOpType::default(), ComputeOpType::Count);
+        assert_eq!(ComputeOpType::Count.name(), Some("undefined"));
+        assert_eq!(ComputeOpType::from_name(""), None);
+    }
+
+    /// `util/sendefs/sendefs.h:30-54` against `sendefs.cpp:18-67` and `:129-141`.
+    #[test]
+    fn data_format_widths_are_the_authoritys_table_and_unknown_text_is_invalid() {
+        assert_eq!(DataFormats::ALL.len(), DataFormats::COUNT);
+        for format in DataFormats::ALL {
+            assert_eq!(DataFormats::from_name(format.name()), format);
+        }
+        assert_eq!(DataFormats::default(), DataFormats::Sen169Fp16);
+
+        // ⛔ SENINT24 IS 16 BITS in the table (`sendefs.cpp:135`).
+        assert_eq!(DataFormats::Senint24.bit_width(), Some(BitWidth(16)));
+        assert_eq!(DataFormats::Sen169Fp16.bit_width(), Some(BitWidth(16)));
+        assert_eq!(DataFormats::IeeeFp32.bit_width(), Some(BitWidth(32)));
+        assert_eq!(DataFormats::Sen121Fp4.bit_width(), Some(BitWidth(4)));
+        assert_eq!(DataFormats::Sen153Fp9.bit_width(), Some(BitWidth(9)));
+        // ⛔ The `-1` entry is not a width (`sendefs.cpp:131`).
+        assert_eq!(DataFormats::Invalid.bit_width(), None);
+
+        // ⭐ `FromString`'s own `else`: unrecognised text is INVALID rather than absent
+        // (`util/sendefs/sendefs.h:294-296`).
+        assert_eq!(DataFormats::from_name("fp16"), DataFormats::Invalid);
+        assert_eq!(DataFormats::from_name(""), DataFormats::Invalid);
+    }
+
+    /// `dsc/dscdefn.cpp:142-144`. The set `getComputeOperandSizes` tests against, and it is not
+    /// `ddc::memories` (`ddc/ddc_metadata.h:20-21`).
+    #[test]
+    fn memories_is_dsc2s_sixteen_and_holds_the_two_the_size_rule_excludes_by_name() {
+        assert_eq!(MEMORIES.len(), 16);
+        assert!(MEMORIES.contains(&SenComponent::Lx));
+        assert!(MEMORIES.contains(&SenComponent::Hbm));
+
+        // ⛔ BOTH ARE MEMORIES, which is exactly why `dsc/dsc2.cpp:2315` excludes them by name
+        // instead of relying on the set.
+        assert!(MEMORIES.contains(&SenComponent::Pelrf));
+        assert!(MEMORIES.contains(&SenComponent::Sfplrf));
+
+        // The two PT endpoints have their own size rules and are not in the set at all.
+        assert!(!MEMORIES.contains(&SenComponent::Ptwest));
+        assert!(!MEMORIES.contains(&SenComponent::Ptnorth));
+
+        // ⛔ The eight `ddc::memories` does NOT hold — reading the ddc set here would size a
+        // register-file operand as the 1024/bitWidth default.
+        for extra in [
+            SenComponent::L0Scale,
+            SenComponent::Lrfreg,
+            SenComponent::L3luibr,
+            SenComponent::L3suibr,
+            SenComponent::Pestate,
+            SenComponent::Sfpstate,
+            SenComponent::Lxluscalereg,
+            SenComponent::Qgi,
+        ] {
+            assert!(MEMORIES.contains(&extra), "{extra:?}");
+        }
+    }
 }
 
 // crustify:todo: e012_CoordinateType
@@ -1446,6 +1666,12 @@ impl LoopDistributionCat {
 /// ⛔ `nonCoreletMemories` AND `directAddressableMemories` ARE DIFFERENT, SMALLER SETS declared
 /// beside it (`dsc/dscdefn.h:519-520`, filled `dsc/dscdefn.cpp:145-150`) — no unit on this worklist
 /// reads either, so neither is ported here and neither may be substituted for this one.
+///
+/// ⛔ NOT `ddc::memories`, WHICH IS A DIFFERENT AND SMALLER SET — eight components, without
+/// `L0_SCALE`, `LRFREG`, `L3LUIBR`, `L3SUIBR`, `PESTATE`, `SFPSTATE`, `LXLUSCALEREG` or `QGI`
+/// (`ddc/ddc_metadata.h:20-21`). `dsc/dsc2.cpp` includes `dscdefn.h` and not `ddc_metadata.h`, so
+/// the `memories.count(input)` in `getComputeOperandSizes` (`dsc/dsc2.cpp:2315`) is THIS set.
+/// ⭐ Only membership is ever read, so the `std::set`'s ordering is not observable.
 pub const MEMORIES: [SenComponent; 16] = [
     SenComponent::Lx,
     SenComponent::L0,
@@ -1827,3 +2053,820 @@ impl TransferNode {
 // crustify:todo: e023_TransferNode.srcRep_
 
 // crustify:todo: e023_TransferNode.transferCoordinates_
+
+/// How many folds one compute node engages — `numFoldsEngaged` (`dsc/dsc2.h:940`, `int`), filled
+/// from `sysDef.numFoldsPerUnit` (`ddc/ddcv1.cpp:1887`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NumFoldsEngaged(pub i32);
+
+/// One operand's element count, as [`ComputeNode::operand_sizes`] reports it — "number of elements
+/// read or written by compute node" (`dsc/dsc2.h:956-958`, `int`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OperandSize(pub i32);
+
+/// One element's width in bits — the value of `EnumsConversion::dataFormatsToBitWidth`
+/// (`util/sendefs/sendefs.cpp:129-141`, `int`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BitWidth(pub i32);
+
+/// A compute instruction's general SRC1/IMM field — `InstrAttribute::mode_` (`dsc/dsc2.h:915`).
+///
+/// ⛔ AN OPCODE-SPECIFIC ENCODING, NOT A CLOSED SET: bridge 1 reads it as an FMUL divide selector at
+/// 11 (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`) and as a FEST flavour at 0
+/// through 9 (`:1317-1385`), and the DDL states it verbatim (`ddc/ddl/ddl_conversion.cpp:1368-1370`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Mode(pub i32);
+
+/// Which compute slices an instruction runs on — `InstrAttribute::compute_mask_`
+/// (`dsc/dsc2.h:916`, `size_t`, all eight slices by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComputeMask(pub u64);
+
+/// A repetition count, as the DDL's `getRepetitionIfExists` yields it
+/// (`ddc/ddl/ddl_conversion.cpp:1393-1394`).
+///
+/// ⛔ TWO ROLES, ONE UNIT: `InstrAttribute::repetition_` counts the slices one PACK/MERGE
+/// instruction repeats over (`dsc/dsc2.h:907`), while a `RepetitionWithOffset` entry is the SPREAD
+/// of one operand — `ddc/ddc_transformation.cpp:1358-1379` clones the node `entry - 1` further
+/// times and leaves 1 behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Repetition(pub i32);
+
+/// One entry of a PACK/MERGE mapping — a source element position within the 128-bit slice
+/// (`dsc/dsc2.h:906`), scaled by `expand_indices` as `compact_indices[i] * scale + j`
+/// (`ddc/ddc_transformation.cpp:1939-1956`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PackMergeIndex(pub i32);
+
+/// A DDL data-connect name — the wire identity of one operand (`dsc/dsc2.h:926-929`). ⛔ OPEN TEXT,
+/// NOT A CLOSED SET: `ddc/ddc_fold.cpp:1996` and `:4099` compare these names to each other and
+/// `ddc/ddc_transformation_util.cpp:1520-1525` rewrites them, all as the DDL authored them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DataConnect(pub String);
+
+/// Replaces: ComputeOpType
+///
+/// `dsc/dscdefn.h:134-207`. Which compute instruction a [`ComputeNode`] issues.
+///
+/// ⛔ `COUNT` IS A LIVE VALUE HERE, NOT A COUNT SENTINEL: it is `ComputeNode::type_`'s initialiser
+/// (`dsc/dsc2.h:933`) and `computeTypeToString` gives it the spelling `"undefined"`
+/// (`dsc/dscdefn.cpp:87`), so an unfilled node has a name rather than a hole.
+///
+/// ⛔ THE DISCRIMINANTS ARE THE AUTHORITY'S: `computeTypeToString` is a `std::map` keyed by this
+/// enum (`dsc/dscdefn.h:210`), so declaration order is its iteration order, and [`Self::ALL`] is
+/// positional against it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ComputeOpType {
+    /// Precision-independent fma/ima — `dataFormat_` picks the precision, which is why
+    /// [`ComputeNode::operand_sizes`] dispatches on the format for this one op alone.
+    Macc,
+    Fma32,
+    Fma16,
+    Fma8,
+    Fma4,
+    Ima8,
+    Ima4,
+    Fmax,
+    Fmin,
+    Fabsmax,
+    Fsignedabsmineq,
+    Fnms,
+    Fsub,
+    Fmul,
+    And,
+    Or,
+    Xnorround,
+    Andnot,
+    Fcmp,
+    Select,
+    Packmerge,
+    Reduce,
+    Reciprocal,
+    Layernormscale,
+    Layernormscale32,
+    Fest,
+    Icvt,
+    Shr,
+    Gcvt,
+    /// ⛔ THE ONE OP WITH NO SPELLING — see [`Self::name`].
+    Fcvt,
+    Splat,
+    Ime,
+    Ee,
+    ExpP1,
+    ExpP2,
+    LogP1,
+    LogP2,
+    Realdiv,
+    Gelu,
+    GeluBwdP1,
+    GeluBwdP2,
+    Where3,
+    Sqrt,
+    Rsqrt,
+    MishP1,
+    MishP2,
+    Greaterequal,
+    Lesserequal,
+    Greaterthan,
+    Lesserthan,
+    Equalto,
+    Notequal,
+    Exx232P1,
+    Exx232P2,
+    Exx232P3,
+    Fp32todl16,
+    Dl16tofp32,
+    Sigmoid,
+    Exp,
+    Shuffle,
+    Dl16tobf16,
+    SoftplusP1,
+    SoftplusP2,
+    AutomaticShuffling,
+    Assign,
+    Floor,
+    Idx32toaddr,
+    AddI32ToI32,
+    AddI64ToI64,
+    MulI32ToI32,
+    /// `ComputeNode::type_`'s initialiser (`dsc/dsc2.h:933`), spelled `"undefined"`.
+    #[default]
+    Count,
+}
+
+/// ⛔ E0080 IF AN OP IS EVER INSERTED, DROPPED, REORDERED OR LEFT OUT OF `ALL`: the discriminants
+/// are what `computeTypeToString`'s `std::map` orders by, and `ALL` is positional against them.
+const _: () = {
+    let mut i = 0;
+    while i < ComputeOpType::ALL.len() {
+        assert!(
+            ComputeOpType::ALL[i] as usize == i,
+            "ComputeOpType::ALL is out of declaration order"
+        );
+        i += 1;
+    }
+};
+
+impl ComputeOpType {
+    /// Every op in the authority's declaration order (`dsc/dscdefn.h:134-207`), `COUNT` included
+    /// because it is a value this campaign's nodes actually hold.
+    pub const ALL: [Self; 71] = [
+        Self::Macc,
+        Self::Fma32,
+        Self::Fma16,
+        Self::Fma8,
+        Self::Fma4,
+        Self::Ima8,
+        Self::Ima4,
+        Self::Fmax,
+        Self::Fmin,
+        Self::Fabsmax,
+        Self::Fsignedabsmineq,
+        Self::Fnms,
+        Self::Fsub,
+        Self::Fmul,
+        Self::And,
+        Self::Or,
+        Self::Xnorround,
+        Self::Andnot,
+        Self::Fcmp,
+        Self::Select,
+        Self::Packmerge,
+        Self::Reduce,
+        Self::Reciprocal,
+        Self::Layernormscale,
+        Self::Layernormscale32,
+        Self::Fest,
+        Self::Icvt,
+        Self::Shr,
+        Self::Gcvt,
+        Self::Fcvt,
+        Self::Splat,
+        Self::Ime,
+        Self::Ee,
+        Self::ExpP1,
+        Self::ExpP2,
+        Self::LogP1,
+        Self::LogP2,
+        Self::Realdiv,
+        Self::Gelu,
+        Self::GeluBwdP1,
+        Self::GeluBwdP2,
+        Self::Where3,
+        Self::Sqrt,
+        Self::Rsqrt,
+        Self::MishP1,
+        Self::MishP2,
+        Self::Greaterequal,
+        Self::Lesserequal,
+        Self::Greaterthan,
+        Self::Lesserthan,
+        Self::Equalto,
+        Self::Notequal,
+        Self::Exx232P1,
+        Self::Exx232P2,
+        Self::Exx232P3,
+        Self::Fp32todl16,
+        Self::Dl16tofp32,
+        Self::Sigmoid,
+        Self::Exp,
+        Self::Shuffle,
+        Self::Dl16tobf16,
+        Self::SoftplusP1,
+        Self::SoftplusP2,
+        Self::AutomaticShuffling,
+        Self::Assign,
+        Self::Floor,
+        Self::Idx32toaddr,
+        Self::AddI32ToI32,
+        Self::AddI64ToI64,
+        Self::MulI32ToI32,
+        Self::Count,
+    ];
+
+    /// The spelling `EnumsConversion::computeTypeToString` gives this op (`dsc/dscdefn.h:210`,
+    /// defined `dsc/dscdefn.cpp:33-105`).
+    ///
+    /// ⛔ `FCVT` HAS NO ENTRY: the map holds 70 of the 71 ops, so `computeTypeToString.at(FCVT)`
+    /// throws — absent here rather than a throw.
+    /// ⛔ `EQUALTO` IS SPELLED `"equal"`, not `"equalto"` (`dsc/dscdefn.cpp:85`), and the DDL is
+    /// matched against these spellings (`ddc/ddl/ddl_conversion.cpp:1432`).
+    pub fn name(self) -> Option<&'static str> {
+        let name = match self {
+            Self::Macc => "macc",
+            Self::Fma32 => "fma32",
+            Self::Fma16 => "fma16",
+            Self::Fma8 => "fma8",
+            Self::Fma4 => "fma4",
+            Self::Ima8 => "ima8",
+            Self::Ima4 => "ima4",
+            Self::Fmax => "fmax",
+            Self::Fmin => "fmin",
+            Self::Fabsmax => "fabsmax",
+            Self::Fsignedabsmineq => "fsignedabsmineq",
+            Self::Fnms => "fnms",
+            Self::Fsub => "fsub",
+            Self::Fmul => "fmul",
+            Self::And => "and",
+            Self::Or => "or",
+            Self::Xnorround => "xnorround",
+            Self::Andnot => "andnot",
+            Self::Fcmp => "fcmp",
+            Self::Select => "select",
+            Self::Packmerge => "packmerge",
+            Self::Reduce => "reduce",
+            Self::Reciprocal => "reciprocal",
+            Self::Layernormscale => "layernormscale",
+            Self::Layernormscale32 => "layernormscale32",
+            Self::Fest => "fest",
+            Self::Icvt => "icvt",
+            Self::Shr => "shr",
+            Self::Gcvt => "gcvt",
+            Self::Fcvt => return None,
+            Self::Splat => "splat",
+            Self::Ime => "ime",
+            Self::Ee => "ee",
+            Self::ExpP1 => "exp_p1",
+            Self::ExpP2 => "exp_p2",
+            Self::LogP1 => "log_p1",
+            Self::LogP2 => "log_p2",
+            Self::Realdiv => "realdiv",
+            Self::Gelu => "gelu",
+            Self::GeluBwdP1 => "gelu_bwd_p1",
+            Self::GeluBwdP2 => "gelu_bwd_p2",
+            Self::Where3 => "where3",
+            Self::Sqrt => "sqrt",
+            Self::Rsqrt => "rsqrt",
+            Self::MishP1 => "mish_p1",
+            Self::MishP2 => "mish_p2",
+            Self::Greaterequal => "greaterequal",
+            Self::Lesserequal => "lesserequal",
+            Self::Greaterthan => "greaterthan",
+            Self::Lesserthan => "lesserthan",
+            Self::Equalto => "equal",
+            Self::Notequal => "notequal",
+            Self::Exx232P1 => "exx2_32_p1",
+            Self::Exx232P2 => "exx2_32_p2",
+            Self::Exx232P3 => "exx2_32_p3",
+            Self::Fp32todl16 => "fp32todl16",
+            Self::Dl16tofp32 => "dl16tofp32",
+            Self::Sigmoid => "sigmoid",
+            Self::Exp => "exp",
+            Self::Shuffle => "shuffle",
+            Self::Dl16tobf16 => "dl16tobf16",
+            Self::SoftplusP1 => "softplus_p1",
+            Self::SoftplusP2 => "softplus_p2",
+            Self::AutomaticShuffling => "automatic_shuffling",
+            Self::Assign => "assign",
+            Self::Floor => "floor",
+            Self::Idx32toaddr => "idx32toaddr",
+            Self::AddI32ToI32 => "addi32toi32",
+            Self::AddI64ToI64 => "addi64toi64",
+            Self::MulI32ToI32 => "muli32toi32",
+            Self::Count => "undefined",
+        };
+        Some(name)
+    }
+
+    /// `EnumsConversion::stringToComputeType`, the `flipMap` of the above (`dsc/dscdefn.h:211`,
+    /// `dsc/dscdefn.cpp:106-107`). An unknown spelling is absent, which is the DDL rejection at
+    /// `ddc/ddl/ddl_conversion.cpp:1432-1436`; the DDL's own `"macc"` never reaches here, because
+    /// that spelling picks an FMA/IMA op from the precision instead (`:1410-1430`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|op| op.name() == Some(name))
+    }
+}
+
+/// Replaces: DataFormats
+///
+/// `util/sendefs/sendefs.h:30-54`. One operand's element format. It is `util/sendefs`' type rather
+/// than dsc2's, and it lives here beside its only ported reader, [`ComputeNode::data_format`].
+///
+/// ⛔ `NUM_DATA_FORMATS` IS A PURE SENTINEL, so it is [`Self::COUNT`] and not a variant: it has no
+/// spelling (`dataFormatsToString` `DT_ERROR`s in its `default:` arm,
+/// `util/sendefs/sendefs.cpp:64-65`) and no bit-width entry.
+/// ⛔ `INVALID` IS A LIVE VALUE, though: `FromString` returns it for every unrecognised spelling
+/// (`util/sendefs/sendefs.h:294-296`) and the DDL conversion parks it on a node as a transient
+/// marker it resolves from the operands' own formats (`ddc/ddl/ddl_conversion.cpp:1438-1468`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DataFormats {
+    /// `ComputeNode::dataFormat_`'s initialiser (`dsc/dsc2.h:934`).
+    #[default]
+    Sen169Fp16,
+    IeeeFp32,
+    Invalid,
+    Sen143Fp8,
+    Sen152Fp8,
+    Sen153Fp9,
+    Senint2,
+    Senint4,
+    Senint8,
+    Senint16,
+    Senint24,
+    IeeeInt64,
+    IeeeInt32,
+    Senuint32,
+    Senuint2,
+    IeeeFp16,
+    Bool,
+    Bfloat16,
+    Sen18fFp24,
+    /// For an MX scale (`util/sendefs/sendefs.h:50`).
+    Sen080Fp8,
+    /// For an MX scale (`util/sendefs/sendefs.h:51`).
+    Sen053Fp8,
+    /// For MX fp4 (`util/sendefs/sendefs.h:52`).
+    Sen121Fp4,
+}
+
+/// ⛔ E0080 IF A FORMAT IS EVER INSERTED, DROPPED, REORDERED OR LEFT OUT OF `ALL`: the
+/// discriminants order `dataFormatsToBitWidth`'s `std::map` and every other map keyed by this enum.
+const _: () = {
+    let mut i = 0;
+    while i < DataFormats::ALL.len() {
+        assert!(
+            DataFormats::ALL[i] as usize == i,
+            "DataFormats::ALL is out of declaration order"
+        );
+        i += 1;
+    }
+};
+
+impl DataFormats {
+    /// `NUM_DATA_FORMATS` (`util/sendefs/sendefs.h:53`) — the count of real formats, which is what
+    /// the sentinel's discriminant is.
+    pub const COUNT: usize = 22;
+
+    /// Every format in the authority's declaration order (`util/sendefs/sendefs.h:30-54`).
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Sen169Fp16,
+        Self::IeeeFp32,
+        Self::Invalid,
+        Self::Sen143Fp8,
+        Self::Sen152Fp8,
+        Self::Sen153Fp9,
+        Self::Senint2,
+        Self::Senint4,
+        Self::Senint8,
+        Self::Senint16,
+        Self::Senint24,
+        Self::IeeeInt64,
+        Self::IeeeInt32,
+        Self::Senuint32,
+        Self::Senuint2,
+        Self::IeeeFp16,
+        Self::Bool,
+        Self::Bfloat16,
+        Self::Sen18fFp24,
+        Self::Sen080Fp8,
+        Self::Sen053Fp8,
+        Self::Sen121Fp4,
+    ];
+
+    /// `EnumsConversion::dataFormatsToString` (`util/sendefs/sendefs.cpp:18-67`). Total over the
+    /// real formats — all 22 have a `case`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sen169Fp16 => "SEN169_FP16",
+            Self::IeeeFp32 => "IEEE_FP32",
+            Self::Invalid => "INVALID",
+            Self::Sen143Fp8 => "SEN143_FP8",
+            Self::Sen152Fp8 => "SEN152_FP8",
+            Self::Sen153Fp9 => "SEN153_FP9",
+            Self::Senint2 => "SENINT2",
+            Self::Senint4 => "SENINT4",
+            Self::Senint8 => "SENINT8",
+            Self::Senint16 => "SENINT16",
+            Self::Senint24 => "SENINT24",
+            Self::IeeeInt64 => "IEEE_INT64",
+            Self::IeeeInt32 => "IEEE_INT32",
+            Self::Senuint32 => "SENUINT32",
+            Self::Senuint2 => "SENUINT2",
+            Self::IeeeFp16 => "IEEE_FP16",
+            Self::Bool => "BOOL",
+            Self::Bfloat16 => "BFLOAT16",
+            Self::Sen18fFp24 => "SEN18F_FP24",
+            Self::Sen080Fp8 => "SEN080_FP8",
+            Self::Sen053Fp8 => "SEN053_FP8",
+            Self::Sen121Fp4 => "SEN121_FP4",
+        }
+    }
+
+    /// `FromString<DataFormats>` (`util/sendefs/sendefs.h:250-297`), which the DDL conversion parses
+    /// every stated type with (`ddc/ddl/ddl_conversion.cpp:459`).
+    ///
+    /// ⛔ TOTAL, AND AN UNKNOWN SPELLING IS `INVALID` RATHER THAN ABSENT — the authority's own
+    /// `else` (`util/sendefs/sendefs.h:294-296`). That is the value the DDL conversion then resolves
+    /// from the operands, so a typo in a DDL type reads as "not stated yet", not as a refusal.
+    pub fn from_name(name: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.name() == name)
+            .unwrap_or(Self::Invalid)
+    }
+
+    /// `EnumsConversion::dataFormatsToBitWidth` (`util/sendefs/sendefs.cpp:129-141`).
+    ///
+    /// ⛔ `SENINT24` IS 16 BITS IN THE AUTHORITY'S TABLE (`:135`), not 24. Every caller reads the
+    /// table, so this reproduces the table.
+    /// ⛔ `INVALID`'S ENTRY IS `-1` (`:131`) — not a width, so it is ABSENT here. Its one arithmetic
+    /// reader divides by it: `getComputeOperandSizes` computes `1024 / bitWidth`
+    /// (`dsc/dsc2.cpp:2295`), which on `INVALID` yields -1024 elements in the authority, and a
+    /// negative operand size is not one — see [`ComputeNode::operand_sizes`].
+    pub fn bit_width(self) -> Option<BitWidth> {
+        let bits = match self {
+            Self::Invalid => return None,
+            Self::Senint2 | Self::Senuint2 => 2,
+            Self::Senint4 | Self::Sen121Fp4 => 4,
+            Self::Sen143Fp8
+            | Self::Sen152Fp8
+            | Self::Senint8
+            | Self::Bool
+            | Self::Sen080Fp8
+            | Self::Sen053Fp8 => 8,
+            Self::Sen153Fp9 => 9,
+            Self::Sen169Fp16
+            | Self::Senint16
+            | Self::Senint24
+            | Self::Bfloat16
+            | Self::IeeeFp16 => 16,
+            Self::Sen18fFp24 => 24,
+            Self::IeeeFp32 | Self::IeeeInt32 | Self::Senuint32 => 32,
+            Self::IeeeInt64 => 64,
+        };
+        Some(BitWidth(bits))
+    }
+}
+/// Replaces: ComputeNode::InstrAttribute
+///
+/// `dsc/dsc2.h:905-930`. The instruction-level attributes of one compute node: what the DDL states
+/// verbatim about the instruction word (`ddc/ddl/ddl_conversion.cpp:1364-1383`) plus the three
+/// opaque alias maps an OPAQUE op carries through to the emitter.
+///
+/// ⛔ THE MAPS ARE ORDERED, AND THAT IS OBSERVABLE: the JSON exporter walks all three in map order
+/// (`dsc/dsc2.cpp:136-167`) and bridge 1 turns them into a `DictionaryAttr`
+/// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1542-1550`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstrAttribute {
+    /// Field: e024_ComputeNode.indices_
+    ///
+    /// The PACK/MERGE mapping (`dsc/dsc2.h:906`). ⛔ `-1` IS NOT A POSITION: the authority's own
+    /// comment reads "-1 for zero/sign extend" (`dsc/dsc2.h:903`), so an absent entry is an
+    /// extension slot rather than a source element.
+    pub indices: Vec<Option<PackMergeIndex>>,
+    /// Field: e024_ComputeNode.repetition_
+    ///
+    /// `dsc/dsc2.h:907` — "default 8 slices works the same".
+    pub repetition: Repetition,
+    /// Field: e024_ComputeNode.sign_extend_
+    ///
+    /// Whether a PACK/MERGE extends signed (`dsc/dsc2.h:908`), read as a bool attribute by bridge 1
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1124`).
+    pub sign_extend: bool,
+    /// Field: e024_ComputeNode.read_write_reg_map_
+    ///
+    /// An OPAQUE op's read/write register alias map (`dsc/dsc2.h:909-910`); `Ddc::finalizeOps` sizes
+    /// its register window from it (`ddc/ddcv1.cpp:3376-3377`).
+    pub read_write_reg_map: BTreeMap<String, String>,
+    /// Field: e024_ComputeNode.read_only_reg_map_
+    ///
+    /// The read-only half of the same (`dsc/dsc2.h:911-912`, `ddc/ddcv1.cpp:3391`).
+    pub read_only_reg_map: BTreeMap<String, String>,
+    /// Field: e024_ComputeNode.param_map_
+    ///
+    /// An OPAQUE op's parameter alias map (`dsc/dsc2.h:913-914`). ⛔ THE SCHEDULER WRITES INTO IT:
+    /// `Ddc::finalizeOps` sets `"unroll"` and `"prec"` (`ddc/ddcv1.cpp:3343`, `:3395-3397`).
+    pub param_map: BTreeMap<String, String>,
+    /// Field: e024_ComputeNode.mode_
+    ///
+    /// `dsc/dsc2.h:915`. ⛔ `-1` IS ABSENT — the DDL writes it only when it states one
+    /// (`ddc/ddl/ddl_conversion.cpp:1368-1370`), and every bridge-1 reader tests it against a
+    /// specific encoding (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:1102`,
+    /// `:1317-1385`), which -1 never is.
+    pub mode: Option<Mode>,
+    /// Field: e024_ComputeNode.compute_mask_
+    ///
+    /// `dsc/dsc2.h:916`, all eight slices unless the DDL states a mask
+    /// (`ddc/ddl/ddl_conversion.cpp:1371-1373`).
+    pub compute_mask: ComputeMask,
+    // crustify:todo: e024_ComputeNode.computeMaskLoopOffsets_
+    /// Field: e024_ComputeNode.input_data_connects_
+    ///
+    /// One name per input of an OPAQUE op (`dsc/dsc2.h:926-927`), index-parallel with
+    /// [`ComputeNode::inputs`] where the fold pass reads them together
+    /// (`ddc/ddc_fold.cpp:1632`, `:1856`).
+    pub input_data_connects: Vec<DataConnect>,
+    /// Field: e024_ComputeNode.output_data_connects_
+    ///
+    /// The output half of the same (`dsc/dsc2.h:928-929`, `ddc/ddc_fold.cpp:4202-4226`).
+    pub output_data_connects: Vec<DataConnect>,
+}
+
+impl Default for InstrAttribute {
+    /// The authority's initialisers (`dsc/dsc2.h:906-929`): eight slices of repetition, all eight
+    /// compute slices, no mode, and every collection empty.
+    fn default() -> Self {
+        Self {
+            indices: Vec::new(),
+            repetition: Repetition(8),
+            sign_extend: false,
+            read_write_reg_map: BTreeMap::new(),
+            read_only_reg_map: BTreeMap::new(),
+            param_map: BTreeMap::new(),
+            mode: None,
+            compute_mask: ComputeMask(255),
+            input_data_connects: Vec::new(),
+            output_data_connects: Vec::new(),
+        }
+    }
+}
+
+/// Replaces: ComputeNode::RepetitionWithOffset
+///
+/// `dsc/dsc2.h:950-953`. How many times each operand repeats with an offset, one entry per operand.
+///
+/// ⛔ INDEX-PARALLEL WITH THE OPERAND LISTS, NOT A MAP: the DDL conversion pushes an entry beside
+/// every `inputs_`/`outputs_` entry it appends (`ddc/ddl/ddl_conversion.cpp:1385-1406`), and both
+/// readers index it with an operand position (`ddc/ddcv1.cpp:3059`,
+/// `ddc/ddc_transformation.cpp:1358-1379`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepetitionWithOffset {
+    /// Field: e024_ComputeNode.forInputs_
+    ///
+    /// `dsc/dsc2.h:951`.
+    pub for_inputs: Vec<Repetition>,
+    /// Field: e024_ComputeNode.forOutputs_
+    ///
+    /// `dsc/dsc2.h:952`. ⛔ A SPREAD THE TRANSFORMATION CONSUMES: it clones the node
+    /// `for_outputs[idx] - 1` further times and writes 1 back into the clone
+    /// (`ddc/ddc_transformation.cpp:1358-1379`).
+    pub for_outputs: Vec<Repetition>,
+}
+
+/// `dsc/dsc2.h:900-962`. One compute instruction in the schedule tree: the unit it issues on, the
+/// op, the operand components and the instruction attributes.
+///
+/// ⛔ THIS CARRIES COMPUTENODE'S OWN DECLARED FIELDS AND NOTHING INHERITED — IBM derives it from
+/// `InheritWithClone<ScheduleNode, ComputeNode>` and its constructor tags the base with `COMPUTE`
+/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e013's. So the `e024_ComputeNode`
+/// anchor at the end of this file is still open, and these five fields stay with it:
+///  * `inputsLdsAndLoopOffsets_` and `outputsLdsAndLoopOffsets_` are `std::vector<DataInfo>`
+///    (`:937-938`) — e019, still unported;
+///  * `coreletViews_` is a per-corelet `CoreletView`, and both of its halves are
+///    `std::vector<ScheduleNode::UnitView>` (`:943-947`) — e013's nested type;
+///  * `inputCoordinates_` and `outputCoordinate_` are `CoordinateType<CoordinateBaseType>`
+///    (`:948-949`) — e012, still unported;
+///  * `instrAttribute_.computeMaskLoopOffsets_` is keyed by `const LoopNode*` (`:923-925`), the
+///    pointer identity that `dsc/dsc2.cpp:1165-1216` round-trips through a node-name map.
+///
+/// ⛔ AND TWO OF THE THREE METHODS STAY OUT WITH THEM: `getComputeOperandFormats` reads
+/// `dsc.labeledDs_.at(outputsLdsAndLoopOffsets_.at(0).myLdsIdx_).dataFormat_` for a PACKMERGE
+/// (`dsc/dsc2.cpp:2348-2357`), which needs e019 and `DesignSpaceConfig`; `print` prints the base's
+/// `name_` and each `DataInfo` (`dsc/dsc2.cpp:4443-4477`).
+///
+/// ⛔ NO `PartialEq`: node identity in the authority is the POINTER — `allocUsers_` and the fold
+/// pass hold `ScheduleNode*` and compare nodes by address (`ddc/ddc_fold.cpp:1698`).
+#[derive(Clone, Debug)]
+pub struct ComputeNode {
+    /// Field: e024_ComputeNode.exUnit_
+    ///
+    /// The execution unit the instruction issues on (`dsc/dsc2.h:932`). ⛔ A COMPUTE WHOSE OWN
+    /// `exUnit_` APPEARS IN ITS OPERANDS IS ILLEGAL DDL (`ddc/ddl/ddl_conversion.cpp:1478-1487`).
+    pub ex_unit: SenComponent,
+    /// Field: e024_ComputeNode.type_
+    ///
+    /// The op (`dsc/dsc2.h:933`). Its `COUNT` initialiser means "not chosen yet"; the DDL conversion
+    /// always overwrites it (`ddc/ddl/ddl_conversion.cpp:1410-1437`).
+    pub r#type: ComputeOpType,
+    /// Field: e024_ComputeNode.dataFormat_
+    ///
+    /// The precision the op runs at (`dsc/dsc2.h:934`). ⛔ IT IS THE OP'S PRECISION FOR `MACC`
+    /// ALONE — every other op names its own width, and `dataFormat_` then only says what the
+    /// operands hold (`ddc/ddl/ddl_conversion.cpp:1410-1430`, and see [`Self::operand_sizes`]).
+    pub data_format: DataFormats,
+    /// Field: e024_ComputeNode.inputs_
+    ///
+    /// Where each input comes from (`dsc/dsc2.h:935`), pushed in lockstep with
+    /// `inputsLdsAndLoopOffsets_` and `repetitionWithOffset_.forInputs_`
+    /// (`ddc/ddl/ddl_conversion.cpp:1385-1395`).
+    pub inputs: Vec<SenComponent>,
+    /// Field: e024_ComputeNode.outputs_
+    ///
+    /// Where each output goes (`dsc/dsc2.h:936`), on the same terms
+    /// (`ddc/ddl/ddl_conversion.cpp:1396-1407`).
+    pub outputs: Vec<SenComponent>,
+    /// Field: e024_ComputeNode.instrAttribute_
+    ///
+    /// `dsc/dsc2.h:939`.
+    pub instr_attribute: InstrAttribute,
+    /// Field: e024_ComputeNode.numFoldsEngaged
+    ///
+    /// `dsc/dsc2.h:940`. ⛔ IT SCALES EVERY OPERAND SIZE (`dsc/dsc2.cpp:2333`, `:2344`); `Ddc` sets
+    /// it from the unit's fold count (`ddc/ddcv1.cpp:1887`).
+    pub num_folds_engaged: NumFoldsEngaged,
+    /// Field: e024_ComputeNode.isOpaqueOp_
+    ///
+    /// Whether the DDL supplied the instruction verbatim (`dsc/dsc2.h:941`). ⛔ THE FOLD AND
+    /// TRANSFORMATION PASSES BRANCH ON IT before reading the data connects
+    /// (`ddc/ddc_fold.cpp:1630`, `:1853`, `ddc/ddc_transformation_util.cpp:1466`).
+    pub is_opaque_op: bool,
+    /// Field: e024_ComputeNode.repetitionWithOffset_
+    ///
+    /// `dsc/dsc2.h:954`.
+    pub repetition_with_offset: RepetitionWithOffset,
+}
+
+impl Default for ComputeNode {
+    /// The authority's default member initializers (`dsc/dsc2.h:932-941`, `:950-954`). ⛔ WHAT IT
+    /// CANNOT SET IS THE BASE'S TAG: `ComputeNode()` passes `COMPUTE` to `ScheduleNode`
+    /// (`dsc/dsc2.h:901`), and that field is e013's.
+    fn default() -> Self {
+        Self {
+            ex_unit: SenComponent::NoComponent,
+            r#type: ComputeOpType::Count,
+            data_format: DataFormats::Sen169Fp16,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            instr_attribute: InstrAttribute::default(),
+            num_folds_engaged: NumFoldsEngaged(1),
+            is_opaque_op: false,
+            repetition_with_offset: RepetitionWithOffset::default(),
+        }
+    }
+}
+
+impl ComputeNode {
+    /// `dsc/dsc2.cpp:2291-2346`. The element count of every operand, inputs in order and the OUTPUT
+    /// LAST (`dsc/dsc2.h:956-957`).
+    ///
+    /// It takes the core generation rather than the `const SenSystemDef&` of the declaration
+    /// (`dsc/dsc2.h:958`), because `sysDef.coreArch` is the only thing the body reads
+    /// (`sys-arch-spec/sysdef.h:93`), and [`Gen`] is `IsaCoreGen` already ported
+    /// (`sys-arch-spec/isa/isa.hpp:25-32`).
+    ///
+    /// ⛔ ABSENT WHERE THE AUTHORITY REFUSES, and it refuses on a PTWEST input twice: `MACC` is
+    /// "not correctly handled at the moment" and anything outside the five FMA/IMA ops is an
+    /// "Unexpected PT operation" (`dsc/dsc2.cpp:2308-2312`).
+    /// ⛔ AND ABSENT ON AN `INVALID` FORMAT, where the authority divides 1024 by the -1 in
+    /// `dataFormatsToBitWidth` and carries -1024 elements forward (`:2295`) — see
+    /// [`DataFormats::bit_width`]. Nothing downstream can use a negative operand size, and the DDL
+    /// conversion resolves `INVALID` away before a node is scheduled
+    /// (`ddc/ddl/ddl_conversion.cpp:1442-1468`).
+    pub fn operand_sizes(&self, core_arch: Gen) -> Option<Vec<OperandSize>> {
+        let up_to_rcudd1a = core_arch <= Gen::Rcudd1a;
+        let mut sizes = Vec::new();
+        for input in &self.inputs {
+            let size = match input {
+                // `dsc/dsc2.cpp:2297-2312`.
+                SenComponent::Ptwest => match self.r#type {
+                    ComputeOpType::Fma16 => {
+                        if up_to_rcudd1a {
+                            8
+                        } else {
+                            32
+                        }
+                    }
+                    ComputeOpType::Fma8 => {
+                        if up_to_rcudd1a {
+                            16
+                        } else {
+                            128
+                        }
+                    }
+                    ComputeOpType::Ima8 => {
+                        if up_to_rcudd1a {
+                            32
+                        } else {
+                            128
+                        }
+                    }
+                    // Only available from SEN1P5.
+                    ComputeOpType::Fma4 => 256,
+                    ComputeOpType::Ima4 => {
+                        if up_to_rcudd1a {
+                            64
+                        } else {
+                            256
+                        }
+                    }
+                    _ => return None,
+                },
+                // `:2313-2314`.
+                SenComponent::Ptnorth => 64,
+                // `:2315-2332`. PELRF and SFPLRF are memories that this branch excludes, so they
+                // take the default below.
+                input
+                    if MEMORIES.contains(input)
+                        && !matches!(input, SenComponent::Pelrf | SenComponent::Sfplrf) =>
+                {
+                    match (self.r#type, self.data_format) {
+                        (ComputeOpType::Fma8, _)
+                        | (ComputeOpType::Macc, DataFormats::Sen143Fp8 | DataFormats::Sen152Fp8) => {
+                            if up_to_rcudd1a {
+                                128
+                            } else {
+                                1024
+                            }
+                        }
+                        (ComputeOpType::Ima8, _) | (ComputeOpType::Macc, DataFormats::Senint8) => {
+                            if up_to_rcudd1a {
+                                256
+                            } else {
+                                1024
+                            }
+                        }
+                        (ComputeOpType::Ima4, _) | (ComputeOpType::Macc, DataFormats::Senint4) => {
+                            if up_to_rcudd1a {
+                                512
+                            } else {
+                                2048
+                            }
+                        }
+                        (ComputeOpType::Fma16, _)
+                        | (ComputeOpType::Macc, DataFormats::Sen169Fp16) => {
+                            if up_to_rcudd1a {
+                                64
+                            } else {
+                                256
+                            }
+                        }
+                        // Only available from SEN1P5.
+                        (ComputeOpType::Fma4, _)
+                        | (ComputeOpType::Macc, DataFormats::Sen121Fp4) => 2048,
+                        // The default for fp16/int24, `:2295-2296`.
+                        _ => 1024 / self.data_format.bit_width()?.0,
+                    }
+                }
+                _ => 1024 / self.data_format.bit_width()?.0,
+            };
+            sizes.push(OperandSize(size * self.num_folds_engaged.0));
+        }
+
+        // `:2337-2344`: all reduced-precision ops produce fp16, so the output is 64 elements unless
+        // the op runs in fp32.
+        let output = if self.data_format == DataFormats::IeeeFp32 {
+            32
+        } else {
+            64
+        };
+        sizes.push(OperandSize(output * self.num_folds_engaged.0));
+        Some(sizes)
+    }
+}
+
+// crustify:todo: e024_ComputeNode
+
+// crustify:todo: e024_ComputeNode.coreletViews_
+
+// crustify:todo: e024_ComputeNode.inputCoordinates_
+
+// crustify:todo: e024_ComputeNode.inputsLdsAndLoopOffsets_
+
+// crustify:todo: e024_ComputeNode.inputsLoopsAndSizes_
+
+// crustify:todo: e024_ComputeNode.outputCoordinate_
+
+// crustify:todo: e024_ComputeNode.outputsLdsAndLoopOffsets_
+
+// crustify:todo: e024_ComputeNode.outputsLoopsAndSizes_
