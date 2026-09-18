@@ -262,16 +262,27 @@ impl PrimaryDimAndKind {
     /// IBM's `std::hash<PrimaryDimAndKind>` value: `(dim << 4) ^ kind` (`dsc/dims.h:88-92`).
     ///
     /// ⛔ IT IS OBSERVABLE, AND THIS FUNCTION ALONE DOES NOT REPRODUCE IT.
-    /// `ddc/ddc_transformation_util.cpp:203-207` iterates an `unordered_map` keyed by this type and
-    /// pushes the result into a loop's dim list, so libstdc++'s bucket order reaches the minted
-    /// tree. Matching that needs libstdc++'s bucket policy too; an ordered container is the
-    /// deterministic answer, and `Ord` is derived above for it.
+    /// `ddc/ddc_transformation_util.cpp:170` declares an `unordered_map` keyed by this type, `:203-206`
+    /// iterates it into the dim list of a loop it is about to mint, and that same list spells the
+    /// node's `name_` (`:151-153` for a new loop, `:253-254` for the base one) — so libstdc++'s
+    /// bucket order reaches both the minted tree and its exported names. Matching that needs
+    /// libstdc++'s bucket policy, not the hash.
+    ///
+    /// ⭐ AN ORDERED CONTAINER IS THE DETERMINISTIC ANSWER, AND IT LOSES NOTHING OF IBM'S NUMBER:
+    /// `MetaDimKind` never reaches `1 << HASH_SHIFT`, so the XOR is an addition and this value is
+    /// strictly increasing in `(dim_, kind_)`. The derived `Ord` above therefore visits keys in
+    /// increasing IBM-hash order.
     pub fn hash_value(self) -> usize {
         ((self.dim as usize) << MetaDimKind::HASH_SHIFT) ^ (self.kind as usize)
     }
 }
 
-/// The authority's hash, so a `HashMap` keyed by this type buckets on IBM's value.
+/// IBM's hash value, so the one number the authority defines is all that is fed to a hasher.
+///
+/// ⛔ THIS DOES NOT GIVE A `HashMap` IBM'S BUCKET ORDER. `RandomState` runs SipHash over these
+/// bytes under a per-process seed, so the bucket — and the iteration order — is Rust's, and is not
+/// stable across runs. `hash_value` is where IBM's number is observable, and it is what the
+/// order-sensitive sites reach through a `BTreeMap`/`BTreeSet` instead.
 impl Hash for PrimaryDimAndKind {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(self.hash_value());
@@ -1630,6 +1641,49 @@ mod unit_tests {
             }
         }
         assert_eq!(seen.len(), EVERY_DIM.len() * EVERY_KIND.len());
+    }
+
+    /// The formula per pair, not merely an injective function of the two halves, and the ordering
+    /// consequence the deterministic-container decision rests on: IBM's hash is strictly increasing
+    /// in `(dim_, kind_)`, so `Ord` and a `BTreeSet` visit keys in increasing IBM-hash order.
+    #[test]
+    fn the_authoritys_hash_is_monotone_so_ord_visits_in_hash_order() {
+        let mut dim_major = Vec::new();
+        for dim in EVERY_DIM {
+            for kind in EVERY_KIND {
+                let pair = PrimaryDimAndKind::new(dim, kind);
+                // `<< 4` is IBM's own width, spelled out so this does not reuse `HASH_SHIFT`.
+                assert_eq!(
+                    pair.hash_value(),
+                    ((dim as usize) << 4) ^ (kind as usize),
+                    "{dim:?}/{kind:?}"
+                );
+                dim_major.push(pair);
+            }
+        }
+
+        let mut sorted = dim_major.clone();
+        sorted.sort();
+        assert_eq!(sorted, dim_major, "Ord is not dim_ then kind_");
+        assert!(
+            dim_major
+                .windows(2)
+                .all(|w| w[0].hash_value() < w[1].hash_value()),
+            "the hash is not monotone in the pair"
+        );
+
+        // Inserted backwards, so the visit order is the container's and not the input's.
+        let visited: Vec<_> = dim_major
+            .iter()
+            .rev()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            visited, dim_major,
+            "a BTreeSet does not visit in hash order"
+        );
     }
 
     /// A bare dim is that dim unpadded, and that is also the default pair.
