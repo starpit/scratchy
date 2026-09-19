@@ -349,14 +349,10 @@ pub type ScheduleDimMap = BTreeMap<ScheduleDimTypes, Vec<PrimaryDimTypes>>;
 
 /// Field: e029_L3DlOpsScheduler.ScheduleDimTableType
 ///
-/// One [`ScheduleDimMap`] per analysed tensor — `ScheduleDimTableType` (`:99`).
-/// `buildScheduleDimensionsTable` returns it and `buildLoopOrder` consumes it (`.cpp:4236-4239`,
-/// `.cpp:4378-4381`).
-///
-/// ⛔ THE `int` KEY IS AN `ldsIdx`, NOT A DSC AND NOT A DATA STAGE: every read indexes it with
-/// `lds.ldsIdx_` (`.cpp:4401`, `:4434`, `:4444`), and index tensors are left out of the table
-/// altogether (`.cpp:4244-4247`) — so a key it does not hold means "not analysed", which `.at`
-/// throws on.
+/// One [`ScheduleDimMap`] per analysed tensor — `ScheduleDimTableType` (`:99`), whose 14 `.at` reads
+/// THROW on a tensor the build skipped: it excludes every index tensor (`.cpp:4246`) while
+/// `getLabeledDsWithDsType` does not (`.cpp:369-376`, read at `.cpp:4434`, `:4494`).
+/// ⛔ ITS KEY IS AN `ldsIdx_` WRITTEN AND A `labeledDs_` POSITION READ (`.cpp:4246` vs `:4414`).
 pub type ScheduleDimTable = BTreeMap<LdsIdx, ScheduleDimMap>;
 
 /// Field: e029_L3DlOpsScheduler.TransferAccessPatternType
@@ -757,6 +753,37 @@ impl MulticastDegree {
     }
 }
 
+/// How many times a loop runs — the `int` `getTripCount` returns (`:493-495`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TripCount {
+    /// `ceil(num / den)` in `double` as the authority computes it — negative or zero wherever exactly
+    /// one side is an unfilled `-1`.
+    Trips(i32),
+    /// ⛔ A ZERO DENOMINATOR, WHERE THE AUTHORITY CASTS `inf` OR `nan` TO `int` AND IS UB: the compiled
+    /// authority answered `-2147483648`, `0` and `2147483647` by the numerator's sign, which is this
+    /// host's saturating cast and not a trip count.
+    Undefined,
+}
+
+impl TripCount {
+    /// `:493-495`. The quotient in `double` as the authority computes it, reaching the `as` cast only
+    /// for the finite values [`Undefined`](Self::Undefined) leaves.
+    fn new(num: DimVal, den: DimVal) -> Self {
+        if den.0 == 0 {
+            return Self::Undefined;
+        }
+        Self::Trips((f64::from(num.0) / f64::from(den.0)).ceil() as i32)
+    }
+
+    /// The count, or `None` where the authority's cast is UB.
+    pub const fn trips(self) -> Option<i32> {
+        match self {
+            Self::Trips(trips) => Some(trips),
+            Self::Undefined => None,
+        }
+    }
+}
+
 /// Stage 2a of the scheduler — `class L3DlOpsScheduler` (`:55-539`), the pass that turns a
 /// `SuperDsc`'s design space configurations into a `dsc2` schedule tree and commits its LX
 /// allocations (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-42`).
@@ -778,9 +805,12 @@ impl MulticastDegree {
 /// no method that reads them can be ported until their types are.
 ///
 /// ⛔ ITS 130 METHOD BODIES ARE NOT THIS UNIT: `UNITS.tsv` splits them into `e029g1`..`e029g7`. What is
-/// ported here is the DECLARATION — the fields, the members defined inline in the header, and
-/// `getBurstEfficiency` (`:344-345`), whose name matches no group's prefix and which is the only
-/// reader of [`Self::burst_efficiency`]'s table.
+/// ported here is the DECLARATION — the fields; `getBurstEfficiency` (`:344-345`), declared here and
+/// defined in the .cpp, matching no group's prefix and the only reader of
+/// [`Self::burst_efficiency`]'s table; and two of the FOUR members the header DEFINES INLINE,
+/// [`Self::is_valid_dim_param`] (`:227`) and [`Self::trip_count`] (`:487-496`). ⛔ THE OTHER TWO WAIT
+/// ON A FIELD [`DesignSpaceConfig`] DOES NOT CARRY: `hasComputeOp` (`:285-287`) reads `computeOp_`,
+/// `isOutputLabeledDs` (`:228-230`) reads `labeledDs_`.
 #[derive(Debug)]
 pub struct L3DlOpsScheduler {
     /// Field: e029_L3DlOpsScheduler.exphases
@@ -802,7 +832,10 @@ pub struct L3DlOpsScheduler {
 
     /// Field: e029_L3DlOpsScheduler.verbose
     ///
-    /// `:208`, defaulting to `0` (`:65`). Every reader is a `> 0` print gate (`.cpp:5585-5594`).
+    /// `:208`, defaulting to `0` (`:65`). ⛔ NOT A BOOLEAN GATE: of its 21 readers 15 test `> 0`, two
+    /// test `> 1` and two test `> 2`, and two hand the VALUE out of the class as
+    /// `dsc2::distributeElemArrToTemporalLoops`'s `coordPropReportLevel` (`.cpp:7442`, `:7644`), which
+    /// tests it `> 1` at five sites and `> 2` at ten (`dsc/dsc2.cpp:5934-6544`).
     pub verbose: Verbosity,
 
     /// Field: e029_L3DlOpsScheduler.gtrCurrGroupName
@@ -830,8 +863,8 @@ pub struct L3DlOpsScheduler {
     /// Field: e029_L3DlOpsScheduler.lxBufferType
     ///
     /// `:221`, `= DOUBLE`. What `setLxBufferType` decided from the mode, the core generation and the
-    /// request count (`.cpp:6425-6450`), and what nine later sites branch on (`.cpp:450`, `:2794`,
-    /// `:2826`, `:3592`, `:3734`, `:4124`, `:4645`, `:4658`, `:6766`).
+    /// request count (`.cpp:6425-6450`), and what TEN later sites branch on: seven plain `if`s and
+    /// three `DT_CHECK_MSG`s, two of which THROW on any value but these two (`.cpp:4658`, `:6827`).
     pub lx_buffer_type: BufferType,
 
     /// Field: e029_L3DlOpsScheduler.dataStageIbrIdx
@@ -1012,6 +1045,32 @@ impl L3DlOpsScheduler {
         }
         // `.cpp:84-85`.
         Some(dsc.corelet_d.primary_dim_to_val(dim)? < dsc.core_d.primary_dim_to_val(dim)?)
+    }
+
+    /// Replaces: e029_L3DlOpsScheduler.isValidDimParam
+    ///
+    /// `:227`. Is a dim's value a positive one? All three callers pass an `int` from
+    /// `primaryDimToVal_st` (`dsc/dims.h:268-269`), two of them through a `long` (`.cpp:1662`,
+    /// `:2282`), so the authority's `double` parameter only ever widens and its `> 0.0` is this `> 0`.
+    /// ⛔ AN UNFILLED DIM IS WHAT IT ANSWERS FALSE FOR: IBM's `-1` is a value here, not an absence.
+    pub const fn is_valid_dim_param(param: DimVal) -> bool {
+        param.0 > 0
+    }
+
+    /// Replaces: e029_L3DlOpsScheduler.getTripCount
+    ///
+    /// `:487-496`. A loop's trip count — its numerator stage's `dim` over its denominator's, rounded
+    /// up; all seven callers pass a `LoopNode`'s `num_id`/`den_id`.
+    /// ⛔ AN UNFILLED DIM IS DIVIDED WITH, NOT REFUSED — a filled `7` over IBM's `-1` is `-7`, so
+    /// [`None`] here is only `dataStageParam_.at`'s throw and `primaryDimToVal_st`'s `DT_ERROR`.
+    pub fn trip_count(
+        dsc: &DesignSpaceConfig,
+        dim: PrimaryDimTypes,
+        num_id: DataStageId,
+        den_id: DataStageId,
+    ) -> Option<TripCount> {
+        let stage_dim = |id: &DataStageId| dsc.data_stage_param.get(id)?.ss.primary_dim_to_val(dim);
+        Some(TripCount::new(stage_dim(&num_id)?, stage_dim(&den_id)?))
     }
 }
 
@@ -3320,6 +3379,120 @@ mod equivalence {
         assert!(
             !double.data_stage_param.contains_key(&super_chunk_idx),
             "the refresh is SPATIAL_DOUBLE only (.cpp:2826)"
+        );
+    }
+
+    /// e029 `:227` — `isValidDimParam` over the `int` extremes, transcribed from a compiled oracle
+    /// whose `Probe` body is the header's `:227-230` and `:487-496` included verbatim
+    /// (`clang++ -std=c++17`, rev `a0d29abbed`).
+    ///
+    /// ⛔ THE AUTHORITY'S PARAMETER IS A `double` AND ALL THREE CALLERS HAND IT AN `int`
+    /// (`.cpp:1394`, `:1666`, `:2286`), so the widening is what makes `> 0.0` and this `> 0` the same
+    /// predicate; `i32::MIN` and `i32::MAX` are where a lossy one would show.
+    #[test]
+    fn is_valid_dim_param_over_the_int_extremes_matches_the_executed_authority() {
+        // The oracle's own stdout, unedited:
+        //   isValidDimParam: -2147483648->0 -2->0 -1->0 0->0 1->1 2->1 7->1 2147483647->1
+        const AUTHORITY: [(i32, bool); 8] = [
+            (-2147483648, false),
+            (-2, false),
+            (-1, false),
+            (0, false),
+            (1, true),
+            (2, true),
+            (7, true),
+            (2147483647, true),
+        ];
+        for (param, valid) in AUTHORITY {
+            assert_eq!(
+                L3DlOpsScheduler::is_valid_dim_param(DimVal(param)),
+                valid,
+                "param {param}"
+            );
+        }
+    }
+
+    /// e029 `:487-496` — `getTripCount` over every pair of the values one dim can hold: IBM's unfilled
+    /// `-1` and the stored `0`, `1`, `2`, `7` and `i32::MAX`, from the same oracle.
+    ///
+    /// ⛔ AN UNFILLED DIM IS A DIVISOR, NOT AN ABSENCE: `den = -1` negates the numerator and `num = -1`
+    /// rounds toward `0`, so a port that refused an unfilled dim would answer [`None`] for ten of the
+    /// eleven pairs that touch stage 0, every one of which the authority answers with a number.
+    /// ⚠️ MEASURED AS A CONTROL: making `trip_count` refuse a negative `DimVal` fails this test at
+    /// `stage 0 over stage 0`, where the authority's `ceil(-1 / -1.0)` is `1`.
+    /// ⛔ AND THE `den = 0` COLUMN IS ITS UB: `ceil(num / 0.0)` cast to `int` gave `-2147483648`, `0`
+    /// and `2147483647` by the numerator's sign, which is a saturating cast and not a trip count —
+    /// [`TripCount::Undefined`], distinct from the `.at()` throw below.
+    #[test]
+    fn trip_count_over_every_dim_value_pair_matches_the_executed_authority() {
+        use crate::schedule::dsc2::DataStage;
+
+        // The oracle's own stdout, unedited:
+        //   stage X: [0]=-1 [1]=0 [2]=1 [3]=2 [4]=7 [5]=2147483647
+        //   getTripCount(dsc, X, num, den):
+        //     num=         -1:           1 -2147483648          -1           0           0           0
+        //     num=          0:           0           0           0           0           0           0
+        //     num=          1:          -1  2147483647           1           1           1           1
+        //     num=          2:          -2  2147483647           2           1           1           1
+        //     num=          7:          -7  2147483647           7           4           1           1
+        //     num= 2147483647: -2147483647  2147483647  2147483647  1073741824   306783379           1
+        const UB: Option<i32> = None;
+        #[rustfmt::skip]
+        const AUTHORITY: [[Option<i32>; 6]; 6] = [
+            [Some(1),           UB, Some(-1),         Some(0),          Some(0),         Some(0)],
+            [Some(0),           UB, Some(0),          Some(0),          Some(0),         Some(0)],
+            [Some(-1),          UB, Some(1),          Some(1),          Some(1),         Some(1)],
+            [Some(-2),          UB, Some(2),          Some(1),          Some(1),         Some(1)],
+            [Some(-7),          UB, Some(7),          Some(4),          Some(1),         Some(1)],
+            [Some(-2147483647), UB, Some(2147483647), Some(1073741824), Some(306783379), Some(1)],
+        ];
+
+        // Stage 0 leaves `X` unfilled, so it reports IBM's `-1`; stages 1..=5 store the rest.
+        let mut dsc = DesignSpaceConfig {
+            data_stage_param: BTreeMap::from([(DataStageId(0), DataStage::default())]),
+            ..DesignSpaceConfig::default()
+        };
+        let stored = [0.0, 1.0, 2.0, 7.0, f64::from(i32::MAX)];
+        for (i, size) in stored.into_iter().enumerate() {
+            let mut stage = DataStage::default();
+            stage.ss.x = DimSize::new(size);
+            dsc.data_stage_param
+                .insert(DataStageId(i32::try_from(i).unwrap() + 1), stage);
+        }
+
+        for (num, row) in AUTHORITY.iter().enumerate() {
+            for (den, &trips) in row.iter().enumerate() {
+                let ids = (
+                    DataStageId(i32::try_from(num).unwrap()),
+                    DataStageId(i32::try_from(den).unwrap()),
+                );
+                assert_eq!(
+                    L3DlOpsScheduler::trip_count(&dsc, PrimaryDimTypes::X, ids.0, ids.1)
+                        .map(TripCount::trips),
+                    Some(trips),
+                    "stage {num} over stage {den}"
+                );
+            }
+        }
+
+        // `dataStageParam_.at()` throws on an absent id, either side; `primaryDimToVal_st` throws on
+        // the sentinel dim — the oracle printed all three.
+        assert_eq!(
+            L3DlOpsScheduler::trip_count(&dsc, PrimaryDimTypes::X, DataStageId(0), DataStageId(99)),
+            None
+        );
+        assert_eq!(
+            L3DlOpsScheduler::trip_count(&dsc, PrimaryDimTypes::X, DataStageId(99), DataStageId(0)),
+            None
+        );
+        assert_eq!(
+            L3DlOpsScheduler::trip_count(
+                &dsc,
+                PrimaryDimTypes::Undefined,
+                DataStageId(1),
+                DataStageId(2)
+            ),
+            None
         );
     }
 }
