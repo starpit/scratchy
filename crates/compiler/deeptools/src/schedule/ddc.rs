@@ -1,7 +1,8 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
 use crate::schedule::dims::PrimaryDimTypes;
-use crate::schedule::dsc2::FoldParamInfoType;
+use crate::schedule::dsc2::{Alpha, Beta, Cardinality, FoldParamInfoType};
+use crate::schedule::fold::{FoldDimPos, FoldManager};
 use crate::schedule::metadata::Metadata;
 use sys_arch_spec::RowId;
 use sys_arch_spec::arch_enums::SenComponent;
@@ -9,6 +10,8 @@ use sys_arch_spec::arch_enums::SenComponent;
 /// Replaces: Ddc::registerComponents
 ///
 /// Field: e025_Ddc.registerComponents
+///
+/// Field: e016_Ddc.registerComponents
 ///
 /// The seven components whose storage is a register file (`ddc/ddcv1.cpp:17-18`, declared
 /// `ddc/ddc.h:36`). All three readers ask only for membership, to decide whether a transfer result
@@ -217,8 +220,8 @@ pub fn ddc_coord_env_option() -> Option<String> {
 /// `SuperDsc`'s design space configurations into a schedule tree.
 ///
 /// ⛔ THIRTEEN OF THE CLASS'S TWENTY DECLARED FIELDS, plus the static `registerComponents` as
-/// [`REGISTER_COMPONENTS`], so the `e025_Ddc` and `e032_Ddc` anchors below stay open. All seven
-/// left out are a pointer or a pointer-keyed container, under two blockers.
+/// [`REGISTER_COMPONENTS`], so the `e016_Ddc`, `e025_Ddc` and `e032_Ddc` anchors below stay
+/// open. All seven left out are a pointer or a pointer-keyed container, under two blockers.
 ///
 /// Types that are not scheduled units in `crustify-scheduler/UNITS.tsv` at all:
 ///  * `dscGlobal` (`ddc/ddc.h:37`) — `const DesignSpaceConfigGlobal&`;
@@ -231,7 +234,9 @@ pub fn ddc_coord_env_option() -> Option<String> {
 ///    ([`crate::schedule::dsc::DesignSpaceConfig`]) but it points INTO `sdsc.dscs_`
 ///    (`ddc/ddcv1.cpp:3700`), so it cannot be represented without `SuperDsc`.
 ///
-/// Fields needing `dsc2::ScheduleNode` identity, the blocker e013, e016, e018 and e023 also report:
+/// Fields needing `dsc2::ScheduleNode` identity, the blocker that the open
+/// `e029_ScheduleNode.prev_`, `e030_BlockNode.next_` and `e032_ScheduleTree.head_` anchors in
+/// `schedule/dsc2.rs` also carry:
 ///  * `loopsBelowChunkBoundary` (`ddc/ddc.h:108`) — `unordered_set<const dsc2::LoopNode*>`, filled by
 ///    a DFS over the tree (`ddc/ddcv1.cpp:3683-3689`);
 ///  * `coordPropTracker` (`ddc/ddc.h:548`) and all three fields of its nested `CoordPropTracker`
@@ -280,6 +285,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.verbose_
     ///
+    /// Field: e016_Ddc.verbose_
+    ///
     /// `ddc/ddc.h:38`. One of TWO fields with no member initialiser that the constructor does set:
     /// the other is the `dscGlobal` reference (`:37`), bound in the same init list (`:52-53`). A THIRD
     /// has none and the constructor does NOT set it — `memTrackers` (`:102`), which is why the type
@@ -290,6 +297,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.latchDataIdCounter_
     ///
+    /// Field: e016_Ddc.latchDataIdCounter_
+    ///
     /// `ddc/ddc.h:39`. Holds the NEXT id to hand out, not the last one handed out. `run_v1` resets it
     /// per DSC (`ddc/ddcv1.cpp:3708`); [`Ddc::next_latch_data_id`] is its only consumer.
     pub latch_data_id_counter: LatchDataId,
@@ -298,12 +307,16 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.transformationReportLevel_
     ///
+    /// Field: e016_Ddc.transformationReportLevel_
+    ///
     /// `ddc/ddc.h:40` — a constructor parameter, never derived from the coordinate option string.
     pub transformation_report_level: TransformationReportLevel,
 
     /// Field: e025_Ddc.coordFoldReportLevel_
     ///
     /// Field: e032_Ddc.coordFoldReportLevel_
+    ///
+    /// Field: e016_Ddc.coordFoldReportLevel_
     ///
     /// `ddc/ddc.h:41`, from the option string's `content_*` spelling ([`CoordReportLevel::content`]).
     /// `Ddc::coordinateCapture` (`ddc/ddc_fold.cpp:1538-1623`) is its ONLY reader and all eight reads
@@ -314,6 +327,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.coordPropReportLevel_
     ///
+    /// Field: e016_Ddc.coordPropReportLevel_
+    ///
     /// `ddc/ddc.h:42`, from the SAME string's `prop_*` spelling ([`CoordReportLevel::prop`]).
     /// SIXTY-FIVE lines of `ddc/ddc_fold.cpp` read it (`:503` through `:4680`) against the eight of
     /// [`Ddc::coord_fold_report_level`], which is why it is a second level and not one knob.
@@ -323,6 +338,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.verifyCoordinateBasedLoopElemOff
     ///
+    /// Field: e016_Ddc.verifyCoordinateBasedLoopElemOff
+    ///
     /// `ddc/ddc.h:43` — the ONLY field driven by an environment variable rather than a parameter
     /// ([`ddc_coord_env_option`]), with one reader: `ddc/ddcv1.cpp:2465` takes the coordinate-derived
     /// element-offset path when this OR `datastage_based_elem_off` is set.
@@ -331,6 +348,8 @@ pub struct Ddc {
     /// Field: e025_Ddc.datastageBasedElemOff
     ///
     /// Field: e032_Ddc.datastageBasedElemOff
+    ///
+    /// Field: e016_Ddc.datastageBasedElemOff
     ///
     /// `ddc/ddc.h:44`. NOT a constructor parameter: `run_v1` latches it true per `SuperDsc`, never
     /// back to false, when any compute op is a `ReStickifyOpLx` or `ReStickifyOpHBM`, and MIRRORS it
@@ -345,6 +364,8 @@ pub struct Ddc {
     /// Field: e025_Ddc.dscToDdl_
     ///
     /// Field: e032_Ddc.dscToDdl_
+    ///
+    /// Field: e016_Ddc.dscToDdl_
     ///
     /// `ddc/ddc.h:45`. Constructor parameter; its one reader dumps the converted DDL to stdout at the
     /// end of `run_v1` (`ddc/ddcv1.cpp:3796`). `runDdc` passes false (`SchedulerStages.cpp:35`).
@@ -371,6 +392,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.exphase
     ///
+    /// Field: e016_Ddc.exphase
+    ///
     /// `ddc/ddc.h:101`; `None` is the authority's `-1`.
     ///
     /// ⛔ `-1` IS NOT INERT — IT THROWS, which is why this is an `Option` AND why [`ExPhase`] cannot
@@ -395,6 +418,8 @@ pub struct Ddc {
     ///
     /// Field: e032_Ddc.metadata
     ///
+    /// Field: e016_Ddc.metadata
+    ///
     /// `ddc/ddc.h:105`. Per-DSC scratch: `run_v1` clears it at the top of every DSC iteration
     /// (`ddc/ddcv1.cpp:3706`), which is [`Metadata::clear`].
     pub metadata: Metadata,
@@ -402,6 +427,8 @@ pub struct Ddc {
     /// Field: e025_Ddc.coreletSplitDim
     ///
     /// Field: e032_Ddc.coreletSplitDim
+    ///
+    /// Field: e016_Ddc.coreletSplitDim
     ///
     /// `ddc/ddc.h:109`. [`PrimaryDimTypes::Undefined`] is the authority's `PrimaryDimTypesCount`
     /// initialiser and means "no corelet split". `initGlobalData` recomputes it per DSC: back to the
@@ -424,6 +451,8 @@ pub struct Ddc {
     /// Field: e025_Ddc.dataStageExplorationDone_
     ///
     /// Field: e032_Ddc.dataStageExplorationDone_
+    ///
+    /// Field: e016_Ddc.dataStageExplorationDone_
     ///
     /// `ddc/ddc.h:112`. A one-way phase latch WITHIN one DSC: false at the top of each
     /// (`ddc/ddcv1.cpp:3707`), true once `exploreAssignDataStages` finishes (`ddc/ddcv1.cpp:556`).
@@ -498,11 +527,51 @@ pub fn print_fold_params(fold_params: &[FoldParamInfoType], out: &mut String) {
     }
 }
 
+/// Replaces: Ddc::gatherFoldParams
+///
+/// One dimension's affine tower flattened to its per-level parameters, outermost level first
+/// (`ddc/ddc_fold.cpp:2224-2236`). ⭐ ALSO THE PORT OF `L3DlOpsScheduler::gatherFoldParams`
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7248-7261`): the two bodies are identical but for
+/// L3's trailing `const`, so that unit calls this and does not write a second copy.
+///
+/// ⛔ IT RETURNS THE VECTOR instead of appending to an out-parameter, because every authority caller
+/// passes one it has just built or `clear()`ed, so nothing observes the append.
+///
+/// ⛔ [`None`] IS `getAlphaBeta`'s OWN REFUSAL AND NOTHING ELSE: a level whose kind is not Affine is
+/// `DT_ERROR(" Cannot query beta in non affine fold func")`
+/// (`util/foldManager/foldInfrastructure.h:2433-2436`). A manager of ZERO dimensions is not a refusal
+/// — the loop body never runs and the result is empty.
+///
+/// ⚠️ NO NON-TEST CALLER YET: all ten authority call sites sit inside `Ddc` methods that need
+/// `currDsc` or `dsc2::ScheduleNode` identity, both still open above.
+pub fn gather_fold_params(fm: &FoldManager<i64>) -> Option<Vec<FoldParamInfoType>> {
+    // `for (int i = 0; i < fm.getNumDims(); ++i)` (`:2230`) — the authority's own counter is an `int`,
+    // so a dimension count past `i32::MAX` is outside its loop just as it is outside this one.
+    (0..i32::try_from(fm.num_dims()).ok()?)
+        .map(|i| {
+            let pos = FoldDimPos(i);
+            let (alpha, beta) = fm.alpha_beta(pos)?;
+            Some(FoldParamInfoType {
+                alpha: Alpha(*alpha),
+                beta: Beta(*beta),
+                cardinality: Cardinality(i64::from(fm.fold_dim_size(pos)?.0)),
+                fold_dim_label: fm.fold_dim_prop(pos)?.label().to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// Field: e025_Ddc.Category
 ///
 /// Field: e025_Ddc.cat
 ///
 /// Field: e025_Ddc.activeRow
+///
+/// Field: e016_Ddc.Category
+///
+/// Field: e016_Ddc.cat
+///
+/// Field: e016_Ddc.activeRow
 ///
 /// How a coordinate propagation relates the reference node's PT row to the working node's —
 /// `RowGroupInfo::Category` (`ddc/ddc.h:556-562`), carrying `activeRow` (`:577`).
@@ -582,7 +651,8 @@ impl RowGroupCategory {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::schedule::dsc2::{Alpha, Beta, Cardinality, MEMORIES};
+    use crate::schedule::dsc2::MEMORIES;
+    use crate::schedule::fold::{FoldDimProp, FoldDimSize};
 
     /// `runDdc`'s own call (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:35`).
     fn ddc() -> Ddc {
@@ -772,6 +842,57 @@ mod unit_tests {
         assert_eq!(out, "");
     }
 
+    /// `ddc/ddc_fold.cpp:2230-2235` over a two-level affine tower: outermost level first, the
+    /// cardinality the level's own fold extent and the label its `Label()`. ⛔ AND THE NEGATIVE: one
+    /// non-Affine level loses the WHOLE vector rather than its own entry, because `getAlphaBeta`
+    /// `DT_ERROR`s and the authority's `push_back` loop never reaches the levels below it.
+    #[test]
+    fn a_fold_tower_gathers_outermost_first_and_one_non_affine_level_refuses_all_of_it() {
+        let mut fm = FoldManager::<i64>::new();
+        assert_eq!(
+            fm.build_affine_dim(&FoldDimProp::new(FoldDimSize(4), "elem_arr_0"), FoldDimPos(0)),
+            Some(())
+        );
+        assert_eq!(fm.insert_alpha_beta(&2, &1, FoldDimPos(0)), Some(()));
+        assert_eq!(
+            fm.build_affine_dim(
+                &FoldDimProp::new(FoldDimSize(2), "rowsplit_fold"),
+                FoldDimPos(0)
+            ),
+            Some(())
+        );
+        assert_eq!(fm.insert_alpha_beta(&100, &0, FoldDimPos(0)), Some(()));
+        assert_eq!(
+            gather_fold_params(&fm),
+            Some(vec![
+                FoldParamInfoType {
+                    alpha: Alpha(100),
+                    beta: Beta(0),
+                    cardinality: Cardinality(2),
+                    fold_dim_label: "rowsplit_fold".to_owned(),
+                },
+                FoldParamInfoType {
+                    alpha: Alpha(2),
+                    beta: Beta(1),
+                    cardinality: Cardinality(4),
+                    fold_dim_label: "elem_arr_0".to_owned(),
+                },
+            ])
+        );
+
+        assert_eq!(
+            gather_fold_params(&FoldManager::<i64>::new()),
+            Some(Vec::new()),
+            "zero dimensions never enters the loop, so it is empty and not a refusal"
+        );
+
+        assert_eq!(
+            fm.build_map_dim(&FoldDimProp::new(FoldDimSize(3), "map_level"), FoldDimPos(0)),
+            Some(())
+        );
+        assert_eq!(gather_fold_params(&fm), None);
+    }
+
     /// `ddc/ddcv1.cpp:17-18` against the initializer list, and ⛔ EVERY ONE IS ALSO A
     /// `dsc2::memories` COMPONENT (`dsc/dscdefn.cpp:142-146`), so the two sets are not complements
     /// and `!is_any_of(storage, registerComponents)` is not "is a memory".
@@ -888,3 +1009,48 @@ mod unit_tests {
 // crustify:todo: e025_Ddc.sdsc_
 
 // crustify:todo: e025_Ddc.unseenDims
+
+// crustify:todo: e016_Ddc
+
+// crustify:todo: e016_Ddc.COMPLETE
+
+// crustify:todo: e016_Ddc.ROLLED_BACK
+
+// crustify:todo: e016_Ddc.ascendingOrder
+
+// crustify:todo: e016_Ddc.beta
+
+// crustify:todo: e016_Ddc.break
+
+// crustify:todo: e016_Ddc.commonGroupAncestor
+
+// crustify:todo: e016_Ddc.continue
+
+// crustify:todo: e016_Ddc.coordPropTracker
+
+// crustify:todo: e016_Ddc.currDsc
+
+// crustify:todo: e016_Ddc.currItemToProcess_
+
+// crustify:todo: e016_Ddc.itemsToProcess_
+
+// crustify:todo: e016_Ddc.loopDistributionParamInfo
+
+// crustify:todo: e016_Ddc.loopsBelowChunkBoundary
+
+// crustify:todo: e016_Ddc.memTrackers
+
+// crustify:todo: e016_Ddc.node
+
+// crustify:todo: e016_Ddc.nodeInfo
+
+// crustify:todo: e016_Ddc.refsAdded_
+
+// crustify:todo: e016_Ddc.retryCount
+
+// crustify:todo: e016_Ddc.row
+
+// crustify:todo: e016_Ddc.sdsc_
+
+// crustify:todo: e016_Ddc.unseenDims
+
