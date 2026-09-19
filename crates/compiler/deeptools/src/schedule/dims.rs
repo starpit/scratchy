@@ -40,12 +40,31 @@ pub enum PrimaryDimTypes {
 }
 
 /// ⛔ E0308 IF A DIM IS EVER INSERTED, DROPPED OR LEFT OUT OF `ALL`: the sentinel's discriminant is
-/// the count of the real dims, which is what `ddc/ddl/ddl_conversion.h:309` iterates.
+/// the count of the real dims, which is the bound of the authority's own dim loop
+/// (`ddc/ddl/ddl_conversion.h:309`).
 const _: [(); PrimaryDimTypes::COUNT] = [(); PrimaryDimTypes::Undefined as usize];
 
+/// ⛔ E0308 IF `ALL`, `NON_COMPOUND` AND `is_compound` EVER DISAGREE: the dims the authority's dim
+/// loops admit plus the ones they drop are all of them (`ddc/ddl/ddl_conversion.h:309-310`).
+const _: [(); PrimaryDimTypes::COUNT] = [(); PrimaryDimTypes::NON_COMPOUND.len() + {
+    let mut compound = 0;
+    let mut i = 0;
+    while i < PrimaryDimTypes::COUNT {
+        if PrimaryDimTypes::ALL[i].is_compound() {
+            compound += 1;
+        }
+        i += 1;
+    }
+    compound
+}];
+
 impl PrimaryDimTypes {
-    /// The real dimensions in the authority's order, which is what `0..PrimaryDimTypesCount`
-    /// iterates (`ddc/ddl/ddl_conversion.h:309`). The sentinel is not one of them.
+    /// The real dimensions in the authority's order — every value `0..PrimaryDimTypesCount` takes
+    /// (`ddc/ddl/ddl_conversion.h:309`). The sentinel is not one of them.
+    ///
+    /// ⛔ NOT THE SET THE AUTHORITY'S DIM LOOPS ADMIT. That loop drops `IJ` and `KIJ` from what it
+    /// inserts (`ddc/ddl/ddl_conversion.h:310`), so a candidate set built from `ALL` is two dims
+    /// too wide. `NON_COMPOUND` is that set.
     pub const ALL: [Self; 12] = [
         Self::In,
         Self::Out,
@@ -63,6 +82,33 @@ impl PrimaryDimTypes {
 
     /// How many real dimensions there are — the authority's `PrimaryDimTypesCount` as a count.
     pub const COUNT: usize = Self::ALL.len();
+
+    /// `ALL` in order, less the compound pair: the dims `DimProp` admits as candidates
+    /// (`ddc/ddl/ddl_conversion.h:309-310`) and the dims `getClSplitDim` compares across corelets
+    /// (`ddc/ddcv1.cpp:1802-1803`, which drops the sentinel too — it walks a keyed map).
+    pub const NON_COMPOUND: [Self; 10] = [
+        Self::In,
+        Self::Out,
+        Self::Mb,
+        Self::X,
+        Self::Y,
+        Self::I,
+        Self::J,
+        Self::Ki,
+        Self::Kj,
+        Self::X1,
+    ];
+
+    /// Whether the authority computes this dim from two halves rather than storing it — what its
+    /// own `DT_ERROR` calls a "compound dim" (`dsc/dims.cpp:571-572`), written by
+    /// `DataStructDims::compound` (`dsc/dims.cpp:84-110`).
+    ///
+    /// ⭐ ONE NAME FOR AN EXCLUSION THREE AUTHORITY SITES SPELL BY HAND: `is_any_of(d, IJ, KIJ)` at
+    /// `dsc/dims.cpp:572` and `ddc/ddl/ddl_conversion.h:310`, and with the sentinel at
+    /// `ddc/ddcv1.cpp:1803`.
+    pub const fn is_compound(self) -> bool {
+        matches!(self, Self::Ij | Self::Kij)
+    }
 
     /// The spelling `EnumsConversion::primaryDimToString` gives this dim (`dsc/dims.cpp:21-35`).
     ///
@@ -242,14 +288,17 @@ impl MetaDimKind {
 }
 
 /// Replaces: e002_PrimaryDimAndKind
+/// Replaces: e040_PrimaryDimAndKind
 ///
 /// `dsc/dims.h:76-82`. One dimension together with which of its quantities is meant — the key
 /// every loop carries in `dims_` and the element of every split-dim set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PrimaryDimAndKind {
     /// Field: e002_PrimaryDimAndKind.dim_
+    /// Field: e040_PrimaryDimAndKind.dim_
     pub dim: PrimaryDimTypes,
     /// Field: e002_PrimaryDimAndKind.kind_
+    /// Field: e040_PrimaryDimAndKind.kind_
     pub kind: MetaDimKind,
 }
 
@@ -299,13 +348,19 @@ impl From<PrimaryDimTypes> for PrimaryDimAndKind {
 }
 
 /// Replaces: e003_PaddingFormType
+/// Replaces: e039_PaddingFormType
 ///
 /// `dsc/dims.h:94-120`. The padding form of each dimension of one allocation, transfer or
 /// coordinate. A dim absent from the map is unpadded, so the empty form is the default one every
 /// `const PaddingFormType &padded = {}` parameter takes.
+///
+/// IBM's three member typedefs (`PerDimPaddingInfoT`, `iterator`, `const_iterator`,
+/// `dsc/dims.h:96-98`) are the map type and its two iterators; they name no stored value, so they
+/// carry no `Field:` anchor. `iter` below is the pair of them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PaddingFormType {
     /// Field: e003_PaddingFormType.padding_
+    /// Field: e039_PaddingFormType.padding_
     ///
     /// IBM's `PerDimPaddingInfoT`, a `std::map` (`dsc/dims.h:96`): ordered, and the order is
     /// exported (`dsc/dsc2.cpp:846-848`), which is why this is a `BTreeMap` and not a `HashMap`.
@@ -370,6 +425,7 @@ impl PaddingFormType {
 }
 
 /// Replaces: e004_DimPaddingSizes
+/// Replaces: e021_DimPaddingSizes
 ///
 /// `dsc/dims.h:134-146`. Everything that contributes to one primary dimension's padded size.
 ///
@@ -378,26 +434,34 @@ impl PaddingFormType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DimPaddingSizes {
     /// Field: e004_DimPaddingSizes.padFront_
+    /// Field: e021_DimPaddingSizes.padFront_
     pub pad_front: i32,
     /// Field: e004_DimPaddingSizes.padBack_
+    /// Field: e021_DimPaddingSizes.padBack_
     pub pad_back: i32,
     /// Field: e004_DimPaddingSizes.unneededPad_
+    /// Field: e021_DimPaddingSizes.unneededPad_
     ///
     /// Total unneeded elements.
     pub unneeded_pad: i32,
     /// Field: e004_DimPaddingSizes.unneededPadFront_
+    /// Field: e021_DimPaddingSizes.unneededPadFront_
     ///
     /// Unneeded elements that come from `pad_front`.
     pub unneeded_pad_front: i32,
     /// Field: e004_DimPaddingSizes.unneededPadBack_
+    /// Field: e021_DimPaddingSizes.unneededPadBack_
     ///
     /// Unneeded elements that come from `pad_back`.
     pub unneeded_pad_back: i32,
     /// Field: e004_DimPaddingSizes.stride_
+    /// Field: e021_DimPaddingSizes.stride_
     pub stride: i32,
     /// Field: e004_DimPaddingSizes.dilation_
+    /// Field: e021_DimPaddingSizes.dilation_
     pub dilation: i32,
     /// Field: e004_DimPaddingSizes.windowDim_
+    /// Field: e021_DimPaddingSizes.windowDim_
     ///
     /// The window dim this padding is associated with; `Undefined` means none, which is the test
     /// every caller writes (`ddc/ddcv1.cpp:1180`, `dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:315`).
@@ -424,9 +488,17 @@ impl Default for DimPaddingSizes {
 impl DimPaddingSizes {
     /// The scalar this kind names, for the four kinds that name one (`dsc/dims.cpp:59-72`).
     ///
-    /// ⭐ ABSENT RATHER THAN A THROW. IBM `DT_ERROR`s on the other five kinds, and the one caller
-    /// (`ddc/ddl/ddl_conversion.cpp:1831`) reaches it with a kind read from the DDL, so the arm is
-    /// live. The kinds that name no stored scalar are the absent case, not a stop.
+    /// ⭐ ABSENT RATHER THAN A THROW, AND ONLY TWO KINDS REACH IT. IBM `DT_ERROR`s on the other
+    /// five, but the one caller filters `Padded`, `Unpadded` and `WindowDim` into a different branch
+    /// one line earlier (`ddc/ddl/ddl_conversion.cpp:1824-1826`), so what can arrive here unhandled
+    /// is `PadValid` and the DDL-settable sentinel alone (`"undefined"` → `MetaDimKind::Count`,
+    /// `dsc/dims.cpp:53`).
+    ///
+    /// ⛔ TRAP — THE CALLER DIVIDES BY THIS AND A DEFAULT `DimPaddingSizes` ANSWERS `0`:
+    /// `scale /= ....getMetaDimVal(kind)` (`ddc/ddl/ddl_conversion.cpp:1828-1831`) is a `float`
+    /// divide, `padFront_`/`padBack_` initialise to `0` (`dsc/dims.h:135-136`), and the `inf` then
+    /// multiplies into a datastage constraint's min and max (`:1838-1844`). The non-zero obligation
+    /// is the constraint port's, not this accessor's — IBM returns the `0`.
     pub fn meta_dim_val(self, kind: MetaDimKind) -> Option<i32> {
         match kind {
             MetaDimKind::Dilation => Some(self.dilation),
@@ -443,6 +515,7 @@ impl DimPaddingSizes {
 }
 
 /// Replaces: e005_SymbolicDimInfo
+/// Replaces: e044_SymbolicDimInfo
 ///
 /// `dsc/dims.h:148-155`. The max and granularity of one symbolic dimension. Whether a dim is
 /// symbolic at all is its presence in `DataStructDims::symbolicDimInfo_`, never these values
@@ -450,8 +523,10 @@ impl DimPaddingSizes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SymbolicDimInfo {
     /// Field: e005_SymbolicDimInfo.maxSize_
+    /// Field: e044_SymbolicDimInfo.maxSize_
     pub max_size: i32,
     /// Field: e005_SymbolicDimInfo.granularity_
+    /// Field: e044_SymbolicDimInfo.granularity_
     pub granularity: i32,
 }
 
@@ -1167,7 +1242,7 @@ impl DataStructDims {
         if pad_type == PadType::NoPad {
             return Some(val);
         }
-        if matches!(d, PrimaryDimTypes::Ij | PrimaryDimTypes::Kij) {
+        if d.is_compound() {
             return None;
         }
         let pad = self.padding_sizes.get(&d)?;
@@ -1612,6 +1687,42 @@ mod unit_tests {
         assert_eq!(sorted, EVERY_DIM);
     }
 
+    /// The dims the authority's own dim loops admit are TEN, not the twelve of `ALL`: `DimProp()`
+    /// initialises its candidate list with "all dimensions (excluding IJ, KIJ)"
+    /// (`ddc/ddl/ddl_conversion.h:307-311`), and `getClSplitDim` drops the same pair plus the
+    /// sentinel (`ddc/ddcv1.cpp:1802-1803`). Spelled as the authority's literals here, not derived
+    /// from `ALL`, so a set built from the wrong one of the two is a failure and not a tautology.
+    #[test]
+    fn the_authoritys_dim_loops_admit_ten_of_the_twelve() {
+        assert_eq!(PrimaryDimTypes::COUNT, 12);
+        assert_eq!(
+            PrimaryDimTypes::NON_COMPOUND,
+            [
+                PrimaryDimTypes::In,
+                PrimaryDimTypes::Out,
+                PrimaryDimTypes::Mb,
+                PrimaryDimTypes::X,
+                PrimaryDimTypes::Y,
+                PrimaryDimTypes::I,
+                PrimaryDimTypes::J,
+                PrimaryDimTypes::Ki,
+                PrimaryDimTypes::Kj,
+                PrimaryDimTypes::X1,
+            ]
+        );
+        for dim in PrimaryDimTypes::ALL {
+            assert_eq!(
+                dim.is_compound(),
+                !PrimaryDimTypes::NON_COMPOUND.contains(&dim),
+                "{dim:?}"
+            );
+        }
+        assert!(PrimaryDimTypes::Ij.is_compound());
+        assert!(PrimaryDimTypes::Kij.is_compound());
+        // `ddc/ddcv1.cpp:1803` skips the sentinel alongside the pair, but for being no dimension.
+        assert!(!PrimaryDimTypes::Undefined.is_compound());
+    }
+
     /// Every dim's spelling round-trips, and an unknown one is absent rather than a throw.
     #[test]
     fn every_dim_name_round_trips() {
@@ -1764,7 +1875,9 @@ mod unit_tests {
         );
     }
 
-    /// Only four kinds name a stored scalar; the other five are absent.
+    /// Only four kinds name a stored scalar; the other five are absent. And of those five, the sole
+    /// caller can only ever arrive with two: it filters `Padded`, `Unpadded` and `WindowDim` into a
+    /// different branch one line before the call (`ddc/ddl/ddl_conversion.cpp:1824-1826`).
     #[test]
     fn only_the_four_direct_kinds_read_a_padding_scalar() {
         let sizes = DimPaddingSizes {
@@ -1787,6 +1900,32 @@ mod unit_tests {
         ] {
             assert_eq!(sizes.meta_dim_val(kind), None, "{kind:?}");
         }
+
+        let taken_as_a_dim = |kind| {
+            matches!(
+                kind,
+                MetaDimKind::Padded | MetaDimKind::Unpadded | MetaDimKind::WindowDim
+            )
+        };
+        let unhandled_at_the_caller: Vec<MetaDimKind> = EVERY_KIND
+            .into_iter()
+            .filter(|kind| !taken_as_a_dim(*kind) && sizes.meta_dim_val(*kind).is_none())
+            .collect();
+        assert_eq!(
+            unhandled_at_the_caller,
+            [MetaDimKind::PadValid, MetaDimKind::Undefined]
+        );
+
+        // What the caller divides `scale` by (`ddc/ddl/ddl_conversion.cpp:1828-1831`): a default's
+        // pads are `0`, so the divisor can be zero and the accessor still owes IBM's answer.
+        assert_eq!(
+            DimPaddingSizes::default().meta_dim_val(MetaDimKind::PadFront),
+            Some(0)
+        );
+        assert_eq!(
+            DimPaddingSizes::default().meta_dim_val(MetaDimKind::PadBack),
+            Some(0)
+        );
     }
 
     /// Unpadded, unit stride and dilation, no window dim — and `operator==` (`dsc/dims.cpp:74-80`)

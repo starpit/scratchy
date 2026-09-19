@@ -94,10 +94,7 @@ impl Default for DimProp {
     fn default() -> Self {
         Self {
             dim: PrimaryDimTypes::Undefined,
-            dim_candidates: PrimaryDimTypes::ALL
-                .into_iter()
-                .filter(|dim| !matches!(dim, PrimaryDimTypes::Ij | PrimaryDimTypes::Kij))
-                .collect(),
+            dim_candidates: PrimaryDimTypes::NON_COMPOUND.into_iter().collect(),
             num_refs_in_global_layouts: 0,
             drop_dim: false,
             meta_dim_kind: MetaDimKind::Unpadded,

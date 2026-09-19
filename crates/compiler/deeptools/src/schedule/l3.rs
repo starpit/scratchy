@@ -1583,19 +1583,16 @@ const CARRY_UNNEEDED_PAD_TO_CHUNK: bool = true;
 
 /// `.cpp:88-103`, `getCoreletSplitDimensions`. Every dim the corelets of a core divide, in the
 /// authority's enum order — which is what its walk over the `std::map`
-/// `EnumsConversion::primaryDimToString` yields (`dsc/dims.cpp:21-35`) once the compound `Ij`/`Kij`
-/// and the [`PrimaryDimTypes::Undefined`] sentinel are skipped, and [`PrimaryDimTypes::ALL`] is
-/// already that order without the sentinel.
+/// `EnumsConversion::primaryDimToString` yields (`dsc/dims.cpp:21-35`) once the compound dims and
+/// the [`PrimaryDimTypes::Undefined`] sentinel are skipped, and [`PrimaryDimTypes::NON_COMPOUND`] is
+/// exactly that order.
 ///
 /// ⛔ ABSENT IS THE INDETERMINATE `numCoreletsUsed_` — see
 /// [`L3DlOpsScheduler::is_dimension_corelet_split`], which this asks once per dim.
 fn corelet_split_dimensions(dsc: &DesignSpaceConfig) -> Option<Vec<PrimaryDimTypes>> {
     let mut dims = Vec::new();
     if dsc.num_corelets_used? > NumCoreletsUsed(1) {
-        for dim in PrimaryDimTypes::ALL {
-            if matches!(dim, PrimaryDimTypes::Ij | PrimaryDimTypes::Kij) {
-                continue;
-            }
+        for dim in PrimaryDimTypes::NON_COMPOUND {
             if L3DlOpsScheduler::is_dimension_corelet_split(dsc, dim)? {
                 dims.push(dim);
             }
