@@ -2118,6 +2118,126 @@ mod unit_tests {
         );
     }
 
+    /// `StickMaskNode::getView` transcribed from `dsc/dsc2.cpp:2440-2491` over raw `int`s, in the
+    /// authority's own order, as `(maskA, maskB, transitionSliceId_)` flattened. [`None`] stands for
+    /// each of the three `DT_ERROR`s and for the empty layout the authority reads `back()` off the
+    /// end of.
+    fn get_view_transcribed(
+        layout: &[(PrimaryDimTypes, i32)],
+        first_masked: &[(PrimaryDimTypes, i32)],
+    ) -> Option<(i32, i32, i32, i32, i32)> {
+        let count = |dim| {
+            first_masked
+                .iter()
+                .find(|&&(d, _)| d == dim)
+                .map(|&(_, c)| c)
+        };
+        if layout.len() > 3 {
+            return None;
+        }
+        let mut wsl_dim = PrimaryDimTypes::Undefined;
+        let xsl_dim = layout.last()?.0;
+        let (mut wsl_size, mut xsl_size) = (1, 1);
+        for &(dim, size) in layout {
+            if dim == xsl_dim {
+                xsl_size *= size;
+            } else {
+                wsl_size *= size;
+                if wsl_dim == PrimaryDimTypes::Undefined {
+                    wsl_dim = dim;
+                } else if wsl_dim != dim {
+                    return None;
+                }
+            }
+        }
+        let xsl_per_slice = xsl_size / 8;
+        if xsl_per_slice == 0 {
+            return None;
+        }
+        let first_coord = count(wsl_dim).unwrap_or(wsl_size);
+        let mut mask_a = (first_coord, wsl_size - first_coord);
+        if layout.len() == 3 {
+            mask_a = (mask_a.0 * xsl_per_slice, mask_a.1 * xsl_per_slice);
+        }
+        let (mut mask_b, transition) = match count(xsl_dim) {
+            None => ((xsl_per_slice, 0), 7),
+            Some(coord) => {
+                let (quot, rem) = (coord / xsl_per_slice, coord % xsl_per_slice);
+                (
+                    (rem, xsl_per_slice - rem),
+                    if rem == 0 { quot - 1 } else { quot },
+                )
+            }
+        };
+        if layout.len() != 3 {
+            mask_b = (mask_b.0 * wsl_size, mask_b.1 * wsl_size);
+        }
+        Some((mask_a.0, mask_a.1, mask_b.0, mask_b.1, transition))
+    }
+
+    /// ⭐ THE FOUR TESTS ABOVE PIN SEVEN HAND-COMPUTED POINTS; THIS ONE SWEEPS THE WHOLE SHORT-LAYOUT
+    /// SPACE against the transcription — every layout of one to four entries over three dims and four
+    /// extents, each with no masked dim and with one masked dim at six coordinates. Both scale
+    /// branches, all three refusals and the `std::div` remainder fall out of the sweep rather than
+    /// being chosen, and truncating division is the same operation in both languages over the
+    /// non-negative coordinates a `firstStickCoordToMaskPerDim_` holds.
+    #[test]
+    fn stick_mask_view_matches_get_view_transcribed_over_every_short_layout() {
+        const DIMS: [PrimaryDimTypes; 3] = [
+            PrimaryDimTypes::Out,
+            PrimaryDimTypes::In,
+            PrimaryDimTypes::Mb,
+        ];
+        let entries: Vec<(PrimaryDimTypes, i32)> = DIMS
+            .iter()
+            .flat_map(|&dim| [1, 2, 8, 16].map(move |size| (dim, size)))
+            .collect();
+        let mut masked: Vec<Vec<(PrimaryDimTypes, i32)>> = vec![Vec::new()];
+        for &dim in &DIMS {
+            masked.extend([0, 1, 3, 4, 5, 8].map(|coord| vec![(dim, coord)]));
+        }
+        let (mut layouts, mut frontier) = (Vec::new(), vec![Vec::new()]);
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|l: &Vec<(PrimaryDimTypes, i32)>| {
+                    entries.iter().map(|&e| [l.as_slice(), &[e][..]].concat())
+                })
+                .collect();
+            layouts.extend(frontier.iter().cloned());
+        }
+        assert_eq!(
+            (entries.len(), masked.len(), layouts.len()),
+            (12, 19, 22620)
+        );
+        let mut viewed = 0usize;
+        for layout in &layouts {
+            for first_masked in &masked {
+                let flat = samv(layout, first_masked).view().map(|v| {
+                    (
+                        v.mask_a.unmasked.0,
+                        v.mask_a.masked.0,
+                        v.mask_b.unmasked.0,
+                        v.mask_b.masked.0,
+                        v.transition_slice.0,
+                    )
+                });
+                assert_eq!(
+                    flat,
+                    get_view_transcribed(layout, first_masked),
+                    "{layout:?} masked at {first_masked:?}"
+                );
+                viewed += usize::from(flat.is_some());
+            }
+        }
+        // ⛔ AND THE SWEEP IS NOT VACUOUS: a space that had drifted to all-refusal, or to no refusal
+        // at all, would agree with the transcription on every case and check nothing.
+        assert!(
+            viewed > 0 && viewed < layouts.len() * masked.len(),
+            "{viewed}"
+        );
+    }
+
     /// `dsc/dsc2.h:976-1005`: every declared initialiser at once. ⛔ `numBuffers_` STARTS AT ONE, NOT
     /// AT [`NumBuffers::STREAMING`] — a default-constructed allocation is unbuffered, and bridge 1
     /// reads mode 1 for it (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:58-64`).
@@ -4496,6 +4616,12 @@ pub struct IterationIdx(pub i32);
 /// resolve against the loop's bounds at lowering time, `LAST` to `upperBound - 1` and `FIRST` to the
 /// lower bound (`SNControlFlowLowering.cpp:99-109`, `:121-130`), which are values no producer of a
 /// `LoopCond` knows.
+///
+/// ⛔ AND THAT PAIRING IS BRIDGE 1'S, NOT THE FIELD'S: the PCFG translator counts DOWN, so it
+/// resolves `FIRST` to `loopCount - 1` and `LAST` to `0` — the OPPOSITE ends of the same loop
+/// (`dsc/dsc2Pcfg.cpp:792-799`). Down-counting is that reader's own convention throughout, which
+/// [`IterationIdx`] already records for the `INT` arm; neither variant means an index, and nothing in
+/// this module converts one reader's answer into the other's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CondVal {
     /// `INT`, carrying the `condValInt_` that form is the only reader of.
@@ -4538,7 +4664,8 @@ impl CondVal {
     /// ⛔ IT DISCARDS `val_int` UNDER `FIRST`/`LAST`, and that is the fusion's whole divergence: a
     /// wire pair carrying anything but [`ABSENT_VAL_INT`](Self::ABSENT_VAL_INT) there does not
     /// round-trip. No producer writes one, and every reader of those two forms already ignores the
-    /// integer (`SNControlFlowLowering.cpp:99-109`, `dsc/dsc2Pcfg.cpp:791-795`).
+    /// integer — BOTH of its arms, not just the first (`SNControlFlowLowering.cpp:99-109`,
+    /// `dsc/dsc2Pcfg.cpp:792-799`).
     pub fn from_wire(val_type: CondValType, val_int: i32) -> Self {
         match val_type {
             CondValType::Int => Self::Iteration(IterationIdx(val_int)),
@@ -7140,17 +7267,25 @@ pub struct MaskSplit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StickMaskView {
     /// Field: e027_StickMaskNode.maskA_
+    /// Field: e040_StickMaskNode.maskA_
     ///
     /// The within-slice (wsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2463-2472`).
     ///
-    /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT, only for its `maskB_` twin; the two are declared on
-    /// one line and bridge 1 reads both halves of both (`SNStickMaskLowering.cpp:25-30`).
+    /// ⚠️ THE SCHEDULER LISTS NO ANCHOR FOR EITHER HALF — not for `maskB_` either, though an earlier
+    /// revision of the plan did. `maskA_, maskB_;` carries a TRAILING `// <unmasked, masked>`
+    /// (`dsc/dsc2.h:1068`), so the field scan finds nothing once its pattern is anchored to the end
+    /// of the line; the same change that anchored it also dropped the trailing-underscore
+    /// requirement, which is what lets `break;` in as `e042_LoopDistributionInfo.break`. So one
+    /// tightening lost a real field and gained a phantom. Bridge 1 reads both halves of both
+    /// (`SNStickMaskLowering.cpp:25-30`).
     pub mask_a: MaskSplit,
     /// Field: e027_StickMaskNode.maskB_
+    /// Field: e040_StickMaskNode.maskB_
     ///
     /// The cross-slice (xsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2473-2489`).
     pub mask_b: MaskSplit,
     /// Field: e027_StickMaskNode.transitionSliceId_
+    /// Field: e040_StickMaskNode.transitionSliceId_
     ///
     /// The slice `mask_b` transitions at (`dsc/dsc2.h:1069`): bridge 1 emits `(A)` for every slice
     /// before it, `(A|B)` at it, and `(1)` after (`SNStickMaskLowering.cpp:51-58`).
@@ -7165,6 +7300,7 @@ pub struct StickMaskView {
 }
 
 /// Replaces: e027_StickMaskNode
+/// Replaces: e040_StickMaskNode
 ///
 /// `dsc/dsc2.h:1059-1072`. A SAMV node: the mask an LXLU transfer applies to the tail of a stick so
 /// that the elements past the tensor's real extent read the mask value instead. `constructSAMVNodes`
@@ -7178,11 +7314,18 @@ pub struct StickMaskView {
 /// schedule-node pointer identity, and its JSON round trip goes through each transfer's `name_`
 /// (`dsc/dsc2.cpp:980-987`), e013's field.
 ///
+/// ⚠️ AND THE SCHEDULER RE-LABELLED THIS UNIT `e040_StickMaskNode` WITHOUT EVER PUTTING THAT ANCHOR
+/// IN THE TREE — no revision of this file has carried an `e040` anchor, so the second label is added
+/// here beside the first rather than replacing it. The remainder schedule did not notice: it matches
+/// a landed unit by CLASS NAME, not by number, so `e027_StickMaskNode` satisfied it — but an anchor
+/// is keyed by its eNNN name, so nothing in the tree answered for `e040` at all.
+///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
 /// `InheritWithClone` (`:1059`), and the DDC leans on it for the reset copy (`ddc/ddcv1.cpp:3663`).
 #[derive(Clone, Debug)]
 pub struct StickMaskNode {
     /// Field: e027_StickMaskNode.maskValConstId_
+    /// Field: e040_StickMaskNode.maskValConstId_
     ///
     /// The constant holding the value written into the masked elements (`dsc/dsc2.h:1061`), taken
     /// from `DesignSpaceConfig::maskingConstId_` (`ddc/ddcv1.cpp:3531`).
@@ -7192,6 +7335,7 @@ pub struct StickMaskNode {
     /// PCFG translator repeats the check (`dsc/dsc2Pcfg.cpp:2202-2203`).
     pub mask_val_const_id: Option<ConstantId>,
     /// Field: e027_StickMaskNode.dataFormat_
+    /// Field: e040_StickMaskNode.dataFormat_
     ///
     /// The precision of the masked tensor (`dsc/dsc2.h:1062`), copied from the affected transfer's
     /// labeled data structure (`ddc/ddcv1.cpp:3577`).
@@ -7201,6 +7345,7 @@ pub struct StickMaskNode {
     /// carries no width at all — see [`StickMaskNode::default`].
     pub data_format: DataFormats,
     /// Field: e027_StickMaskNode.stickLayout_
+    /// Field: e040_StickMaskNode.stickLayout_
     ///
     /// What one stick is made of: each dim inside it with its extent in elements (`dsc/dsc2.h:1063`),
     /// range-built out of `getStickSizes` (`ddc/ddcv1.cpp:3546-3547`) — the conversion [`Size`]
@@ -7210,6 +7355,7 @@ pub struct StickMaskNode {
     /// this is a `Vec` and not a map: [`view`](Self::view) reads the layout's order and its length.
     pub stick_layout: Vec<Size>,
     /// Field: e027_StickMaskNode.firstStickCoordToMaskPerDim_
+    /// Field: e040_StickMaskNode.firstStickCoordToMaskPerDim_
     ///
     /// Per dim, the first coordinate inside the stick the mask covers (`dsc/dsc2.h:1064`).
     ///
@@ -7318,7 +7464,11 @@ impl StickMaskNode {
 
 // crustify:todo: e027_StickMaskNode
 
+// crustify:todo: e040_StickMaskNode
+
 // crustify:todo: e027_StickMaskNode.affectedTransfers_
+
+// crustify:todo: e040_StickMaskNode.affectedTransfers_
 
 /// Which half of an indirect access an allocation is — `AllocateNode::IndirectAllocType`
 /// (`dsc/dsc2.h:990-994`). It is the paged-access discriminator the L3 scheduler reads: `isPagedLds`
@@ -9354,6 +9504,53 @@ mod equivalence {
         }
     }
 
+    /// `SNControlFlowLowering.cpp:99-109` — bridge 1's own resolution of the two bound-relative
+    /// forms on an `affine.for` with constant bounds, as an iteration of the loop it guards.
+    fn resolve_cond_val_on_bridge_one(val: CondVal, lower: i32, upper: i32) -> i32 {
+        match val {
+            CondVal::First => lower,
+            CondVal::Last => upper - 1,
+            CondVal::Iteration(idx) => idx.0,
+        }
+    }
+
+    /// ⛔ THE TWO READERS OF A `FIRST`/`LAST` ANSWER OPPOSITE ENDS OF THE SAME LOOP, so no fused
+    /// resolution is possible and nothing in this module offers one: the PCFG counts DOWN from the
+    /// last iteration, which makes its `FIRST` bridge 1's `LAST` and its `LAST` bridge 1's `FIRST`
+    /// (`dsc/dsc2Pcfg.cpp:792-799` against `SNControlFlowLowering.cpp:99-109`). ⭐ THE SWAP IS THE
+    /// CONVENTION, NOT A DEFECT — [`IterationIdx`] carries the same inversion on the `INT` arm — and a
+    /// port that resolved either form to a number would have to pick a reader and be wrong on the
+    /// other.
+    #[test]
+    fn the_two_readers_resolve_first_and_last_to_opposite_ends_of_the_loop() {
+        for loop_count in [2i32, 8, 64] {
+            // A DSC loop lowers to a zero-based `affine.for`, so `loopCount` IS the upper bound.
+            let (lower, upper) = (0, loop_count);
+            assert_eq!(
+                convert_cond_val_to_int(CondVal::First, loop_count),
+                resolve_cond_val_on_bridge_one(CondVal::Last, lower, upper),
+                "the PCFG's FIRST is bridge 1's LAST over {loop_count}"
+            );
+            assert_eq!(
+                convert_cond_val_to_int(CondVal::Last, loop_count),
+                resolve_cond_val_on_bridge_one(CondVal::First, lower, upper),
+                "the PCFG's LAST is bridge 1's FIRST over {loop_count}"
+            );
+            // ⛔ AND THE SAME FORM DISAGREES ACROSS THE TWO, one assertion per form so that a single
+            // reader answering both ends cannot pass.
+            assert_ne!(
+                convert_cond_val_to_int(CondVal::First, loop_count),
+                resolve_cond_val_on_bridge_one(CondVal::First, lower, upper),
+                "FIRST over {loop_count}"
+            );
+            assert_ne!(
+                convert_cond_val_to_int(CondVal::Last, loop_count),
+                resolve_cond_val_on_bridge_one(CondVal::Last, lower, upper),
+                "LAST over {loop_count}"
+            );
+        }
+    }
+
     /// A DDL conditional expression: the four ops `processCondition` accepts, an operand at a time
     /// (`ddc/ddl/ddl_conversion.cpp:317`, `:321`, `:345`). Its `And`/`Or` are binary because the
     /// authority folds an n-ary op operand by operand into the same two guards.
@@ -9804,6 +10001,18 @@ mod equivalence {
 
 // crustify:todo: e039_LoopCond.loopComp_
 
+// ⛔ e041_DistributionStatusInfo IS A DEAD DECLARATION: the four anchors below stay open because
+// there is nothing to port, not because the work is pending. `DistributionStatusInfo`,
+// `DistributionStatusType`, `NEED_LOOP_SPLIT`, `loopToSplit`, `loopSplitDim` and `loopSplitDimSizes`
+// occur in the authority tree — any file type — ONLY in their own declaration
+// (`dsc/dsc2.h:1129-1135`); the CodeQL oracle lists nothing behind them but compiler-generated
+// members.
+//
+// ⛔ AND ITS NEIGHBOUR IS NOT EVIDENCE FOR THAT, EITHER WAY. It sits under a block-commented
+// `loopDistributionParamInfo` extern (`dsc/dsc2.h:1124-1127`), but that declaration was RELOCATED,
+// not abandoned: the map is a live `Ddc` member (`ddc/ddc.h:553`) read throughout
+// `ddc/ddc_fold.cpp` and `ddc/ddcv1.cpp`. This type's deadness rests on its own symbol census.
+
 // crustify:todo: e041_DistributionStatusInfo
 
 // crustify:todo: e041_DistributionStatusInfo.loopSplitDim
@@ -9811,6 +10020,21 @@ mod equivalence {
 // crustify:todo: e041_DistributionStatusInfo.loopSplitDimSizes
 
 // crustify:todo: e041_DistributionStatusInfo.loopToSplit
+
+// ⛔ e042_LoopDistributionInfo IS BLOCKED ON SCHEDULE-NODE IDENTITY, NOT ON ITS VALUE HALF: `cat` is
+// already ported as `LoopDistributionCat` above. What stays open is `loopNode`, a `LoopNode*` held as
+// pointer identity — and ALL EIGHT writers supply one, so there is no single producer to port it
+// behind. Two climb an owner chain (`dsc/dsc2.cpp:6593-6605`, and its CORELET_SLICE push at
+// `:6620-6622`), two are in the fold (`ddc/ddc_fold.cpp:3513-3517`, `:3549-3551`), and four are in
+// the L3 scheduler — including two in `findAndStoreLoopWithDim`, which takes the loop as a PARAMETER
+// and never climbs (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7316-7318`, `:7325-7327`, then
+// `:7586-7588`, `:7608-7610`).
+//
+// ⚠️ AND `.break` BELOW IS NOT A FIELD. The type declares three (`dsc/dsc2.h:1142-1144`); the fourth
+// anchor is a `break;` from `print`'s own switch (`:1151-1167`), minted once the field scan stopped
+// requiring a trailing underscore. Tree-wide that costs 8 anchors of 453, beside 14 from `friend
+// class` lines, 16 from method-signature continuations ending `) const;` and 5 from `using`/`typedef`
+// declarations: 43 anchors that name no field.
 
 // crustify:todo: e042_LoopDistributionInfo
 
