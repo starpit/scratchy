@@ -8546,6 +8546,13 @@ impl PadSizeFold {
 
 /// Replaces: e024_TransferPadInfo
 ///
+/// Replaces: e037_MapWithFMHelper
+///
+/// ⛔ TWO UNITS, ONE TYPE: e037 is a facade whose only member is a reference to a map this type owns
+/// (`util/foldManager/mapWithFMHelper.h:830-831`), and `dsc/dsc2.h:808-809` is its only in-scope
+/// instantiation, so dissolving it into the owner discharges it. `crate::schedule::fold_helper`
+/// records the five methods those two instances reach and where each of them landed.
+///
 /// A transfer's LX zero-pad sizes, one two-level affine fold per padded dim per end
 /// (`dsc/dsc2.h:755-812`) — what `L3DlOpsScheduler` writes onto a `TransferNode` so that
 /// `dsc/dsc2.cpp:4736-5817` can turn padding into condition and transfer nodes.
@@ -8582,18 +8589,26 @@ pub struct TransferPadInfo {
     ///
     /// Field: e024_TransferPadInfo.transferPadFrontSizeHelper
     ///
+    /// Field: e037_MapWithFMHelper.key_val_
+    ///
     /// ⛔ THREE OF THE AUTHORITY'S FIELDS ARE ONE FIELD HERE, and the helper is not a field at all:
     /// `transferPadFrontSizeHelper` is a `MapWithFMHelper` whose ONLY member is
     /// `std::map<Dkey, FoldManager<Dval>>& key_val_` (`util/foldManager/mapWithFMHelper.h:829-831`)
     /// bound to `transferPadFrontSize_` in every constructor (`dsc/dsc2.h:759-767`) — a facade over
     /// the sibling map, holding no state of its own. `transferPadFrontFoldProps` is then the storage
     /// map's `dim_prop_` pointers point INTO; see [`PadSizeFold`].
+    ///
+    /// ⛔ AND `key_val_` IS ANCHORED HERE AND ON [`back`](Self::back) BOTH: the authority binds that
+    /// ONE member twice, once per end (`dsc/dsc2.h:758-759`), so the two bindings are two distinct
+    /// fields of this type and neither may go unnamed.
     front: BTreeMap<PrimaryDimTypes, PadSizeFold>,
     /// Field: e024_TransferPadInfo.transferPadBackFoldProps
     ///
     /// Field: e024_TransferPadInfo.transferPadBackSize_
     ///
     /// Field: e024_TransferPadInfo.transferPadBackSizeHelper
+    ///
+    /// Field: e037_MapWithFMHelper.key_val_
     ///
     /// The same three fields at the other end, and independent of [`front`](Self::front): measured,
     /// building only the front leaves every back query throwing.
