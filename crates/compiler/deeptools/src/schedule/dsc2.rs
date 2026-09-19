@@ -8179,9 +8179,12 @@ pub struct TransferNode {
     /// padded dim and end (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5359-5473`) and what
     /// `dsc/dsc2.cpp:4761-4990` then turns into condition and transfer nodes.
     ///
-    /// ⛔ EMPTY IS THE GATE, NOT A VALUE: every reader but that one transformation does nothing at
-    /// all unless [`TransferPadInfo::is_empty`] is false (`ddc/ddcv1.cpp:2860`,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6298`, `dsc/dsc2.cpp:4761`).
+    /// ⛔ EMPTY IS NOT A SKIP ANYWHERE BUT THAT ONE TRANSFORMATION, whose `!isEmpty()` SELECTS
+    /// (`dsc/dsc2.cpp:4757-4762`): `ddc/ddcv1.cpp:2859-2861` and
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6297-6299` skip a transfer only when it is ALSO
+    /// source-less, so an empty pad info leaves their whole src/dst LDS-and-loop-offset fill
+    /// running, and `dsc/dsc2.cpp:5445`/`:5692`/`:5792` `DT_CHECK_MSG` that it IS empty. See
+    /// [`TransferPadInfo::is_empty`].
     ///
     /// ⛔ AND IT IS WHY THIS TYPE HAS NO `Clone` DERIVE — see [`clone`](Self::clone).
     pub padding_info: TransferPadInfo,
@@ -8239,9 +8242,10 @@ impl Clone for TransferNode {
     ///
     /// ⛔ SO A CLONED TRANSFER NODE HAS NO PADDING INFO, and that is load-bearing rather than a leak
     /// this port may tidy up: [`TransferPadInfo`]'s copy constructor is "Do nothing on purpose"
-    /// (`dsc/dsc2.h:761-764`), and the authority CHECKS the consequence three times — `dsc/dsc2.cpp`
-    /// clones a padded transfer at `:5546` and `:5702` and then `DT_CHECK_MSG`s the clone `isEmpty()`
-    /// at `:5445`, `:5692` and `:5792`. A deep copy would turn all three into fatal errors.
+    /// (`dsc/dsc2.h:761-764`), and the authority CHECKS the consequence TWICE — `dsc/dsc2.cpp` clones
+    /// a padded transfer at `:5546` and `:5702` and then `DT_CHECK_MSG`s the clone `isEmpty()` at
+    /// `:5692` and `:5792`; the third such check, `:5445`, is on the default-constructed node minted
+    /// at `:5343` and says nothing about copying. A deep copy would turn the two into fatal errors.
     /// [`TransferPadInfo`]'s own absent `Clone` is what makes the derive here impossible, so this is
     /// a compile error the port cannot walk past rather than a convention.
     ///
@@ -11272,7 +11276,7 @@ impl PadSizeFold {
     }
 }
 
-/// Replaces: e024_TransferPadInfo
+/// Replaces: e047_TransferPadInfo
 ///
 /// Replaces: e037_MapWithFMHelper
 ///
@@ -11311,11 +11315,11 @@ impl PadSizeFold {
 /// ```
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TransferPadInfo {
-    /// Field: e024_TransferPadInfo.transferPadFrontFoldProps
+    /// Field: e047_TransferPadInfo.transferPadFrontFoldProps
     ///
-    /// Field: e024_TransferPadInfo.transferPadFrontSize_
+    /// Field: e047_TransferPadInfo.transferPadFrontSize_
     ///
-    /// Field: e024_TransferPadInfo.transferPadFrontSizeHelper
+    /// Field: e047_TransferPadInfo.transferPadFrontSizeHelper
     ///
     /// Field: e037_MapWithFMHelper.key_val_
     ///
@@ -11330,11 +11334,11 @@ pub struct TransferPadInfo {
     /// ONE member twice, once per end (`dsc/dsc2.h:758-759`), so the two bindings are two distinct
     /// fields of this type and neither may go unnamed.
     front: BTreeMap<PrimaryDimTypes, PadSizeFold>,
-    /// Field: e024_TransferPadInfo.transferPadBackFoldProps
+    /// Field: e047_TransferPadInfo.transferPadBackFoldProps
     ///
-    /// Field: e024_TransferPadInfo.transferPadBackSize_
+    /// Field: e047_TransferPadInfo.transferPadBackSize_
     ///
-    /// Field: e024_TransferPadInfo.transferPadBackSizeHelper
+    /// Field: e047_TransferPadInfo.transferPadBackSizeHelper
     ///
     /// Field: e037_MapWithFMHelper.key_val_
     ///
@@ -11346,8 +11350,17 @@ pub struct TransferPadInfo {
 }
 
 impl TransferPadInfo {
-    /// `isEmpty()` (`dsc/dsc2.h:774-776`) — the predicate two schedulers gate the whole
-    /// padding-to-schedule-tree transformation on (`ddc/ddcv1.cpp:2860`, `dsc/dsc2.cpp:4761`).
+    /// `isEmpty()` (`dsc/dsc2.h:774-776`). Exactly ONE of its six readers gates on it the way the
+    /// name suggests — `dsc/dsc2.cpp:4757-4762` takes `!isEmpty()` as an INCLUSION criterion; three
+    /// REQUIRE empty, `DT_CHECK_MSG(isEmpty())` on a node the authority has just minted — `:5445` on
+    /// a default-constructed one (`:5343`), `:5692` and `:5792` on one from `clone()` (`:5546`,
+    /// `:5702`), which is [`TransferNode::clone`]'s contract.
+    ///
+    /// ⛔ AND THE OTHER TWO READ IT WITH THE OPPOSITE POLARITY: `ddc/ddcv1.cpp:2859-2861` and
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6297-6299` are both
+    /// `if (src_.unit_ == NO_COMPONENT && paddingInfo_.isEmpty()) continue;`, so an EMPTY pad info
+    /// does not skip a transfer with a real source, and a NON-EMPTY one is what rescues a
+    /// source-less one. Measured, 1 of the 4 combinations skips.
     pub fn is_empty(&self) -> bool {
         self.front.is_empty() && self.back.is_empty()
     }
@@ -11544,7 +11557,7 @@ mod equivalence {
     /// ⛔ AND THE TWO ENDS ARE INDEPENDENT: `frontOnly` proves a back query throws on an object whose
     /// front is built, so they are two maps and not one keyed by end.
     #[test]
-    fn e024_a_pad_fold_is_two_affine_levels_over_the_wk_slice_and_chunk_coordinates() {
+    fn e047_a_pad_fold_is_two_affine_levels_over_the_wk_slice_and_chunk_coordinates() {
         let empty = TransferPadInfo::default();
         assert!(empty.is_empty());
         assert_eq!(empty.pad_dims(PadEnd::Front).count(), 0);
@@ -11648,7 +11661,7 @@ mod equivalence {
     /// three and answers `3 * chunkOffset` — and past the stored extent it then throws, immediately on
     /// the back end whose first coordinate is `numChunks - 1`.
     #[test]
-    fn e024_the_wk_slice_walk_stops_at_the_first_chunk_that_is_not_fully_padded() {
+    fn e047_the_wk_slice_walk_stops_at_the_first_chunk_that_is_not_fully_padded() {
         let info = both_ends();
         let wk = |end, w: i64, num_chunks: u32, cap: i32| {
             info.wk_slice_pad_size(
@@ -11716,7 +11729,7 @@ mod equivalence {
     /// when the cap is negative, which is outside the `[0, chunk_param_with_zero_pad]` range the
     /// authority's own comment claims (`dsc/dsc2.cpp:4723-4728`), and [`Ord::clamp`] would panic.
     #[test]
-    fn e024_a_chunks_pad_size_is_clamped_into_the_padded_chunk_and_the_cap_wins() {
+    fn e047_a_chunks_pad_size_is_clamped_into_the_padded_chunk_and_the_cap_wins() {
         let info = both_ends();
         let clamp = |end, w: i64, c: i64, cap: i32| {
             info.transfer_pad_size(
@@ -11753,10 +11766,12 @@ mod equivalence {
     /// stores 4294967295 and every `int` work slice is in range from then on. [`FoldDimSize`] is a
     /// `u32`, so the `-1` cannot be spelled here — but the extent it produces can, and that is what
     /// this pins, because the guard is the only thing between a query and the walk.
-    /// ⛔ AND `i32::MAX` IS WHY THE AFFINE WALK IS `Wrapping`: clang wraps `-40 * 2147483647 + 25`
-    /// to 65, where a checked multiply would panic in a debug build and diverge.
+    /// ⛔ AND `i32::MAX` IS WHY THE AFFINE WALK IS `Wrapping`, THOUGH THE AUTHORITY NEVER OVERFLOWS:
+    /// it evaluates `-40 * 2147483647 + 25` as `-85899345855` in `int64_t` and NARROWS on each
+    /// virtual return (`util/foldManager/foldInfrastructure.h:405-416`), which is 65 at `int` width.
+    /// A checked multiply here would panic in a debug build and diverge from that.
     #[test]
-    fn e024_a_four_billion_extent_makes_the_range_guard_admit_every_int_work_slice() {
+    fn e047_a_four_billion_extent_makes_the_range_guard_admit_every_int_work_slice() {
         let mut info = TransferPadInfo::default();
         assert_eq!(
             info.build_pad_sizes(
@@ -11806,7 +11821,7 @@ mod equivalence {
     /// "always legal" shortcut (`:1667`, `:2603`): that one reads the NUMBER of fold dims, never an
     /// extent, so it cannot fire on a fold whose signature is two positions.
     #[test]
-    fn e024_a_zero_extent_refuses_coordinate_zero_and_still_answers_for_minus_one() {
+    fn e047_a_zero_extent_refuses_coordinate_zero_and_still_answers_for_minus_one() {
         let mut info = TransferPadInfo::default();
         assert_eq!(
             info.build_pad_sizes(
@@ -11846,7 +11861,7 @@ mod equivalence {
     /// ⛔ AND THE REFUSED REBUILD LEAVES THE LEVELS ALONE, not just the key set: the authority throws
     /// at `DT_CHECK_MSG(!foldProps.count(dim))` (`dsc/dsc2.cpp:4662`) before it resizes anything.
     #[test]
-    fn e024_pad_dims_is_ascending_and_a_refused_rebuild_leaves_the_fold_alone() {
+    fn e047_pad_dims_is_ascending_and_a_refused_rebuild_leaves_the_fold_alone() {
         let mut info = TransferPadInfo::default();
         for dim in [PrimaryDimTypes::Ki, PrimaryDimTypes::Ij, PrimaryDimTypes::Y] {
             assert_eq!(
@@ -11925,11 +11940,12 @@ mod equivalence {
     ///
     /// ⛔ THE EVIDENCE THAT [`NumChunks`] LOSES NOTHING BY BEING UNSIGNED. The authority's
     /// `numChunks` is an `int` (`dsc/dsc2.cpp:4685`), and measured, -1 and `INT_MIN` each answer 0 at
-    /// both ends — identically to 0 — because `numChunksVisited < numChunks` fails before the first
-    /// `getDataForKey` (`:4699`), leaving `chunkOffset * 0 + 0`. So every negative the authority
-    /// accepts is spelled `NumChunks(0)` here, and the `chunkOffset` is never applied.
+    /// the ends probed — identically to 0 — because `numChunksVisited < numChunks` fails before the
+    /// first `getDataForKey` (`:4699`), leaving `chunkOffset * 0 + 0`. So every negative the authority
+    /// accepts is spelled `NumChunks(0)` here, which is what the loop below runs, and the
+    /// `chunkOffset` is never applied.
     #[test]
-    fn e024_a_chunk_count_of_zero_visits_nothing_and_speaks_for_the_authoritys_negatives() {
+    fn e047_a_chunk_count_of_zero_visits_nothing_and_speaks_for_the_authoritys_negatives() {
         let info = both_ends();
         for end in [PadEnd::Front, PadEnd::Back] {
             assert_eq!(
@@ -11942,7 +11958,7 @@ mod equivalence {
                     ChunkSizePadded(10)
                 ),
                 Some(PadSize(0)),
-                "`N.{end:?}_neg1`"
+                "`N.{end:?}_zero`, which the authority also answers for -1 and `INT_MIN`"
             );
         }
     }
@@ -11957,7 +11973,7 @@ mod equivalence {
     /// panic, which this crate forbids — so what this test pins is a UB-dependent agreement, and a
     /// future reader must not have to rediscover that the authority has no defined answer here.
     #[test]
-    fn e024_the_wk_slice_tail_wraps_where_the_authoritys_int_arithmetic_is_undefined() {
+    fn e047_the_wk_slice_tail_wraps_where_the_authoritys_int_arithmetic_is_undefined() {
         // Three fully padded chunks against a cap of 0, so the walk visits all of them and the
         // MULTIPLY overflows: 800000000 * 3 = 2400000000.
         assert_eq!(
@@ -12011,7 +12027,7 @@ mod equivalence {
     /// disguise itself: it folds to 65, stays at or above a cap of 10 across all three chunks, and
     /// answers `10 * 3 = 30`.
     #[test]
-    fn e024_a_four_billion_extent_answers_a_clamped_zero_through_the_public_readers() {
+    fn e047_a_four_billion_extent_answers_a_clamped_zero_through_the_public_readers() {
         let mut info = TransferPadInfo::default();
         assert_eq!(
             info.build_pad_sizes(
@@ -12058,6 +12074,53 @@ mod equivalence {
             Some(PadSize(30)),
             "`C.api_wk_int32max_cap10`"
         );
+    }
+
+    /// `ddcv1_2859.skips.{src_absent.pad_empty, src_absent.pad_built, src_real.pad_empty,
+    /// src_real.pad_built} = 1, 0, 0, 0` over `isEmpty = 1, 0, 1, 0`, and
+    /// `dsc2_4757.selects.{pad_empty, pad_built} = 0, 1`.
+    ///
+    /// ⛔ THE TWO SCHEDULER READERS SKIP ON EMPTY ONLY WHEN THE SOURCE IS ALSO ABSENT — 1 of the 4
+    /// combinations — so a NON-empty pad info is what RESCUES a source-less transfer, and an empty one
+    /// leaves their whole src/dst LDS-and-loop-offset fill running. Only the `l3ZeroPadTransNodes`
+    /// selection reads it as an inclusion criterion.
+    #[test]
+    fn e047_an_empty_pad_info_skips_a_transfer_only_when_its_source_is_absent_too() {
+        // `if (transfer->src_.unit_ == NO_COMPONENT && transfer->paddingInfo_.isEmpty()) continue;`
+        // (`ddc/ddcv1.cpp:2859-2861`; `L3DlOpsScheduler.cpp:6297-6299` is the same three lines).
+        let skips =
+            |t: &TransferNode| t.src.unit == SenComponent::NoComponent && t.padding_info.is_empty();
+        // `dsc/dsc2.cpp:4757-4762` — the one reader whose polarity the name suggests.
+        let selects = |t: &TransferNode| {
+            matches!(t.src.storage, SenComponent::Hbm | SenComponent::Constant)
+                && t.dst_vias[0].loc.storage == SenComponent::Lx
+                && !t.padding_info.is_empty()
+        };
+
+        let mut node = TransferNode::default();
+        node.dst_vias.push(DstVia::default());
+        for (src_unit, pad_built, measured_skips, measured_empty) in [
+            (SenComponent::NoComponent, false, true, true),
+            (SenComponent::NoComponent, true, false, false),
+            (SenComponent::Lx, false, false, true),
+            (SenComponent::Lx, true, false, false),
+        ] {
+            node.src.unit = src_unit;
+            node.padding_info = if pad_built {
+                both_ends()
+            } else {
+                TransferPadInfo::default()
+            };
+            assert_eq!(node.padding_info.is_empty(), measured_empty, "`isEmpty`");
+            assert_eq!(skips(&node), measured_skips, "`ddcv1_2859.skips`");
+        }
+
+        node.src.storage = SenComponent::Hbm;
+        node.dst_vias[0].loc.storage = SenComponent::Lx;
+        node.padding_info = TransferPadInfo::default();
+        assert!(!selects(&node), "`dsc2_4757.selects.pad_empty`");
+        node.padding_info = both_ends();
+        assert!(selects(&node), "`dsc2_4757.selects.pad_built`");
     }
 
     /// The one probe [`ComputeNode::operand_formats`] is measured at below. `SENINT8` is chosen
