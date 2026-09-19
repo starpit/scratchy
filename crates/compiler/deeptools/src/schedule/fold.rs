@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, VecDeque};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FoldDimSize(pub u32);
 
-/// Replaces: e009_FoldDimProp
+/// Replaces: e024_FoldDimProp
 ///
 /// One folded dimension's extent and label (`foldInfrastructure.h:119-155`).
 ///
@@ -49,11 +49,33 @@ pub struct FoldDimSize(pub u32);
 /// use deeptools::schedule::fold::{FoldDimProp, FoldDimSize};
 /// assert_eq!(FoldDimProp::new(FoldDimSize(32), "core_fold_dim").size(), FoldDimSize(32));
 /// ```
+///
+/// ⛔ AND A NEGATIVE EXTENT IS NOT SPELLABLE, the other half of that guard: `setSize` takes a
+/// `uint32_t` (`:129`) and the authority reaches it with an `int` (`dsc/dsc2.cpp:4669`), so a `-1`
+/// there STORES 4294967295 — a four-billion extent, not a negative one. Both codes below were read
+/// from `rustc` against the built rlib. `E0600`, whose help line names the very value the authority
+/// would have stored, "you may have meant the maximum value of `u32`":
+/// ```compile_fail,E0600
+/// use deeptools::schedule::fold::{FoldDimProp, FoldDimSize};
+/// let _ = FoldDimProp::new(FoldDimSize(-1), "loop_1_dim");
+/// ```
+/// And `E0308`, "expected `u32`, found `i32`", for the authority's own call shape — a cardinality
+/// that arrives as a C++ `int`:
+/// ```compile_fail,E0308
+/// use deeptools::schedule::fold::{FoldDimProp, FoldDimSize};
+/// let cardinality: i32 = -1;
+/// let _ = FoldDimProp::new(FoldDimSize(cardinality), "loop_1_dim");
+/// ```
+/// ```
+/// use deeptools::schedule::fold::{FoldDimProp, FoldDimSize};
+/// let cardinality: u32 = 1;
+/// assert_eq!(FoldDimProp::new(FoldDimSize(cardinality), "x").size(), FoldDimSize(1));
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FoldDimProp {
-    /// Field: e009_FoldDimProp.factor_
+    /// Field: e024_FoldDimProp.factor_
     factor: FoldDimSize,
-    /// Field: e009_FoldDimProp.label_
+    /// Field: e024_FoldDimProp.label_
     ///
     /// An open set, never matched against: `foldDimLabel` (`dsc/dsc2.h:1084`) is assigned,
     /// forwarded and printed at every one of its sites and compared at none. Read into
@@ -143,10 +165,10 @@ const _: () = {
     assert!(FuncType::Unknown as u8 == 7);
 };
 
-/// Replaces: e010_FoldFunction
+/// Replaces: e025_FoldFunction
 ///
 /// The `FoldFunction<Dtype>` base subobject (`foldInfrastructure.h:163-257`): the kind tag every
-/// fold function carries, plus its two predicates. The seven kinds (e013-e019) carry it and add
+/// fold function carries, plus its two predicates. The seven kinds (`:269-886`) carry it and add
 /// their own data; element-type-free because `type_` is the base's only state.
 ///
 /// ⛔ WHERE THE BASE'S OTHER 15 MEMBERS GO, so none reads as dropped: `getData`/`insertData`
@@ -158,10 +180,12 @@ const _: () = {
 /// walk's, not the tag's: depth is built at run time from a `fm_dim_prop` (`:888`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FoldFunction {
-    /// Field: e010_FoldFunction.type_
+    /// Field: e025_FoldFunction.type_
     ///
-    /// Public in the authority (`:180`) but written only by the constructor (`:177`) and read only
-    /// through `Type()`; private here, which makes "fixed at construction" a property of the type.
+    /// Public in the authority (`:180`) but written ONLY by the constructor (`:177`), and read only
+    /// from inside the class — `Type()` (`:179`) and the two predicates (`:183`, `:188`). NOTHING
+    /// outside it touches `type_` anywhere in the authority (grepped), so private here makes "fixed
+    /// at construction" a property of the type.
     ty: FuncType,
 }
 
@@ -3396,6 +3420,34 @@ mod unit_tests {
         }
     }
 
+    /// The extent the authority stores for a fold dim it is handed a NEGATIVE cardinality for
+    /// (`setSize(uint32_t)` `:129`, reached with an `int` at `dsc/dsc2.cpp:4669`): `-1` is
+    /// 4294967295, so [`FoldDimSize`] has to CARRY that value rather than reject it. The
+    /// `compile_fail` blocks on [`FoldDimProp`] are the other half — the `-1` itself is unspellable.
+    ///
+    /// ⛔ NOT A DIVERGENCE TO CORRECT: an extent is `uint32_t` in the authority, and a four-billion
+    /// one is what a `-1` MEANS there, so clamping or refusing it would answer a question no C++ run
+    /// answers that way.
+    /// ⛔ AND THE NEWTYPE DOES NOT CLOSE THE HOLE, it only makes the `-1` unspellable: the extent it
+    /// still admits is what makes the authority's signed range test vacuous, and that half is pinned
+    /// at the public readers by `dsc2.rs`'s two `a_four_billion_extent_*` tests.
+    #[test]
+    fn a_negative_cardinality_is_a_four_billion_extent_and_prints_as_one() {
+        let mut prop = FoldDimProp::new(FoldDimSize(u32::MAX), "loop_1_dim");
+        assert_eq!(prop.size(), FoldDimSize(4_294_967_295));
+
+        let mut out = String::new();
+        prop.print(&mut out);
+        assert_eq!(out, "\"factor_\" : 4294967295, \"label_\" : \"loop_1_dim\"");
+
+        // And it is the GREATEST extent, not the least: `factor_` is not a signed quantity that
+        // wrapped, so every real fold dim orders below it.
+        assert!(FoldDimSize(64) < prop.size());
+
+        prop.set_size(FoldDimSize(64));
+        assert_eq!(prop, FoldDimProp::new(FoldDimSize(64), "loop_1_dim"));
+    }
+
     /// An affine level's state is `alpha_`, `beta_` and its subtree (`foldInfrastructure.h:517-519`,
     /// `:676-677`).
     ///
@@ -4231,11 +4283,15 @@ mod equivalence {
     /// `e009.eq_after_setters = 1`, `e009.eq_same_size_diff_label = 0`,
     /// `e009.eq_same_label_diff_size = 0`, `e009.eq_identical = 1`, `e009.copy_roundtrip_eq = 1`.
     ///
+    /// ⛔ THE PROBE'S OWN KEY PREFIX IS A STALE ENTITY ID, kept as it printed: `e009` is
+    /// `crustify-types`' `ScheduleNode` (`crustify-types/UNITS.tsv:10`), and this type is
+    /// `e024_FoldDimProp` (`crustify/crates.json:293`).
+    ///
     /// The props are IBM's own (`util/foldManager/test/test_fold_infrastructure.cpp:324-336`) and the
     /// setter order is `buildTransferFoldDim`'s (`dsc/dsc2.cpp:4669-4675`).
     /// ⛔ THE LABEL IS PART OF EQUALITY (`:148-150`), so each `assert_ne!` below moves ONE field.
     #[test]
-    fn e009_a_fold_dim_prop_carries_its_extent_and_its_label_and_prints_both() {
+    fn e024_a_fold_dim_prop_carries_its_extent_and_its_label_and_prints_both() {
         let mut core = FoldDimProp::new(FoldDimSize(32), "core_fold_dim");
         assert_eq!(core.size(), FoldDimSize(32));
         assert_eq!(core.label(), "core_fold_dim");
@@ -4276,10 +4332,13 @@ mod equivalence {
     ///
     /// All eight rows came off ONE instance: `type_` is public (`:180`), so the probe reassigned it
     /// per row — the only way to reach a tag no constructor produces, `Unknown` being the one.
+    /// ⛔ THE PROBE'S OWN KEY PREFIX IS A STALE ENTITY ID, kept as it printed: `e010` is
+    /// `crustify-types`' `BlockNode` (`crustify-types/UNITS.tsv:11`), and this type is
+    /// `e025_FoldFunction` (`crustify/crates.json:294`).
     /// ⛔ THE TWO PREDICATES ARE NEITHER COMPLEMENTS NOR A COVER (`:182-190`): `WkSplit_leaf` is
     /// absent from BOTH lists, so the one kind that exists only as a leaf answers false to `isLeaf`.
     #[test]
-    fn e010_the_two_leaf_predicates_are_not_complements_and_wksplit_is_in_neither() {
+    fn e025_the_two_leaf_predicates_are_not_complements_and_wksplit_is_in_neither() {
         // (kind, isLeaf, isNonLeaf), read off `:183-189`.
         let expected = [
             (FuncType::ConstantLeaf, true, false),
