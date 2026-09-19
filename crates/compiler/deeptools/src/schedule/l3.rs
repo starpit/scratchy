@@ -5,7 +5,8 @@
 //! header; a `.cpp:NNN` one is `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp`.
 
 use crate::schedule::ddc::{ExPhase, Verbosity};
-use crate::schedule::dims::PrimaryDimTypes;
+use crate::schedule::dims::{DimDensity, PaddingFormType, PrimaryDimTypes};
+use crate::schedule::dsc::DesignSpaceConfig;
 use crate::schedule::dsc2::{AllocateNode, DataStageId, GroupId, LdsIdx, SyncNode, TransferNode};
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
@@ -995,6 +996,49 @@ impl L3DlOpsScheduler {
         node.is_soft = is_soft;
         node
     }
+
+    /// Replaces: e029g3_L3DlOpsScheduler_coord.isDimensionCoreletSplit
+    ///
+    /// `:81-82`, defined `.cpp:74-86`. Whether one corelet's share of `dim` is SMALLER than the whole
+    /// core's — asked of every primary dim by `getCoreletSplitDimensions` (`.cpp:88-102`) and of one
+    /// candidate chunk parameter by `isParamCoreletSplitValid` (`.cpp:1334-1345`).
+    ///
+    /// ⛔ THE CORE DATA STAGE WINS WHEN THERE IS ONE and the two dim objects are then NEVER READ
+    /// (`.cpp:77-85`), so a DSC carrying `dataStageParam_[0]` is answered from that stage's steady
+    /// state alone however `CoreletD_` and `CoreD_` stand.
+    /// ⛔ `clId = 0` AGAINST `clId = -1` IS THE WHOLE COMPARISON, both readings of the same `dim` with
+    /// `NO_COMPONENT` and no PT row: the first takes `coreletSplit_[dim][0]` and the second never
+    /// does (`dsc/dims.cpp:631-644`), so a dim absent from `coreletSplit_` reads equal and is not
+    /// split.
+    /// ⛔ [`None`] IS IBM'S `.at()` THROW — an empty `coreletSplit_` entry for a split dim — AND ALSO
+    /// the unwritten `numCoreletsUsed_`, whose `int` `.cpp:75` reads indeterminate
+    /// (`dsc/designSpaceConfig.h:74`). Neither is `Some(false)`.
+    pub fn is_dimension_corelet_split(
+        dsc: &DesignSpaceConfig,
+        dim: PrimaryDimTypes,
+    ) -> Option<bool> {
+        // `.cpp:75`: one corelet has nothing to split.
+        if dsc.num_corelets_used?.0 <= 1 {
+            return Some(false);
+        }
+        // `.cpp:76-83`.
+        if let Some(core_stage) = dsc.data_stage_param.get(&Self::DATA_STAGE_CORE_IDX) {
+            let reading = |cl_id| {
+                core_stage.ss.primary_dim_to_val_for_component(
+                    dim,
+                    SenComponent::NoComponent,
+                    None,
+                    cl_id,
+                    &PaddingFormType::default(),
+                    DimDensity::FULL,
+                    false,
+                )
+            };
+            return Some(reading(Some(CoreletId(0)))? < reading(None)?);
+        }
+        // `.cpp:84-85`.
+        Some(dsc.corelet_d.primary_dim_to_val(dim)? < dsc.core_d.primary_dim_to_val(dim)?)
+    }
 }
 
 impl L3DlOpsScheduler {
@@ -1863,6 +1907,76 @@ mod equivalence {
             "the depthwise conv is its own family (`.cpp:843-847`)"
         );
     }
+
+    /// `.cpp:74-86` on the branch it chooses and on both answers of each. The two dim objects are set
+    /// to say "split" while the core stage says "not", so reading them once a core stage exists would
+    /// flip an answer; and `numCoreletsUsed_` absent is neither of the two `bool`s.
+    #[test]
+    fn the_core_data_stage_answers_alone_and_the_two_dim_objects_only_without_one() {
+        use crate::schedule::dims::{DataStructDims, DimSize, DimVal};
+        use crate::schedule::dsc::NumCoreletsUsed;
+        use crate::schedule::dsc2::DataStage;
+
+        let dim = PrimaryDimTypes::Out;
+        let filled = |size: f64| DataStructDims {
+            out: DimSize::new(size),
+            ..DataStructDims::default()
+        };
+
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.num_corelets_used = Some(NumCoreletsUsed(2));
+        // `.cpp:84-85` answers `true` from these two: 32 per corelet of 64 per core.
+        dsc.corelet_d = filled(32.0);
+        dsc.core_d = filled(64.0);
+
+        // With no core stage the fallback reads them.
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, dim),
+            Some(true),
+            "`CoreletD_` below `CoreD_` is the split (`.cpp:84-85`)"
+        );
+
+        // A core stage that does NOT split the dim takes the answer over.
+        dsc.data_stage_param.insert(
+            L3DlOpsScheduler::DATA_STAGE_CORE_IDX,
+            DataStage {
+                ss: filled(64.0),
+                ..DataStage::default()
+            },
+        );
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, dim),
+            Some(false),
+            "the stage answers alone and `CoreletD_`/`CoreD_` go unread (`.cpp:77-83`)"
+        );
+
+        // The same stage with the dim in `coreletSplit_`: `clId = 0` reads its share, `-1` the whole.
+        dsc.data_stage_param
+            .get_mut(&L3DlOpsScheduler::DATA_STAGE_CORE_IDX)
+            .unwrap()
+            .ss
+            .corelet_split
+            .insert(dim, vec![DimVal(32), DimVal(32)]);
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, dim),
+            Some(true),
+            "32 against the whole object's 64 (`.cpp:79-81`)"
+        );
+
+        // `numCoreletsUsed_` absent is the indeterminate read at `.cpp:75`, not a `false`.
+        dsc.num_corelets_used = None;
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, dim),
+            None
+        );
+
+        // One corelet is `.cpp:75`'s early `false`, ahead of either branch.
+        dsc.num_corelets_used = Some(NumCoreletsUsed(1));
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, dim),
+            Some(false)
+        );
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -1907,3 +2021,8 @@ mod equivalence {
 
 // crustify:todo: e029g2_L3DlOpsScheduler_opfunc.isOpCrossCoreReduction
 
+// crustify:todo: e029g3_L3DlOpsScheduler_coord
+
+// crustify:todo: e029g3_L3DlOpsScheduler_coord.propagateCoordinate
+
+// crustify:todo: e029g3_L3DlOpsScheduler_coord.sliceCoordinateForCorelet
