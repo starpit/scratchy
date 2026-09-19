@@ -1915,21 +1915,35 @@ mod unit_tests {
         }
     }
 
-    /// `dsc/dsc2.cpp:2667-2683` INTERSECTS `coreClCond_` into the "then" region's components, so a
-    /// core listed with no corelets and a core not listed at all are different conditions — the
-    /// distinction a flattened set of core/corelet pairs would lose.
+    /// `dsc/dsc2.h:693-695`: the discriminator reads the LOOP side alone. So a node carrying NEITHER
+    /// guard is a core/corelet condition selecting no core — the state the DDL resolves to the
+    /// CONSTANT FALSE before any node is minted (`ddc/ddl/ddl_conversion.cpp:438-441`) — and a node
+    /// carrying BOTH is a loop condition whose `coreClCond_` every gated reader skips
+    /// (`dsc/dsc2.cpp:2663`, `ddc/ddc_transformation_util.cpp:489`,
+    /// `ddc/ddl/ddl_conversion.cpp:3248`).
     #[test]
-    fn a_condition_nodes_listed_core_with_no_corelets_is_not_an_absent_core() {
+    fn a_condition_nodes_discriminator_reads_the_loop_guard_alone() {
         let mut node = ConditionNode::default();
-        assert!(node.core_cl_cond.is_empty());
+        assert!(node.loop_cond.is_none() && node.core_cl_cond.is_empty());
+        assert!(node.has_core_cl_cond());
+
         node.core_cl_cond.insert(CoreId(0), BTreeSet::new());
         node.core_cl_cond
             .insert(CoreId(1), BTreeSet::from([CoreletId(0)]));
-        assert_eq!(
-            node.core_cl_cond.get(&CoreId(0)).map(BTreeSet::len),
-            Some(0)
+        assert!(node.has_core_cl_cond());
+
+        node.loop_cond = Some(
+            LoopCondConjunction::new(LoopCond {
+                dim: PrimaryDimTypes::Y,
+                cond_op: LoopCondOp::Eq,
+                cond_val: CondVal::Last,
+            })
+            .into(),
         );
-        assert_eq!(node.core_cl_cond.get(&CoreId(2)), None);
+        assert!(!node.has_core_cl_cond());
+
+        node.core_cl_cond.clear();
+        assert!(!node.has_core_cl_cond());
     }
 
     /// `dsc/dsc2.h:964-972`, and the ordering divergence on `units_`: the node's JSON array
@@ -4827,7 +4841,8 @@ impl From<LoopCond> for LoopCondConjunction {
 ///
 /// ⛔ NON-EMPTY FOR THE SAME REASON ONE LEVEL UP, and here the empty state is not a weaker condition
 /// but a DIFFERENT KIND OF NODE: `hasCoreClCond()` IS that emptiness (`dsc/dsc2.h:693-695`), so what
-/// e025 must carry is this type's ABSENCE. ⭐ THAT DELETES A CHECK IN BOTH DSC-TO-DATAFLOW-IR
+/// e044 carries as an [`Option`] — see [`ConditionNode::has_core_cl_cond`], now filled. ⭐ THAT
+/// DELETES A CHECK IN BOTH DSC-TO-DATAFLOW-IR
 /// LOWERINGS, each re-asserting `twoLevelOrOfAnds_.empty()` inside the arm the same predicate
 /// already selected (`SNControlFlowLowering.cpp:1049`, `:1079`; `DSC2ToDataflowIR.cpp:91`, `:113`).
 #[derive(Clone, Debug)]
@@ -4932,7 +4947,7 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// `adjustConditionForSplitLoop` selects and rebuilds its terms by that pointer
 /// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`).
 ///
-/// ⚠️ AND THAT DISPATCH HAS NO FIFTH REFUSAL: it has the FOUR the e025 anchor lists, and that
+/// ⚠️ AND THAT DISPATCH HAS NO FIFTH REFUSAL: it has the FOUR the e044 anchor lists, and that
 /// anchor's fourth IS `:2136` — "anything outside `EQ` / `NE` / `(GT,FIRST)` / `(LT,LAST)`". What is
 /// worth recording is WHICH pairs reach it, because there are only two: over the six operators a
 /// ported condition can spell times `FIRST`/`LAST`, `:2087-2101` takes the four always-true/false
@@ -7047,28 +7062,26 @@ impl ComputeNode {
 
 // crustify:todo: e035_ComputeNode.outputCoordinate_
 
-/// Replaces: e025_ConditionNode
+/// Replaces: e044_ConditionNode
 ///
 /// `dsc/dsc2.h:685-719`. A two-way branch in the schedule tree: a `BlockNode` whose at most two
 /// children are the "then" and the "else" region (`:688`, `:698-699`) — in THAT order, because
 /// `getThenBranchNode` is `next_[0]` and `getElseBranchNode` is `next_[1]` (`:707-718`).
 ///
-/// ⛔ THIS CARRIES ONE OF CONDITIONNODE'S TWO GUARDS, so the `e025_ConditionNode` anchor below stays
-/// open. `loopCond_` (`:690`) is a `LoopCondComposite` — e022, blocked behind e018's
-/// `const LoopNode* loopComp_`, which is schedule-node pointer identity.
+/// `e025_ConditionNode` is this same class under the superseded numbering, and e025 is now `Ddc`
+/// (`crustify-scheduler/UNITS.tsv:26`) — a COLLISION, not a merely stale number. Both of its filled
+/// anchors and its open type anchor are RENUMBERED onto e044 here (`UNITS.tsv:45`); none is deleted
+/// and none changes meaning.
 ///
-/// ⛔ AND THAT BLOCK IS IDENTITY AND NOT EQUALITY, which is what a port must supply before e022 can
-/// land: `LoopCondComposite::adjustConditionForSplitLoop` selects a term by
-/// `loopComp_ != origLoop` and rewrites it to `newLoops.at(0)` (`dsc/dsc2.cpp:2071-2076`), then
-/// rebuilds the enclosing conjunction by comparing every term against `newLoops.at(0)` AGAIN
-/// (`:2126-2132`) — so two terms of one conjunction that both named `origLoop` are
-/// indistinguishable once the first has been substituted, and the rebuild replaces BOTH. Nothing in
-/// that function reads a loop's contents, so an index or a name will not do.
+/// ⭐ AND BOTH GUARDS NOW LAND, BECAUSE THE BLOCK WAS ON THE TERM AND NOT ON THIS FIELD: `loopCond_`
+/// (`:690`) is [`LoopCondComposite`], which landed carrying its value half with `loopComp_` still
+/// open on [`LoopCond`] — schedule-node pointer identity, recorded there, on the type that is
+/// missing the pointer. Carrying the composite here adds no gap of its own.
 ///
-/// ⛔ AND E022 HAS TWO CARRIERS, NOT ONE: besides `loopCond_` here, `DdlInterface::CondProp` holds
-/// one (`ddc/ddl/ddl_conversion.h:419-424`, the composite at `:421`), and it is that copy the DDL
-/// front end toggles and then refuses on (`ddc/ddl/ddl_conversion.cpp:326`, `:381-394`). Both must
-/// reach the same Rust type.
+/// ⭐ WHAT THIS TYPE ADDS IS THE [`Option`], AND THAT IS THE DISCRIMINATOR ITSELF: `hasCoreClCond()`
+/// IS `loopCond_.twoLevelOrOfAnds_.empty()` (`:693-695`) and never looks at `coreClCond_`, and a
+/// landed composite cannot BE empty ([`LoopCondDisjunction`] is non-empty by shape), so the absence
+/// of one spells that predicate exactly — see [`has_core_cl_cond`](Self::has_core_cl_cond).
 ///
 /// ⛔ `negated_` IS A PARITY TOGGLE AT BOTH WRITERS AND IS NEVER SET: `^= true` when the else branch
 /// carries the condition (`ddc/ddc_transformation_util.cpp:592`) and `= !` under a `condNot`
@@ -7081,42 +7094,107 @@ impl ComputeNode {
 /// take: an empty `newLoops` (`dsc/dsc2.cpp:2064`), a `condValType_` outside `FIRST`/`LAST`
 /// (`:2082-2084`), the four always-true/always-false pairings `(GT,LAST)`, `(LT,FIRST)`,
 /// `(LE,LAST)`, `(GE,FIRST)` (`:2087-2099`), and anything outside `EQ` / `NE` / `(GT,FIRST)` /
-/// `(LT,LAST)` (`:2136`). The first two are total over closed enums and belong in the type; the
-/// always-true/false four are a `(CondOp, CondValType)` PAIR, and the authority's own comment says
-/// the DDL parser was supposed to simplify them away (`:2097-2098`), so they are a guard on the
+/// `(LT,LAST)` (`:2136`) — which is `(LE,FIRST)` and `(GE,LAST)` alone, both of them equalities, as
+/// [`LoopCondComposite`] records. The first two are total over closed enums and belong in the type;
+/// the always-true/false four are a `(CondOp, CondValType)` PAIR, and the authority's own comment
+/// says the DDL parser was supposed to simplify them away (`:2097-2098`), so they are a guard on the
 /// pairing and not on either enum alone.
 ///
-/// ⛔ AND THE DISCRIMINATOR IS THAT MISSING FIELD, NOT THIS ONE: `hasCoreClCond()` answers
-/// `loopCond_.twoLevelOrOfAnds_.empty()` (`:693-695`) and never looks at `coreClCond_`. A node with
-/// both guards empty therefore reads as a core/corelet condition selecting NO core, not as an
-/// unconditional region — nothing in the authority enforces the header's "only one is filled"
-/// (`:688-689`).
+/// ⚠️ AND THE HEADER'S "only one is filled" (`:689`) IS ENFORCED — ON THE OTHER CARRIER, NOT ON THIS
+/// NODE. The DDL front end refuses a mixed composition outright, `emitError("And/or op is mixing
+/// incompatible types")` then `DT_ERROR` in both directions
+/// (`ddc/ddl/ddl_conversion.cpp:369-373`, `:405-409`), and it is that same `DdlInterface::CondProp`
+/// — [`LoopCondComposite`]'s second carrier — that it then copies into a fresh node's two fields in
+/// consecutive statements (`:1557-1558`). What is unchecked is the JSON importer, which fills both
+/// from the wire in one pass with no cross-field test (`dsc/dsc2.cpp:1431-1467`).
+/// ⭐ AND IF BOTH DO ARRIVE FILLED, THE LOOP GUARD WINS AND THE MAP GOES SILENTLY DEAD: every reader
+/// of `coreClCond_` except the JSON and DDL exporters is gated on `hasCoreClCond()`
+/// (`dsc/dsc2.cpp:2663`, `ddc/ddc_transformation_util.cpp:489`, `ddc/ddl/ddl_conversion.cpp:3248`).
 ///
-/// ⛔ ITS EIGHT METHODS ALL REACH `next_`, e015's field, blocked on e013: `addChildNode` (which
-/// refuses anything but a `BLOCK` and any third child, `dsc/dsc2.cpp:2143-2150`), `addThenRegion`,
-/// `addElseRegion`, `getThenBranchNode`, `getElseBranchNode`, `getThenCoreCl`, `getElseCoreCl` and
-/// `getNextView`, which widens the base view to `ALL, -1, -1` whenever the guard is a loop condition
-/// (`dsc/dsc2.cpp:1995-2001`).
+/// ⭐ AND BOTH-EMPTY IS A CORE/CORELET CONDITION SELECTING NO CORE, not an unconditional region —
+/// which the authority says twice: `hasCoreClCond()` answers `true` there, and the DDL resolves that
+/// exact pair of empties to the CONSTANT FALSE (`ddc/ddl/ddl_conversion.cpp:438-441`) before any node
+/// is minted.
+///
+/// ⛔ THE `e044_ConditionNode` ANCHOR BELOW STAYS OPEN FOR THE EIGHT METHODS, every one of which
+/// reaches `next_`, e015's field, blocked on e013: `addChildNode` (which refuses anything but a
+/// `BLOCK` and any third child, `dsc/dsc2.cpp:2146-2148`), `addThenRegion` and `addElseRegion` (one
+/// refusal and two more, `:2153-2155`, `:2160-2165`), `getThenBranchNode`, `getElseBranchNode`,
+/// `getThenCoreCl`, `getElseCoreCl` and `getNextView`, which widens the base view to `ALL, -1, -1`
+/// whenever the guard is a loop condition (`:1995-2001`).
+///
+/// ⚠️ AND TWO OF THOSE EIGHT REFUSE BY THROWING, WHERE THE TWO BESIDE THEM ANSWER `nullptr`:
+/// `getThenCoreCl` is `next_.at(0)` and `getElseCoreCl` is `next_.at(1)` (`dsc/dsc2.cpp:2004-2011`)
+/// over a `VectorOfChildren` deriving from `std::vector` (`dsc/dsc2.h:529`), so each throws
+/// `std::out_of_range` on the very node `getThenBranchNode`/`getElseBranchNode` report absent
+/// (`:707-718`). A port of the four takes the branch handles, never an index.
+///
+/// ⚠️ AND THE SCHEDULER'S FOUR FIELD ANCHORS FOR THIS UNIT NAME ONE FIELD: `loopCond_`, beside
+/// `comp`, `coreId` and `siblingRefNode`, which are method-signature continuations of the class
+/// already tallied on e042 below — two ending `) const;` (`dsc/dsc2.h:702`, `:704`) and one ending
+/// `) override;` (`:697`), which that tally's `) const;` count does not reach. `coreClCond_` itself
+/// is absent from the list because its declaration carries a trailing comment (`:691-692`), the
+/// class tallied on e031. Both real fields are carried here regardless.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
 /// `InheritWithClone` (`:685`).
 #[derive(Clone, Debug, Default)]
 pub struct ConditionNode {
-    /// Field: e025_ConditionNode.coreClCond_
+    /// Field: e044_ConditionNode.loopCond_
+    ///
+    /// The loop guard (`dsc/dsc2.h:690`), ABSENT exactly when this node's condition is the
+    /// core/corelet one. ⭐ `= {}` IS HOW THE DDL DROPS ONE it resolved to a constant
+    /// (`ddc/ddl/ddl_conversion.cpp:353`, `:359`), and what that leaves behind is the discriminator,
+    /// not a guard that holds trivially — which is why [`LoopCondComposite`] has no `Default`.
+    pub loop_cond: Option<LoopCondComposite>,
+    /// Field: e044_ConditionNode.coreClCond_
     ///
     /// The cores and corelets the "then" region applies to (`dsc/dsc2.h:691-692`).
     ///
-    /// ⛔ AN ABSENT CORE IS AN EXCLUDED ONE, NOT AN UNCONSTRAINED ONE: `setRelevantCompCoreCl`
-    /// INTERSECTS this map into the "then" region's inherited `relevantComps_` and hands the
-    /// complement to the "else" region (`dsc/dsc2.cpp:2647-2685`), so an empty map excludes every
-    /// core from the "then" side. That is why the corelets are a set per core rather than the pairs
-    /// flattened: a core present with no corelets is a different condition from a core absent.
+    /// ⭐ AN ABSENT CORE IS AN EXCLUDED ONE, NOT AN UNCONSTRAINED ONE: `setRelevantCompCoreCl`
+    /// INTERSECTS this map into the "then" region's `relevantComps_` and hands the complement to the
+    /// "else" region (`dsc/dsc2.cpp:2663-2683`), so an EMPTY map excludes every core from the "then"
+    /// side — and not because the intersection came out empty but because the `operator[]` at `:2665`
+    /// CREATES that child's `NO_COMPONENT` entry, which is what then stops it inheriting its parent's
+    /// set at `:2658-2660`.
+    ///
+    /// ⛔ WHAT IS NOT TRUE IS THAT A CORE LISTED WITH NO CORELETS IS A DIFFERENT CONDITION FROM AN
+    /// ABSENT ONE. Executed over the extracted body, 35,625 of 37,500 absent-versus-listed-empty
+    /// pairs propagate IDENTICALLY, and all 1,875 that differ need the PARENT's own set to list that
+    /// core with no corelets — a state this function cannot produce (the head seeds `{0}` or `{0,1}`
+    /// at `:2648-2653`, the "then" arm `emplace`s only a NON-EMPTY intersection at `:2671`, and the
+    /// "else" arm ERASES a core whose difference empties at `:2681`). The four direct minters cannot
+    /// produce it either — each fills `0..numCoreletsUsed_DSC2_` (`ddc/ddl/ddl_conversion.cpp:1738`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3223`, `:3267`, and `dsc/dsc2.cpp:4746-4748`
+    /// emplaced at `:4912`) — and every composition ERASES a core whose set empties
+    /// (`ddl_conversion.cpp:337`, `:419`, `:424`, `ddc/ddc_transformation_util.cpp:504`, `:507`,
+    /// `:541`). ⚠️ TWO ROUTES SURVIVE THAT, AND BOTH ARE AN `operator[]` REACHED BEFORE AN `insert`:
+    /// the JSON importer creates the entry and then inserts the wire's array, so an EMPTY array mints
+    /// one (`dsc/dsc2.cpp:1465-1471`), and the DDL's OR arm inserts one operand's set into an entry it
+    /// just created, which leaves it empty when that operand's was (`ddl_conversion.cpp:428-429`) — a
+    /// propagation, not a first cause. The sweep and its control are in
+    /// `equivalence::e044_core_cl_cond_propagation_matches_the_executed_authority`.
+    ///
+    /// ⭐ SO THE NESTING IS THE AUTHORITY'S DECLARATION AND THE WIRE'S, not a distinction the
+    /// propagation draws: `std::map<int, std::set<int>>` (`dsc/dsc2.h:691-692`), exported as a nested
+    /// object (`dsc/dsc2.cpp:486-497`) and imported back the same way (`:1465-1471`).
     pub core_cl_cond: BTreeMap<CoreId, BTreeSet<CoreletId>>,
 }
 
-// crustify:todo: e025_ConditionNode
+impl ConditionNode {
+    /// `hasCoreClCond()` (`dsc/dsc2.h:693-695`): WHICH of the two guards this node carries, answered
+    /// off the loop side alone. Nine live sites read it — `getNextView` (`dsc/dsc2.cpp:1998`),
+    /// `setRelevantCompCoreCl` (`:2663`), `ddc/ddcv1.cpp:3472`,
+    /// `ddc/ddc_transformation_util.cpp:324`, `:489`, `ddc/ddl/ddl_conversion.cpp:3248`,
+    /// `dsc/dsc2Pcfg.cpp:290`, `DSC2ToDataflowIR.cpp:91` and `SNControlFlowLowering.cpp:1049`.
+    /// ⚠️ A TENTH IS BLOCK-COMMENTED INSIDE A CONDITION and is not a reader, so the arm it would have
+    /// narrowed breaks on EVERY condition node (`ddc/ddcv1.cpp:2822-2825`).
+    pub fn has_core_cl_cond(&self) -> bool {
+        self.loop_cond.is_none()
+    }
+}
 
-// crustify:todo: e025_ConditionNode.loopCond_
+// crustify:todo: e044_ConditionNode
 
 /// Replaces: e036_SyncNode
 ///
@@ -9816,7 +9894,7 @@ mod equivalence {
     /// ⛔ THE `:2136` REFUSAL IS TWO PAIRS, AND BOTH ARE THE EQUALITY ARM'S: over the eighteen
     /// `(LoopCondOp, CondVal)` combinations a ported condition can spell, the split dispatch reaches
     /// `DT_ERROR("Unsupported condition operation")` (`dsc/dsc2.cpp:2136`) on exactly `(LE, FIRST)`
-    /// and `(GE, LAST)` — the e025 anchor's FOURTH refusal, not a fifth — and written as the `EQ`
+    /// and `(GE, LAST)` — the e044 anchor's FOURTH refusal, not a fifth — and written as the `EQ`
     /// each of them is, both land in the ANDed-term arm `:2113` and not the new-clause arm `:2134`.
     #[test]
     fn the_split_dispatchs_last_refusal_is_two_pairs_and_both_are_the_equality_arm() {
@@ -10090,6 +10168,214 @@ mod equivalence {
         assert_eq!(
             digest.nones, 25_867,
             "11,347 negative defaults and 14,520 DT_ERRORs"
+        );
+    }
+
+    /// `dsc/dsc2.cpp:2663-2683` — the whole `ConditionNode` arm of
+    /// `DesignSpaceConfig::setRelevantCompCoreCl`, executed against this port over 62,500 cases: both
+    /// this node's map and the parent's swept over all 125 combinations of three cores × five
+    /// per-core states (absent, listed with no corelets, `{0}`, `{1}`, `{0,1}`), for one child and
+    /// two, with the guard both a loop condition and a core/corelet one. The C++ side LINE-EXTRACTS
+    /// the two arms, `set_intersect`/`set_diff` (`util/utils.h:111-125`) and `hasCoreClCond`
+    /// (`dsc/dsc2.h:693-695`) byte-exact and supplies only the declarations they read.
+    ///
+    /// ⛔ AND IT CORRECTED THE CLAIM IT PINS: of the 37,500 pairs that swap ONE core between absent
+    /// and listed-with-no-corelets, 35,625 propagate IDENTICALLY. The 1,875 that do not are the
+    /// single bucket `L1 N2 parent=listed-empty` — the core/corelet guard, an else region, and the
+    /// PARENT's own set listing that core with no corelets, which is the state no writer but the wire
+    /// produces (see [`ConditionNode::core_cl_cond`]). ⭐ AND THE CONTROL SEPARATES THAT FROM A DEAD
+    /// COMPARISON: swapping the same core to `{0}` instead moves the propagation in 9,375 of the same
+    /// 37,500.
+    ///
+    /// ⚠️ WHAT IS OUT OF THE SWEPT SPACE IS THE PARENT'S OWN THROW: `:2664` is
+    /// `relevantComps_.at(NO_COMPONENT)`, so a parent without that entry throws `std::out_of_range`
+    /// before either arm runs, and both sides seed it on every case.
+    #[test]
+    fn e044_core_cl_cond_propagation_matches_the_executed_authority() {
+        /// The two arms as the authority writes them (`dsc/dsc2.cpp:2665-2683`). A child's half is
+        /// `None` when the pass skipped this node and `Some` when it ran, because both arms reach
+        /// their child through `relevantComps_[NO_COMPONENT]`, an `operator[]` that CREATES the
+        /// entry: an empty map and no map at all are different answers downstream (`:2658-2660`).
+        fn propagate(
+            node: &ConditionNode,
+            orig: &BTreeMap<CoreId, BTreeSet<CoreletId>>,
+            children: usize,
+        ) -> [Option<BTreeMap<CoreId, BTreeSet<CoreletId>>>; 2] {
+            if !node.has_core_cl_cond() || children == 0 {
+                return [None, None];
+            }
+            let mut then_core_cl = BTreeMap::new();
+            for (core, cls) in &node.core_cl_cond {
+                let Some(orig_cls) = orig.get(core) else {
+                    continue;
+                };
+                let new_set: BTreeSet<CoreletId> = orig_cls.intersection(cls).copied().collect();
+                if !new_set.is_empty() {
+                    then_core_cl.insert(*core, new_set);
+                }
+            }
+            let mut else_core_cl = None;
+            if children >= 2 {
+                let mut half = orig.clone();
+                for (core, cls) in &node.core_cl_cond {
+                    let Some(else_cls) = half.get_mut(core) else {
+                        continue;
+                    };
+                    *else_cls = else_cls.difference(cls).copied().collect();
+                    if else_cls.is_empty() {
+                        half.remove(core);
+                    }
+                }
+                else_core_cl = Some(half);
+            }
+            [Some(then_core_cl), else_core_cl]
+        }
+
+        fn shown(map: &BTreeMap<CoreId, BTreeSet<CoreletId>>) -> String {
+            let cores: Vec<String> = map
+                .iter()
+                .map(|(core, cls)| {
+                    let cls: Vec<String> = cls.iter().map(|cl| cl.0.to_string()).collect();
+                    format!("{}:[{}]", core.0, cls.join(","))
+                })
+                .collect();
+            format!("{{{}}}", cores.join(";"))
+        }
+
+        /// The five per-core states, in the order the C++ sweep spells them.
+        fn build(codes: [u8; 3]) -> BTreeMap<CoreId, BTreeSet<CoreletId>> {
+            let mut map = BTreeMap::new();
+            for (core, code) in codes.into_iter().enumerate() {
+                let cls = match code {
+                    0 => continue,
+                    1 => BTreeSet::new(),
+                    2 => BTreeSet::from([CoreletId(0)]),
+                    3 => BTreeSet::from([CoreletId(1)]),
+                    _ => BTreeSet::from([CoreletId(0), CoreletId(1)]),
+                };
+                map.insert(CoreId(core as u8), cls);
+            }
+            map
+        }
+
+        fn one_case(
+            loop_empty: bool,
+            children: usize,
+            cond: &BTreeMap<CoreId, BTreeSet<CoreletId>>,
+            orig: &BTreeMap<CoreId, BTreeSet<CoreletId>>,
+        ) -> String {
+            let mut node = ConditionNode {
+                core_cl_cond: cond.clone(),
+                ..ConditionNode::default()
+            };
+            if !loop_empty {
+                node.loop_cond = Some(
+                    LoopCondConjunction::new(LoopCond {
+                        dim: PrimaryDimTypes::Y,
+                        cond_op: LoopCondOp::Eq,
+                        cond_val: CondVal::Last,
+                    })
+                    .into(),
+                );
+            }
+            let [then_half, else_half] = propagate(&node, orig, children);
+            let half = |region: &Option<BTreeMap<CoreId, BTreeSet<CoreletId>>>| match region {
+                None => "absent".to_string(),
+                Some(map) => shown(map),
+            };
+            format!(
+                "L{}|N{children}|c{}|o{}|t{}|e{}",
+                u8::from(loop_empty),
+                shown(cond),
+                shown(orig),
+                half(&then_half),
+                if children > 1 {
+                    half(&else_half)
+                } else {
+                    "none".to_string()
+                }
+            )
+        }
+
+        let codes =
+            || (0..5).flat_map(|a| (0..5).flat_map(move |b| (0..5).map(move |c| [a, b, c])));
+        let mut hash = 14_695_981_039_346_656_037_u64;
+        let mut cases = 0_u64;
+        let mut collapse_agree = 0_u64;
+        let mut collapse_disagree = 0_u64;
+        let mut distinguishable = 0_u64;
+        let mut buckets: BTreeMap<(u8, usize, u8), u64> = BTreeMap::new();
+
+        for loop_empty in [false, true] {
+            for children in 1..=2 {
+                for cond in codes() {
+                    let cond_map = build(cond);
+                    for orig in codes() {
+                        let line = one_case(loop_empty, children, &cond_map, &build(orig));
+                        for byte in line.bytes() {
+                            hash ^= u64::from(byte);
+                            hash = hash.wrapping_mul(1_099_511_628_211);
+                        }
+                        cases += 1;
+                    }
+                }
+                // Does swapping ONE core between "absent" and "listed with no corelets" change the
+                // propagated then/else regions?  Everything else held fixed.
+                for core in 0..3 {
+                    for other0 in 0..5 {
+                        for other1 in 0..5 {
+                            for orig in codes() {
+                                let orig_map = build(orig);
+                                let mut swept = [0_u8; 3];
+                                let fill = [other0, other1];
+                                let mut next = 0;
+                                for (position, code) in swept.iter_mut().enumerate() {
+                                    if position != core {
+                                        *code = fill[next];
+                                        next += 1;
+                                    }
+                                }
+                                // The propagated halves only, never the printed condition itself.
+                                let halves = |codes: [u8; 3]| {
+                                    let line =
+                                        one_case(loop_empty, children, &build(codes), &orig_map);
+                                    line[line.find("|t").unwrap()..].to_string()
+                                };
+                                let absent = halves(swept);
+                                swept[core] = 1;
+                                let listed_empty = halves(swept);
+                                swept[core] = 2;
+                                let listed_zero = halves(swept);
+                                if absent == listed_empty {
+                                    collapse_agree += 1;
+                                } else {
+                                    collapse_disagree += 1;
+                                    *buckets
+                                        .entry((u8::from(loop_empty), children, orig[core]))
+                                        .or_default() += 1;
+                                }
+                                if listed_zero != absent {
+                                    distinguishable += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            (cases, hash),
+            (62_500, 9_967_431_661_323_938_275),
+            "executed dsc/dsc2.cpp:2663-2683"
+        );
+        assert_eq!((collapse_agree, collapse_disagree), (35_625, 1_875));
+        assert_eq!(distinguishable, 9_375, "the control");
+        assert_eq!(
+            buckets.into_iter().collect::<Vec<_>>(),
+            vec![((1, 2, 1), 1_875)],
+            "every disagreement needs the core/corelet guard, an else region, and the PARENT listing \
+             that core with no corelets"
         );
     }
 }
