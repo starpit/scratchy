@@ -7212,8 +7212,8 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// `coreClCond_` instead) and through `hasCoreClCond()`'s else arm
 /// (`ddc/ddc_transformation_util.cpp:489`, `:592`).
 ///
-/// ⛔ PARTIAL, AND THE `e022`/`e043` ANCHORS STAY OPEN BELOW: every term is [`LoopCond`]'s value
-/// half, so a composite still cannot name the loops it is a condition ON, and
+/// ⛔ PARTIAL, AND THE `e022`/`e043`/`e031` ANCHORS STAY OPEN BELOW: every term is [`LoopCond`]'s
+/// value half, so a composite still cannot name the loops it is a condition ON, and
 /// `adjustConditionForSplitLoop` selects and rebuilds its terms by that pointer
 /// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`).
 ///
@@ -7263,11 +7263,13 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 pub struct LoopCondComposite {
     /// Field: e043_LoopCondComposite.twoLevelOrOfAnds_
     /// Field: e022_LoopCondComposite.twoLevelOrOfAnds_
+    /// Field: e031_LoopCondComposite.twoLevelOrOfAnds_
     ///
     /// The OR of ANDs itself (`dsc/dsc2.h:676`) — non-empty, per [`LoopCondDisjunction`].
     pub or_of_ands: LoopCondDisjunction,
     /// Field: e043_LoopCondComposite.negated_
     /// Field: e022_LoopCondComposite.negated_
+    /// Field: e031_LoopCondComposite.negated_
     ///
     /// Whether the whole disjunction is inverted (`dsc/dsc2.h:677`).
     ///
@@ -15023,4 +15025,17 @@ mod equivalence {
 // crustify:todo: e032_LoopDistributionInfo.dimAndKind
 
 // crustify:todo: e032_LoopDistributionInfo.loopNode
+
+// crustify:todo: e031_LoopCondComposite
+//
+// ⛔ e031 IS e022 AND e043 — ONE `LoopCondComposite` (`dsc/dsc2.h:675-683`), THREE GENERATIONS OF
+// ENTITY ID. Its two field anchors are FILLED at the type above; the TYPE anchor stays open for all
+// three because `adjustConditionForSplitLoop` (`dsc/dsc2.cpp:2061-2141`) is the struct's only
+// method and its four `loopComp_` touches ARE its whole body: the `!= origLoop` filter that decides
+// which terms it rewrites (`:2071`), the substitution (`:2076`), the per-new-loop rewrite (`:2108`)
+// and the `!= newLoops.at(0)` clause rebuild (`:2128`). So it wants the field [`LoopCond`] still
+// carries as open (`e018_`/`e030_`/`e039_LoopCond.loopComp_`) — a PARALLEL entity, not this one.
+//
+// ⚠️ AND `e031` NAMES A SECOND, UNRELATED TYPE IN THIS FILE: `Field: e031_LoopNode.numId_` is an
+// EARLIER generation's e031, so grep an entity id WITH its type name and never alone.
 
