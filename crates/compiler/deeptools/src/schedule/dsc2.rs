@@ -2368,7 +2368,9 @@ mod unit_tests {
     /// `:340`, `:352-356`) for a streaming allocation — the one case where the REQUEST and the
     /// RESERVATION differ. ⛔ THE STRIDE IS THE REQUEST OVER THE COUNT, NOT THE RESERVATION OVER THE
     /// COUNT: `kv.second` at `:356` is what was pushed at `:244`, while the widening at `:327` only
-    /// reached the local `mySize` that `checkAndAddDs` places at `:340`.
+    /// reached the local `mySize` that `checkAndAddDs` places at `:340`. The quotient lands in a
+    /// FUNCTION-LOCAL map that the committing tail copies onto the node (`:407-408`), see
+    /// [`AllocateNode::buffer_offset_core_corelet`].
     #[test]
     fn a_streaming_buffer_offset_is_one_buffers_capacity_and_not_half_the_reservation() {
         // `:224-226`: the count `-1` becomes 2 before anything is sized with it.
@@ -2401,6 +2403,223 @@ mod unit_tests {
         let plain = NumBuffers(2);
         let plain_reserved = i64::from(plain.0) * capacity;
         assert_eq!(BufferOffset(plain_reserved / i64::from(plain.0)), offset);
+    }
+
+    /// `finalizeAllocateLayouts`'s inner loop transcribed onto the ported readers the authority
+    /// calls (`ddc/ddcv1.cpp:1718-1730`): the entry names a sizing data stage, that stage's extent
+    /// for the dim beside it REPLACES the stage index, and a dim inside the stick is divided by its
+    /// cumulative stick size. ⛔ THAT DIVISION IS `int` DIVISION, truncating toward zero in both
+    /// languages.
+    fn finalize_allocate_layouts_entry(
+        sizing_stage: &DataStructDims,
+        component: SenComponent,
+        dim: PrimaryDimTypes,
+        stick_sizes: &BTreeMap<PrimaryDimTypes, DimSize>,
+    ) -> Option<MaxDimSize> {
+        use crate::schedule::dims::DimDensity;
+        use sys_arch_spec::RowId;
+
+        // `:1720-1722`: `ss_.primaryDimToVal_st(dim, component_, 0, 0)` — PT row 0, corelet 0.
+        let mut size = sizing_stage
+            .primary_dim_to_val_for_component(
+                dim,
+                component,
+                Some(RowId(0)),
+                Some(CoreletId(0)),
+                &PaddingFormType::default(),
+                DimDensity::FULL,
+                false,
+            )
+            .expect("`primaryDimToVal_st` answers an `int` for every real dim")
+            .0;
+        // `:1723-1728`: only a dim that is part of the stick divides.
+        if let Some(stick) = stick_sizes.get(&dim) {
+            size /= stick.0;
+        }
+        // `:1729` writes the `int` straight back into `maxDimSizes_`, where negative is [`None`].
+        u32::try_from(size).ok().map(MaxDimSize)
+    }
+
+    /// ⛔ AN UNFILLED SIZING DIM IS NOT AN UNBOUNDED ONE: on a stick dim the SAME absence becomes a
+    /// filled ZERO. `primaryDimToVal_st` answers `-1` for a dim the sizing stage does not carry
+    /// (`dsc/dims.cpp:567-568`, over dims born `-1`, `dsc/dims.h:162-192`) and
+    /// `finalizeAllocateLayouts` divides that `-1` by the cumulative stick size before writing it
+    /// back (`ddc/ddcv1.cpp:1723-1729`), so `-1 / 4 == 0`. Both halves come out of the ported code
+    /// the authority would call — [`DesignSpaceConfig::cumulative_stick_sizes`] for the divisor and
+    /// [`DataStructDims::primary_dim_to_val_for_component`] for the extent — so what is pinned is
+    /// that a porter of that pass cannot pass the reader's answer through: one absence reaches
+    /// [`MaxDimSize`] as TWO different values, and `as u32` would make it 4294967295.
+    #[test]
+    fn an_unfilled_sizing_extent_is_a_zero_page_on_a_stick_dim_and_no_page_off_it() {
+        use crate::schedule::dims::{DimDensity, DimVal};
+        use crate::schedule::dsc::{
+            DesignSpaceConfig, DsTypes, PrimaryDsInfo, StickRepl, StickSize, StickSizeScope,
+        };
+        use sys_arch_spec::RowId;
+
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.primary_ds_info.insert(
+            DsTypes::Input,
+            PrimaryDsInfo {
+                layout_dim_order: Vec::new(),
+                stick_dim_order: vec![PrimaryDimTypes::In, PrimaryDimTypes::Out],
+                stick_size: vec![StickSize(8.0), StickSize(4.0)],
+                stick_repl: vec![StickRepl(1), StickRepl(1)],
+            },
+        );
+        let stick_sizes = dsc
+            .cumulative_stick_sizes(DsTypes::Input, StickSizeScope::WholeStick)
+            .expect("the stick is fully described");
+        assert_eq!(
+            stick_sizes,
+            BTreeMap::from([
+                (PrimaryDimTypes::In, DimSize(8)),
+                (PrimaryDimTypes::Out, DimSize(4)),
+            ])
+        );
+
+        // The sizing stage carries `In` and neither `Out` nor `Y`. The two it does not carry are the
+        // authority's `-1`, which the ported reader reports as the VALUE it is and not as an absence.
+        let mut stage = DataStructDims::default();
+        *stage
+            .primary_dim_to_val_handler_mut(PrimaryDimTypes::In)
+            .expect("`In` has a field") = crate::schedule::dims::DimSize::new(64.0);
+        let sized = |dim| {
+            stage.primary_dim_to_val_for_component(
+                dim,
+                SenComponent::Lx,
+                Some(RowId(0)),
+                Some(CoreletId(0)),
+                &PaddingFormType::default(),
+                DimDensity::FULL,
+                false,
+            )
+        };
+        assert_eq!(sized(PrimaryDimTypes::In), Some(DimVal(64)));
+        assert_eq!(sized(PrimaryDimTypes::Out), Some(DimVal(-1)));
+        assert_eq!(sized(PrimaryDimTypes::Y), Some(DimVal(-1)));
+
+        let entry =
+            |dim| finalize_allocate_layouts_entry(&stage, SenComponent::Lx, dim, &stick_sizes);
+        // A dim the stage carries is an extent counted in sticks: 64 / 8.
+        assert_eq!(entry(PrimaryDimTypes::In), Some(MaxDimSize(8)));
+        // ⛔ The absence, on a stick dim: `-1 / 4` truncates to a FILLED zero.
+        assert_eq!(entry(PrimaryDimTypes::Out), Some(MaxDimSize(0)));
+        // The same absence, off the stick: the negative survives, and that is the unbounded dim.
+        assert_eq!(entry(PrimaryDimTypes::Y), None);
+
+        // And the two answers part company downstream: the zero is a page size of zero, the
+        // negative erases its dim (`dsc/dsc2.cpp:4501-4508`).
+        let node = AllocateNode {
+            indirect_alloc_type: IndirectAllocType::ValueTensor,
+            layout_dim_order: [
+                PrimaryDimTypes::In,
+                PrimaryDimTypes::Out,
+                PrimaryDimTypes::Y,
+            ]
+            .map(|dim| (dim, entry(dim)))
+            .to_vec(),
+            ..AllocateNode::default()
+        };
+        assert_eq!(
+            node.page_size(&node),
+            BTreeMap::from([
+                (PrimaryDimTypes::In, PageSize(8)),
+                (PrimaryDimTypes::Out, PageSize(0)),
+            ])
+        );
+    }
+
+    /// `allocAllMem`'s commit of the buffer strides transcribed as the authority writes it
+    /// (`ddc/ddcv1.cpp:407-429`): the strides it computed live in a function-local map (`:136-137`)
+    /// that only the committing branch copies onto the node, corelet 0 is then replicated to every
+    /// used corelet, and the head core to the other used cores — the last gated on
+    /// `numBuffers_ != 1`.
+    fn commit_buffer_offsets(
+        node: &mut AllocateNode,
+        placed: &BTreeMap<CoreId, BTreeMap<CoreletId, BufferOffset>>,
+        commit: bool,
+        copy_core: bool,
+        copy_corelet: bool,
+        cores_used: &[CoreId],
+        num_corelets_used: u8,
+    ) {
+        // `:351`: the writes of the local are gated on `commitIfValid` and so is this whole tail, so
+        // a speculative run reaches neither.
+        if !commit {
+            return;
+        }
+        // `:407-408`: the node takes the local's per-node value wholesale.
+        node.buffer_offset_core_corelet = placed.clone();
+        if copy_corelet {
+            // `:413-417`, whose `.at(0)` is this index.
+            for per_corelet in node.buffer_offset_core_corelet.values_mut() {
+                let corelet0 = per_corelet[&CoreletId(0)];
+                for cl in 1..num_corelets_used {
+                    per_corelet.insert(CoreletId(cl), corelet0);
+                }
+            }
+        }
+        if copy_core {
+            // `:421-428`, including the gate at `:424`.
+            let (head, others) = cores_used.split_first().expect("`coreIdsUsed_.front()`");
+            for &core in others {
+                if node.num_buffers != NumBuffers(1) {
+                    let from_head = node.buffer_offset_core_corelet[head].clone();
+                    node.buffer_offset_core_corelet.insert(core, from_head);
+                }
+            }
+        }
+    }
+
+    /// ⛔ THE PER-CORE WRITE AT `ddc/ddcv1.cpp:355-356` IS NOT THIS FIELD, and two consequences are
+    /// pinned over the transcription above. A speculative `allocAllMem(false)` — fifteen of the
+    /// seventeen call sites — leaves the map EMPTY although the placement itself ran, because the
+    /// write lands in the function-local homonym (`:136-137`). And a committed UNBUFFERED allocation
+    /// keeps a SINGLE core key, because the cross-core replication is gated on `numBuffers_ != 1`
+    /// (`:424`). ⭐ WHICH IS WHY THE READER THAT INDEXES THIS MAP BY AN ARBITRARY CORE DEMANDS LX AND
+    /// `numBuffers_` 1 OR 2 FIRST (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4929`, `:4940-4944`):
+    /// off that path the core it asks for need not be a key at all.
+    #[test]
+    fn a_speculative_placement_writes_no_stride_and_an_unbuffered_one_keeps_one_core() {
+        const HEAD: CoreId = CoreId(0);
+        const CORES: [CoreId; 3] = [HEAD, CoreId(1), CoreId(2)];
+        const STRIDE: BufferOffset = BufferOffset(6 * 1024);
+        let placed = BTreeMap::from([(HEAD, BTreeMap::from([(CoreletId(0), STRIDE)]))]);
+
+        let mut speculative = AllocateNode::default();
+        commit_buffer_offsets(&mut speculative, &placed, false, true, true, &CORES, 2);
+        assert!(speculative.buffer_offset_core_corelet.is_empty());
+
+        let mut unbuffered = AllocateNode::default();
+        assert_eq!(unbuffered.num_buffers, NumBuffers(1));
+        commit_buffer_offsets(&mut unbuffered, &placed, true, true, true, &CORES, 2);
+        assert_eq!(
+            unbuffered.buffer_offset_core_corelet,
+            BTreeMap::from([(
+                HEAD,
+                BTreeMap::from([(CoreletId(0), STRIDE), (CoreletId(1), STRIDE)])
+            )])
+        );
+
+        // The same placement, double buffered: every used core is a key, and each is the head's.
+        let mut doubled = AllocateNode {
+            num_buffers: NumBuffers(2),
+            ..AllocateNode::default()
+        };
+        commit_buffer_offsets(&mut doubled, &placed, true, true, true, &CORES, 2);
+        assert_eq!(
+            doubled
+                .buffer_offset_core_corelet
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            CORES
+        );
+        assert_eq!(
+            doubled.buffer_offset_core_corelet[&CoreId(2)],
+            doubled.buffer_offset_core_corelet[&HEAD]
+        );
     }
 
     /// `dsc/dsc2.h:47-51`: a fresh constant is INVALID, unnamed and not symbolic. ⛔ ITS FORMAT IS
@@ -3745,6 +3964,17 @@ impl DataStage {
 /// Only the last item is marked, once per iteration, and every other rolled-back item keeps
 /// `COMPLETE` from `getCurrItem`. Inert today because nothing reads the field; do not reproduce the
 /// aliasing when porting it, and do not "fix" it into a reader either.
+///
+/// ⚠️ THE SEVEN `e038_CoordPropInfoType.*` ANCHORS STAY OPEN BECAUSE THE STRUCT CANNOT LAND YET:
+/// `refNode` and `nodeToFold` are both `ScheduleNode*` (`dsc/dsc2.h:1089-1090`), e029, and its own
+/// `print` dereferences both for their `name_` (`:1099-1100`) — so that type is the pointer pair
+/// plus five carried fields, and a port without them would be a different unit. ⛔ AND ONE OF THOSE
+/// FIVE CARRIES AN AUTHORITY ASYMMETRY TO REPRODUCE: `CoordPropTracker::retry` re-queues an item
+/// with SIX of the seven initialisers and omits `scaleDown` (`ddc/ddc.h:438-441`), so the
+/// aggregate's own `= false` wins, while `addPropInfo(rhs, dims)` beside it forwards
+/// `rhs.scaleDown` (`:432-433`). A scaled value-tensor propagation therefore loses its scale-down
+/// on retry, and both retries in `buildFoldForAllocation` are on the very path that reads it
+/// (`ddc/ddc_fold.cpp:2402-2407`, `:2437`, `:2460`), queued by the site that sets it (`:1744-1748`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropStateType {
     /// The field's own initialiser (`dsc/dsc2.h:1093`) and what both push sites state.
@@ -7211,8 +7441,9 @@ impl IndexTensorType {
 /// ⛔ AND NOT AN [`Option`] EITHER: [`STREAMING`](Self::STREAMING) is a live third mode, not the
 /// absence of a count, and its readers keep it distinct from `2` even while mapping it to `2` —
 /// `allocAllMem` sizes its REQUEST with `2` (`ddc/ddcv1.cpp:224-226`) and then widens the
-/// RESERVATION to the whole memory capacity, which no other count gets (`ddc/ddcv1.cpp:317-328`),
-/// and `processImplicitSync` refuses an implicit sync on anything else, "Implicit syncs are only
+/// RESERVATION to the memory's whole capacity — half of it on a post-RCUDD1A L0 or L0_SCALE that is
+/// not tethered — which no other count gets (`ddc/ddcv1.cpp:317-328`), and `processImplicitSync`
+/// refuses an implicit sync on anything else, "Implicit syncs are only
 /// possible on circular buffers (num_buffers=-1)"
 /// (`ddc/ddl/ddl_conversion.cpp:1777-1782`).
 ///
@@ -7253,10 +7484,23 @@ impl NumBuffers {
 /// (`dsc/dsc2.cpp:1761-1764`), so a dump taken before that pass reimports stage indices into the
 /// same slots an extent would occupy.
 ///
-/// ⭐ NEITHER CURRENCY IS EVER NEGATIVE, so this is `u32` and the authority's negative is the [`None`]
-/// beside the dim: a data-stage index is an index, and `finalizeAllocateLayouts` writes an extent
-/// divided by a stick size (`ddc/ddcv1.cpp:1723-1729`). ⛔ THAT MAKES `Some` OF A NEGATIVE
-/// UNSPELLABLE, which is the whole boundary three readers disagree about below.
+/// ⭐ A FILLED ENTRY IS NEVER NEGATIVE, so this is `u32` and the authority's negative is the
+/// [`None`] beside the dim: a data-stage index is an index, and the extent that overwrites it is a
+/// size. ⛔ BUT THE SIZING READER ANSWERS `-1`, SO THE CONVERSION IS NOT A CAST.
+/// `finalizeAllocateLayouts` sizes each entry with `ss_.primaryDimToVal_st(dim, component_, 0, 0)`
+/// (`ddc/ddcv1.cpp:1720-1722`), and that is `-1` — a VALUE, not an absence — for a dim the sizing
+/// data stage does not carry: every dim is born `-1` (`dsc/dims.h:162-192`) and `calculate_padded`
+/// returns `-1` for any negative before every other branch (`dsc/dims.cpp:567-568`), which is what
+/// [`DataStructDims::primary_dim_to_val_for_component`] reports as `Some(DimVal(-1))`. A porter of
+/// that pass has to map the negative to [`None`], because `size as u32` would write 4294967295 into
+/// a slot every reader below treats as a bound.
+///
+/// ⛔⛔ AND ON A STICK DIM THAT SAME ABSENCE BECOMES A FILLED ZERO: the `-1` is divided by the dim's
+/// cumulative stick size before being written back, with INTEGER division truncating toward zero
+/// (`ddc/ddcv1.cpp:1723-1729`), and `-1 / 8 == 0`. So ONE unfilled sizing dim lands as
+/// `Some(MaxDimSize(0))` when the dim is part of the stick and as [`None`] when it is not — a zero
+/// page size arrived at from an absence rather than from a small extent. Pinned by
+/// `an_unfilled_sizing_extent_is_a_zero_page_on_a_stick_dim_and_no_page_off_it`.
 ///
 /// ⛔⛔ AND ITS READERS DO NOT AGREE ON WHERE ABSENCE STOPS. [`None`] here is the authority's
 /// NEGATIVE entry, which is the boundary `getPageSize` draws (`maxSize < 0` is the unbounded dim,
@@ -7265,17 +7509,19 @@ impl NumBuffers {
 /// `ddc/ddl/ddl_conversion.cpp:1879-1881`). `buildUnitView`'s is `> 0` —
 /// `if (maxDimSize > 0 && size > maxDimSize)` (`dsc/dsc2.cpp:2806`) — so a ZERO entry takes the
 /// `else` branch: it is never capped, and it never reaches the `DT_CHECK` that the remainder divides
-/// (`:2810`), which is the one guard that would have refused it.
+/// (`:2810`), which is the one guard that would have refused it. `constructAllocElemArrLayout` draws
+/// the same `> 0` boundary over the same `DT_CHECK` and turns a capping entry into a fold level's
+/// `cardinality` (`ddc/ddc_fold.cpp:353-366`).
 ///
 /// ⭐ ZERO IS REACHABLE AND IT IS NOT INERT. The pass that fills these entries divides by the
-/// cumulative stick size with INTEGER division, so any extent below one stick lands on zero
-/// (`ddc/ddcv1.cpp:1723-1729`), and the JSON importer pushes back whatever the dump held
-/// (`dsc/dsc2.cpp:1761-1764`). Downstream, that zero is a bound and not an absence: `getPageSize`
-/// multiplies it into the dim's page size (`dsc/dsc2.cpp:4508`), and both in-file readers of that map
-/// then divide a per-dim size by it under `INDEX_TENSOR` (`dsc/dsc2.cpp:3569`, `:3899`) or
-/// `DT_CHECK` `dimSize <= 0` under `VALUE_TENSOR` (`:3572-3573`). So the three boundaries are three
-/// different predicates over the same [`Option`], and [`Option::is_some`] is the writers' test, NEVER
-/// `buildUnitView`'s cap test.
+/// cumulative stick size with INTEGER division, so any extent below one stick lands on zero — an
+/// unfilled dim's `-1` included, as above (`ddc/ddcv1.cpp:1723-1729`) — and the JSON importer pushes
+/// back whatever the dump held (`dsc/dsc2.cpp:1761-1764`). Downstream, that zero is a bound and not
+/// an absence: `getPageSize` multiplies it into the dim's page size (`dsc/dsc2.cpp:4508`), and both
+/// in-file readers of that map then divide a per-dim size by it under `INDEX_TENSOR`
+/// (`dsc/dsc2.cpp:3569`, `:3899`) or `DT_CHECK` `dimSize <= 0` under `VALUE_TENSOR` (`:3572-3573`).
+/// So the three boundaries are three different predicates over the same [`Option`], and
+/// [`Option::is_some`] is the writers' test, NEVER `buildUnitView`'s cap test.
 ///
 /// ⭐ NEITHER OTHER CURRENCY CAN REACH THE LAYOUT:
 ///
@@ -7309,9 +7555,11 @@ pub struct PageSize(pub u32);
 /// The distance in bytes between one buffer of an allocation and the next — one value of
 /// `AllocateNode::bufferOffsetCoreCorelet_` (`dsc/dsc2.h:988`).
 ///
-/// ⛔ A STRIDE, NOT A BASE ADDRESS: `allocAllMem` writes one buffer's own capacity here while the
-/// base goes to `startAddressCoreCorelet_` beside it (`ddc/ddcv1.cpp:351-356`), and the L3 scheduler
-/// reads the pair together (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`).
+/// ⛔ A STRIDE, NOT A BASE ADDRESS: `allocAllMem` computes one buffer's own capacity for this while
+/// the base goes to `startAddressCoreCorelet_` beside it (`ddc/ddcv1.cpp:351-356`) — both into
+/// FUNCTION-LOCAL maps that only the committing tail copies onto the node, see
+/// [`AllocateNode::buffer_offset_core_corelet`] — and the L3 scheduler reads the pair back together
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`).
 ///
 /// ⛔ ITS NUMERATOR IS THE REQUESTED SIZE, NOT THE RESERVED ONE, and the two differ on exactly the
 /// allocations [`NumBuffers::STREAMING`] marks. The request is `numBuffers * capacity` with `-1`
@@ -7338,9 +7586,10 @@ pub struct BufferOffset(pub i64);
 /// (`ddc/ddcv1.cpp:1704`); the internal-register transformation, which puts one new stick dim's own
 /// size on every input, output and internal-register allocation of the compute
 /// (`ddc/ddc_transformation.cpp:1132-1135`); and `cloneComputeForOffsetAdjustment`, which puts the
-/// OUTPUT REPETITION COUNT on the innermost layout dim of the cloned compute's output allocation
-/// (`ddc/ddc_transformation.cpp:1356`, written at `:1378-1380`) — so a filled entry is not always a
-/// stick count, and reading one as the masked pass's `8` would be wrong for every cloned compute.
+/// OUTPUT REPETITION COUNT on the innermost layout dim of the output allocation the clone now
+/// shares with its original (`ddc/ddc_transformation.cpp:1356`, written at `:1378-1380`) — so a
+/// filled entry is not always a stick count, and reading one as the masked pass's `8` would be
+/// wrong for every cloned compute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StickSpread(pub i32);
 
@@ -7365,9 +7614,10 @@ pub struct StickSpread(pub i32);
 /// ⛔ NAME IDENTITY WOULD NOT SUBSTITUTE FOR THE POINTER IN `allocUsers_`, and one pass proves it:
 /// `cloneComputeForOffsetAdjustment` pushes a `clone()`d compute straight onto the list
 /// (`ddc/ddc_transformation.cpp:1373`, bypassing `addAllocUser`) while the original is still on it,
-/// and the clone carries the original's `name_` because `finalizeScheduleTree` uniquifies names only
-/// later (`dsc/dsc2.cpp:2988-2992`). Keyed by name, the two users would collapse into one, and the
-/// live-range walk that reads this list would then span one clone instead of both
+/// and the clone carries the original's `name_` because the uniquifier runs later — the clone pass
+/// is called at `ddc/ddcv1.cpp:3732` and `finalizeScheduleTree` only at `:3790`, where the suffix
+/// is appended (`dsc/dsc2.cpp:2988-2992`). Keyed by name, the two users would collapse into one,
+/// and the live-range walk that reads this list would then span one clone instead of both
 /// (`ddc/ddcv1.cpp:48-56`). ⛔ THE AUTHORITY'S OWN JSON ROUND TRIP ALREADY COLLAPSES THEM: the
 /// exporter `emplace`s into a `std::map<std::string, int>` keyed by name, so the colliding second
 /// refcount is DROPPED and the list comes back in NAME order (`dsc/dsc2.cpp:934-944`, `:1811-1823`)
@@ -7378,9 +7628,11 @@ pub struct StickSpread(pub i32);
 /// [`page_size`](Self::page_size), which takes the one unported field it reads as a parameter. Its
 /// six remaining methods stay out with `allocUsers_`: `addAllocUser`, `removeAllocUser`,
 /// `hasAllocUsers`, `hasAllocUser` and `clearAllocUsers` (`:1012-1046`) are that list's five
-/// operations, all four of the first three comparing `node == userNode` BY POINTER; and `print`
-/// (`:1048`, defined `dsc/dsc2.cpp:4514-4573`) streams `this`, recurses into
-/// `tempStorageForCompute_` and prints every `allocUsers_` name.
+/// operations, THREE of which compare `node == userNode` BY POINTER — `addAllocUser` (`:1014`),
+/// `removeAllocUser` (`:1024`) and `hasAllocUser` (`:1039`), while `hasAllocUsers` and
+/// `clearAllocUsers` only test and clear it; and `print` (`:1048`, defined
+/// `dsc/dsc2.cpp:4515-4573`) streams `this`, recurses into `tempStorageForCompute_` and prints
+/// every `allocUsers_` name.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and `allocUsers_` and
 /// `relatedIndirectAccessAlloc_` compare by it. `Clone` is IBM's own, through `InheritWithClone`
@@ -7527,18 +7779,42 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.bufferOffsetCoreCorelet_
     ///
-    /// The buffer stride per core and corelet (`dsc/dsc2.h:988`), written by `allocAllMem` beside
-    /// the start address (`ddc/ddcv1.cpp:351-356`) and read as `.at(coord.at(0)).at(corelet0Id)`
+    /// The buffer stride per core and corelet (`dsc/dsc2.h:988`), read as
+    /// `.at(coord.at(0)).at(corelet0Id)` beside the start address
     /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4942-4944`). See [`BufferOffset`]: it is a stride
     /// in bytes, not a base.
     ///
+    /// ⛔ `allocAllMem`'S PER-CORE WRITE DOES NOT REACH THIS FIELD, AND THAT IS WHAT MAKES ITS
+    /// SPECULATIVE RUNS SAFE. `bufferOffsetCoreCorelet_[kv.first][core][corelet] = kv.second /
+    /// numBuffers` (`ddc/ddcv1.cpp:355-356`) names a FUNCTION-LOCAL homonym declared at `:136-137`
+    /// and keyed by `AllocateNode*`, so the fifteen calls that pass `false` (`ddc/ddcv1.cpp:1335`,
+    /// `:1381` and thirteen in the L3 scheduler's copy of the function) leave every node's map
+    /// untouched even though the placement itself ran. This field's own writers are all in the
+    /// `commitIfValid` tail: `kv.first->bufferOffsetCoreCorelet_ = kv.second` assigns the local's
+    /// per-node value wholesale (`:407-408`), corelet 0 is then replicated to every
+    /// `numCoreletsUsed_` corelet (`:413-417`) and the head core to the other used cores
+    /// (`:421-428`). The L3 scheduler repeats all three (`:5714-5715`, `:5720-5724`, `:5728-5735`).
+    ///
+    /// ⛔⛔ SO ITS KEY SET IS NOT "EVERY USED CORE": the cross-core replication is gated on
+    /// `alloc->numBuffers_ != 1` (`ddc/ddcv1.cpp:424`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5731`), and only an `LX`, `L0` or `L0_SCALE`
+    /// allocation is placed on every core to begin with — every other component is placed on
+    /// `coreIdsUsed_.front()` as a proxy (`ddc/ddcv1.cpp:189-198`). An unbuffered non-LX allocation
+    /// therefore keeps a SINGLE core key while `startAddressCoreCorelet_` beside it gets every core
+    /// (`:396-405`), which is why the reader that indexes this map by an arbitrary core demands LX
+    /// and `DT_CHECK_MSG`s `numBuffers_ == 1 || numBuffers_ == 2` first
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4929`, `:4940-4941`). Pinned by
+    /// `a_speculative_placement_writes_no_stride_and_an_unbuffered_one_keeps_one_core`.
+    ///
     /// ⭐ ORDERED, AND THE ORDER IS EXPORTED: the authority's nested `std::map`s print in key order
     /// in the node's JSON (`dsc/dsc2.cpp:879-892`), which a [`BTreeMap`] reproduces. Both keys are
-    /// `int` there and non-negative in every writer — `allocAllMem` iterates real cores and corelets
-    /// (`ddc/ddcv1.cpp:351-356`) and the L3 scheduler writes `[coreId][coreletId]`
-    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4991`, `:5008`, `:5035`, `:5130`) — so unlike
-    /// [`back_gap_core`](Self::back_gap_core) this map has no `-1` pseudo-key and needs no
-    /// [`Option`].
+    /// `int` there and non-negative in every writer — the placement loop draws its cores from
+    /// `coreIdsUsed_` and its corelets from `0` up to `numCoreletsUsed_DSC2_`
+    /// (`ddc/ddcv1.cpp:189-213`, and note that the replication above bounds itself by the OTHER
+    /// counter, `numCoreletsUsed_`), the replication only copies those keys, and the L3 scheduler
+    /// writes `[coreId][coreletId]` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4991`, `:5008`,
+    /// `:5035`, `:5130`) — so unlike [`back_gap_core`](Self::back_gap_core) this map has no `-1`
+    /// pseudo-key and needs no [`Option`].
     pub buffer_offset_core_corelet: BTreeMap<CoreId, BTreeMap<CoreletId, BufferOffset>>,
     /// Field: e028_AllocateNode.backGapCore_
     ///
