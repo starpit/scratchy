@@ -11,6 +11,7 @@ use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 use sys_arch_spec::{CoreId, CoreletId, RowId};
 
 /// Replaces: e001_FailedAlloc
+/// Replaces: e023_FailedAlloc
 ///
 /// The memory-tracker key an allocation would not fit in — `ddc/ddc_metadata.h:24-29`.
 ///
@@ -39,7 +40,13 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// Transposing any two of the three `int` keys is `E0308`, twice per block below — measured, by
 /// compiling each snippet by hand against the built rlibs, not inferred. It is what stops a
 /// transposition being a silently wrong tracker; the corelet/row pair is the one the C++ cannot
-/// catch even at runtime, because this fill site fixes both at `0` (`:205`, `:211`).
+/// catch even at runtime — ⛔ AND NOT BECAUSE BOTH ARE `0` HERE. `rows` is the single proxy row
+/// (`:211`), but `corelets` gains `1..numCoreletsUsed_DSC2_` for L0 and L0_SCALE past RCUDD1A
+/// (`:200-209`), and those are exactly the arms `getTracker` keys on `(core, corelet)` without ever
+/// reading `row` (`sys-arch-spec/memtracker/mem_track_bundle.cpp:180-183`), so that one swap returns
+/// the corelet-`0` tracker with no throw, while a core/corelet or core/row swap dies in
+/// `std::map::at`. The literals below carry a NON-proxy corelet for that reason: at `0` and `0` the
+/// swap is value-identical and only the types separate the two records.
 /// ⛔ ONE TRANSPOSITION PER BLOCK. `compile_fail` asserts only that the block AS A WHOLE does not
 /// compile, so two wrong literals in one block pin NEITHER: measured 2026-09-18, correcting one of
 /// them and leaving the other wrong still reported `compile fail ... ok`, while that same correction
@@ -54,8 +61,8 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// use sys_arch_spec::arch_enums::SenComponent;
 /// use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// let _ = FailedAlloc {
-///     comp: SenComponent::Lx,
-///     core: CoreletId(0),
+///     comp: SenComponent::L0,
+///     core: CoreletId(1),
 ///     corelet: CoreId(3),
 ///     row: RowId(0),
 /// };
@@ -65,10 +72,10 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// use sys_arch_spec::arch_enums::SenComponent;
 /// use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// let _ = FailedAlloc {
-///     comp: SenComponent::Lx,
+///     comp: SenComponent::L0,
 ///     core: CoreId(3),
 ///     corelet: RowId(0),
-///     row: CoreletId(0),
+///     row: CoreletId(1),
 /// };
 /// ```
 /// ```compile_fail,E0308
@@ -76,9 +83,9 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// use sys_arch_spec::arch_enums::SenComponent;
 /// use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// let _ = FailedAlloc {
-///     comp: SenComponent::Lx,
+///     comp: SenComponent::L0,
 ///     core: RowId(0),
-///     corelet: CoreletId(0),
+///     corelet: CoreletId(1),
 ///     row: CoreId(3),
 /// };
 /// ```
@@ -87,9 +94,9 @@ use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// use sys_arch_spec::arch_enums::SenComponent;
 /// use sys_arch_spec::{CoreId, CoreletId, RowId};
 /// let _ = FailedAlloc {
-///     comp: SenComponent::Lx,
+///     comp: SenComponent::L0,
 ///     core: CoreId(3),
-///     corelet: CoreletId(0),
+///     corelet: CoreletId(1),
 ///     row: RowId(0),
 /// };
 /// ```
@@ -901,8 +908,10 @@ mod unit_tests {
     use super::*;
     use crate::schedule::dsc2::NumBuffers;
 
-    /// `ddc/ddcv1.cpp:362-369` — the LX tracker of a used core refuses, with the corelet and row at
-    /// the proxy `0` that `corelets(1, 0)` and `rows(1, 0)` fix for it (`:205`, `:211`).
+    /// `ddc/ddcv1.cpp:362-369` — the LX tracker of a used core refuses. Both the corelet and the row
+    /// are the proxy `0` HERE BECAUSE THE COMPONENT IS LX: that takes `copyCorelet = true`
+    /// (`:200-204`), which is what leaves `corelets` at the `{0}` it was initialised to (`:205`)
+    /// instead of growing it; `rows` is `{0}` for every component (`:211`).
     ///
     /// ⛔ ALL FOUR SINGLE-FIELD MOVES, NOT JUST THE CORELET. `getTracker` keys on all four
     /// (`mem_track_bundle.h:34`), and the corelet move alone does not pin that: measured against a
@@ -944,6 +953,34 @@ mod unit_tests {
                 "a one-field move must name a different tracker"
             );
         }
+    }
+
+    /// `ddc/ddcv1.cpp:200-209` — the OTHER fill-site regime, which the LX case above cannot show:
+    /// past RCUDD1A an L0 allocation is tried on every corelet up to `numCoreletsUsed_DSC2_`, so a
+    /// recorded corelet is NOT always the proxy `0` while the row still is (`:211`).
+    ///
+    /// ⛔ AND NOTHING WOULD REPORT THE CONFUSION: `getTracker`'s L0 arm is
+    /// `l0Track.at(core).at(corelet)` and never reads the row at all
+    /// (`sys-arch-spec/memtracker/mem_track_bundle.cpp:181`), so a corelet that fell back to the
+    /// row's `0` returns a real tracker for the wrong corelet rather than throwing.
+    #[test]
+    fn a_recorded_corelet_is_not_always_the_proxy() {
+        let failed = FailedAlloc {
+            comp: SenComponent::L0,
+            core: CoreId(3),
+            corelet: CoreletId(1),
+            row: RowId(0),
+        };
+        assert_ne!(failed.corelet, CoreletId(0), "`:207-209` reaches corelet 1");
+        assert_eq!(failed.row, RowId(0), "`:211` fixes the row at the proxy");
+        assert_ne!(
+            failed,
+            FailedAlloc {
+                corelet: CoreletId(0),
+                ..failed
+            },
+            "`mem_track_bundle.cpp:181` keys the L0 tracker on the corelet"
+        );
     }
 
     /// A bound that no ordered set could place is not a bound (`ddc/ddc_metadata.h:38`).
