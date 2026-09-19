@@ -284,8 +284,9 @@ impl CondProp {
 //     `transfer_acc_pat_dims_` (`:401-403`, keyed by `const dsc2::TransferNode*`), `loop_labels_`
 //     (`:409-410`, `dsc2::LoopNode*`), `region2blocks_` (`:412-413`, keyed by `mlir::Region*` — the
 //     deleted `RegionId` — and valued by `dsc2::BlockNode*`), `sync_definitions_` (`:440-441`).
-//   * keyed by `mlir::Operation*` AND valued by the unported `FoldManager<int64_t>`
-//     (`e020_FoldManager`, open in `src/schedule/fold.rs`): `coreToCore_definitions_` (`:452-453`).
+//   * keyed by `mlir::Operation*`: `coreToCore_definitions_` (`:452-453`). Its VALUE type
+//     `FoldManager<int64_t>` is no longer the blocker — that is e026_FoldManager, filled in
+//     `src/schedule/fold.rs` — so what is left open here is the key alone.
 //   * `core_chunk_loop_label_` (`:411`) is the one portable field, a `std::string`. One of fifteen is
 //     a shell, and `clear()` (`:458-461`) — a placement-new re-run of the constructor — has nothing
 //     to clear on one.

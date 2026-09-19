@@ -3,8 +3,7 @@
 use crate::schedule::ddc::LatchDataId;
 use crate::schedule::dims::{DataStructDims, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes};
 use crate::schedule::fold::{
-    AffineFoldFunctionLeaf, AffineFoldFunctionNonLeaf, FoldDimIndex, FoldDimProp, FoldDimSize,
-    FoldFunc,
+    BaseFuncType, FoldDimIndex, FoldDimPos, FoldDimProp, FoldDimSize, FoldManager,
 };
 use core::num::{NonZeroUsize, Wrapping};
 use std::collections::btree_map::Entry;
@@ -2972,8 +2971,15 @@ mod unit_tests {
         );
 
         // The two `FoldDimProp`s the fold was built over — `wkslice_index` outer, `chunk_index`
-        // inner (`dsc/dsc2.cpp:4669-4675`).
-        let props = &moved.front[&PrimaryDimTypes::X].props;
+        // inner (`dsc/dsc2.cpp:4669-4675`) — now read off the manager's own `dim_prop_`, which is
+        // where they live.
+        let fm = moved.front[&PrimaryDimTypes::X].manager();
+        assert_eq!(fm.num_dims(), FoldDimPosition::COUNT);
+        assert_eq!(
+            fm.func_types(),
+            vec![BaseFuncType::Affine; FoldDimPosition::COUNT]
+        );
+        let props = fm.fold_dim_props();
         assert_eq!(props[0].size(), FoldDimSize(2));
         assert_eq!(props[0].label(), "wkslice_index");
         assert_eq!(props[1].size(), FoldDimSize(3));
@@ -5118,8 +5124,8 @@ pub enum LdsOrConst {
 /// and again for stage 2a at `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5780-6272`).
 ///
 /// ⛔ SEVEN OF TEN DECLARED FIELDS ARE HERE. The three that are not, with the reason:
-///  * `startAddr_` (`:723`) is a `FoldManager<int64_t>`, e020_FoldManager, whose own dependencies
-///    are in `util/foldManager/` and unscoped;
+///  * `startAddr_` (`:723`) is a `FoldManager<int64_t>` — e026_FoldManager, which HAS now landed in
+///    `src/schedule/fold.rs`, so this one's stated blocker is gone and the field is schedulable;
 ///  * `loopEleOffsets_` (`:730-734`) is keyed by `const LoopNode*` — POINTER IDENTITY, needing
 ///    e029_ScheduleNode's `name_`, which is also the only thing the JSON export can order those keys
 ///    by (`dsc/dsc2.cpp:251-256`). Its value currency is already here as [`TemporalStride`];
@@ -5141,7 +5147,7 @@ pub enum LdsOrConst {
 /// (`L3DlOpsScheduler.cpp:5850-5852`) and divides by `numPTRows` separately, inside the block
 /// (`:6271`). Truncating division makes those two equal — but `startAddr_` is scaled by that same
 /// `addrScale` in both (`ddc/ddcv1.cpp:2398-2406`, `L3DlOpsScheduler.cpp:5854-5862`), so on L0LU
-/// stage 2b divides the start address by `numPTRows` and stage 2a does not. That is e020_FoldManager's
+/// stage 2b divides the start address by `numPTRows` and stage 2a does not. That is this field's own
 /// to carry, and it is why one citation per stage is the minimum here.
 ///
 /// ⛔ AND WHICH ADDRESS FIELDS GET FILLED AT ALL IS A THREE-WAY MATCH ON
@@ -6720,8 +6726,10 @@ pub struct ComputeCoreletView {
 /// `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`) — e023 under the
 /// current numbering, whose own anchors in this file still read `e012` — and the third is
 /// `instrAttribute_.computeMaskLoopOffsets_` below. ⛔ THE ONE DEP `port.json` NAMES,
-/// `e023_CoordinateType`, IS GENUINELY UNSATISFIED: it is `std::map<PrimaryDimTypes,
-/// FoldManager<Dtype>>` (`dsc/dsc2.h:431`) and `FoldManager` has not landed.
+/// `e023_CoordinateType`, WAS UNSATISFIED WHEN THIS WAS WRITTEN: it is `std::map<PrimaryDimTypes,
+/// FoldManager<Dtype>>` (`dsc/dsc2.h:431`) and `FoldManager` had not landed. ⭐ IT HAS NOW —
+/// e026_FoldManager, `src/schedule/fold.rs` — so that dep is satisfied and the two coordinate anchors
+/// are open work rather than blocked work.
 /// ⭐ `coreletViews_` AND ITS TWO SEPARATELY ANCHORED HALVES ARE PORTED HERE and were not portable
 /// when e024 ran: `ScheduleNode::UnitView` (`:943-947`) landed with e029 in `625e761da`.
 /// ⭐ AND `inputsLdsAndLoopOffsets_` / `outputsLdsAndLoopOffsets_` (`:937-938`) ARE CARRIED NOW: the
@@ -8474,73 +8482,93 @@ impl FoldDimPosition {
 
     /// Outer to inner, which is the order `buildFoldSpace` nests the levels in.
     pub const ALL: [Self; Self::COUNT] = [Self::WorkSlice, Self::Chunk];
+
+    /// The label `buildTransferFoldDim` sets on this position's prop (`dsc/dsc2.cpp:4669-4671`,
+    /// `:4674-4675`).
+    ///
+    /// ⛔ NOTHING MATCHES ON IT — see [`FoldDimProp`]'s own note — so it reaches the metadata dump and
+    /// nowhere else, and a `FoldManager`'s `operator==` does not compare it
+    /// (`util/foldManager/foldInfrastructure.h:1104-1109`).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WorkSlice => "wkslice_index",
+            Self::Chunk => "chunk_index",
+        }
+    }
 }
 
 /// ⛔ E0308 IF A POSITION IS EVER ADDED: `COUNT` is the array length every caller's `sizes`,
 /// `alphas` and `betas` are checked against.
 const _: [(); FoldDimPosition::COUNT] = [(); FoldDimPosition::Chunk as usize + 1];
 
-/// One dim's pad-size fold: the two `FoldDimProp`s the authority stores plus the two-level affine
-/// tree its manager builds over them (`dsc/dsc2.cpp:4655-4682`).
+/// One dim's pad-size fold: the [`FoldManager`] the authority's `MapWithFMHelper` keeps per dim, over
+/// the two `FoldDimProp`s stored beside it (`dsc/dsc2.cpp:4655-4682`).
 ///
 /// ⛔ THE PROPS AND THE TREE ARE ONE OWNER HERE BECAUSE IN C++ THEY ALIAS: `FoldManager::dim_prop_`
 /// holds `const FoldDimProp*` INTO `transferPadFrontFoldProps`
 /// (`util/foldManager/foldInfrastructure.h:2909`, `:888`), so `DT_CHECK_MSG(!foldProps.count(dim))`
 /// (`dsc/dsc2.cpp:4662`) is the only thing standing between a rebuild's `resize` and a dangling
-/// pointer. Co-owning them makes the pointer unnecessary rather than safe.
+/// pointer. [`FoldManager`] co-owns its props for exactly that reason, so this is the manager alone
+/// and the two `currDimFoldProps` entries (`:4664-4676`) live inside it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PadSizeFold {
-    props: [FoldDimProp; FoldDimPosition::COUNT],
-    fold: FoldFunc<i32>,
-}
+struct PadSizeFold(FoldManager<i32>);
 
 impl PadSizeFold {
     /// `buildTransferFoldDim` (`dsc/dsc2.cpp:4655-4682`) and the four `insert*ForKey` calls that
-    /// follow it (`:4624-4635`), which are one construction: `buildFoldSpace` nests two affine
-    /// levels with `alpha_{}`/`beta_{}` at zero and each `insertAlphaForKey(.., pos)` then writes the
-    /// level `collectFoldFunctionAtLevel(pos)` reaches — 0 the non-leaf, 1 its leaf.
+    /// follow it (`:4624-4635`), which are one construction: `addKeyBuildFoldSpace` (`:4678-4681`)
+    /// nests two affine levels with `alpha_{}`/`beta_{}` at zero, and each `insertAlphaForKey(..,
+    /// pos)` then writes the level `collectFoldFunctionAtLevel(pos)` reaches — 0 the non-leaf, 1 its
+    /// leaf.
+    ///
+    /// ⛔ NEITHER [`None`] BELOW IS REACHABLE, and they are propagated rather than asserted away.
+    /// [`FoldManager::build_fold_space_dims`] refuses an empty list or a kind it cannot build, and
+    /// this list is [`FoldDimPosition::COUNT`] entries of `Affine` over the `i32` payload that HAS the
+    /// affine constructor; [`FoldManager::insert_alpha_beta`] refuses a position past the end or a
+    /// level that is not Affine, and every position comes from [`FoldDimPosition::ALL`]. The caller's
+    /// own [`None`] is the authority's one real check (`:4662`) and it is the same channel.
     fn new(
         sizes: [FoldDimSize; FoldDimPosition::COUNT],
         alphas: [PadSize; FoldDimPosition::COUNT],
         betas: [PadSize; FoldDimPosition::COUNT],
-    ) -> Self {
-        let outer = FoldDimPosition::WorkSlice as usize;
-        let inner = FoldDimPosition::Chunk as usize;
-        Self {
-            props: [
-                FoldDimProp::new(sizes[outer], "wkslice_index"),
-                FoldDimProp::new(sizes[inner], "chunk_index"),
-            ],
-            fold: FoldFunc::AffineNonLeaf(AffineFoldFunctionNonLeaf::<i32>::new(
-                alphas[outer].0,
-                betas[outer].0,
-                FoldFunc::AffineLeaf(AffineFoldFunctionLeaf::<i32>::new(
-                    alphas[inner].0,
-                    betas[inner].0,
-                )),
-            )),
+    ) -> Option<Self> {
+        let dim_prop = FoldDimPosition::ALL.map(|pos| {
+            (
+                FoldDimProp::new(sizes[pos as usize], pos.label()),
+                BaseFuncType::Affine,
+            )
+        });
+        let mut fm = FoldManager::<i32>::new();
+        fm.build_fold_space_dims(&dim_prop)?;
+        for pos in FoldDimPosition::ALL {
+            let idx = pos as usize;
+            fm.insert_alpha_beta(&alphas[idx].0, &betas[idx].0, FoldDimPos(pos as i32))?;
         }
+        Some(Self(fm))
+    }
+
+    /// The manager every read goes through, including the `FoldDimProp` readers the authority reaches
+    /// via `transferPadFrontFoldProps` and this port reaches via `dim_prop_`.
+    const fn manager(&self) -> &FoldManager<i32> {
+        &self.0
     }
 
     /// `MapWithFMHelper::getDataForKey` past the key check — its three-argument callers reach the
     /// variadic overload (`util/foldManager/mapWithFMHelper.h:253-258`), which packs a
     /// `std::deque<int64_t>` and delegates to `:206-209`; that is `DT_CHECK(key_val_.count(key))`
-    /// and then the manager's `isLegal` range test
+    /// and then [`FoldManager::get_data`], which is `isLegal`
     /// (`util/foldManager/foldInfrastructure.h:1666-1681`) and the walk.
     ///
     /// ⛔ THE RANGE TEST IS SIGNED AND THAT IS NOT A BUG TO FIX: `getSize() <= idx` widens a
     /// `uint32_t` extent to `int64_t` (`:1677`), so a NEGATIVE coordinate is LEGAL and computes.
     /// Measured on the authority: work slice -1 answers 65 where work slice 2 of 2 throws, and a
     /// zero extent refuses coordinate 0 while still answering 65 for -1.
-    /// ⛔ The count half of `isLegal` is gone instead of ported — two coordinates is the signature.
+    /// ⛔ AND ITS ARITY HALF CANNOT REFUSE HERE (`:1668-1669`): the coordinate array and the fold
+    /// space are both [`FoldDimPosition::COUNT`] long, which is what makes two coordinates the
+    /// signature rather than a checked length.
     fn data(&self, wk_slice: WkSliceIdx, chunk: ChunkIdx) -> Option<PadSize> {
-        let coords = [FoldDimIndex(wk_slice.0), FoldDimIndex(chunk.0)];
-        for (prop, coord) in self.props.iter().zip(coords) {
-            if i64::from(prop.size().0) <= coord.0 {
-                return None;
-            }
-        }
-        self.fold.get_data(&coords).map(PadSize)
+        self.manager()
+            .get_data(&[FoldDimIndex(wk_slice.0), FoldDimIndex(chunk.0)])
+            .map(PadSize)
     }
 }
 
@@ -8653,7 +8681,7 @@ impl TransferPadInfo {
         match folds.entry(dim) {
             Entry::Occupied(_) => None,
             Entry::Vacant(slot) => {
-                slot.insert(PadSizeFold::new(sizes, alphas, betas));
+                slot.insert(PadSizeFold::new(sizes, alphas, betas)?);
                 Some(())
             }
         }
@@ -9028,12 +9056,12 @@ mod equivalence {
         );
         let fold = &info.front[&PrimaryDimTypes::X];
         assert_eq!(
-            fold.props[0].size(),
+            fold.manager().fold_dim_props()[0].size(),
             FoldDimSize(4_294_967_295),
             "`C.stored_wkslice_extent`"
         );
         assert_eq!(
-            fold.props[1].size(),
+            fold.manager().fold_dim_props()[1].size(),
             FoldDimSize(3),
             "`C.stored_chunk_extent`"
         );
@@ -9078,7 +9106,7 @@ mod equivalence {
         );
         let fold = &info.front[&PrimaryDimTypes::X];
         assert_eq!(
-            fold.props[0].size(),
+            fold.manager().fold_dim_props()[0].size(),
             FoldDimSize(0),
             "`C.zero_extent_stored`"
         );
