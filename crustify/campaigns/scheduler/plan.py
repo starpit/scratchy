@@ -228,11 +228,19 @@ def main():
         for c in multi:
             print(f"    L{cdepth[comp_of[c[0]]]}: " + ", ".join(c))
 
+    # ⛔⛔ NUMBER BY CLASS NAME, NOT BY LAYER ORDER. Numbering the sorted-by-depth list means inserting
+    # ONE unit shifts every later eNNN — which is what orphaned wave 1's anchors when foldManager was
+    # scoped, and what the review found as "e044_ConditionNode was FILED UNDER A COLLIDING NUMBER" and
+    # "e036_SyncNode's whole port was filed" under another unit's number. A number that moves is not an
+    # identity. Sorted class names give each unit a number that never changes unless the class is
+    # renamed in the authority; scheduling order is carried by `layer`, which is where it belongs.
+    numbering = {c["name"]: i for i, c in
+                 enumerate(sorted(cs.values(), key=lambda c: c["name"]), 1)}
     order = sorted(cs.values(), key=lambda c: (depth[c["name"]], c["header"], c["first"]))
     rows = ["\t".join(["entry", "level", "loc", "authority", "extract_lines", "rust_home",
                        "callees", "note"])]
-    for i, c in enumerate(order, 1):
-        e = f"e{i:03d}_{c['name']}"
+    for c in order:
+        e = f"e{numbering[c['name']]:03d}_{c['name']}"
         c["entry"] = e
         c["home"] = HOME[c["header"]]
         note = (f"{c['kind']} {c['name']}, {c['loc']} lines, {len(c['fields'])} declared fields. "
