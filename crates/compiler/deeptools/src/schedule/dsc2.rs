@@ -4504,6 +4504,62 @@ mod unit_tests {
             "the mutable reading reaches the node the read-only one names"
         );
     }
+
+    /// [`SyncNode::components_from_other_ends`] over ends that are NOT a sync node of this tree — the
+    /// one place the port must answer where the authority dereferences a `const SyncNode*` come what
+    /// may: an out-of-range index, a path past a leaf, the ROOT (which [`ScheduleTree::node_at`] never
+    /// names) and a path resolving to a node of the WRONG kind. Each contributes nothing.
+    ///
+    /// ⛔ AND THE SECOND ASSERTION IS `dsc/dsc2.cpp:2412` ITSELF: the component entry is created before
+    /// `:2414` filters the core, so filtering EVERY core leaves the entry behind with an empty map —
+    /// the state `dsc/dsc2Pcfg.cpp:434` distinguishes from an absent one.
+    #[test]
+    fn an_other_end_that_is_not_a_sync_node_of_this_tree_contributes_nothing() {
+        let mut tree = ScheduleTree::default();
+        let mut end = SyncNode::default();
+        end.base_class.relevant_comps_mut().insert(
+            SenComponent::L3su,
+            BTreeMap::from([(CoreId(1), BTreeSet::from([CoreletId(0)]))]),
+        );
+        let mut decoy = TransferNode::default();
+        decoy.base_class.relevant_comps_mut().insert(
+            SenComponent::Hbm,
+            BTreeMap::from([(CoreId(1), BTreeSet::from([CoreletId(1)]))]),
+        );
+        for node in [ChildNode::Sync(end), ChildNode::Transfer(decoy)] {
+            assert!(
+                tree.head_mut()
+                    .base_class
+                    .add_child_node(InsertionPoint::Back, node)
+                    .is_none()
+            );
+        }
+
+        let sync = SyncNode {
+            other_end_of_the_signals: vec![
+                NodePath::new([0]),
+                NodePath::new([1]),
+                NodePath::new([7]),
+                NodePath::new([0, 0]),
+                NodePath::default(),
+            ],
+            ..SyncNode::default()
+        };
+        assert_eq!(
+            sync.components_from_other_ends(&tree, None),
+            BTreeMap::from([(
+                SenComponent::L3su,
+                BTreeMap::from([(CoreId(1), BTreeSet::from([CoreletId(0)]))]),
+            )]),
+            "only the end that resolves to a sync node contributes"
+        );
+        assert!(
+            sync.components_from_other_ends(&tree, Some(CoreId(0)))
+                .get(&SenComponent::L3su)
+                .is_some_and(BTreeMap::is_empty),
+            "the component entry outlives a filter that excludes its every core"
+        );
+    }
 }
 
 /// Replaces: CoordinateCategory
@@ -9590,6 +9646,7 @@ pub struct InstrAttribute {
     /// (`ddc/ddl/ddl_conversion.cpp:1371-1373`).
     pub compute_mask: ComputeMask,
     // crustify:todo: e035_ComputeNode.computeMaskLoopOffsets_
+    // crustify:todo: e005_ComputeNode.computeMaskLoopOffsets_
     /// Field: e035_ComputeNode.input_data_connects_
     ///
     /// One name per input of an OPAQUE op (`dsc/dsc2.h:926-927`), index-parallel with
@@ -9637,10 +9694,12 @@ impl Default for InstrAttribute {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepetitionWithOffset {
     /// Field: e035_ComputeNode.forInputs_
+    /// Field: e005_ComputeNode.forInputs_
     ///
     /// `dsc/dsc2.h:951`. ⛔ WRITTEN AND NEVER READ — see the type's note above.
     pub for_inputs: Vec<Repetition>,
     /// Field: e035_ComputeNode.forOutputs_
+    /// Field: e005_ComputeNode.forOutputs_
     ///
     /// `dsc/dsc2.h:952`. ⛔ A SPREAD THE TRANSFORMATION CONSUMES: it clones the node
     /// `for_outputs[idx] - 1` further times and writes 1 back into the clone
@@ -9660,17 +9719,20 @@ pub struct RepetitionWithOffset {
 #[derive(Clone, Debug, Default)]
 pub struct ComputeCoreletView {
     /// Field: e035_ComputeNode.inputsLoopsAndSizes_
+    /// Field: e005_ComputeNode.inputsLoopsAndSizes_
     ///
     /// One view per entry of [`ComputeNode::inputs`], built from that input's own `DataInfo`
     /// (`dsc/dsc2.cpp:3021-3025`).
     pub inputs_loops_and_sizes: Vec<UnitView>,
     /// Field: e035_ComputeNode.outputsLoopsAndSizes_
+    /// Field: e005_ComputeNode.outputsLoopsAndSizes_
     ///
     /// One view per entry of [`ComputeNode::outputs`], on the same terms (`dsc/dsc2.cpp:3026-3031`).
     pub outputs_loops_and_sizes: Vec<UnitView>,
 }
 
 /// Replaces: e035_ComputeNode
+/// Replaces: e005_ComputeNode
 ///
 /// `dsc/dsc2.h:900-962`. One compute instruction in the schedule tree: the unit it issues on, the
 /// op, the operand components and the instruction attributes.
@@ -9729,16 +9791,19 @@ pub struct ComputeNode {
     /// tagged `COMPUTE` by `ComputeNode()` (`:901`). A compute is a LEAF.
     pub base_class: ScheduleNode,
     /// Field: e035_ComputeNode.exUnit_
+    /// Field: e005_ComputeNode.exUnit_
     ///
     /// The execution unit the instruction issues on (`dsc/dsc2.h:932`). ⛔ A COMPUTE WHOSE OWN
     /// `exUnit_` APPEARS IN ITS OPERANDS IS ILLEGAL DDL (`ddc/ddl/ddl_conversion.cpp:1478-1487`).
     pub ex_unit: SenComponent,
     /// Field: e035_ComputeNode.type_
+    /// Field: e005_ComputeNode.type_
     ///
     /// The op (`dsc/dsc2.h:933`). Its `COUNT` initialiser means "not chosen yet"; the DDL conversion
     /// always overwrites it (`ddc/ddl/ddl_conversion.cpp:1410-1437`).
     pub r#type: ComputeOpType,
     /// Field: e035_ComputeNode.dataFormat_
+    /// Field: e005_ComputeNode.dataFormat_
     ///
     /// The precision the op runs at (`dsc/dsc2.h:934`). ⛔ IT IS THE OP'S PRECISION FOR `MACC`
     /// ALONE, which is why [`Self::operand_sizes`] dispatches on it for that one op: a `"macc"` in
@@ -9753,17 +9818,20 @@ pub struct ComputeNode {
     /// there.
     pub data_format: DataFormats,
     /// Field: e035_ComputeNode.inputs_
+    /// Field: e005_ComputeNode.inputs_
     ///
     /// Where each input comes from (`dsc/dsc2.h:935`), pushed in lockstep with
     /// `inputsLdsAndLoopOffsets_` and `repetitionWithOffset_.forInputs_`
     /// (`ddc/ddl/ddl_conversion.cpp:1385-1395`).
     pub inputs: Vec<SenComponent>,
     /// Field: e035_ComputeNode.outputs_
+    /// Field: e005_ComputeNode.outputs_
     ///
     /// Where each output goes (`dsc/dsc2.h:936`), on the same terms
     /// (`ddc/ddl/ddl_conversion.cpp:1396-1407`).
     pub outputs: Vec<SenComponent>,
     /// Field: e035_ComputeNode.inputsLdsAndLoopOffsets_
+    /// Field: e005_ComputeNode.inputsLdsAndLoopOffsets_
     ///
     /// One [`DataInfo`] per input, pushed in lockstep with [`inputs`](Self::inputs) and
     /// `repetitionWithOffset_.forInputs_` (`dsc/dsc2.h:937`,
@@ -9775,6 +9843,7 @@ pub struct ComputeNode {
     /// reader that shortens one has broken the other.
     pub inputs_lds_and_loop_offsets: Vec<DataInfo>,
     /// Field: e035_ComputeNode.outputsLdsAndLoopOffsets_
+    /// Field: e005_ComputeNode.outputsLdsAndLoopOffsets_
     ///
     /// One [`DataInfo`] per output, on the same terms (`dsc/dsc2.h:938`,
     /// `ddc/ddl/ddl_conversion.cpp:1396-1407`).
@@ -9789,17 +9858,20 @@ pub struct ComputeNode {
     /// `dsc/dsc2.h:939`.
     pub instr_attribute: InstrAttribute,
     /// Field: e035_ComputeNode.numFoldsEngaged
+    /// Field: e005_ComputeNode.numFoldsEngaged
     ///
     /// `dsc/dsc2.h:940`. ⛔ IT SCALES EVERY OPERAND SIZE (`dsc/dsc2.cpp:2333`, `:2344`); `Ddc` sets
     /// it from the unit's fold count (`ddc/ddcv1.cpp:1887`).
     pub num_folds_engaged: NumFoldsEngaged,
     /// Field: e035_ComputeNode.isOpaqueOp_
+    /// Field: e005_ComputeNode.isOpaqueOp_
     ///
     /// Whether the DDL supplied the instruction verbatim (`dsc/dsc2.h:941`). ⛔ THE FOLD AND
     /// TRANSFORMATION PASSES BRANCH ON IT before reading the data connects
     /// (`ddc/ddc_fold.cpp:1630`, `:1853`, `ddc/ddc_transformation_util.cpp:1466`).
     pub is_opaque_op: bool,
     /// Field: e035_ComputeNode.coreletViews_
+    /// Field: e005_ComputeNode.coreletViews_
     ///
     /// One [`ComputeCoreletView`] per corelet (`dsc/dsc2.h:948`), filled for every corelet in
     /// `0..numCoreletsUsed_DSC2_` by `finalizeScheduleTree` (`dsc/dsc2.cpp:3019-3032`).
@@ -9812,6 +9884,7 @@ pub struct ComputeNode {
     /// comes from [`UnitView::sizes_for_core`] inside the view, not from a second key.
     pub corelet_views: BTreeMap<CoreletId, ComputeCoreletView>,
     /// Field: e035_ComputeNode.inputCoordinates_
+    /// Field: e005_ComputeNode.inputCoordinates_
     ///
     /// How each input operand's dims are folded, one coordinate per input (`dsc/dsc2.h:948`) —
     /// parallel to [`inputs`](Self::inputs) on the same index.
@@ -9823,6 +9896,7 @@ pub struct ComputeNode {
     /// [`CoordinateType::fold_category`]'s `UNKNOWN_COORD` can be reached — see its note.
     pub input_coordinates: Vec<CoordinateType>,
     /// Field: e035_ComputeNode.outputCoordinate_
+    /// Field: e005_ComputeNode.outputCoordinate_
     ///
     /// How the output operand's dims are folded (`dsc/dsc2.h:949`).
     ///
@@ -9831,6 +9905,7 @@ pub struct ComputeNode {
     /// [`outputs`](Self::outputs) has.
     pub output_coordinate: CoordinateType,
     /// Field: e035_ComputeNode.repetitionWithOffset_
+    /// Field: e005_ComputeNode.repetitionWithOffset_
     ///
     /// `dsc/dsc2.h:954`.
     pub repetition_with_offset: RepetitionWithOffset,
@@ -10355,32 +10430,40 @@ impl ConditionNode {
 }
 
 /// Replaces: e036_SyncNode
+/// Replaces: e045_SyncNode
 ///
-/// `dsc/dsc2.h:964-972`. One end of a signal: which units it signals to or waits on, and which end
-/// it is. The DDL conversion mints one per `SyncOp` (`ddc/ddl/ddl_conversion.cpp:1708-1732`) and the
-/// L3 scheduler mints them in send/receive pairs
+/// `dsc/dsc2.h:964-972`. One end of a signal: which units it signals to or waits on, which end it is,
+/// and which other ends it is linked to. The DDL conversion mints one per `SyncOp`
+/// (`ddc/ddl/ddl_conversion.cpp:1708-1732`) and the L3 scheduler mints them in send/receive pairs
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:640-660`).
 ///
 /// `e026_SyncNode` is this same class under the superseded numbering, and e026 is now `Metadata`
 /// (`crustify-scheduler/UNITS.tsv:27`) — a COLLISION, not a merely stale number. All eight of its
-/// anchors are RENUMBERED onto e036 here (`UNITS.tsv:37`), the three UNFILLED ones included, so the
-/// open work stays attributed to the live entry. None is deleted and none changes meaning.
+/// anchors are RENUMBERED onto e036 and e045 here (`UNITS.tsv:37`). None is deleted and none changes
+/// meaning.
 ///
-/// ⛔ THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the `e036_SyncNode` anchor below stays open.
-/// Both of the others are schedule-node pointer identity: `implicitSyncRefTransfer_` (`:968`) is a
-/// `const TransferNode*` its reader dereferences for that transfer's TILE SIZE and for its SOURCE
-/// labeled DS's precision (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:156-158`,
-/// `:179-184`) — never its destination, which is the lowering's own component (`:144-145`); its JSON
-/// round trip goes through the node's `name_` (`dsc/dsc2.cpp:823-826`), e013's field;
-/// `otherEndOfTheSignals_` (`:969`) is the `vector<const SyncNode*>` linking the two ends.
+/// ⭐ ALL FIVE FIELDS AND THE CLASS'S ONE METHOD NOW LAND, AND THE BLOCKER THAT HELD THE LAST THREE
+/// FAILS REVIEW ON EVERY LEG. It read: "THIS CARRIES THREE OF SYNCNODE'S FIVE FIELDS, so the
+/// `e036_SyncNode` anchor below stays open … ⛔ AND `getComponentsFromOtherEnds` STAYS OUT WITH THEM:
+/// it walks those pointers and unions each other end's `relevantComps_` …, e013's field, which has no
+/// ported writer."
+/// * `relevantComps_` IS PORTED, WITH A PUBLIC WRITER, and this method only READS it:
+///   [`ScheduleNode::relevant_comps`] hands the whole map over and
+///   [`ScheduleNode::relevant_comps_mut`] is the writer the claim says does not exist — the fixture
+///   under `mod equivalence` writes every node's comps through it.
+/// * THE POINTER HAS THIS CAMPAIGN'S OWN ANSWER ONE SCREEN ABOVE. [`NodePath`] landed for exactly this
+///   shape: a raw `ScheduleNode*` into the tree that owns it IS its position in that tree. Both of
+///   these fields are such pointers, so both are paths.
+/// * ⛔ AND ONE OF THEM IS READ BY THE VERY FUNCTION [`units`](Self::units)' OWN ANCHOR CITES: the L3
+///   scheduler `DT_CHECK`s `otherEndOfTheSignals_.size() == 1` and takes `.front()` at
+///   `L3DlOpsScheduler.cpp:4088-4091`, two lines inside the block whose `:4086`, `:4092` and
+///   `:4094-4100` that anchor already quotes.
+/// * ⛔ AND THE METHOD IS BRIDGE 1'S OWN, in the file this doc named as where the units come from:
+///   `SNSyncLowering::constructUnits` (`.../V3/SNSyncLowering.cpp:22`) and
+///   `constructUnitsForUniformization` (`:53`) are its only two callers there.
 ///
-/// ⛔ AND `getComponentsFromOtherEnds` STAYS OUT WITH THEM: it walks those pointers and unions each
-/// other end's `relevantComps_` (`dsc/dsc2.cpp:2408-2421`), e013's field, which has no ported
-/// writer. ⛔ THAT, NOT [`units`](Self::units), is where bridge 1 gets the units it emits a
-/// `sync_send`/`sync_recv` against (`SNSyncLowering.cpp:20-42`).
-///
-/// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and here it is what links the
-/// ends. `Clone` is IBM's own, through `InheritWithClone` (`:964`).
+/// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and here it is the position that
+/// links the ends. `Clone` is IBM's own, through `InheritWithClone` (`:964`).
 #[derive(Clone, Debug)]
 pub struct SyncNode {
     /// The `ScheduleNode` subobject (`dsc/dsc2.h:964`, `InheritWithClone<ScheduleNode, SyncNode>`),
@@ -10412,18 +10495,20 @@ pub struct SyncNode {
     /// ⛔ AND THREE READS ARE CARDINALITY, WHICH THIS TYPE CANNOT GUARANTEE AND MUST NOT NARROW TO:
     /// `!units_.empty()` guards the membership walk (`dlOpsNew.cpp:2650`) and `units_.size() == 1` is
     /// asserted on BOTH ends of every sync node in the tree (`L3DlOpsScheduler.cpp:4086`, `:4092`,
-    /// beside the same guard on `otherEndOfTheSignals_` at `:4088`). ⭐ A ONE-COMPONENT FIELD WOULD BE
-    /// WRONG ANYWAY: the DDL conversion mints an implicit L0 sync whose units are `{L0SU}` on one end
-    /// and one `L0LUROW<i>` PER ROW on the other (`ddc/ddl/ddl_conversion.cpp:1785-1788`), so that
-    /// guard is a PHASE constraint on the nodes the L3 scheduler is willing to delete, not an
-    /// invariant of the class.
+    /// beside the same guard on [`other_end_of_the_signals`](Self::other_end_of_the_signals) at
+    /// `:4088`). ⭐ A ONE-COMPONENT FIELD WOULD BE WRONG ANYWAY: the DDL conversion mints an implicit
+    /// L0 sync whose units are `{L0SU}` on one end and one `L0LUROW<i>` PER ROW on the other
+    /// (`ddc/ddl/ddl_conversion.cpp:1785-1788`), so that guard is a PHASE constraint on the nodes the
+    /// L3 scheduler is willing to delete, not an invariant of the class.
     pub units: BTreeSet<SenComponent>,
     /// Field: e036_SyncNode.isReceive_
+    /// Field: e045_SyncNode.isReceive_
     ///
     /// Which end this is (`dsc/dsc2.h:967`): bridge 1 emits a `sync_send` when it is false and a
     /// `sync_recv` when it is true (`SNSyncLowering.cpp:209`, `:239`).
     ///
-    /// ⛔ BOTH ARMS ARE ALSO GATED ON A NULL `implicitSyncRefTransfer_`, so this flag selects NEITHER
+    /// ⛔ BOTH ARMS ARE ALSO GATED ON AN ABSENT
+    /// [`implicit_sync_ref_transfer`](Self::implicit_sync_ref_transfer), so this flag selects NEITHER
     /// when one is set: `is_implicit_sync` is that pointer against `nullptr` (`:208`), both arms carry
     /// `&& !is_implicit_sync`, and the third arm reads this field not at all (`:264-269`).
     pub is_receive: bool,
@@ -10446,11 +10531,45 @@ pub struct SyncNode {
     /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT: it is declared on the same line as
     /// [`is_receive`](Self::is_receive), and that bridge-1 read is on this campaign's path.
     pub is_soft: bool,
+    /// Field: e036_SyncNode.implicitSyncRefTransfer_
+    /// Field: e045_SyncNode.implicitSyncRefTransfer_
+    ///
+    /// The transfer an IMPLICIT sync covers (`dsc/dsc2.h:968`), as the position that transfer occupies
+    /// in the owning [`ScheduleTree`] — a `const TransferNode*` into that tree, so a [`NodePath`] for
+    /// the reason `prev_` is. [`None`] is the authority's `nullptr` default.
+    ///
+    /// ⛔ IT IS A DISCRIMINATOR, NOT A DECORATION, AND IT OUTRANKS BOTH FLAGS ABOVE: bridge 1's
+    /// `is_implicit_sync` is this pointer against `nullptr` (`SNSyncLowering.cpp:208`) and selects a
+    /// third emission arm (`:264-269`). Its readers then dereference it for the covered transfer's
+    /// TILE SIZE — the sync is passed whole to `getImplicitSyncTileSizePerDim`, which `DT_ERROR`s on a
+    /// null one (`:156-158`, `dsc/dsc2.cpp:3460-3469`) — and for that transfer's SOURCE labeled DS's
+    /// precision (`:179-184`), never its destination, which is the lowering's own component
+    /// (`:144-145`). ⭐ THE PCFG KEYS A MAP BY IT (`dsc/dsc2Pcfg.cpp:438`), which a position spells as
+    /// well as an address does, and the JSON round trip already goes through the pointed-to node's
+    /// `name_` (`dsc/dsc2.cpp:823-827`, `:1725-1727`) rather than the pointer.
+    pub implicit_sync_ref_transfer: Option<NodePath>,
+    /// Field: e036_SyncNode.otherEndOfTheSignals_
+    /// Field: e045_SyncNode.otherEndOfTheSignals_
+    ///
+    /// The other ends of this signal (`dsc/dsc2.h:969`), each as the position it occupies. Every
+    /// writer links the two ends in CONSECUTIVE statements — NINE such pairs in the L3 scheduler
+    /// (`L3DlOpsScheduler.cpp:3706-3707`, `:3731-3732`, `:3784-3785`, `:3827-3828`, `:3927-3928`,
+    /// `:3943-3944`, `:3976-3977`, `:7024-7025`, `:7086-7087`) and two in the transformation
+    /// (`ddc/ddc_transformation.cpp:1207-1208`, `:1274-1275`) — so symmetry is a property of those
+    /// eleven call sites and NOT an invariant this type can hold.
+    ///
+    /// ⛔ NOT AN `Option<NodePath>` DESPITE THE TWO SITES THAT TREAT IT AS ONE: those are PHASE
+    /// constraints, `DT_CHECK`ed where the L3 scheduler is about to delete a pair
+    /// (`L3DlOpsScheduler.cpp:4088-4091`) and `.at(0)`-ed in the PCFG sync builder
+    /// (`dcg/dcg_fe/pcfg_gen/dlOpsNew.cpp:2679`), while the DDL conversion appends a WHOLE RANGE in
+    /// one statement (`ddc/ddl/ddl_conversion.cpp:2813-2815`) and the implicit L0 sync it mints has
+    /// one end PER ROW (`:1785-1788`).
+    pub other_end_of_the_signals: Vec<NodePath>,
 }
 
 impl Default for SyncNode {
     /// `SyncNode() : BaseClass(SYNC) {}` (`dsc/dsc2.h:965`) over the authority's member initialisers
-    /// (`:966-967`). ⛔ HAND-WRITTEN RATHER THAN DERIVED, because a derived one would leave the base's
+    /// (`:966-968`). ⛔ HAND-WRITTEN RATHER THAN DERIVED, because a derived one would leave the base's
     /// tag `INVALID` — the kind a node of this class can never have.
     fn default() -> Self {
         Self {
@@ -10458,15 +10577,55 @@ impl Default for SyncNode {
             units: BTreeSet::new(),
             is_receive: false,
             is_soft: false,
+            implicit_sync_ref_transfer: None,
+            other_end_of_the_signals: Vec::new(),
         }
     }
 }
 
-// crustify:todo: e036_SyncNode
-
-// crustify:todo: e036_SyncNode.implicitSyncRefTransfer_
-
-// crustify:todo: e036_SyncNode.otherEndOfTheSignals_
+impl SyncNode {
+    /// `getComponentsFromOtherEnds(coreId)` (`dsc/dsc2.cpp:2407-2421`): the union of every OTHER end's
+    /// `relevantComps_`, optionally narrowed to one core. [`None`] is the authority's `coreId = -1`
+    /// default (`dsc/dsc2.h:971`) — and the whole negative half of its domain, since the test is
+    /// `coreId >= 0`, which [`CoreId`]'s `u8` makes unspellable.
+    ///
+    /// It takes the owning [`ScheduleTree`] because the other ends are positions in it; an end whose
+    /// path resolves to no sync node contributes nothing, where the authority would dereference a
+    /// dangling pointer.
+    ///
+    /// ⛔ A COMPONENT ENTRY IS CREATED BEFORE THE CORE FILTER RUNS, AND THE DIFFERENCE IS LOAD-BEARING:
+    /// `auto& comp = comps[compPair.first];` (`:2412`) inserts unconditionally and only then does
+    /// `:2414` `continue` past a non-matching core, so a component whose every core is filtered out
+    /// STAYS IN THE RESULT with an empty map. ⛔ THE PCFG BRANCHES ON EXACTLY THAT: `compMap.empty()`
+    /// is its implicit-sync discriminator (`dsc/dsc2Pcfg.cpp:434`), and past it `coreCl.at(c)` (`:455`,
+    /// `:469`) THROWS on such an entry — so the skip-empty reading routes to `buildImplicitSync` where
+    /// the authority raises, on 272 of the 896 cases the test below measures.
+    /// ⭐ AN EMPTY CORELET SET SURVIVES TOO, one level down (`:2415-2416`): bridge 1 emits one unit for
+    /// an `L3LU`/`L3SU` core without reading its corelets at all (`SNSyncLowering.cpp:36-40`).
+    pub fn components_from_other_ends(
+        &self,
+        tree: &ScheduleTree,
+        core: Option<CoreId>,
+    ) -> BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        let mut comps: BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>> =
+            BTreeMap::new();
+        for path in &self.other_end_of_the_signals {
+            let Some(other) = tree.node_at(path).and_then(ChildNode::as_sync) else {
+                continue;
+            };
+            for (comp, cores) in other.base_class.relevant_comps() {
+                let entry = comps.entry(*comp).or_default();
+                for (other_core, corelets) in cores {
+                    if core.is_some_and(|only| *other_core != only) {
+                        continue;
+                    }
+                    entry.entry(*other_core).or_default().extend(corelets);
+                }
+            }
+        }
+        comps
+    }
+}
 
 /// A constant container the mask value is read out of — an index into
 /// `DesignSpaceConfig::constantInfo_` (`dsc/designSpaceConfig.h:90`).
@@ -15758,6 +15917,195 @@ mod equivalence {
             (digest.cases, digest.hash),
             (75, 17_623_091_572_251_361_890),
             "executed dsc/dsc2.h:463 and dsc/dsc2.cpp:1896-1914"
+        );
+    }
+
+    /// [`SyncNode::components_from_other_ends`] against the EXECUTED authority. `dsc/dsc2.cpp:2407-2421`
+    /// and the `SenComponents` enum (`sys-arch-spec/arch_enums.h:13-124`) were `sed`-extracted BYTE-EXACT
+    /// — cross-checked against an independent awk slicer — into a clang++ probe whose only additions are
+    /// stand-in carriers for the two fields the body reads, then swept over every subset of six
+    /// other-ends × seven `coreId`s × once- and twice-linked: 896 cases, FNV-1a digest
+    /// 17956673328360114787, 28 of them an empty map and 1,792 component entries with an EMPTY core map.
+    ///
+    /// ⛔ TWO MUTATED CONTROLS PIN THE READINGS THIS COULD HAVE HAD, reproduced here rather than
+    /// asserted in prose. Creating the component entry AFTER the core filter digests to
+    /// 5327383878629588911 with 300 empty results instead of 28 — the 272 extra are cases where the
+    /// authority hands the PCFG a non-empty map and the skip-empty reading sends it to
+    /// `buildImplicitSync` (`dsc/dsc2Pcfg.cpp:434-445`) where the authority `.at()`-throws. Dropping
+    /// the `coreId >= 0` half of `:2414` digests to 14198336873244725691.
+    #[test]
+    fn e045_components_from_other_ends_agrees_with_the_executed_authority() {
+        /// FNV-1a 64 over the canonical case lines, with the same seed on the C++ side.
+        struct Digest {
+            hash: u64,
+            cases: u64,
+            empty: u64,
+            empty_comps: u64,
+        }
+
+        impl Digest {
+            fn new() -> Self {
+                Self {
+                    hash: 14_695_981_039_346_656_037,
+                    cases: 0,
+                    empty: 0,
+                    empty_comps: 0,
+                }
+            }
+
+            fn feed(&mut self, comps: &Comps, line: &str) {
+                for byte in line.bytes() {
+                    self.hash ^= u64::from(byte);
+                    self.hash = self.hash.wrapping_mul(1_099_511_628_211);
+                }
+                self.cases += 1;
+                self.empty += u64::from(comps.is_empty());
+                self.empty_comps += comps.values().filter(|cores| cores.is_empty()).count() as u64;
+            }
+        }
+
+        type Comps = BTreeMap<SenComponent, BTreeMap<CoreId, BTreeSet<CoreletId>>>;
+
+        /// The probe's own spelling: component VALUES, so no name table has to agree.
+        fn canon(comps: &Comps) -> String {
+            let body = comps
+                .iter()
+                .map(|(comp, cores)| {
+                    let inner = cores
+                        .iter()
+                        .map(|(core, corelets)| {
+                            let list = corelets
+                                .iter()
+                                .map(|corelet| corelet.0.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!("{}:[{list}]", core.0)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{}:{{{inner}}}", *comp as i32)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+
+        /// Control A — `comps[compPair.first]` moved BELOW `:2414`, so a wholly filtered component
+        /// leaves no entry.
+        fn skip_empty(sync: &SyncNode, tree: &ScheduleTree, core: Option<CoreId>) -> Comps {
+            let mut comps = Comps::new();
+            for path in &sync.other_end_of_the_signals {
+                let Some(other) = tree.node_at(path).and_then(ChildNode::as_sync) else {
+                    continue;
+                };
+                for (comp, cores) in other.base_class.relevant_comps() {
+                    for (other_core, corelets) in cores {
+                        if core.is_some_and(|only| *other_core != only) {
+                            continue;
+                        }
+                        let entry = comps.entry(*comp).or_default();
+                        entry.entry(*other_core).or_default().extend(corelets);
+                    }
+                }
+            }
+            comps
+        }
+
+        /// Control B — the `coreId >= 0` test dropped, i.e. every core kept whatever was asked for.
+        fn no_filter(sync: &SyncNode, tree: &ScheduleTree) -> Comps {
+            let mut comps = Comps::new();
+            for path in &sync.other_end_of_the_signals {
+                let Some(other) = tree.node_at(path).and_then(ChildNode::as_sync) else {
+                    continue;
+                };
+                for (comp, cores) in other.base_class.relevant_comps() {
+                    let entry = comps.entry(*comp).or_default();
+                    for (other_core, corelets) in cores {
+                        entry.entry(*other_core).or_default().extend(corelets);
+                    }
+                }
+            }
+            comps
+        }
+
+        // The probe's six candidate other-ends, in its order: `E0` is empty, `E1` and `E3` carry a
+        // component whose only core has an EMPTY corelet set, and `E5` carries an `L0LUROW1`, which
+        // bridge 1 skips downstream (`SNSyncLowering.cpp:26-27`) but this method does not.
+        const ENDS: [TreeRel; 6] = [
+            &[],
+            &[(SenComponent::L0, &[(0, &[])])],
+            &[
+                (SenComponent::L0, &[(0, &[0, 1])]),
+                (SenComponent::Pe, &[(1, &[0])]),
+            ],
+            &[
+                (SenComponent::L3su, &[(2, &[])]),
+                (SenComponent::L0, &[(0, &[2])]),
+            ],
+            &[
+                (SenComponent::Pe, &[(0, &[0]), (1, &[1])]),
+                (SenComponent::Lx, &[(3, &[0, 1, 2])]),
+            ],
+            &[
+                (SenComponent::L0lurow1, &[(0, &[0])]),
+                (SenComponent::Hbm, &[(0, &[])]),
+            ],
+        ];
+
+        let mut tree = ScheduleTree::default();
+        for (index, rel) in ENDS.into_iter().enumerate() {
+            tree_push(
+                &mut tree.head_mut().base_class,
+                tree_sync(&format!("e{index}"), rel),
+            );
+        }
+
+        let mut port = Digest::new();
+        let mut control_a = Digest::new();
+        let mut control_b = Digest::new();
+        for dup in 0..2 {
+            for mask in 0..64_u32 {
+                for core_arg in [-5_i32, -1, 0, 1, 2, 3, 7] {
+                    let mut ends: Vec<NodePath> = (0..6_u32)
+                        .filter(|index| (mask >> index) & 1 == 1)
+                        .map(|index| NodePath::new([index as usize]))
+                        .collect();
+                    if dup == 1 {
+                        let once = ends.clone();
+                        ends.extend(once);
+                    }
+                    let sync = SyncNode {
+                        other_end_of_the_signals: ends,
+                        ..SyncNode::default()
+                    };
+                    // `coreId >= 0` is the authority's whole test, so -5 and -1 are one case here.
+                    let core = u8::try_from(core_arg).ok().map(CoreId);
+                    let head = format!("d{dup} m{mask:02} k{core_arg} ");
+
+                    let got = sync.components_from_other_ends(&tree, core);
+                    port.feed(&got, &format!("{head}{}\n", canon(&got)));
+                    let mutated = skip_empty(&sync, &tree, core);
+                    control_a.feed(&mutated, &format!("{head}{}\n", canon(&mutated)));
+                    let unfiltered = no_filter(&sync, &tree);
+                    control_b.feed(&unfiltered, &format!("{head}{}\n", canon(&unfiltered)));
+                }
+            }
+        }
+
+        assert_eq!(
+            (port.cases, port.empty, port.empty_comps, port.hash),
+            (896, 28, 1_792, 17_956_673_328_360_114_787),
+            "executed dsc/dsc2.cpp:2407-2421"
+        );
+        assert_eq!(
+            (control_a.empty, control_a.empty_comps, control_a.hash),
+            (300, 0, 5_327_383_878_629_588_911),
+            "the entry created after the filter — the probe's control A"
+        );
+        assert_eq!(
+            (control_b.empty, control_b.empty_comps, control_b.hash),
+            (28, 0, 14_198_336_873_244_725_691),
+            "the filter dropped — the probe's control B"
         );
     }
 }
