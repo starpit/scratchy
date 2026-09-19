@@ -6,9 +6,10 @@
 
 use crate::schedule::ddc::{ExPhase, Verbosity};
 use crate::schedule::dims::PrimaryDimTypes;
-use crate::schedule::dsc2::{AllocateNode, DataStageId, GroupId, LdsIdx, TransferNode};
+use crate::schedule::dsc2::{AllocateNode, DataStageId, GroupId, LdsIdx, SyncNode, TransferNode};
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
+use sys_arch_spec::arch_enums::SenComponent;
 use sys_arch_spec::{CoreId, CoreletId};
 
 /// Replaces: e012_CrossCoreReductionGroup.GroupType
@@ -971,6 +972,29 @@ impl L3DlOpsScheduler {
     ) -> BurstEfficiency {
         BurstEfficiency(Self::BURST_EFFICIENCY[burst_size.row()][multicast_degree.column()])
     }
+
+    /// `.cpp:652-663`, `createSyncNode` (`:273-276`). One end of a sync — the units it signals to or
+    /// waits on, its name, and two flags whose declared defaults are `false` (`:275-276`), which is
+    /// what the authority's two conditional writes leave (`.cpp:657-658`).
+    ///
+    /// ⭐ BY VALUE AND WITHOUT `self`, where the authority returns `new dsc2::SyncNode` from a `const`
+    /// member that reads no field (`.cpp:655`): the tree owns its nodes as
+    /// [`ChildNode`](crate::schedule::dsc2::ChildNode)s, so a caller holding `&mut self` inserts it.
+    /// ⛔ IT DOES NOT PAIR THE ENDS — neither does the authority; each call site pushes
+    /// `otherEndOfTheSignals_` itself (`.cpp:3975-3976`), `e036_SyncNode`'s open anchor.
+    pub fn create_sync_node(
+        units: BTreeSet<SenComponent>,
+        name: String,
+        is_receive: bool,
+        is_soft: bool,
+    ) -> SyncNode {
+        let mut node = SyncNode::default();
+        node.base_class.name = name;
+        node.units = units;
+        node.is_receive = is_receive;
+        node.is_soft = is_soft;
+        node
+    }
 }
 
 impl L3DlOpsScheduler {
@@ -1388,6 +1412,49 @@ mod equivalence {
         assert!(op.internal_regs.is_empty());
         assert_eq!(op.max_unroll, 1);
     }
+
+    /// `.cpp:3961-3974`, the soft-sync pair, against `createSyncNode` alone. The flags are ordered
+    /// `isReceive` then `isSoft` (`:275-276`), so the send — soft and not a receive — is the mint a
+    /// transposition breaks, and each end carries the units and the name the sequence hands it.
+    #[test]
+    fn the_soft_sync_pair_mints_a_soft_send_and_a_soft_receive() {
+        let send = L3DlOpsScheduler::create_sync_node(
+            BTreeSet::from([SenComponent::L3lu]),
+            format!(
+                "sync_soft_send_{}_to_{}",
+                SenComponent::L3lu.spelling(),
+                SenComponent::Lxlu.spelling()
+            ),
+            false,
+            true,
+        );
+        let receive = L3DlOpsScheduler::create_sync_node(
+            BTreeSet::from([SenComponent::Lxlu]),
+            format!(
+                "sync_soft_receive_{}_from_{}",
+                SenComponent::Lxlu.spelling(),
+                SenComponent::L3lu.spelling()
+            ),
+            true,
+            true,
+        );
+
+        assert_eq!(send.base_class.name, "sync_soft_send_l3lu_to_lxlu");
+        assert_eq!(send.units, BTreeSet::from([SenComponent::L3lu]));
+        assert!(
+            !send.is_receive,
+            "the send end is not a receive (`.cpp:3967`)"
+        );
+        assert!(send.is_soft, "and it is soft (`.cpp:3967`)");
+
+        assert_eq!(receive.base_class.name, "sync_soft_receive_lxlu_from_l3lu");
+        assert_eq!(receive.units, BTreeSet::from([SenComponent::Lxlu]));
+        assert!(
+            receive.is_receive,
+            "the other end is the receive (`.cpp:3974`)"
+        );
+        assert!(receive.is_soft, "and it is soft too (`.cpp:3974`)");
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -1421,3 +1488,9 @@ mod equivalence {
 // crustify:todo: e029_L3DlOpsScheduler.opaqueOps_
 
 // crustify:todo: e029_L3DlOpsScheduler.producers_
+
+// crustify:todo: e029g1_L3DlOpsScheduler_sync
+
+// crustify:todo: e029g1_L3DlOpsScheduler_sync.createSynchronization
+
+// crustify:todo: e029g1_L3DlOpsScheduler_sync.createSynchronizationDSC
