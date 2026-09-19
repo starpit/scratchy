@@ -7,12 +7,12 @@
 // ⛔ THE SCHEDULER'S FIELD ANCHORS FOR THESE TWO UNITS NAME ONE DECLARED FIELD BETWEEN THEM. The
 // census matched `Type name = init;` inside method bodies, so it wrote a local and missed the field
 // the local sits next to. Named here so the removal is not silent, and neither is the addition:
-//   e018_MapFoldFunction_Leaf.data_vec_   `:782`  DECLARED — the one anchor that is a field
-//   e019_WkSplitFoldFunction_Leaf.temp_data
+//   e035_MapFoldFunction_Leaf.data_vec_   `:782`  DECLARED — the one anchor that is a field
+//   e048_WkSplitFoldFunction_Leaf.temp_data
 //                                        `:828`  local of the `DT_ERROR`-only `getFoldedData`
 //                                                overload, a declaration the compiler reaches only
 //                                                after an abort
-//   e019_WkSplitFoldFunction_Leaf.wksplit_param_
+//   e048_WkSplitFoldFunction_Leaf.wksplit_param_
 //                                        `:885`  DECLARED, and UNSCHEDULED — it is this type's
 //                                                whole state, so it carries a `Field:` anchor the
 //                                                worklist never asked for
@@ -237,7 +237,7 @@ impl FoldFunction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FoldDimIndex(pub i64);
 
-/// Replaces: e018_MapFoldFunction_Leaf
+/// Replaces: e035_MapFoldFunction_Leaf
 ///
 /// The map fold `f(a1)` — one stored value per coordinate of one folded dimension
 /// (`foldInfrastructure.h:739-783`). The only fold function whose payload IS its data, which is why
@@ -263,7 +263,7 @@ pub struct FoldDimIndex(pub i64);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MapFoldFunctionLeaf<Dtype> {
-    /// Field: e018_MapFoldFunction_Leaf.data_vec_
+    /// Field: e035_MapFoldFunction_Leaf.data_vec_
     ///
     /// One value per coordinate (`:782`). Its length is the fold dim's extent — set by the extent
     /// in two of the three constructors (`:744`, `:748`) and taken from the vector in the third
@@ -360,7 +360,7 @@ impl<Dtype: Default> MapFoldFunctionLeaf<Dtype> {
     }
 }
 
-/// Replaces: e019_WkSplitFoldFunction_Leaf
+/// Replaces: e048_WkSplitFoldFunction_Leaf
 ///
 /// The work-split fold `f(a1)` — a leaf that stores no data at all and answers from a
 /// [`WkSplitParam`] instead (`foldInfrastructure.h:794-886`). The one fold function whose value at a
@@ -400,7 +400,7 @@ impl<Dtype: Default> MapFoldFunctionLeaf<Dtype> {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WkSplitFoldFunctionLeaf {
-    /// Field: e019_WkSplitFoldFunction_Leaf.wksplit_param_
+    /// Field: e048_WkSplitFoldFunction_Leaf.wksplit_param_
     ///
     /// The work split this leaf reports (`:885`). ⛔ THE WORKLIST DID NOT SCHEDULE THIS FIELD and
     /// scheduled a method-body local instead; it is this type's whole state, so it is anchored here.
@@ -535,7 +535,7 @@ impl From<WkSplitParam> for WkSplitFoldFunctionLeaf {
 /// ⛔ NOT [`FoldFunction`]: that is the base subobject each kind embeds, and it is what
 /// [`base`](Self::base) hands back. The variant IS the tag, so the two cannot disagree — the C++
 /// pairing of a `Type()` test with a `static_cast` (`dsc/dsc2.h:375-390`) becomes one `match`.
-/// ⛔ SIX OF THE SEVEN KINDS ARE HERE, AND THE SEVENTH CANNOT BE. `WkSplitFoldFunction_Leaf` (e019)
+/// ⛔ SIX OF THE SEVEN KINDS ARE HERE, AND THE SEVENTH CANNOT BE. `WkSplitFoldFunction_Leaf` (e048)
 /// stores no value: its value at a coordinate is COMPUTED, and WHICH reading — `getCoordVec`
 /// (`:838`) or `getSize` cast to the element type (`:844`) — is chosen by the `FoldManager<Dtype>`
 /// that built it, not by the leaf. [`WkSplitFoldFunctionLeaf`] is therefore not generic at all, so a
@@ -566,7 +566,7 @@ pub enum FoldFunc<D> {
     AffineLeaf(AffineFoldFunctionLeaf<D>),
     /// A [`MapFoldFunctionNonLeaf`] — e017.
     MapNonLeaf(MapFoldFunctionNonLeaf<D>),
-    /// A [`MapFoldFunctionLeaf`] — e018, the bottom of every Map-base dim's subtree
+    /// A [`MapFoldFunctionLeaf`] — e035, the bottom of every Map-base dim's subtree
     /// (`createLeafFunc`, `:1877`, `:1898`).
     MapLeaf(MapFoldFunctionLeaf<D>),
 }
@@ -661,7 +661,7 @@ impl<D> FoldFunc<D> {
 
     /// `getFoldFunc(fold_dim_indices, idx)` (`:209`) — the node one coordinate list reaches.
     ///
-    /// Its only three consumers all want a `WkSplitFoldFunction_Leaf` (e019) at the end of the walk:
+    /// Its only three consumers all want a `WkSplitFoldFunction_Leaf` (e048) at the end of the walk:
     /// `insertWkSplitParam` and both `getWkSplitParam` overloads (`:2655-2681`). The kinds here are
     /// the descent, and a leaf answers itself with NO depth check of its own (`:328-331`,
     /// `:619-622`, `:776-779`) — unlike [`get_data`](Self::get_data).
@@ -1723,10 +1723,12 @@ impl<D> FoldManager<D> {
 
     /// `clear()` (`:2917-2921`).
     ///
-    /// ⛔ THE AUTHORITY LEAVES `parent_func_` NULL AND THIS DOES NOT. See the field's own note: every
-    /// caller of `clear` rebuilds a tree on the next line, and the one that does not —
-    /// `buildFoldSpace` with an empty list — throws with the manager still cleared, so the null is
-    /// observable only through a manager the authority has already thrown out of.
+    /// ⛔ THE AUTHORITY LEAVES `parent_func_` NULL AND THIS DOES NOT. See the field's own note: TWO
+    /// callers of `clear` never rebuild a tree over it — `buildFoldSpace` with an empty list, which
+    /// throws with the manager still cleared, and `clone` with an ignore map covering every dimension,
+    /// which returns NORMALLY: measured, `e026.clone_all_dims_ignored_parent_is_null = 1` at
+    /// `getNumDims() == 0`. This default constant leaf stands in for that null, and
+    /// [`clone_ignoring`](Self::clone_ignoring) hands it back.
     fn clear(&mut self)
     where
         D: Default,
@@ -1917,10 +1919,13 @@ impl<D> FoldManager<D> {
     /// overloads guard the initial push with `if (dim_prop_.size())` (`:1797`, `:1845`) — even the one
     /// that takes the node to start from — so the root is left out of its own list and everything built
     /// on the list does nothing: `copy` copies no payload, `operator==` compares none, and
-    /// `deleteSubTree` leaks the tree. This port always lists the root. No caller can see the
-    /// difference: [`clone_ignoring`](Self::clone_ignoring) and [`assign`](Self::assign) are its only
-    /// two, and both answer the zero-dimension case before the list is built — which is what the
-    /// authority's own `getData()`-comparing branch in `operator==` (`:1112-1117`) does too.
+    /// `deleteSubTree` leaks the tree. This port always lists the root, so both of its callers —
+    /// [`clone_ignoring`](Self::clone_ignoring) and [`assign`](Self::assign) — answer the
+    /// zero-dimension case BEFORE the list is built: `assign` on its own dimension count, and
+    /// `clone_ignoring` on the count that SURVIVES the ignore map, which is what an ignore map
+    /// covering every dimension reaches (`e026.clone_all_dims_ignored = OK`). Left instead to the
+    /// length check in [`copy_lists`](Self::copy_lists), a one-node list against an empty one is a
+    /// refusal where the authority copies nothing and returns.
     fn linear_list_ignoring(&self, ignore: &BTreeMap<usize, usize>) -> Vec<&FoldFunc<D>> {
         let mut out = Vec::new();
         let mut fifo = VecDeque::from([(&self.parent_func, 0usize)]);
@@ -2646,10 +2651,13 @@ impl<D: Clone + Default> FoldManager<D> {
     /// `rebuildDim(int pos, BaseFuncType)` (`:1473-1484`) — change ONE level's fold function, keeping
     /// the data below it where the two kinds allow. `false` when `pos` names no dimension.
     ///
-    /// ⛔ ITS RANGE TEST UNDERFLOWS AT ZERO DIMENSIONS and the throw that follows is NOT the `false`
-    /// this returns for an out-of-range `pos` — measured: `rebuildDim(5, Map)` on a two-dimension
-    /// manager answers `false`, `rebuildDim(0, Map)` on a zero-dimension one throws. Hence
-    /// [`Option<bool>`]: [`None`] is the throw, `Some(false)` the refusal.
+    /// ⛔ ITS RANGE TEST UNDERFLOWS AT ZERO DIMENSIONS, AND ONLY FOR A NON-NEGATIVE `pos`. The two
+    /// halves of `pos >= 0 && pos <= dim_prop_.size() - 1` (`:1477`) fail in different places: a
+    /// `pos` the from-the-end pass leaves NEGATIVE fails the first half and short-circuits to `false`,
+    /// while a non-negative one passes the underflowed `SIZE_MAX` bound and reaches the `.at(pos)`
+    /// that throws. Measured at zero dimensions: `rebuildDim(0, Map)` throws and
+    /// `rebuildDim(-1, Map)` answers `false`. Hence [`Option<bool>`]: [`None`] is the throw,
+    /// `Some(false)` the refusal.
     /// ⛔ THE THREE-ARGUMENT FORM (`:1494-1591`) IS NOT SEPARATELY PUBLIC. Its extra parameter is the
     /// `FoldDimProp*` the manager already holds, asserted equal to it by POINTER
     /// (`DT_CHECK(dim_prop_.at(pos).first == prop)`, `:1503`) — an identity of the caller's own
@@ -2661,7 +2669,9 @@ impl<D: Clone + Default> FoldManager<D> {
         D: Clone,
     {
         if self.dim_prop.is_empty() {
-            return None;
+            // `dim_prop_.at(pos)` (`:1478`) is reached only because the underflowed upper bound let a
+            // non-negative `pos` through; a negative one never gets there.
+            return (pos.0 < 0).then_some(false);
         }
         let Some(idx) = pos.resolve(self.dim_prop.len()) else {
             return Some(false);
@@ -2777,6 +2787,14 @@ impl<D: Clone + Default> FoldManager<D> {
             }
             let (prop, ty) = &rhs.dim_prop[idx];
             self.build_dim(prop, *ty, FoldDimPos(0))?;
+        }
+        // `this->getLinearFuncList(linear_ff_list_this)` (`:1013`) guards its initial push with
+        // `if (dim_prop_.size())` (`:1797`), so an ignore map covering EVERY dimension leaves both
+        // lists empty and `copy` copies nothing: measured, `clone(rhs, {0:0, 1:0})` on a
+        // two-dimension manager returns normally with `getNumDims() == 0` and `parent_func_` NULL.
+        // [`clear`](Self::clear) has already installed this port's stand-in for that null.
+        if self.dim_prop.is_empty() {
+            return Some(());
         }
         let rhs_list = rhs.linear_list_ignoring(&ignore);
         Self::copy_lists(&mut self.parent_func, &rhs_list)
@@ -3558,7 +3576,7 @@ mod unit_tests {
             "and the 9 the constant leaf held before either build is still there (`:1341-1343`)"
         );
 
-        // And the leaf type itself is fully ported (e019) — it is only the MANAGER that will not put
+        // And the leaf type itself is fully ported (e048) — it is only the MANAGER that will not put
         // one in a tree, so nothing above is a gap in the work split.
         assert_eq!(
             WkSplitFoldFunctionLeaf::FUNCTION.ty(),
@@ -4212,7 +4230,7 @@ mod equivalence {
     /// `mapleaf.root_two_coords = THROW`, `mapleaf.root_empty = THROW`,
     /// `mapleaf.under_affine_level = 227`, `mapleaf.under_map_level_1_1 = 4`.
     ///
-    /// ⛔ THE MAP LEAF IS e018 AND ITS TYPE IS NOT PORTED HERE — this pins the WALK, which is: the
+    /// ⛔ THE MAP LEAF IS e035 AND ITS TYPE IS NOT PORTED HERE — this pins the WALK, which is: the
     /// depth `DT_CHECK` at `:757` that [`MapFoldFunctionLeaf::data`]'s one-coordinate signature
     /// leaves to its caller. Every level above it is one of the four ported here, so a leaf that
     /// answered at the wrong depth would be this file's defect and nothing else would catch it:
@@ -4723,12 +4741,18 @@ mod equivalence {
     /// `c7.build = OK`, `c7.all_data = [1,2]`, `c7.rebuild_last_to_map = 1`, `c7.after_types = 11`,
     /// `c7.after_all_data = [0,0,0,0,0,0]`, `c7.rebuild_out_of_range = 0`,
     /// `c7.rebuild_first_to_const = 1`, `c7.after_first_types = 1`,
-    /// `c7.after_first_all_data = [0,0,0]`, `c7.rebuild_zero_dims = THROW`.
+    /// `c7.after_first_all_data = [0,0,0]`, `c7.rebuild_zero_dims = THROW`,
+    /// `e026.rebuild_zero_dim_pos_0 = THROW(vector)`, `e026.rebuild_zero_dim_pos_1 = THROW(vector)`,
+    /// `e026.rebuild_zero_dim_pos_neg_1 = 0`, `e026.rebuild_zero_dim_pos_neg_5 = 0`,
+    /// `e026.rebuild_zero_dim_pos_neg_1_unknown = 0`, `e026.rebuild_two_dim_pos_neg_3 = 0`.
     ///
     /// ⛔ THE TWO FAILURES ARE DIFFERENT ANSWERS, WHICH IS WHY THIS RETURNS [`Option<bool>`]:
     /// `rebuildDim(2, ...)` on a two-dimension manager answers FALSE, while `rebuildDim(0, ...)` on a
     /// zero-dimension one THROWS — its range check is `pos <= dim_prop_.size() - 1` on an unsigned
     /// size, so at zero dimensions the bound is `SIZE_MAX` and the `.at(pos)` after it is what fails.
+    /// ⛔ AND AT ZERO DIMENSIONS A NEGATIVE POSITION IS THE REFUSAL, NOT THAT THROW: `pos >= 0` is the
+    /// first half of the same check and it short-circuits before the underflowed bound is reached, so
+    /// `rebuildDim(-1, Map)` answers FALSE where `rebuildDim(0, Map)` throws.
     /// ⛔ AND A REBUILT LEVEL LOSES ITS DATA whenever the two kinds do not pair: Constant to Map
     /// leaves the new map leaves at their defaults, measured as six zeroes where there were two
     /// values.
@@ -4768,6 +4792,11 @@ mod equivalence {
             "out of range is a refusal"
         );
         assert_eq!(
+            fm.rebuild_dim(FoldDimPos(-3), BaseFuncType::Map),
+            Some(false),
+            "`e026.rebuild_two_dim_pos_neg_3 = 0` — past the outermost is a refusal too"
+        );
+        assert_eq!(
             fm.rebuild_dim(FoldDimPos(0), BaseFuncType::Constant),
             Some(true)
         );
@@ -4783,6 +4812,26 @@ mod equivalence {
             FoldManager::<i64>::new().rebuild_dim(FoldDimPos(0), BaseFuncType::Map),
             None,
             "zero dimensions is the throw, not the refusal"
+        );
+        assert_eq!(
+            FoldManager::<i64>::new().rebuild_dim(FoldDimPos(1), BaseFuncType::Map),
+            None,
+            "`e026.rebuild_zero_dim_pos_1 = THROW(vector)` — the underflowed bound lets it through"
+        );
+        assert_eq!(
+            FoldManager::<i64>::new().rebuild_dim(FoldDimPos(-1), BaseFuncType::Map),
+            Some(false),
+            "`e026.rebuild_zero_dim_pos_neg_1 = 0` — the first half of the check, not the bound"
+        );
+        assert_eq!(
+            FoldManager::<i64>::new().rebuild_dim(FoldDimPos(-5), BaseFuncType::Constant),
+            Some(false),
+            "`e026.rebuild_zero_dim_pos_neg_5 = 0`"
+        );
+        assert_eq!(
+            FoldManager::<i64>::new().rebuild_dim(FoldDimPos(-1), BaseFuncType::Unknown),
+            Some(false),
+            "`e026.rebuild_zero_dim_pos_neg_1_unknown = 0`"
         );
     }
 
@@ -5388,5 +5437,77 @@ mod equivalence {
             Some(())
         );
         assert_eq!(out, "\"42\"", "q.zero");
+    }
+
+    /// `e026.clone_all_dims_ignored = OK`, `e026.clone_all_dims_ignored_num_dims = 0`,
+    /// `e026.clone_all_dims_ignored_parent_is_null = 1`, `e026.clone_one_dim_all_ignored = OK`,
+    /// `e026.clone_one_dim_all_ignored_parent_is_null = 1`,
+    /// `e026.clone_outer_dim_ignored_num_dims = 1`, `e026.clone_outer_dim_ignored_data = 7`,
+    /// `e026.clone_map_ignored_out_of_range = THROW(vector)`.
+    ///
+    /// ⛔ AN IGNORE MAP COVERING EVERY DIMENSION IS NOT A REFUSAL. `clone` clears, builds none of
+    /// rhs's levels, and both linear lists come back empty — the `this` one because
+    /// `getLinearFuncList` guards its initial push with `if (dim_prop_.size())` (`:1797`) — so `copy`
+    /// copies nothing and the manager is left at zero dimensions with a NULL tree. This port's
+    /// stand-in for that null is [`clear`]'s default constant leaf, which is why the value below is 0
+    /// and not rhs's 7.
+    /// ⛔ AN OUT-OF-RANGE FIXED COORDINATE ON AN IGNORED MAP LEVEL IS A THROW, `getChildren().at()`
+    /// (`:1826-1828`); here the child it names is simply absent and the shortened list meets
+    /// [`copy_lists`]'s length check instead.
+    ///
+    /// [`clear`]: FoldManager::clear
+    /// [`copy_lists`]: FoldManager::copy_lists
+    #[test]
+    fn e026_ignoring_every_dimension_of_a_clone_is_a_zero_dimension_manager_not_a_refusal() {
+        let mut two = FoldManager::<i64>::new();
+        assert_eq!(
+            two.build_fold_space(
+                &[prop(2, "a"), prop(3, "b")],
+                &[BaseFuncType::Constant, BaseFuncType::Constant]
+            ),
+            Some(())
+        );
+        assert_eq!(
+            two.insert_data(7, &[FoldDimIndex(0), FoldDimIndex(0)]),
+            Some(())
+        );
+
+        let mut dst = FoldManager::<i64>::new();
+        assert_eq!(
+            dst.clone_ignoring(&two, &fixed(&[(0, 0), (1, 0)])),
+            Some(())
+        );
+        assert_eq!(dst.num_dims(), 0);
+        assert_eq!(
+            dst.get_data(&[]),
+            Some(0),
+            "`clear`'s leaf, not rhs's value"
+        );
+
+        // One dimension, all of it ignored — the same answer from the other end.
+        let mut one = FoldManager::<i64>::new();
+        assert_eq!(one.build_const_dim(&prop(2, "a"), FoldDimPos(0)), Some(()));
+        assert_eq!(one.insert_data(5, &[FoldDimIndex(0)]), Some(()));
+        let mut dst = FoldManager::<i64>::new();
+        assert_eq!(dst.clone_ignoring(&one, &fixed(&[(0, 0)])), Some(()));
+        assert_eq!(dst.num_dims(), 0);
+
+        // The level that DOES survive still carries its data.
+        let mut dst = FoldManager::<i64>::new();
+        assert_eq!(dst.clone_ignoring(&two, &fixed(&[(0, 0)])), Some(()));
+        assert_eq!(dst.num_dims(), 1);
+        assert_eq!(dst.get_data(&[FoldDimIndex(0)]), Some(7));
+
+        // `getChildren().at(5)` on a two-child Map level.
+        let mut map_outer = FoldManager::<i64>::new();
+        assert_eq!(
+            map_outer.build_fold_space(
+                &[prop(2, "a"), prop(3, "b")],
+                &[BaseFuncType::Map, BaseFuncType::Constant]
+            ),
+            Some(())
+        );
+        let mut dst = FoldManager::<i64>::new();
+        assert_eq!(dst.clone_ignoring(&map_outer, &fixed(&[(0, 5)])), None);
     }
 }
