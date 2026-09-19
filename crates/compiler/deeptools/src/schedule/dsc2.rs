@@ -50,11 +50,28 @@ pub struct Beta(pub i64);
 /// and comes back out as `int` (`:2631-2633`).
 ///
 /// ⛔ AND 0 IS PRODUCED, NOT MERELY DEFAULTED — "Parametric loops may have 0 iteration count"
-/// (`dsc/dsc2.cpp:6251`) — and both readers spell it as the multiplicative identity 1: one skips it
-/// in the inner-cardinality product (`:6249-6253`, `:6460-6464`), the other writes
-/// `cardinality == 0 ? 1 : cardinality` (`:6359-6361`).
+/// (`dsc/dsc2.cpp:6251`). ⛔ BUT IT IS NOT THE MULTIPLICATIVE IDENTITY: only the two readers
+/// that TEST for it neutralise a 0 — the inner-cardinality product skips it (`:6249-6253`,
+/// `:6460-6464`) and `:6359-6361` writes `cardinality == 0 ? 1 : cardinality`. Everywhere else
+/// a 0 is hostile. `combineContigousLevels` merges levels with an unguarded
+/// `cardinality *= cardinality` (`ddc/ddc_fold.cpp:415`), so a 0 ANNIHILATES the next outer
+/// level, and its unit-fold erase tests `== 1` (`:422`), so that level is never collapsed.
+/// `constructAllocElemArrLayout` scans inward past `== 1` only (`:332-333`) and leaves a 0
+/// residue (`:363`). Every `addFold` site (`:587`, `:677`, `:2766`, `:3277`, `:3637`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7503`) carries it verbatim into
+/// `FoldDimProp::factor_`, so `getFoldDimSize` answers 0. And `distributeFoldBase` refuses it:
+/// `DT_CHECK(origFold.cardinality > 0)` (`dsc/dsc2.cpp:5887`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Cardinality(pub i64);
+
+impl Cardinality {
+    /// `cardinality == 0 ? 1 : cardinality` (`dsc/dsc2.cpp:6359-6361`), equivalently the `!= 0`
+    /// skip at `:6249-6253` and `:6460-6464`. ⛔ THE GUARDED READING ONLY, and NOT substitutable
+    /// for the field: see the type's note for the sites that annihilate, carry or refuse a 0.
+    pub fn trip_count_or_one(self) -> i64 {
+        if self.0 == 0 { 1 } else { self.0 }
+    }
+}
 
 /// A loop's element stride after distribution, read straight into `loopEleOffsets_`
 /// (`ddc/ddcv1.cpp:2455-2460`).
@@ -195,11 +212,13 @@ pub struct GroupTagRegInfo {
 /// Replaces: e007_FoldParamInfoType
 ///
 /// One fold level's affine parameters, trip count and label (`dsc/dsc2.h:1081-1085`).
-/// TRAP: the declared default is the identity in NEITHER field, and `cardinality`'s 0 is not an
-/// empty fold — every reader takes a 0 as 1 (`dsc/dsc2.cpp:6249-6253`, `:6359-6361`; see
-/// [`Cardinality`]). The identity a caller actually wants is the one `getDefaultRowSplitFold`
-/// writes, `alpha = 0` with `cardinality = 1` (`ddc/ddc_fold.cpp:2154-2159`), which overrides BOTH
-/// declared initialisers.
+/// TRAP: the declared default is the identity in NEITHER field, and `cardinality`'s 0 is neither
+/// an empty fold nor a 1 — only the two readers that TEST for it take it as 1
+/// (`dsc/dsc2.cpp:6249-6253`, `:6359-6361`), while `combineContigousLevels` lets it ANNIHILATE
+/// the next outer level (`ddc/ddc_fold.cpp:415`) and `distributeFoldBase` refuses it outright
+/// (`dsc/dsc2.cpp:5887`); see [`Cardinality`]. The identity a caller wants is the one
+/// `getDefaultRowSplitFold` writes, `alpha = 0` with `cardinality = 1`
+/// (`ddc/ddc_fold.cpp:2154-2159`), which overrides BOTH declared initialisers.
 ///
 /// ⭐ AGGREGATE-INITIALISED STRAIGHT OUT OF A [`LoopDistributionParamType`]'s `alpha` and `beta`
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7654-7655`), which is why the two types share these
@@ -239,7 +258,9 @@ impl Default for FoldParamInfoType {
 ///
 /// One loop's affine parameters for one dimension after loop distribution (`dsc/dsc2.h:1110-1114`),
 /// filled in two goes: alpha, beta and the level together (`ddc/ddc_fold.cpp:2687-2689`), the stride
-/// afterwards (`dsc/dsc2.cpp:6748-6751`).
+/// afterwards (`dsc/dsc2.cpp:6748-6751`) — plus a SECOND stride writer the walk's own dim does not
+/// cover: the window-dim case at `:6778-6783` writes the entry of a DIFFERENT dim and, unlike
+/// `:6747`, divides by `allocFm.getAlpha(..)` with no `> 0` guard.
 /// TRAP: the authority's `= -1` on the last two fields is UNSET, not a value, and no reader compares
 /// against -1. An unset `relatedElemArrLevel` is LOUD, not silent: `allocFm.getNumDims() - level - 1`
 /// (`dsc/dsc2.cpp:6727-6728`) makes the position `getNumDims()`, which `FoldManager::getAlpha`
@@ -631,10 +652,11 @@ mod unit_tests {
     }
 
     /// `dsc/dsc2.cpp:6249-6253` and `:6359-6361`: a 0 `cardinality` is PRODUCED — "Parametric loops
-    /// may have 0 iteration count" (`:6251`) — and both readers take it as the multiplicative
-    /// identity 1. ⛔ It is not an empty fold, and it does not annihilate the product.
+    /// may have 0 iteration count" (`:6251`) — and those two readers, which TEST for it, take it as
+    /// 1. ⛔ NO OTHER READER DOES: `combineContigousLevels` multiplies it unguarded
+    /// (`ddc/ddc_fold.cpp:415`), so the same 0 annihilates the level it is folded into.
     #[test]
-    fn a_zero_cardinality_reads_as_one_not_as_an_empty_fold() {
+    fn a_zero_cardinality_is_one_only_to_the_readers_that_test_for_it() {
         let inner_folds = [
             FoldParamInfoType {
                 cardinality: Cardinality(4),
@@ -649,26 +671,37 @@ mod unit_tests {
         ];
         assert_eq!(inner_folds[1].cardinality, Cardinality(0));
 
-        // `:6250-6252` skips a 0 in the inner-cardinality product.
+        // `:6250-6252` skips a 0 in the inner-cardinality product, and `:6359-6361` spells
+        // `cardinality == 0 ? 1 : cardinality` over the same folds. Both are the GUARDED reading.
         let skipping_zero: i64 = inner_folds
             .iter()
             .filter(|fold| fold.cardinality != Cardinality(0))
             .map(|fold| fold.cardinality.0)
             .product();
-        // `:6359-6361` spells `cardinality == 0 ? 1 : cardinality` over the same folds.
         let coercing_zero_to_one: i64 = inner_folds
             .iter()
-            .map(|fold| {
-                if fold.cardinality == Cardinality(0) {
-                    1
-                } else {
-                    fold.cardinality.0
-                }
-            })
+            .map(|fold| fold.cardinality.trip_count_or_one())
             .product();
-
         assert_eq!(skipping_zero, 32, "the 0 contributed the identity, not 0");
-        assert_eq!(skipping_zero, coercing_zero_to_one, "both readers agree");
+        assert_eq!(
+            skipping_zero, coercing_zero_to_one,
+            "the guarded readers agree"
+        );
+
+        // ⛔ AND THE UNGUARDED READING DISAGREES. `combineContigousLevels` merges the inner level
+        // into the outer with `foldParams.at(i - 1).cardinality *= foldParams.at(i).cardinality`
+        // (`ddc/ddc_fold.cpp:415`) — no `!= 0` test anywhere in that function — and its unit-fold
+        // erase tests `== 1` (`:422`), which a 0 fails, so the annihilated level also survives.
+        let merged = Cardinality(inner_folds[0].cardinality.0 * inner_folds[1].cardinality.0);
+        assert_eq!(merged, Cardinality(0), "a 0 annihilates the outer level");
+        let zero_as_one = inner_folds[1].cardinality.trip_count_or_one();
+        let merged_if_zero_were_one = Cardinality(inner_folds[0].cardinality.0 * zero_as_one);
+        assert_eq!(merged_if_zero_were_one, Cardinality(4));
+        assert_ne!(
+            merged, merged_if_zero_were_one,
+            "so `trip_count_or_one` is NOT substitutable for the field"
+        );
+        assert_ne!(inner_folds[1].cardinality, Cardinality(1));
     }
 
     /// `dsc/dsc2.h:1082-1084` against `getDefaultRowSplitFold`, `ddc/ddc_fold.cpp:2154-2159`:
@@ -691,7 +724,13 @@ mod unit_tests {
             cardinality: Cardinality(1),
             fold_dim_label: "rowsplit_fold".to_string(),
         };
-        assert_ne!(FoldParamInfoType::default(), row_split_fold);
+        // Per field: a whole-struct `assert_ne!` would pass on the label difference ALONE and so
+        // would not establish that BOTH declared initialisers are overridden. `beta` is written
+        // too, but to the value it already had.
+        let declared = FoldParamInfoType::default();
+        assert_ne!(row_split_fold.alpha, declared.alpha);
+        assert_ne!(row_split_fold.cardinality, declared.cardinality);
+        assert_eq!(row_split_fold.beta, declared.beta);
     }
 
     /// `dsc/dsc2.h:1111-1113`: alpha starts at 1 and beta at 0, and the two -1 fields start unset.
