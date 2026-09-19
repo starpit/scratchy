@@ -3700,6 +3700,417 @@ mod unit_tests {
         assert_eq!(coord.padding(PrimaryDimTypes::Y), PadType::PaddedFullSpan);
         assert_eq!(coord.padding_form(), &replacement);
     }
+
+    /// `addChildNode`'s sibling arm at the one state the authority cannot survive: a reference that is
+    /// not a child of this node. There the scan dereferences BEFORE it tests `end()`
+    /// (`dsc/dsc2.cpp:2019-2021`), so it runs off the vector instead of reaching the `DT_ERROR` below
+    /// it; here the index is simply out of range and the node comes back whole.
+    ///
+    /// ⭐ `After(0)` IS `end()` ON A ONE-CHILD LIST AND IS IN RANGE, where `Before(1)` is not — the
+    /// asymmetry `insertion_point` gets from the authority's `it` against `it + 1` (`:2023-2027`).
+    #[test]
+    fn a_refused_child_insertion_hands_the_node_back_and_changes_nothing() {
+        let mut block = BlockNode::default();
+        block.base_class.name = "B".to_owned();
+        let mut first = SyncNode::default();
+        first.base_class.name = "s".to_owned();
+        assert!(
+            block
+                .add_child_node(InsertionPoint::Back, ChildNode::Sync(first))
+                .is_none()
+        );
+
+        let mut orphan = ComputeNode::default();
+        orphan.base_class.name = "NEW".to_owned();
+        let handed_back = block
+            .add_child_node(InsertionPoint::Before(1), ChildNode::Compute(orphan))
+            .expect("index 1 is past the only child");
+        assert_eq!(handed_back.base().name, "NEW");
+        assert_eq!(block.children().len(), 1, "the refusal inserted nothing");
+
+        assert!(
+            block
+                .add_child_node(InsertionPoint::After(0), handed_back)
+                .is_none(),
+            "`After(0)` is one past the only child, which is in range"
+        );
+        assert_eq!(
+            block
+                .children()
+                .iter()
+                .map(|child| child.base().name.as_str())
+                .collect::<Vec<_>>(),
+            ["s", "NEW"]
+        );
+    }
+
+    /// `deleteChildNode(ownerDsc, node, /*nonDestructive*/ true)` is `childIt->release()` before the
+    /// erase (`dsc/dsc2.cpp:2202-2206`) — take the node out and hand it to the caller, which is the
+    /// arm `moveChildNode` uses (`:2038`). The DESTRUCTIVE arm is blocked on
+    /// `DesignSpaceConfig::cleanupAllocation` and stays off this type, and it is the arm that cleans
+    /// up BEFORE it discovers the node is not a child at all (`:2189` against `:2191-2199`).
+    #[test]
+    fn taking_a_child_out_hands_it_over_and_an_index_past_the_end_is_refused() {
+        let mut block = BlockNode::default();
+        for name in ["a", "b"] {
+            let mut leaf = SyncNode::default();
+            leaf.base_class.name = name.to_owned();
+            assert!(
+                block
+                    .add_child_node(InsertionPoint::Back, ChildNode::Sync(leaf))
+                    .is_none()
+            );
+        }
+
+        assert!(
+            block.take_child_node(2).is_none(),
+            "only two children exist"
+        );
+        let taken = block.take_child_node(0).expect("index 0 is a child");
+        assert_eq!(taken.base().name, "a");
+        assert_eq!(block.children().len(), 1);
+        assert_eq!(block.children()[0].base().name, "b");
+    }
+
+    /// `traverseTreeDFS` seeds its work list from `head_.next_` and never pushes the head itself
+    /// (`dsc/dsc2.cpp:2228-2231`), so a filter naming LOOP still does not report the tree's own loop
+    /// head — which is why [`ScheduleTree::traverse_dfs`] iterates the children rather than the head.
+    #[test]
+    fn the_tree_walk_starts_below_the_head_even_when_the_head_matches_the_filter() {
+        let mut tree = ScheduleTree::default();
+        tree.head_mut().base_class.base_class.name = "head".to_owned();
+        let mut inner = LoopNode::default();
+        inner.base_class.base_class.name = "inner".to_owned();
+        assert!(
+            tree.head_mut()
+                .base_class
+                .add_child_node(InsertionPoint::Back, ChildNode::Loop(inner))
+                .is_none()
+        );
+
+        assert_eq!(
+            tree.head().base_class.base_class.node_type(),
+            NodeType::Loop,
+            "the head is itself a loop node"
+        );
+        let visited = tree.traverse_dfs(&[NodeType::Loop], SenComponent::All);
+        assert_eq!(
+            visited
+                .iter()
+                .map(|node| node.base().name.as_str())
+                .collect::<Vec<_>>(),
+            ["inner"]
+        );
+    }
+
+    /// The exclude list is an `unordered_set<const ScheduleNode*>` tested with `count(currNode)`
+    /// (`dsc/dsc2.cpp:2242`), i.e. IDENTITY — so two nodes with the same name are two different
+    /// entries. [`ChildNode::traverse_dfs_excluding`] uses [`std::ptr::eq`] for exactly that reason,
+    /// and this tree has two `twin`s to prove a name would not do.
+    #[test]
+    fn the_exclude_list_prunes_by_identity_and_never_by_name() {
+        let mut root = BlockNode::default();
+        root.base_class.name = "root".to_owned();
+        for leaf_name in ["a", "b"] {
+            let mut twin = BlockNode::default();
+            twin.base_class.name = "twin".to_owned();
+            let mut leaf = SyncNode::default();
+            leaf.base_class.name = leaf_name.to_owned();
+            assert!(
+                twin.add_child_node(InsertionPoint::Back, ChildNode::Sync(leaf))
+                    .is_none()
+            );
+            assert!(
+                root.add_child_node(InsertionPoint::Back, ChildNode::Block(twin))
+                    .is_none()
+            );
+        }
+        let root = ChildNode::Block(root);
+
+        let names = |order: &[&ChildNode]| {
+            order
+                .iter()
+                .map(|node| node.base().name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&root.traverse_dfs(&[], SenComponent::All)),
+            ["root", "twin", "a", "twin", "b"]
+        );
+
+        let second_twin = &root.as_block().expect("the root is a block").children()[1];
+        assert_eq!(
+            names(&root.traverse_dfs_excluding(&[], SenComponent::All, &[second_twin])),
+            ["root", "twin", "a"],
+            "the FIRST twin survives an exclusion of the second"
+        );
+    }
+
+    /// `insertPerfectlyNestedBlockNode`'s guard is `!nodeToAdd->next_.empty()`
+    /// (`dsc/dsc2.cpp:2043-2045`), and the authority THROWS out of it — leaving the caller holding a
+    /// node it must still free. Both variants hand it back here, with its children intact, and the
+    /// parent untouched.
+    ///
+    /// ⚠️ THE LOOP VARIANT IS THE ONE WITH A LIVE CALLER: the authority's parameter is `BlockNode*`
+    /// and its single caller passes a `LoopNode*` (`ddc/ddc_transformation_util.cpp:287-303`).
+    #[test]
+    fn a_refused_nesting_hands_the_node_back_with_its_children() {
+        let mut parent = BlockNode::default();
+        let mut existing = SyncNode::default();
+        existing.base_class.name = "existing".to_owned();
+        assert!(
+            parent
+                .add_child_node(InsertionPoint::Back, ChildNode::Sync(existing))
+                .is_none()
+        );
+
+        let mut nest = BlockNode::default();
+        nest.base_class.name = "NEST".to_owned();
+        let mut filler = SyncNode::default();
+        filler.base_class.name = "filler".to_owned();
+        assert!(
+            nest.add_child_node(InsertionPoint::Back, ChildNode::Sync(filler))
+                .is_none()
+        );
+        let nest = parent
+            .insert_perfectly_nested_block_node(nest)
+            .expect("a node that already has children is refused");
+        assert_eq!(nest.children()[0].base().name, "filler");
+        assert_eq!(parent.children()[0].base().name, "existing");
+
+        let nest_loop = LoopNode {
+            base_class: nest,
+            ..LoopNode::default()
+        };
+        let nest_loop = parent
+            .insert_perfectly_nested_loop_node(nest_loop)
+            .expect("the loop variant has the same guard");
+        assert_eq!(nest_loop.base_class.children().len(), 1);
+        assert_eq!(parent.children().len(), 1);
+
+        // Emptied, the same node is accepted, and the parent's children move down into it.
+        let mut nest_loop = nest_loop;
+        assert!(nest_loop.base_class.take_child_node(0).is_some());
+        assert!(
+            parent
+                .insert_perfectly_nested_loop_node(nest_loop)
+                .is_none()
+        );
+        assert_eq!(parent.children().len(), 1);
+        let nested = parent.children()[0]
+            .as_loop()
+            .expect("the nested node is a loop");
+        assert_eq!(nested.base_class.children()[0].base().name, "existing");
+    }
+
+    /// `moveChildren` is `toNode->next_ = std::move(next_)` with no test at all
+    /// (`dsc/dsc2.cpp:2053-2056`), so a destination that already has children LOSES them — which is
+    /// what makes [`BlockNode::move_children_to`] an overwrite and not an append.
+    #[test]
+    fn moving_children_overwrites_the_destinations_own_list() {
+        let mut source = BlockNode::default();
+        let mut moved = SyncNode::default();
+        moved.base_class.name = "moved".to_owned();
+        assert!(
+            source
+                .add_child_node(InsertionPoint::Back, ChildNode::Sync(moved))
+                .is_none()
+        );
+
+        let mut destination = BlockNode::default();
+        let mut dropped = SyncNode::default();
+        dropped.base_class.name = "dropped".to_owned();
+        assert!(
+            destination
+                .add_child_node(InsertionPoint::Back, ChildNode::Sync(dropped))
+                .is_none()
+        );
+
+        source.move_children_to(&mut destination);
+        assert!(source.children().is_empty());
+        assert_eq!(
+            destination
+                .children()
+                .iter()
+                .map(|child| child.base().name.as_str())
+                .collect::<Vec<_>>(),
+            ["moved"],
+            "`dropped` is gone, not appended after"
+        );
+    }
+
+    /// The condition node's three writers are three DIFFERENT predicates
+    /// (`dsc/dsc2.cpp:2143-2167`), and an empty condition is the state that separates them:
+    /// `addElseRegion` requires exactly one child (`:2160-2163`) and refuses, while the general
+    /// insertion accepts. At two children all three refuse.
+    #[test]
+    fn an_else_region_needs_a_then_region_and_a_third_region_is_refused() {
+        let mut cond = ConditionNode::default();
+        let mut early = BlockNode::default();
+        early.base_class.name = "early".to_owned();
+        let early = cond
+            .add_else_region(early)
+            .expect("an else region needs a then region first");
+        assert_eq!(early.base_class.name, "early");
+        assert!(cond.base().children().is_empty());
+        assert!(cond.then_branch().is_none());
+        assert!(cond.then_core_cl(SenComponent::All).is_none());
+
+        assert!(cond.add_then_region(early).is_none());
+        let mut second = BlockNode::default();
+        second.base_class.name = "second".to_owned();
+        assert!(cond.add_else_region(second).is_none());
+        assert_eq!(cond.then_branch().expect("then").base().name, "early");
+        assert_eq!(cond.else_branch().expect("else").base().name, "second");
+
+        let mut third = BlockNode::default();
+        third.base_class.name = "third".to_owned();
+        let third = cond
+            .add_child_node(InsertionPoint::Back, third)
+            .expect("a third region is refused");
+        assert_eq!(third.base_class.name, "third");
+        assert!(
+            cond.add_then_region(third).is_some(),
+            "and so is a then region on a full condition"
+        );
+        assert_eq!(cond.base().children().len(), 2);
+    }
+
+    /// `ConditionNode::getNextView`'s loop-guarded arm discards the caller's component, core AND
+    /// corelet and reads the whole child list (`dsc/dsc2.cpp:1996-2001`), so on a loop-guarded
+    /// condition the per-corelet reading is the UNFILTERED one — the same widening
+    /// [`ConditionNode::next_view`] does, reached through the other entry point.
+    #[test]
+    fn a_loop_guarded_conditions_per_corelet_view_ignores_the_corelet() {
+        let mut cond = ConditionNode::default();
+        let mut then_region = BlockNode::default();
+        then_region.base_class.name = "then".to_owned();
+        then_region.base_class.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]),
+        );
+        let mut else_region = BlockNode::default();
+        else_region.base_class.name = "else".to_owned();
+        else_region.base_class.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(1)]))]),
+        );
+        assert!(cond.add_then_region(then_region).is_none());
+        assert!(cond.add_else_region(else_region).is_none());
+
+        assert!(cond.has_core_cl_cond(), "`loopCond_` is unset");
+        let filtered = cond.next_view_of_corelet(SenComponent::Lx, CoreId(0), Some(CoreletId(1)));
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|child| child.base().name.as_str())
+                .collect::<Vec<_>>(),
+            ["else"]
+        );
+
+        cond.loop_cond = Some(LoopCondComposite::from(LoopCondConjunction::new(
+            LoopCond {
+                dim: PrimaryDimTypes::X,
+                cond_op: LoopCondOp::Eq,
+                cond_val: CondVal::First,
+            },
+        )));
+        assert!(!cond.has_core_cl_cond());
+        assert_eq!(
+            cond.next_view_of_corelet(SenComponent::Lx, CoreId(0), Some(CoreletId(1)))
+                .len(),
+            2,
+            "a loop-guarded condition hands back both regions"
+        );
+        assert_eq!(
+            cond.next_view_of_corelet(SenComponent::NoComponent, CoreId(9), None)
+                .len(),
+            2,
+            "including for a component no region is relevant to"
+        );
+    }
+
+    /// `isParametricLoop_` and `parametricLdsIdx_` are private with one getter and one setter each
+    /// (`dsc/dsc2.h:604-619`), and `markAsParametricLoop` only ever SETS — the authority has no
+    /// clearing path, which is why there is no `mark_as_non_parametric` here. The index is `-1` until
+    /// written, which is [`None`].
+    #[test]
+    fn the_loops_parametric_marker_only_sets_and_its_lds_index_is_absent_until_written() {
+        let mut node = LoopNode::default();
+        assert!(!node.is_parametric_loop());
+        assert_eq!(node.parametric_lds_idx(), None);
+
+        node.mark_as_parametric_loop();
+        assert!(node.is_parametric_loop());
+        node.mark_as_parametric_loop();
+        assert!(node.is_parametric_loop(), "setting twice is the same state");
+
+        node.set_parametric_lds_idx(Some(LdsIdx(3)));
+        assert_eq!(node.parametric_lds_idx(), Some(LdsIdx(3)));
+        node.set_parametric_lds_idx(None);
+        assert_eq!(
+            node.parametric_lds_idx(),
+            None,
+            "the authority's -1 is expressible, unlike clearing the flag above"
+        );
+
+        // `LoopNode(numId, denId, dims, isParametricLoop)` (`dsc/dsc2.h:607-614`) is the only
+        // constructor that takes the flag, and it is the DSC2-to-DataflowIR translator's.
+        let built = LoopNode::new(
+            Some(DataStageId(1)),
+            Some(DataStageId(0)),
+            vec![PrimaryDimAndKind::new(
+                PrimaryDimTypes::X,
+                crate::schedule::dims::MetaDimKind::Unpadded,
+            )],
+            true,
+        );
+        assert!(built.is_parametric_loop());
+        assert_eq!(built.parametric_lds_idx(), None);
+        assert!(built.has_loop_dim(PrimaryDimTypes::X));
+        assert!(!built.has_loop_dim(PrimaryDimTypes::Y));
+    }
+
+    /// `traverseTreeDFSMutable` is the same walk handing out non-const pointers
+    /// (`dsc/dsc2.cpp:2208-2220`), and its one live caller rewrites the lds index of every node
+    /// beneath a given one (`ddc/ddc_transformation_util.cpp:1920-1930`). ⛔ A VISITOR RATHER THAN A
+    /// LIST, because the authority's list ALIASES the tree: an ancestor and its descendant are both
+    /// in it, so two `&mut` to the same storage would be live at once.
+    #[test]
+    fn the_mutable_walk_reaches_every_node_the_read_only_one_does() {
+        let mut tree = ScheduleTree::default();
+        let mut outer = LoopNode::default();
+        outer.base_class.base_class.name = "outer".to_owned();
+        let mut leaf = ComputeNode::default();
+        leaf.base_class.name = "leaf".to_owned();
+        assert!(
+            outer
+                .base_class
+                .add_child_node(InsertionPoint::Back, ChildNode::Compute(leaf))
+                .is_none()
+        );
+        assert!(
+            tree.head_mut()
+                .base_class
+                .add_child_node(InsertionPoint::Back, ChildNode::Loop(outer))
+                .is_none()
+        );
+
+        let mut seen = Vec::new();
+        tree.for_each_dfs_mut(&[], SenComponent::All, |node| {
+            seen.push(node.base().name.clone());
+            node.base_mut().name.push('!');
+        });
+        assert_eq!(seen, ["outer", "leaf"]);
+        assert_eq!(
+            tree.traverse_dfs(&[], SenComponent::All)
+                .iter()
+                .map(|node| node.base().name.as_str())
+                .collect::<Vec<_>>(),
+            ["outer!", "leaf!"],
+            "every node the read-only walk reports was reached mutably"
+        );
+    }
 }
 
 /// Replaces: CoordinateCategory
@@ -4548,6 +4959,28 @@ impl ScheduleNode {
         comp == SenComponent::All || self.relevant_comps.contains_key(&comp)
     }
 
+    /// `isNodeRelevant(comp, clId, coreId)` with a real core (`dsc/dsc2.cpp:1916-1933`): whether this
+    /// node belongs to ONE unit. `getNextView`'s filtered reading is this
+    /// (`dsc/dsc2.cpp:1988`) and so is the sync lowering's test that a signal's end is in the unit
+    /// being emitted (`dsc-based-utils/DSC2ToDataflowIR/V3/SNSyncLowering.cpp:109`).
+    ///
+    /// ⛔ AN ABSENT CORELET IS "ANY CORELET OF THAT CORE", WHICH IS THE `clId < 0 ||` AT `:1931` — the
+    /// core has to be listed either way, and only the corelet set is skipped. ⛔ AND A COMPONENT OF
+    /// [`SenComponent::All`] IS THE AUTHORITY'S ONE REFUSAL HERE (`:1919-1921`), narrowed to `false`:
+    /// `ALL` is never a key in `relevantComps_` (see [`Self::is_relevant`]), so a core-filtered
+    /// question about "every component" answers no. Both live callers pass the component of the unit
+    /// they are lowering (`DSC2ToDataflowIR.cpp:291-300`, `SNSyncLowering.cpp:105-109`).
+    pub fn is_relevant_to_corelet(
+        &self,
+        comp: SenComponent,
+        core: CoreId,
+        corelet: Option<CoreletId>,
+    ) -> bool {
+        self.relevant_cores(comp)
+            .and_then(|cores| cores.get(&core))
+            .is_some_and(|corelets| corelet.is_none_or(|cl| corelets.contains(&cl)))
+    }
+
     /// `isNodeRelevant`'s `relevantComps_.find(comp)` (`dsc/dsc2.cpp:1923-1924`) — this component's
     /// cores and their corelets, absent when the component is not relevant at all. See
     /// [`Self::is_relevant`] for why the core-filtered readings are spelled from here.
@@ -4958,9 +5391,12 @@ pub enum PropStateType {
 /// stay open in all three generations. `refNode` and `nodeToFold` (`:1089-1090`) are `ScheduleNode*`
 /// held as tree identity: they key `CoordPropTracker::refsAdded_` (`ddc/ddc.h:410-418`), and
 /// `rollbackToPos` `static_cast`s `nodeToFold` to the concrete node and CLEARS its coordinates
-/// through the pointer (`:487-503`). That identity is the one `BlockNode::next_` and
-/// `ScheduleTree::head_` have to define, and both are open — e030_BlockNode, e032_ScheduleTree. The
-/// type's one method goes out with them: `print` (`:1098-1107`) dereferences both for their `name_`.
+/// through the pointer (`:487-503`). ⛔ AND THE TREE NOW ANSWERS WHAT THAT IDENTITY IS, WHICH IS WHY
+/// THESE TWO STAY OPEN RATHER THAN BECOMING POINTERS: `BlockNode::next_` owns its children by value
+/// and `ScheduleTree::head_` owns the root, so what names a node is its POSITION — [`InsertionPoint`]
+/// for the three sites that search the list by address, and `std::ptr::eq` over live borrows for the
+/// traversal's exclude set. The type's one method goes out with them: `print` (`:1098-1107`)
+/// dereferences both for their `name_`.
 ///
 /// ⛔ THE AUTHORITY'S DEFAULT CONSTRUCTION LEAVES THOSE TWO POINTERS INDETERMINATE — neither
 /// declaration carries an initialiser — and both default-construction sites assign both on the next
@@ -5053,37 +5489,766 @@ impl Default for CoordPropInfoType {
     }
 }
 
+/// One entry of a [`BlockNode`]'s child list: the `std::unique_ptr<ScheduleNode>` the authority's
+/// `VectorOfChildren` owns (`dsc/dsc2.h:529-537`), resolved to the CONCRETE node behind it.
+///
+/// ⭐ THE NAME IS `addChildNode`'S. The three operations that put a node into that list or take it
+/// out all spell it — `addChildNode(ScheduleNode* nodeToAdd, ..)` (`dsc/dsc2.h:544-545`),
+/// `moveChildNode` (`:546-549`) and `deleteChildNode` (`:552-553`) — and `deleteChildNode`'s own
+/// refusal message calls the node "a child of node" `name_` (`dsc/dsc2.cpp:2197-2198`).
+///
+/// ⛔ THE VARIANTS ARE THE WHOLE HIERARCHY AND [`NodeType`] IS THEIR TAG, so the authority's pairing
+/// of a `nodeType_` with a `dynamic_cast` is ONE fact here. The JSON importer is that pairing written
+/// out once per kind (`dsc/dsc2.cpp:1337-1358`) and it is the exhaustive list; [`Self::node_type`]
+/// READS the variant rather than carrying a second copy of the tag, and every [`Default`] in the
+/// hierarchy passes its own kind to the base, so the two agree at every constructor. ⚠️ THE ONE WAY
+/// TO BREAK THAT AGREEMENT IS THE WHOLE-BASE OVERWRITE `ScheduleNode`'s own field records
+/// (`*node.base_mut() = ScheduleNode::new(..)`, see [`ScheduleNode::node_type`]) — C++ cannot spell it
+/// because `nodeType_` is `const`, and nothing in Rust forbids it. ⛔ `INVALID` IS NOT A VARIANT: it
+/// is `ScheduleNode`'s initialiser for a base nobody constructed (`dsc/dsc2.h:460`) and no minting
+/// site produces it.
+///
+/// ⚠️ AND A `dynamic_cast<BlockNode*>` IS THREE VARIANTS, NOT ONE — `BLOCK`, `LOOP` and `CONDITION`,
+/// which is exactly what `isBlockNode()` states (`dsc/dsc2.h:475-477`) and what [`Self::as_block`]
+/// answers. The traversal leans on it: `if (auto* currBlock = dynamic_cast<const BlockNode*>(...))`
+/// is what descends into a condition node's two regions (`dsc/dsc2.cpp:2243`).
+///
+/// ⛔ NO `PartialEq`, BECAUSE NODE IDENTITY IN THE AUTHORITY IS THE ADDRESS and the tree owns its
+/// nodes here: `insertLoopAbove` finds `this` in its parent's list with `nodePtr.get() == this`
+/// (`dsc/dsc2.cpp:2177`), `deleteChildNode` finds the child with `x.get() == nodeToDelete`
+/// (`:2191-2193`), `addChildNode` finds the sibling with `insertionPoint->get() != siblingRefNode`
+/// (`:2019`), and `traverseTreeDFS`'s exclude list is a set of pointers (`:2265`). What replaces the
+/// address is the POSITION — [`InsertionPoint`] for the first three, and
+/// [`traverse_dfs_excluding`](Self::traverse_dfs_excluding)'s `std::ptr::eq` over live borrows for
+/// the fourth.
+#[derive(Clone, Debug)]
+pub enum ChildNode {
+    Block(BlockNode),
+    Loop(LoopNode),
+    Transfer(TransferNode),
+    Compute(ComputeNode),
+    Sync(SyncNode),
+    Condition(ConditionNode),
+    Allocate(AllocateNode),
+    StickMask(StickMaskNode),
+}
+
+impl ChildNode {
+    /// The tag `ScheduleNode::nodeType_` holds (`dsc/dsc2.h:460`), read off the variant. It agrees
+    /// with `self.base().node_type()` by construction, because every [`Default`] in this hierarchy
+    /// passes its own kind to the base exactly as the authority's constructors do
+    /// (`dsc/dsc2.h:554`, `:583`, `:686`, `:815`, `:901`, `:965`, `:975`, `:1060`).
+    pub fn node_type(&self) -> NodeType {
+        match self {
+            Self::Block(_) => NodeType::Block,
+            Self::Loop(_) => NodeType::Loop,
+            Self::Transfer(_) => NodeType::Transfer,
+            Self::Compute(_) => NodeType::Compute,
+            Self::Sync(_) => NodeType::Sync,
+            Self::Condition(_) => NodeType::Condition,
+            Self::Allocate(_) => NodeType::Allocate,
+            Self::StickMask(_) => NodeType::StickMask,
+        }
+    }
+
+    /// The `ScheduleNode` subobject every node in the hierarchy has, reached through the two
+    /// `BlockNode`-derived kinds' own base (`dsc/dsc2.h:563`, `:685`). It is the implicit conversion
+    /// to a public base, which is how every caller of `name_`, `isNodeRelevant` or
+    /// `getRelevantCoreCl` reaches those from a concrete node.
+    pub fn base(&self) -> &ScheduleNode {
+        match self {
+            Self::Block(node) => &node.base_class,
+            Self::Loop(node) => &node.base_class.base_class,
+            Self::Condition(node) => &node.base().base_class,
+            Self::Transfer(node) => &node.base_class,
+            Self::Compute(node) => &node.base_class,
+            Self::Sync(node) => &node.base_class,
+            Self::Allocate(node) => &node.base_class,
+            Self::StickMask(node) => &node.base_class,
+        }
+    }
+
+    /// The mutable base, which is how a name is written: `finalizeScheduleTree` renames colliding
+    /// nodes as it walks (`dsc/dsc2.cpp:2988-2992`) and `setRelevantCompCoreCl` fills
+    /// `relevantComps_` node by node (`:2647-2729`).
+    pub fn base_mut(&mut self) -> &mut ScheduleNode {
+        match self {
+            Self::Block(node) => &mut node.base_class,
+            Self::Loop(node) => &mut node.base_class.base_class,
+            Self::Condition(node) => &mut node.base_mut().base_class,
+            Self::Transfer(node) => &mut node.base_class,
+            Self::Compute(node) => &mut node.base_class,
+            Self::Sync(node) => &mut node.base_class,
+            Self::Allocate(node) => &mut node.base_class,
+            Self::StickMask(node) => &mut node.base_class,
+        }
+    }
+
+    /// `dynamic_cast<const BlockNode*>` (`dsc/dsc2.cpp:2243`), which succeeds for all three
+    /// `isBlockNode()` kinds (`dsc/dsc2.h:475-477`) — a loop and a condition node ARE block nodes
+    /// and own children through the same list.
+    pub fn as_block(&self) -> Option<&BlockNode> {
+        match self {
+            Self::Block(node) => Some(node),
+            Self::Loop(node) => Some(&node.base_class),
+            Self::Condition(node) => Some(node.base()),
+            _ => None,
+        }
+    }
+
+    /// The mutable `static_cast<BlockNode*>` (`ddc/ddl/ddl_conversion.cpp:2934`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4204`).
+    ///
+    /// ⛔ AND IT REFUSES A CONDITION NODE, WHERE THE AUTHORITY'S CAST DOES NOT. `ConditionNode`
+    /// OVERRIDES `addChildNode` to refuse anything but a `BLOCK` and any third child
+    /// (`dsc/dsc2.h:697`, body `dsc/dsc2.cpp:2143-2150`), and that override is NOT reached through a
+    /// `BlockNode*` — the base method is `virtual` (`dsc/dsc2.h:544`), so it IS reached there, but
+    /// `BlockNode::addChildNode` is then reachable directly as `node->BlockNode::addChildNode(..)`
+    /// and every non-virtual sibling of it (`moveChildren`, `insertPerfectlyNestedBlockNode`'s own
+    /// `addChildNode` call) can still put a third non-block child into a condition node. Handing out
+    /// `&mut BlockNode` for a condition node would reopen that; [`ConditionNode`]'s own
+    /// [`add_child_node`](ConditionNode::add_child_node) is the only mutable route to its children,
+    /// and it takes a [`BlockNode`] BY VALUE, which is the "only 2 BlockNodes" rule as a type.
+    pub fn as_block_mut(&mut self) -> Option<&mut BlockNode> {
+        match self {
+            Self::Block(node) => Some(node),
+            Self::Loop(node) => Some(&mut node.base_class),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::LoopNode*>` after a `nodeType_ == LOOP` test (`ddc/ddcv1.cpp:596-597`).
+    pub fn as_loop(&self) -> Option<&LoopNode> {
+        match self {
+            Self::Loop(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddcv1.cpp:596-597`, reached from `traverseTreeDFSMutable`).
+    pub fn as_loop_mut(&mut self) -> Option<&mut LoopNode> {
+        match self {
+            Self::Loop(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::ConditionNode *>` after a `CONDITION` test
+    /// (`ddc/ddc_transformation_util.cpp:262-263`).
+    pub fn as_condition(&self) -> Option<&ConditionNode> {
+        match self {
+            Self::Condition(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form, which is how `addThenRegion`/`addElseRegion` are reached from a traversal
+    /// (`ddc/ddc_transformation_util.cpp:262-263`, `:587-588`).
+    pub fn as_condition_mut(&mut self) -> Option<&mut ConditionNode> {
+        match self {
+            Self::Condition(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `dynamic_cast<const dsc2::TransferNode *>` (`DSC2ToDataflowIR.cpp:265`) and its
+    /// `static_cast` twin (`ddc/ddcv1.cpp:441-442`).
+    pub fn as_transfer(&self) -> Option<&TransferNode> {
+        match self {
+            Self::Transfer(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddcv1.cpp:441-442`).
+    pub fn as_transfer_mut(&mut self) -> Option<&mut TransferNode> {
+        match self {
+            Self::Transfer(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::ComputeNode *>` (`ddc/ddc_fold.cpp:1628-1629`).
+    pub fn as_compute(&self) -> Option<&ComputeNode> {
+        match self {
+            Self::Compute(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddc_fold.cpp:1628-1629`).
+    pub fn as_compute_mut(&mut self) -> Option<&mut ComputeNode> {
+        match self {
+            Self::Compute(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::SyncNode *>` (`ddc/ddc_transformation.cpp:1528-1529`).
+    pub fn as_sync(&self) -> Option<&SyncNode> {
+        match self {
+            Self::Sync(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddc_transformation.cpp:1528-1529`).
+    pub fn as_sync_mut(&mut self) -> Option<&mut SyncNode> {
+        match self {
+            Self::Sync(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::AllocateNode*>` (`ddc/ddcv1.cpp:48-49`).
+    pub fn as_allocate(&self) -> Option<&AllocateNode> {
+        match self {
+            Self::Allocate(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddcv1.cpp:48-49`).
+    pub fn as_allocate_mut(&mut self) -> Option<&mut AllocateNode> {
+        match self {
+            Self::Allocate(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `static_cast<dsc2::StickMaskNode*>` (`ddc/ddcv1.cpp:3662-3663`).
+    pub fn as_stick_mask(&self) -> Option<&StickMaskNode> {
+        match self {
+            Self::StickMask(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// The mutable form (`ddc/ddcv1.cpp:3662-3663`).
+    pub fn as_stick_mask_mut(&mut self) -> Option<&mut StickMaskNode> {
+        match self {
+            Self::StickMask(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    /// `traverseTreeDFS(startNode, nodeTypes, comp)` over the subtree rooted at THIS node, the node
+    /// itself included (`dsc/dsc2.cpp:2222-2265`): the authority seeds `nodesToVisit` with
+    /// `startNode` and tests it like any other (`:2228`, `:2237`).
+    ///
+    /// ⭐ IT IS A PURE SUBTREE WALK, WHICH IS WHY IT IS A METHOD ON THE NODE AND NOT ON THE TREE:
+    /// with a `startNode` whose `prev_` is set, nothing in the body reaches `head_` again. The
+    /// `startNode == nullptr || startNode->prev_ == nullptr` arm (`:2224`) is the whole-tree walk,
+    /// [`ScheduleTree::traverse_dfs`], and the second half of that test — an ORPHAN node silently
+    /// walking the whole tree instead of itself — is unspellable here.
+    ///
+    /// ⛔ A NODE THAT IS NOT RELEVANT PRUNES ITS WHOLE SUBTREE, not just itself (`:2237-2240`
+    /// `continue`s before the children are pushed), and `nodeTypes` filters only what is COLLECTED —
+    /// a non-matching block node is still descended into (`:2241-2253`).
+    ///
+    /// ⛔ AND `maxLoopDepth` IS NOT PORTED BECAUSE NOTHING PASSES ONE. Tree-wide, every one of the
+    /// ~60 `traverseTreeDFS`/`traverseTreeDFSMutable` calls either stops before that parameter or
+    /// passes the `-1` default, and it is the ONLY reader of the `loopDepth` stack the body carries
+    /// (`:2224`, `:2231-2235`, `:2244-2250`). ⭐ THAT STACK IS ALSO THE TRAVERSAL'S ONLY USE OF
+    /// `prev_` — `while (currNode->prev_ != loopDepth.back().first) loopDepth.pop_back()` (`:2235`)
+    /// — so dropping the dead parameter is what makes a `prev_`-free tree walk EXACT rather than
+    /// approximate. ⛔ AND THAT SAME LINE IS UNSOUND ON A STALE `prev_`: `insertLoopAbove` splices a
+    /// loop in without updating either node's (`:2169-2186`), and `pop_back()` on an emptied vector
+    /// is undefined behaviour, so a walk through a spliced node has no defined result at all. It has
+    /// no callers either (`insertLoopAbove` is unreferenced tree-wide).
+    ///
+    /// ⛔ AND THE CORE/CORELET FILTER IS NOT PORTED FOR THE SAME REASON: every in-scope caller
+    /// passes `-1, -1` (`DSC2ToDataflowIR.cpp:262-263`, `ddc/ddcv1.cpp:3416-3417`,
+    /// `ddc/ddc_transformation.cpp:1525-1527`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1596`).
+    /// The only callers that pass a core or a corelet are in `dsc/dsc2Pcfg.cpp` (`:144`, `:2253`,
+    /// `:2257-2258`), and DCG/PCFG is off this campaign's path. The COMPONENT filter stays because
+    /// two in-scope callers do use it: bridge 1 passes the component it is lowering
+    /// (`DSC2ToDataflowIR.cpp:262-263`) and the DDC passes a transfer's destination component
+    /// (`ddc/ddcv1.cpp:3416-3417`).
+    pub fn traverse_dfs(&self, node_types: &[NodeType], comp: SenComponent) -> Vec<&ChildNode> {
+        let mut order = Vec::new();
+        self.visit_dfs(node_types, comp, &[], &mut order);
+        order
+    }
+
+    /// `traverseTreeDFS`'s `excludeList` (`dsc/dsc2.cpp:2265`), whose one live caller scans a loop
+    /// for `SYNC` nodes while skipping the inner loop it scanned on the previous iteration
+    /// (`ddc/ddc_transformation.cpp:1525-1527`, filled at `:1656-1657`).
+    ///
+    /// ⛔ EXCLUDING A NODE PRUNES ITS SUBTREE, which is the whole point at that caller: the
+    /// `continue` at `:2239` happens before the children are pushed, so an excluded loop hides the
+    /// syncs beneath it. ⭐ AND THE IDENTITY IS THE ADDRESS, as it is in the authority's
+    /// `excludeList.count(currNode)` over a set of pointers: `std::ptr::eq` on live borrows says the
+    /// same thing, and the borrow is what keeps the excluded node alive for the walk.
+    pub fn traverse_dfs_excluding(
+        &self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        exclude: &[&ChildNode],
+    ) -> Vec<&ChildNode> {
+        let mut order = Vec::new();
+        self.visit_dfs(node_types, comp, exclude, &mut order);
+        order
+    }
+
+    /// The body of `traverseTreeDFS` (`dsc/dsc2.cpp:2236-2254`) with its work list turned into
+    /// recursion: the authority pops the FRONT of a deque and pushes a block's children back onto
+    /// the front in reverse (`:2251-2253`), which is pre-order depth-first over the children in
+    /// order — what this produces.
+    fn visit_dfs<'tree>(
+        &'tree self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        exclude: &[&ChildNode],
+        order: &mut Vec<&'tree ChildNode>,
+    ) {
+        if !self.base().is_relevant(comp) || exclude.iter().any(|node| std::ptr::eq(*node, self)) {
+            return;
+        }
+        if node_types.is_empty() || node_types.contains(&self.node_type()) {
+            order.push(self);
+        }
+        for child in self.as_block().map_or(&[][..], BlockNode::children) {
+            child.visit_dfs(node_types, comp, exclude, order);
+        }
+    }
+
+    /// `traverseTreeDFSMutable(startNode, nodeTypes, comp)` over this subtree
+    /// (`dsc/dsc2.cpp:2208-2220`), whose live caller takes the start node as a PARAMETER and rewrites
+    /// the lds index of every allocate, transfer and compute beneath it
+    /// (`ddc/ddc_transformation_util.cpp:1920-1930`).
+    ///
+    /// ⛔ A VISITOR RATHER THAN A LIST OF `&mut`, for the reason [`ScheduleTree::for_each_dfs_mut`]
+    /// records: the authority's list aliases the tree, and an ancestor and its descendant appear in it
+    /// together.
+    pub fn for_each_dfs_mut(
+        &mut self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        mut f: impl FnMut(&mut ChildNode),
+    ) {
+        self.visit_dfs_mut(node_types, comp, &mut f);
+    }
+
+    /// The mutable walk itself. `&mut dyn FnMut` rather than a second type parameter because the
+    /// recursion would otherwise instantiate itself infinitely through `&mut F`.
+    fn visit_dfs_mut(
+        &mut self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        f: &mut dyn FnMut(&mut ChildNode),
+    ) {
+        if !self.base().is_relevant(comp) {
+            return;
+        }
+        if node_types.is_empty() || node_types.contains(&self.node_type()) {
+            f(self);
+        }
+        let Some(children) = self.children_mut() else {
+            return;
+        };
+        for child in children.iter_mut() {
+            child.visit_dfs_mut(node_types, comp, f);
+        }
+    }
+
+    /// The child list of a block node by value, or [`None`] for a leaf — what
+    /// [`Self::visit_dfs_mut`] descends through, the mutable twin of
+    /// `dynamic_cast<const BlockNode*>` at `dsc/dsc2.cpp:2243`.
+    ///
+    /// ⛔ MODULE-PRIVATE, AND THAT IS WHAT MAKES [`ConditionNode`]'S TWO-CHILD RULE HOLD: a public
+    /// `&mut Vec<ChildNode>` would let any caller `push` a third child, or a non-`BLOCK` one, into a
+    /// condition node — exactly what `ConditionNode::addChildNode` `DT_ERROR`s on
+    /// (`dsc/dsc2.cpp:2143-2150`). [`ChildNode::as_block_mut`] refuses a condition node for the same
+    /// reason.
+    fn children_mut(&mut self) -> Option<&mut Vec<ChildNode>> {
+        match self {
+            Self::Block(node) => Some(&mut node.next),
+            Self::Loop(node) => Some(&mut node.base_class.next),
+            Self::Condition(node) => Some(node.children_mut()),
+            _ => None,
+        }
+    }
+}
+
+/// Where in a [`BlockNode`]'s child list `addChildNode` puts the node — the authority's own
+/// `insertionPoint` local, which is an ITERATOR into `next_` (`dsc/dsc2.cpp:2015-2025`).
+///
+/// ⭐ FOUR SHAPES, ALL FOUR WITH LIVE CALLERS, and they are what the `(addBefore, siblingRefNode)`
+/// pair spells rather than two independent flags:
+///  * [`Self::Back`] is `(false, nullptr)`, the default and the common case
+///    (`ddc/ddc_transformation.cpp:986`, `:1195-1197`, `ddc/ddcv1.cpp:3656`);
+///  * [`Self::Front`] is `(true, nullptr)` — `next_.begin()` is where `insertionPoint` starts and
+///    `addBefore` is what stops it being reassigned to `end()` (`dsc/dsc2.cpp:2016-2017`), used to
+///    put a `"root_level_operations"` block at the head of the tree
+///    (`ddc/ddl/ddl_conversion.cpp:2779-2782`);
+///  * [`Self::Before`] is `(true, sibling)` (`ddc/ddc_transformation_util.cpp:861`, `:1187`,
+///    `ddc/ddcv1.cpp:2158`, `ddc/ddc_transformation.cpp:1011`);
+///  * [`Self::After`] is `(false, sibling)`, the `insertionPoint++` at `dsc/dsc2.cpp:2026`
+///    (`ddc/ddc_transformation_util.cpp:1036`, `:1366`, `ddc/ddc_transformation.cpp:1012`).
+///
+/// ⛔ THE SIBLING IS A POSITION HERE AND AN ADDRESS THERE, AND THAT IS WHAT CLOSES A REAL HOLE.
+/// The authority walks `for (; insertionPoint->get() != siblingRefNode; ++insertionPoint)` and tests
+/// `insertionPoint == next_.end()` INSIDE the body (`dsc/dsc2.cpp:2019-2023`), so the dereference
+/// happens BEFORE the end test: a sibling that is not in this list runs off the vector instead of
+/// reaching the `DT_ERROR` one line below. Compiled and run under ASAN over the extracted body, that
+/// is a heap-buffer-overflow read followed by a member call on the null it loads — never the
+/// diagnostic. An index cannot express it, and an out-of-range one is refused by
+/// [`BlockNode::add_child_node`] handing the node back.
+///
+/// ⚠️ AND AN INDEX IS ONLY VALID UNTIL THE LIST CHANGES, where the authority's pointer survives a
+/// sibling insertion. Every live caller resolves the sibling and inserts in the same statement, so
+/// none of them holds one across a mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionPoint {
+    Front,
+    Back,
+    Before(usize),
+    After(usize),
+}
+
+/// Replaces: e004_BlockNode
+/// Replaces: e030_BlockNode
+///
+/// `dsc2::BlockNode` (`dsc/dsc2.h:526-561`) — the node that OWNS other nodes. Every interior node of
+/// a schedule tree is one: `LoopNode` (`:563`) and `ConditionNode` (`:685`) derive from it, the tree's
+/// root IS one (`ScheduleTree::head_` is a `LoopNode`, `:623`), and the DDL conversion mints plain
+/// ones to group operations (`ddc/ddl/ddl_conversion.cpp:2779`, `:1738-1745`).
+///
+/// ⭐ THIS IS WHERE THE SCHEDULE TREE BECOMES A TREE, and it is the shape the deleted port never had:
+/// the five leaf node types carried none of the base's fields and nothing owned a child. With this
+/// type there is exactly one owner of a node — the `Vec<ChildNode>` below — and the parent link,
+/// the visit order and the lifetime of every node follow from it.
+///
+/// ⛔ `getNextView` IS NOT VIRTUAL, AND `ConditionNode` DECLARES ITS OWN (`dsc/dsc2.h:541-543`,
+/// `:701-703`), so which body runs depends on the STATIC type of the handle: through a `BlockNode*`
+/// a condition node gets the FILTERED reading, and only a `ConditionNode*` gets the one that widens a
+/// loop-guarded node's view to `ALL, -1, -1` (`dsc/dsc2.cpp:1995-2002`). Rust method resolution is
+/// the same rule, so [`Self::next_view`] on a condition node's base and
+/// [`ConditionNode::next_view`] on the node itself preserve the split exactly — including at the
+/// ~25 sites that hold a `BlockNode*`.
+///
+/// ⛔ TWO OF THIS CLASS'S SIX METHODS ARE BLOCKED ON e027_DesignSpaceConfig, which is why the
+/// `e004_BlockNode`/`e030_BlockNode` TODO anchors at the end of this file stay open.
+/// `deleteChildNode` calls `ownerDsc->cleanupAllocation(nodeToDelete)` (`dsc/dsc2.cpp:2188-2190`)
+/// and `moveChildNode` forwards to it (`:2031-2039`); `DesignSpaceConfig::cleanupAllocation`
+/// (`dsc/designSpaceConfig.h:262`) is unported. ⭐ THE OTHER HALF OF `deleteChildNode` IS HERE:
+/// `nonDestructive` is `childIt->release()` before the erase (`:2202-2206`), i.e. "take the node out
+/// and hand it to the caller", which is [`Self::take_child_node`] and which is the arm
+/// `moveChildNode` uses (`:2038`).
+///
+/// ⚠️ AND THE AUTHORITY'S DESTRUCTIVE ARM CLEANS UP BEFORE IT CHECKS: `cleanupAllocation` runs on
+/// `nodeToDelete` at `:2189`, and only then does the `find_if` at `:2191-2196` discover the node is
+/// not a child of this one and `DT_ERROR` (`:2197-2199`). A failed delete has therefore already
+/// unregistered the allocation.
+///
+/// ⛔ NO `prev_`, AND NOTHING THIS UNIT PORTS READS ONE. The four operations that do —
+/// `getOwnerLoop`, `getParentDimLoop`, `moveNode` and `insertLoopAbove` (`dsc/dsc2.cpp:1892-1933`,
+/// `:1977-1982`, `:2169-2186`) — are `ScheduleNode`'s, and they stay with e029_ScheduleNode's open
+/// anchor. In an owning tree the parent is the walker's, not the node's, which is what makes
+/// `insertLoopAbove`'s measured defect unrepresentable here: it splices a loop between a node and its
+/// parent and updates NEITHER `prev_`, so both the node's and the new loop's are stale the moment it
+/// returns.
+///
+/// ⛔ NO `PartialEq`: see [`ChildNode`]. `Default` is `BlockNode() : BaseClass(BLOCK)`
+/// (`dsc/dsc2.h:554`) and `Clone` is IBM's, which DROPS THE CHILDREN — see [`Self::clone`].
+#[derive(Debug)]
+pub struct BlockNode {
+    /// Field: e004_BlockNode.BaseClass
+    /// Field: e030_BlockNode.BaseClass
+    ///
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:526`, `InheritWithClone<ScheduleNode, BlockNode>`).
+    /// The anchor names `using BaseClass::BaseClass;` (`:528`), the PROTECTED inherited constructor
+    /// that is how a derived class passes its own kind down — `LoopNode() : BaseClass(LOOP)`
+    /// (`:583`), `ConditionNode() : BaseClass(CONDITION)` (`:686`) — while `BlockNode()` itself
+    /// passes `BLOCK` (`:554`). [`Self::new`] is that protected constructor and is module-private for
+    /// the same reason: outside this module [`Default`] is the only way to make one, so no `BlockNode`
+    /// is CONSTRUCTED with a kind other than its own.
+    ///
+    /// PUBLIC, because the authority's inheritance is public and `name_` with it: the DDL conversion
+    /// writes `initialInsertionBlock->name_ = "root_level_operations"` straight through a
+    /// `BlockNode*` (`ddc/ddl/ddl_conversion.cpp:2782`). ⚠️ `BaseClass` IS ALSO A TYPEDEF, `typedef
+    /// Base BaseClass` in `InheritWithClone` (`util/utils.h:100`), and the scheduler's field scan
+    /// anchored the `using` line rather than a field; what the field holds is the base's four
+    /// members, three of which e029_ScheduleNode carries.
+    pub base_class: ScheduleNode,
+    /// Field: e004_BlockNode.next_
+    /// Field: e030_BlockNode.next_
+    ///
+    /// The children, in order (`dsc/dsc2.h:538`). The authority's `VectorOfChildren` is a
+    /// `std::vector<std::unique_ptr<ScheduleNode>>` (`:529`), so this list OWNS its nodes and is the
+    /// only owner — which is what `unique_ptr` states and what `deleteChildNode`'s
+    /// `childIt->release()` has to defeat to hand a node out alive (`dsc/dsc2.cpp:2202-2206`).
+    ///
+    /// PRIVATE, because the authority's is `protected` behind five friend classes (`:556-560`) while
+    /// the readings are public methods: [`Self::children`] hands out the list, [`Self::next_view`]
+    /// the relevance-filtered one, and every mutation goes through an operation that keeps the
+    /// invariants — which is what makes [`ConditionNode`]'s "at most two BLOCK children" true rather
+    /// than documented.
+    ///
+    /// ⛔ ORDER IS THE SCHEDULE, so this is a `Vec` and never a set: bridge 1 emits the children of a
+    /// block in list order and that is program order (`SNControlFlowLowering.cpp:577-600`), and
+    /// `getThenBranchNode`/`getElseBranchNode` are positions 0 and 1 (`dsc/dsc2.h:707-718`).
+    next: Vec<ChildNode>,
+}
+
+impl Default for BlockNode {
+    /// `BlockNode() : BaseClass(BLOCK) {}` (`dsc/dsc2.h:554`) over `VectorOfChildren() = default`
+    /// (`:530`).
+    fn default() -> Self {
+        Self::new(NodeType::Block)
+    }
+}
+
+impl Clone for BlockNode {
+    /// IBM's `clone()` is `new BlockNode(static_cast<BlockNode const&>(*this))`, the implicit COPY
+    /// CONSTRUCTOR reached through `InheritWithClone` (`util/utils.h:105-107`, `dsc/dsc2.h:526`).
+    ///
+    /// ⛔ SO A CLONED BLOCK NODE HAS NO CHILDREN, and that is load-bearing rather than a leak to
+    /// tidy up: `VectorOfChildren(const VectorOfChildren&) {}` is "do nothing on purpose", with the
+    /// authority's own comment "when copying, it is up to the caller to manually insert copies of
+    /// the children" (`dsc/dsc2.h:533-536`). Both `BlockNode`-derived clone sites depend on it —
+    /// `ddc/ddc_transformation.cpp:984-986` clones a loop and then `addChildNode`s one cloned child,
+    /// and `ddc/ddc_transformation_util.cpp:580-588` clones a `ConditionNode` and then
+    /// `addThenRegion`s a fresh block, which `DT_ERROR`s outright if `next_` is non-empty
+    /// (`dsc/dsc2.cpp:2152-2155`). A deep `Clone` would turn a working DDC path into a fatal error.
+    ///
+    /// ⛔ AND C++ CANNOT ASSIGN ONE: `VectorOfChildren`'s copy assignment is `= delete` (`:536`),
+    /// which implicitly deletes `BlockNode`'s, so `*a = b` does not compile there and always
+    /// compiles here — the same asymmetry [`TransferNode::clone`] records for `paddingInfo_`.
+    /// [`ScheduleTree`] is where it matters, and there it is closed: the tree has no [`Clone`] at
+    /// all.
+    fn clone(&self) -> Self {
+        Self {
+            base_class: self.base_class.clone(),
+            next: Vec::new(),
+        }
+    }
+}
+
+impl BlockNode {
+    /// `using BaseClass::BaseClass;` (`dsc/dsc2.h:528`), the PROTECTED inherited constructor. Module
+    /// -private, so the only callers are the two derived kinds' [`Default`] impls and this one's —
+    /// which is what `protected` buys the authority.
+    fn new(node_type: NodeType) -> Self {
+        Self {
+            base_class: ScheduleNode::new(node_type),
+            next: Vec::new(),
+        }
+    }
+
+    /// The child list in order (`dsc/dsc2.h:538`). The authority reaches it directly through
+    /// friendship — `for (const auto& child : scheduleTree_.getHeadMutable()->next_)`
+    /// (`dsc/dsc2.cpp:1389`), and `setRelevantCompCoreCl` walks it at `:2658-2686`.
+    ///
+    /// ⭐ NAMED FOR `moveChildren` (`dsc/dsc2.h:551`), whose own comment calls these "children of the
+    /// current node" (`dsc/dsc2.cpp:2042-2043`).
+    pub fn children(&self) -> &[ChildNode] {
+        &self.next
+    }
+
+    /// `getNextView(comp)` (`dsc/dsc2.cpp:1984-1993`): the children this component can see. Bridge 1
+    /// takes the roots of a uniformized program unit this way (`DSC2ToDataflowIR.cpp:380`).
+    ///
+    /// ⛔ [`SenComponent::All`] RETURNS EVERY CHILD rather than looking anything up, which is
+    /// `isNodeRelevant`'s first arm (`dsc/dsc2.cpp:1919-1923`) and is why `ALL` is never a key in
+    /// `relevantComps_`. ⛔ AND A CHILD WITH AN EMPTY `relevantComps_` IS IN NOBODY'S VIEW: before
+    /// `setRelevantCompCoreCl` has run (`:2647-2729`) every view except `ALL`'s is empty.
+    pub fn next_view(&self, comp: SenComponent) -> Vec<&ChildNode> {
+        self.next
+            .iter()
+            .filter(|child| child.base().is_relevant(comp))
+            .collect()
+    }
+
+    /// `getNextView(comp, clId, coreId)` with a real core (`dsc/dsc2.cpp:1984-1993`), the reading
+    /// bridge 1 uses to find the roots of ONE program unit — a core, a corelet and a component
+    /// (`DSC2ToDataflowIR.cpp:298-300`, `SNControlFlowLowering.cpp:577`, `:1213`).
+    ///
+    /// ⛔ A SEPARATE METHOD BECAUSE THE AUTHORITY REFUSES THE MIXED CALL: `isNodeRelevant` `DT_ERROR`s
+    /// on `ALL` together with a core or corelet filter, and on a corelet with no core
+    /// (`dsc/dsc2.cpp:1919-1928`). The second of those two is unspellable here — a corelet without a
+    /// core has nowhere to go in this signature — and bridge 1's own call sites are the split: the
+    /// one that has a unit passes all three (`:298-300`), the one that does not calls
+    /// [`Self::next_view`] (`:380`).
+    ///
+    /// ⚠️ THE FIRST REFUSAL IS A NARROWING HERE, NOT AN ABORT: `comp == All` cannot be a key in
+    /// `relevantComps_`, so this answers with an EMPTY view where the authority ends the process. No
+    /// live caller reaches it — a `ProgramUnitOp` is built per component (`DSC2ToDataflowIR.cpp:291`)
+    /// and `comp` is that component.
+    pub fn next_view_of_corelet(
+        &self,
+        comp: SenComponent,
+        core: CoreId,
+        corelet: Option<CoreletId>,
+    ) -> Vec<&ChildNode> {
+        self.next
+            .iter()
+            .filter(|child| child.base().is_relevant_to_corelet(comp, core, corelet))
+            .collect()
+    }
+
+    /// `addChildNode(nodeToAdd, addBefore, siblingRefNode)` (`dsc/dsc2.cpp:2013-2029`), the one way
+    /// a node enters a tree. 60-odd call sites; the four [`InsertionPoint`] shapes are all of them.
+    ///
+    /// ⭐ THE REFUSAL HANDS THE NODE BACK. An [`InsertionPoint::Before`] or
+    /// [`InsertionPoint::After`] past the end of the list is the authority's "Sibling reference node
+    /// not found in parent node" (`:2021`) — except that the authority never reaches that
+    /// `DT_ERROR`, because the loop above it dereferences before testing for the end (see
+    /// [`InsertionPoint`]). Returning the node means a refused insertion loses nothing and nothing
+    /// needs to unwind; [`None`] is the success.
+    ///
+    /// ⛔ IT DOES NOT CHECK THE KIND, AND A CONDITION NODE IS WHERE THAT MATTERS: this body accepts
+    /// any node, and `ConditionNode::addChildNode` is the `override` that narrows it to two BLOCKs
+    /// (`dsc/dsc2.h:697`, `dsc/dsc2.cpp:2143-2150`). [`ChildNode::as_block_mut`] refusing a
+    /// condition node is what stops this method being reached on one.
+    ///
+    /// ⛔ AND `nodeToAdd->prev_ = this` (`:2028`) HAS NO COUNTERPART: the parent is the position in
+    /// this list.
+    #[must_use = "a refused insertion hands the node back and it is lost if dropped"]
+    pub fn add_child_node(&mut self, at: InsertionPoint, node: ChildNode) -> Option<ChildNode> {
+        match self.insertion_point(at) {
+            Some(index) => {
+                self.next.insert(index, node);
+                None
+            }
+            None => Some(node),
+        }
+    }
+
+    /// The authority's `insertionPoint` iterator resolved to an index (`dsc/dsc2.cpp:2015-2026`).
+    /// [`None`] is the sibling it cannot find.
+    fn insertion_point(&self, at: InsertionPoint) -> Option<usize> {
+        match at {
+            InsertionPoint::Front => Some(0),
+            InsertionPoint::Back => Some(self.next.len()),
+            InsertionPoint::Before(sibling) => (sibling < self.next.len()).then_some(sibling),
+            InsertionPoint::After(sibling) => (sibling < self.next.len()).then_some(sibling + 1),
+        }
+    }
+
+    /// `deleteChildNode(ownerDsc, nodeToDelete, /*nonDestructive=*/true)`
+    /// (`dsc/dsc2.cpp:2188-2207`): take the child out of the list and hand it to the caller alive.
+    /// That arm skips `cleanupAllocation` entirely (`:2188-2190`) and `release()`s the `unique_ptr`
+    /// before erasing it (`:2202-2206`), which is a MOVE out of the tree — what returning the
+    /// [`ChildNode`] by value is.
+    ///
+    /// ⭐ ITS CALLER IS `moveChildNode` (`:2038`), and taking the node out rather than deleting it is
+    /// what lets a move be spelled as a take plus an [`Self::add_child_node`] — two operations on
+    /// two objects, where the authority's one takes the destination parent as a third pointer.
+    ///
+    /// ⛔ THE DESTRUCTIVE ARM IS NOT HERE: it needs `DesignSpaceConfig::cleanupAllocation`
+    /// (`dsc/designSpaceConfig.h:262`), which is unported, and dropping the returned node is not the
+    /// same thing — that cleanup unregisters the allocation from the DSC.
+    #[must_use = "the node is removed from the tree and is lost if dropped"]
+    pub fn take_child_node(&mut self, child: usize) -> Option<ChildNode> {
+        (child < self.next.len()).then(|| self.next.remove(child))
+    }
+
+    /// `moveChildren(toNode)` (`dsc/dsc2.cpp:2053-2059`).
+    ///
+    /// ⛔ IT OVERWRITES THE DESTINATION'S CHILDREN, IT DOES NOT APPEND: `toNode->next_ =
+    /// std::move(this->next_)` (`:2057`), so a non-empty destination silently loses its own. Both
+    /// live callers pass a freshly minted, still-detached loop
+    /// (`ddc/ddc_transformation_util.cpp:236-245`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6852-6859`), and
+    /// [`Self::insert_perfectly_nested_block_node`] REFUSES a non-empty node before calling this
+    /// (`dsc/dsc2.cpp:2044-2048`) — the authority's own guard against its own overwrite.
+    ///
+    /// ⭐ AND "STILL DETACHED" IS WHAT MAKES THIS EXPRESSIBLE AT ALL: two `&mut BlockNode`s are two
+    /// distinct objects only because every caller moves the children into the new node BEFORE
+    /// linking it into the tree (`ddc/ddc_transformation_util.cpp:245` then `:247`).
+    ///
+    /// ⛔ `child->prev_ = toNode` (`:2055-2056`) has no counterpart: the children's parent is the
+    /// list they are in, and they change lists here.
+    pub fn move_children_to(&mut self, to: &mut BlockNode) {
+        to.next = std::mem::take(&mut self.next);
+    }
+
+    /// `insertPerfectlyNestedBlockNode(nodeToAdd)` (`dsc/dsc2.cpp:2041-2051`): make `node` this
+    /// node's ONLY child and give it everything that was here.
+    ///
+    /// ⭐ THE REFUSAL HANDS THE NODE BACK, as [`Self::add_child_node`] does: "Nested node must not
+    /// have any children" (`:2044-2046`) is the guard that keeps [`Self::move_children_to`]'s
+    /// overwrite from losing them. ⛔ AND IT IS NOT REDUNDANT WITH THE MOVE: a node with children
+    /// would keep them in the authority too — the overwrite happens on the way IN, so the caller's
+    /// children would be the ones dropped.
+    ///
+    /// ⚠️ THE AUTHORITY'S PARAMETER IS `BlockNode*` AND ITS ONE CALLER PASSES A `LoopNode*`
+    /// (`dsc/dsc2.h:550`, `ddc/ddc_transformation_util.cpp:301`), so WHICH KIND of node gets nested
+    /// is the caller's static choice and not something this body can recover — see
+    /// [`Self::insert_perfectly_nested_loop_node`], which is the reading that one caller needs. This
+    /// variant is the parameter's own declared type and has no live caller in the authority.
+    ///
+    /// ⛔ NEITHER VARIANT TAKES A [`ChildNode`]: the authority's parameter is `BlockNode*` because a
+    /// leaf cannot hold the children it is handed.
+    #[must_use = "a refused nesting hands the node back and it is lost if dropped"]
+    pub fn insert_perfectly_nested_block_node(&mut self, mut node: BlockNode) -> Option<BlockNode> {
+        if !node.next.is_empty() {
+            return Some(node);
+        }
+        self.move_children_to(&mut node);
+        self.next.push(ChildNode::Block(node));
+        None
+    }
+
+    /// `insertPerfectlyNestedBlockNode(nodeToAdd)` reached with a `LoopNode*`, which is what its ONLY
+    /// caller passes (`dsc/dsc2.cpp:2041-2051`): `Ddc::splitLoopBandOnDatastage` mints a loop over the
+    /// base loop's own dims and nests it inside that loop, then moves the denominator datastage down
+    /// into it (`ddc/ddc_transformation_util.cpp:287-303`, the call at `:301`).
+    ///
+    /// ⭐ A SECOND NAME RATHER THAN A WIDER PARAMETER, because the kind of the nested node SURVIVES
+    /// here: `BlockNode*` erases it in the authority and every later reader gets it back with a
+    /// `dynamic_cast`, whereas the node enters this tree as [`ChildNode::Loop`] and stays a loop for
+    /// the walk that follows.
+    #[must_use = "a refused nesting hands the node back and it is lost if dropped"]
+    pub fn insert_perfectly_nested_loop_node(&mut self, mut node: LoopNode) -> Option<LoopNode> {
+        if !node.base_class.next.is_empty() {
+            return Some(node);
+        }
+        self.move_children_to(&mut node.base_class);
+        self.next.push(ChildNode::Loop(node));
+        None
+    }
+}
+
+/// Replaces: e034_LoopNode
+/// Replaces: e031_LoopNode
+///
 /// `dsc/dsc2.h:563-619`. One loop of the schedule tree: the dims it iterates and the two data
 /// stages whose ratio is its trip count (`getTripCount(dsc, dim, numId_, denId_)`,
 /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1840`). The minting site is
 /// `ddc/ddl/ddl_conversion.cpp:1076-1164`: a DDL `LoopOp` becomes a datastage loop and a
 /// `ParametricLoopOp` a parametric one.
 ///
-/// ⛔ THIS CARRIES ALL SIX OF LOOPNODE'S OWN DECLARED FIELDS AND NOTHING INHERITED. `nodeType_`,
-/// `name_`, `prev_` and `relevantComps_` are `ScheduleNode`'s (`dsc/dsc2.h:460-461`, `:515-516`) and
-/// `next_` is `BlockNode`'s (`:538`) — e029_ScheduleNode and e030_BlockNode both.
+/// ⛔ THIS CARRIES ALL SIX OF LOOPNODE'S OWN DECLARED FIELDS AND ITS BASE SUBOBJECT. `next_` is
+/// `BlockNode`'s (`dsc/dsc2.h:538`) and `nodeType_`, `name_` and `relevantComps_` are
+/// `ScheduleNode`'s (`:460-461`, `:516`); all four arrive through
+/// [`base_class`](Self::base_class), because `LoopNode : public InheritWithClone<BlockNode,
+/// LoopNode>` (`:563`) and a loop IS a block node — `isBlockNode()` says so (`:475-477`) and the
+/// traversal descends into a loop's children through exactly that cast (`dsc/dsc2.cpp:2243`).
+/// ⛔ `prev_` (`:515`) IS THE ONE FIELD NOT CARRIED, and not because an owner is missing: in an
+/// owning tree the parent is the list a node is in, so `prev_` would be a second, independently
+/// writable answer to a question [`BlockNode::children`] already answers — see [`ScheduleTree`].
 ///
-/// ⛔ AND IT IS THE METHODS, NOT THE FIELD COUNT, THAT KEEP THE `e031_LoopNode` ANCHOR AT THE END OF
-/// THIS FILE OPEN. A unit is its fields AND its methods together, and three of this class's nine
-/// cannot be written until those two owners land: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and
-/// `parametricStride` (`:4197`) read `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb
-/// `getOwnerLoop()` through `prev_`, and `print` (`:4284`) prints `name_`.
+/// ⛔ AND IT IS THE METHODS, NOT THE FIELD COUNT, THAT KEEP THE `e031_LoopNode`/`e034_LoopNode`
+/// ANCHORS AT THE END OF THIS FILE OPEN. A unit is its fields AND its methods together, and three of
+/// this class's nine still cannot be written: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and
+/// `parametricStride` (`:4197`) read `DesignSpaceConfig::dataStageParam_` and `labeledDs_`
+/// (e027_DesignSpaceConfig), and `print` (`:4284`) prints `this` — a raw address (`:4288`).
 ///
-/// ⚠️ THE FIVE REMAINING `e031_LoopNode.*` ANCHORS NAME NOTHING THIS TYPE CAN CARRY: `Ddc`,
-/// `DesignSpaceConfig`, `ScheduleTree` and `ScheduleNode` are the four `friend class` declarations
-/// (`dsc/dsc2.h:611-614`), and `rowId` is `parametricIterCount`'s fourth PARAMETER, `int rowId = -1`
-/// (`:602`). They stay open because a deleted anchor cannot be told from a finished one.
+/// ⚠️ FIVE OF EACH ANCHOR SET NAME NOTHING THIS TYPE CAN CARRY: `Ddc`, `DesignSpaceConfig`,
+/// `ScheduleTree` and `ScheduleNode` are the four `friend class` declarations (`dsc/dsc2.h:611-614`),
+/// and `rowId` is `parametricIterCount`'s fourth PARAMETER, `int rowId = -1` (`:602`). They stay open
+/// because a deleted anchor cannot be told from a finished one.
 ///
-/// ⛔ WHEN `next_` LANDS, THE `Clone` DERIVE BELOW BECOMES A DIVERGENCE. IBM's `clone()` is
-/// `new Derived(static_cast<Derived const&>(*this))` (`util/utils.h:105-107`), i.e. the copy
+/// ⛔ AND THE `Clone` DERIVE IS EXACT ONLY BECAUSE [`BlockNode`] HAND-WRITES ITS OWN. IBM's `clone()`
+/// is `new Derived(static_cast<Derived const&>(*this))` (`util/utils.h:105-107`), i.e. the copy
 /// constructor, and `BlockNode::next_`'s copy constructor is EMPTY ON PURPOSE
-/// (`VectorOfChildren(const VectorOfChildren&) {}`, `dsc/dsc2.h:533-536`) — so cloning a loop,
-/// block or condition yields a node with NO CHILDREN and the caller re-inserts them. Both
-/// BlockNode-derived clone sites rely on it: `ddc/ddc_transformation.cpp:984-986` clones a loop and
-/// then `addChildNode`s one cloned child, and `ddc/ddc_transformation_util.cpp:580-588` clones a
-/// `ConditionNode` and then `addThenRegion`s a fresh block — which `DT_ERROR`s outright if `next_`
-/// is non-empty (`dsc/dsc2.cpp:2152-2155`). A derived deep `Clone` over an owning child list would
-/// therefore turn a working DDC path into a fatal error, not merely copy too much.
+/// (`VectorOfChildren(const VectorOfChildren&) {}`, `dsc/dsc2.h:533-536`) — so cloning a loop yields
+/// a loop with NO CHILDREN and the caller re-inserts them. `ddc/ddc_transformation.cpp:984-986` is
+/// that caller: it clones a loop and then `addChildNode`s one cloned child. Deriving `Clone` here
+/// reproduces it because [`BlockNode::clone`] drops the children and copies the rest.
 ///
 /// ⛔ THE THREE SHAPES BELOW ARE DISJOINT AND THIS TYPE CANNOT ENFORCE IT — IBM declares four
 /// independent fields and the JSON importer writes them one entry at a time
@@ -5101,9 +6266,18 @@ impl Default for CoordPropInfoType {
 /// (`ddc/ddl/ddl_conversion.h:409-410`). ⛔ TRAP: `LoopDistributionParamPerLoopType`, declared three
 /// lines above the per-node one, is NOT a loop key at all — it is keyed by `const PrimaryDimTypes`
 /// (`dsc/dsc2.h:1115-1116`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LoopNode {
+    /// The `BlockNode` subobject (`dsc/dsc2.h:563`), which is where a loop's CHILDREN live — the
+    /// loop body. ⭐ EVERY INTERIOR NODE OF A SCHEDULE TREE IS ONE OF THESE, and the tree's root is a
+    /// bare `LoopNode` with nothing above it (`ScheduleTree::head_`, `:623`).
+    ///
+    /// PUBLIC, because the authority's inheritance is public and its own code reaches straight
+    /// through: `scheduleTree_.getHeadMutable()->next_` (`dsc/dsc2.cpp:1389`) and
+    /// `loopNode->getNextView(comp)` (`ddc/ddcv1.cpp:3413`) are both a loop used as a block node.
+    pub base_class: BlockNode,
     /// Field: e031_LoopNode.numId_
+    /// Field: e034_LoopNode.numId_
     ///
     /// The numerator stage (`dsc/dsc2.h:573`). ⛔ `-1` IS ABSENT, AND A READER EITHER THROWS ON IT OR
     /// **MINTS** IT. The `.at()` readers throw (`dsc/dsc2.cpp:2995`, itself behind
@@ -5131,6 +6305,7 @@ pub struct LoopNode {
     /// that key as an `Option` is what keeps the two spellings one.
     pub num_id: Option<DataStageId>,
     /// Field: e031_LoopNode.denId_
+    /// Field: e034_LoopNode.denId_
     ///
     /// The denominator stage (`dsc/dsc2.h:574`). ⛔ NOT SYMMETRIC WITH [`num_id`](Self::num_id):
     /// this is the id with `>= 0` guards, and all three sit where the reader has climbed
@@ -5172,6 +6347,7 @@ pub struct LoopNode {
     /// `DT_CHECK(size() == 1)` on the bound is what fails (`SNControlFlowLowering.cpp:921-923`).
     pub loop_count_symbol_ids: BTreeMap<PrimaryDimTypes, Vec<VariableSymbol>>,
     /// Field: e031_LoopNode.isParametricLoop_
+    /// Field: e034_LoopNode.isParametricLoop_
     ///
     /// Private in IBM's declaration (`dsc/dsc2.h:617`) and ONE-WAY: `markAsParametricLoop` is the
     /// only writer tree-wide (`ddc/ddl/ddl_conversion.cpp:1128`, `dsc/dsc2.cpp:1412`) and nothing
@@ -5181,6 +6357,7 @@ pub struct LoopNode {
     /// and this stays private.
     is_parametric_loop: bool,
     /// Field: e031_LoopNode.parametricLdsIdx_
+    /// Field: e034_LoopNode.parametricLdsIdx_
     ///
     /// The reference tensor whose cumulative stick size along the loop dim IS the parametric loop's
     /// stride (`dsc/dsc2.h:618`, read at `dsc/dsc2.cpp:4198-4210`). ⛔ `-1` IS ABSENT and
@@ -5188,6 +6365,25 @@ pub struct LoopNode {
     /// reference tensor's `ldsIdx_` and rejects a tensor without one
     /// (`ddc/ddl/ddl_conversion.cpp:1155-1161`).
     parametric_lds_idx: Option<LdsIdx>,
+}
+
+impl Default for LoopNode {
+    /// `LoopNode() : BaseClass(LOOP) {}` (`dsc/dsc2.h:583`) over the authority's member initialisers
+    /// (`:573-578`). ⭐ THE TAG IS SET HERE, AND THAT IS WHAT MAKES IT UNFORGEABLE: the only public
+    /// route to a fresh loop is this one, so no caller can mint a `LoopNode` whose base says
+    /// `TRANSFER` — [`BlockNode::new`], the protected inherited constructor that takes a kind, is
+    /// module-private.
+    fn default() -> Self {
+        Self {
+            base_class: BlockNode::new(NodeType::Loop),
+            num_id: None,
+            den_id: None,
+            dims: Vec::new(),
+            loop_count_symbol_ids: BTreeMap::new(),
+            is_parametric_loop: false,
+            parametric_lds_idx: None,
+        }
+    }
 }
 
 impl LoopNode {
@@ -5246,6 +6442,135 @@ impl LoopNode {
     /// (`dsc/dsc2.cpp:1906-1914`).
     pub fn has_loop_dim(&self, dim: PrimaryDimTypes) -> bool {
         self.dims.iter().any(|d| d.dim == dim)
+    }
+}
+
+/// Replaces: e042_ScheduleTree
+/// Replaces: e032_ScheduleTree
+///
+/// `dsc2::ScheduleTree` (`dsc/dsc2.h:621-652`) — THE SCHEDULE. One object, one root, and every node
+/// of the program underneath it. `DesignSpaceConfig::scheduleTree_` (`dsc/designSpaceConfig.h:115`)
+/// is the only holder, and it is what bridge 1 walks to emit a program
+/// (`DSC2ToDataflowIR.cpp:262-263`, `:380`) and what the DDL conversion fills
+/// (`ddc/ddl/ddl_conversion.cpp:2779-2782`).
+///
+/// ⭐ THE NUMBER THAT MATTERS HANGS OFF THIS TYPE: IBM's 187 `g0` fixture trees hold 14,711 nodes,
+/// and every one of them is reached from here through [`BlockNode::children`].
+///
+/// ⛔ NO `Clone`, AND THAT IS THE AUTHORITY'S OWN REFUSAL MADE STATIC. `copyFrom` is
+/// `DT_ERROR("Not yet able to deep copy a schedule tree")` on any non-empty tree
+/// (`dsc/dsc2.cpp:2267-2281`) — the deep copy it would have performed is entirely commented out
+/// there, including its own `/// TODO: add update of pointers throughout the various nodes` — and
+/// `operator=` is `= delete` "so that copy needs to be more voluntary" (`dsc/dsc2.h:636-637`). The
+/// copy CONSTRUCTOR is the only route in and it forwards to `copyFrom` (`:633`), so a holder's
+/// implicit copy is exactly what aborts. ⚠️ AN EMPTY TREE DOES COPY THERE AND CANNOT HERE: the guard
+/// is `!oldTree.head_.next_.empty()`, so copying an empty one returns `*this` UNMODIFIED — it does
+/// not even clear the destination. Nothing tree-wide calls `copyFrom` and nothing copies a
+/// `DesignSpaceConfig`, so the divergence is a refusal nobody reaches, and a `Clone` that panicked on
+/// a non-empty tree would be a run-time refusal where this is a compile error.
+///
+/// ⛔ AND THE HEAD IS NEVER A VISITED NODE. `traverseTreeDFS` seeds its work list with `head_.next_`
+/// and never pushes `head_` itself (`dsc/dsc2.cpp:2224-2226`), so the root loop is a container for the
+/// program and not a loop in it — which is why [`Self::default`] leaves `numId_` absent and why
+/// [`LoopNode`] records that shape as one of its three.
+pub struct ScheduleTree {
+    /// Field: e042_ScheduleTree.head_
+    /// Field: e032_ScheduleTree.head_
+    ///
+    /// The root (`dsc/dsc2.h:623`). PRIVATE, as the authority's is — the only `private:` section in
+    /// this class — with [`Self::head`] and [`Self::head_mut`] the two public readings
+    /// (`:635-636`).
+    ///
+    /// ⭐ AND IT IS A `LoopNode` BY VALUE, NOT A POINTER: the tree always has a root, an empty tree is
+    /// a root with no children (`:625-626`), and every node in the program is owned transitively from
+    /// here. That is what makes [`Self::clear`] `head_.next_.clear()` (`:625`) and nothing else.
+    head: LoopNode,
+}
+
+impl Default for ScheduleTree {
+    /// `ScheduleTree() { head_.denId_ = 0; }` — the root's denominator is the CORE DATASTAGE, which is
+    /// what the authority's own trailing comment on that line says (`dsc/dsc2.h:629`).
+    ///
+    /// ⛔ AND `numId_` STAYS ABSENT, which is the head's whole shape: `denId_` alone. Every `>= 0`
+    /// guard on a climbed parent's numerator exists for it (`ddc/ddcv1.cpp:634`, `:645`).
+    fn default() -> Self {
+        Self {
+            head: LoopNode {
+                den_id: Some(DataStageId(0)),
+                ..LoopNode::default()
+            },
+        }
+    }
+}
+
+impl ScheduleTree {
+    /// `clear()` (`dsc/dsc2.h:625`): drop every node, keep the root. ⛔ IT DOES NOT RESET THE ROOT —
+    /// `denId_` and any `relevantComps_` set on the head survive, because only `next_` is cleared.
+    pub fn clear(&mut self) {
+        self.head.base_class.next.clear();
+    }
+
+    /// `empty()` (`dsc/dsc2.h:626`), which is the root having no children and says nothing about the
+    /// root itself. `copyFrom`'s refusal is gated on it (`dsc/dsc2.cpp:2277`).
+    pub fn is_empty(&self) -> bool {
+        self.head.base_class.next.is_empty()
+    }
+
+    /// `getHead()` (`dsc/dsc2.h:635`), read by the DDL conversion to find where to insert
+    /// (`ddc/ddl/ddl_conversion.cpp:2777`) and by the L3 scheduler's walkers
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1596`).
+    pub fn head(&self) -> &LoopNode {
+        &self.head
+    }
+
+    /// `getHeadMutable()` (`dsc/dsc2.h:636`), which is how every minting site attaches its node:
+    /// `scheduleTree_.getHeadMutable()->addChildNode(..)` (`ddc/ddl/ddl_conversion.cpp:2781`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3225`, `dsc/dsc2.cpp:1389`).
+    pub fn head_mut(&mut self) -> &mut LoopNode {
+        &mut self.head
+    }
+
+    /// `traverseTreeDFS()` with no start node (`dsc/dsc2.cpp:2222-2265`): every node of the tree in
+    /// pre-order, the root excluded. Bridge 1 collects a component's transfers this way
+    /// (`DSC2ToDataflowIR.cpp:262-263`) and the DDC its allocations (`ddc/ddcv1.cpp:3416-3417`).
+    ///
+    /// ⭐ ROOT EXCLUDED BECAUSE THE AUTHORITY SEEDS WITH `head_.next_` (`:2225`), so the head is the
+    /// only node of the tree no walk ever returns. Everything else about the walk — the relevance
+    /// pruning, the empty `nodeTypes` meaning "collect all", the dead `maxLoopDepth` — is
+    /// [`ChildNode::traverse_dfs`]'s, which this delegates to per root child.
+    pub fn traverse_dfs(&self, node_types: &[NodeType], comp: SenComponent) -> Vec<&ChildNode> {
+        let mut order = Vec::new();
+        for child in self.head.base_class.children() {
+            child.visit_dfs(node_types, comp, &[], &mut order);
+        }
+        order
+    }
+
+    /// `traverseTreeDFSMutable()` (`dsc/dsc2.cpp:2208-2220`), which is `traverseTreeDFS` with every
+    /// pointer `const_cast` back to mutable (`:2216`). Its live callers rename nodes
+    /// (`dsc/dsc2.cpp:2985-2992`), mark loops parametric (`ddc/ddcv1.cpp:2830-2831`) and rewrite
+    /// transfer offsets (`:441-442`).
+    ///
+    /// ⛔ IT IS A VISITOR, NOT A `Vec<&mut ChildNode>`, AND THAT IS THE ONE DIVERGENCE THIS METHOD
+    /// CARRIES. The authority hands back a flat list of mutable pointers ALIASING the tree it walked;
+    /// two of them can be held at once and one can be an ancestor of another, which is what a
+    /// `Vec<&mut _>` cannot be. Every live caller uses the list as a `for` loop over one node at a
+    /// time, so the visitor serves all of them — what it forbids is holding node `i` while touching
+    /// node `j`. ⚠️ AND THE INTERLEAVING DIFFERS: the authority walks the tree ONCE, collects, and
+    /// then the caller's loop runs, so a mutation cannot change what is visited; here the mutation
+    /// happens DURING the walk, so a `f` that adds children sees them. No live caller adds one —
+    /// `finalizeScheduleTree` writes `name_` (`dsc/dsc2.cpp:2988-2992`), `ddcv1` writes a flag and an
+    /// offset — and adding one through `f` is impossible anyway, because `f` receives the node and not
+    /// its parent.
+    pub fn for_each_dfs_mut(
+        &mut self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        mut f: impl FnMut(&mut ChildNode),
+    ) {
+        for child in self.head.base_class.next.iter_mut() {
+            child.visit_dfs_mut(node_types, comp, &mut f);
+        }
     }
 }
 
@@ -6556,8 +7881,10 @@ pub struct TransferRepetition {
 /// numbering, which listed ten of its fields; those are renumbered onto e034 below, and this batch
 /// adds `repetition_`, `paddingInfo_` and the four `DataInfo` operands.
 ///
-/// ⛔ THIS CARRIES SEVENTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED. The
-/// other three, with the reason:
+/// ⛔ THIS CARRIES SEVENTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND ITS BASE SUBOBJECT.
+/// `nodeType_`, `name_` and `relevantComps_` arrive through [`base_class`](Self::base_class)
+/// (`dsc/dsc2.h:460-461`, `:516`); `prev_` (`:515`) does not, because in an owning tree the parent is
+/// the [`BlockNode`] whose child list holds the node. The other three of its own, with the reason:
 ///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
 ///    `const LoopNode*` held as POINTER IDENTITY, which needs e029_ScheduleNode's `name_`, exactly as
 ///    `DataInfo::bufferSwitchPosition_` does;
@@ -6574,8 +7901,9 @@ pub struct TransferRepetition {
 ///    their line-sharing twins `srcLoopsAndSize_` and `dstLoopsAndSizes_` have no anchor either.
 ///
 /// ⭐ THE FIVE `DataInfo` PREDICATES AND `getTransferType` ARE HERE, because the four [`DataInfo`]
-/// fields they read landed with e033_DataInfo (`dsc/dsc2.h:867-896`). ⛔ ONLY `print` STAYS OUT: it
-/// prints `name_` (`dsc/dsc2.cpp:4385-4441`), which is e029_ScheduleNode's.
+/// fields they read landed with e033_DataInfo (`dsc/dsc2.h:867-896`). ⛔ ONLY `print` STAYS OUT, AND
+/// NOT FOR `name_`: it prints `this`, the node's own ADDRESS (`dsc/dsc2.cpp:4385-4389`), which no
+/// Rust value can reproduce. All three node `print`s do (`:4387`, `:4445`, `:4517`).
 ///
 /// ⛔ `dstVias_`, `dstLdsAndLoopOffsets_` AND [`TransferRepetition::dsts`] ARE THREE PARALLEL VECTORS
 /// ON ONE INDEX, and all three are now carried: the DDL conversion emplaces one of each per
@@ -6590,6 +7918,10 @@ pub struct TransferRepetition {
 /// [`clone`](Self::clone).
 #[derive(Debug)]
 pub struct TransferNode {
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:814`,
+    /// `InheritWithClone<ScheduleNode, TransferNode>`), tagged `TRANSFER` by `TransferNode()`
+    /// (`:815`). A transfer is a LEAF: it derives from `ScheduleNode` directly and owns no children.
+    pub base_class: ScheduleNode,
     /// Field: e034_TransferNode.src_
     ///
     /// Where the data comes from (`dsc/dsc2.h:824`), written by `setDataLocAndInfo`
@@ -6780,13 +8112,15 @@ impl Default for TransferNode {
     /// The authority's member initialisers (`dsc/dsc2.h:834`, `:837`, `:839`) over
     /// [`DataLocation`]'s own (`sys-arch-spec/arch_enums.h:390-391`).
     ///
-    /// ⛔ IT IS NOT `TransferNode()`: that constructor also passes `TRANSFER` to the base class
-    /// (`dsc/dsc2.h:815`), and `nodeType_` is `ScheduleNode`'s, e029_ScheduleNode's to port.
+    /// ⭐ AND IT IS `TransferNode()`, BASE TAG INCLUDED: that constructor passes `TRANSFER` to
+    /// `ScheduleNode` (`dsc/dsc2.h:815`), which is [`base_class`](TransferNode::base_class)'s
+    /// `nodeType_`.
     ///
     /// ⛔ AND ONE MEMBER HAS NO INITIALISER TO REPRODUCE: `repetition_.srcRep_` (`:827`) is left
     /// uninitialised by that constructor, which is what [`TransferRepetition::src`]'s [`None`] spells.
     fn default() -> Self {
         Self {
+            base_class: ScheduleNode::new(NodeType::Transfer),
             src: DataLocation::UNSET,
             src_indirect: DataLocation::UNSET,
             dst_vias: Vec::new(),
@@ -6829,6 +8163,7 @@ impl Clone for TransferNode {
     /// assignment was rejected as "copy assignment operator is implicitly deleted".
     fn clone(&self) -> Self {
         Self {
+            base_class: self.base_class.clone(),
             src: self.src,
             src_indirect: self.src_indirect,
             dst_vias: self.dst_vias.clone(),
@@ -7702,6 +9037,9 @@ pub struct ComputeCoreletView {
 /// fold pass then walks that pointer-keyed list (`ddc/ddc_fold.cpp:1688`).
 #[derive(Clone, Debug)]
 pub struct ComputeNode {
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:900`, `InheritWithClone<ScheduleNode, ComputeNode>`),
+    /// tagged `COMPUTE` by `ComputeNode()` (`:901`). A compute is a LEAF.
+    pub base_class: ScheduleNode,
     /// Field: e035_ComputeNode.exUnit_
     ///
     /// The execution unit the instruction issues on (`dsc/dsc2.h:932`). ⛔ A COMPUTE WHOSE OWN
@@ -7811,11 +9149,12 @@ pub struct ComputeNode {
 }
 
 impl Default for ComputeNode {
-    /// The authority's default member initializers (`dsc/dsc2.h:932-941`, `:950-954`). ⛔ WHAT IT
-    /// CANNOT SET IS THE BASE'S TAG: `ComputeNode()` passes `COMPUTE` to `ScheduleNode`
-    /// (`dsc/dsc2.h:901`), and that field is e029_ScheduleNode's.
+    /// The authority's default member initializers (`dsc/dsc2.h:932-941`, `:950-954`). ⭐ AND IT IS
+    /// `ComputeNode()`, BASE TAG INCLUDED: that constructor passes `COMPUTE` to `ScheduleNode`
+    /// (`dsc/dsc2.h:901`).
     fn default() -> Self {
         Self {
+            base_class: ScheduleNode::new(NodeType::Compute),
             ex_unit: SenComponent::NoComponent,
             r#type: ComputeOpType::Count,
             data_format: DataFormats::Sen169Fp16,
@@ -8077,18 +9416,29 @@ impl ComputeNode {
 /// exact pair of empties to the CONSTANT FALSE (`ddc/ddl/ddl_conversion.cpp:438-441`) before any node
 /// is minted.
 ///
-/// ⛔ THE `e044_ConditionNode` ANCHOR BELOW STAYS OPEN FOR THE EIGHT METHODS, every one of which
-/// reaches `next_`, e015's field, blocked on e013: `addChildNode` (which refuses anything but a
-/// `BLOCK` and any third child, `dsc/dsc2.cpp:2146-2148`), `addThenRegion` and `addElseRegion` (one
-/// refusal and two more, `:2153-2155`, `:2160-2165`), `getThenBranchNode`, `getElseBranchNode`,
-/// `getThenCoreCl`, `getElseCoreCl` and `getNextView`, which widens the base view to `ALL, -1, -1`
-/// whenever the guard is a loop condition (`:1995-2001`).
+/// ⭐ AND ALL EIGHT OF THIS CLASS'S METHODS NOW LAND, BECAUSE `next_` LANDED WITH IT. Each one
+/// reaches the child list, and the list is [`BlockNode`]'s: `addChildNode` (the `override` that
+/// refuses anything but a `BLOCK` and any third child, `dsc/dsc2.cpp:2143-2150`), `addThenRegion` and
+/// `addElseRegion` (one refusal and two more, `:2152-2155`, `:2157-2167`), `getThenBranchNode`,
+/// `getElseBranchNode`, `getThenCoreCl`, `getElseCoreCl` and `getNextView`, which widens the base
+/// view to `ALL, -1, -1` whenever the guard is a loop condition (`:1995-2001`).
 ///
-/// ⚠️ AND TWO OF THOSE EIGHT REFUSE BY THROWING, WHERE THE TWO BESIDE THEM ANSWER `nullptr`:
-/// `getThenCoreCl` is `next_.at(0)` and `getElseCoreCl` is `next_.at(1)` (`dsc/dsc2.cpp:2004-2011`)
-/// over a `VectorOfChildren` deriving from `std::vector` (`dsc/dsc2.h:529`), so each throws
-/// `std::out_of_range` on the very node `getThenBranchNode`/`getElseBranchNode` report absent
-/// (`:707-718`). A port of the four takes the branch handles, never an index.
+/// ⛔ AND THE HEADER'S "max 2 children in next_, of type BLOCK" (`dsc/dsc2.h:687-688`) IS A TYPE HERE
+/// RATHER THAN A COMMENT: [`Self::add_child_node`] takes a [`BlockNode`] BY VALUE, and it is the only
+/// mutable route to this node's children — [`ChildNode::as_block_mut`] refuses a condition node
+/// precisely so that `BlockNode`'s own non-virtual `moveChildren` and
+/// `insertPerfectlyNestedBlockNode` cannot reach one and put a third, non-block child in.
+///
+/// ⚠️ AND TWO OF THE EIGHT REFUSE BY THROWING IN THE AUTHORITY, WHERE THE TWO BESIDE THEM ANSWER
+/// `nullptr`: `getThenCoreCl` is `next_.at(0)` and `getElseCoreCl` is `next_.at(1)`
+/// (`dsc/dsc2.cpp:2004-2011`) over a `VectorOfChildren` deriving from `std::vector`
+/// (`dsc/dsc2.h:529`), so each throws `std::out_of_range` on the very node
+/// `getThenBranchNode`/`getElseBranchNode` report absent (`:707-718`). ⛔ AND BRIDGE 1 REACHES THE
+/// `at(1)` UNGUARDED: `DSC2ToDataflowIR.cpp:144-146` calls `getThenCoreCl` and `getElseCoreCl` in
+/// consecutive statements behind nothing but `DT_CHECK_MSG(1 <= num_regions && num_regions <= 2)`, so
+/// a ONE-region condition node throws there — while the V3 lowering of the same read guards it with
+/// `if (max_num_regions == 2)` (`SNControlFlowLowering.cpp:1116`). [`Self::then_core_cl`] and
+/// [`Self::else_core_cl`] answer [`None`], which is what the guarded site tests for.
 ///
 /// ⚠️ AND THE SCHEDULER'S FOUR FIELD ANCHORS FOR THIS UNIT NAME ONE FIELD: `loopCond_`, beside
 /// `comp`, `coreId` and `siblingRefNode`, which are method-signature continuations of the class
@@ -8099,8 +9449,18 @@ impl ComputeNode {
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
 /// `InheritWithClone` (`:685`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ConditionNode {
+    /// The `BlockNode` subobject (`dsc/dsc2.h:685`), holding the at most two region blocks.
+    ///
+    /// PRIVATE, WHERE [`LoopNode`]'S IS PUBLIC, and that is the whole enforcement of this class's
+    /// two-child rule: `BlockNode::addChildNode` is `virtual` so the authority's override is reached
+    /// through a `BlockNode*` (`dsc/dsc2.h:544`, `:697`), but `moveChildren` and
+    /// `insertPerfectlyNestedBlockNode` are NOT overridden, and a `BlockNode::addChildNode(..)`
+    /// qualified call bypasses the override outright — three routes that put a third or a non-block
+    /// child into a condition node there and none of which exist here. [`Self::base`] is the public
+    /// read-only conversion, which is what the ~25 sites holding a `const BlockNode*` need.
+    base_class: BlockNode,
     /// Field: e044_ConditionNode.loopCond_
     ///
     /// The loop guard (`dsc/dsc2.h:690`), ABSENT exactly when this node's condition is the
@@ -8142,6 +9502,18 @@ pub struct ConditionNode {
     pub core_cl_cond: BTreeMap<CoreId, BTreeSet<CoreletId>>,
 }
 
+impl Default for ConditionNode {
+    /// `ConditionNode() : BaseClass(CONDITION) {}` (`dsc/dsc2.h:686`) over an empty composite and an
+    /// empty map (`:690-692`).
+    fn default() -> Self {
+        Self {
+            base_class: BlockNode::new(NodeType::Condition),
+            loop_cond: None,
+            core_cl_cond: BTreeMap::new(),
+        }
+    }
+}
+
 impl ConditionNode {
     /// `hasCoreClCond()` (`dsc/dsc2.h:693-695`): WHICH of the two guards this node carries, answered
     /// off the loop side alone. Nine live sites read it — `getNextView` (`dsc/dsc2.cpp:1998`),
@@ -8153,9 +9525,146 @@ impl ConditionNode {
     pub fn has_core_cl_cond(&self) -> bool {
         self.loop_cond.is_none()
     }
-}
 
-// crustify:todo: e044_ConditionNode
+    /// The public `BlockNode` base (`dsc/dsc2.h:685`) — the conversion every site holding a
+    /// `const BlockNode*` performs, and the read-only half of
+    /// [`base_class`](ConditionNode::base_class).
+    pub fn base(&self) -> &BlockNode {
+        &self.base_class
+    }
+
+    /// The mutable base, MODULE-PRIVATE so that `BlockNode`'s own child operations cannot be reached
+    /// on a condition node — see [`base_class`](ConditionNode::base_class).
+    fn base_mut(&mut self) -> &mut BlockNode {
+        &mut self.base_class
+    }
+
+    /// The region list by value, for [`ChildNode::children_mut`] alone.
+    fn children_mut(&mut self) -> &mut Vec<ChildNode> {
+        &mut self.base_class.next
+    }
+
+    /// `ConditionNode::addChildNode` (`dsc/dsc2.h:697`, body `dsc/dsc2.cpp:2143-2151`), the `override`
+    /// that narrows `BlockNode`'s to two `BLOCK`s.
+    ///
+    /// ⭐ THE `nodeType_ != BLOCK` HALF OF THAT REFUSAL IS THE PARAMETER TYPE: a [`BlockNode`] by
+    /// value cannot be a transfer. What remains at run time is the count, and it hands the node back
+    /// exactly as [`BlockNode::add_child_node`] does.
+    ///
+    /// ⚠️ IT KEEPS THE [`InsertionPoint`] THE OVERRIDE TAKES, so the "else" region can still be
+    /// inserted BEFORE the "then" one — the authority's signature allows it (`dsc/dsc2.h:697-698`) and
+    /// the positional readings at `:707-718` are what would then disagree with the caller's intent.
+    /// Both region helpers below pass [`InsertionPoint::Back`], which is the default the authority's
+    /// own `addChildNode(nodeToAdd)` calls supply (`dsc/dsc2.cpp:2155`, `:2166`).
+    #[must_use = "a refused insertion hands the node back and it is lost if dropped"]
+    pub fn add_child_node(&mut self, at: InsertionPoint, node: BlockNode) -> Option<BlockNode> {
+        if self.base_class.next.len() >= 2 {
+            return Some(node);
+        }
+        let Some(index) = self.base_class.insertion_point(at) else {
+            return Some(node);
+        };
+        self.base_class.next.insert(index, ChildNode::Block(node));
+        None
+    }
+
+    /// `addThenRegion` (`dsc/dsc2.cpp:2152-2156`): the FIRST region, refused once one exists. Its
+    /// callers build a conditional around code they are about to move
+    /// (`ddc/ddc_transformation_util.cpp:265`, `:588`, `ddc/ddl/ddl_conversion.cpp:1745`).
+    ///
+    /// ⭐ AND `ddc/ddc_transformation_util.cpp:580-588` IS WHY [`BlockNode::clone`] MUST DROP THE
+    /// CHILDREN: it clones a condition node and then calls this on the clone, which the authority
+    /// refuses outright if the clone kept its regions.
+    #[must_use = "a refused insertion hands the node back and it is lost if dropped"]
+    pub fn add_then_region(&mut self, node: BlockNode) -> Option<BlockNode> {
+        if !self.base_class.next.is_empty() {
+            return Some(node);
+        }
+        self.add_child_node(InsertionPoint::Back, node)
+    }
+
+    /// `addElseRegion` (`dsc/dsc2.cpp:2158-2167`): the SECOND region, refused both when one already
+    /// exists and when the "then" region does not (`:2159-2165`) — two `DT_ERROR`s with one answer
+    /// here, because `next_.size() != 1` is exactly their union and neither leaves the node changed.
+    #[must_use = "a refused insertion hands the node back and it is lost if dropped"]
+    pub fn add_else_region(&mut self, node: BlockNode) -> Option<BlockNode> {
+        if self.base_class.next.len() != 1 {
+            return Some(node);
+        }
+        self.add_child_node(InsertionPoint::Back, node)
+    }
+
+    /// `getThenBranchNode()` (`dsc/dsc2.h:707-712`): `next_[0]`, absent on an empty node. Bridge 1
+    /// emits the region's body from it (`SNControlFlowLowering.cpp:1096`) and the DDC reads it to
+    /// decide whether a transfer is inside the guarded half (`ddc/ddc_transformation_util.cpp:326`).
+    pub fn then_branch(&self) -> Option<&ChildNode> {
+        self.base_class.next.first()
+    }
+
+    /// `getElseBranchNode()` (`dsc/dsc2.h:713-718`): `next_[1]`, absent on a node with fewer than two
+    /// regions — which is the common shape, since a condition with no else region is one child
+    /// (`ddc/ddl/ddl_conversion.cpp:1745`).
+    pub fn else_branch(&self) -> Option<&ChildNode> {
+        self.base_class.next.get(1)
+    }
+
+    /// `getThenCoreCl(comp)` (`dsc/dsc2.cpp:2003-2006`): the cores and corelets the "then" region is
+    /// relevant to, which is that CHILD's `getRelevantCoreCl(comp)` and not this node's
+    /// `coreClCond_` — the two agree only after `setRelevantCompCoreCl` has intersected one into the
+    /// other (`:2663-2683`). [`None`] is the `next_.at(0)` throw.
+    pub fn then_core_cl(
+        &self,
+        comp: SenComponent,
+    ) -> Option<BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        self.then_branch()
+            .map(|node| node.base().relevant_core_cl_of_comp(comp))
+    }
+
+    /// `getElseCoreCl(comp)` (`dsc/dsc2.cpp:2007-2011`). [`None`] is the `next_.at(1)` throw — the one
+    /// bridge 1 reaches unguarded at `DSC2ToDataflowIR.cpp:146`.
+    pub fn else_core_cl(
+        &self,
+        comp: SenComponent,
+    ) -> Option<BTreeMap<CoreId, BTreeSet<CoreletId>>> {
+        self.else_branch()
+            .map(|node| node.base().relevant_core_cl_of_comp(comp))
+    }
+
+    /// `ConditionNode::getNextView(comp)` (`dsc/dsc2.cpp:1995-2002`).
+    ///
+    /// ⛔ A LOOP-GUARDED CONDITION NODE RETURNS BOTH REGIONS TO EVERY COMPONENT — "always return both
+    /// children for loop cond" (`:1998`) — by delegating with `ALL, -1, -1` and DISCARDING the
+    /// caller's filter. A core/corelet-guarded one filters normally.
+    ///
+    /// ⛔ AND THIS METHOD IS NOT `virtual`, WHICH IS LOAD-BEARING: `BlockNode::getNextView`
+    /// (`dsc/dsc2.h:541-543`) and this one (`:701-703`) are two unrelated functions, so a caller
+    /// holding a `BlockNode*` gets the FILTERED reading even on a condition node. Rust's static method
+    /// resolution reproduces that exactly — [`BlockNode::next_view`] through [`Self::base`], this one
+    /// through the node itself.
+    pub fn next_view(&self, comp: SenComponent) -> Vec<&ChildNode> {
+        if self.has_core_cl_cond() {
+            self.base_class.next_view(comp)
+        } else {
+            self.base_class.next_view(SenComponent::All)
+        }
+    }
+
+    /// `ConditionNode::getNextView(comp, clId, coreId)` with a real core
+    /// (`dsc/dsc2.cpp:1995-2002`), the form bridge 1's control-flow lowering calls per program unit
+    /// (`SNControlFlowLowering.cpp:1213`). The loop-guarded arm discards all three filters, as above.
+    pub fn next_view_of_corelet(
+        &self,
+        comp: SenComponent,
+        core: CoreId,
+        corelet: Option<CoreletId>,
+    ) -> Vec<&ChildNode> {
+        if self.has_core_cl_cond() {
+            self.base_class.next_view_of_corelet(comp, core, corelet)
+        } else {
+            self.base_class.next_view(SenComponent::All)
+        }
+    }
+}
 
 /// Replaces: e036_SyncNode
 ///
@@ -8184,8 +9693,11 @@ impl ConditionNode {
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer, and here it is what links the
 /// ends. `Clone` is IBM's own, through `InheritWithClone` (`:964`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SyncNode {
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:964`, `InheritWithClone<ScheduleNode, SyncNode>`),
+    /// tagged `SYNC` by `SyncNode()` (`:965`). A sync is a LEAF.
+    pub base_class: ScheduleNode,
     /// Field: e036_SyncNode.units_
     ///
     /// "all to all signals" (`dsc/dsc2.h:966`): every unit this end signals to or waits on.
@@ -8246,6 +9758,20 @@ pub struct SyncNode {
     /// ⚠️ THE SCHEDULER LISTED NO ANCHOR FOR IT: it is declared on the same line as
     /// [`is_receive`](Self::is_receive), and that bridge-1 read is on this campaign's path.
     pub is_soft: bool,
+}
+
+impl Default for SyncNode {
+    /// `SyncNode() : BaseClass(SYNC) {}` (`dsc/dsc2.h:965`) over the authority's member initialisers
+    /// (`:966-967`). ⛔ HAND-WRITTEN RATHER THAN DERIVED, because a derived one would leave the base's
+    /// tag `INVALID` — the kind a node of this class can never have.
+    fn default() -> Self {
+        Self {
+            base_class: ScheduleNode::new(NodeType::Sync),
+            units: BTreeSet::new(),
+            is_receive: false,
+            is_soft: false,
+        }
+    }
 }
 
 // crustify:todo: e036_SyncNode
@@ -8388,6 +9914,10 @@ pub struct StickMaskView {
 /// `InheritWithClone` (`:1059`), and the DDC leans on it for the reset copy (`ddc/ddcv1.cpp:3663`).
 #[derive(Clone, Debug)]
 pub struct StickMaskNode {
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:1059`,
+    /// `InheritWithClone<ScheduleNode, StickMaskNode>`), tagged `STICKMASK` by `StickMaskNode()`
+    /// (`:1060`). A stick mask is a LEAF.
+    pub base_class: ScheduleNode,
     /// Field: e027_StickMaskNode.maskValConstId_
     /// Field: e040_StickMaskNode.maskValConstId_
     ///
@@ -8431,11 +9961,12 @@ pub struct StickMaskNode {
     pub first_stick_coord_to_mask_per_dim: BTreeMap<PrimaryDimTypes, StickCoord>,
 }
 
-/// `dsc/dsc2.h:1061-1062`: the mask value is absent and the precision is `INVALID`, unlike
-/// [`DataFormats`]' own default.
+/// `dsc/dsc2.h:1060-1062`: the base is tagged `STICKMASK` by `StickMaskNode()`, the mask value is
+/// absent and the precision is `INVALID`, unlike [`DataFormats`]' own default.
 impl Default for StickMaskNode {
     fn default() -> Self {
         Self {
+            base_class: ScheduleNode::new(NodeType::StickMask),
             mask_val_const_id: None,
             data_format: DataFormats::Invalid,
             stick_layout: Vec::new(),
@@ -8861,6 +10392,10 @@ pub struct StickSpread(pub i32);
 /// (`:974`).
 #[derive(Clone, Debug)]
 pub struct AllocateNode {
+    /// The `ScheduleNode` subobject (`dsc/dsc2.h:974`,
+    /// `InheritWithClone<ScheduleNode, AllocateNode>`), tagged `ALLOCATE` by `AllocateNode()`
+    /// (`:975`). An allocate is a LEAF.
+    pub base_class: ScheduleNode,
     /// Field: e028_AllocateNode.ldsIdx_
     ///
     /// Field: e037_AllocateNode.ldsIdx_
@@ -9162,10 +10697,11 @@ pub struct AllocateNode {
 impl Default for AllocateNode {
     /// The authority's member initialisers (`dsc/dsc2.h:976-1005`).
     ///
-    /// ⛔ IT IS NOT `AllocateNode()`: that constructor also passes `ALLOCATE` to the base class
-    /// (`dsc/dsc2.h:975`), and `nodeType_` is `ScheduleNode`'s, e013's to port.
+    /// ⭐ AND IT IS `AllocateNode()`, BASE TAG INCLUDED: that constructor passes `ALLOCATE` to
+    /// `ScheduleNode` (`dsc/dsc2.h:975`).
     fn default() -> Self {
         Self {
+            base_class: ScheduleNode::new(NodeType::Allocate),
             lds_idx: None,
             const_idx: None,
             component: SenComponent::NoComponent,
@@ -12312,11 +13848,972 @@ mod equivalence {
         assert!(!reverse.scale_down, "so the reverse walk is unscaled");
         assert!(reverse.dims_to_propagate.is_empty());
     }
+
+    // ======================================================== the schedule tree (e004, e034, e042)
+
+    use crate::schedule::dims::MetaDimKind;
+
+    /// FNV-1a 64 over one canonical, `'\n'`-terminated line per case, with the same seed and the same
+    /// line text on the C++ side. One instance per SECTION rather than one for the whole sweep,
+    /// because four of the eleven sections the authority was run under are not expressible here — see
+    /// [`e042_the_depth_first_walk_agrees_with_the_executed_authority`].
+    struct SectionDigest {
+        hash: u64,
+        cases: u64,
+    }
+
+    impl SectionDigest {
+        fn new() -> Self {
+            Self {
+                hash: 1_469_598_103_934_665_603,
+                cases: 0,
+            }
+        }
+
+        fn feed(&mut self, line: &str) {
+            for byte in line.bytes().chain(std::iter::once(b'\n')) {
+                self.hash ^= u64::from(byte);
+                self.hash = self.hash.wrapping_mul(1_099_511_628_211);
+            }
+            self.cases += 1;
+        }
+    }
+
+    /// One node's `relevantComps_`, as the C++ harness spells it: component, then core, then that
+    /// core's corelets. An EMPTY corelet list is a real state and the fixture uses one.
+    type TreeRel = &'static [(SenComponent, &'static [(u8, &'static [u8])])];
+
+    /// `n->name_ = name` followed by `DesignSpaceConfig::setRelevantComps(n, rel)`, which is
+    /// `relevantComps_ = r` on the friend class (`dsc/dsc2.h:519`, `dsc/designSpaceConfig.h:262`).
+    fn tree_name_rel(base: &mut ScheduleNode, name: &str, rel: TreeRel) {
+        base.name = name.to_owned();
+        let comps = base.relevant_comps_mut();
+        for (comp, cores) in rel {
+            let entry = comps.entry(*comp).or_default();
+            for (core, corelets) in *cores {
+                entry.insert(
+                    CoreId(*core),
+                    corelets.iter().copied().map(CoreletId).collect(),
+                );
+            }
+        }
+    }
+
+    fn tree_block(name: &str, rel: TreeRel) -> BlockNode {
+        let mut node = BlockNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        node
+    }
+
+    /// `Fixture::mkLoop(dims, num, den)` — `new LoopNode()` with `dims_`, `numId_` and `denId_`
+    /// written afterwards, which is what [`LoopNode::new`] takes up front.
+    fn tree_loop(
+        name: &str,
+        rel: TreeRel,
+        dims: &[(PrimaryDimTypes, MetaDimKind)],
+        num: i32,
+        den: i32,
+    ) -> LoopNode {
+        let mut node = LoopNode::new(
+            Some(DataStageId(num)),
+            Some(DataStageId(den)),
+            dims.iter()
+                .map(|(dim, kind)| PrimaryDimAndKind::new(*dim, *kind))
+                .collect(),
+            false,
+        );
+        tree_name_rel(&mut node.base_class.base_class, name, rel);
+        node
+    }
+
+    fn tree_transfer(name: &str, rel: TreeRel) -> ChildNode {
+        let mut node = TransferNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        ChildNode::Transfer(node)
+    }
+
+    fn tree_compute(name: &str, rel: TreeRel) -> ChildNode {
+        let mut node = ComputeNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        ChildNode::Compute(node)
+    }
+
+    fn tree_sync(name: &str, rel: TreeRel) -> ChildNode {
+        let mut node = SyncNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        ChildNode::Sync(node)
+    }
+
+    fn tree_allocate(name: &str, rel: TreeRel) -> ChildNode {
+        let mut node = AllocateNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        ChildNode::Allocate(node)
+    }
+
+    fn tree_stick_mask(name: &str, rel: TreeRel) -> ChildNode {
+        let mut node = StickMaskNode::default();
+        tree_name_rel(&mut node.base_class, name, rel);
+        ChildNode::StickMask(node)
+    }
+
+    /// `addChildNode(node)` with both defaults, i.e. `next_.end()` (`dsc/dsc2.cpp:2013-2029`).
+    fn tree_push(parent: &mut BlockNode, child: ChildNode) {
+        assert!(
+            parent.add_child_node(InsertionPoint::Back, child).is_none(),
+            "a Back insertion is always in range"
+        );
+    }
+
+    /// The C++ harness's one fixture, built through `addChildNode` only:
+    ///
+    /// ```text
+    /// head[den=0]
+    ///   L1(LOOP {X,Unpadded})        LX{0:{0,1}} L0{0:{0},1:{0}} PE{0:{0,1}}
+    ///     t1(TRANSFER)               LX{0:{0,1}} L0{1:{0}}
+    ///     B1(BLOCK)                  LX{0:{0}}   PE{0:{0,1}}
+    ///       c1(COMPUTE)              PE{0:{0,1}}
+    ///       L2(LOOP {Y,Padded})      LX{1:{1}}   L0{0:{}}
+    ///         t2(TRANSFER)           LX{1:{1}}
+    ///         s1(SYNC)               L0{0:{}}    <- a core with an EMPTY corelet set
+    ///     C1(CONDITION)              LX{0:{0,1}}, coreClCond_ {0:{0}}
+    ///       Bt(BLOCK)                LX{0:{0}}
+    ///         a1(ALLOCATE)           LX{0:{0}}
+    ///       Be(BLOCK)                LX{0:{1}}
+    ///         m1(STICKMASK)          LX{0:{1}}
+    ///   L3(LOOP {X,PadFront} {Y,Unpadded})  PE{1:{0}}
+    ///     c2(COMPUTE)                PE{1:{0}}
+    /// ```
+    ///
+    /// ⛔ BUILT BOTTOM-UP WHERE THE C++ BUILDS TOP-DOWN, and that is forced rather than stylistic:
+    /// the authority holds a raw `BlockNode*` to a node it has already handed to a parent, which is
+    /// exactly the second owner an owning `Vec<ChildNode>` refuses. The tree it produces is the same
+    /// one — every case below prints it.
+    fn tree_fixture() -> ScheduleTree {
+        let mut l2 = tree_loop(
+            "L2",
+            &[
+                (SenComponent::Lx, &[(1, &[1])]),
+                (SenComponent::L0, &[(0, &[])]),
+            ],
+            &[(PrimaryDimTypes::Y, MetaDimKind::Padded)],
+            2,
+            1,
+        );
+        tree_push(
+            &mut l2.base_class,
+            tree_transfer("t2", &[(SenComponent::Lx, &[(1, &[1])])]),
+        );
+        tree_push(
+            &mut l2.base_class,
+            tree_sync("s1", &[(SenComponent::L0, &[(0, &[])])]),
+        );
+
+        let mut b1 = tree_block(
+            "B1",
+            &[
+                (SenComponent::Lx, &[(0, &[0])]),
+                (SenComponent::Pe, &[(0, &[0, 1])]),
+            ],
+        );
+        tree_push(
+            &mut b1,
+            tree_compute("c1", &[(SenComponent::Pe, &[(0, &[0, 1])])]),
+        );
+        tree_push(&mut b1, ChildNode::Loop(l2));
+
+        let mut bt = tree_block("Bt", &[(SenComponent::Lx, &[(0, &[0])])]);
+        tree_push(
+            &mut bt,
+            tree_allocate("a1", &[(SenComponent::Lx, &[(0, &[0])])]),
+        );
+        let mut be = tree_block("Be", &[(SenComponent::Lx, &[(0, &[1])])]);
+        tree_push(
+            &mut be,
+            tree_stick_mask("m1", &[(SenComponent::Lx, &[(0, &[1])])]),
+        );
+
+        let mut c1 = ConditionNode::default();
+        tree_name_rel(
+            &mut c1.base_mut().base_class,
+            "C1",
+            &[(SenComponent::Lx, &[(0, &[0, 1])])],
+        );
+        c1.core_cl_cond = BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]);
+        assert!(
+            c1.add_then_region(bt).is_none(),
+            "C1 has no then region yet"
+        );
+        assert!(
+            c1.add_else_region(be).is_none(),
+            "C1 has exactly one region"
+        );
+
+        let mut l1 = tree_loop(
+            "L1",
+            &[
+                (SenComponent::Lx, &[(0, &[0, 1])]),
+                (SenComponent::L0, &[(0, &[0]), (1, &[0])]),
+                (SenComponent::Pe, &[(0, &[0, 1])]),
+            ],
+            &[(PrimaryDimTypes::X, MetaDimKind::Unpadded)],
+            1,
+            0,
+        );
+        tree_push(
+            &mut l1.base_class,
+            tree_transfer(
+                "t1",
+                &[
+                    (SenComponent::Lx, &[(0, &[0, 1])]),
+                    (SenComponent::L0, &[(1, &[0])]),
+                ],
+            ),
+        );
+        tree_push(&mut l1.base_class, ChildNode::Block(b1));
+        tree_push(&mut l1.base_class, ChildNode::Condition(c1));
+
+        let mut l3 = tree_loop(
+            "L3",
+            &[(SenComponent::Pe, &[(1, &[0])])],
+            &[
+                (PrimaryDimTypes::X, MetaDimKind::PadFront),
+                (PrimaryDimTypes::Y, MetaDimKind::Unpadded),
+            ],
+            3,
+            0,
+        );
+        tree_push(
+            &mut l3.base_class,
+            tree_compute("c2", &[(SenComponent::Pe, &[(1, &[0])])]),
+        );
+
+        let mut tree = ScheduleTree::default();
+        tree_name_rel(
+            &mut tree.head_mut().base_class.base_class,
+            "head",
+            &[
+                (SenComponent::Lx, &[(0, &[0, 1])]),
+                (SenComponent::L0, &[(0, &[0]), (1, &[0])]),
+                (SenComponent::Pe, &[(0, &[0, 1]), (1, &[0])]),
+            ],
+        );
+        tree_push(&mut tree.head_mut().base_class, ChildNode::Loop(l1));
+        tree_push(&mut tree.head_mut().base_class, ChildNode::Loop(l3));
+        tree
+    }
+
+    /// The fixture's `by_name` map, as a search rather than a table of raw pointers.
+    fn tree_find<'tree>(tree: &'tree ScheduleTree, name: &str) -> &'tree ChildNode {
+        fn search<'a>(children: &'a [ChildNode], name: &str) -> Option<&'a ChildNode> {
+            for child in children {
+                if child.base().name == name {
+                    return Some(child);
+                }
+                if let Some(found) = child
+                    .as_block()
+                    .and_then(|block| search(block.children(), name))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        search(tree.head().base_class.children(), name).expect("the fixture names every node")
+    }
+
+    /// ⛔ `ChildNode::as_block_mut` STOPS AT A CONDITION NODE where [`ChildNode::as_block`] does not,
+    /// because the condition node's base is private for the reason [`ConditionNode`] records — so this
+    /// walk names the three block-bearing variants itself. `head` is not a `ChildNode` at all: it is
+    /// the tree's own `LoopNode` member.
+    fn tree_find_block_mut<'tree>(
+        tree: &'tree mut ScheduleTree,
+        name: &str,
+    ) -> &'tree mut BlockNode {
+        fn block_of(child: &mut ChildNode) -> Option<&mut BlockNode> {
+            match child {
+                ChildNode::Block(node) => Some(node),
+                ChildNode::Loop(node) => Some(&mut node.base_class),
+                ChildNode::Condition(node) => Some(node.base_mut()),
+                _ => None,
+            }
+        }
+        fn search<'a>(children: &'a mut [ChildNode], name: &str) -> Option<&'a mut BlockNode> {
+            for child in children {
+                let matched = child.base().name == name;
+                let Some(block) = block_of(child) else {
+                    continue;
+                };
+                if matched {
+                    return Some(block);
+                }
+                if let Some(found) = search(block.next.as_mut_slice(), name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        if name == "head" {
+            return &mut tree.head_mut().base_class;
+        }
+        search(tree.head_mut().base_class.next.as_mut_slice(), name)
+            .expect("the fixture names every block node")
+    }
+
+    fn tree_find_condition_mut<'tree>(
+        tree: &'tree mut ScheduleTree,
+        name: &str,
+    ) -> &'tree mut ConditionNode {
+        fn search<'a>(children: &'a mut [ChildNode], name: &str) -> Option<&'a mut ConditionNode> {
+            for child in children {
+                if child.base().name == name {
+                    return child.as_condition_mut();
+                }
+                let Some(kids) = child.children_mut() else {
+                    continue;
+                };
+                if let Some(found) = search(kids.as_mut_slice(), name) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        search(tree.head_mut().base_class.next.as_mut_slice(), name)
+            .expect("the fixture names one condition node")
+    }
+
+    /// `joinNames` — the visited names, comma-separated, `-` when nothing was visited.
+    fn tree_join(nodes: &[&ChildNode]) -> String {
+        if nodes.is_empty() {
+            return "-".to_owned();
+        }
+        nodes
+            .iter()
+            .map(|node| node.base().name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// `shapeSOf` — the whole tree as ` parent>child[kind]` pairs in child order, `-` when empty.
+    /// ⛔ NO `prev=` COLUMN, which is the reason the sections are digested separately: the C++
+    /// harness's whole-tree print carries the parent pointer and this type has none.
+    fn tree_shape(tree: &ScheduleTree) -> String {
+        fn walk(parent: &BlockNode, out: &mut String) {
+            for child in parent.children() {
+                out.push_str(&format!(
+                    " {}>{}[{}]",
+                    parent.base_class.name,
+                    child.base().name,
+                    child.node_type().name()
+                ));
+                if let Some(block) = child.as_block() {
+                    walk(block, out);
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&tree.head().base_class, &mut out);
+        if out.is_empty() { " -".to_owned() } else { out }
+    }
+
+    /// `coreClStr` — `<core>:{<corelets>}` per core, `{}` when the map is empty.
+    fn tree_core_cl(core_cl: &BTreeMap<CoreId, BTreeSet<CoreletId>>) -> String {
+        if core_cl.is_empty() {
+            return "{}".to_owned();
+        }
+        let mut out = String::new();
+        for (core, corelets) in core_cl {
+            out.push_str(&format!("{}:{{", core.0));
+            out.push_str(
+                &corelets
+                    .iter()
+                    .map(|corelet| corelet.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            out.push('}');
+        }
+        out
+    }
+
+    /// `getThenCoreCl`/`getElseCoreCl` are `next_.at(0)`/`.at(1)`, so the absent branch is
+    /// `std::out_of_range` there and [`Option::None`] here.
+    fn tree_opt_core_cl(core_cl: Option<BTreeMap<CoreId, BTreeSet<CoreletId>>>) -> String {
+        match core_cl {
+            Some(core_cl) => tree_core_cl(&core_cl),
+            None => "OUT_OF_RANGE".to_owned(),
+        }
+    }
+
+    /// `getThenBranchNode`/`getElseBranchNode` answer `nullptr` for the very state the two above
+    /// throw on (`dsc/dsc2.h:707-718`), which `nameOf` prints as `-`.
+    fn tree_branch_name(branch: Option<&ChildNode>) -> String {
+        match branch {
+            Some(node) => node.base().name.clone(),
+            None => "-".to_owned(),
+        }
+    }
+
+    /// The `cond` section's seed: a fresh condition node with `existing` BLOCK children already in
+    /// place, inserted through the override itself because that is what the C++ harness's
+    /// `static_cast<BlockNode&>(c).addChildNode(r)` reaches — `addChildNode` IS virtual
+    /// (`dsc/dsc2.h:535`, overridden `:697`), so the cast changes the overload set and not the body.
+    fn tree_condition(existing: usize) -> ConditionNode {
+        const REGION_RELS: [TreeRel; 2] = [
+            &[(SenComponent::Lx, &[(0, &[0])])],
+            &[
+                (SenComponent::Lx, &[(0, &[1])]),
+                (SenComponent::Pe, &[(1, &[0, 1])]),
+            ],
+        ];
+        let mut cond = ConditionNode::default();
+        cond.base_mut().base_class.name = "C".to_owned();
+        cond.core_cl_cond = BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]);
+        for (index, rel) in REGION_RELS.into_iter().take(existing).enumerate() {
+            let mut region = BlockNode::default();
+            tree_name_rel(&mut region.base_class, &format!("R{index}"), rel);
+            assert!(
+                cond.add_child_node(InsertionPoint::Back, region).is_none(),
+                "the seed never exceeds two regions"
+            );
+        }
+        cond
+    }
+
+    /// One loop-guarded condition, which is all `getNextView`'s second dispatch reads: the C++ side
+    /// pushes one clause into `loopCond_.twoLevelOrOfAnds_` and the printed view does not name it.
+    fn tree_loop_guard() -> LoopCondComposite {
+        LoopCondComposite::from(LoopCondDisjunction::new(LoopCondConjunction::new(
+            LoopCond {
+                dim: PrimaryDimTypes::X,
+                cond_op: LoopCondOp::Eq,
+                cond_val: CondVal::First,
+            },
+        )))
+    }
+
+    /// The four type sets and six components every walk below is swept over.
+    const TREE_TYPE_SETS: [(&str, &[NodeType]); 4] = [
+        ("any", &[]),
+        ("loop", &[NodeType::Loop]),
+        (
+            "blocky",
+            &[NodeType::Block, NodeType::Loop, NodeType::Condition],
+        ),
+        (
+            "leaf",
+            &[
+                NodeType::Transfer,
+                NodeType::Compute,
+                NodeType::Sync,
+                NodeType::Allocate,
+                NodeType::StickMask,
+            ],
+        ),
+    ];
+    const TREE_COMPS: [(&str, SenComponent); 6] = [
+        ("ALL", SenComponent::All),
+        ("LX", SenComponent::Lx),
+        ("L0", SenComponent::L0),
+        ("PE", SenComponent::Pe),
+        ("HBM", SenComponent::Hbm),
+        ("NONE", SenComponent::NoComponent),
+    ];
+    /// The six block nodes any child can be added to, plus `Bt` and `Be` for the readings. `C1` is a
+    /// parent in the C++ harness too, but only through a `BlockNode*` — see
+    /// [`e004_a_child_insertion_lands_where_the_authority_puts_it`].
+    const TREE_PARENTS: [&str; 6] = ["head", "L1", "B1", "L2", "Bt", "L3"];
+
+    /// `dsc/dsc2.cpp:2222-2255` — `ScheduleTree::traverseTreeDFS`, executed against this port over
+    /// 1,392 cases: four node-type sets × six components × sixteen start nodes × the exclude list,
+    /// reference digest 12546984765533884190.
+    ///
+    /// ⭐ `clId`, `coreId` AND `maxLoopDepth` ARE ALL -1 IN EVERY CASE, AND THAT IS THE WHOLE TREE'S
+    /// CALL GRAPH, not a narrowing of the sweep. No in-scope caller passes a core or a corelet —
+    /// `dsc/dsc2Pcfg.cpp` is the only one that does and DCG/PCFG is off our path — and
+    /// `maxLoopDepth` has NO caller at all tree-wide. That matters because `maxLoopDepth` is the only
+    /// consumer of the `loopDepth` stack (`:2233`, `:2246-2250`), and that stack is the only reader of
+    /// `prev_` inside this body (`:2239`): with it dead the traversal is a plain pre-order walk over
+    /// an owning tree, which is what [`ChildNode::visit_dfs`] is.
+    ///
+    /// ⛔ AND `prev_` IS REDUNDANT ON A WELL-FORMED TREE ANYWAY: a C++-only `prevparent` section
+    /// compares every node's `prev_` against the parent found by walking the child lists, and they
+    /// agree 15/15 on this fixture. The disagreement it was written to catch is real but unreachable
+    /// from here — `insertLoopAbove` leaves BOTH links stale (11/11 cases) and has zero callers.
+    ///
+    /// ⚠️ THE START NODE IS NOT A `ScheduleNode*` HERE. The authority takes one and branches on
+    /// `startNode->prev_ == nullptr` (`:2228`), so `nullptr` and the head are the SAME case — which
+    /// is why `s-` and `shead` are the tree-wide walk in both columns. Every other start is a
+    /// subtree, i.e. [`ChildNode::traverse_dfs`], and only those carry an exclude list: the one live
+    /// caller passes the loop it is scanning (`ddc/ddc_transformation.cpp:1525-1527`).
+    #[test]
+    fn e042_the_depth_first_walk_agrees_with_the_executed_authority() {
+        const STARTS: [&str; 16] = [
+            "-", "head", "L1", "t1", "B1", "c1", "L2", "t2", "s1", "C1", "Bt", "a1", "Be", "m1",
+            "L3", "c2",
+        ];
+
+        let tree = tree_fixture();
+        let mut digest = SectionDigest::new();
+        for (set_name, node_types) in TREE_TYPE_SETS {
+            for (comp_name, comp) in TREE_COMPS {
+                for start in STARTS {
+                    let whole_tree = start == "-" || start == "head";
+                    let excludes: &[&str] = if whole_tree {
+                        &["-"]
+                    } else {
+                        &["-", "B1", "L2", "C1"]
+                    };
+                    for exclude in excludes {
+                        let order = if whole_tree {
+                            tree.traverse_dfs(node_types, comp)
+                        } else if *exclude == "-" {
+                            tree_find(&tree, start).traverse_dfs(node_types, comp)
+                        } else {
+                            tree_find(&tree, start).traverse_dfs_excluding(
+                                node_types,
+                                comp,
+                                &[tree_find(&tree, exclude)],
+                            )
+                        };
+                        digest.feed(&format!(
+                            "dfs {set_name} {comp_name} s{start} x{exclude} = {}",
+                            tree_join(&order)
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (1_392, 12_546_984_765_533_884_190),
+            "executed dsc/dsc2.cpp:2222-2255"
+        );
+    }
+
+    /// `dsc/dsc2.cpp:1984-2002` — both `getNextView` bodies, executed over 32 cases: four components
+    /// × eight block nodes, reference digest 1180193418606023406.
+    ///
+    /// ⛔ THE TWO BODIES ARE SELECTED BY THE HANDLE'S STATIC TYPE, NOT BY THE NODE. `getNextView` is
+    /// NOT virtual (`dsc/dsc2.h:541`, `:701`), so the `cond_static` column — the same condition node
+    /// reached as a `ConditionNode` rather than as its base — is a DIFFERENT function from the
+    /// `nextview C1` column beside it, and `cond_loopguard` is that function on a node whose
+    /// `loopCond_` is set, where it widens the view to `ALL, -1, -1` (`:1996-2001`). Rust method
+    /// resolution reproduces the split exactly, which is why [`ConditionNode::next_view`] shadows
+    /// [`BlockNode::next_view`] instead of overriding it.
+    #[test]
+    fn e034_the_child_view_keeps_the_conditions_own_static_dispatch() {
+        const BLOCKS: [&str; 8] = ["head", "L1", "B1", "L2", "C1", "Bt", "Be", "L3"];
+
+        let mut digest = SectionDigest::new();
+        for (comp_name, comp) in &TREE_COMPS[..4] {
+            for block in BLOCKS {
+                let mut tree = tree_fixture();
+                let mut line = format!(
+                    "nextview {block} {comp_name} = {}",
+                    tree_join(&tree_find_block_mut(&mut tree, block).next_view(*comp))
+                );
+                if block == "C1" {
+                    let cond = tree_find_condition_mut(&mut tree, block);
+                    line += &format!(" | cond_static = {}", tree_join(&cond.next_view(*comp)));
+                    cond.loop_cond = Some(tree_loop_guard());
+                    line += &format!(" | cond_loopguard = {}", tree_join(&cond.next_view(*comp)));
+                }
+                digest.feed(&line);
+            }
+        }
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (32, 1_180_193_418_606_023_406),
+            "executed dsc/dsc2.cpp:1984-2002"
+        );
+    }
+
+    /// `dsc/dsc2.cpp:2013-2029` — `BlockNode::addChildNode`, executed over 44 cases: six parents ×
+    /// `addBefore` × the four sibling choices that exist on each, reference digest
+    /// 15424645884529233517.
+    ///
+    /// ⭐ THE FOUR INSERTION POINTS ARE THE WHOLE FUNCTION. A null sibling with `addBefore` is
+    /// `begin()` and without it `end()`; a sibling resolves to the iterator found by scanning `next_`
+    /// and then to it or one past it (`:2017-2027`) — which is [`InsertionPoint`]'s four variants.
+    ///
+    /// ⛔ AND THE AUTHORITY'S OWN SIBLING SCAN IS UNDEFINED BEHAVIOUR, WHICH IS WHY NO CASE HERE
+    /// REFUSES: `for (; it != next_.end() && it->get() != siblingRefNode; it++)` is not what it
+    /// writes — the dereference happens BEFORE the end test, so a sibling that is not a child of this
+    /// node runs off the vector instead of reaching the `DT_ERROR` one line below. Compiled and run
+    /// under ASAN over the extracted body that is a heap-buffer-overflow read followed by a member
+    /// call on the null it loads, never the diagnostic. An out-of-range index cannot be built here,
+    /// and [`BlockNode::add_child_node`] hands the node back for one that is.
+    #[test]
+    fn e004_a_child_insertion_lands_where_the_authority_puts_it() {
+        let mut digest = SectionDigest::new();
+        for parent in TREE_PARENTS {
+            for add_before in [0, 1] {
+                for sibling in ["-", "SELF0", "SELF1", "SELFLAST"] {
+                    let mut tree = tree_fixture();
+                    let count = tree_find_block_mut(&mut tree, parent).children().len();
+                    let index = match sibling {
+                        "SELF0" => (count > 0).then_some(0),
+                        "SELF1" => (count > 1).then_some(1),
+                        "SELFLAST" => (count > 0).then_some(count - 1),
+                        _ => None,
+                    };
+                    if sibling != "-" && index.is_none() {
+                        continue;
+                    }
+                    let (at, reference) = match index {
+                        None if add_before == 1 => (InsertionPoint::Front, "-".to_owned()),
+                        None => (InsertionPoint::Back, "-".to_owned()),
+                        Some(index) => {
+                            let name = tree_find_block_mut(&mut tree, parent).children()[index]
+                                .base()
+                                .name
+                                .clone();
+                            let at = if add_before == 1 {
+                                InsertionPoint::Before(index)
+                            } else {
+                                InsertionPoint::After(index)
+                            };
+                            (at, name)
+                        }
+                    };
+                    let refused = tree_find_block_mut(&mut tree, parent)
+                        .add_child_node(at, tree_compute("NEW", &[]))
+                        .is_some();
+                    let line = format!(
+                        "addchild {parent} before{add_before} sib{sibling} ref{reference} ="
+                    );
+                    digest.feed(&if refused {
+                        format!("{line} REFUSED")
+                    } else {
+                        format!("{line}{}", tree_shape(&tree))
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (44, 15_424_645_884_529_233_517),
+            "executed dsc/dsc2.cpp:2013-2029"
+        );
+    }
+
+    /// `dsc/dsc2.cpp:2041-2051` and `:2053-2056` — `insertPerfectlyNestedBlockNode` and
+    /// `moveChildren`, executed over 48 cases: six parents × the two node kinds a caller passes × a
+    /// pre-filled node × both routes, reference digest 581752260481533989 with 12 refusals.
+    ///
+    /// ⭐ THE TWO OPERATIONS SHARE A BODY AND DIFFER ONLY IN THE GUARD. `moveChildren` is
+    /// `toNode->next_ = std::move(next_)` with no test at all, so the 12 refusals are exactly the
+    /// `prefill mc0` cases: nesting refuses a node that already has children (`:2043-2045`) and
+    /// moving OVERWRITES them — `nest.kids` on a `prefill1 mc1` case is the parent's count, never the
+    /// filler's, and the filler is gone.
+    ///
+    /// ⛔ AND A MOVE DOES NOT PUT THE DESTINATION IN THE TREE, which the shape column shows: after
+    /// `mc1` the parent has no children and the node holding them is not reachable from the head. The
+    /// authority leaks it unless the caller inserts it; here it is a local that drops.
+    ///
+    /// ⚠️ TWO NESTING METHODS, NOT A WIDER PARAMETER: the authority takes `BlockNode*` and its ONE
+    /// caller passes a `LoopNode*` (`ddc/ddc_transformation_util.cpp:287-303`, the call at `:301`),
+    /// so `kind1 mc0` is the live case and `kind0 mc0` has no caller in the authority at all. See
+    /// [`BlockNode::insert_perfectly_nested_loop_node`].
+    ///
+    /// ⛔ NEITHER IS REACHABLE ON A CONDITION NODE HERE, where both succeed in C++ on one — a
+    /// C++-only `nestcond` section records that, and it puts a third and fourth region into a node
+    /// whose own contract caps it at two. All three live call sites hold a `LoopNode`.
+    #[test]
+    fn e004_nesting_and_moving_children_agree_with_the_executed_authority() {
+        const NEST_DIMS: [(PrimaryDimTypes, MetaDimKind); 1] =
+            [(PrimaryDimTypes::Mb, MetaDimKind::Unpadded)];
+
+        let mut digest = SectionDigest::new();
+        for parent in TREE_PARENTS {
+            for kind in [0, 1] {
+                for prefill in [0, 1] {
+                    for via_move in [0, 1] {
+                        let mut tree = tree_fixture();
+                        let mut moved_kids = None;
+                        let refused = match (kind, via_move) {
+                            (0, 0) => {
+                                let mut nest = tree_block("NEST", &[]);
+                                if prefill == 1 {
+                                    tree_push(&mut nest, tree_sync("FILLER", &[]));
+                                }
+                                tree_find_block_mut(&mut tree, parent)
+                                    .insert_perfectly_nested_block_node(nest)
+                                    .is_some()
+                            }
+                            (_, 0) => {
+                                let mut nest = tree_loop("NEST", &[], &NEST_DIMS, 7, 7);
+                                if prefill == 1 {
+                                    tree_push(&mut nest.base_class, tree_sync("FILLER", &[]));
+                                }
+                                tree_find_block_mut(&mut tree, parent)
+                                    .insert_perfectly_nested_loop_node(nest)
+                                    .is_some()
+                            }
+                            (0, _) => {
+                                let mut nest = tree_block("NEST", &[]);
+                                if prefill == 1 {
+                                    tree_push(&mut nest, tree_sync("FILLER", &[]));
+                                }
+                                tree_find_block_mut(&mut tree, parent).move_children_to(&mut nest);
+                                moved_kids = Some(nest.children().len());
+                                false
+                            }
+                            (_, _) => {
+                                let mut nest = tree_loop("NEST", &[], &NEST_DIMS, 7, 7);
+                                if prefill == 1 {
+                                    tree_push(&mut nest.base_class, tree_sync("FILLER", &[]));
+                                }
+                                tree_find_block_mut(&mut tree, parent)
+                                    .move_children_to(&mut nest.base_class);
+                                moved_kids = Some(nest.base_class.children().len());
+                                false
+                            }
+                        };
+                        let mut line =
+                            format!("nest {parent} kind{kind} prefill{prefill} mc{via_move} =");
+                        if refused {
+                            line += " REFUSED";
+                        } else {
+                            line += &tree_shape(&tree);
+                            let parent_kids =
+                                tree_find_block_mut(&mut tree, parent).children().len();
+                            let nest_kids = match moved_kids {
+                                Some(kids) => kids,
+                                None => tree_find_block_mut(&mut tree, "NEST").children().len(),
+                            };
+                            line += &format!(" | parent.kids={parent_kids} nest.kids={nest_kids}");
+                        }
+                        digest.feed(&line);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (48, 581_752_260_481_533_989),
+            "executed dsc/dsc2.cpp:2041-2051 and :2053-2056"
+        );
+    }
+
+    /// `dsc/dsc2.cpp:2143-2167` and `:2003-2011` — `ConditionNode::addChildNode`, `addThenRegion`,
+    /// `addElseRegion` and the two branch readings, executed over 9 cases against conditions seeded
+    /// with zero, one and two regions, reference digest 6850261760959776999 with 5 refusals.
+    ///
+    /// ⭐ THE THREE GUARDS ARE DIFFERENT PREDICATES, and that is what the 5 refusals separate:
+    /// `addChildNode` refuses only the THIRD child (`:2145-2147`), `addThenRegion` refuses a
+    /// non-empty `next_` (`:2152-2155`) and `addElseRegion` refuses anything but exactly one
+    /// (`:2160-2163`) — so `h1 existing0` refuses while `h0 existing0` does not, and both refuse at
+    /// two. All three also refuse a non-BLOCK child, which is an `E0308` here rather than a case:
+    /// [`ConditionNode::add_child_node`] takes a [`BlockNode`].
+    ///
+    /// ⛔ THE TWO READING PAIRS DISAGREE ABOUT THE SAME STATE. `getThenCoreCl`/`getElseCoreCl` are
+    /// `next_.at(0)`/`.at(1)` and throw where the region is absent, while
+    /// `getThenBranchNode`/`getElseBranchNode` answer `nullptr` (`dsc/dsc2.h:707-718`) — the
+    /// `OUT_OF_RANGE` and `-` columns on the same line. Bridge 1 has one UNGUARDED caller of the
+    /// throwing pair (`DSC2ToDataflowIR/DSC2ToDataflowIR.cpp:146`) against a guarded one
+    /// (`SNControlFlowLowering.cpp:1116`), so both are `Option` here.
+    #[test]
+    fn e034_the_condition_nodes_two_region_contract_agrees_with_the_executed_authority() {
+        const NEW_REL: TreeRel = &[(SenComponent::Pe, &[(0, &[0])])];
+        const REG_REL: TreeRel = &[
+            (SenComponent::Pe, &[(0, &[0])]),
+            (SenComponent::Lx, &[(1, &[1])]),
+        ];
+
+        let mut digest = SectionDigest::new();
+        for existing in [0, 1, 2] {
+            let mut cond = tree_condition(existing);
+            let mut line = format!("condadd existing{existing} = ");
+            match cond.add_child_node(InsertionPoint::Back, tree_block("NEW", NEW_REL)) {
+                Some(_) => line += "REFUSED",
+                None => line += &format!("kids={}", cond.base().children().len()),
+            }
+            line += &format!(
+                " then={} else={} thenb={} elseb={}",
+                tree_opt_core_cl(cond.then_core_cl(SenComponent::All)),
+                tree_opt_core_cl(cond.else_core_cl(SenComponent::All)),
+                tree_branch_name(cond.then_branch()),
+                tree_branch_name(cond.else_branch()),
+            );
+            digest.feed(&line);
+
+            for helper in [0, 1] {
+                let mut cond = tree_condition(existing);
+                let region = tree_block("REG", REG_REL);
+                let mut line = format!("condregion h{helper} existing{existing} = ");
+                let handed_back = if helper == 1 {
+                    cond.add_else_region(region)
+                } else {
+                    cond.add_then_region(region)
+                };
+                match handed_back {
+                    Some(_) => line += "REFUSED",
+                    None => line += &format!("kids={}", cond.base().children().len()),
+                }
+                line += &format!(
+                    " then={} else={} thenb={} elseb={}",
+                    tree_opt_core_cl(cond.then_core_cl(SenComponent::All)),
+                    tree_opt_core_cl(cond.else_core_cl(SenComponent::All)),
+                    tree_branch_name(cond.then_branch()),
+                    tree_branch_name(cond.else_branch()),
+                );
+                digest.feed(&line);
+            }
+        }
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (9, 6_850_261_760_959_776_999),
+            "executed dsc/dsc2.cpp:2143-2167 and :2003-2011"
+        );
+    }
+
+    /// `dsc/dsc2.h:621-652` — `ScheduleTree`'s default constructor, `clear` and `empty`, executed
+    /// over 3 cases, reference digest 7012364341469060330.
+    ///
+    /// ⭐ THE DEFAULT CONSTRUCTOR'S ONE STATEMENT IS `head_.denId_ = 0` (`:625`), the core datastage,
+    /// and it is the only field of the head that is not a `LoopNode` default — which is what
+    /// `head.den=0` beside `head.num=-1` pins.
+    ///
+    /// ⛔ AND THE COPY CONSTRUCTOR LOSES IT, which is why this type has no [`Clone`] AND why the
+    /// "harmless" case is not harmless. `ScheduleTree(const ScheduleTree& old) { copyFrom(old); }`
+    /// (`:628`) never runs that statement, and `copyFrom` `DT_ERROR`s on any non-empty tree
+    /// (`dsc/dsc2.cpp:2287-2291`) — its deep-copy body is commented out with a `TODO` above it. A
+    /// C++-only `treecopy` section records both halves: copying an EMPTY tree yields
+    /// `copy.head.den=-1` against the original's `0`, and copying the fixture refuses.
+    #[test]
+    fn e042_a_fresh_tree_is_one_loop_head_holding_the_core_datastage() {
+        let mut digest = SectionDigest::new();
+        let fresh = ScheduleTree::default();
+        digest.feed(&format!(
+            "tree fresh empty={} head.den={} head.num={} head.kind={} head.dims={} head.parametric={} head.ldsidx={} shape={}",
+            u8::from(fresh.is_empty()),
+            fresh.head().den_id.map_or(-1, |id| id.0),
+            fresh.head().num_id.map_or(-1, |id| id.0),
+            fresh.head().base_class.base_class.node_type().name(),
+            fresh.head().dims.len(),
+            u8::from(fresh.head().is_parametric_loop()),
+            fresh.head().parametric_lds_idx().map_or(-1, |idx| idx.0),
+            tree_shape(&fresh),
+        ));
+
+        let mut tree = tree_fixture();
+        digest.feed(&format!(
+            "tree built empty={} shape={}",
+            u8::from(tree.is_empty()),
+            tree_shape(&tree)
+        ));
+        tree.clear();
+        digest.feed(&format!(
+            "tree cleared empty={} shape={}",
+            u8::from(tree.is_empty()),
+            tree_shape(&tree)
+        ));
+
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (3, 7_012_364_341_469_060_330),
+            "executed dsc/dsc2.h:621-652"
+        );
+    }
+
+    /// `util/utils.h:100-107` over `dsc/dsc2.h:529-537` — `clone()` on a loop, a block and a
+    /// condition node, executed over 3 cases, reference digest 3999731503567925404.
+    ///
+    /// ⛔ A CLONED BLOCK NODE HAS NO CHILDREN AND THAT IS DELIBERATE: `kids=0` against `origkids=3`
+    /// is `VectorOfChildren(const VectorOfChildren&) {}`, "do nothing on purpose", with the
+    /// authority's own note that the caller inserts the copies (`:533-536`). Both clone sites in DDC
+    /// depend on it — `ddc/ddc_transformation.cpp:984-986` clones a loop and then adds one cloned
+    /// child, and `ddc/ddc_transformation_util.cpp:580-588` clones a condition node and then calls
+    /// `addThenRegion`, which refuses outright on a non-empty `next_`. A deep [`Clone`] would turn a
+    /// working path into a fatal error.
+    ///
+    /// ⭐ EVERYTHING ELSE SURVIVES, which is what the remaining columns are for: the name, both
+    /// datastage ids, the dim list, the whole `relevantComps_` map, the `const` kind, the loop's two
+    /// private parametric fields and the condition's `coreClCond_`.
+    #[test]
+    fn e034_a_cloned_node_keeps_every_field_but_its_children() {
+        let mut digest = SectionDigest::new();
+        let tree = tree_fixture();
+
+        let original_loop = tree_find(&tree, "L1").as_loop().expect("L1 is a loop");
+        let cloned_loop = original_loop.clone();
+        digest.feed(&format!(
+            "clone loop kids={} origkids={} name={} num={} den={} dims={} rel={} kind={} parametric={} ldsidx={}",
+            cloned_loop.base_class.children().len(),
+            original_loop.base_class.children().len(),
+            cloned_loop.base_class.base_class.name,
+            cloned_loop.num_id.map_or(-1, |id| id.0),
+            cloned_loop.den_id.map_or(-1, |id| id.0),
+            cloned_loop.dims.len(),
+            cloned_loop.base_class.base_class.relevant_comps().len(),
+            cloned_loop.base_class.base_class.node_type().name(),
+            u8::from(cloned_loop.is_parametric_loop()),
+            cloned_loop.parametric_lds_idx().map_or(-1, |idx| idx.0),
+        ));
+
+        let original_block = tree_find(&tree, "B1").as_block().expect("B1 is a block");
+        let cloned_block = original_block.clone();
+        digest.feed(&format!(
+            "clone block kids={} origkids={} name={} rel={} kind={}",
+            cloned_block.children().len(),
+            original_block.children().len(),
+            cloned_block.base_class.name,
+            cloned_block.base_class.relevant_comps().len(),
+            cloned_block.base_class.node_type().name(),
+        ));
+
+        let original_cond = tree_find(&tree, "C1")
+            .as_condition()
+            .expect("C1 is a condition");
+        let cloned_cond = original_cond.clone();
+        digest.feed(&format!(
+            "clone cond kids={} origkids={} name={} corecl={} hascorecl={} rel={} kind={}",
+            cloned_cond.base().children().len(),
+            original_cond.base().children().len(),
+            cloned_cond.base().base_class.name,
+            tree_core_cl(&cloned_cond.core_cl_cond),
+            u8::from(cloned_cond.has_core_cl_cond()),
+            cloned_cond.base().base_class.relevant_comps().len(),
+            cloned_cond.base().base_class.node_type().name(),
+        ));
+
+        assert_eq!(
+            (digest.cases, digest.hash),
+            (3, 3_999_731_503_567_925_404),
+            "executed util/utils.h:100-107 over dsc/dsc2.h:529-537"
+        );
+    }
 }
 
-// crustify:todo: e030_BlockNode
+// ⛔ THE TWO BLOCKNODE AND TWO LOOPNODE TYPE ANCHORS STAY OPEN ON e027_DesignSpaceConfig, AND NINE OF
+// THEIR ELEVEN REMAINING FIELD ANCHORS NAME NO FIELD. Both classes are ported above with their base
+// subobject and their child list, and both keep an open type anchor for the methods that are still
+// unreachable:
+//  * `BlockNode::deleteChildNode`'s DESTRUCTIVE arm and `moveChildNode`, which forwards to it, both
+//    call `ownerDsc->cleanupAllocation(nodeToDelete)` (`dsc/dsc2.cpp:2031-2039`, `:2188-2190`) —
+//    `DesignSpaceConfig::cleanupAllocation` (`dsc/designSpaceConfig.h:262`) is unported. The
+//    NON-destructive arm is [`BlockNode::take_child_node`] and has landed.
+//  * `LoopNode::parametricIterCount` (`dsc/dsc2.cpp:4126`) and `parametricStride` (`:4197`) read
+//    `DesignSpaceConfig::dataStageParam_` and `labeledDs_` and climb `getOwnerLoop()`.
+//  * `LoopNode::print` (`:4284`) prints `this`, a raw address (`:4288`) — as all three node `print`s
+//    do (`:4387`, `:4445`, `:4517`).
+//
+// ⚠️ AND THE FIELD ANCHORS THAT REMAIN ARE `friend class` LINES AND PARAMETER DEFAULTS, so filling
+// them is impossible rather than pending. `.Ddc`, `.DesignSpaceConfig`, `.L3DlOpsScheduler`,
+// `.ScheduleNode` and `.ScheduleTree` are `BlockNode`'s five `friend class` declarations
+// (`dsc/dsc2.h:556-560`) and four of them are `LoopNode`'s (`:611-614`); `.coreId` is
+// `BlockNode::getNextView`'s third parameter, `int coreId = -1) const;` (`:543`), and `.rowId` is
+// `parametricIterCount`'s fourth, `int rowId = -1) const;` (`:602`). That is 12 of the 43 anchors the
+// e042_LoopDistributionInfo note below tallies as naming no field.
+//
+// ⭐ WHAT IS FILLED IS `.BaseClass` AND `.next_` UNDER BOTH BLOCKNODE IDS, AND `.head_` UNDER BOTH
+// SCHEDULETREE IDS — `e032_ScheduleTree` and `e042_ScheduleTree` are closed entirely, type anchors
+// included, because every one of `ScheduleTree`'s methods landed. ⚠️ `e042` NAMES TWO ENTITIES IN THIS
+// CAMPAIGN, `e042_LoopDistributionInfo` and `e042_ScheduleTree`, and `e034` names two,
+// `e034_TransferNode` and `e034_LoopNode`; only the name disambiguates them.
 
-// crustify:todo: e030_BlockNode.BaseClass
+// crustify:todo: e030_BlockNode
 
 // crustify:todo: e030_BlockNode.Ddc
 
@@ -12330,8 +14827,6 @@ mod equivalence {
 
 // crustify:todo: e030_BlockNode.coreId
 
-// crustify:todo: e030_BlockNode.next_
-
 // crustify:todo: e031_LoopNode
 
 // crustify:todo: e031_LoopNode.Ddc
@@ -12343,10 +14838,6 @@ mod equivalence {
 // crustify:todo: e031_LoopNode.ScheduleTree
 
 // crustify:todo: e031_LoopNode.rowId
-
-// crustify:todo: e032_ScheduleTree
-
-// crustify:todo: e032_ScheduleTree.head_
 
 // crustify:todo: e033_DataInfo.bufferSwitchPosition_
 
@@ -12446,3 +14937,29 @@ mod equivalence {
 // crustify:todo: e010_CoordPropInfoType.nodeToFold
 
 // crustify:todo: e010_CoordPropInfoType.refNode
+
+// crustify:todo: e004_BlockNode
+
+// crustify:todo: e004_BlockNode.Ddc
+
+// crustify:todo: e004_BlockNode.DesignSpaceConfig
+
+// crustify:todo: e004_BlockNode.L3DlOpsScheduler
+
+// crustify:todo: e004_BlockNode.ScheduleNode
+
+// crustify:todo: e004_BlockNode.ScheduleTree
+
+// crustify:todo: e004_BlockNode.coreId
+
+// crustify:todo: e034_LoopNode
+
+// crustify:todo: e034_LoopNode.Ddc
+
+// crustify:todo: e034_LoopNode.DesignSpaceConfig
+
+// crustify:todo: e034_LoopNode.ScheduleNode
+
+// crustify:todo: e034_LoopNode.ScheduleTree
+
+// crustify:todo: e034_LoopNode.rowId
