@@ -3885,6 +3885,109 @@ mod unit_tests {
         );
     }
 
+    /// `traverseTreeDFS` runs `isNodeRelevant(comp, clId, coreId)` on EVERY node it reaches and
+    /// `continue`s on a miss (`dsc/dsc2.cpp:2237-2239`), so the unit ids PRUNE SUBTREES rather than
+    /// filter leaves — which is why bridge 1's `comp_, corelet_id_, core_id_` walk
+    /// (`V3/SNControlFlowLowering.cpp:470-472`) cannot be the component walk plus a post-filter.
+    /// Every expectation below is a probe splicing `:1916-1933` and `:2222-2265` byte-exact over this
+    /// same tree (rev `a0d29abbed`).
+    #[test]
+    fn a_unit_filtered_tree_walk_prunes_the_subtree_of_a_unit_irrelevant_loop() {
+        let transfer = |name: &str, core: CoreId, corelet: CoreletId| {
+            let mut node = TransferNode::default();
+            node.base_class.name = name.to_owned();
+            node.base_class.relevant_comps_mut().insert(
+                SenComponent::Lx,
+                BTreeMap::from([(core, BTreeSet::from([corelet]))]),
+            );
+            ChildNode::Transfer(node)
+        };
+        let mut body = LoopNode::default();
+        body.base_class.base_class.name = "body".to_owned();
+        body.base_class.base_class.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]),
+        );
+        for leaf in [
+            transfer("c0cl0", CoreId(0), CoreletId(0)),
+            transfer("c1cl0", CoreId(1), CoreletId(0)),
+            transfer("c0cl1", CoreId(0), CoreletId(1)),
+        ] {
+            assert!(
+                body.base_class
+                    .add_child_node(InsertionPoint::Back, leaf)
+                    .is_none()
+            );
+        }
+        // A second loop LX-relevant with an EMPTY core map, i.e. relevant to the component and to no
+        // unit at all (`dsc/dsc2.cpp:1929-1931`), hiding one core-0/corelet-0 transfer.
+        let mut nocore = LoopNode::default();
+        nocore.base_class.base_class.name = "nocore".to_owned();
+        nocore
+            .base_class
+            .base_class
+            .relevant_comps_mut()
+            .insert(SenComponent::Lx, BTreeMap::new());
+        assert!(
+            nocore
+                .base_class
+                .add_child_node(
+                    InsertionPoint::Back,
+                    transfer("under_nocore", CoreId(0), CoreletId(0))
+                )
+                .is_none()
+        );
+        let mut tree = ScheduleTree::default();
+        for node in [ChildNode::Loop(body), ChildNode::Loop(nocore)] {
+            assert!(
+                tree.head_mut()
+                    .base_class
+                    .add_child_node(InsertionPoint::Back, node)
+                    .is_none()
+            );
+        }
+
+        let names = |order: &[&ChildNode]| {
+            order
+                .iter()
+                .map(|node| node.base().name.to_owned())
+                .collect::<Vec<_>>()
+        };
+        let transfers = [NodeType::Transfer];
+        let unit = |core, corelet| {
+            names(&tree.traverse_dfs_of_corelet(&transfers, SenComponent::Lx, core, corelet))
+        };
+        assert_eq!(
+            names(&tree.traverse_dfs(&transfers, SenComponent::Lx)),
+            ["c0cl0", "c1cl0", "c0cl1", "under_nocore"],
+            "the component-only walk, the only reading this port could spell, reports FOUR"
+        );
+        assert_eq!(unit(CoreId(0), Some(CoreletId(0))), ["c0cl0"]);
+        assert!(
+            unit(CoreId(1), Some(CoreletId(0))).is_empty(),
+            "core 1's own transfer is under a loop relevant to core 0 alone"
+        );
+        assert!(unit(CoreId(0), Some(CoreletId(1))).is_empty());
+        assert_eq!(
+            unit(CoreId(0), None),
+            ["c0cl0", "c0cl1"],
+            "an absent corelet is any corelet of core 0, and `under_nocore` stays pruned"
+        );
+        assert_eq!(
+            names(&tree.traverse_dfs(&[], SenComponent::Lx)),
+            ["body", "c0cl0", "c1cl0", "c0cl1", "nocore", "under_nocore"]
+        );
+        assert_eq!(
+            names(&tree.traverse_dfs_of_corelet(
+                &[],
+                SenComponent::Lx,
+                CoreId(0),
+                Some(CoreletId(0))
+            )),
+            ["body", "c0cl0"]
+        );
+    }
+
     /// `insertPerfectlyNestedBlockNode`'s guard is `!nodeToAdd->next_.empty()`
     /// (`dsc/dsc2.cpp:2043-2045`), and the authority THROWS out of it — leaving the caller holding a
     /// node it must still free. Both variants hand it back here, with its children intact, and the
@@ -5903,17 +6006,16 @@ impl ChildNode {
     /// is undefined behaviour, so a walk through a spliced node has no defined result at all. It has
     /// no callers either (`insertLoopAbove` is unreferenced tree-wide).
     ///
-    /// ⛔ AND THE CORE/CORELET FILTER IS NOT PORTED FOR THE SAME REASON: every in-scope caller
-    /// passes `-1, -1` (`DSC2ToDataflowIR.cpp:262-263`, `ddc/ddcv1.cpp:3416-3417`,
-    /// `ddc/ddc_transformation.cpp:1525-1527`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1596`).
-    /// The only callers that pass a core or a corelet are in `dsc/dsc2Pcfg.cpp` (`:144`, `:2253`,
-    /// `:2257-2258`), and DCG/PCFG is off this campaign's path. The COMPONENT filter stays because
-    /// two in-scope callers do use it: bridge 1 passes the component it is lowering
-    /// (`DSC2ToDataflowIR.cpp:262-263`) and the DDC passes a transfer's destination component
-    /// (`ddc/ddcv1.cpp:3416-3417`).
+    /// ⛔ AND THE CORE/CORELET FILTER IS A SECOND NAMED WALK, NOT AN OMISSION — one in-scope caller
+    /// passes BOTH, and it is a WHOLE-TREE walk, so the unit form is
+    /// [`ScheduleTree::traverse_dfs_of_corelet`] and no SUBTREE caller needs one. This is the
+    /// `-1, -1` reading, which is what every caller that starts from a node takes
+    /// (`ddc/ddcv1.cpp:3416-3417`, `ddc/ddc_transformation.cpp:1525-1527`) alongside the two
+    /// whole-tree ones that filter by component alone (`DSC2ToDataflowIR.cpp:262-263`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:1596`).
     pub fn traverse_dfs(&self, node_types: &[NodeType], comp: SenComponent) -> Vec<&ChildNode> {
         let mut order = Vec::new();
-        self.visit_dfs(node_types, comp, &[], &mut order);
+        self.visit_dfs(node_types, NodeRelevance::Comp(comp), &[], &mut order);
         order
     }
 
@@ -5933,7 +6035,7 @@ impl ChildNode {
         exclude: &[&ChildNode],
     ) -> Vec<&ChildNode> {
         let mut order = Vec::new();
-        self.visit_dfs(node_types, comp, exclude, &mut order);
+        self.visit_dfs(node_types, NodeRelevance::Comp(comp), exclude, &mut order);
         order
     }
 
@@ -5944,18 +6046,18 @@ impl ChildNode {
     fn visit_dfs<'tree>(
         &'tree self,
         node_types: &[NodeType],
-        comp: SenComponent,
+        relevance: NodeRelevance,
         exclude: &[&ChildNode],
         order: &mut Vec<&'tree ChildNode>,
     ) {
-        if !self.base().is_relevant(comp) || exclude.iter().any(|node| std::ptr::eq(*node, self)) {
+        if !relevance.admits(self.base()) || exclude.iter().any(|node| std::ptr::eq(*node, self)) {
             return;
         }
         if node_types.is_empty() || node_types.contains(&self.node_type()) {
             order.push(self);
         }
         for child in self.as_block().map_or(&[][..], BlockNode::children) {
-            child.visit_dfs(node_types, comp, exclude, order);
+            child.visit_dfs(node_types, relevance, exclude, order);
         }
     }
 
@@ -6013,6 +6115,30 @@ impl ChildNode {
             Self::Loop(node) => Some(&mut node.base_class.next),
             Self::Condition(node) => Some(node.children_mut()),
             _ => None,
+        }
+    }
+}
+
+/// `isNodeRelevant`'s two live argument shapes as ONE value (`dsc/dsc2.cpp:1916-1933`), so a walk
+/// carries one filter rather than three loose ints. ⛔ IT IS WHAT KEEPS THE AUTHORITY'S TWO
+/// REFUSALS UNSPELLABLE: "Cannot filter node by clId/coreId and not by SenComponent" (`:1919-1921`)
+/// and "..by clId and not by coreId" (`:1927`) each need a combination no variant here has.
+/// Module-private — every public walk names its own shape, as `getNextView`'s two readings do.
+#[derive(Clone, Copy, Debug)]
+enum NodeRelevance {
+    /// `isNodeRelevant(comp)`, both ids left at `-1`.
+    Comp(SenComponent),
+    /// `isNodeRelevant(comp, clId, coreId)` with a real core; [`None`] is the `clId < 0` arm at
+    /// `dsc/dsc2.cpp:1931`, "any corelet of that core".
+    Unit(SenComponent, CoreId, Option<CoreletId>),
+}
+
+impl NodeRelevance {
+    /// The `isNodeRelevant(comp, clId, coreId)` call the traversal makes at `dsc/dsc2.cpp:2237`.
+    fn admits(self, node: &ScheduleNode) -> bool {
+        match self {
+            Self::Comp(comp) => node.is_relevant(comp),
+            Self::Unit(comp, core, corelet) => node.is_relevant_to_corelet(comp, core, corelet),
         }
     }
 }
@@ -6723,7 +6849,32 @@ impl ScheduleTree {
     pub fn traverse_dfs(&self, node_types: &[NodeType], comp: SenComponent) -> Vec<&ChildNode> {
         let mut order = Vec::new();
         for child in self.head.base_class.children() {
-            child.visit_dfs(node_types, comp, &[], &mut order);
+            child.visit_dfs(node_types, NodeRelevance::Comp(comp), &[], &mut order);
+        }
+        order
+    }
+
+    /// The SAME `traverseTreeDFS` with its `clId`/`coreId` supplied rather than left at `-1`, which
+    /// is how bridge 1 decides blocking vs. streaming buffering
+    /// (`V3/SNControlFlowLowering.cpp:470-472`, `nullptr, {TRANSFER}, comp_, corelet_id_, core_id_`)
+    /// — the unit the `getNextView` calls beside it name (`:523`, `:577`, `:886`).
+    /// ⛔ NOT A FILTER OVER [`Self::traverse_dfs`]'S RESULT: an enclosing loop relevant to the
+    /// component but not to the unit PRUNES ITS WHOLE SUBTREE (`dsc/dsc2.cpp:2237-2239`).
+    pub fn traverse_dfs_of_corelet(
+        &self,
+        node_types: &[NodeType],
+        comp: SenComponent,
+        core: CoreId,
+        corelet: Option<CoreletId>,
+    ) -> Vec<&ChildNode> {
+        let mut order = Vec::new();
+        for child in self.head.base_class.children() {
+            child.visit_dfs(
+                node_types,
+                NodeRelevance::Unit(comp, core, corelet),
+                &[],
+                &mut order,
+            );
         }
         order
     }
@@ -7726,6 +7877,7 @@ pub enum LdsOrConst {
 }
 
 /// Replaces: e033_DataInfo
+/// Replaces: e013_DataInfo
 ///
 /// `dsc/dsc2.h:721-753`. WHICH data one operand of a node refers to and HOW its address is formed —
 /// the struct [`TransferNode`] holds four of and [`ComputeNode`] a vector of per operand
@@ -7778,6 +7930,7 @@ pub enum LdsOrConst {
 #[derive(Clone, Debug)]
 pub struct DataInfo {
     /// Field: e033_DataInfo.myLdsIdx_
+    /// Field: e013_DataInfo.myLdsIdx_
     ///
     /// Field: e033_DataInfo.constantId_
     ///
@@ -7787,11 +7940,11 @@ pub struct DataInfo {
     /// `false` for. See [`LdsOrConst`] for why they are one field.
     pub lds_or_const: Option<LdsOrConst>,
     /// Field: e033_DataInfo.isStartAddrSymbolic_
+    /// Field: e013_DataInfo.isStartAddrSymbolic_
     ///
     /// Whether `startAddr_` is a symbol to be resolved rather than a number (`dsc/dsc2.h:724`),
-    /// copied from the backing allocation (`ddc/ddcv1.cpp:2397`,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5817`) and read immediately after to branch on
-    /// (`ddc/ddcv1.cpp:2399`, `L3DlOpsScheduler.cpp:5855`).
+    /// copied from the backing allocation and read immediately after to branch on
+    /// (`ddc/ddcv1.cpp:2397`, `:2399`, `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5817`, `:5855`).
     ///
     /// ⛔ ONE OF THOSE BRANCHES IS A REFUSAL, NOT A PATH. Stage 2a `DT_ERROR`s "Currently no support;
     /// work in progress" when a symbolic start address meets cross-core reduction with a corelet split
@@ -7850,6 +8003,7 @@ pub struct DataInfo {
     /// negative pseudo-key. See [`BufferAddrOffset`]: it is NOT the allocation's byte stride.
     pub buffer_addr_offset: BTreeMap<CoreId, BTreeMap<CoreletId, BufferAddrOffset>>,
     /// Field: e033_DataInfo.dataConnect_
+    /// Field: e013_DataInfo.dataConnect_
     ///
     /// The DDL wire name of this operand (`dsc/dsc2.h:739`) — the key under which the DDC indexes
     /// producers and consumers (`ddc/ddcv1.cpp:3293-3308`) and the name it reports when it cannot
@@ -15425,9 +15579,21 @@ mod equivalence {
 //
 // ⭐ WHAT IS FILLED IS `.BaseClass` AND `.next_` UNDER BOTH BLOCKNODE IDS, AND `.head_` UNDER BOTH
 // SCHEDULETREE IDS — `e032_ScheduleTree` and `e042_ScheduleTree` are closed entirely, type anchors
-// included, because every one of `ScheduleTree`'s methods landed. ⚠️ `e042` NAMES TWO ENTITIES IN THIS
-// CAMPAIGN, `e042_LoopDistributionInfo` and `e042_ScheduleTree`, and `e034` names two,
+// included. ⛔ AND THAT HOLDS FOR A REASON IT DID NOT HOLD BEFORE THIS REVIEW: `traverseTreeDFS` has
+// TWO live argument shapes, and the census that closed these ids counted only the component one, so
+// the whole-tree walk bridge 1 decides blocking-vs-streaming buffering with
+// (`V3/SNControlFlowLowering.cpp:470-472`) had no spelling at all. It is
+// [`ScheduleTree::traverse_dfs_of_corelet`], and a method group is closed when every SHAPE lands, not
+// every name. ⚠️ `e042` NAMES TWO ENTITIES IN THIS CAMPAIGN, `e042_LoopDistributionInfo` and
+// `e042_ScheduleTree`, and `e034` names two,
 // `e034_TransferNode` and `e034_LoopNode`; only the name disambiguates them.
+//
+// ⛔ AND `e013_DataInfo` IS `e033_DataInfo`, THE SAME CLASS RE-SCHEDULED, WHICH CARRIED NO ANCHOR OF
+// ITS OWN AT ALL until this review: the port mirrored every other dual-generation id onto both
+// spellings and missed this one, so a fully ported class read as zero coverage under the id that
+// scheduled it. Its four scheduled field anchors are mirrored beside `e033`'s — `myLdsIdx_`,
+// `isStartAddrSymbolic_` and `dataConnect_` filled, `bufferSwitchPosition_` open under both ids for
+// the reason the `e033` note gives.
 
 // crustify:todo: e030_BlockNode
 
@@ -15456,6 +15622,8 @@ mod equivalence {
 // crustify:todo: e031_LoopNode.rowId
 
 // crustify:todo: e033_DataInfo.bufferSwitchPosition_
+
+// crustify:todo: e013_DataInfo.bufferSwitchPosition_
 
 // crustify:todo: e033_DataInfo.loopEleOffsets_
 
