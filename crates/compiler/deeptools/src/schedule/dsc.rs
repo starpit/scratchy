@@ -140,7 +140,7 @@ impl DsTypes {
         Self::NotSet,
     ];
 
-    /// Field: e027_DesignSpaceConfig.dsTypeToString
+    /// Field: e020_DesignSpaceConfig.dsTypeToString
     ///
     /// `dsTypeToString` (`dsc/designSpaceConfig.cpp:9255-9263`).
     pub const fn name(self) -> &'static str {
@@ -156,7 +156,7 @@ impl DsTypes {
         }
     }
 
-    /// Field: e027_DesignSpaceConfig.stringToDsType
+    /// Field: e020_DesignSpaceConfig.stringToDsType
     ///
     /// `stringToDsType`, which is `flipMap(dsTypeToString)` (`dsc/designSpaceConfig.cpp:9264-9265`) —
     /// so an unknown spelling is absent, where IBM's `.at()` throws.
@@ -180,7 +180,7 @@ impl DtType {
     /// The keys of `dtTypeToString`, in the enum's order (`dsc/dscdefn.h:214`).
     pub const ALL: [Self; 3] = [Self::DblBuff, Self::BlkLoad, Self::Streaming];
 
-    /// Field: e027_DesignSpaceConfig.dtTypeToString
+    /// Field: e020_DesignSpaceConfig.dtTypeToString
     ///
     /// `dtTypeToString` (`dsc/designSpaceConfig.cpp:9266-9269`).
     pub const fn name(self) -> &'static str {
@@ -191,7 +191,7 @@ impl DtType {
         }
     }
 
-    /// Field: e027_DesignSpaceConfig.stringToDtType
+    /// Field: e020_DesignSpaceConfig.stringToDtType
     ///
     /// `stringToDtType`, which is `flipMap(dtTypeToString)` (`dsc/designSpaceConfig.cpp:9270-9271`) —
     /// so an unknown spelling is absent, where IBM's `.at()` throws.
@@ -239,7 +239,7 @@ impl ExternalSenOps {
         Self::SenBnPrecompute,
     ];
 
-    /// Field: e027_DesignSpaceConfig.exSenOpsToString
+    /// Field: e020_DesignSpaceConfig.exSenOpsToString
     ///
     /// `exSenOpsToString` (`dsc/designSpaceConfig.cpp:9272-9281`) — the printed name is the Sen op's,
     /// not the enumerator's: `SENCOMPUTE` prints `SenPreparedOp`, `SENDATAPREP` `SenDataConvert` and
@@ -257,7 +257,7 @@ impl ExternalSenOps {
         }
     }
 
-    /// Field: e027_DesignSpaceConfig.stringToExSenOps
+    /// Field: e020_DesignSpaceConfig.stringToExSenOps
     ///
     /// `stringToExSenOps`, which is `flipMap(exSenOpsToString)` (`dsc/designSpaceConfig.cpp:9282-9283`)
     /// — so an unknown spelling is absent, where IBM's `.at()` throws.
@@ -375,7 +375,7 @@ impl LoopNames {
         Self::Invalid,
     ];
 
-    /// Field: e027_DesignSpaceConfig.loopNameToString
+    /// Field: e020_DesignSpaceConfig.loopNameToString
     ///
     /// `loopNameToString` (`dsc/designSpaceConfig.cpp:9222-9238`).
     ///
@@ -420,7 +420,7 @@ impl LoopNames {
         }
     }
 
-    /// Field: e027_DesignSpaceConfig.stringToLoopName
+    /// Field: e020_DesignSpaceConfig.stringToLoopName
     ///
     /// `stringToLoopName`, which is `flipMap(loopNameToString)`
     /// (`dsc/designSpaceConfig.cpp:9239-9240`).
@@ -430,7 +430,7 @@ impl LoopNames {
             .find(|loop_name| loop_name.name() == name)
     }
 
-    /// Field: e027_DesignSpaceConfig.stringToLoopNameDm
+    /// Field: e020_DesignSpaceConfig.stringToLoopNameDm
     ///
     /// `stringToLoopNameDm`, the DM's own spellings — a SEPARATE table, not the flip of
     /// [`name`](Self::name) (`dsc/designSpaceConfig.cpp:9241-9254`).
@@ -725,7 +725,7 @@ pub enum OpFuncInputs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OpFuncOutputs(pub u32);
 
-/// Field: e027_DesignSpaceConfig.opFuncsToInOuts
+/// Field: e020_DesignSpaceConfig.opFuncsToInOuts
 ///
 /// `opFuncsToInOuts` (`dsc/designSpaceConfig.cpp:9285-9448`) — 161 of [`OpFunc`]'s 176 variants, so
 /// the fifteen in the last arm are absent, where IBM's `.at()` throws (`:8213`, `:8274`).
@@ -918,7 +918,7 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
     })
 }
 
-/// Replaces: e027_DesignSpaceConfig
+/// Replaces: e020_DesignSpaceConfig
 ///
 /// `dsc/designSpaceConfig.h:51-705`. One op's design space configuration: the data structures it
 /// moves, the memory-hierarchy stages it moves them through, the loop nest that drives them and the
@@ -941,7 +941,7 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 ///   (`dsc/designSpaceConfig.cpp:1344-1346`) and the JSON importer resolves those two pointers by
 ///   matching the string against the `name_` of eight named members PLUS every [`sc`](Self::sc)
 ///   entry (`:6927-6931`, `:7511-7515`).
-/// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, still the open `e032_ScheduleTree` anchor.
+/// * `scheduleTree_` (`:115`) — `dsc2::ScheduleTree`, whose own unit is still open.
 ///   `isDSC2` — `return !scheduleTree_.empty()` (`dsc/designSpaceConfig.cpp:30`) — is the one method
 ///   blocked on it alone, and is NOT ported here.
 /// * `pcfg_` (`:120`) — `std::vector<SenPcfg>`, and DCG/PCFG is off this campaign's path
@@ -954,8 +954,8 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 ///
 /// ⛔ AND `paramNameToVal` (`:358-609`) IS PORTED AS A RESOLVER, NOT A TABLE. IBM's 240 entries are
 /// `double*` INTO this object's own `DataStructDims` members, so a copy leaves every pointer aimed at
-/// the SOURCE object; `updateParamNameToVal()` (`:614`) exists to re-point them and it re-points only
-/// 62 of the 240 — and it has ZERO callers tree-wide. [`param_name_to_val`](Self::param_name_to_val)
+/// the SOURCE object; `updateParamNameToVal()` (`:614`) re-points 66 of the 240 — each to the target
+/// it already holds — and has ZERO callers. [`param_name_to_val`](Self::param_name_to_val)
 /// resolves the name on each call, so there is nothing to go stale and nothing for that method to fix.
 ///
 /// ⛔ AND EIGHT OF THIS UNIT'S STILL-OPEN ANCHORS NAME NO FIELD AT ALL. `addNewLine`,
@@ -966,11 +966,11 @@ pub fn op_func_in_outs(op: OpFunc) -> Option<OpFuncInOuts> {
 /// `dimToSymbolMapping_`, `dscN_`, `coordinateMasking_` and `maskingConstId_`.
 #[derive(Clone, Debug)]
 pub struct DesignSpaceConfig {
-    /// Field: e027_DesignSpaceConfig.name_
+    /// Field: e020_DesignSpaceConfig.name_
     ///
     /// The op's name (`dsc/designSpaceConfig.h:72`), filled by DSM.
     pub name: String,
-    /// Field: e027_DesignSpaceConfig.numCoresUsed_
+    /// Field: e020_DesignSpaceConfig.numCoresUsed_
     ///
     /// How many cores this DSC uses (`dsc/designSpaceConfig.h:73`).
     ///
@@ -978,7 +978,7 @@ pub struct DesignSpaceConfig {
     /// initialiser, so a default-constructed DSC's value is indeterminate — and `0` would be a real
     /// count, which is why this is an [`Option`] rather than a zero.
     pub num_cores_used: Option<NumCoresUsed>,
-    /// Field: e027_DesignSpaceConfig.numCoreletsUsed_
+    /// Field: e020_DesignSpaceConfig.numCoreletsUsed_
     ///
     /// How many corelets per core this DSC uses (`dsc/designSpaceConfig.h:74`), absent on the same
     /// terms as [`num_cores_used`](Self::num_cores_used).
@@ -986,65 +986,65 @@ pub struct DesignSpaceConfig {
     /// ⛔ NOT THE SAME FIELD AS [`num_corelets_used_dsc2`](Self::num_corelets_used_dsc2): this one is
     /// DSM's and carries no absent encoding of its own, that one is DM's and starts at `-1`.
     pub num_corelets_used: Option<NumCoreletsUsed>,
-    /// Field: e027_DesignSpaceConfig.coreIdsUsed_
+    /// Field: e020_DesignSpaceConfig.coreIdsUsed_
     ///
     /// Which cores, by id (`dsc/designSpaceConfig.h:75`). The DDC iterates it to place per-core
     /// allocations (`ddc/ddcv1.cpp:193`, `ddc/ddc_transformation.cpp:1310`).
     pub core_ids_used: Vec<CoreId>,
-    /// Field: e027_DesignSpaceConfig.dimToSymbolMapping_
+    /// Field: e020_DesignSpaceConfig.dimToSymbolMapping_
     ///
     /// Per dim, the symbols standing in for its extent: one for a pure symbolic or pivot dim, several
     /// (max-pivot) for an irregular one (`dsc/designSpaceConfig.h:76-78`). Round-tripped through JSON
     /// with the DSC2 fields (`dsc/dsc2.cpp:50-52`, `:1120`).
     pub dim_to_symbol_mapping: BTreeMap<PrimaryDimTypes, Vec<VariableSymbol>>,
-    /// Field: e027_DesignSpaceConfig.N_
+    /// Field: e020_DesignSpaceConfig.N_
     ///
     /// The whole op's dims, padded (`dsc/designSpaceConfig.h:81`), named `"n"` by the constructor.
     pub n: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.unpadN_
+    /// Field: e020_DesignSpaceConfig.unpadN_
     ///
     /// The same dims before padding (`dsc/designSpaceConfig.h:82`), named `"unpadn"`.
     pub unpad_n: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.dscN_
+    /// Field: e020_DesignSpaceConfig.dscN_
     ///
     /// The parameters THIS DSC performs, which is a share of [`n`](Self::n) when an op is split
     /// across DSCs (`dsc/designSpaceConfig.h:83`), named `"dscn"`. It is what the coordinate-masking
     /// writers subtract the valid extent from (`dsm/dsm.cpp:17532`, `:17573`).
     pub dsc_n: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.constantInfo_
+    /// Field: e020_DesignSpaceConfig.constantInfo_
     ///
     /// Every constant this op needs, by id (`dsc/designSpaceConfig.h:90`).
     pub constant_info: BTreeMap<ConstantId, ConstantInfo>,
-    /// Field: e027_DesignSpaceConfig.primaryDsInfo_
+    /// Field: e020_DesignSpaceConfig.primaryDsInfo_
     ///
     /// Per data-structure role, its layout and stick order (`dsc/designSpaceConfig.h:93`). It is what
     /// [`stick_sizes`](Self::stick_sizes), [`layout_dim_set`](Self::layout_dim_set) and
     /// [`dim_index_in_layout_order`](Self::dim_index_in_layout_order) all read.
     pub primary_ds_info: BTreeMap<DsTypes, PrimaryDsInfo>,
-    /// Field: e027_DesignSpaceConfig.pdsRelation_
+    /// Field: e020_DesignSpaceConfig.pdsRelation_
     ///
     /// Whether the primary data structures reuse each other (`dsc/designSpaceConfig.h:94`).
     pub pds_relation: PrimaryDsRelationInfo,
-    /// Field: e027_DesignSpaceConfig.ChipD_
+    /// Field: e020_DesignSpaceConfig.ChipD_
     ///
     /// The dims one chip handles (`dsc/designSpaceConfig.h:95`), named `"chipd"`.
     pub chip_d: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.ChipletD_
+    /// Field: e020_DesignSpaceConfig.ChipletD_
     ///
     /// The dims one chiplet handles (`dsc/designSpaceConfig.h:96`), named `"chipletd"`.
     pub chiplet_d: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.CoreD_
+    /// Field: e020_DesignSpaceConfig.CoreD_
     ///
     /// The dims one CORE handles (`dsc/designSpaceConfig.h:97`).
     ///
     /// ⛔ ITS NAME IS `"d"`, NOT `"cored"` (`dsc/designSpaceConfig.cpp:22`), and that bare `d` is the
     /// prefix of twenty `paramNameToVal` keys and of `getLoopCount`'s numerator for every DB loop.
     pub core_d: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.CoreletD_
+    /// Field: e020_DesignSpaceConfig.CoreletD_
     ///
     /// The dims one corelet handles (`dsc/designSpaceConfig.h:98`), named `"coreletd"`.
     pub corelet_d: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.coordinateMasking_
+    /// Field: e020_DesignSpaceConfig.coordinateMasking_
     ///
     /// Per dim, each masked stretch as a `<unmasked, masked>` pair of ELEMENT COUNTS
     /// (`dsc/designSpaceConfig.h:99-100`) — DSM writes `(valid, dscN_.j_ - valid)`
@@ -1052,46 +1052,46 @@ pub struct DesignSpaceConfig {
     /// [`StickMaskNode`](crate::schedule::dsc2::StickMaskNode) (`ddc/ddcv1.cpp:3485-3600`).
     /// Round-tripped with the DSC2 fields (`dsc/dsc2.cpp:36-38`, `:1101-1105`).
     pub coordinate_masking: BTreeMap<PrimaryDimTypes, Vec<MaskSplit>>,
-    /// Field: e027_DesignSpaceConfig.maskingConstId_
+    /// Field: e020_DesignSpaceConfig.maskingConstId_
     ///
     /// The constant holding the value masked elements read, shared by every tensor of the op
     /// (`dsc/designSpaceConfig.h:101`). ⛔ ITS `-1` IS ABSENT: the SAMV node copies it and both
     /// readers test `>= 0` before indexing `constantInfo_` (`ddc/ddcv1.cpp:3531`,
     /// `dsc-based-utils/DSC2ToDataflowIR/V3/SNStickMaskLowering.cpp:32-36`).
     pub masking_const_id: Option<ConstantId>,
-    /// Field: e027_DesignSpaceConfig.numCoreletsUsed_DSC2_
+    /// Field: e020_DesignSpaceConfig.numCoreletsUsed_DSC2_
     ///
     /// DM's corelet count, which is what the DSC2 path iterates (`dsc/designSpaceConfig.h:104`;
     /// `ddc/ddcv1.cpp:207`, `:1755`, `:1769`, `ddc/ddc_transformation_util.cpp:519`). ⛔ ITS `-1` IS
     /// ABSENT, and IBM's `for (cl = 0; cl < -1; cl++)` simply does not run.
     pub num_corelets_used_dsc2: Option<NumCoreletsUsed>,
-    /// Field: e027_DesignSpaceConfig.dataStageParam_
+    /// Field: e020_DesignSpaceConfig.dataStageParam_
     ///
     /// Each data stage by id (`dsc/designSpaceConfig.h:105`) — the stage a loop's numerator and
     /// denominator name, and where `parametricIterCount` reads its padding from
     /// (`dsc/dsc2.cpp:4155`).
     pub data_stage_param: BTreeMap<DataStageId, DataStage>,
-    /// Field: e027_DesignSpaceConfig.B_
+    /// Field: e020_DesignSpaceConfig.B_
     ///
     /// The block-transfer stage's dims (`dsc/designSpaceConfig.h:106`), named `"b"`.
     pub b: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.T_
+    /// Field: e020_DesignSpaceConfig.T_
     ///
     /// The tile stage's dims (`dsc/designSpaceConfig.h:107`), named `"t"`.
     pub t: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.Tel_
+    /// Field: e020_DesignSpaceConfig.Tel_
     ///
     /// The tile stage's element-level dims (`dsc/designSpaceConfig.h:108`), named `"tel"`.
     pub tel: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.P_
+    /// Field: e020_DesignSpaceConfig.P_
     ///
     /// The processing stage's dims (`dsc/designSpaceConfig.h:109`), named `"p"`.
     pub p: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.Pel_
+    /// Field: e020_DesignSpaceConfig.Pel_
     ///
     /// The processing stage's element-level dims (`dsc/designSpaceConfig.h:110`), named `"pel"`.
     pub pel: DataStructDims,
-    /// Field: e027_DesignSpaceConfig.sc_
+    /// Field: e020_DesignSpaceConfig.sc_
     ///
     /// The auxiliary loop sets' dims (`dsc/designSpaceConfig.h:111`).
     ///
@@ -1110,7 +1110,7 @@ pub struct DesignSpaceConfig {
     /// `exportJson` (`:6235-6237`) both emit it. `AuxLoopSetInfo::scDimOrder_` (`dsc/dscdefn.h:128`)
     /// is a different field.
     pub sc: Vec<DataStructDims>,
-    /// Field: e027_DesignSpaceConfig.loopOrder_
+    /// Field: e020_DesignSpaceConfig.loopOrder_
     ///
     /// The loop nest, outermost first (`dsc/designSpaceConfig.h:112`). Filled by DM/DSI
     /// (`dsi/test/psum_test.cpp:70`).
@@ -1122,22 +1122,22 @@ pub struct DesignSpaceConfig {
     /// name (`dm/dm.cpp:1120-1125`). So the loop order chooses WHICH stage's extent a
     /// `paramNameToVal` lookup answers with.
     pub loop_order: Vec<LoopNames>,
-    /// Field: e027_DesignSpaceConfig.loopProperties_
+    /// Field: e020_DesignSpaceConfig.loopProperties_
     ///
     /// Per loop, its properties (`dsc/designSpaceConfig.h:113`). DM copies the map wholesale and then
     /// overwrites single entries (`dm/dm.cpp:470`, `:1446`).
     pub loop_properties: BTreeMap<LoopNames, LoopProperties>,
-    /// Field: e027_DesignSpaceConfig.gtrIdsUsed_
+    /// Field: e020_DesignSpaceConfig.gtrIdsUsed_
     ///
     /// Which group tag registers this DSC occupies (`dsc/designSpaceConfig.h:116`), round-tripped
     /// with the DSC2 fields (`dsc/dsc2.cpp:111-113`, `:1151-1154`).
     pub gtr_ids_used: BTreeSet<GroupId>,
-    /// Field: e027_DesignSpaceConfig.l0TetheredMode_
+    /// Field: e020_DesignSpaceConfig.l0TetheredMode_
     ///
     /// Whether L0 is tethered (`dsc/designSpaceConfig.h:117`), which the DDC's allocation walk
     /// branches on (`ddc/ddcv1.cpp:299`, `:324`) and JSON carries (`dsc/dsc2.cpp:364`, `:1156`).
     pub l0_tethered_mode: bool,
-    /// Field: e027_DesignSpaceConfig.target_
+    /// Field: e020_DesignSpaceConfig.target_
     ///
     /// What this DSC is being compiled for (`dsc/designSpaceConfig.h:121`); it selects which tool
     /// fills the program frame (`:123-128`) and is the key `fillPcfgProgramFrame` writes under
@@ -1217,8 +1217,11 @@ impl DesignSpaceConfig {
         })
     }
 
-    /// The same dispatch as a handle to assign through — IBM's `getDsdFromStr` returns a
-    /// `DataStructDims&` and its callers write through it (`dsc/designSpaceConfig.h:317-346`).
+    /// The same dispatch as a handle to assign through, because `getDsdFromStr` is non-const and
+    /// returns a `DataStructDims&` (`dsc/designSpaceConfig.h:317-346`).
+    ///
+    /// ⛔ NEITHER CALLER USES THE MUTATION: both (`dsc/designSpaceConfig.cpp:644`, `:691`) bind the
+    /// reference only to call `primaryDimToVal_st`, `const` on both overloads (`dsc/dims.h:268-273`).
     pub fn dsd_from_str_mut(&mut self, dsdstr: &str) -> Option<&mut DataStructDims> {
         Some(match dsdstr.to_ascii_lowercase().as_str() {
             "n" => &mut self.n,
@@ -1238,7 +1241,7 @@ impl DesignSpaceConfig {
     }
 
     /// The dim one of `paramNameToVal`'s 240 keys names (`dsc/designSpaceConfig.h:358-609`), or one of
-    /// the twenty an [`sc`](Self::sc) entry adds under its own `name_` (`dm/dm.cpp:980-983`).
+    /// the twenty registered under a NAMED [`sc`](Self::sc) entry's `name_` (`dm/dm.cpp:976-984`).
     ///
     /// ⛔ ABSENT MEANS ONLY THAT THE KEY IS NOT IN THE TABLE, which is IBM's `.at()` throw. An
     /// UNFILLED dim is [`ParamVal::UNFILLED`], because IBM reads through a `double*` at a member born
@@ -1251,8 +1254,11 @@ impl DesignSpaceConfig {
         dim_val_by_name(self.dsd_from_str(prefix)?, dim)
     }
 
-    /// The same key as a handle to assign through — the table's values are `double*` for that reason
+    /// The same key as a handle to assign through, the table's values being `double*`
     /// (`dsc/designSpaceConfig.h:358-609`).
+    ///
+    /// ⛔ THOUGH NO SITE ASSIGNS THROUGH ONE: the writes in this family go through the FIELD's own
+    /// accessor instead (`dsm/dsm.cpp:22561-22568`).
     pub fn param_name_to_val_mut(&mut self, name: &str) -> Option<&mut Option<dims::DimSize>> {
         if let Some((entry, dim)) = self.sc_param_name(name) {
             return self.sc[entry].param_name_to_val_mut(dim);
@@ -1261,11 +1267,17 @@ impl DesignSpaceConfig {
         self.dsd_from_str_mut(prefix)?.param_name_to_val_mut(dim)
     }
 
-    /// Which [`sc`](Self::sc) entry a key names, and the dim spelled after that entry's `name_`
-    /// (`dm/dm.cpp:980-983`). ⛔ THE LAST MATCHING ENTRY WINS, because both writers register entry 0
-    /// before entry 1 and `map[key] = ptr` overwrites.
+    /// Which [`sc`](Self::sc) entry a key names, and the dim after that entry's `name_` — registered
+    /// by four ascending loops in `dm/dm.cpp` (`:976`, `:1127`, `:4078`, `:4429`), each over the same
+    /// twenty names at the index it just wrote, so the LAST match holds the key.
+    ///
+    /// ⛔ AN UNNAMED ENTRY REGISTERS NOTHING, and `strip_prefix("")` cannot tell it from a match:
+    /// every registrar spells `name_` `"sc_" + index` FIRST; the importer's `resize` mints the nameless.
     fn sc_param_name(&self, name: &str) -> Option<(usize, &'static str)> {
         self.sc.iter().enumerate().rev().find_map(|(entry, dsd)| {
+            if dsd.name.is_empty() {
+                return None;
+            }
             let rest = name.strip_prefix(dsd.name.as_str())?;
             PARAM_DIM_NAMES
                 .into_iter()
@@ -1816,8 +1828,8 @@ mod unit_tests {
         assert_eq!(dsc.param_name_to_val("nij"), Some(ParamVal(9.0)));
     }
 
-    /// `dm/dm.cpp:980-983`: entry 0 is registered before entry 1 and `map[key] = ptr` overwrites, so
-    /// two entries sharing a `name_` leave the LATER one holding the twenty keys.
+    /// `dm/dm.cpp:976-984`: each registrar walks the entries ascending and `map[key] = ptr`
+    /// overwrites, so two entries sharing a `name_` leave the LATER one holding the twenty keys.
     #[test]
     fn the_last_sc_entry_sharing_a_name_holds_the_key() {
         let mut dsc = DesignSpaceConfig::default();
@@ -1831,6 +1843,29 @@ mod unit_tests {
         }
 
         assert_eq!(dsc.param_name_to_val("sc_0mb"), Some(ParamVal(7.0)));
+    }
+
+    /// `dsc/designSpaceConfig.cpp:6892-6899`: the JSON importer's `resize(id + 1)` is the one writer
+    /// that leaves an `sc_` entry UNNAMED, and it registers no key at all — measured on the authority,
+    /// a DSC holding three unnamed entries still has exactly the 240 keys and `at("ij")` throws.
+    #[test]
+    fn an_unnamed_sc_entry_holds_no_param_key() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.sc = vec![DataStructDims::default(); 3];
+        *dsc.sc[2].param_name_to_val_mut("ij").unwrap() = dims::DimSize::new(48.0);
+
+        // A bare dim name is not a key: no registrar can mint one, because each names its entry first.
+        for dim in PARAM_DIM_NAMES {
+            assert_eq!(dsc.param_name_to_val(dim), None, "{dim}");
+            assert!(dsc.param_name_to_val_mut(dim).is_none(), "{dim}");
+        }
+        // The twelve-prefix table answers for its own keys throughout.
+        assert_eq!(dsc.param_name_to_val("nij"), Some(ParamVal::UNFILLED));
+        // Naming the entry is what registers it, and it does so at its own index.
+        dsc.sc[2].name = "sc_2".to_string();
+        assert_eq!(dsc.param_name_to_val("sc_2ij"), Some(ParamVal(48.0)));
+        assert_eq!(dsc.param_name_to_val("ij"), None);
+        assert_eq!(dsc.param_name_to_val("sc_0ij"), None);
     }
 
     /// `dsc/designSpaceConfig.cpp:9451-9486`: each is a PRODUCT over the entries naming that dim, a
@@ -2092,34 +2127,78 @@ mod unit_tests {
     }
 }
 
-// crustify:todo: e027_DesignSpaceConfig.addNewLine
+#[cfg(test)]
+mod equivalence {
+    use super::*;
 
-// crustify:todo: e027_DesignSpaceConfig.allowMissingAlloc
+    /// `paramNameToVal(...).size()` measured on the authority, before and after `dm/dm.cpp:972-984`
+    /// names and registers entries 0 and 1 of an `sc_` the JSON importer left unnamed
+    /// (`dsc/designSpaceConfig.h:358-609`, `dsc/designSpaceConfig.cpp:6892-6899`).
+    const KEYS_UNNAMED: usize = 240;
+    const KEYS_TWO_REGISTERED: usize = 280;
 
-// crustify:todo: e027_DesignSpaceConfig.allowSymbolicVolumeLimit
+    /// How many of the names either registrar could mint the port resolves: the twelve-prefix cross
+    /// product, the twenty bare dims, and `sc_<i>` + dim for every entry.
+    fn resolved(dsc: &DesignSpaceConfig, entries: usize) -> usize {
+        let mut names: Vec<String> = Vec::new();
+        for prefix in DSD_PREFIXES {
+            names.extend(PARAM_DIM_NAMES.map(|dim| format!("{prefix}{dim}")));
+        }
+        names.extend(PARAM_DIM_NAMES.map(str::to_string));
+        for entry in 0..entries {
+            names.extend(PARAM_DIM_NAMES.map(|dim| format!("sc_{entry}{dim}")));
+        }
+        names
+            .iter()
+            .filter(|name| dsc.param_name_to_val(name).is_some())
+            .count()
+    }
 
-// crustify:todo: e027_DesignSpaceConfig.auxLoopOrder_
+    /// The importer's `resize(id + 1)` grows `sc_` without naming anything, so the key set is the
+    /// literal table until `dm` names an entry — and then it grows by twenty at that entry's index.
+    #[test]
+    fn the_key_set_is_240_until_dm_names_an_sc_entry() {
+        let mut dsc = DesignSpaceConfig::default();
+        dsc.sc = vec![DataStructDims::default(); 3];
+        assert_eq!(resolved(&dsc, dsc.sc.len()), KEYS_UNNAMED);
 
-// crustify:todo: e027_DesignSpaceConfig.computeOp_
+        dsc.sc[0].name = "sc_0".to_string();
+        dsc.sc[1].name = "sc_1".to_string();
+        assert_eq!(resolved(&dsc, dsc.sc.len()), KEYS_TWO_REGISTERED);
 
-// crustify:todo: e027_DesignSpaceConfig.doNotRound
+        // The third entry is still nameless, so `sc_2ij` remains the `.at()` throw.
+        assert_eq!(dsc.param_name_to_val("sc_2ij"), None);
+    }
+}
 
-// crustify:todo: e027_DesignSpaceConfig.includeGaps
+// crustify:todo: e020_DesignSpaceConfig.addNewLine
 
-// crustify:todo: e027_DesignSpaceConfig.labeledDs_
+// crustify:todo: e020_DesignSpaceConfig.allowMissingAlloc
 
-// crustify:todo: e027_DesignSpaceConfig.numL0Slices
+// crustify:todo: e020_DesignSpaceConfig.allowSymbolicVolumeLimit
 
-// crustify:todo: e027_DesignSpaceConfig.pcfg_
+// crustify:todo: e020_DesignSpaceConfig.auxLoopOrder_
 
-// crustify:todo: e027_DesignSpaceConfig.prog_frame_ptr_
+// crustify:todo: e020_DesignSpaceConfig.computeOp_
 
-// crustify:todo: e027_DesignSpaceConfig.ps
+// crustify:todo: e020_DesignSpaceConfig.doNotRound
 
-// crustify:todo: e027_DesignSpaceConfig.ptr_
+// crustify:todo: e020_DesignSpaceConfig.includeGaps
 
-// crustify:todo: e027_DesignSpaceConfig.scheduleTree_
+// crustify:todo: e020_DesignSpaceConfig.labeledDs_
 
-// crustify:todo: e027_DesignSpaceConfig.sizeInNumberOfLoads
+// crustify:todo: e020_DesignSpaceConfig.numL0Slices
 
-// crustify:todo: e027_DesignSpaceConfig.size_
+// crustify:todo: e020_DesignSpaceConfig.pcfg_
+
+// crustify:todo: e020_DesignSpaceConfig.prog_frame_ptr_
+
+// crustify:todo: e020_DesignSpaceConfig.ps
+
+// crustify:todo: e020_DesignSpaceConfig.ptr_
+
+// crustify:todo: e020_DesignSpaceConfig.scheduleTree_
+
+// crustify:todo: e020_DesignSpaceConfig.sizeInNumberOfLoads
+
+// crustify:todo: e020_DesignSpaceConfig.size_

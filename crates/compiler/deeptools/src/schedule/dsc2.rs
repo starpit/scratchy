@@ -5991,7 +5991,7 @@ pub enum InsertionPoint {
 /// [`ConditionNode::next_view`] on the node itself preserve the split exactly — including at the
 /// ~25 sites that hold a `BlockNode*`.
 ///
-/// ⛔ TWO OF THIS CLASS'S SIX METHODS ARE BLOCKED ON e027_DesignSpaceConfig, which is why the
+/// ⛔ TWO OF THIS CLASS'S SIX METHODS ARE BLOCKED ON `DesignSpaceConfig`, which is why the
 /// `e004_BlockNode`/`e030_BlockNode` TODO anchors at the end of this file stay open.
 /// `deleteChildNode` calls `ownerDsc->cleanupAllocation(nodeToDelete)` (`dsc/dsc2.cpp:2188-2190`)
 /// and `moveChildNode` forwards to it (`:2031-2039`); `DesignSpaceConfig::cleanupAllocation`
@@ -6298,7 +6298,7 @@ impl BlockNode {
 /// ANCHORS AT THE END OF THIS FILE OPEN. A unit is its fields AND its methods together, and three of
 /// this class's nine still cannot be written: `parametricIterCount` (`dsc/dsc2.cpp:4126`) and
 /// `parametricStride` (`:4197`) read `DesignSpaceConfig::dataStageParam_` and `labeledDs_`
-/// (e027_DesignSpaceConfig), and `print` (`:4284`) prints `this` — a raw address (`:4288`).
+/// (`DesignSpaceConfig`), and `print` (`:4284`) prints `this` — a raw address (`:4288`).
 ///
 /// ⚠️ FIVE OF EACH ANCHOR SET NAME NOTHING THIS TYPE CAN CARRY: `Ddc`, `DesignSpaceConfig`,
 /// `ScheduleTree` and `ScheduleNode` are the four `friend class` declarations (`dsc/dsc2.h:611-614`),
@@ -15042,7 +15042,7 @@ mod equivalence {
     }
 }
 
-// ⛔ THE TWO BLOCKNODE AND TWO LOOPNODE TYPE ANCHORS STAY OPEN ON e027_DesignSpaceConfig, AND NINE OF
+// ⛔ THE TWO BLOCKNODE AND TWO LOOPNODE TYPE ANCHORS STAY OPEN ON DesignSpaceConfig, AND NINE OF
 // THEIR ELEVEN REMAINING FIELD ANCHORS NAME NO FIELD. Both classes are ported above with their base
 // subobject and their child list, and both keep an open type anchor for the methods that are still
 // unreachable:
