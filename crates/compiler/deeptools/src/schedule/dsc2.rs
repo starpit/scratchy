@@ -4209,12 +4209,24 @@ impl CoordinateCategory {
 ///
 /// ⛔ `coordinates_` IS PUBLIC IN THE AUTHORITY AND PRIVATE HERE, AND THAT IS WHAT MAKES EVERY LEVEL
 /// OF EVERY TOWER AFFINE. [`add_fold`](Self::add_fold) is the only builder and it only ever calls
-/// [`FoldManager::build_affine_dim`]; no site outside this class builds through the field — the uses
-/// of `coordinates_.at(...)` elsewhere read alphas, betas, sizes and labels (`ddc/ddc_fold.cpp:906`,
-/// `:1192-1197`, `:4016-4024`, `dsc/dsc2.cpp:3848-3871`), and the one non-const binding,
-/// `auto& allocFoldCurrDim = ...coordinates_[currDim.dim_]` (`ddc/ddc_fold.cpp:2276`), is never read
-/// again. [`coordinates`](Self::coordinates) is that read access. The invariant is load-bearing:
-/// [`Clone`] is total only because of it.
+/// [`FoldManager::build_affine_dim`]; no site outside this class BUILDS through the field. ⛔ BUT ONE
+/// WRITES: `Ddc::buildFoldForTransfer` binds it non-const and adds the PE/SFP split offset onto the
+/// innermost level, `fm.insertBeta(transferSizePerDim.at(dim) + fm.getBeta(fm.getNumDims() - 1),
+/// fm.getNumDims() - 1)` (`ddc/ddc_fold.cpp:4711-4718`), which is why
+/// [`insert_beta`](Self::insert_beta) stands beside the shared [`coordinates`](Self::coordinates).
+/// It is the only mutation any site performs through the field, and it cannot break the invariant:
+/// `insertBeta` is `DT_ERROR` on a non-affine level
+/// (`util/foldManager/foldInfrastructure.h:2309-2310`). The other non-const bindings either only read
+/// — `getAlphaBeta`, `getFoldDimSize`, `getFoldDimProp`, `gatherFoldParams` (`ddc/ddc_fold.cpp:906`,
+/// `:1192-1197`, `:2995`, `:3337`, `:4016-4024`, `:4300`, `:4320`, `dsc/dsc2.cpp:3848-3871`, `:6721`)
+/// — or mint a dim's key with `operator[]` and never read the reference, each followed by its own
+/// `addFold` (`ddc/ddc_fold.cpp:2277`, `dbo/src/Utils/sdsc_bundle/GatherBuffers.cpp:133`,
+/// `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1128`).
+///
+/// ⭐ THE INVARIANT IS LOAD-BEARING, BUT NOT FOR [`Clone`]'s TOTALITY — that clones each tower
+/// structurally and is total unconditionally. What rests on it is [`Clone`]'s EQUIVALENCE to the
+/// authority's `operator=`, which replays every level through `getAlphaBeta` + `addFold`
+/// (`:166-184`) and so only agrees while every level is affine.
 ///
 /// ⛔ AND THE JSON IMPORTER IS NOT PORTED. `dsc_import_json` (`:318-358`) rebuilds a coordinate from
 /// the object [`print_coordinates`](Self::print_coordinates) writes, through
@@ -4571,12 +4583,32 @@ impl CoordinateType {
     /// The `coordinates_` field's read access (`:431`), which is public in the authority and how every
     /// pass outside this class reaches a level's alpha, beta, size or label.
     ///
-    /// ⛔ SHARED ON PURPOSE. A `&mut` here would let a caller build a Map or Constant level and break
-    /// the all-affine invariant [`Clone`] rests on; no in-scope site needs one, and the two that
-    /// `const_cast` (`dsc/dsc2.cpp:3849`, `ddc/ddc_fold.cpp:4016`) do it only because IBM's readers are
-    /// not `const`.
+    /// ⛔ SHARED ON PURPOSE, AND NOT BECAUSE NOBODY WRITES. A `&mut` here would let a caller build a
+    /// Map or Constant level and break the all-affine invariant; the one site that does write through
+    /// the field only moves a beta, so it gets [`insert_beta`](Self::insert_beta) instead. The two
+    /// `const_cast`s (`dsc/dsc2.cpp:3849`, `ddc/ddc_fold.cpp:4016`) are reads, done non-const only
+    /// because IBM's getters are not `const`.
     pub fn coordinates(&self) -> &BTreeMap<PrimaryDimTypes, FoldManager<i64>> {
         &self.coordinates
+    }
+
+    /// `coordinates_.at(dim).insertBeta(new_beta, pos)` as `Ddc::buildFoldForTransfer` performs it
+    /// (`ddc/ddc_fold.cpp:4711-4718`) — move one affine level's beta on one dim's tower, leaving that
+    /// level's alpha, size, label and the three counts alone.
+    ///
+    /// ⛔ THE ONLY WRITE ANY SITE MAKES THROUGH `coordinates_`, and narrow by construction:
+    /// `insertBeta` is `DT_ERROR` on a non-affine level (`foldInfrastructure.h:2309-2310`), so it
+    /// cannot introduce the level [`coordinates`](Self::coordinates) withholds a `&mut` to prevent.
+    /// ⛔ [`None`] IS A DIM WITH NO TOWER (`.at` throwing) or [`FoldManager::insert_beta`]'s refusal.
+    pub fn insert_beta(
+        &mut self,
+        dim: PrimaryDimTypes,
+        new_beta: Beta,
+        pos: FoldDimPos,
+    ) -> Option<()> {
+        self.coordinates
+            .get_mut(&dim)?
+            .insert_beta(&new_beta.0, pos)
     }
 
     /// `printCoordinates(out, printContent, ps)` (`:257-315`) — the coordinate as the JSON object
@@ -5323,6 +5355,7 @@ pub struct LoopInfo {
 
 // crustify:todo: e041_ScheduleNode.comp
 
+/// Replaces: e014_DataStage
 /// Replaces: e022_DataStage
 ///
 /// `dsc/dsc2.h:39-44`. One data stage's two halves — the steady-state dims and the epilogue dims of
@@ -5330,8 +5363,11 @@ pub struct LoopInfo {
 /// (`dsc/designSpaceConfig.h:105`); id 0 is the core stage, whose name `getSizeDataStageForNode`
 /// `DT_CHECK`s to be `"core"` (`dsc/dsc2.cpp:3638-3639`).
 ///
-/// `e014_DataStage` is this same class under the superseded numbering; its two filled field anchors
-/// are RENUMBERED onto e022 here, not deleted.
+/// ⛔ `e022_DataStage` RESOLVES IN NO CAMPAIGN'S `UNITS.tsv`, SO THE RENUMBERING WENT THE WRONG WAY.
+/// This class's id is `e014_DataStage` (`crustify/crates.json:259`, `crustify-scheduler/UNITS.tsv:26`)
+/// and `e022` is locally `DistributionStatusInfo` (`crates.json:260`, `UNITS.tsv:47`), itself homed in
+/// this file — so the mis-spelling counted this type at zero. Both ids are anchored, the live one
+/// first.
 ///
 /// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and WHETHER THE EPILOGUE CARRIES A
 /// DIFFERENT ONE DEPENDS ON WHO MINTED THE STAGE. The `+ "el"` suffix belongs to the stages the DDC
@@ -5357,12 +5393,14 @@ pub struct LoopInfo {
 /// omits `name_` (`dsc/dims.h:221-228`) — so two stages with different names would compare equal.
 #[derive(Clone, Debug, Default)]
 pub struct DataStage {
+    /// Field: e014_DataStage.ss_
     /// Field: e022_DataStage.ss_
     ///
     /// The steady state: the dims of every trip but the last. It is the half readers reach for by
     /// default (`ddc/ddc_fold.cpp:2113`, `ddc/ddcv1.cpp:1924`,
     /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4848`).
     pub ss: DataStructDims,
+    /// Field: e014_DataStage.el_
     /// Field: e022_DataStage.el_
     ///
     /// The epilogue: the dims of the last, short trip. `calculateEpilogues` seeds it from `ss_` and
@@ -14849,6 +14887,109 @@ mod equivalence {
             (3, 3_999_731_503_567_925_404),
             "executed util/utils.h:100-107 over dsc/dsc2.h:529-537"
         );
+    }
+
+    /// `Ddc::buildFoldForTransfer`'s PE/SFP split step (`ddc/ddc_fold.cpp:4711-4718`) — the only site
+    /// that WRITES through the public `coordinates_`, and the reason
+    /// [`CoordinateType::insert_beta`] exists. Measured against a compiled `dsc/dsc2.h` over a tower
+    /// built `addFold(X, ELEM_ARR, 4, "elem_arr_0", 1, 0, 0)` then
+    /// `addFold(X, SPATIAL, 2, "core_fold", 10, 3, 0)`, with `transferSizePerDim.at(X) == 7`:
+    ///
+    /// ```text
+    /// before numDims=2 alpha0=10 beta0=3 alpha1=1 beta1=0 size0=2 size1=4 spatial=1 elemArr=1
+    /// after  numDims=2 alpha0=10 beta0=3 alpha1=1 beta1=7 size0=2 size1=4 spatial=1 elemArr=1
+    /// copy   numDims=2 beta1=7 equal=1
+    /// ```
+    #[test]
+    fn the_pe_sfp_split_step_moves_the_innermost_beta_and_nothing_else() {
+        let mut coord = CoordinateType::default();
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::X,
+                CoordinateCategory::ElemArr,
+                FoldDimSize(4),
+                "elem_arr_0",
+                Alpha(1),
+                Beta(0),
+                FoldDimPos(0)
+            ),
+            Some(())
+        );
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::X,
+                CoordinateCategory::Spatial,
+                FoldDimSize(2),
+                "core_fold",
+                Alpha(10),
+                Beta(3),
+                FoldDimPos(0)
+            ),
+            Some(())
+        );
+
+        // `fm.getNumDims() - 1`, then `transferSizePerDim.at(dim) + fm.getBeta(that)` (`:4714-4716`).
+        let fm = &coord.coordinates()[&PrimaryDimTypes::X];
+        let innermost = FoldDimPos(i32::try_from(fm.num_dims()).unwrap() - 1);
+        assert_eq!(innermost, FoldDimPos(1), "before numDims=2");
+        assert_eq!(fm.beta(innermost), Some(&0), "before beta1=0");
+        let beta = Beta(7 + fm.beta(innermost).unwrap());
+        assert_eq!(
+            coord.insert_beta(PrimaryDimTypes::X, beta, innermost),
+            Some(())
+        );
+
+        #[allow(clippy::type_complexity)]
+        fn show(
+            c: &CoordinateType,
+        ) -> (
+            usize,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<FoldDimSize>,
+            Option<FoldDimSize>,
+            Option<&str>,
+            Option<&str>,
+            usize,
+            usize,
+        ) {
+            let fm = &c.coordinates()[&PrimaryDimTypes::X];
+            (
+                fm.num_dims(),
+                fm.alpha(FoldDimPos(0)).copied(),
+                fm.beta(FoldDimPos(0)).copied(),
+                fm.alpha(FoldDimPos(1)).copied(),
+                fm.beta(FoldDimPos(1)).copied(),
+                fm.fold_dim_size(FoldDimPos(0)),
+                fm.fold_dim_size(FoldDimPos(1)),
+                fm.fold_dim_prop(FoldDimPos(0)).map(FoldDimProp::label),
+                fm.fold_dim_prop(FoldDimPos(1)).map(FoldDimProp::label),
+                c.num_of_spatial_folds(PrimaryDimTypes::X),
+                c.num_of_elem_arr_folds(PrimaryDimTypes::X),
+            )
+        }
+
+        let after = (
+            2,
+            Some(10),
+            Some(3),
+            Some(1),
+            Some(7),
+            Some(FoldDimSize(2)),
+            Some(FoldDimSize(4)),
+            Some("core_fold"),
+            Some("elem_arr_0"),
+            1,
+            1,
+        );
+        assert_eq!(show(&coord), after, "after ddc/ddc_fold.cpp:4716");
+
+        // The write survives the authority's `operator=` replay (`dsc/dsc2.h:166-184`).
+        let copy = coord.clone();
+        assert_eq!(show(&copy), after, "copy beta1=7");
+        assert_eq!(coord, copy, "copy equal=1");
     }
 }
 
