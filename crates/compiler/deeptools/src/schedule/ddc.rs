@@ -19,7 +19,7 @@ use sys_arch_spec::arch_enums::SenComponent;
 /// `ddc/ddc_transformation.cpp:624`).
 ///
 /// ⛔ A SUBSET OF `dsc2::memories`, NOT ITS COMPLEMENT: all seven are in that sixteen-component set
-/// too (`dsc/dscdefn.h:518`, filled `dsc/dscdefn.cpp:142-146`, ported as
+/// too (`dsc/dscdefn.h:518`, filled `dsc/dscdefn.cpp:142-144`, ported as
 /// [`crate::schedule::dsc2::MEMORIES`]), and `dsc/dsc2.cpp:2315` excludes `PELRF` and `SFPLRF` from a
 /// `memories.count(input)` branch BY NAME. Membership here never means "is not a memory".
 pub const REGISTER_COMPONENTS: [SenComponent; 7] = [
@@ -92,10 +92,11 @@ pub struct LatchDataId(pub i32);
 ///
 /// ⛔ UNSIGNED BECAUSE A NEGATIVE PHASE IS THE THROW, NOT A PHASE. `epsToListIter` is keyed only by
 /// `0..exPhases` (`util/memtracker/mem_track.cpp:128-130`), and the unguarded `.at(currEp)` calls
-/// [`Ddc::exphase`] enumerates make any other key `std::out_of_range`. Both writers in the authority
-/// already supply a member of that domain — `0` (`ddc/ddc_standalone.cpp:72`) and `execStepOf`, a
-/// phase index defaulting to `0` (`dbo/src/ProgramAttrs.h:97-104`, via `SchedulerStages.cpp:38`) — so
-/// the authority's `-1` is spelled `None` here and NOWHERE ELSE:
+/// [`Ddc::exphase`] enumerates make any other key `std::out_of_range`. ALL FOUR writers in the
+/// authority already supply a member of that domain — a literal `0` at `ddc/ddc_standalone.cpp:72`,
+/// `deeprt/deeprt_scheduler_codegen_pipeline.cpp:99` and `deeprt/deeprt.cpp:2181`, and `execStepOf`,
+/// a phase index defaulting to `0` (`dbo/src/ProgramAttrs.h:97-104`, via `SchedulerStages.cpp:38`) —
+/// so the authority's `-1` is spelled `None` here and NOWHERE ELSE:
 /// ```compile_fail
 /// let _ = deeptools::schedule::ddc::ExPhase(-1);
 /// ```
@@ -220,23 +221,23 @@ pub fn ddc_coord_env_option() -> Option<String> {
 /// `SuperDsc`'s design space configurations into a schedule tree.
 ///
 /// ⛔ THIRTEEN OF THE CLASS'S TWENTY DECLARED FIELDS, plus the static `registerComponents` as
-/// [`REGISTER_COMPONENTS`], so the `e016_Ddc`, `e025_Ddc` and `e032_Ddc` anchors below stay
-/// open. All seven left out are a pointer or a pointer-keyed container, under two blockers.
+/// [`REGISTER_COMPONENTS`], so the anchors below this type stay open. All seven left out are a
+/// reference, a pointer or a pointer-keyed container, under two blockers.
 ///
 /// Types that are not scheduled units in `crustify-scheduler/UNITS.tsv` at all:
 ///  * `dscGlobal` (`ddc/ddc.h:37`) — `const DesignSpaceConfigGlobal&`;
 ///  * `memTrackers` (`ddc/ddc.h:102`) — `MemTrackBundle*`, and note it has NO member initialiser, so
-///    a `Ddc` whose caller forgets it holds an indeterminate pointer; both real construction sites
-///    assign it at once (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:36`,
-///    `ddc/ddc_standalone.cpp:71`);
+///    a `Ddc` whose caller forgets it holds an indeterminate pointer; ALL FOUR construction sites
+///    assign it on the next line (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:35-36`,
+///    `ddc/ddc_standalone.cpp:69-71`, `deeprt/deeprt_scheduler_codegen_pipeline.cpp:97-98`,
+///    `deeprt/deeprt.cpp:2178-2179`);
 ///  * `sdsc_` (`ddc/ddc.h:106`) — `SuperDsc*`, set to `run_v1`'s argument (`ddc/ddcv1.cpp:3693`);
 ///  * `currDsc` (`ddc/ddc.h:107`) — `DesignSpaceConfig*`; the target type IS ported
 ///    ([`crate::schedule::dsc::DesignSpaceConfig`]) but it points INTO `sdsc.dscs_`
 ///    (`ddc/ddcv1.cpp:3700`), so it cannot be represented without `SuperDsc`.
 ///
-/// Fields needing `dsc2::ScheduleNode` identity, the blocker that the open
-/// `e029_ScheduleNode.prev_`, `e030_BlockNode.next_` and `e032_ScheduleTree.head_` anchors in
-/// `schedule/dsc2.rs` also carry:
+/// Fields needing `dsc2::ScheduleNode` identity, the blocker the open `ScheduleNode::prev_`,
+/// `BlockNode::next_` and `ScheduleTree::head_` anchors in `schedule/dsc2.rs` also carry:
 ///  * `loopsBelowChunkBoundary` (`ddc/ddc.h:108`) — `unordered_set<const dsc2::LoopNode*>`, filled by
 ///    a DFS over the tree (`ddc/ddcv1.cpp:3683-3689`);
 ///  * `coordPropTracker` (`ddc/ddc.h:548`) and all three fields of its nested `CoordPropTracker`
@@ -537,13 +538,22 @@ pub fn print_fold_params(fold_params: &[FoldParamInfoType], out: &mut String) {
 /// ⛔ IT RETURNS THE VECTOR instead of appending to an out-parameter, because every authority caller
 /// passes one it has just built or `clear()`ed, so nothing observes the append.
 ///
-/// ⛔ [`None`] IS `getAlphaBeta`'s OWN REFUSAL AND NOTHING ELSE: a level whose kind is not Affine is
-/// `DT_ERROR(" Cannot query beta in non affine fold func")`
-/// (`util/foldManager/foldInfrastructure.h:2433-2436`). A manager of ZERO dimensions is not a refusal
-/// — the loop body never runs and the result is empty.
+/// ⛔ THIS SEAM DECIDES THE CARDINALITY'S SIGN, AND IT IS NOT THE STORED EXTENT'S: `factor_` is a
+/// `uint32_t` (`util/foldManager/foldInfrastructure.h:153`) that `getFoldDimSize` hands back as an
+/// `int` (`:2631-2633`) before the `int64_t` field widens it (`dsc/dsc2.h:1083`), so a factor above
+/// `INT32_MAX` arrives NEGATIVE — which is what `dsc/dsc2.cpp:5887`'s
+/// `DT_CHECK(origFold.cardinality > 0)` refuses. [`FoldManager::fold_dim_size`] keeps the stored
+/// `u32` deliberately, so the narrowing is this seam's, and this is the tree's only crossing.
 ///
-/// ⚠️ NO NON-TEST CALLER YET: all ten authority call sites sit inside `Ddc` methods that need
-/// `currDsc` or `dsc2::ScheduleNode` identity, both still open above.
+/// ⛔ [`None`] IS `getAlphaBeta` AT THREE ARMS, NOT ONE: a non-Affine level
+/// (`util/foldManager/foldInfrastructure.h:2430-2431`), a level with no fold function (`:2437`), and
+/// a first node of neither affine kind, where the authority pushes its caller's UNINITIALISED
+/// `alpha, beta` instead (`:2439-2449`, `ddc/ddc_fold.cpp:2231-2234`). A manager of ZERO dimensions
+/// is not a refusal — the loop body never runs and the result is empty.
+///
+/// ⚠️ NO NON-TEST CALLER YET: all ten authority call sites need `currDsc` or `dsc2::ScheduleNode`
+/// identity — EIGHT in `Ddc` (`ddc/ddc_fold.cpp:499`, `:621`, `:1345`, `:1346`, `:2531`, `:2997`,
+/// `:3142`, `:3413`) and TWO in `L3DlOpsScheduler` (`L3DlOpsScheduler.cpp:7396`, `:7617`).
 pub fn gather_fold_params(fm: &FoldManager<i64>) -> Option<Vec<FoldParamInfoType>> {
     // `for (int i = 0; i < fm.getNumDims(); ++i)` (`:2230`) — the authority's own counter is an `int`,
     // so a dimension count past `i32::MAX` is outside its loop just as it is outside this one.
@@ -554,7 +564,9 @@ pub fn gather_fold_params(fm: &FoldManager<i64>) -> Option<Vec<FoldParamInfoType
             Some(FoldParamInfoType {
                 alpha: Alpha(*alpha),
                 beta: Beta(*beta),
-                cardinality: Cardinality(i64::from(fm.fold_dim_size(pos)?.0)),
+                // `int getFoldDimSize(int)` (`:2631-2633`) REINTERPRETS `factor_`'s bits and the
+                // `int64_t` field then sign-extends them; it does not zero-extend the `u32`.
+                cardinality: Cardinality(i64::from(fm.fold_dim_size(pos)?.0.cast_signed())),
                 fold_dim_label: fm.fold_dim_prop(pos)?.label().to_owned(),
             })
         })
@@ -604,7 +616,8 @@ pub fn gather_fold_params(fm: &FoldManager<i64>) -> Option<Vec<FoldParamInfoType
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum RowGroupCategory {
     /// `ROW_TO_SAME_ROW` (`ddc/ddc.h:557`): reference and working node share one PT row, so the
-    /// rowsplit fold is that row alone (`ddc/ddc_fold.cpp:2175-2188`).
+    /// rowsplit fold is that row alone — `cardinality = 1`, in an arm it shares with
+    /// [`Self::RowNorthSouth`] (`ddc/ddc_fold.cpp:2184-2189`).
     RowToSameRow {
         /// The one row the group requires (`ddc/ddc.h:577`).
         active_row: RowId,
@@ -893,8 +906,39 @@ mod unit_tests {
         assert_eq!(gather_fold_params(&fm), None);
     }
 
+    /// ⛔ `getFoldDimSize` NARROWS `FoldDimProp::factor_` TO `int` BEFORE `FoldParamInfoType`'s
+    /// `int64_t` WIDENS IT (`util/foldManager/foldInfrastructure.h:2631-2633`, `dsc/dsc2.h:1083`), so
+    /// a factor above `INT32_MAX` is a NEGATIVE cardinality — and `dsc/dsc2.cpp:5887`'s
+    /// `DT_CHECK(origFold.cardinality > 0)` refuses exactly what zero-extending the `u32` would pass.
+    #[test]
+    fn a_fold_factor_past_the_int_ceiling_is_a_negative_cardinality() {
+        for (factor, cardinality) in [
+            (2_147_483_647u32, 2_147_483_647i64),
+            (2_147_483_648, -2_147_483_648),
+            (3_000_000_000, -1_294_967_296),
+            (u32::MAX, -1),
+        ] {
+            let mut fm = FoldManager::<i64>::new();
+            assert_eq!(
+                fm.build_affine_dim(&FoldDimProp::new(FoldDimSize(factor), "f"), FoldDimPos(0)),
+                Some(())
+            );
+            assert_eq!(fm.insert_alpha_beta(&1, &0, FoldDimPos(0)), Some(()));
+            assert_eq!(fm.fold_dim_size(FoldDimPos(0)), Some(FoldDimSize(factor)));
+            assert_eq!(
+                gather_fold_params(&fm).expect("one affine level")[0].cardinality,
+                Cardinality(cardinality)
+            );
+            assert_eq!(
+                cardinality > 0,
+                factor <= i32::MAX.cast_unsigned(),
+                "`cardinality > 0` splits the u32 range at INT32_MAX"
+            );
+        }
+    }
+
     /// `ddc/ddcv1.cpp:17-18` against the initializer list, and ⛔ EVERY ONE IS ALSO A
-    /// `dsc2::memories` COMPONENT (`dsc/dscdefn.cpp:142-146`), so the two sets are not complements
+    /// `dsc2::memories` COMPONENT (`dsc/dscdefn.cpp:142-144`), so the two sets are not complements
     /// and `!is_any_of(storage, registerComponents)` is not "is a memory".
     #[test]
     fn the_seven_register_components_are_all_also_dsc2_memories() {
