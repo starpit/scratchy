@@ -5,8 +5,10 @@
 //! header; a `.cpp:NNN` one is `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp`.
 
 use crate::schedule::ddc::{ExPhase, Verbosity};
-use crate::schedule::dims::{DimDensity, PaddingFormType, PrimaryDimTypes};
-use crate::schedule::dsc::DesignSpaceConfig;
+use crate::schedule::dims::{
+    DataStructDims, DimDensity, DimSize, DimVal, PaddingFormType, PrimaryDimTypes,
+};
+use crate::schedule::dsc::{DesignSpaceConfig, NumCoreletsUsed};
 use crate::schedule::dsc2::{
     AllocateNode, DataStageId, GroupId, IndirectAllocType, LdsIdx, ScheduleTree, SyncNode,
     TransferNode,
@@ -1564,6 +1566,360 @@ impl L3DlOpsScheduler {
     }
 }
 
+/// Replaces: e029_L3DlOpsScheduler.DscParamCandidatesType
+///
+/// `:100-101`. Per DSC, then per primary dim, the extents the chunk explorer may choose between —
+/// `generateDscParamCandidates` sizes the outer vector to the op's DSC count (`.cpp:1177-1178`) and
+/// `getChunkParamsFromCandidates` is the only reader (`.cpp:1431`).
+///
+/// ⭐ THE ELEMENT IS A [`DimSize`], NOT IBM'S `long`: its one use assigns it straight into a
+/// [`DataStructDims`] dim handler (`.cpp:1430-1431`), which is a `double`, and nothing computes with
+/// it along the way. That makes a negative candidate unrepresentable here instead of an unfilled dim.
+/// ⭐ A [`BTreeMap`] WHERE IBM HAS AN `unordered_map` (`:101`): the inner map is only ever reached by
+/// `.at(dim)` against a caller's dim list (`.cpp:1428`, `:1431`) and never iterated, so no order of
+/// it is observable.
+pub type DscParamCandidates = Vec<BTreeMap<PrimaryDimTypes, Vec<DimSize>>>;
+
+/// Which candidate of one dim's list the explorer picked — IBM's `unsigned` (`:103`) and the
+/// `selectedIdx` its one reader bounds-checks against that list's length (`.cpp:1428-1430`).
+///
+/// ⛔ MINTED BECAUSE NOTHING IN THE CRATE SPELLS A POSITION IN A CANDIDATE LIST, and because it must
+/// not be interchangeable with [`DscIdx`], which indexes the OUTER vector of the very same two
+/// typedefs. The name is the authority's own local (`.cpp:1428`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CandidateIdx(pub usize);
+
+/// Replaces: e029_L3DlOpsScheduler.DscParamCandidateIndicesType
+///
+/// `:102-103`. Per DSC, then per primary dim, which candidate is selected — the point in the
+/// candidate space the two search routines walk (`.cpp:2019`, `:2501`) and hand to
+/// [`L3DlOpsScheduler::update_chunk_data_stages_from_candidates`] by const reference.
+pub type DscParamCandidateIndices = Vec<BTreeMap<PrimaryDimTypes, CandidateIdx>>;
+
+/// `.cpp:48`. A temporary option carrying `unneededPad_` from the core data stage to the chunk one
+/// while L3 PCFG generation needs it (`.cpp:44-47`, `.cpp:135-140`).
+///
+/// ⛔ ITS `false` ARM IS DEAD IN EVERY BUILD OF THE AUTHORITY: nothing assigns this flag, and unlike
+/// `enableChunkExplore` it has no environment override — `DISABLE_ABOVE_LX_CHUNK_EXPLORE`
+/// (`.cpp:7924-7929`) reaches that one and only that one.
+const CARRY_UNNEEDED_PAD_TO_CHUNK: bool = true;
+
+/// `.cpp:88-103`, `getCoreletSplitDimensions`. Every dim the corelets of a core divide, in the
+/// authority's enum order — which is what its walk over the `std::map`
+/// `EnumsConversion::primaryDimToString` yields (`dsc/dims.cpp:21-35`) once the compound `Ij`/`Kij`
+/// and the [`PrimaryDimTypes::Undefined`] sentinel are skipped, and [`PrimaryDimTypes::ALL`] is
+/// already that order without the sentinel.
+///
+/// ⛔ ABSENT IS THE INDETERMINATE `numCoreletsUsed_` — see
+/// [`L3DlOpsScheduler::is_dimension_corelet_split`], which this asks once per dim.
+fn corelet_split_dimensions(dsc: &DesignSpaceConfig) -> Option<Vec<PrimaryDimTypes>> {
+    let mut dims = Vec::new();
+    if dsc.num_corelets_used? > NumCoreletsUsed(1) {
+        for dim in PrimaryDimTypes::ALL {
+            if matches!(dim, PrimaryDimTypes::Ij | PrimaryDimTypes::Kij) {
+                continue;
+            }
+            if L3DlOpsScheduler::is_dimension_corelet_split(dsc, dim)? {
+                dims.push(dim);
+            }
+        }
+    }
+    Some(dims)
+}
+
+/// `.cpp:105-126`, `addOrUpdateCoreletSplitInParams`. Give every corelet-split dim an equal share of
+/// this stage's extent, one entry per corelet, replacing whatever share was recorded before.
+///
+/// ⛔ AN UNFILLED DIM IS SKIPPED AND THAT IS NOT AN ABSENCE: `primaryDimToVal_st(dim) == -1`
+/// (`.cpp:111-113`) tests the `-1` an unfilled dim REPORTS (`dsc/dims.cpp:567-568`), not the
+/// `DT_ERROR`, which is why this reads a [`DimVal`] and not a [`DimSize`].
+/// ⛔ ABSENT IS IBM'S ONE `DT_CHECK` — the extent must divide by the corelet count
+/// (`.cpp:114-115`) — plus the `.at(clId)` throws inside `primaryDimToVal_st`. NOTHING IS UNDONE in
+/// that case: the dims visited before it keep the shares this wrote, exactly as IBM leaves them.
+/// ⭐ `checked_rem`/`checked_div` WHERE IBM DIVIDES BY A PLAIN `int`: a zero corelet count is UB
+/// there and is no answer here, so the arm needs no unreachable branch to stay panic-free.
+fn add_or_update_corelet_split_in_params(
+    params: &mut DataStructDims,
+    dsc: &DesignSpaceConfig,
+) -> Option<()> {
+    for dim in corelet_split_dimensions(dsc)? {
+        let num_corelets_per_core = i32::try_from(dsc.num_corelets_used?.0).ok()?;
+        let val = params.primary_dim_to_val(dim)?;
+        if val == DimVal(-1) {
+            continue;
+        }
+        if val.0.checked_rem(num_corelets_per_core)? != 0 {
+            return None;
+        }
+        let corelet_val = DimVal(val.0.checked_div(num_corelets_per_core)?);
+        let split = params.corelet_split.entry(dim).or_default();
+        split.clear();
+        split.resize(usize::try_from(num_corelets_per_core).ok()?, corelet_val);
+    }
+    Some(())
+}
+
+/// `.cpp:128-148`, `voidPaddingIfChunking`. Where this stage chunks a padded dim — or chunks the
+/// window dim that dim's padding is measured against — the front and back pads become IBM's `-1`
+/// marker, because a pad computed for the whole core extent does not describe a chunk of it.
+///
+/// ⛔ ABSENT IS IBM'S `DT_CHECK` THAT NEITHER STAGE IS EMPTY (`.cpp:130-131`), and nothing is
+/// written in that case.
+/// ⭐ TWO PHASES WHERE IBM HAS ONE, AND THE RESULT IS IDENTICAL: IBM mutates `ds.paddingSizes_`
+/// while iterating it and reads `ds.primaryDimToVal_st(..)` on the same object inside that loop,
+/// which would make the answer depend on the map's order. It does not, because the one-argument
+/// overload defaults `padded` to an empty `PaddingFormType`, whose every dim is `NOPAD`
+/// (`dsc/dims.cpp:809-810`), and `calculate_padded` returns the raw value before it ever consults
+/// `paddingSizes_` (`dsc/dims.cpp:563-566`). No read in this loop can observe a write in it.
+/// ⭐ AND THE `||` SHORT-CIRCUITS AS IBM'S DOES: a dim whose own extent already differs never asks
+/// after its window dim (`.cpp:133-136`).
+fn void_padding_if_chunking(ds: &mut DataStructDims, ref_ds: &DataStructDims) -> Option<()> {
+    if ds.empty() || ref_ds.empty() {
+        return None;
+    }
+
+    let mut chunked = Vec::new();
+    for (&dim, pad) in &ds.padding_sizes {
+        if ref_ds.primary_dim_to_val(dim)? != ds.primary_dim_to_val(dim)?
+            || (pad.window_dim != PrimaryDimTypes::Undefined
+                && ref_ds.primary_dim_to_val(pad.window_dim)?
+                    != ds.primary_dim_to_val(pad.window_dim)?)
+        {
+            chunked.push(dim);
+        }
+    }
+
+    for dim in chunked {
+        let pad = ds.padding_sizes.get_mut(&dim)?;
+        if pad.pad_back != 0 || pad.pad_front != 0 {
+            pad.pad_back = -1;
+            pad.pad_front = -1;
+        }
+        if !CARRY_UNNEEDED_PAD_TO_CHUNK {
+            pad.unneeded_pad = 0;
+            pad.unneeded_pad_front = 0;
+            pad.unneeded_pad_back = 0;
+        }
+    }
+    Some(())
+}
+
+/// `.cpp:150-156`, `addOrUpdatePaddingSizesInChunkParams`. Copy the core stage's padding scalars onto
+/// the chunk stage, then void the ones chunking has invalidated.
+///
+/// ⛔ ABSENT IS IBM'S `DT_CHECK` THAT NEITHER STAGE IS EMPTY (`.cpp:152-153`). IBM checks it again
+/// inside `voidPaddingIfChunking` and both checks answer the same, since copying a non-empty stage's
+/// padding cannot make either stage empty.
+fn add_or_update_padding_sizes_in_chunk_params(
+    chunk_params: &mut DataStructDims,
+    core_params: &DataStructDims,
+) -> Option<()> {
+    if chunk_params.empty() || core_params.empty() {
+        return None;
+    }
+    chunk_params.padding_sizes = core_params.padding_sizes.clone();
+    void_padding_if_chunking(chunk_params, core_params)
+}
+
+/// `.cpp:158-172`, `addOrUpdateSymbolicInfoInParams`. Carry the core stage's symbolic dims onto the
+/// chunk stage for the dims chunking left at their core extent, then carry the joint volume limits
+/// and prune them against the core stage.
+///
+/// ⛔ ABSENT IS IBM'S `DT_CHECK` THAT NEITHER STAGE IS EMPTY (`.cpp:160-161`) and the two inside
+/// `pruneMaxSymbolicVolumes` (`dsc/dims.cpp:729-762`) — where IBM has already erased the entries it
+/// visited and this writes nothing at all.
+/// ⭐ EVERY READ HERE IS OF THE DIM IT IS ABOUT TO WRITE, so the writes cannot move the later reads:
+/// `primaryDimToVal_st` consults `symbolicDimInfo_` at the asked dim only (`dsc/dims.cpp:516-524`).
+/// ⛔ AND A CARRIED SYMBOLIC DIM CHANGES THAT DIM'S REPORTED VALUE: presence in `symbolicDimInfo_`
+/// makes `maxSize_` the answer instead of the dim field, which is why the comparison is the last
+/// thing that reads the chunk stage unmodified.
+fn add_or_update_symbolic_info_in_params(
+    chunk_params: &mut DataStructDims,
+    core_params: &DataStructDims,
+) -> Option<()> {
+    if chunk_params.empty() || core_params.empty() {
+        return None;
+    }
+    for (&dim, &symbolic_info) in &core_params.symbolic_dim_info {
+        if chunk_params.primary_dim_to_val(dim)? == core_params.primary_dim_to_val(dim)? {
+            chunk_params.symbolic_dim_info.insert(dim, symbolic_info);
+        }
+    }
+    chunk_params.max_symbolic_volume = core_params.max_symbolic_volume.clone();
+    chunk_params.prune_max_symbolic_volumes(core_params)
+}
+
+impl L3DlOpsScheduler {
+    /// `.cpp:721-736`, `addOrUpdateDataStageParam` (`:280-285`). Write one data stage's two halves,
+    /// minting the stage when this DSC holds none at that id.
+    ///
+    /// ⛔ ABSENT IS IBM'S ONE `DT_CHECK`: neither half may be empty (`.cpp:727-728`), and nothing is
+    /// written in that case — not even the default stage the `emplace` would have added.
+    /// ⚠️ TRANSPOSING THE TWO HALVES IS NOT A TYPE ERROR, and it is not one in the authority either:
+    /// both parameters are a `const DataStructDims &` and both names a `const std::string &`
+    /// (`:281-284`). Both real call sites pass ONE name for both halves (`.cpp:1419-1420`,
+    /// `:1477-1480`), which is why a chunk stage's epilogue is also named `"chunk"`.
+    pub fn add_or_update_data_stage_param(
+        dsc: &mut DesignSpaceConfig,
+        ss_param: &DataStructDims,
+        ss_name: &str,
+        el_param: &DataStructDims,
+        el_name: &str,
+        index: DataStageId,
+    ) -> Option<()> {
+        if ss_param.empty() || el_param.empty() {
+            return None;
+        }
+        let stage = dsc.data_stage_param.entry(index).or_default();
+        stage.ss = ss_param.clone();
+        stage.ss.name = String::from(ss_name);
+        stage.el = el_param.clone();
+        stage.el.name = String::from(el_name);
+        Some(())
+    }
+
+    /// `.cpp:1423-1436`, `getChunkParamsFromCandidates` (`:339-343`). Give each named dim the
+    /// candidate the search selected, then recompute the compound dims from their halves.
+    ///
+    /// ⛔ ABSENT IS IBM'S BOUNDS `DT_CHECK` (`.cpp:1429-1430`) and the two `.at()` throws on a dim
+    /// that the selection or the candidate map does not name. IBM keeps the dims it assigned before
+    /// aborting, and so does this — but `compound()` never runs, so the compound dims stay as they
+    /// were.
+    /// ⛔ AND ABSENT FOR A `dscIdx` PAST THE END, WHERE IBM HAS NO CHECK AT ALL: both containers are
+    /// reached through `std::vector::operator[]` (`.cpp:1428`, `:1431`).
+    pub fn chunk_params_from_candidates(
+        params: &mut DataStructDims,
+        selected_indices: &DscParamCandidateIndices,
+        dsc_candidates: &DscParamCandidates,
+        dsc_idx: DscIdx,
+        primary_dims: &[PrimaryDimTypes],
+    ) -> Option<()> {
+        let dsc_idx = usize::try_from(dsc_idx.0).ok()?;
+        for &dim in primary_dims {
+            let selected_idx = *selected_indices.get(dsc_idx)?.get(&dim)?;
+            let candidate = *dsc_candidates
+                .get(dsc_idx)?
+                .get(&dim)?
+                .get(selected_idx.0)?;
+            *params.primary_dim_to_val_handler_mut(dim)? = Some(candidate);
+        }
+        params.compound();
+        Some(())
+    }
+
+    /// `.cpp:1405-1421`, `addChunkDataStageFromCandidates` (`:334-338`). Build the chunk stage's dims
+    /// from one selected point of the candidate space, give the corelets their share of it, carry the
+    /// core stage's padding and symbolic information onto it, and write it in as the chunk data stage.
+    ///
+    /// ⛔ ABSENT IS IBM'S `DT_CHECK` THAT THE CORE STAGE EXISTS (`.cpp:1410-1411`) and every check the
+    /// five helpers make. Each one stops where IBM stops, and the writes made before it stand.
+    /// ⭐ THE STEADY STATE IS WRITTEN AS BOTH HALVES UNDER ONE NAME (`.cpp:1419-1420`): the chunk
+    /// stage has no epilogue of its own until `calculateEpilogues` shrinks one
+    /// (`ddc/ddcv1.cpp:1230-1330`).
+    /// ⭐ NO CLONE OF THE CORE STAGE, WHERE IBM BINDS `dsCore` FIRST: the reference is read by the two
+    /// carry helpers and dead before the write, and the two steps between it
+    /// ([`Self::chunk_params_from_candidates`] and [`add_or_update_corelet_split_in_params`]) do not
+    /// touch the DSC.
+    pub fn add_chunk_data_stage_from_candidates(
+        chunk_params: &mut DataStructDims,
+        dsc: &mut DesignSpaceConfig,
+        dsc_idx: DscIdx,
+        selected_indices: &DscParamCandidateIndices,
+        dsc_candidates: &DscParamCandidates,
+        primary_dims: &[PrimaryDimTypes],
+    ) -> Option<()> {
+        const CHUNK_DS_NAME: &str = "chunk";
+
+        let core_ss = &dsc.data_stage_param.get(&Self::DATA_STAGE_CORE_IDX)?.ss;
+        Self::chunk_params_from_candidates(
+            chunk_params,
+            selected_indices,
+            dsc_candidates,
+            dsc_idx,
+            primary_dims,
+        )?;
+        add_or_update_corelet_split_in_params(chunk_params, dsc)?;
+        add_or_update_padding_sizes_in_chunk_params(chunk_params, core_ss)?;
+        add_or_update_symbolic_info_in_params(chunk_params, core_ss)?;
+        Self::add_or_update_data_stage_param(
+            dsc,
+            chunk_params,
+            CHUNK_DS_NAME,
+            chunk_params,
+            CHUNK_DS_NAME,
+            Self::DATA_STAGE_CHUNK_IDX,
+        )
+    }
+
+    /// `.cpp:2806-2817`, `addSuperChunkDataStage` (`:397`). Seed the super-chunk stage from the chunk
+    /// stage, both halves renamed.
+    ///
+    /// ⛔ ABSENT IS IBM'S TWO `DT_CHECK`s, AND THEY ARE NOT ONE FACT: the id must have been minted
+    /// (`.cpp:2807`), which is [`Self::data_stage_super_chunk_idx`] being [`Some`], AND THIS DSC must
+    /// already hold an entry at it (`.cpp:2807-2808`). The mint is guarded on the scheduler-wide
+    /// field while the entry it creates is per DSC — `getNewDataStageIndex` ends with
+    /// `dsc.dataStageParam_[newIdx]` (`.cpp:6622`) and `createChunkLoopNodes` only mints while the
+    /// field is still `-1` (`.cpp:4645-4648`) — so the second DSC of a multi-DSC op reaches this with
+    /// a valid id and no entry of its own. That is why the two checks stay two.
+    /// ⛔ AND THE ENTRY IS OVERWRITTEN, NOT MERGED: the whole stage is assigned (`.cpp:2816`), so
+    /// anything `exploreSuperChunkDataStageParams` had written into it is gone.
+    pub fn add_super_chunk_data_stage(&self, dsc: &mut DesignSpaceConfig) -> Option<()> {
+        const SUPER_CHUNK_NAME: &str = "superchunk";
+
+        let super_chunk_idx = self.data_stage_super_chunk_idx?;
+        if !dsc.data_stage_param.contains_key(&super_chunk_idx) {
+            return None;
+        }
+        let mut stage = dsc
+            .data_stage_param
+            .get(&Self::DATA_STAGE_CHUNK_IDX)?
+            .clone();
+        stage.ss.name = String::from(SUPER_CHUNK_NAME);
+        stage.el.name = String::from(SUPER_CHUNK_NAME);
+        dsc.data_stage_param.insert(super_chunk_idx, stage);
+        Some(())
+    }
+
+    /// Replaces: e029g4_L3DlOpsScheduler_stages.updateChunkDataStagesFromCandidates
+    ///
+    /// `.cpp:2819-2827` (`:391-396`). Write the chunk data stage from one selected point of the
+    /// candidate space, and under [`BufferType::SpatialDouble`] bring the super-chunk stage back into
+    /// step with it.
+    ///
+    /// ⭐ EIGHT REAL NON-TEST CALLERS, ALL IN THIS CLASS: the two direct writes in
+    /// `setChunkDataStageParams` (`.cpp:1528`, `:1559`) and the six inside the two searches
+    /// `findBestParamsForMemoryBandwidth` (`.cpp:2043`, `:2186`, `:2233`) and
+    /// `findBestParamsForArithmeticIntensity` (`.cpp:2540`, `:2652`, `:2701`), which call it once for
+    /// every point they try and once more for the point they keep. None of the eight is ported —
+    /// `setChunkDataStageParams` is this group's blocked anchor and both searches take a `SuperDsc&`.
+    /// ⛔ THIS IS NEITHER THE SUPER-CHUNK STAGE'S MINT NOR ITS ONLY WRITE: `createChunkLoopNodes`
+    /// mints it and `run` reaches that first (`.cpp:7944` before `:7968`), and
+    /// `setSuperChunkDataStageParams` seeds it again and then explores it (`.cpp:2796-2802`). What
+    /// this call guarantees is that it equals the chunk stage just chosen.
+    pub fn update_chunk_data_stages_from_candidates(
+        &self,
+        chunk_params: &mut DataStructDims,
+        dsc: &mut DesignSpaceConfig,
+        dsc_idx: DscIdx,
+        selected_indices: &DscParamCandidateIndices,
+        dsc_candidates: &DscParamCandidates,
+        primary_dims: &[PrimaryDimTypes],
+    ) -> Option<()> {
+        Self::add_chunk_data_stage_from_candidates(
+            chunk_params,
+            dsc,
+            dsc_idx,
+            selected_indices,
+            dsc_candidates,
+            primary_dims,
+        )?;
+        if self.lx_buffer_type == BufferType::SpatialDouble {
+            self.add_super_chunk_data_stage(dsc)?;
+        }
+        Some(())
+    }
+}
+
 #[cfg(test)]
 mod equivalence {
     use super::*;
@@ -2283,6 +2639,438 @@ mod equivalence {
             "`hasUniqueName = false` at `.cpp:6401`"
         );
     }
+
+    /// A DSC holding the core data stage every chunk-stage writer requires (`.cpp:1410-1411`) and the
+    /// single corelet the standalone driver fills in (`dsc/dsc_standalone.cpp:30`), so that
+    /// `addOrUpdateCoreletSplitInParams` finds no split dim unless a test asks for one.
+    fn dsc_with_core_stage(core_ss: DataStructDims) -> DesignSpaceConfig {
+        use crate::schedule::dsc2::DataStage;
+
+        DesignSpaceConfig {
+            num_corelets_used: Some(NumCoreletsUsed(1)),
+            data_stage_param: BTreeMap::from([(
+                L3DlOpsScheduler::DATA_STAGE_CORE_IDX,
+                DataStage {
+                    ss: core_ss.clone(),
+                    el: core_ss,
+                },
+            )]),
+            ..DesignSpaceConfig::default()
+        }
+    }
+
+    /// `.cpp:1405-1436` against the candidate space `getChunkParamsFromCandidates` reads: the selected
+    /// candidate of each named dim becomes that dim (`.cpp:1431`), the compound dims are recomputed
+    /// from their halves (`.cpp:1435`), and BOTH halves of the chunk stage are that one set of params
+    /// under the name `"chunk"` (`.cpp:1419-1420`) — the name `attachToPrefilledSchedule` then requires
+    /// (`ddc/ddcv1.cpp:2285`). An index past the end of a dim's candidate list is
+    /// `DT_CHECK_MSG(selectedIdx < ..size(), "Index is out of range.")` (`.cpp:1429-1430`), and then no
+    /// chunk stage is written at all.
+    #[test]
+    fn the_selected_candidates_become_both_halves_of_the_chunk_stage_and_a_stale_index_writes_none()
+    {
+        let core_ss = DataStructDims {
+            name: String::from("core"),
+            i: DimSize::new(8.0),
+            j: DimSize::new(8.0),
+            ..DataStructDims::default()
+        };
+        let candidates: DscParamCandidates = vec![BTreeMap::from([
+            (
+                PrimaryDimTypes::I,
+                vec![DimSize::new(2.0).unwrap(), DimSize::new(4.0).unwrap()],
+            ),
+            (PrimaryDimTypes::J, vec![DimSize::new(8.0).unwrap()]),
+        ])];
+        let selected: DscParamCandidateIndices = vec![BTreeMap::from([
+            (PrimaryDimTypes::I, CandidateIdx(1)),
+            (PrimaryDimTypes::J, CandidateIdx(0)),
+        ])];
+        let dims = [PrimaryDimTypes::I, PrimaryDimTypes::J];
+
+        let mut dsc = dsc_with_core_stage(core_ss.clone());
+        L3DlOpsScheduler::add_chunk_data_stage_from_candidates(
+            &mut DataStructDims::default(),
+            &mut dsc,
+            DscIdx(0),
+            &selected,
+            &candidates,
+            &dims,
+        )
+        .expect("a present core stage and an in-range selection is all .cpp:1410-1420 asks");
+
+        let chunk = &dsc.data_stage_param[&L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX];
+        assert_eq!(
+            chunk.ss.i,
+            DimSize::new(4.0),
+            "candidate 1 of I's two (.cpp:1431)"
+        );
+        assert_eq!(chunk.ss.j, DimSize::new(8.0), "candidate 0 of J's one");
+        assert_eq!(
+            chunk.ss.ij,
+            DimSize::new(32.0),
+            "compound() recomputes IJ from I and J (.cpp:1435)"
+        );
+        assert_eq!(chunk.ss.name, "chunk");
+        assert_eq!(
+            chunk.el.name, "chunk",
+            "one name for both halves (.cpp:1419-1420)"
+        );
+        assert_eq!(
+            chunk.el.i, chunk.ss.i,
+            "the steady state is written as the epilogue too"
+        );
+
+        let stale: DscParamCandidateIndices =
+            vec![BTreeMap::from([(PrimaryDimTypes::I, CandidateIdx(2))])];
+        let mut fresh = dsc_with_core_stage(core_ss);
+        assert_eq!(
+            L3DlOpsScheduler::add_chunk_data_stage_from_candidates(
+                &mut DataStructDims::default(),
+                &mut fresh,
+                DscIdx(0),
+                &stale,
+                &candidates,
+                &[PrimaryDimTypes::I],
+            ),
+            None,
+            "I has two candidates, so index 2 is out of range (.cpp:1429-1430)"
+        );
+        assert!(
+            !fresh
+                .data_stage_param
+                .contains_key(&L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX),
+            "the abort comes before addOrUpdateDataStageParam (.cpp:1419)"
+        );
+    }
+
+    /// `.cpp:74-126` — `getCoreletSplitDimensions` keeps the dims whose corelet-0 share is smaller
+    /// than the whole core's (`.cpp:78-80`), `addOrUpdateCoreletSplitInParams` then gives each of them
+    /// an equal share once per corelet (`.cpp:116-125`). An unfilled dim is skipped on the `-1` it
+    /// reports (`.cpp:111-113`) and an extent the corelet count does not divide is
+    /// `DT_CHECK_MSG(.., "Invalid corelet split.")` (`.cpp:114-115`). With no core data stage the
+    /// question is `CoreletD_` against `CoreD_` instead (`.cpp:82-84`), and with one corelet it is not
+    /// asked at all (`.cpp:76`).
+    #[test]
+    fn the_corelets_take_an_equal_share_of_each_split_dim_and_an_indivisible_extent_writes_nothing()
+    {
+        let core_ss = DataStructDims {
+            name: String::from("core"),
+            i: DimSize::new(8.0),
+            j: DimSize::new(8.0),
+            x: DimSize::new(4.0),
+            corelet_split: BTreeMap::from([
+                (PrimaryDimTypes::I, vec![DimVal(4), DimVal(4)]),
+                (PrimaryDimTypes::X, vec![DimVal(2), DimVal(2)]),
+            ]),
+            ..DataStructDims::default()
+        };
+        let mut dsc = dsc_with_core_stage(core_ss);
+        dsc.num_corelets_used = Some(NumCoreletsUsed(2));
+
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, PrimaryDimTypes::I),
+            Some(true),
+            "corelet 0 holds 4 of the core's 8 (.cpp:79-80)"
+        );
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&dsc, PrimaryDimTypes::J),
+            Some(false),
+            "J has no coreletSplit_ entry, so both reads are the dim itself"
+        );
+
+        let mut params = DataStructDims {
+            i: DimSize::new(8.0),
+            ..DataStructDims::default()
+        };
+        add_or_update_corelet_split_in_params(&mut params, &dsc)
+            .expect("8 divides by the two corelets (.cpp:114)");
+        assert_eq!(
+            params.corelet_split[&PrimaryDimTypes::I],
+            [DimVal(4), DimVal(4)],
+            "one equal share per corelet (.cpp:123-124)"
+        );
+        assert!(
+            !params.corelet_split.contains_key(&PrimaryDimTypes::X),
+            "X is split on the core stage but unfilled here, so it is skipped (.cpp:111-113)"
+        );
+        assert!(!params.corelet_split.contains_key(&PrimaryDimTypes::J));
+
+        let mut odd = DataStructDims {
+            i: DimSize::new(7.0),
+            ..DataStructDims::default()
+        };
+        assert_eq!(
+            add_or_update_corelet_split_in_params(&mut odd, &dsc),
+            None,
+            "7 does not divide by the two corelets (.cpp:114-115)"
+        );
+        assert!(odd.corelet_split.is_empty());
+
+        let mut without_core_stage = DesignSpaceConfig {
+            num_corelets_used: Some(NumCoreletsUsed(2)),
+            ..DesignSpaceConfig::default()
+        };
+        without_core_stage.corelet_d.i = DimSize::new(4.0);
+        without_core_stage.core_d.i = DimSize::new(8.0);
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(&without_core_stage, PrimaryDimTypes::I),
+            Some(true),
+            "CoreletD_ against CoreD_ (.cpp:82-84)"
+        );
+
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(
+                &DesignSpaceConfig {
+                    num_corelets_used: Some(NumCoreletsUsed(1)),
+                    ..DesignSpaceConfig::default()
+                },
+                PrimaryDimTypes::I
+            ),
+            Some(false),
+            "one corelet splits nothing (.cpp:76)"
+        );
+        assert_eq!(
+            L3DlOpsScheduler::is_dimension_corelet_split(
+                &DesignSpaceConfig::default(),
+                PrimaryDimTypes::I
+            ),
+            None,
+            "numCoreletsUsed_ is indeterminate until DSM or importJson writes it"
+        );
+    }
+
+    /// `.cpp:128-156` — the chunk stage takes the core stage's padding scalars whole (`.cpp:154`) and
+    /// then voids the pads of every dim chunking invalidated: the dim's own extent differing, or the
+    /// WINDOW dim its padding is measured against differing (`.cpp:133-136`). The voided value is
+    /// IBM's `-1` marker on both pads at once, and only where one of them was non-zero
+    /// (`.cpp:137-138`); `unneededPad_` survives because `carryUnneededPadToChunk` is `true`
+    /// (`.cpp:48`, `.cpp:143-146`).
+    #[test]
+    fn a_chunked_padded_dim_voids_both_pads_and_keeps_its_unneeded_ones() {
+        use crate::schedule::dims::DimPaddingSizes;
+
+        let padded = |pad_front, pad_back, window_dim| DimPaddingSizes {
+            pad_front,
+            pad_back,
+            unneeded_pad: 2,
+            unneeded_pad_front: 1,
+            unneeded_pad_back: 1,
+            window_dim,
+            ..DimPaddingSizes::default()
+        };
+        let core = DataStructDims {
+            name: String::from("core"),
+            i: DimSize::new(8.0),
+            ki: DimSize::new(3.0),
+            j: DimSize::new(8.0),
+            kj: DimSize::new(3.0),
+            out: DimSize::new(64.0),
+            padding_sizes: BTreeMap::from([
+                (PrimaryDimTypes::I, padded(1, 1, PrimaryDimTypes::Ki)),
+                (PrimaryDimTypes::J, padded(1, 0, PrimaryDimTypes::Kj)),
+                (
+                    PrimaryDimTypes::Out,
+                    padded(3, 3, PrimaryDimTypes::Undefined),
+                ),
+            ]),
+            ..DataStructDims::default()
+        };
+        let mut chunk = DataStructDims {
+            i: DimSize::new(4.0),
+            ki: DimSize::new(3.0),
+            j: DimSize::new(8.0),
+            kj: DimSize::new(1.0),
+            out: DimSize::new(64.0),
+            ..DataStructDims::default()
+        };
+        add_or_update_padding_sizes_in_chunk_params(&mut chunk, &core)
+            .expect("neither stage is empty (.cpp:152-153)");
+
+        let i_pad = &chunk.padding_sizes[&PrimaryDimTypes::I];
+        assert_eq!(
+            (i_pad.pad_front, i_pad.pad_back),
+            (-1, -1),
+            "I itself is chunked, 8 to 4 (.cpp:133)"
+        );
+        assert_eq!(
+            i_pad.unneeded_pad, 2,
+            "carryUnneededPadToChunk keeps it (.cpp:48, .cpp:143-146)"
+        );
+        let j_pad = &chunk.padding_sizes[&PrimaryDimTypes::J];
+        assert_eq!(
+            (j_pad.pad_front, j_pad.pad_back),
+            (-1, -1),
+            "J is unchunked but its window Kj went 3 to 1 (.cpp:134-136)"
+        );
+        let out_pad = &chunk.padding_sizes[&PrimaryDimTypes::Out];
+        assert_eq!(
+            (out_pad.pad_front, out_pad.pad_back),
+            (3, 3),
+            "Out is unchunked and has no window dim, so its pads stand"
+        );
+
+        assert_eq!(
+            add_or_update_padding_sizes_in_chunk_params(&mut DataStructDims::default(), &core),
+            None,
+            "an empty stage is the DT_CHECK (.cpp:152-153)"
+        );
+    }
+
+    /// `.cpp:158-172` — a symbolic dim carries onto the chunk stage only where the chunk did not
+    /// shrink it (`.cpp:164-168`), and the joint volume limits carry whole and are then pruned against
+    /// the core stage (`.cpp:170-171`), which divides the limit by the granularity of every dim that
+    /// stopped being symbolic and caps it at the product of the maxes that remain
+    /// (`dsc/dims.cpp:729-762`).
+    #[test]
+    fn only_the_symbolic_dims_the_chunk_did_not_shrink_carry_over_and_the_volume_limit_is_pruned() {
+        use crate::schedule::dims::{SymbolicDimInfo, SymbolicVolume};
+
+        let core = DataStructDims {
+            name: String::from("core"),
+            i: DimSize::new(8.0),
+            out: DimSize::new(64.0),
+            symbolic_dim_info: BTreeMap::from([
+                (
+                    PrimaryDimTypes::I,
+                    SymbolicDimInfo {
+                        max_size: 8,
+                        granularity: 2,
+                    },
+                ),
+                (
+                    PrimaryDimTypes::Out,
+                    SymbolicDimInfo {
+                        max_size: 64,
+                        granularity: 8,
+                    },
+                ),
+            ]),
+            max_symbolic_volume: BTreeMap::from([(
+                BTreeSet::from([PrimaryDimTypes::I, PrimaryDimTypes::Out]),
+                SymbolicVolume(512),
+            )]),
+            ..DataStructDims::default()
+        };
+        let mut chunk = DataStructDims {
+            i: DimSize::new(4.0),
+            out: DimSize::new(64.0),
+            ..DataStructDims::default()
+        };
+        add_or_update_symbolic_info_in_params(&mut chunk, &core)
+            .expect("neither stage is empty and 512 divides by I's granularity");
+
+        assert_eq!(
+            chunk.symbolic_dim_info.keys().copied().collect::<Vec<_>>(),
+            [PrimaryDimTypes::Out],
+            "I is 4 against the core's symbolic max of 8, so it is not carried (.cpp:165-167)"
+        );
+        assert_eq!(
+            chunk.max_symbolic_volume,
+            BTreeMap::from([(BTreeSet::from([PrimaryDimTypes::Out]), SymbolicVolume(64))]),
+            "512 over I's granularity of 2 is 256, capped at Out's max of 64 (dsc/dims.cpp:755-758)"
+        );
+    }
+
+    /// `.cpp:2819-2827` with `.cpp:2806-2817` — under `BufferType::SPATIAL_DOUBLE` the chunk stage is
+    /// written and the super-chunk stage is then made a copy of it under the name `"superchunk"`
+    /// (`.cpp:2815`); under `DOUBLE` only the chunk stage is written (`.cpp:2826`). An id whose entry
+    /// `createChunkLoopNodes` has not minted for THIS DSC (`.cpp:4645-4648`, `.cpp:6622`) is
+    /// `DT_CHECK_MSG(dataStageSuperChunkIdx >= 0 && .., "Expect a valid SuperChunk data stage id
+    /// created.")` (`.cpp:2807-2809`), which stops the call after the chunk stage is already in place.
+    #[test]
+    fn spatial_double_copies_the_chunk_stage_into_the_super_chunk_stage_and_an_unminted_id_stops() {
+        use crate::schedule::dsc2::DataStage;
+
+        let candidates: DscParamCandidates = vec![BTreeMap::from([(
+            PrimaryDimTypes::I,
+            vec![DimSize::new(4.0).unwrap()],
+        )])];
+        let selected: DscParamCandidateIndices =
+            vec![BTreeMap::from([(PrimaryDimTypes::I, CandidateIdx(0))])];
+        let dims = [PrimaryDimTypes::I];
+        let core_ss = DataStructDims {
+            name: String::from("core"),
+            i: DimSize::new(8.0),
+            ..DataStructDims::default()
+        };
+
+        let mut scheduler = L3DlOpsScheduler::new(
+            vec![ExPhase(0)],
+            Verbosity(0),
+            LxBufferTypeMode::ForceSpatialDouble,
+        )
+        .expect("one execution phase");
+        scheduler.lx_buffer_type = BufferType::SpatialDouble;
+        let super_chunk_idx = DataStageId(2);
+        scheduler.data_stage_super_chunk_idx = Some(super_chunk_idx);
+
+        let mut minted = dsc_with_core_stage(core_ss.clone());
+        minted
+            .data_stage_param
+            .insert(super_chunk_idx, DataStage::default());
+        scheduler
+            .update_chunk_data_stages_from_candidates(
+                &mut DataStructDims::default(),
+                &mut minted,
+                DscIdx(0),
+                &selected,
+                &candidates,
+                &dims,
+            )
+            .expect("a minted super-chunk id with an entry of its own on this DSC");
+
+        let chunk_i = minted.data_stage_param[&L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX]
+            .ss
+            .i;
+        let super_chunk = &minted.data_stage_param[&super_chunk_idx];
+        assert_eq!(
+            super_chunk.ss.i, chunk_i,
+            "the super-chunk stage is a copy of the chunk stage (.cpp:2813-2814)"
+        );
+        assert_eq!(super_chunk.ss.name, "superchunk");
+        assert_eq!(
+            super_chunk.el.name, "superchunk",
+            "both halves take the one name (.cpp:2815)"
+        );
+
+        let mut unminted = dsc_with_core_stage(core_ss.clone());
+        assert_eq!(
+            scheduler.update_chunk_data_stages_from_candidates(
+                &mut DataStructDims::default(),
+                &mut unminted,
+                DscIdx(0),
+                &selected,
+                &candidates,
+                &dims,
+            ),
+            None,
+            "this DSC holds no entry at the minted id (.cpp:2807-2808)"
+        );
+        assert!(
+            unminted
+                .data_stage_param
+                .contains_key(&L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX),
+            "the chunk stage was written before the check (.cpp:2824)"
+        );
+
+        scheduler.lx_buffer_type = BufferType::Double;
+        let mut double = dsc_with_core_stage(core_ss);
+        scheduler
+            .update_chunk_data_stages_from_candidates(
+                &mut DataStructDims::default(),
+                &mut double,
+                DscIdx(0),
+                &selected,
+                &candidates,
+                &dims,
+            )
+            .expect("DOUBLE asks for no super-chunk stage at all");
+        assert!(
+            !double.data_stage_param.contains_key(&super_chunk_idx),
+            "the refresh is SPATIAL_DOUBLE only (.cpp:2826)"
+        );
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -2332,6 +3120,12 @@ mod equivalence {
 // crustify:todo: e029g3_L3DlOpsScheduler_coord.propagateCoordinate
 
 // crustify:todo: e029g3_L3DlOpsScheduler_coord.sliceCoordinateForCorelet
+
+// crustify:todo: e029g4_L3DlOpsScheduler_stages
+
+// crustify:todo: e029g4_L3DlOpsScheduler_stages.setChunkDataStageParams
+
+// crustify:todo: e029g4_L3DlOpsScheduler_stages.setSuperChunkDataStageParams
 
 // crustify:todo: e029g5_L3DlOpsScheduler_paged
 
