@@ -9,7 +9,7 @@ use crate::schedule::dims::PrimaryDimTypes;
 use crate::schedule::dsc2::{AllocateNode, DataStageId, GroupId, LdsIdx, SyncNode, TransferNode};
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
-use sys_arch_spec::arch_enums::SenComponent;
+use sys_arch_spec::arch_enums::{OpFunc, SenComponent};
 use sys_arch_spec::{CoreId, CoreletId};
 
 /// Replaces: e012_CrossCoreReductionGroup.GroupType
@@ -1145,6 +1145,260 @@ impl L3DlOpsScheduler {
     ];
 }
 
+/// `.cpp:739-869`, the sixteen `isOpFunc*` predicates (`:288-303`) — which family a compute op's
+/// [`OpFunc`] belongs to, asked by the ordered dispatch in `getMinParamForDimFromOpFunc`
+/// (`.cpp:1137-1169`).
+///
+/// ⭐ ASSOCIATED FUNCTIONS, NOT METHODS: every one is a `const` member that reads no field, and each
+/// set it tests is a function-local `static const` — one table for all schedulers, so no `self`
+/// supplies anything. Same shape as [`Self::burst_efficiency`] and [`Self::create_sync_node`].
+///
+/// ⛔ THE FOURTEEN LEAF SETS ARE DISJOINT AND NAME ONLY 74 OF [`OpFunc`]'S 176 VARIANTS, and that
+/// matters twice over: the dispatch is an `if / else if` chain, so an op in two families would take
+/// whichever arm comes first, and each of the other 102 ops falls out of it with a minimum parameter
+/// of `1` (`.cpp:1168`). ⛔ THREE OF THE 102 ARE SPELLED `BATCHMATMUL_*` — `BATCHMATMULV2`,
+/// `BATCHMATMUL_MXFP4W_FWD` and `BATCHMATMUL_MXFP8_FWD` are NOT bmm to this scheduler, so a matmul
+/// flavour added to the vocabulary stays unrecognised until one of these sets is extended by hand.
+impl L3DlOpsScheduler {
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:739-744`. The three INT4 convolutions — plain, `GENKG3` and `SPARSEKG3`. Its own arm of
+    /// the `IN` minimum, where it alone asks for 128 (`.cpp:905-906`).
+    pub fn is_op_func_conv2d_int4(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::Conv2DInt4Fwd | OpFunc::Conv2DInt4FwdGenkg3 | OpFunc::Conv2DInt4FwdSparsekg3
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:746-751`. The four output-stationary-1 convolutions, which take the whole core extent as
+    /// their `IN` minimum rather than a constant (`.cpp:907-908`).
+    pub fn is_op_func_conv2d_os1(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::Conv2DFwdOs1
+                | OpFunc::Conv2DXrfInt8FwdOs1
+                | OpFunc::Conv2DFwdGenOs1
+                | OpFunc::Conv2DInt8FwdOs1
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:753-767`. Any convolution: the INT4 three, the OS1 four, and nine more.
+    ///
+    /// ⛔ THOSE NINE HAVE NO PREDICATE OF THEIR OWN. `opFuncConv2dOthers` (`.cpp:754-763`) is local to
+    /// this body, so this is NOT the disjunction of the two named conv2d predicates and nothing can
+    /// ask for the remainder alone.
+    pub fn is_op_func_conv2d(op_func_name: OpFunc) -> bool {
+        Self::is_op_func_conv2d_int4(op_func_name)
+            || Self::is_op_func_conv2d_os1(op_func_name)
+            || matches!(
+                op_func_name,
+                OpFunc::Conv2DFwd
+                    | OpFunc::Conv2DFp8Fwd
+                    | OpFunc::Conv2DInt8Fwd
+                    | OpFunc::Conv2DFwdGenkg3
+                    | OpFunc::Conv2DFp8FwdGenkg3
+                    | OpFunc::Conv2DInt8FwdGenkg3
+                    | OpFunc::Conv2DFwdSparsekg3
+                    | OpFunc::Conv2DFp8FwdSparsekg3
+                    | OpFunc::Conv2DInt8FwdSparsekg3
+            )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:769-774`. The four INT4 batch matmuls, XRF and non-XRF alike (`.cpp:963-964`).
+    pub fn is_op_func_bmm_int4(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::BatchmatmulInt4Fwd
+                | OpFunc::BatchmatmulInt4FwdSparsekg3
+                | OpFunc::BatchmatmulXrfInt4Fwd
+                | OpFunc::BatchmatmulXrfchInt4Fwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:776-782`. The five INT8 batch matmuls, which share the FP8-non-XRF arm of the bmm
+    /// minimum (`.cpp:965-966`).
+    pub fn is_op_func_bmm_int8(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::BatchmatmulInt8Fwd
+                | OpFunc::BatchmatmulInt8FwdMbkg3
+                | OpFunc::BatchmatmulInt8FwdSparsekg3
+                | OpFunc::BatchmatmulXrfInt8Fwd
+                | OpFunc::BatchmatmulXrfchInt8Fwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:784-789`. The three FP8 batch matmuls that do NOT go through the XRF — ⭐ INCLUDING
+    /// `BATCHMATMUL_FP8_FWD_MB`, the multi-batch one, which is on our own fp8 decode path.
+    pub fn is_op_func_bmm_fp8_non_xrf(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::BatchmatmulFp8Fwd
+                | OpFunc::BatchmatmulFp8FwdMb
+                | OpFunc::BatchmatmulFp8FwdSparsekg3
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:791-795`. The two FP8 batch matmuls that DO — the XRF and per-channel-XRF pair, split
+    /// out because they get their own arm of the bmm minimum (`.cpp:983-990`).
+    pub fn is_op_func_bmm_fp8_xrf(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::BatchmatmulXrfFp8Fwd | OpFunc::BatchmatmulXrfchFp8Fwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:797-802`. The four FP16 batch matmuls; the unsuffixed `BATCHMATMUL_FWD` is one of them
+    /// (`.cpp:974-982`).
+    pub fn is_op_func_bmm_fp16(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::BatchmatmulFwd
+                | OpFunc::BatchmatmulFwdSparsekg3
+                | OpFunc::BatchmatmulXrfFwd
+                | OpFunc::BatchmatmulXrfchFwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:804-808`. Any batch matmul: the union of the five format-keyed sets, and nothing else.
+    ///
+    /// ⛔ NOT "ANY OP SPELLED `BATCHMATMUL_*`" — see the family note on this `impl`.
+    pub fn is_op_func_bmm(op_func_name: OpFunc) -> bool {
+        Self::is_op_func_bmm_fp16(op_func_name)
+            || Self::is_op_func_bmm_fp8_xrf(op_func_name)
+            || Self::is_op_func_bmm_fp8_non_xrf(op_func_name)
+            || Self::is_op_func_bmm_int4(op_func_name)
+            || Self::is_op_func_bmm_int8(op_func_name)
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:810-827`. The fourteen ops whose operand may be a broadcast scalar — seven activations,
+    /// five arithmetic ops, `BIASADD` and `BATCHNORM_FWD`.
+    ///
+    /// ⛔ `REALDIV` IS NOT ONE, though `ADD`, `MUL`, `SUB` and `REVSUB` all are.
+    pub fn is_op_func_scalar_broadcast(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::ReluFwd
+                | OpFunc::Relu6Fwd
+                | OpFunc::LeakyreluFwd
+                | OpFunc::GeluFwd
+                | OpFunc::TanhFwd
+                | OpFunc::SigmoidFwd
+                | OpFunc::FastSigmoidFwd
+                | OpFunc::Add
+                | OpFunc::StridedAdd
+                | OpFunc::Mul
+                | OpFunc::Sub
+                | OpFunc::Revsub
+                | OpFunc::Biasadd
+                | OpFunc::BatchnormFwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:829-835`. Four stick reductions and four non-stick ones.
+    ///
+    /// ⛔ THE TWO HALVES DO NOT MIRROR EACH OTHER: `PROD_NONSTICK` is here with no stick `PROD`
+    /// beside it, and `ABSMAX`, `MIN`, `EXX2_ZEROMEAN` and both `_NONSTICK` spellings of the first
+    /// two are reductions the vocabulary has and this predicate rejects.
+    pub fn is_op_func_reduction(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::Sum
+                | OpFunc::Max
+                | OpFunc::Mean
+                | OpFunc::Exx2
+                | OpFunc::SumNonstick
+                | OpFunc::MaxNonstick
+                | OpFunc::MeanNonstick
+                | OpFunc::ProdNonstick
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:837-841`. The three pooling ops, which share the depthwise conv's minimum
+    /// (`.cpp:1159-1161`).
+    pub fn is_op_func_pooling(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::MaxpoolFwd | OpFunc::AvgpoolFwd | OpFunc::AvgpoolNmapFwd
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:843-847`. The one depthwise convolution — a set of one in the authority too, and ⛔ NOT a
+    /// member of [`Self::is_op_func_conv2d`], which is why the dispatch pairs it with pooling.
+    pub fn is_op_func_depthwise_conv(op_func_name: OpFunc) -> bool {
+        matches!(op_func_name, OpFunc::DepthwiseConvFwd)
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:849-856`. The twelve quantize / compute-scale-and-quantize ops.
+    ///
+    /// ⛔ THREE SPELLINGS ARE LEFT OUT: `Q_FP8_MB` — though `CSQ_INT8_MB` is in — and the two `_V2`s,
+    /// `CSQ_INT8_V2` and `CSQ_INT8_MB_V2`.
+    pub fn is_op_func_quantization(op_func_name: OpFunc) -> bool {
+        matches!(
+            op_func_name,
+            OpFunc::QFp8
+                | OpFunc::QFp8Ch
+                | OpFunc::QFp8Chil
+                | OpFunc::QFp8Wt
+                | OpFunc::CsqInt8
+                | OpFunc::CsqInt8Ch
+                | OpFunc::CsqInt8Wt
+                | OpFunc::CsqInt8Chil
+                | OpFunc::CsqInt8Mb
+                | OpFunc::CsqInt4
+                | OpFunc::CsqInt4Wt
+                | OpFunc::CsqInt4Chil
+        )
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:858-863`. The DL16↔FP32 conversion pair — ⛔ and only that pair: `FP8TODL16` and
+    /// `DL16TOBF16` are conversions this predicate rejects.
+    pub fn is_op_func_conversion_dl16_and_fp32(op_func_name: OpFunc) -> bool {
+        matches!(op_func_name, OpFunc::Dl16Tofp32 | OpFunc::Fp32Todl16)
+    }
+
+    /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
+    ///
+    /// `.cpp:865-869`. Any op that walks a window across its input with a stride — every convolution,
+    /// every pooling op, and the depthwise conv. Its one call site is the `DT_CHECK_MSG` that guards
+    /// `computeMinParamForPaddedDim` (`.cpp:873-874`), so it states a precondition rather than
+    /// choosing a minimum.
+    pub fn is_op_func_strided_window(op_func_name: OpFunc) -> bool {
+        Self::is_op_func_conv2d(op_func_name)
+            || Self::is_op_func_pooling(op_func_name)
+            || Self::is_op_func_depthwise_conv(op_func_name)
+    }
+}
+
 #[cfg(test)]
 mod equivalence {
     use super::*;
@@ -1455,6 +1709,160 @@ mod equivalence {
         );
         assert!(receive.is_soft, "and it is soft too (`.cpp:3974`)");
     }
+
+    /// `.cpp:739-869` — the fourteen leaf `isOpFunc*` sets against every one of [`OpFunc`]'s 176
+    /// variants. ⛔ WHAT MAKES THIS MORE THAN A SECOND READING OF THE SAME LITERALS: the families
+    /// must PARTITION, because `getMinParamForDimFromOpFunc` is an `if / else if` chain
+    /// (`.cpp:1143-1166`) and an op in two of them would silently take the earlier arm; and each
+    /// cardinality is the authority's own set size, which a dropped or duplicated variant breaks
+    /// even when every name present is spelled right.
+    #[test]
+    fn the_fourteen_leaf_op_func_families_partition_74_of_the_176_op_funcs() {
+        // The nine convolutions in `opFuncConv2dOthers` (`.cpp:754-763`) have no predicate of their
+        // own, so the fourteenth leaf is the one the union answers for and the other two do not.
+        let conv2d_other = |op: OpFunc| {
+            L3DlOpsScheduler::is_op_func_conv2d(op)
+                && !L3DlOpsScheduler::is_op_func_conv2d_int4(op)
+                && !L3DlOpsScheduler::is_op_func_conv2d_os1(op)
+        };
+        let leaves: [(&str, &dyn Fn(OpFunc) -> bool, usize); 14] = [
+            ("conv2dInt4", &L3DlOpsScheduler::is_op_func_conv2d_int4, 3),
+            ("conv2dOs1", &L3DlOpsScheduler::is_op_func_conv2d_os1, 4),
+            ("conv2dOthers", &conv2d_other, 9),
+            ("bmmInt4", &L3DlOpsScheduler::is_op_func_bmm_int4, 4),
+            ("bmmInt8", &L3DlOpsScheduler::is_op_func_bmm_int8, 5),
+            (
+                "bmmFp8NonXrf",
+                &L3DlOpsScheduler::is_op_func_bmm_fp8_non_xrf,
+                3,
+            ),
+            ("bmmFp8Xrf", &L3DlOpsScheduler::is_op_func_bmm_fp8_xrf, 2),
+            ("bmmFp16", &L3DlOpsScheduler::is_op_func_bmm_fp16, 4),
+            (
+                "scalarBroadcast",
+                &L3DlOpsScheduler::is_op_func_scalar_broadcast,
+                14,
+            ),
+            ("reduction", &L3DlOpsScheduler::is_op_func_reduction, 8),
+            ("pooling", &L3DlOpsScheduler::is_op_func_pooling, 3),
+            (
+                "depthwiseConv",
+                &L3DlOpsScheduler::is_op_func_depthwise_conv,
+                1,
+            ),
+            (
+                "quantization",
+                &L3DlOpsScheduler::is_op_func_quantization,
+                12,
+            ),
+            (
+                "conversionDl16AndFp32",
+                &L3DlOpsScheduler::is_op_func_conversion_dl16_and_fp32,
+                2,
+            ),
+        ];
+
+        let mut classified = 0usize;
+        for op in OpFunc::ALL {
+            let hits: Vec<&str> = leaves
+                .iter()
+                .filter(|(_, holds, _)| holds(op))
+                .map(|(name, _, _)| *name)
+                .collect();
+            assert!(
+                hits.len() <= 1,
+                "{op:?} is in {hits:?}; the dispatch takes the first arm, so the families must be \
+                 disjoint (`.cpp:1143-1166`)"
+            );
+            classified += hits.len();
+        }
+        assert_eq!(
+            classified, 74,
+            "the sixteen predicates name 74 of the 176 op-funcs; every other one falls through to a \
+             minimum parameter of 1 (`.cpp:1168`)"
+        );
+
+        for (name, holds, count) in &leaves {
+            assert_eq!(
+                OpFunc::ALL.iter().filter(|&&op| holds(op)).count(),
+                *count,
+                "{name} does not hold the authority's number of op-funcs"
+            );
+        }
+
+        // The absences the family notes claim, each an op the vocabulary spells and no set takes.
+        for absent in [
+            OpFunc::Realdiv,
+            OpFunc::Absmax,
+            OpFunc::Min,
+            OpFunc::Exx2Zeromean,
+            OpFunc::QFp8Mb,
+            OpFunc::CsqInt8V2,
+            OpFunc::CsqInt8MbV2,
+            OpFunc::Fp8Todl16,
+            OpFunc::Dl16Tobf16,
+        ] {
+            assert!(
+                !leaves.iter().any(|(_, holds, _)| holds(absent)),
+                "{absent:?} is in no isOpFunc* set"
+            );
+        }
+    }
+
+    /// `.cpp:753-767`, `:804-808`, `:865-869` — the three predicates that are unions. Each holds
+    /// exactly what its parts hold, and its cardinality is the sum of theirs: 16 convolutions, 18
+    /// batch matmuls, 20 strided-window ops. ⛔ AND THE NEGATIVE THAT COSTS THE MOST: three ops
+    /// SPELLED `BATCHMATMUL_*` are in none of the five format sets, so `isOpFuncBmm` rejects them and
+    /// they take the fall-through minimum of 1 rather than `getMinParamBmm`.
+    #[test]
+    fn the_three_union_predicates_are_their_parts_and_three_batchmatmuls_are_in_none() {
+        for op in OpFunc::ALL {
+            assert_eq!(
+                L3DlOpsScheduler::is_op_func_bmm(op),
+                L3DlOpsScheduler::is_op_func_bmm_fp16(op)
+                    || L3DlOpsScheduler::is_op_func_bmm_fp8_xrf(op)
+                    || L3DlOpsScheduler::is_op_func_bmm_fp8_non_xrf(op)
+                    || L3DlOpsScheduler::is_op_func_bmm_int4(op)
+                    || L3DlOpsScheduler::is_op_func_bmm_int8(op),
+                "{op:?}: isOpFuncBmm is the five format sets (`.cpp:805-807`)"
+            );
+            assert_eq!(
+                L3DlOpsScheduler::is_op_func_strided_window(op),
+                L3DlOpsScheduler::is_op_func_conv2d(op)
+                    || L3DlOpsScheduler::is_op_func_pooling(op)
+                    || L3DlOpsScheduler::is_op_func_depthwise_conv(op),
+                "{op:?}: isOpFuncStridedWindow is conv2d, pooling and depthwise (`.cpp:866-867`)"
+            );
+        }
+
+        let count =
+            |holds: &dyn Fn(OpFunc) -> bool| OpFunc::ALL.iter().filter(|&&op| holds(op)).count();
+        assert_eq!(count(&L3DlOpsScheduler::is_op_func_conv2d), 3 + 4 + 9);
+        assert_eq!(count(&L3DlOpsScheduler::is_op_func_bmm), 4 + 5 + 3 + 2 + 4);
+        assert_eq!(
+            count(&L3DlOpsScheduler::is_op_func_strided_window),
+            16 + 3 + 1
+        );
+
+        for spelled_bmm in [
+            OpFunc::Batchmatmulv2,
+            OpFunc::BatchmatmulMxfp4WFwd,
+            OpFunc::BatchmatmulMxfp8Fwd,
+        ] {
+            assert!(
+                !L3DlOpsScheduler::is_op_func_bmm(spelled_bmm),
+                "{spelled_bmm:?} is spelled BATCHMATMUL_* and is in none of the five sets"
+            );
+        }
+        assert!(
+            !L3DlOpsScheduler::is_op_func_bmm(OpFunc::MatmulFwd),
+            "MATMUL_FWD is a matmul, not a batch matmul"
+        );
+        assert!(
+            !L3DlOpsScheduler::is_op_func_conv2d(OpFunc::DepthwiseConvFwd),
+            "the depthwise conv is its own family (`.cpp:843-847`)"
+        );
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -1494,3 +1902,8 @@ mod equivalence {
 // crustify:todo: e029g1_L3DlOpsScheduler_sync.createSynchronization
 
 // crustify:todo: e029g1_L3DlOpsScheduler_sync.createSynchronizationDSC
+
+// crustify:todo: e029g2_L3DlOpsScheduler_opfunc
+
+// crustify:todo: e029g2_L3DlOpsScheduler_opfunc.isOpCrossCoreReduction
+
