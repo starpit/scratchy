@@ -179,6 +179,7 @@ pub struct Constraints {
     /// divisibility test on [`loop_dim_kind`](Self::loop_dim_kind) (`:856-891`).
     pub must_be_multiple: bool,
     /// Field: e026_Metadata.loopDimKind_
+    /// Field: e038_Metadata.loopDimKind_
     ///
     /// Which quantity of the dim the relative multiple applies to (`ddc/ddc_metadata.h:36`);
     /// `Padded` makes the check use the padded size (`ddc/ddcv1.cpp:867-880`).
@@ -189,15 +190,18 @@ pub struct Constraints {
     /// `WindowDim` (`ddc/ddcv1.cpp:612-619`, `ddc/ddl/ddl_conversion.cpp:1824-1826`).
     pub loop_dim_kind: MetaDimKind,
     /// Field: e026_Metadata.min_
+    /// Field: e038_Metadata.min_
     ///
     /// The smallest ratio allowed, absent for unbounded below (`ddc/ddcv1.cpp:898-899`) — which the
     /// dump spells `-inf` (`ddc/ddc_metadata.h:56-60`).
     pub min: Option<ConstraintValue>,
     /// Field: e026_Metadata.max_
+    /// Field: e038_Metadata.max_
     ///
     /// The largest ratio allowed, absent for unbounded above (`ddc/ddcv1.cpp:895-896`).
     pub max: Option<ConstraintValue>,
     /// Field: e026_Metadata.values_
+    /// Field: e038_Metadata.values_
     ///
     /// The exact ratios allowed, absent when nothing constrains them (`ddc/ddcv1.cpp:901-902`).
     ///
@@ -205,6 +209,7 @@ pub struct Constraints {
     /// intersection that empties (`ddc/ddl/ddl_conversion.cpp:1850-1857`).
     pub values: Option<BTreeSet<ConstraintValue>>,
     /// Field: e026_Metadata.cannotBeSymbolic_
+    /// Field: e038_Metadata.cannotBeSymbolic_
     ///
     /// No dim of the set may be symbolic (`ddc/ddc_metadata.h:39`). Written under the absolute key
     /// only, and `DT_CHECK`ed to be absolute where it is read (`ddc/ddcv1.cpp:689`, `:803-807`).
@@ -300,6 +305,7 @@ impl Constraints {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Datastage {
     /// Field: e026_Metadata.constraints_
+    /// Field: e038_Metadata.constraints_
     ///
     /// Per reference stage, per dimension set, what that set is constrained to
     /// (`ddc/ddc_metadata.h:73-76`).
@@ -311,6 +317,19 @@ pub struct Datastage {
     /// ⛔ SO [`None`] IS THE ONLY SPELLING OF THAT KEY, never `Some(DataStageId(-1))`: the writer at
     /// `:610` cannot produce one, because `numId_` is `-1` only on a parametric loop
     /// (`ddc/ddl/ddl_conversion.cpp:1129`) and `:599` skips those before reaching it.
+    /// ⭐ AN ORDERED OUTER MAP STANDS IN FOR THE AUTHORITY'S `unordered_map`, AND THE ONE READER
+    /// THAT WALKS IT CANNOT SEE THE DIFFERENCE: `checkConstraints` iterates every reference key
+    /// (`ddc/ddcv1.cpp:795`) but writes nothing — it and its inner `checkConstraintsImpl` are a pure
+    /// conjunction that returns on the first violation (`:795-921`) — so the verdict is the same
+    /// under every permutation.
+    /// ⛔ WHAT THE ORDER WOULD DECIDE IS WHICH `DT_ERROR` A MALFORMED TABLE REPORTS, and [`None`]
+    /// sorting before every [`Some`] fixes that where a hash map leaves it open: an absolute entry
+    /// carrying [`Constraints::must_be_multiple`] with no [`Constraints::min`] throws (`:849-852`)
+    /// where another entry might have answered `false` first.
+    /// ⭐ AND IT IS UNREACHABLE EITHER WAY, by the flag's whole writer census: of the five sites that
+    /// set it (`ddc/ddcv1.cpp:618`, `:650`, `:657`, `:767`, `:1226`) only `:1226` writes under the
+    /// absolute key — `constraints_[-1]` from `:1119` — and `:1224` calls `updateMin` two lines
+    /// above it.
     pub constraints: BTreeMap<Option<DataStageId>, BTreeMap<BTreeSet<PrimaryDimTypes>, Constraints>>,
     /// Field: e026_Metadata.strategyMinimize_
     ///
@@ -319,17 +338,26 @@ pub struct Datastage {
     /// every stage that minimises (`ddc/ddcv1.cpp:1344`).
     pub strategy_minimize: bool,
     /// Field: e026_Metadata.allowEpilogue_
+    /// Field: e038_Metadata.allowEpilogue_
     ///
     /// The stage may leave a remainder, so the no-epilogue divisibility test is skipped
     /// (`ddc/ddc_metadata.h:78`, `ddc/ddcv1.cpp:856`, `:1418`).
     pub allow_epilogue: bool,
     /// Field: e026_Metadata.relevantDimsAndNumerator_
+    /// Field: e038_Metadata.relevantDimsAndNumerator_
     ///
     /// Which dims this stage is explored over, each with the numerator stage of the loop that
     /// introduced it (`ddc/ddc_metadata.h:79`, filled at `ddc/ddcv1.cpp:615-616`). `calculateEpilogues`
     /// reads the pair to size the epilogue (`:1238-1244`).
+    /// ⭐ ITS ONE ITERATION IS ORDER-INDEPENDENT TOO, which is what lets an ordered map stand in for
+    /// the authority's `unordered_map` here: `calculateEpilogues` walks it (`ddc/ddcv1.cpp:1238`) and
+    /// every write inside lands in that dim's OWN slot of the epilogue stage — `makeDimSymbolic`
+    /// (`:1240`) and the `primaryDimToValHandler_st(dim)` accumulator (`:1249-1250`, `:1284`,
+    /// `:1322`) — so no pass observes another's write. The other two readers are `count` lookups
+    /// (`:1155`, `:1349`).
     pub relevant_dims_and_numerator: BTreeMap<PrimaryDimTypes, DataStageId>,
     /// Field: e026_Metadata.nearestNumeratorIdx_
+    /// Field: e038_Metadata.nearestNumeratorIdx_
     ///
     /// The stage one loop level up, absent for the authority's `-1` (`ddc/ddc_metadata.h:80`). Set to
     /// `loop->numId_` (`ddc/ddcv1.cpp:609`) and followed upward as a chain (`:940`, `:990`).
@@ -351,6 +379,7 @@ impl Default for Datastage {
 }
 
 /// Field: e026_Metadata.TransferAccessPatternType
+/// Field: e038_Metadata.TransferAccessPatternType
 ///
 /// How one dimension is padded at each end of a transfer — the authority's
 /// `Metadata::TransferAccessPatternType`, a `std::pair<PadType, PadType>` (`ddc/ddc_metadata.h:84`).
@@ -368,6 +397,7 @@ pub struct TransferAccessPattern {
 }
 
 /// Field: e026_Metadata.TransferAccessPatternPerDimType
+/// Field: e038_Metadata.TransferAccessPatternPerDimType
 ///
 /// The authority's `Metadata::TransferAccessPatternPerDimType` (`ddc/ddc_metadata.h:85-86`): one
 /// [`TransferAccessPattern`] per dimension, and a `std::map`, so ordered and not a hash map.
@@ -405,31 +435,40 @@ pub struct ForcedNumElements(pub u32);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DataTransfer {
     /// Field: e026_Metadata.apply_row_offset_src_
+    /// Field: e038_Metadata.apply_row_offset_src_
     ///
     /// Offset the source by the destination's PT row (`ddc/ddc_metadata.h:90`). Set when a row-split
     /// copy has no source units left (`ddc/ddl/ddl_conversion.cpp:1333`), applied at
     /// `ddc/ddcv1.cpp:2881-2894`.
     pub apply_row_offset_src: bool,
     /// Field: e026_Metadata.apply_row_offset_dst_
+    /// Field: e038_Metadata.apply_row_offset_dst_
     ///
     /// The same for the destination side, by the SOURCE's row (`ddc/ddc_metadata.h:91`,
     /// `ddc/ddl/ddl_conversion.cpp:1334`, `ddc/ddcv1.cpp:2895-2911`).
     pub apply_row_offset_dst: bool,
     /// Field: e026_Metadata.apply_pe_sfp_split_offset_src_
+    /// Field: e038_Metadata.apply_pe_sfp_split_offset_src_
     ///
     /// The clone's source starts one original transfer size further in
     /// (`ddc/ddc_metadata.h:92`, set by the PE/SFP split at
     /// `ddc/ddc_transformation_util.cpp:1635`, applied at `ddc/ddcv1.cpp:2967-2998`).
     pub apply_pe_sfp_split_offset_src: bool,
     /// Field: e026_Metadata.apply_pe_sfp_split_offset_dest_
+    /// Field: e038_Metadata.apply_pe_sfp_split_offset_dest_
     ///
     /// The destinations that take that offset, by INDEX into `dstLdsAndLoopOffsets_` — the vector
     /// that bounds the push (`ddc/ddc_transformation_util.cpp:1637`, pushed at `:1642`) and the one
     /// the reader indexes (`dstLdsAndLoopOffsets_.at(destInd)`, `ddc/ddcv1.cpp:3027`). `dstVias_` is
     /// only what the push TESTS (`:1638-1640`). `ddc/ddc_metadata.h:93`; `usize` makes a negative
     /// destination unrepresentable.
+    /// ⭐ ITS THIRD READER IS THE FOLD, which takes the PE/SFP offset path when this vector is
+    /// non-empty or [`Self::apply_pe_sfp_split_offset_src`] is set (`ddc/ddc_fold.cpp:4700-4704`) —
+    /// the same disjunction `fillLoopOffsetsAndAddresses` forms across `ddc/ddcv1.cpp:2967` and
+    /// `:2999`.
     pub apply_pe_sfp_split_offset_dest: Vec<usize>,
     /// Field: e026_Metadata.replicated_
+    /// Field: e038_Metadata.replicated_
     ///
     /// This transfer is a replication clone (`ddc/ddc_metadata.h:94`).
     ///
@@ -438,6 +477,7 @@ pub struct DataTransfer {
     /// clone-offset branch that reads the two fields below.
     pub replicated: bool,
     /// Field: e026_Metadata.offset_src_
+    /// Field: e038_Metadata.offset_src_
     ///
     /// Whether the replicated source takes an offset (`ddc/ddc_metadata.h:95`). ⛔ NO WRITER EITHER,
     /// and both readers test it as `> 0` rather than using the magnitude
@@ -450,6 +490,7 @@ pub struct DataTransfer {
     /// `> 0` only (`:2950`).
     pub offset_dest: BTreeMap<usize, i32>,
     /// Field: e026_Metadata.force_num_elements_
+    /// Field: e038_Metadata.force_num_elements_
     ///
     /// The DDL's element cap on a stick-replicated dim, absent for any NEGATIVE authority value
     /// (`ddc/ddc_metadata.h:97`, written at `ddc/ddl/ddl_conversion.cpp:1235-1238`).
@@ -461,6 +502,7 @@ pub struct DataTransfer {
     /// the factor from them (`:531-535`). Only the DDL's reader gates on `> 0` alone (`:3217`).
     pub force_num_elements: Option<ForcedNumElements>,
     /// Field: e026_Metadata.accessPatternPerDim_
+    /// Field: e038_Metadata.accessPatternPerDim_
     ///
     /// The per-dim padding pair (`ddc/ddc_metadata.h:117`), private as the authority declares it.
     /// The DDL fills it through [`access_pattern_list_mut`](DataTransfer::access_pattern_list_mut)
@@ -543,10 +585,12 @@ impl DataTransfer {
 ///
 /// ⛔ THIS CARRIES FOUR OF THE SIX DECLARED FIELDS. `inOutRegAllocs_` (`:197`) and
 /// `internalRegAlloc_` (`:200`) are `dsc2::AllocateNode*` held as pointer identity, which needs
-/// e013's node identity — the blocker e018 and e023 report; their anchors stay open below.
+/// the node identity `ScheduleTree::head_` (`dsc/dsc2.h:623`) and `BlockNode::next_` (`:538`) have
+/// to define; their anchors stay open below.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpaqueOp {
     /// Field: e026_Metadata.internalRegs_
+    /// Field: e038_Metadata.internalRegs_
     ///
     /// The op's internal register names, in the DDL's order (`ddc/ddc_metadata.h:198`,
     /// `ddc/ddl/ddl_conversion.cpp:1656-1667`). `finalizeOps` turns each into an `R<n>` entry of the
@@ -554,18 +598,21 @@ pub struct OpaqueOp {
     /// as [`ComputeNode::read_write_reg_map`](crate::schedule::dsc2::InstrAttribute) does.
     pub internal_regs: Vec<String>,
     /// Field: e026_Metadata.internalRegsWithUnroll_
+    /// Field: e038_Metadata.internalRegsWithUnroll_
     ///
     /// How many of those names end in `_unroll` (`ddc/ddc_metadata.h:199`,
     /// `ddc/ddl/ddl_conversion.cpp:1663-1665`), so each further unroll step costs that many more
     /// registers (`ddc/ddcv1.cpp:267-269`).
     pub internal_regs_with_unroll: i32,
     /// Field: e026_Metadata.max_unroll_
+    /// Field: e038_Metadata.max_unroll_
     ///
     /// The largest unroll factor the op accepts (`ddc/ddc_metadata.h:201`, the DDL's
     /// `max_unroll_factor`, `ddc/ddl/ddl_conversion.cpp:1598`); a candidate above it is rejected
     /// (`ddc/ddcv1.cpp:262`).
     pub max_unroll: i32,
     /// Field: e026_Metadata.ldsIdx_
+    /// Field: e038_Metadata.ldsIdx_
     ///
     /// The labelled data structure the op computes over, absent for the authority's `-1`
     /// (`ddc/ddc_metadata.h:202`, set from the new LDS at `ddc/ddl/ddl_conversion.cpp:1576-1578`).
@@ -589,6 +636,7 @@ impl Default for OpaqueOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DdcTransformationConfig {
     /// Field: e026_Metadata.enableMovingDataTransfer
+    /// Field: e038_Metadata.enableMovingDataTransfer
     ///
     /// Whether stage 2b may move data transfers (`ddc/ddc_metadata.h:231`). The DDL turns it off
     /// (`ddc/ddl/ddl_conversion.cpp:2044`) and `run_v1` gates the transformation on it
@@ -622,10 +670,12 @@ impl Default for DdcTransformationConfig {
 #[derive(Debug)]
 pub struct ExternalTransfer {
     /// Field: e026_Metadata.transfer_
+    /// Field: e038_Metadata.transfer_
     ///
     /// The transfer node this entry owns (`ddc/ddc_metadata.h:131`).
     pub transfer: Box<TransferNode>,
     /// Field: e026_Metadata.allocate_
+    /// Field: e038_Metadata.allocate_
     ///
     /// The allocate node this entry owns (`ddc/ddc_metadata.h:132`).
     pub allocate: Box<AllocateNode>,
@@ -645,9 +695,11 @@ impl ExternalTransfer {
 /// (`ddc/ddcv1.cpp:3695`).
 ///
 /// ⛔ THIS CARRIES TWELVE OF METADATA'S OWN TWENTY-FOUR DECLARED FIELDS — ten fields and the two
-/// `const int` data-stage ids as associated consts — so the `e026_Metadata` anchor below is still
-/// open. The twelve left out all hold, or are keyed by, a SCHEDULE-NODE POINTER, which needs e029's
-/// node identity, the same blocker e018 and e023 report:
+/// `const int` data-stage ids as associated consts — so the `e026_Metadata` and `e038_Metadata`
+/// anchors below are still open. The twelve left out all hold, or are keyed by, a SCHEDULE-NODE
+/// POINTER, which is a TREE fact and not a node fact: it needs `ScheduleTree::head_`
+/// (`dsc/dsc2.h:623`), `BlockNode::next_` (`:538`) and `ScheduleNode::prev_` (`:515`), none of
+/// which is ported — the same blocker the node types report:
 ///  * `datatransfers_` (`:119`) keys [`DataTransfer`] by `const dsc2::TransferNode*`, and
 ///    `opaqueOps_` (`:204`) keys [`OpaqueOp`] by `dsc2::ComputeNode*` — both values are ported here;
 ///  * `newAllocations_` (`:127`) and `shadowAllocations_` (`:128`) hold `dsc2::AllocateNode*`, as do
@@ -715,11 +767,13 @@ impl ExternalTransfer {
 #[derive(Debug)]
 pub struct Metadata {
     /// Field: e026_Metadata.datastages_
+    /// Field: e038_Metadata.datastages_
     ///
     /// The INTERNAL data stages, by id (`ddc/ddc_metadata.h:82`). An id the map does not hold is an
     /// external stage and every loop over the sorted stages skips it (`ddc/ddcv1.cpp:742`, `:1342`).
     pub datastages: BTreeMap<DataStageId, Datastage>,
     /// Field: e026_Metadata.externalTransfers_
+    /// Field: e038_Metadata.externalTransfers_
     ///
     /// The external transfers stage 2b minted, each OWNING its node pair
     /// (`ddc/ddc_metadata.h:137`). ⛔ DEAD, LIKE THE ENTRY TYPE: see [`ExternalTransfer`] — the
@@ -727,6 +781,7 @@ pub struct Metadata {
     /// Carried because the class declares it, and it is the field that makes this type non-copyable.
     pub external_transfers: Vec<ExternalTransfer>,
     /// Field: e026_Metadata.rowSplitDim
+    /// Field: e038_Metadata.rowSplitDim
     ///
     /// The dim split across PT rows (`ddc/ddc_metadata.h:213`), taken from the first stick dim
     /// without a slice layout (`ddc/ddcv1.cpp:2033`) and read by stage 2a as well
@@ -737,6 +792,7 @@ pub struct Metadata {
     /// [`PrimaryDimTypes::Undefined`] — the authority's `PrimaryDimTypesCount` — stays the value.
     pub row_split_dim: PrimaryDimTypes,
     /// Field: e026_Metadata.clSplitDims_
+    /// Field: e038_Metadata.clSplitDims_
     ///
     /// The dims split across corelets (`ddc/ddc_metadata.h:214`), copied from the core stage's
     /// `coreletSplit_` (`ddc/ddcv1.cpp:2093-2096`).
@@ -746,17 +802,20 @@ pub struct Metadata {
     /// corelet split.
     pub cl_split_dims: BTreeSet<PrimaryDimTypes>,
     /// Field: e026_Metadata.peSfpSplitDims_
+    /// Field: e038_Metadata.peSfpSplitDims_
     ///
     /// The dims split between PE and SFP (`ddc/ddc_metadata.h:215`), from `getPeSfpSplitDim`
     /// (`ddc/ddcv1.cpp:2035`) and cleared again when the split is undone (`:3750`).
     pub pe_sfp_split_dims: BTreeSet<PrimaryDimTypes>,
     /// Field: e026_Metadata.discardAboveLxSchedule_
+    /// Field: e038_Metadata.discardAboveLxSchedule_
     ///
     /// `ddc/ddc_metadata.h:218`. ⛔ DEAD IN THE AUTHORITY: the declaration is its ONLY occurrence
     /// tree-wide — no writer, no reader — so nothing observes it. Carried because the class declares
     /// it.
     pub discard_above_lx_schedule: bool,
     /// Field: e026_Metadata.opFuncBackup_
+    /// Field: e038_Metadata.opFuncBackup_
     ///
     /// The op func of `computeOp_.at(0)` saved before the fold rewrites it
     /// (`ddc/ddc_metadata.h:221-222`, saved at `ddc/ddcv1.cpp:2068`, `:2075`).
@@ -768,10 +827,12 @@ pub struct Metadata {
     /// written `EXX2_ZEROMEAN` and backs THAT up — leaving `restoreDsc` to restore the rewrite.
     pub op_func_backup: OpFunc,
     /// Field: e026_Metadata.transformationConfig_
+    /// Field: e038_Metadata.transformationConfig_
     ///
     /// The transformation switches (`ddc/ddc_metadata.h:230-232`).
     pub transformation_config: DdcTransformationConfig,
     /// Field: e026_Metadata.ldsIdxAfterDdc
+    /// Field: e038_Metadata.ldsIdxAfterDdc
     ///
     /// Where each labelled data structure ended up after stage 2b (`ddc/ddc_metadata.h:234-235`),
     /// seeded as the identity (`ddc/ddcv1.cpp:3669`), repointed when an LDS is replaced
@@ -779,6 +840,7 @@ pub struct Metadata {
     /// (`ddc/ddl/ddl_conversion.cpp:3378-3391`).
     pub lds_idx_after_ddc: BTreeMap<LdsIdx, LdsIdx>,
     /// Field: e026_Metadata.intermLdsIdxToExtLds
+    /// Field: e038_Metadata.intermLdsIdxToExtLds
     ///
     /// Which external tensor an intermediate LDS stands for (`ddc/ddc_metadata.h:237-238`), written
     /// when a tensor is split into intermediates (`ddc/ddc_transformation.cpp:1085`, `:1090`).
@@ -808,6 +870,7 @@ impl Default for Metadata {
 
 impl Metadata {
     /// Field: e026_Metadata.core_dstgid
+    /// Field: e038_Metadata.core_dstgid
     ///
     /// The core data stage's id — `const int core_dstgid = 0` (`ddc/ddc_metadata.h:211`).
     /// `attachToPrefilledSchedule`, not `run_v1`, checks that stage 0 is really named `"core"` and
@@ -820,6 +883,7 @@ impl Metadata {
     pub const CORE_DSTGID: DataStageId = DataStageId(0);
 
     /// Field: e026_Metadata.chunk_dstgid
+    /// Field: e038_Metadata.chunk_dstgid
     ///
     /// The chunk data stage's id — `const int chunk_dstgid = 1` (`ddc/ddc_metadata.h:212`). A loop
     /// from `CORE_DSTGID` to this one is the core-chunk loop (`ddc/ddl/ddl_conversion.cpp:1114-1115`).
@@ -1149,44 +1213,258 @@ mod unit_tests {
             NumBuffers::STREAMING
         );
     }
+
+    /// `ddc/ddc_metadata.h:46-48` — an intersection that empties leaves the list PRESENT and empty,
+    /// which admits no size at all, where an absent list admits every size
+    /// (`ddc/ddcv1.cpp:901-902` reads it only when it is there).
+    ///
+    /// ⛔ AND THE AUTHORITY'S OWN `dump` CANNOT TELL THE TWO APART: `values_= {}` is what `:66-70`
+    /// prints for both, because it writes the braces unconditionally and only the contents under the
+    /// `if`. So the text is not evidence about which state a constraint is in — the [`Option`] is.
+    #[test]
+    fn intersecting_a_value_list_to_nothing_is_not_an_absent_list() {
+        let mut constraints = Constraints::default();
+        assert_eq!(constraints.values, None);
+
+        constraints.update_values(
+            [2.0, 4.0]
+                .into_iter()
+                .filter_map(ConstraintValue::new)
+                .collect(),
+        );
+        constraints.update_values([8.0].into_iter().filter_map(ConstraintValue::new).collect());
+
+        // Present, and admitting nothing.
+        assert_eq!(constraints.values.as_ref().map(BTreeSet::len), Some(0));
+
+        // The one state the dump conflates with the other.
+        let empty = constraints.dump();
+        assert_eq!(
+            empty,
+            "mustBeMultiple_= F loopDimKind_= NOT_SET , min_= -inf , max_= inf , values_= {}\n"
+        );
+        assert_eq!(empty, Constraints::default().dump());
+    }
+
+    /// ⛔ A DELIBERATE DIVERGENCE FROM `std::set<float>`, and the only one [`ConstraintValue`]'s
+    /// ordering introduces: `f32::total_cmp` separates `-0.0` from `0.0` where the authority's
+    /// `operator<` merges them, so a `std::set<float>` given both holds ONE element and
+    /// [`BTreeSet`] holds two (`ddc/ddc_metadata.h:38`).
+    ///
+    /// ⭐ UNREACHABLE FROM THE AUTHORITY'S WRITERS, which is why the total order is worth the
+    /// divergence: every bound is a dimension size or a product of them (`ddc/ddcv1.cpp:620`,
+    /// `:1224`, `ddc/ddc_transformation.cpp:968-1035`) or a DDL expression scaled by a stick size
+    /// (`ddc/ddl/ddl_conversion.cpp:1840-1848`), and none of those produces a zero of either sign.
+    #[test]
+    fn a_constraint_value_keeps_the_two_signed_zeroes_apart() {
+        let negative = ConstraintValue::new(-0.0).expect("-0 is not NaN");
+        let positive = ConstraintValue::new(0.0).expect("0 is not NaN");
+
+        assert_ne!(negative, positive);
+        assert!(negative < positive);
+        assert_eq!(BTreeSet::from([negative, positive]).len(), 2);
+
+        // The values themselves still compare equal as `float`s do, so it is the ORDER that differs.
+        assert_eq!(negative.get(), positive.get());
+    }
+
+    /// ⛔ A SECOND DELIBERATE DIVERGENCE, IN THE DUMP TEXT: `{}` on an `f32` is shortest
+    /// round-trip and never switches to exponent form, where `std::cerr << float` gives six
+    /// significant digits and switches at and above `1e6` and below `1e-4`
+    /// (`ddc/ddc_metadata.h:49-71`). So a third prints `0.33333334` here and `0.333333` there, a
+    /// million prints `1000000` and not `1e+06`, and a hundred-thousandth `0.00001` and not `1e-05`.
+    ///
+    /// ⭐ NOTHING PARSES THIS TEXT BACK — `dump` writes to `std::cerr` and has no reader
+    /// (`ddc/ddc_metadata.h:49`), and the DDL's own parse route is
+    /// [`DataTransfer::access_pattern_as_str`]'s, not this one's. The divergence is therefore
+    /// diagnostic only, and this test is what keeps it from being mistaken for equivalence.
+    #[test]
+    fn a_constraint_dump_spells_floats_rusts_way_and_not_ostreams() {
+        let mut constraints = Constraints::default();
+        constraints.update_min(ConstraintValue::new(1.0 / 3.0).expect("a third is not NaN"));
+        constraints.update_max(ConstraintValue::new(1.0e6).expect("a million is not NaN"));
+        constraints.update_values(
+            [1.0e-5]
+                .into_iter()
+                .filter_map(ConstraintValue::new)
+                .collect(),
+        );
+
+        assert_eq!(
+            constraints.dump(),
+            "mustBeMultiple_= F loopDimKind_= NOT_SET , min_= 0.33333334 , max_= 1000000 \
+             , values_= {0.00001 }\n"
+        );
+    }
+
+    /// `ddc/ddc_metadata.h:98-101` — the class's own setter, which has NO CALLER in the authority:
+    /// the one filler goes through `getMutableAccessPatternList` instead
+    /// (`ddc/ddl/ddl_conversion.cpp:1226`). Ported because it is this class's own method over this
+    /// class's own field, and tested here because a method with no caller is otherwise a method with
+    /// no evidence.
+    ///
+    /// ⭐ THE SETTER AND THE LIST HANDLE REACH THE SAME SLOT, which is what makes the two routes
+    /// interchangeable: a second statement of the same dim REPLACES the first rather than adding an
+    /// entry, exactly as `accessPatternPerDim_[dimVal] = accessPattern` does (`:100`).
+    #[test]
+    fn a_transfer_states_one_dims_pattern_through_its_own_setter() {
+        let mut transfer = DataTransfer::default();
+        transfer.set_access_pattern(
+            PrimaryDimTypes::Y,
+            TransferAccessPattern {
+                src: PadType::PaddedWZeroPad,
+                dst: PadType::NoPad,
+            },
+        );
+
+        assert!(transfer.has_any_access_pattern());
+        assert!(transfer.has_access_pattern(PrimaryDimTypes::Y));
+        assert_eq!(
+            transfer.access_pattern_as_str(PrimaryDimTypes::Y),
+            Some(String::from("padded_wzeropad-to-nopad"))
+        );
+
+        // Assignment, not insertion: the list handle overwrites the slot the setter filled.
+        transfer.access_pattern_list_mut().insert(
+            PrimaryDimTypes::Y,
+            TransferAccessPattern {
+                src: PadType::NoPad,
+                dst: PadType::NoPad,
+            },
+        );
+        assert_eq!(transfer.access_pattern_list().len(), 1);
+        assert_eq!(
+            transfer.access_pattern(PrimaryDimTypes::Y).map(|p| p.src),
+            Some(PadType::NoPad)
+        );
+
+        // And the setter overwrites what the handle wrote, in the same one slot.
+        transfer.set_access_pattern(
+            PrimaryDimTypes::Y,
+            TransferAccessPattern {
+                src: PadType::PaddedWZeroPad,
+                dst: PadType::PaddedWZeroPad,
+            },
+        );
+        assert_eq!(transfer.access_pattern_list().len(), 1);
+        assert_eq!(
+            transfer.access_pattern(PrimaryDimTypes::Y).map(|p| p.dst),
+            Some(PadType::PaddedWZeroPad)
+        );
+    }
+
+    /// ⭐ WHAT THE [`Option`] KEY BUYS BEYOND SPELLING THE `-1`: `checkConstraints` walks the whole
+    /// outer map (`ddc/ddcv1.cpp:795`) and the authority's `unordered_map` gives the hash's order,
+    /// while [`None`] sorts before every [`Some`] here — so the absolute entries are visited first,
+    /// always, and the one thing that order decides is fixed rather than left to a hash.
+    ///
+    /// ⛔ AND THE ORDER IS NOT THE VERDICT: that lambda writes nothing and returns on the first
+    /// violation (`:795-921`), so any permutation answers the same. What it decides is which
+    /// `DT_ERROR` a malformed table reports — see [`Datastage::constraints`].
+    #[test]
+    fn a_datastages_absolute_constraints_are_visited_before_its_relative_ones() {
+        let mut datastage = Datastage::default();
+        for key in [
+            Some(Metadata::CHUNK_DSTGID),
+            None,
+            Some(Metadata::CORE_DSTGID),
+        ] {
+            datastage
+                .constraints
+                .entry(key)
+                .or_default()
+                .entry(BTreeSet::from([PrimaryDimTypes::Mb]))
+                .or_default()
+                .must_be_multiple = true;
+        }
+
+        assert_eq!(
+            datastage.constraints.keys().copied().collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(Metadata::CORE_DSTGID),
+                Some(Metadata::CHUNK_DSTGID),
+            ]
+        );
+    }
 }
 
 // crustify:todo: e026_Metadata
 
+// crustify:todo: e038_Metadata
+
 // crustify:todo: e026_Metadata.TransferNodesInterSliceTranspose_
+
+// crustify:todo: e038_Metadata.TransferNodesInterSliceTranspose_
 
 // crustify:todo: e026_Metadata.belowLxScheduleInsertBlock
 
+// crustify:todo: e038_Metadata.belowLxScheduleInsertBlock
+
 // crustify:todo: e026_Metadata.compAndAllocNode
+
+// crustify:todo: e038_Metadata.compAndAllocNode
 
 // crustify:todo: e026_Metadata.consIdAndAllocNode
 
+// crustify:todo: e038_Metadata.consIdAndAllocNode
+
 // crustify:todo: e026_Metadata.consumers_
+
+// crustify:todo: e038_Metadata.consumers_
 
 // crustify:todo: e026_Metadata.dataConnects_
 
+// crustify:todo: e038_Metadata.dataConnects_
+
 // crustify:todo: e026_Metadata.datatransfers_
+
+// crustify:todo: e038_Metadata.datatransfers_
 
 // crustify:todo: e026_Metadata.dimToCoreChunkLoops_
 
+// crustify:todo: e038_Metadata.dimToCoreChunkLoops_
+
 // crustify:todo: e026_Metadata.externalNodes_
+
+// crustify:todo: e038_Metadata.externalNodes_
 
 // crustify:todo: e026_Metadata.implicitSyncs_
 
+// crustify:todo: e038_Metadata.implicitSyncs_
+
 // crustify:todo: e026_Metadata.inOutRegAllocs_
+
+// crustify:todo: e038_Metadata.inOutRegAllocs_
 
 // crustify:todo: e026_Metadata.internalRegAlloc_
 
+// crustify:todo: e038_Metadata.internalRegAlloc_
+
 // crustify:todo: e026_Metadata.ldsIdxAndAllocNode
+
+// crustify:todo: e038_Metadata.ldsIdxAndAllocNode
 
 // crustify:todo: e026_Metadata.newAllocations_
 
+// crustify:todo: e038_Metadata.newAllocations_
+
 // crustify:todo: e026_Metadata.nodeCloningMap_
+
+// crustify:todo: e038_Metadata.nodeCloningMap_
 
 // crustify:todo: e026_Metadata.opaqueOps_
 
+// crustify:todo: e038_Metadata.opaqueOps_
+
 // crustify:todo: e026_Metadata.prefilledExternalTransferToDataConnectToFill_
+
+// crustify:todo: e038_Metadata.prefilledExternalTransferToDataConnectToFill_
 
 // crustify:todo: e026_Metadata.producers_
 
+// crustify:todo: e038_Metadata.producers_
+
 // crustify:todo: e026_Metadata.shadowAllocations_
+
+// crustify:todo: e038_Metadata.shadowAllocations_
