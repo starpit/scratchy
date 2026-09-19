@@ -1476,6 +1476,45 @@ impl L3DlOpsScheduler {
     }
 }
 
+/// `.cpp:6411-6423`, `prepDsc` (`:506`) — the first thing `run` does to a `SuperDsc` (`.cpp:7921`):
+/// give DM the corelet count DSM chose, and mint the [`Metadata`] table every later allocation reads
+/// (`.cpp:580`, `:5511`, `:5756`).
+///
+/// ⛔ THE PARAMETER IS THE DSC LIST, NOT A `SuperDsc`: `mySDsc.dscs_` is the only member this body
+/// touches, and nothing in this crate spells a `SuperDsc` — `crustify-scheduler/UNITS.tsv` has no row
+/// for it. Same technique and the same reason as [`Self::is_paged_lds`].
+///
+/// ⛔ `emplace` KEEPS A TABLE ALREADY FILED UNDER THAT INDEX (`.cpp:6419`), so this is
+/// `entry().or_default()` and NOT an insert. The two ids are reassigned on the next two lines either
+/// way (`.cpp:6420-6421`), but `newAllocations_` — the map's only other writer (`.cpp:583-587`) — is
+/// not, and `dscMetadata` is never cleared. The difference is invisible at both construction sites,
+/// each of which runs one `SuperDsc` through a fresh scheduler
+/// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:30-32`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler_standalone.cpp:192-198`), and reachable from Rust, where
+/// this function and [`Self::dsc_metadata`] are both public.
+///
+/// ⭐ COPYING THE ABSENCE IS THE COPY: neither count has a member initialiser
+/// (`dsc/designSpaceConfig.h:74`, `:104`), and `.cpp:6415` copies whatever `numCoreletsUsed_` holds.
+impl L3DlOpsScheduler {
+    /// Replaces: e029g7_L3DlOpsScheduler_run.prepDsc
+    ///
+    /// `.cpp:6411-6423`. Hand DM's corelet count the value DSM chose for every DSC, then mint one
+    /// [`Metadata`] per DSC index carrying the core and chunk data-stage ids. The block above has the
+    /// parameter and the `emplace` semantics.
+    pub fn prep_dsc(&mut self, dscs: &mut [DesignSpaceConfig]) {
+        // `.cpp:6413-6415`. The imbalanced corelet split IBM leaves for the future is what would
+        // make the two counts differ.
+        for dsc in dscs.iter_mut() {
+            dsc.num_corelets_used_dsc2 = dsc.num_corelets_used;
+        }
+        // `.cpp:6418-6421`.
+        for dsc_idx in 0..dscs.len() {
+            let metadata = self.dsc_metadata.entry(DscIdx(dsc_idx as i32)).or_default();
+            metadata.core_dstgid = Some(Self::DATA_STAGE_CORE_IDX);
+            metadata.chunk_dstgid = Some(Self::DATA_STAGE_CHUNK_IDX);
+        }
+    }
+}
 #[cfg(test)]
 mod equivalence {
     use super::*;
@@ -2051,6 +2090,91 @@ mod equivalence {
             "no HBM memOrg_ entry and a null allocateNode_ both reach `return false` (`.cpp:6603`)"
         );
     }
+
+    /// `.cpp:6411-6423` over a list of DSCs: DM's corelet count becomes DSM's, the absence included,
+    /// and every index gains a [`Metadata`] carrying the two data-stage ids (`:210-211`).
+    #[test]
+    fn prep_dsc_gives_dm_the_count_dsm_chose_and_mints_one_metadata_per_dsc() {
+        use crate::schedule::dsc::NumCoreletsUsed;
+
+        // The third DSC is the one DSM never wrote, which `.cpp:6415` copies just the same.
+        let counts = [Some(NumCoreletsUsed(2)), Some(NumCoreletsUsed(1)), None];
+        let mut dscs = Vec::new();
+        for count in counts {
+            let mut dsc = DesignSpaceConfig::default();
+            dsc.num_corelets_used = count;
+            assert_eq!(dsc.num_corelets_used_dsc2, None, "DM's count starts absent");
+            dscs.push(dsc);
+        }
+
+        let mut scheduler =
+            L3DlOpsScheduler::new(vec![ExPhase(0)], Verbosity(0), LxBufferTypeMode::Auto).unwrap();
+        assert!(scheduler.dsc_metadata.is_empty(), "`:205` starts empty");
+        scheduler.prep_dsc(&mut dscs);
+
+        for (dsc_idx, count) in counts.into_iter().enumerate() {
+            assert_eq!(
+                dscs[dsc_idx].num_corelets_used_dsc2, count,
+                "`.cpp:6415` copies whatever `numCoreletsUsed_` holds"
+            );
+            let metadata = &scheduler.dsc_metadata[&DscIdx(dsc_idx as i32)];
+            assert_eq!(
+                metadata.core_dstgid,
+                Some(L3DlOpsScheduler::DATA_STAGE_CORE_IDX),
+                "`.cpp:6420`"
+            );
+            assert_eq!(
+                metadata.chunk_dstgid,
+                Some(L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX),
+                "`.cpp:6421`"
+            );
+        }
+        assert_eq!(
+            scheduler.dsc_metadata.len(),
+            counts.len(),
+            "one entry per DSC and no more (`.cpp:6418`)"
+        );
+    }
+
+    /// `.cpp:6419`'s `emplace` against `.cpp:6420-6421`'s two `at` writes: a second `prepDsc` over an
+    /// index that already holds a table reassigns the two ids and keeps everything else — which is
+    /// what would lose `newAllocations_` (`.cpp:583-587`) if the mint replaced the entry instead.
+    #[test]
+    fn a_second_prep_dsc_reassigns_the_two_ids_and_keeps_the_rest_of_the_table() {
+        let mut dscs = vec![DesignSpaceConfig::default()];
+        let mut scheduler =
+            L3DlOpsScheduler::new(vec![ExPhase(0)], Verbosity(0), LxBufferTypeMode::Auto).unwrap();
+        scheduler.prep_dsc(&mut dscs);
+
+        // Stand in for what a run records in the table, and take the two ids away again.
+        let metadata = scheduler.dsc_metadata.get_mut(&DscIdx(0)).unwrap();
+        metadata
+            .datastages
+            .insert(L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX, Datastage::default());
+        metadata.row_split_dim = PrimaryDimTypes::Out;
+        metadata.core_dstgid = None;
+        metadata.chunk_dstgid = None;
+
+        scheduler.prep_dsc(&mut dscs);
+
+        let metadata = &scheduler.dsc_metadata[&DscIdx(0)];
+        assert_eq!(
+            metadata.datastages.len(),
+            1,
+            "`emplace` does not replace an existing entry (`.cpp:6419`)"
+        );
+        assert_eq!(metadata.row_split_dim, PrimaryDimTypes::Out);
+        assert_eq!(
+            metadata.core_dstgid,
+            Some(L3DlOpsScheduler::DATA_STAGE_CORE_IDX),
+            "the `at` write runs on the entry that was already there (`.cpp:6420`)"
+        );
+        assert_eq!(
+            metadata.chunk_dstgid,
+            Some(L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX),
+            "`.cpp:6421`"
+        );
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -2112,3 +2236,8 @@ mod equivalence {
 // crustify:todo: e029g5_L3DlOpsScheduler_paged.optimizeHbmTransfers
 
 // crustify:todo: e029g5_L3DlOpsScheduler_paged.optimizeHbmLdsOutputInScheduleTree
+
+// crustify:todo: e029g7_L3DlOpsScheduler_run
+
+// crustify:todo: e029g7_L3DlOpsScheduler_run.run
+
