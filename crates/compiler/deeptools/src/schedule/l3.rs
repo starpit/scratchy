@@ -999,20 +999,12 @@ impl L3DlOpsScheduler {
 
     /// Replaces: e029g3_L3DlOpsScheduler_coord.isDimensionCoreletSplit
     ///
-    /// `:81-82`, defined `.cpp:74-86`. Whether one corelet's share of `dim` is SMALLER than the whole
-    /// core's — asked of every primary dim by `getCoreletSplitDimensions` (`.cpp:88-102`) and of one
-    /// candidate chunk parameter by `isParamCoreletSplitValid` (`.cpp:1334-1345`).
-    ///
-    /// ⛔ THE CORE DATA STAGE WINS WHEN THERE IS ONE and the two dim objects are then NEVER READ
-    /// (`.cpp:77-85`), so a DSC carrying `dataStageParam_[0]` is answered from that stage's steady
-    /// state alone however `CoreletD_` and `CoreD_` stand.
-    /// ⛔ `clId = 0` AGAINST `clId = -1` IS THE WHOLE COMPARISON, both readings of the same `dim` with
-    /// `NO_COMPONENT` and no PT row: the first takes `coreletSplit_[dim][0]` and the second never
-    /// does (`dsc/dims.cpp:631-644`), so a dim absent from `coreletSplit_` reads equal and is not
-    /// split.
-    /// ⛔ [`None`] IS IBM'S `.at()` THROW — an empty `coreletSplit_` entry for a split dim — AND ALSO
-    /// the unwritten `numCoreletsUsed_`, whose `int` `.cpp:75` reads indeterminate
-    /// (`dsc/designSpaceConfig.h:74`). Neither is `Some(false)`.
+    /// `:81-82`, defined `.cpp:74-86`. Is one corelet's share of `dim` SMALLER than the whole core's?
+    /// ⛔ THE CORE DATA STAGE ANSWERS ALONE when `dataStageParam_[0]` exists: `CoreletD_`/`CoreD_` go
+    /// unread (`.cpp:77-85`), and `clId = 0` against `clId = -1` IS the comparison — only the first
+    /// takes `coreletSplit_[dim][0]` (`dsc/dims.cpp:631-644`), so a dim absent there reads equal.
+    /// ⛔ [`None`] is IBM's `.at()` throw AND the unwritten `numCoreletsUsed_`, indeterminate at
+    /// `.cpp:75` (`dsc/designSpaceConfig.h:74`) — neither is `Some(false)`.
     pub fn is_dimension_corelet_split(
         dsc: &DesignSpaceConfig,
         dim: PrimaryDimTypes,
