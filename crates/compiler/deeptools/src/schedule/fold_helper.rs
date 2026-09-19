@@ -8,7 +8,11 @@
 //! member functions, 37 are `key_val_.at(key).<a FoldManager method>` or a loop over `key_val_`
 //! doing the same to every value; the six that are not — `numKeys` (`:40`), `getAllKeys` (`:51`),
 //! `getRef` (`:433`), `removeKey` (`:702`), `isKeyPresent` (`:714`) and `getVal` (`:722`) — are
-//! `std::map` operations spelled through the reference. It holds no state and decides nothing.
+//! `std::map` operations spelled through the reference. It holds no state of its own, and what it
+//! does decide is cross-key: `getNumUniqueCoordsInEachFold` (`:517-552`) `DT_ERROR`s when neither
+//! key's fold space contains the other (`:543-546`), and `getCommonFlattenedCoordinates` (`:559-583`)
+//! runs an odometer over that verdict without touching `key_val_` at all. No in-scope caller reaches
+//! either, which is the ground of the dissolution and is what the table below establishes.
 //!
 //! ⛔ SO THE UNIT'S ANCHORS ARE FILLED AT THE OWNER OF THE MAP, NOT HERE:
 //! [`TransferPadInfo`](crate::schedule::dsc2::TransferPadInfo) in `schedule/dsc2.rs` carries
@@ -189,9 +193,9 @@ mod equivalence {
     /// represented: `getDataForKey` reaches `key_val_.at(key)` (`:208`) and the range test runs
     /// against THAT manager's `dim_prop_` (`foldInfrastructure.h:1677`), never a shared one.
     ///
-    /// The negatives read 0 here rather than `-15`: `getTransferPadSizeFrontOrBack` wraps every
-    /// query in `std::max(.., 0)` (`dsc/dsc2.cpp:4729-4731`) and is the only public reader, so the
-    /// raw fold value is observable exactly where it is positive.
+    /// The negatives read 0 here rather than `-15`: BOTH public readers wrap every query in
+    /// `std::max(.., 0)` (`dsc/dsc2.cpp:4706`, `:4729-4731`), so the raw fold value is observable
+    /// exactly where it is positive.
     #[test]
     fn e037_each_dims_fold_extents_bound_only_that_dim() {
         let info = two_dims_one_end();
@@ -333,6 +337,144 @@ mod equivalence {
                 "`B.getRef_order = 0:0 4:4 9:9`"
             );
         }
+    }
+
+    /// `X` built at the FRONT only and `Y` at the BACK only. The one production builder does not
+    /// make this state — `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5469` and `:5473` build both ends
+    /// in one loop body — but `buildPadFrontSizes` and `buildPadBackSizes` are two separate public
+    /// functions (`dsc/dsc2.h:777-782`), so the authority has an answer for it and this port must
+    /// give the same one.
+    fn one_dim_at_each_end() -> TransferPadInfo {
+        let mut info = TransferPadInfo::default();
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Front,
+                PrimaryDimTypes::X,
+                [FoldDimSize(2), FoldDimSize(3)],
+                [PadSize(-40), PadSize(-10)],
+                [PadSize(25), PadSize(0)],
+            ),
+            Some(())
+        );
+        assert_eq!(
+            info.build_pad_sizes(
+                PadEnd::Back,
+                PrimaryDimTypes::Y,
+                [FoldDimSize(3), FoldDimSize(2)],
+                [PadSize(-100), PadSize(-7)],
+                [PadSize(50), PadSize(0)],
+            ),
+            Some(())
+        );
+        info
+    }
+
+    /// `front_dims = 4`, `back_dims = 5`, `wk.x.front.nc0 = 0`, `wk.y.back.nc0 = 0`,
+    /// `wk.x.back.nc0_never_built = 0`, `wk.y.front.nc0_never_built = 0`,
+    /// `wk.x.back.nc0_off7_w99 = 0`, `wk.kij.front.nc0_no_key = 0`, `wk.kij.back.nc0_no_key = 0`,
+    /// `wk.x.back.nc1_never_built = THROW`, `wk.kij.front.nc1_no_key = THROW`,
+    /// `tr.x.back.never_built = THROW`, `wk.x.back.ncneg1_never_built = 0`.
+    ///
+    /// ⛔ THE WALK LOOKS THE DIM UP INSIDE THE LOOP, SO AT ZERO CHUNKS IT ANSWERS FOR A DIM IT HAS NO
+    /// KEY FOR AT ALL. `getWkSlicePadSizeFrontOrBack` binds `padSizeHelper` by reference
+    /// (`dsc/dsc2.cpp:4688-4689`) and reaches `getDataForKey` only at `:4706`, inside
+    /// `while (numChunksVisited < numChunks)` (`:4698`), so `chunkOffset * 0 + 0` comes back without
+    /// the map being consulted — whereas `getTransferPadSizeFrontOrBack` has no loop and throws for
+    /// the same dim on the same object (`:4729-4731`), and one visited chunk makes the walk throw too.
+    ///
+    /// So `getDataForKey`'s `DT_CHECK(key_val_.count(key))` (`:207`) is a refusal of the READ and
+    /// never of the bind, and this case pins WHERE the port may spell it. The C++ reader that makes
+    /// asymmetric ends matter is `dsc/dsc2.cpp:4817-4820`, which `std::set_union`s the two dim sets,
+    /// and `:4863-4870`, which then asks BOTH ends about every dim in the union with `numChunks` an
+    /// integer division (`:4790-4796`).
+    #[test]
+    fn e037_the_wk_slice_walk_answers_zero_chunks_without_looking_the_dim_up() {
+        let info = one_dim_at_each_end();
+        assert_eq!(
+            info.pad_dims(PadEnd::Front).collect::<Vec<_>>(),
+            [PrimaryDimTypes::X],
+            "`front_dims = 4`"
+        );
+        assert_eq!(
+            info.pad_dims(PadEnd::Back).collect::<Vec<_>>(),
+            [PrimaryDimTypes::Y],
+            "`back_dims = 5`"
+        );
+
+        let walk = |end, dim, w: i64, num_chunks: u32, off: i32| {
+            info.wk_slice_pad_size(
+                end,
+                dim,
+                WkSliceIdx(w),
+                NumChunks(num_chunks),
+                ChunkOffset(off),
+                ChunkSizePadded(10),
+            )
+        };
+
+        // The end each dim WAS built at: zero chunks visits nothing, so the walk contributes nothing.
+        assert_eq!(
+            walk(PadEnd::Front, PrimaryDimTypes::X, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.x.front.nc0 = 0`"
+        );
+        assert_eq!(
+            walk(PadEnd::Back, PrimaryDimTypes::Y, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.y.back.nc0 = 0`"
+        );
+
+        // The end each dim was NEVER built at, and a dim built at neither end: the same 0.
+        assert_eq!(
+            walk(PadEnd::Back, PrimaryDimTypes::X, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.x.back.nc0_never_built = 0`"
+        );
+        assert_eq!(
+            walk(PadEnd::Front, PrimaryDimTypes::Y, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.y.front.nc0_never_built = 0`"
+        );
+        assert_eq!(
+            walk(PadEnd::Back, PrimaryDimTypes::X, 99, 0, 7),
+            Some(PadSize(0)),
+            "`wk.x.back.nc0_off7_w99 = 0`"
+        );
+        assert_eq!(
+            walk(PadEnd::Front, PrimaryDimTypes::Kij, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.kij.front.nc0_no_key = 0`"
+        );
+        assert_eq!(
+            walk(PadEnd::Back, PrimaryDimTypes::Kij, 0, 0, 10),
+            Some(PadSize(0)),
+            "`wk.kij.back.nc0_no_key = 0`"
+        );
+
+        // One visited chunk reaches `:4706`, and then the very same query throws.
+        assert_eq!(
+            walk(PadEnd::Back, PrimaryDimTypes::X, 0, 1, 10),
+            None,
+            "`wk.x.back.nc1_never_built = THROW`"
+        );
+        assert_eq!(
+            walk(PadEnd::Front, PrimaryDimTypes::Kij, 0, 1, 10),
+            None,
+            "`wk.kij.front.nc1_no_key = THROW`"
+        );
+
+        // The other reader has no count to be zero, so it refuses the dim outright.
+        assert_eq!(
+            info.transfer_pad_size(
+                PadEnd::Back,
+                PrimaryDimTypes::X,
+                WkSliceIdx(0),
+                ChunkIdx(0),
+                ChunkSizePadded(10)
+            ),
+            None,
+            "`tr.x.back.never_built = THROW`"
+        );
     }
 }
 

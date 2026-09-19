@@ -11301,7 +11301,9 @@ pub struct TransferPadInfo {
     /// Field: e037_MapWithFMHelper.key_val_
     ///
     /// The same three fields at the other end, and independent of [`front`](Self::front): measured,
-    /// building only the front leaves every back query throwing.
+    /// building only the front leaves every back query that READS throwing — but not
+    /// [`Self::wk_slice_pad_size`] at zero chunks, whose walk reads nothing
+    /// (`dsc/dsc2.cpp:4698`, measured `wk.x.back.nc0_never_built = 0`).
     back: BTreeMap<PrimaryDimTypes, PadSizeFold>,
 }
 
@@ -11369,9 +11371,18 @@ impl TransferPadInfo {
     ///
     /// ⛔ `chunkSizePadded` IS THE ONLY THING THAT ENDS THE WALK EARLY, so a 0 or negative one visits
     /// every chunk: measured, `chunkSizePadded = 0` over three chunks answers `3 * chunkOffset`.
-    /// ⛔ [`None`] IS THE READER THROWING MID-WALK, on an unknown dim
-    /// (`util/foldManager/mapWithFMHelper.h:207`) or a coordinate past its extent — reachable exactly
-    /// when [`NumChunks`] exceeds the stored `chunk_index` extent and no chunk breaks the walk first.
+    /// ⛔ [`None`] IS THE READER THROWING *INSIDE* THE WALK, WHICH IS ALSO WHERE `dim` IS LOOKED UP:
+    /// the authority binds `padSizeHelper` by reference (`:4688-4689`) and touches `dim` only at
+    /// `:4706`, so at [`NumChunks`]`(0)` it returns `chunkOffset * 0 + 0` for EVERY dim, one this end
+    /// never built included, and needs one visited chunk before an unknown dim
+    /// (`util/foldManager/mapWithFMHelper.h:207`) or a coordinate past the stored `chunk_index`
+    /// extent can throw. Measured on the authority over an object with `X` built at the front only
+    /// and `Y` at the back only: `wk.x.back.nc0_never_built = 0`, `wk.kij.back.nc0_no_key = 0`,
+    /// `wk.x.back.nc1_never_built = THROW`.
+    /// ⛔ SO THE LOOKUP MAY NOT BE HOISTED ABOVE THE LOOP, and that is not academic: the two ends are
+    /// built independently ([`Self::build_pad_sizes`]) and the one C++ reader unions their dim sets
+    /// and then queries BOTH ends for every dim in the union (`dsc/dsc2.cpp:4817-4820`, `:4863-4870`),
+    /// so a dim built at one end arrives at the other end's walk by construction.
     pub fn wk_slice_pad_size(
         &self,
         end: PadEnd,
@@ -11381,9 +11392,12 @@ impl TransferPadInfo {
         chunk_offset: ChunkOffset,
         chunk_size_padded: ChunkSizePadded,
     ) -> Option<PadSize> {
+        // Selecting the end is `:4688-4689`'s reference bind and cannot fail; the per-dim lookup is
+        // `:4706`, inside the loop. `Option<&PadSizeFold>` is [`Copy`], so each iteration refuses on
+        // it afresh and a walk that visits no chunk never consults it.
         let fold = match end {
-            PadEnd::Front => self.front.get(&dim)?,
-            PadEnd::Back => self.back.get(&dim)?,
+            PadEnd::Front => self.front.get(&dim),
+            PadEnd::Back => self.back.get(&dim),
         };
         let mut num_chunks_visited = 0u32;
         let mut partial_pad_size = 0i32;
@@ -11393,7 +11407,7 @@ impl TransferPadInfo {
                 PadEnd::Back => num_chunks.0 - num_chunks_visited - 1,
             };
             // "the agreement is that negative pad size is treated as zero" (`:4702-4704`).
-            let curr_pad_size = fold
+            let curr_pad_size = fold?
                 .data(wk_slice, ChunkIdx(i64::from(curr_chunk_idx)))?
                 .0
                 .max(0);
