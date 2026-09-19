@@ -953,7 +953,7 @@ impl Metadata {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::schedule::dsc2::NumBuffers;
+    use crate::schedule::dsc2::{NumBuffers, ReplicationFactor};
 
     /// `ddc/ddcv1.cpp:362-369` — the LX tracker of a used core refuses. Both the corelet and the row
     /// are the proxy `0` HERE BECAUSE THE COMPONENT IS LX: that takes `copyCorelet = true`
@@ -1268,7 +1268,7 @@ mod unit_tests {
             .insert(Metadata::CORE_DSTGID, Datastage::default());
         metadata.external_transfers.push(ExternalTransfer::new(
             Box::new(TransferNode {
-                replication_factor: 2,
+                replication_factor: ReplicationFactor(2),
                 ..TransferNode::default()
             }),
             Box::new(AllocateNode {
@@ -1310,7 +1310,7 @@ mod unit_tests {
     #[test]
     fn an_external_transfer_owns_the_node_pair_it_is_built_from() {
         let transfer = TransferNode {
-            replication_factor: 4,
+            replication_factor: ReplicationFactor(4),
             ..TransferNode::default()
         };
         let allocate = AllocateNode {
@@ -1319,7 +1319,7 @@ mod unit_tests {
         };
 
         let mut entry = ExternalTransfer::new(Box::new(transfer), Box::new(allocate));
-        assert_eq!(entry.transfer.replication_factor, 4);
+        assert_eq!(entry.transfer.replication_factor, ReplicationFactor(4));
         assert_eq!(entry.allocate.component, SenComponent::Lx);
         assert_eq!(entry.allocate.num_buffers, NumBuffers(1));
 
@@ -1331,7 +1331,7 @@ mod unit_tests {
         assert_eq!(metadata.external_transfers.len(), 1);
         assert_eq!(
             metadata.external_transfers[0].transfer.replication_factor,
-            4
+            ReplicationFactor(4)
         );
         assert_eq!(
             metadata.external_transfers[0].allocate.num_buffers,

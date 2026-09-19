@@ -1525,9 +1525,9 @@ mod unit_tests {
     #[test]
     fn a_default_transfer_node_carries_the_authoritys_initialisers() {
         let node = TransferNode::default();
-        assert_eq!(node.replication_factor, 1);
-        assert_eq!(node.unit_time_transfer_num_chunks, 1);
-        assert_eq!(node.rotate_num_elements, 0);
+        assert_eq!(node.replication_factor, ReplicationFactor(1));
+        assert_eq!(node.unit_time_transfer_num_chunks, UnitTimeChunkCount(1));
+        assert_eq!(node.rotate_num_elements, RotateElements(0));
         assert_eq!(node.src, DataLocation::UNSET);
         assert_eq!(DstVia::default().loc_indirect, DataLocation::UNSET);
 
@@ -1548,8 +1548,8 @@ mod unit_tests {
     #[test]
     fn cloning_a_transfer_node_drops_its_padding_info_and_copies_everything_else() {
         let mut node = TransferNode {
-            replication_factor: 8,
-            rotate_num_elements: 16,
+            replication_factor: ReplicationFactor(8),
+            rotate_num_elements: RotateElements(16),
             dst_vias: vec![DstVia::default(), DstVia::default()],
             repetition: TransferRepetition {
                 src: Some(Repetition(2)),
@@ -1577,8 +1577,8 @@ mod unit_tests {
         assert!(!node.padding_info.is_empty());
 
         // Every other member is a plain member-wise copy.
-        assert_eq!(clone.replication_factor, 8);
-        assert_eq!(clone.rotate_num_elements, 16);
+        assert_eq!(clone.replication_factor, ReplicationFactor(8));
+        assert_eq!(clone.rotate_num_elements, RotateElements(16));
         assert_eq!(clone.dst_vias, node.dst_vias);
         assert_eq!(clone.repetition, node.repetition);
         assert_eq!(clone.transfer_size, node.transfer_size);
@@ -3509,7 +3509,7 @@ mod unit_tests {
     /// `INVALID_TRANSFER_TYPE` while a TENSOR source with no destination is
     /// `NO_TRANSFER_FROM_TENSOR`.
     #[test]
-    fn e034_the_transfer_type_chain_is_ordered_and_a_constant_source_takes_the_first_two_arms() {
+    fn e046_the_transfer_type_chain_is_ordered_and_a_constant_source_takes_the_first_two_arms() {
         let lds = || DataInfo {
             lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(0))),
             ..DataInfo::default()
@@ -3570,7 +3570,7 @@ mod unit_tests {
     /// one field the authority names — and `isDstIndirect` reading EMPTINESS alone, never a
     /// destination's contents.
     #[test]
-    fn e034_the_data_info_predicates_each_read_their_own_operand() {
+    fn e046_the_data_info_predicates_each_read_their_own_operand() {
         let lds = DataInfo {
             lds_or_const: Some(LdsOrConst::LabeledDs(LdsIdx(1))),
             ..DataInfo::default()
@@ -3597,13 +3597,14 @@ mod unit_tests {
         assert!(!node.is_dst_labeled_ds());
     }
 
-    /// ⭐ THE COUPLING THE THREE FIELDS' DOCS NAME, AS A PROPERTY RATHER THAN A SPOT CHECK. The
-    /// element count bridge 1 reassembles — `Π extents × numChunks × replicationFactor_`
-    /// (`SNTransferLowering.cpp:32-38`, `:963-965`) — is what each DDC writer preserves; the extent
-    /// product ALONE is not. One input, the stick sizes `getStickSizes` hands
-    /// `populateUnitTimeTransfers`, through every writer the authority applies to this vector.
+    /// ⛔ THE PRODUCT IS BRIDGE 1'S FORMULA, NOT AN INVARIANT DDC KEEPS — what this test asserted
+    /// before, that it is "what each DDC writer preserves", is FALSE. Four writers DO move magnitude
+    /// between the extents and [`ReplicationFactor`]; three ASSIGN the factor outright and break it,
+    /// one of them to the `0` bridge 1 divides by (`SNTransferLowering.cpp:727-729`). Every number is
+    /// measured on a compiled byte-exact extract of `ddc/ddcv1.cpp:455-468`, `:510-535`, `:544-548`
+    /// and `:1659-1667`, with `l0PtBwPerSlice = 64` and `bytesPerStick = 128`.
     #[test]
-    fn e034_the_chunk_extents_and_the_replication_factor_are_one_load_size() {
+    fn e046_the_load_size_survives_the_writers_that_move_it_not_the_ones_that_assign_it() {
         // The stick sizes of one 256-element load (`ddc/ddcv1.cpp:513`, `dsc/dsc2.h:835-836`).
         let stick_sizes = [(PrimaryDimTypes::In, 4), (PrimaryDimTypes::Ij, 64)];
         let entry = |(dim, size): (PrimaryDimTypes, i32), idx| SizeAndIndex {
@@ -3619,67 +3620,100 @@ mod unit_tests {
         };
         // One `agen` access's element count (`SNTransferLowering.cpp:32-38`, `:963-965`).
         let elements = |node: &TransferNode| {
-            extents(node) * node.unit_time_transfer_num_chunks * node.replication_factor
+            extents(node) * node.unit_time_transfer_num_chunks.0 * node.replication_factor.0
         };
-
-        // `:510-525` with `do2BSplat == false`: one entry per stick size, at its own position.
-        let plain = TransferNode {
+        // `:510-525`: one entry per stick size at its own position, extent `1` under `do2BSplat`.
+        let mint = |splat: bool| TransferNode {
             unit_time_transfer_chunk_size: stick_sizes
                 .iter()
                 .enumerate()
-                .map(|(i, &size)| entry(size, i as u32))
+                .map(|(i, &(dim, size))| entry((dim, if splat { 1 } else { size }), i as u32))
                 .collect(),
             ..TransferNode::default()
         };
+
+        let plain = mint(false);
         assert_eq!(elements(&plain), 256);
         assert_eq!(extents(&plain), 256);
 
-        // `:525` with `do2BSplat == true` pushes extent 1 for every dim, and `:532-535` puts the
-        // product of the stick sizes in the factor instead — the same load, on the OTHER field.
+        // `:532-535` puts the product of the stick sizes in the factor instead — the same load, on
+        // the OTHER field — and `:544-548`'s fp32 fixup moves a 4 BACK into entry 0.
         let mut splat = TransferNode {
-            unit_time_transfer_chunk_size: stick_sizes
-                .iter()
-                .enumerate()
-                .map(|(i, &(dim, _))| entry((dim, 1), i as u32))
-                .collect(),
-            replication_factor: stick_sizes.iter().map(|&(_, size)| size).product(),
-            ..TransferNode::default()
+            replication_factor: ReplicationFactor(stick_sizes.iter().map(|&(_, s)| s).product()),
+            ..mint(true)
         };
         assert_eq!(elements(&splat), 256);
         assert_eq!(extents(&splat), 1, "the extents alone lost the whole load");
-
-        // `:544-548`, the fp32 fixup: a 4 moves BACK out of the factor into entry 0.
         splat.unit_time_transfer_chunk_size[0].size_dim.size = DimSize(4);
-        splat.replication_factor /= 4;
-        assert_eq!(splat.replication_factor, 64);
+        splat.replication_factor.0 /= 4;
+        assert_eq!(splat.replication_factor, ReplicationFactor(64));
         assert_eq!(elements(&splat), 256);
-        assert_eq!(extents(&splat), 4);
 
-        // `:1549-1552`, the data-stage shrink of entry 0 from 4 to `dsDim = 2`, in place, with
-        // `replicationFactor_ *= size / dsDim`.
+        // `:1549-1552` shrinks entry 0 from 4 to `dsDim = 2` in place with `replicationFactor_ *=
+        // size / dsDim`, and `:1669-1677`'s `reduce2B` tail folds EVERY extent in — under `doSplat`.
         let mut shrunk = plain.clone();
         shrunk.unit_time_transfer_chunk_size[0].size_dim.size = DimSize(2);
-        shrunk.replication_factor *= 2;
+        shrunk.replication_factor.0 *= 2;
         assert_eq!(elements(&shrunk), 256);
-        assert_eq!(extents(&shrunk), 128);
-
-        // `:1669-1677`, the `reduce2B` tail WITH `doSplat`: every extent to 1, each folded in.
         let mut reduced = splat.clone();
         let mut factor = reduced.replication_factor;
         for chunk in &mut reduced.unit_time_transfer_chunk_size {
-            factor *= chunk.size_dim.size.0;
+            factor.0 *= chunk.size_dim.size.0;
             chunk.size_dim.size = DimSize(1);
         }
         reduced.replication_factor = factor;
         assert_eq!(elements(&reduced), 256);
 
-        // ⛔ AND WITHOUT `doSplat` THAT SAME LOOP DISCARDS IT (`:1673`) — the transfer really did get
-        // smaller, which is why the product is an invariant of the SPLAT path alone.
+        // ⛔ AND WITHOUT `doSplat` THAT SAME LOOP DISCARDS IT (`:1673`) — there the transfer really
+        // did get smaller, which is why even the moving writers preserve it on the splat path only.
         let mut dropped = splat.clone();
         for chunk in &mut dropped.unit_time_transfer_chunk_size {
             chunk.size_dim.size = DimSize(1);
         }
         assert_eq!(elements(&dropped), 64);
+
+        // ⛔ `:529-530`, the forced half of `do2BSplat`: the factor becomes `force_num_elements_`
+        // OUTRIGHT — measured over these sticks, `-1` gives 256 through `:532-535` but `0`, `8` and
+        // `4096` give 0, 8 and 4096, none of them the load the sticks describe.
+        let forced = TransferNode {
+            replication_factor: ReplicationFactor(4096),
+            ..mint(true)
+        };
+        assert_eq!(elements(&forced), 4096);
+
+        // ⛔ `:455-457`, CONSTANT_TO_CONSTANT: `8 * bytesPerStick / numElemInConst / bits`, assigned
+        // BEFORE the minting loop that `:468` then `continue`s past, so the vector stays EMPTY and no
+        // stick size takes part at all — the extent product is the empty product 1.
+        let constant = |num_elem: i32, bits: i32| ReplicationFactor(8 * 128 / num_elem / bits);
+        assert_eq!(constant(1, 8), ReplicationFactor(128));
+        assert_eq!(constant(128, 16), ReplicationFactor(0));
+        let c2c = TransferNode {
+            replication_factor: constant(1, 8),
+            ..TransferNode::default()
+        };
+        assert_eq!(extents(&c2c), 1);
+        assert_eq!(elements(&c2c), 128);
+
+        // ⛔ `:1664-1667`, the SEN1P5 bandwidth writer: a `double` quotient
+        // `l0PtBwPerSlice / ((float)bits / 8) / loadSize` TRUNCATED into the `int`. It reads this
+        // vector's own product (`:1659-1663`) and then OVERWRITES the factor, so the reassembled
+        // count is neither the load nor a multiple of it — and at fp16 it reaches `0`.
+        let bandwidth = |bits: i32, load_size: i32| {
+            ReplicationFactor((64.0 / (f64::from(bits) / 8.0) / f64::from(load_size)) as i32)
+        };
+        assert_eq!(bandwidth(16, 32), ReplicationFactor(1));
+        assert_eq!(bandwidth(16, 48), ReplicationFactor(0));
+        assert_eq!(bandwidth(8, 3), ReplicationFactor(21));
+        assert_eq!(bandwidth(32, 32), ReplicationFactor(0));
+        let starved = TransferNode {
+            replication_factor: bandwidth(16, 48),
+            ..plain.clone()
+        };
+        assert_eq!(
+            elements(&starved),
+            0,
+            "the 256-element load reads as no load at all"
+        );
     }
 
     /// [`LoopCondOp`] IS `CondOp::COMPARISONS`, positionally and by spelling, and the narrowing is
@@ -8351,19 +8385,19 @@ const _: () = {
 /// and the units it routes through on the way (`dsc/dsc2.h:816-819`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DstVia {
-    /// Field: e034_TransferNode.loc_
+    /// Field: e046_TransferNode.loc_
     ///
     /// Where this destination writes (`dsc/dsc2.h:817`). Its `storage` is what decides whether the
     /// destination is a memory at all (`dsc/dsc2.cpp:4372-4383`).
     pub loc: DataLocation,
-    /// Field: e034_TransferNode.locIndirect_
+    /// Field: e046_TransferNode.locIndirect_
     ///
     /// The location holding the address when this destination is indirect, or
     /// [`DataLocation::UNSET`] when it is not —
     /// [`is_dst_indirect_at_index`](TransferNode::is_dst_indirect_at_index) tests the `unit` half
     /// against `NO_COMPONENT` (`dsc/dsc2.h:879-883`).
     pub loc_indirect: DataLocation,
-    /// Field: e034_TransferNode.via_
+    /// Field: e046_TransferNode.via_
     ///
     /// ⛔ ORDERED SOURCE TO DESTINATION, and bridge 1 walks it as a route: at the component it is
     /// lowering for, `via_[i + 1]` is the next hop and `via_[i - 1]` the previous
@@ -8409,7 +8443,7 @@ impl Default for DstVia {
 /// the load path matches `srcSizeIdx_` and the store path `dstSizeIdx_` (`:338-348`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SizeAndIndex {
-    /// Field: e034_TransferNode.sizeDim_
+    /// Field: e046_TransferNode.sizeDim_
     ///
     /// The dim and how much of it this chunk covers (`dsc/dsc2.h:821`).
     ///
@@ -8421,14 +8455,14 @@ pub struct SizeAndIndex {
     /// (`:1638-1640`), and then ERASES the source entries from `unitTimeTransferChunkSize_`
     /// (`:1642-1643`) — so nothing in the chunk-size vector is ever left holding the 1.
     pub size_dim: Size,
-    /// Field: e034_TransferNode.srcSizeIdx_
+    /// Field: e046_TransferNode.srcSizeIdx_
     ///
     /// This dim's position in the SOURCE's view sizes, absent as the authority's `-1`
     /// (`dsc/dsc2.h:822`). Bridge 1's load path searches for the entry whose index equals the
     /// position it is emitting (`SNTransferLowering.cpp:338-341`), so an absent index simply never
     /// matches — and the miss is a live answer there, not a refusal (`:349-370`).
     pub src_size_idx: Option<SizeIdx>,
-    /// Field: e034_TransferNode.dstSizeIdx_
+    /// Field: e046_TransferNode.dstSizeIdx_
     ///
     /// The same position in the DESTINATION's view sizes, read by the store path
     /// (`SNTransferLowering.cpp:344-347`).
@@ -8487,7 +8521,7 @@ impl TransferType {
 /// counts is the whole contract.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransferRepetition {
-    /// Field: e034_TransferNode.srcRep_
+    /// Field: e046_TransferNode.srcRep_
     ///
     /// The source end's count, from `getRepetitionIfExists(transfer_op.getSource())`
     /// (`ddc/ddl/ddl_conversion.cpp:1171-1172`).
@@ -8499,7 +8533,7 @@ pub struct TransferRepetition {
     /// an [`Option`] spells the authority's `-1` sentinel; here it spells storage no writer has
     /// touched, which is why it is not simply `Repetition(1)`.
     pub src: Option<Repetition>,
-    /// Field: e034_TransferNode.dstReps_
+    /// Field: e046_TransferNode.dstReps_
     ///
     /// ⛔ INDEX-PARALLEL WITH [`TransferNode::dst_vias`], NOT KEYED: the minting loop pushes one
     /// entry per `dstVias_.emplace_back()` in the same iteration
@@ -8509,14 +8543,12 @@ pub struct TransferRepetition {
     pub dsts: Vec<Repetition>,
 }
 
-/// Replaces: e034_TransferNode
+/// Replaces: e046_TransferNode
 ///
 /// `dsc/dsc2.h:814-898`. A transfer of one data stage from one source to one or more destinations —
 /// the node bridge 1 lowers into an `agen` load or store. Its minting site is
 /// `ddc/ddl/ddl_conversion.cpp:1166-1195`: a DDL `DataTransferOp` becomes one of these, with one
-/// [`DstVia`] per declared destination. e023_TransferNode is this same class under the superseded
-/// numbering, which listed ten of its fields; those are renumbered onto e034 below, and this batch
-/// adds `repetition_`, `paddingInfo_` and the four `DataInfo` operands.
+/// [`DstVia`] per declared destination.
 ///
 /// ⛔ THIS CARRIES SEVENTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND ITS BASE SUBOBJECT.
 /// `nodeType_`, `name_` and `relevantComps_` arrive through [`base_class`](Self::base_class)
@@ -8559,30 +8591,30 @@ pub struct TransferNode {
     /// `InheritWithClone<ScheduleNode, TransferNode>`), tagged `TRANSFER` by `TransferNode()`
     /// (`:815`). A transfer is a LEAF: it derives from `ScheduleNode` directly and owns no children.
     pub base_class: ScheduleNode,
-    /// Field: e034_TransferNode.src_
+    /// Field: e046_TransferNode.src_
     ///
     /// Where the data comes from (`dsc/dsc2.h:824`), written by `setDataLocAndInfo`
     /// (`ddc/ddl/ddl_conversion.cpp:1169`).
     pub src: DataLocation,
-    /// Field: e034_TransferNode.srcIndirect_
+    /// Field: e046_TransferNode.srcIndirect_
     ///
     /// The location holding the source address when the read is indirect, or
     /// [`DataLocation::UNSET`] when it is direct (`dsc/dsc2.h:824`).
     /// [`is_src_indirect`](Self::is_src_indirect) is the test every reader applies before touching
     /// it (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
     pub src_indirect: DataLocation,
-    /// Field: e034_TransferNode.dstVias_
+    /// Field: e046_TransferNode.dstVias_
     ///
     /// One entry per destination, in the DDL's declaration order (`dsc/dsc2.h:825`,
     /// `ddc/ddl/ddl_conversion.cpp:1175-1190`). Several entries is a multicast; the row-expansion
     /// path rejects several destinations at once (`:1183-1187`).
     pub dst_vias: Vec<DstVia>,
-    /// Field: e034_TransferNode.repetition_
+    /// Field: e046_TransferNode.repetition_
     ///
     /// The DDL allocation's replication for both ends (`dsc/dsc2.h:826-829`) — see
     /// [`TransferRepetition`], which names IBM's unnamed struct.
     pub repetition: TransferRepetition,
-    /// Field: e034_TransferNode.srcLdsAndLoopOffsets_
+    /// Field: e046_TransferNode.srcLdsAndLoopOffsets_
     ///
     /// What the source operand IS and how it is addressed (`dsc/dsc2.h:832`). `setDataLocAndInfo`
     /// fills it from the DDL's source operand (`ddc/ddl/ddl_conversion.cpp:1169`) and
@@ -8593,13 +8625,13 @@ pub struct TransferNode {
     /// (`:832-833`) and `plan.py` takes only the first name of such a declaration, which is why the
     /// two `Indirect` halves were anchored and these two were not.
     pub src_lds_and_loop_offsets: DataInfo,
-    /// Field: e034_TransferNode.srcIndirectLdsAndLoopOffsets_
+    /// Field: e046_TransferNode.srcIndirectLdsAndLoopOffsets_
     ///
     /// The same, for the operand that HOLDS THE SOURCE ADDRESS when the read is indirect
     /// (`dsc/dsc2.h:832`). [`is_src_indirect`](Self::is_src_indirect) is the test every reader applies
     /// before touching it (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:6302-6305`).
     pub src_indirect_lds_and_loop_offsets: DataInfo,
-    /// Field: e034_TransferNode.dstLdsAndLoopOffsets_
+    /// Field: e046_TransferNode.dstLdsAndLoopOffsets_
     ///
     /// One entry per destination (`dsc/dsc2.h:833`).
     ///
@@ -8612,42 +8644,38 @@ pub struct TransferNode {
     /// They are two vectors here because IBM declares two and every writer pushes to them separately;
     /// nothing in the type keeps their lengths equal.
     pub dst_lds_and_loop_offsets: Vec<DataInfo>,
-    /// Field: e034_TransferNode.dstIndirectLdsAndLoopOffsets_
+    /// Field: e046_TransferNode.dstIndirectLdsAndLoopOffsets_
     ///
     /// The operands that hold the destination addresses when the writes are indirect
     /// (`dsc/dsc2.h:833`). ⛔ ITS EMPTINESS IS THE WHOLE OF
     /// [`is_dst_indirect`](Self::is_dst_indirect) (`dsc/dsc2.h:878`).
     pub dst_indirect_lds_and_loop_offsets: Vec<DataInfo>,
-    /// Field: e034_TransferNode.replicationFactor_
+    /// Field: e046_TransferNode.replicationFactor_
     ///
-    /// How many times the loaded chunk is splatted, `1` for no splat (`dsc/dsc2.h:834`). Bridge 1
-    /// multiplies one `agen` access's element count by it, refusing an LXLU splat it cannot express
-    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:963-971`), and divides the
-    /// recorded `OUT` stick and element counts by it (`:727-729`).
-    ///
-    /// ⛔ IT IS THE OTHER HALF OF
-    /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size) AND NOT AN
-    /// INDEPENDENT COUNT — every DDC writer moves magnitude between the two. Read that field's doc
-    /// before reading either alone.
-    pub replication_factor: i32,
-    /// Field: e034_TransferNode.unitTimeTransferChunkSize_
+    /// How many times the loaded chunk is splatted (`dsc/dsc2.h:834`). Bridge 1 multiplies one `agen`
+    /// access's element count by it, refusing an LXLU splat it cannot express
+    /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNTransferLowering.cpp:963-971`), and DIVIDES the
+    /// recorded `OUT` stick and element counts by it UNGUARDED (`:727-729`) — where it guards the
+    /// chunk count with `> 0` on that same product (`:32-38`). See [`ReplicationFactor`].
+    pub replication_factor: ReplicationFactor,
+    /// Field: e046_TransferNode.unitTimeTransferChunkSize_
     ///
     /// "Continuous elements within a stick" (`dsc/dsc2.h:835-836`) — the contiguous dims of one
     /// unit-time transfer, in stick order, each entry's index equal to its own position, minted by
-    /// `e126_populateUnitTimeTransfers` (`ddc/ddcv1.cpp:524-525`).
+    /// `Ddc::populateUnitTimeTransfers` (`ddc/ddcv1.cpp:439`, `:524-525`).
     ///
     /// ⛔ THE EXTENTS ARE NOT THE STICK SIZES AND THIS VECTOR ALONE IS NOT THE LOAD. What bridge 1
     /// reassembles is `Π extents × unitTimeTransferNumChunks_` (`SNTransferLowering.cpp:32-38`)
-    /// `× replicationFactor_` (`:963-965`), and every DDC writer moves magnitude between the extents
-    /// and [`replication_factor`](Self::replication_factor) rather than setting either alone: a
-    /// `do2BSplat` mint pushes extent `1` per dim and the product of the stick sizes into the factor
-    /// (`ddc/ddcv1.cpp:510-525`, `:527-535`), the fp32 fixup hands 4 of it back to entry 0
-    /// (`:544-548`), `e307_exploreAssignDataStages` shrinks each entry IN PLACE to its data-stage
-    /// extent with `replicationFactor_ *= size / dsDim; size = dsDim` (`:1549-1552`), and its
-    /// `reduce2B` tail sets EVERY extent to `1` (`:1669-1677`). ⛔ Both shrinks DISCARD the
-    /// magnitude when `!doSplat` (`:1549`, `:1673`) — there the transfer really did get smaller — so
-    /// the product holds for a splat only. A reader that takes the extents for the stick geometry
-    /// reads a transfer already reduced; one that drops the factor loses the splat.
+    /// `× replicationFactor_` (`:963-965`), and four DDC writers move magnitude between the extents
+    /// and [`replication_factor`](Self::replication_factor): a `do2BSplat` mint pushes extent `1`
+    /// per dim and the product of the stick sizes into the factor (`ddc/ddcv1.cpp:510-525`,
+    /// `:527-535`), the fp32 fixup hands 4 of it back to entry 0 (`:544-548`),
+    /// `exploreAssignDataStages` shrinks each entry IN PLACE with `replicationFactor_ *= size /
+    /// dsDim; size = dsDim` (`:1549-1552`), and its `reduce2B` tail sets EVERY extent to `1`
+    /// (`:1669-1677`) — both shrinks DISCARDING the magnitude when `!doSplat` (`:1549`, `:1673`).
+    /// ⛔ BUT THE PRODUCT IS NOT AN INVARIANT DDC KEEPS: three writers ASSIGN the factor outright,
+    /// two of them with no entry of this vector involved (`:455-457`, `:530`, `:1664-1667`), so
+    /// neither field may be reconstructed from the other. See [`ReplicationFactor`].
     ///
     /// ⛔ NOR IS THE LENGTH ALWAYS THE STICK COUNT, as recorded before: minting stops as soon as
     /// `elemSoFar >= numElemLimit`, dividing the extent it is pushing when it oversteps
@@ -8659,7 +8687,7 @@ pub struct TransferNode {
     /// whose callsite is commented out (`:1649-1650`), which is also why the
     /// `DT_CHECK(uttChunkSize.size() == tensorSizes.size())` at `:1568` is unreachable.
     pub unit_time_transfer_chunk_size: Vec<SizeAndIndex>,
-    /// Field: e034_TransferNode.unitTimeTransferNumChunks_
+    /// Field: e046_TransferNode.unitTimeTransferNumChunks_
     ///
     /// How many chunks one unit-time transfer covers, `1` for a single contiguous chunk
     /// (`dsc/dsc2.h:837`), which bridge 1 multiplies into the element count
@@ -8672,8 +8700,8 @@ pub struct TransferNode {
     /// as [`unit_time_transfer_chunk_stride`](Self::unit_time_transfer_chunk_stride)'s
     /// (`:1649-1650`), so outside the JSON importer (`dsc/dsc2.cpp:1571-1572`) it holds the
     /// initialiser `1` and `loadSize *= unitTimeTransferNumChunks_` at `:1663` multiplies by one.
-    pub unit_time_transfer_num_chunks: i32,
-    /// Field: e034_TransferNode.unitTimeTransferChunkStride_
+    pub unit_time_transfer_num_chunks: UnitTimeChunkCount,
+    /// Field: e046_TransferNode.unitTimeTransferChunkStride_
     ///
     /// The dims the chunks stride over — the entries the hole split removed from
     /// [`unit_time_transfer_chunk_size`](Self::unit_time_transfer_chunk_size), each with its extent
@@ -8687,12 +8715,12 @@ pub struct TransferNode {
     /// It is carried rather than dropped because bridge 1 reads it in seven places (`:930`, `:1270`,
     /// `:1713`, `:1723`, `:2227`, `:2256`, `:2454`) and a JSON-imported tree can carry it.
     pub unit_time_transfer_chunk_stride: Vec<SizeAndIndex>,
-    /// Field: e034_TransferNode.rotateNumElements_
+    /// Field: e046_TransferNode.rotateNumElements_
     ///
     /// How far the LXLU rotates the loaded data, `0` for no rotation (`dsc/dsc2.h:839`). Every
     /// reader guards on `> 0` (`SNTransferLowering.cpp:991`, `:1097`, `:2239`, `:2277`).
-    pub rotate_num_elements: i32,
-    /// Field: e034_TransferNode.coreIdToGTRInfo_
+    pub rotate_num_elements: RotateElements,
+    /// Field: e046_TransferNode.coreIdToGTRInfo_
     ///
     /// The group tag register each core uses for this transfer — L3 only, as the authority's own
     /// comment says (`dsc/dsc2.h:840`). The L3 scheduler writes it one core at a time and refuses to
@@ -8703,7 +8731,7 @@ pub struct TransferNode {
     /// `std::map`'s ascending-core-id order reaches the emitted DSC. [`CoreId`]'s derived [`Ord`] is
     /// that same numeric order over the `int` key `std::stoi` reads back (`dsc/dsc2.cpp:1599`).
     pub core_id_to_gtr_info: BTreeMap<CoreId, GroupTagRegInfo>,
-    /// Field: e034_TransferNode.transferSize_
+    /// Field: e046_TransferNode.transferSize_
     ///
     /// "Explicit transfer size. If filled, use this size rather than derived from data stage"
     /// (`dsc/dsc2.h:841-843`). ⛔ ABSENCE IS THE COMMON CASE AND IS TESTED PER DIM, never for the
@@ -8720,7 +8748,7 @@ pub struct TransferNode {
     /// that enum — would silently reorder emitted JSON, which is why the enum's own discriminant
     /// guard and this container are one decision and not two.
     pub transfer_size: BTreeMap<PrimaryDimTypes, DimSize>,
-    /// Field: e034_TransferNode.paddingInfo_
+    /// Field: e046_TransferNode.paddingInfo_
     ///
     /// "Zero padding sizes in L3 transfers" (`dsc/dsc2.h:844-845`) — what the L3 scheduler builds per
     /// padded dim and end (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5359-5473`) and what
@@ -8735,7 +8763,7 @@ pub struct TransferNode {
     ///
     /// ⛔ AND IT IS WHY THIS TYPE HAS NO `Clone` DERIVE — see [`clone`](Self::clone).
     pub padding_info: TransferPadInfo,
-    /// Field: e034_TransferNode.transferCoordinates_
+    /// Field: e046_TransferNode.transferCoordinates_
     ///
     /// How this transfer's dims are folded (`dsc/dsc2.h:852`). `buildFoldForTransferNode` is the
     /// writer — it copies the allocation's coordinate for each transferred dim and then rebuilds the
@@ -8769,11 +8797,11 @@ impl Default for TransferNode {
             src_indirect_lds_and_loop_offsets: DataInfo::default(),
             dst_lds_and_loop_offsets: Vec::new(),
             dst_indirect_lds_and_loop_offsets: Vec::new(),
-            replication_factor: 1,
+            replication_factor: ReplicationFactor(1),
             unit_time_transfer_chunk_size: Vec::new(),
-            unit_time_transfer_num_chunks: 1,
+            unit_time_transfer_num_chunks: UnitTimeChunkCount(1),
             unit_time_transfer_chunk_stride: Vec::new(),
-            rotate_num_elements: 0,
+            rotate_num_elements: RotateElements(0),
             core_id_to_gtr_info: BTreeMap::new(),
             transfer_size: BTreeMap::new(),
             padding_info: TransferPadInfo::default(),
@@ -8964,15 +8992,34 @@ impl TransferNode {
     }
 }
 
-// crustify:todo: e034_TransferNode.coreletViews_
+// crustify:todo: e046_TransferNode.coreletViews_
 
-// crustify:todo: e034_TransferNode.dstIndirectLoopsAndSizes_
+// crustify:todo: e046_TransferNode.dstIndirectLoopsAndSizes_
 
-// crustify:todo: e034_TransferNode.lastFusableParentLoopDst_
+// crustify:todo: e046_TransferNode.lastFusableParentLoopDst_
 
-// crustify:todo: e034_TransferNode.lastFusableParentLoopSrc_
+// crustify:todo: e046_TransferNode.lastFusableParentLoopSrc_
 
-// crustify:todo: e034_TransferNode.srcIndirectLoopsAndSize_
+// crustify:todo: e046_TransferNode.srcIndirectLoopsAndSize_
+
+/// How many times one transfer's loaded chunk is splatted — `replicationFactor_` (`dsc/dsc2.h:834`,
+/// `int`, `1` for no splat).
+///
+/// ⛔ `0` IS REACHABLE AND IT IS A DIVISOR: `l0PtBwPerSlice / (bits / 8) / loadSize`
+/// (`ddc/ddcv1.cpp:1664-1667`) truncates a `double` quotient into this `int`, so an fp16 48-element
+/// load holds `0` where `SNTransferLowering.cpp:727-729` divides by it unguarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReplicationFactor(pub i32);
+
+/// How many chunks one unit-time transfer covers — `unitTimeTransferNumChunks_`
+/// (`dsc/dsc2.h:837`, `int`, `1` for a single contiguous chunk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnitTimeChunkCount(pub i32);
+
+/// How far the LXLU rotates one transfer's loaded data — `rotateNumElements_` (`dsc/dsc2.h:839`,
+/// `int`, `0` for no rotation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RotateElements(pub i32);
 
 /// How many folds one compute node engages — `numFoldsEngaged` (`dsc/dsc2.h:940`, `int`), filled
 /// from `sysDef.numFoldsPerUnit` (`ddc/ddcv1.cpp:1887`).
@@ -15747,8 +15794,7 @@ mod equivalence {
 // (`V3/SNControlFlowLowering.cpp:470-472`) had no spelling at all. It is
 // [`ScheduleTree::traverse_dfs_of_corelet`], and a method group is closed when every SHAPE lands, not
 // every name. ⚠️ `e042` NAMES TWO ENTITIES IN THIS CAMPAIGN, `e042_LoopDistributionInfo` and
-// `e042_ScheduleTree`, and `e034` names two,
-// `e034_TransferNode` and `e034_LoopNode`; only the name disambiguates them.
+// `e042_ScheduleTree`; only the name disambiguates them.
 //
 // ⛔ AND `e013_DataInfo` IS `e033_DataInfo`, THE SAME CLASS RE-SCHEDULED, WHICH CARRIED NO ANCHOR OF
 // ITS OWN AT ALL until this review: the port mirrored every other dual-generation id onto both

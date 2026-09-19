@@ -1957,7 +1957,7 @@ impl L3DlOpsScheduler {
 mod equivalence {
     use super::*;
     use crate::schedule::dims::PadType;
-    use crate::schedule::dsc2::{ChildNode, InsertionPoint, TransferNode};
+    use crate::schedule::dsc2::{ChildNode, InsertionPoint, ReplicationFactor, TransferNode};
 
     /// e012 `:29-32` — every ordering of three `addCore` calls over slices `0..4`, cores 1, 2 and 3 in
     /// call order, transcribed from a compiled oracle whose class body is the authority's `:24-53`
@@ -2467,7 +2467,7 @@ mod equivalence {
     #[test]
     fn an_external_transfer_owns_the_node_pair_it_adopts() {
         let transfer = TransferNode {
-            replication_factor: 4,
+            replication_factor: ReplicationFactor(4),
             ..TransferNode::default()
         };
         let allocate = AllocateNode {
@@ -2476,7 +2476,7 @@ mod equivalence {
         };
 
         let mut entry = ExternalTransfer::new(Box::new(transfer), Box::new(allocate));
-        assert_eq!(entry.transfer.replication_factor, 4);
+        assert_eq!(entry.transfer.replication_factor, ReplicationFactor(4));
         assert_eq!(entry.allocate.lds_idx, Some(LdsIdx(9)));
         entry.allocate.lds_idx = Some(LdsIdx(11));
 
