@@ -2801,6 +2801,132 @@ mod unit_tests {
         );
     }
 
+    /// ⛔ THE COMMIT TAIL'S OTHER LOOP IS THE ONE THAT WRITES THE PLACED ADDRESS, and until this
+    /// review the type had nowhere to put it. `allocAllMem` builds
+    /// [`start_address_core_corelet`](AllocateNode::start_address_core_corelet)'s fold space
+    /// immediately before the strides above — `[coreFoldProp_, coreletFoldProp_, ..sdscFoldProps_]`,
+    /// every level `Constant` but level 0 promoted to `Map` where the address varies across cores
+    /// and level 1 where it varies across corelets, then `insertData(addr, {core, corelet, 0..})`
+    /// per placed pair, over the zero-dimension state `DT_CHECK(addrFM.hasZeroFoldDim())` demands
+    /// (`ddc/ddcv1.cpp:379-405`, the check at `:388`). Transcribed against the landed
+    /// [`FoldManager`], it runs.
+    #[test]
+    fn the_commit_tail_builds_the_placed_start_address_over_a_fold_manager() {
+        const CORES: [CoreId; 2] = [CoreId(0), CoreId(1)];
+        let placed: BTreeMap<CoreId, BTreeMap<CoreletId, i64>> = BTreeMap::from([
+            (
+                CORES[0],
+                BTreeMap::from([(CoreletId(0), 0x1000), (CoreletId(1), 0x1800)]),
+            ),
+            (
+                CORES[1],
+                BTreeMap::from([(CoreletId(0), 0x2000), (CoreletId(1), 0x2800)]),
+            ),
+        ]);
+        let coord = |core: CoreId, corelet: CoreletId| {
+            // `:397`, `:401-402`: one index per fold dim, zero in every one the loop does not set.
+            [
+                FoldDimIndex(i64::from(core.0)),
+                FoldDimIndex(i64::from(corelet.0)),
+                FoldDimIndex(0),
+            ]
+        };
+
+        let mut node = AllocateNode::default();
+        // `:388`: an UNPLACED region is a zero-dimension manager holding `0`, not an absence.
+        assert!(
+            node.start_address_core_corelet.has_zero_fold_dim(),
+            "`:388`"
+        );
+        assert_eq!(
+            node.start_address_core_corelet
+                .single_data(&BTreeMap::new()),
+            Some(0)
+        );
+
+        // `:379-385`, `:392`, `:394`: core and corelet first, then the SuperDSC's own folds, and
+        // the two levels that vary become `Map`.
+        let props = [
+            FoldDimProp::new(FoldDimSize(CORES.len() as u32), "core"),
+            FoldDimProp::new(FoldDimSize(2), "corelet"),
+            FoldDimProp::new(FoldDimSize(1), "sdsc_0"),
+        ];
+        let types = [BaseFuncType::Map, BaseFuncType::Map, BaseFuncType::Constant];
+        assert_eq!(
+            node.start_address_core_corelet
+                .build_fold_space(&props, &types),
+            Some(())
+        );
+        // `:396-403`: build inner to outer, then one insert per placed pair.
+        for (&core, per_corelet) in &placed {
+            for (&corelet, &addr) in per_corelet {
+                assert_eq!(
+                    node.start_address_core_corelet
+                        .insert_data(addr, &coord(core, corelet)),
+                    Some(())
+                );
+            }
+        }
+
+        // `ddc/ddcv1.cpp:1996-1998` reads the corelet level's KIND back, and `:2001` every pair.
+        assert_eq!(
+            node.start_address_core_corelet.func_type(FoldDimPos(1)),
+            Some(BaseFuncType::Map)
+        );
+        for (&core, per_corelet) in &placed {
+            for (&corelet, &addr) in per_corelet {
+                assert_eq!(
+                    node.start_address_core_corelet
+                        .get_data(&coord(core, corelet)),
+                    Some(addr)
+                );
+            }
+        }
+        assert!(!node.start_address_core_corelet.has_zero_fold_dim());
+
+        // ⛔ THE CONTROL, BECAUSE THE READBACK ABOVE WOULD PASS OVER A COLLAPSED SPACE TOO: the
+        // authority promotes level 0 to `Map` at `:392` only when the address DIFFERS across cores,
+        // and leaving it `Constant` routes every core to one slot, so the last write wins and core 0
+        // answers core 1's address.
+        let mut collapsed = AllocateNode::default();
+        assert_eq!(
+            collapsed.start_address_core_corelet.build_fold_space(
+                &props,
+                &[
+                    BaseFuncType::Constant,
+                    BaseFuncType::Map,
+                    BaseFuncType::Constant
+                ]
+            ),
+            Some(())
+        );
+        for (&core, per_corelet) in &placed {
+            for (&corelet, &addr) in per_corelet {
+                assert_eq!(
+                    collapsed
+                        .start_address_core_corelet
+                        .insert_data(addr, &coord(core, corelet)),
+                    Some(())
+                );
+            }
+        }
+        assert_eq!(
+            collapsed
+                .start_address_core_corelet
+                .get_data(&coord(CORES[0], CoreletId(0))),
+            Some(0x2000),
+            "level 0 `Constant` collapses the cores (`ddc/ddcv1.cpp:392`)"
+        );
+
+        // And the arity is the fold space's, not the caller's: `is_legal` (`:1666-1681`) refuses a
+        // coordinate that drops the SuperDSC level.
+        assert_eq!(
+            node.start_address_core_corelet
+                .get_data(&[FoldDimIndex(0), FoldDimIndex(0)]),
+            None
+        );
+    }
+
     /// `dsc/dsc2.h:47-51`: a fresh constant is INVALID, unnamed and not symbolic. ⛔ ITS FORMAT IS
     /// NOT [`DataFormats::default()`], which is `SEN169_FP16` (`dsc/dsc2.h:934`). ⛔ AND THE
     /// AUTHORITY'S TABLE DOES NOT REFUSE THAT INITIALISER: `INVALID` maps to `-1`
@@ -10867,17 +10993,25 @@ pub struct StickSpread(pub i32);
 /// the L3 scheduler reads its addresses back
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4926-4950`).
 ///
-/// ⛔ THIS CARRIES 17 OF ALLOCATENODE'S 21 FIELDS, so four `e028_AllocateNode` and
-/// `e037_AllocateNode` anchors below stay open. Three are schedule-node pointer identity, e013's
-/// `name_` and the tree it hangs on: `tempStorageForCompute_` (`:978`), the `ComputeNode` whose
-/// temporary this region is; `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of an
-/// indirect access; and `allocUsers_` (`:1007`), the reference-counted list of nodes that read or
-/// write the region. All three serialize by node name and re-resolve through `nodeNamePtrMap`
-/// (`dsc/dsc2.cpp:840-843`, `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`). The
-/// fourth is `startAddressCoreCorelet_` (`:985-986`), a `FoldManager<int64_t>`; ⭐ THAT TYPE HAS
-/// SINCE LANDED as e026_FoldManager (`src/schedule/fold.rs`), so it is open work rather than blocked
-/// work, as are the two coordinates' own former blockers — `allocateCoordinates_` and
-/// `sliceViewCoordinates_` (`:1008-1009`) are CARRIED below.
+/// ⛔ THIS CARRIES 18 OF ALLOCATENODE'S 21 FIELDS, so three `e028_AllocateNode` and
+/// `e037_AllocateNode` anchors below stay open, and ALL THREE are schedule-node pointer identity,
+/// e013's `name_` and the tree it hangs on: `tempStorageForCompute_` (`:978`), the `ComputeNode`
+/// whose temporary this region is; `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of
+/// an indirect access; and `allocUsers_` (`:1007`), the reference-counted list of nodes that read
+/// or write the region. All three serialize by node name and re-resolve through `nodeNamePtrMap`
+/// (`dsc/dsc2.cpp:840-843`, `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`).
+///
+/// ⛔ THE FOURTH WAS NEVER BLOCKED, AND THIS REVIEW CARRIES IT rather than leaving the type anchor
+/// resting on it: `startAddressCoreCorelet_` (`:985-986`) is a `FoldManager<int64_t>`, and
+/// e026_FoldManager has landed (`src/schedule/fold.rs`) with every operation the field's in-scope
+/// sites use — `buildFoldSpace`, `insertData`, `getSingleData`, `getDataAndFoldCoordinates`,
+/// `getFuncType`, `clone` and `rebuildDim`. It is THE PLACED ADDRESS, the one output this campaign
+/// exists to produce, and its writers and readers were already cited field by field two screens
+/// below (`ddc/ddcv1.cpp:396-405` on [`buffer_offset_core_corelet`](Self::buffer_offset_core_corelet))
+/// while the field itself had nowhere to land. See
+/// [`start_address_core_corelet`](Self::start_address_core_corelet). The two coordinates' own
+/// former blockers were the same type — `allocateCoordinates_` and `sliceViewCoordinates_`
+/// (`:1008-1009`) are CARRIED below.
 ///
 /// ⛔ NAME IDENTITY WOULD NOT SUBSTITUTE FOR THE POINTER IN `allocUsers_`, and one pass proves it:
 /// `cloneComputeForOffsetAdjustment` pushes a `clone()`d compute straight onto the list
@@ -11048,6 +11182,33 @@ pub struct AllocateNode {
     /// ⚠️ E037 LISTED NO ANCHOR FOR IT, nor for [`back_gap_core`](Self::back_gap_core), though e028
     /// listed both.
     pub num_buffers: NumBuffers,
+    /// The region's PLACED START ADDRESS, per core, per corelet and per SuperDSC fold — the
+    /// authority's own "per core, corelet, and sdsc folds" (`dsc/dsc2.h:985-986`), a
+    /// `FoldManager<int64_t>`.
+    ///
+    /// ⛔ ONLY `allocAllMem`'S COMMIT TAIL BUILDS IT, AND THE SHAPE IS FIXED:
+    /// `[coreFoldProp_, coreletFoldProp_, ..sdscFoldProps_]`, every level `Constant` except that
+    /// level 0 becomes `Map` when the address differs across cores and level 1 when it differs
+    /// across corelets, followed by one `insertData(addr, {core, corelet, 0..})` per placed pair
+    /// (`ddc/ddcv1.cpp:379-405`). `DT_CHECK(addrFM.hasZeroFoldDim())` (`:388`) is the precondition
+    /// that it is built exactly once; see [`FoldManager::has_zero_fold_dim`]. Pinned by
+    /// `the_commit_tail_builds_the_placed_start_address_over_a_fold_manager`.
+    ///
+    /// ⛔ SO AN UNPLACED REGION IS A ZERO-DIMENSION MANAGER HOLDING `0`, NOT AN ABSENCE, and that is
+    /// what its readers guard against by demanding the built shape instead of a sentinel:
+    /// `getFuncType(1) == Map` before the corelet offsets are folded in
+    /// (`ddc/ddcv1.cpp:1996-1998`), and `getDimProp().at(1).second` before a corelet split rebuilds
+    /// the level (`dbo/src/Utils/sdsc_bundle/SdscCoreletSplit.cpp:266-268`).
+    ///
+    /// ⛔ [`is_start_addr_symbolic`](Self::is_start_addr_symbolic) SAYS WHAT THE PAYLOAD MEANS: a
+    /// symbolic allocation carries a negative symbol id here rather than an address, which is why
+    /// the indirect path `DT_CHECK`s that flag clear before reading one
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:5882`).
+    ///
+    /// ⚠️ NEITHER WAVE'S SCHEDULER LISTED AN ANCHOR FOR IT — the declaration wraps onto a second
+    /// line — so it is carried under the type anchor, like
+    /// [`ignore_symbolic_volume_limits`](Self::ignore_symbolic_volume_limits) below.
+    pub start_address_core_corelet: FoldManager<i64>,
     /// Field: e028_AllocateNode.isStartAddrSymbolic_
     ///
     /// Field: e037_AllocateNode.isStartAddrSymbolic_
@@ -11223,6 +11384,7 @@ impl Default for AllocateNode {
             padding: PaddingFormType::default(),
             layout_dim_order: Vec::new(),
             num_buffers: NumBuffers(1),
+            start_address_core_corelet: FoldManager::<i64>::new(),
             is_start_addr_symbolic: false,
             buffer_offset_core_corelet: BTreeMap::new(),
             back_gap_core: BTreeMap::new(),
@@ -15701,14 +15863,30 @@ mod equivalence {
 
 // ⛔ e003_AllocateNode'S TWO OPEN FIELD ANCHORS ARE e028_'S AND e037_'S: `allocUsers_`
 // (`dsc/dsc2.h:1007`) and `tempStorageForCompute_` (`:978`) are schedule-node pointer identity. The
-// TYPE anchor stays open with them, with the five methods that operate on that list, and with the two
-// uncarried members this generation's scan does not name at all — `startAddressCoreCorelet_`
-// (`:985-986`) and `relatedIndirectAccessAlloc_` (`:999-1001`).
+// TYPE anchor stays open with them, with the five methods that operate on that list, and with ONE
+// uncarried member this generation's scan does not name at all — `relatedIndirectAccessAlloc_`
+// (`:999-1001`), which `getPageSize` already takes as a parameter.
+//
+// ⛔ THE FOURTH REASON THIS ANCHOR USED TO REST ON IS GONE, AND IT WAS NEVER A BLOCKER. The earlier
+// generation of this note also named `startAddressCoreCorelet_` (`:985-986`) as uncarried, while the
+// type's own doc one screen away said of that same field "⭐ THAT TYPE HAS SINCE LANDED as
+// e026_FoldManager (`src/schedule/fold.rs`), so it is open work rather than blocked work" — so the
+// crate held the anchor open on a field it had already recorded as unblocked, and did so around THE
+// PLACED ADDRESS, the one output this campaign's own manifest names as its acceptance criterion
+// ("Our emitted views have printed `start_address = 0` where the reference states a placed base").
+// Nothing enforced the difference between "open" and "blocked", which is the same failure mode as a
+// carried field with no writer. It is now CARRIED as a `FoldManager<i64>`, the payload
+// `CoordinateType::coordinates` already uses, and every operation its in-scope sites need landed with
+// e026: `buildFoldSpace`, `insertData`, `getSingleData`, `getDataAndFoldCoordinates`, `getFuncType`,
+// `assign` and `rebuildDim`. `ddc/ddcv1.cpp` alone reaches it at `:352`, `:386-405`, `:1737-1738`,
+// `:1996-2011`, `:2241-2247`, `:2388`, `:3373` and `:3390`, and `ddc/ddc_transformation.cpp` at
+// `:1318-1342`.
 //
 // ⚠️ THAT SCAN NAMES 15 OF THE CLASS'S 21 MEMBERS, plus its 4 static string maps. All six it omits —
-// the two above and `numBuffers_` (`:984`), `backGapCore_` (`:989`), `ignoreSymbolicVolumeLimits_`
-// (`:1002-1003`) and `nonUnifiedAllocInHBM_` (`:1004-1005`), the last four CARRIED above — either
-// carry a trailing `//` comment or wrap onto a second line; e028_'s own scan did name two of them.
+// `relatedIndirectAccessAlloc_` and `startAddressCoreCorelet_` above, plus `numBuffers_` (`:984`),
+// `backGapCore_` (`:989`), `ignoreSymbolicVolumeLimits_` (`:1002-1003`) and `nonUnifiedAllocInHBM_`
+// (`:1004-1005`) — either carry a trailing `//` comment or wrap onto a second line, and FIVE OF THE
+// SIX are now CARRIED above; e028_'s own scan did name two of them.
 
 // crustify:todo: e003_AllocateNode
 
