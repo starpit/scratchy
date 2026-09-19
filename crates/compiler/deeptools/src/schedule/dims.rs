@@ -599,6 +599,7 @@ impl DimDensity {
 pub struct SymbolicVolume(pub i32);
 
 /// Replaces: e012_DataStructDims
+/// Replaces: e015_DataStructDims
 ///
 /// `dsc/dims.h:158-303`. Every dimension of one data structure or op: the primary dims, the derived
 /// halves they compound from, which of them are symbolic and at what granularity, how each is split
@@ -609,36 +610,45 @@ pub struct SymbolicVolume(pub i32);
 #[derive(Clone, Debug, Default)]
 pub struct DataStructDims {
     /// Field: e012_DataStructDims.name_
+    /// Field: e015_DataStructDims.name_
     pub name: String,
     /// Field: e012_DataStructDims.in_
+    /// Field: e015_DataStructDims.in_
     ///
     /// Input features (or channels).
     pub r#in: Option<DimSize>,
     /// Field: e012_DataStructDims.out_
+    /// Field: e015_DataStructDims.out_
     ///
     /// Output features (or channels).
     pub out: Option<DimSize>,
     /// Field: e012_DataStructDims.mb_
+    /// Field: e015_DataStructDims.mb_
     ///
     /// Minibatch size.
     pub mb: Option<DimSize>,
     /// Field: e012_DataStructDims.ij_
+    /// Field: e015_DataStructDims.ij_
     ///
     /// Output image dimensions (rows/cols) — `compound` writes it from `i_` and `j_`.
     pub ij: Option<DimSize>,
     /// Field: e012_DataStructDims.rc_
+    /// Field: e015_DataStructDims.rc_
     ///
     /// Input image (rows/cols) with zero padding — `compound` writes it from `r_` and `c_`.
     pub rc: Option<DimSize>,
     /// Field: e012_DataStructDims.kij_
+    /// Field: e015_DataStructDims.kij_
     ///
     /// Kernel dimensions (rows/cols) — `compound` writes it from `ki_` and `kj_`.
     pub kij: Option<DimSize>,
     /// Field: e012_DataStructDims.y_
+    /// Field: e015_DataStructDims.y_
     ///
     /// A kernel reuse dimension (e.g. timestep).
     pub y: Option<DimSize>,
     /// Field: e012_DataStructDims.x_
+    /// Field: e015_DataStructDims.x_
     ///
     /// A repeat dim that does not add reuse (e.g. attention heads).
     pub x: Option<DimSize>,
@@ -647,73 +657,90 @@ pub struct DataStructDims {
     /// A second repeat dim that does not add reuse.
     pub x1: Option<DimSize>,
     /// Field: e012_DataStructDims.sij_
+    /// Field: e015_DataStructDims.sij_
     ///
     /// Stride dimensions (rows/cols). To be removed in future (`dsc/dims.h:174-176`).
     pub sij: Option<DimSize>,
     /// Field: e012_DataStructDims.zij_
+    /// Field: e015_DataStructDims.zij_
     ///
     /// Zero pad dimensions (rows/cols). To be removed in future (`dsc/dims.h:174-176`).
     pub zij: Option<DimSize>,
     /// Field: e012_DataStructDims.i_
+    /// Field: e015_DataStructDims.i_
     ///
     /// Output image rows.
     pub i: Option<DimSize>,
     /// Field: e012_DataStructDims.j_
+    /// Field: e015_DataStructDims.j_
     ///
     /// Output image cols.
     pub j: Option<DimSize>,
     /// Field: e012_DataStructDims.r_
+    /// Field: e015_DataStructDims.r_
     ///
     /// Input image rows with zero padding.
     pub r: Option<DimSize>,
     /// Field: e012_DataStructDims.c_
+    /// Field: e015_DataStructDims.c_
     ///
     /// Input image cols with zero padding.
     pub c: Option<DimSize>,
     /// Field: e012_DataStructDims.ki_
+    /// Field: e015_DataStructDims.ki_
     ///
     /// Kernel rows.
     pub ki: Option<DimSize>,
     /// Field: e012_DataStructDims.kj_
+    /// Field: e015_DataStructDims.kj_
     ///
     /// Kernel cols.
     pub kj: Option<DimSize>,
     /// Field: e012_DataStructDims.si_
+    /// Field: e015_DataStructDims.si_
     ///
     /// Stride along rows.
     pub si: Option<DimSize>,
     /// Field: e012_DataStructDims.sj_
+    /// Field: e015_DataStructDims.sj_
     ///
     /// Stride along cols.
     pub sj: Option<DimSize>,
     /// Field: e012_DataStructDims.zi_
+    /// Field: e015_DataStructDims.zi_
     ///
     /// Zero pad rows, at each side: top and bottom (`dsc/dims.h:187-193`).
     pub zi: Option<DimSize>,
     /// Field: e012_DataStructDims.zj_
+    /// Field: e015_DataStructDims.zj_
     ///
     /// Zero pad cols, at each side: left and right (`dsc/dims.h:187-193`).
     pub zj: Option<DimSize>,
     /// Field: e012_DataStructDims.symbolicDimInfo_
+    /// Field: e015_DataStructDims.symbolicDimInfo_
     ///
     /// The max and granularity of each symbolic dim. Presence here IS symbolic-ness, and when a dim
     /// is symbolic its main size above is set to the max (`dsc/dims.h:195-197`).
     pub symbolic_dim_info: BTreeMap<PrimaryDimTypes, SymbolicDimInfo>,
     /// Field: e012_DataStructDims.maxSymbolicVolume_
+    /// Field: e015_DataStructDims.maxSymbolicVolume_
     ///
     /// A joint limit over several symbolic dims, usually below the product of their maxes.
     pub max_symbolic_volume: BTreeMap<BTreeSet<PrimaryDimTypes>, SymbolicVolume>,
     /// Field: e012_DataStructDims.coreletSplit_
+    /// Field: e015_DataStructDims.coreletSplit_
     ///
     /// For each split dim, the amount of work per corelet, indexed by corelet id
     /// (`dsc/dims.cpp:633`).
     pub corelet_split: BTreeMap<PrimaryDimTypes, Vec<DimVal>>,
     /// Field: e012_DataStructDims.rowSplit_
+    /// Field: e015_DataStructDims.rowSplit_
     ///
     /// For each split dim and corelet, the amount of work per PT row, indexed by row id
     /// (`dsc/dims.cpp:669`).
     pub row_split: BTreeMap<PrimaryDimTypes, BTreeMap<CoreletId, Vec<DimVal>>>,
     /// Field: e012_DataStructDims.peSfpSplit_
+    /// Field: e015_DataStructDims.peSfpSplit_
     ///
     /// For each split dim and corelet, the amount of work for PE and for SFP.
     ///
@@ -722,6 +749,7 @@ pub struct DataStructDims {
     pub pe_sfp_split:
         BTreeMap<PrimaryDimTypes, BTreeMap<CoreletId, BTreeMap<SenComponent, DimVal>>>,
     /// Field: e012_DataStructDims.paddingSizes_
+    /// Field: e015_DataStructDims.paddingSizes_
     ///
     /// For each primary dim that has a padded version, everything contributing to that padded size.
     pub padding_sizes: BTreeMap<PrimaryDimTypes, DimPaddingSizes>,
@@ -982,7 +1010,14 @@ impl DataStructDims {
     /// `unordered_map` (`dsc/dims.h:212-214`), and a compiled authority emits `{"sfp", "pe"}` for
     /// one corelet and `{"pe", "sfp"}` for the next in the same object with the same two keys.
     /// ⛔ AN ABSENT `totalSize_` PRINTS `-1`, which is what IBM prints when the dim is unfilled
-    /// (`dsc/dims.cpp:567-568`); where IBM instead `DT_ERROR`s there is no JSON to compare with.
+    /// (`dsc/dims.cpp:567-568`). Where IBM instead `DT_ERROR`s there is no document to compare
+    /// with: it streams into the caller's `ostream` and throws part-way, and a compiled authority
+    /// asked for a `windowDim_` whose dim is unfilled leaves the stream truncated at exactly
+    /// `"totalSize_" : ` with no closing brace.
+    /// ⛔ `importJsonObj` (`dsc/dims.h:265`, `dsc/dims.cpp:311-435`) HAS NO COUNTERPART HERE. It is
+    /// a `json11::Json` reader and this crate has no JSON reader at all, the same reason
+    /// `FoldDimProp::importFromJson` and `dsc_import_json` are unported (`schedule/fold.rs:40`,
+    /// `schedule/dsc2.rs:4219`). It is the one method of this class that is deliberately absent.
     pub fn export_json(&self, skip_deprecated_fields: bool) -> String {
         let mut json = format!("{{\"name_\" : \"{}\", ", self.name);
         for (key, dim) in [
@@ -1295,8 +1330,14 @@ impl DataStructDims {
     /// A split size stated as a max, rescaled to the granularity (`dsc/dims.cpp:618-629`). A dim
     /// that is not symbolic keeps its value.
     ///
-    /// ⛔ ABSENT IS IBM'S TWO `DT_CHECK`s plus the division it does not guard: the max must be a
-    /// whole number of granules, the ratio must be non-zero, and the value must divide by it.
+    /// ⛔ TWO OF THESE THREE REFUSALS ARE IBM'S AND THE FIRST IS NOT.
+    /// `DT_CHECK(maxSize_ % granularity_ == 0)` and `DT_CHECK(factor != 0 && val % factor == 0)`
+    /// (`dsc/dims.cpp:623`, `:626`) are the max being a whole number of granules and the value
+    /// dividing by the ratio. A ZERO GRANULARITY IS CHECKED NOWHERE: it is the divisor of the first
+    /// `DT_CHECK`'s own `%`, so IBM divides by zero evaluating that argument and never reaches any
+    /// check. Measured on the compiled authority, a `getSymbolicGranularity` read of a dim carrying
+    /// `SymbolicDimInfo { max_size: 64, granularity: 0 }`: `runtime error: division by zero` at
+    /// `dsc/dims.cpp:623`, aborting under `-fsanitize=undefined`, where this port answers absent.
     fn scale_from_max_to_granularity(&self, d: PrimaryDimTypes, val: DimVal) -> Option<DimVal> {
         let Some(info) = self.symbolic_dim_info.get(&d) else {
             return Some(val);
@@ -1458,6 +1499,10 @@ impl DataStructDims {
     /// ⛔ ABSENT IS IBM'S TWO `DT_CHECK`s — the reference must know the dim, and the limit must
     /// divide by its granularity — and NOTHING IS WRITTEN in that case, where IBM has already
     /// erased the entries it visited.
+    /// ⛔ THE ZERO-GRANULARITY REFUSAL IS THIS PORT'S AND NOT IBM'S, the same unchecked divisor
+    /// `scale_from_max_to_granularity` records: at `dsc/dims.cpp:748` the granularity read from
+    /// `ref_dstg` divides the limit inside a `DT_CHECK` argument, measured as `runtime error:
+    /// division by zero`.
     #[must_use]
     pub fn prune_max_symbolic_volumes(&mut self, ref_dstg: &Self) -> Option<()> {
         let mut pruned = self.max_symbolic_volume.clone();
@@ -1549,6 +1594,10 @@ impl DataStructDims {
     /// the dim is unfilled, which a ratio of one carries straight back (`dsc/dims.cpp:787-792`).
     /// ⛔ ABSENT IS IBM'S `DT_CHECK`s: max a whole number of granules, ratio non-zero, and every
     /// value divisible by it. Nothing is written in that case.
+    /// ⛔ THE ZERO-GRANULARITY REFUSAL IS THIS PORT'S AND NOT IBM'S: `dsc/dims.cpp:784` is the same
+    /// `maxSize_ % granularity_` standing inside a `DT_CHECK` argument, so a zero granularity
+    /// divides by zero before the check is reached — measured as `runtime error: division by zero`.
+    /// See `scale_from_max_to_granularity`.
     #[must_use]
     pub fn make_dim_not_symbolic(&mut self, dim: PrimaryDimTypes) -> Option<()> {
         let Some(info) = self.symbolic_dim_info.get(&dim).copied() else {
@@ -2123,10 +2172,10 @@ mod unit_tests {
     /// The DGP line is sixteen dims at `std::ostream`'s six significant digits, an empty object
     /// writes nothing, and `read` takes them back and recompounds.
     ///
-    /// ⛔ THE EIGHT REFUSED TOKENS ARE MEASURED AGAINST A COMPILED AUTHORITY, and it agrees on only
-    /// three: `abc`, `-` and `1e400` terminate it, while `-5`, `nan` and `inf` are stored and
-    /// written straight back and `std::stod` reads `5abc` as 5 and `0x10` as 16. The first three of
-    /// those five are what this port used to take and silently rewrite as an unfilled dim.
+    /// ⛔ THIS PORT REFUSES EIGHT TOKENS; THE COMPILED AUTHORITY REFUSES THREE OF THEM. The two
+    /// groups are asserted separately on purpose. One loop over all eight reads as agreement, and
+    /// the `empty()` it asserted afterwards is the NEGATION of what the authority leaves behind on
+    /// the five it takes — measured `empty=0` and a full sixteen-dim line written back.
     #[test]
     fn write_states_sixteen_dims_and_read_takes_them_back() {
         let mut text = String::new();
@@ -2148,17 +2197,48 @@ mod unit_tests {
         let mut read_back = DataStructDims::default();
         assert_eq!(read_back.read(&mut line.split_whitespace()), Some(()));
         assert_eq!(read_back, source, "the compound dims are recomputed");
+
         const REST: &str = " 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1";
-        for token in ["abc", "-", "1e400", "-5", "nan", "inf", "5abc", "0x10"] {
+
+        // `std::stod` throws on these three, so the authority's `read` terminates with the object
+        // its own `clear()` left (`dsc/dims.cpp:126-130`): measured `threw=1 empty=1 write=[]`.
+        for token in ["abc", "-", "1e400"] {
             let line = format!("{token}{REST}");
             let mut refused = DataStructDims::default();
             assert_eq!(refused.read(&mut line.split_whitespace()), None, "{token}");
             assert!(refused.empty(), "{token} left nothing behind");
         }
-        assert_eq!(
-            DataStructDims::default().read(&mut "1 2 3".split_whitespace()),
-            None,
-            "a short line is sixteen tokens short of one"
+
+        // ⛔ A DELIBERATE NARROWING, NOT AGREEMENT. The authority takes all five, and the line its
+        // `write` then emits is transcribed beside each — `-5` and the non-finites as themselves,
+        // `5abc` as 5 and `0x10` as 16, because `std::stod` takes a leading prefix and hex. This
+        // port takes only `-1` or a finite non-negative size, so it refuses the token and, under
+        // `read`'s all-or-nothing rule, writes nothing at all where the authority writes a line.
+        for (token, authority_writes) in [
+            ("-5", "-5"),
+            ("nan", "nan"),
+            ("inf", "inf"),
+            ("5abc", "5"),
+            ("0x10", "16"),
+        ] {
+            let line = format!("{token}{REST}");
+            let mut narrowed = DataStructDims::default();
+            assert_eq!(narrowed.read(&mut line.split_whitespace()), None, "{token}");
+            let mut back = String::new();
+            narrowed.write(&mut back);
+            assert!(
+                back.is_empty(),
+                "{token}: the authority writes `{authority_writes}{REST}`, this port writes nothing"
+            );
+        }
+
+        // A short line: the authority half-reads it and keeps the three tokens that did parse
+        // (measured `threw=1 empty=0`), where this port leaves the object untouched.
+        let mut short = DataStructDims::default();
+        assert_eq!(short.read(&mut "1 2 3".split_whitespace()), None);
+        assert!(
+            short.empty(),
+            "nothing is written unless every token parses"
         );
     }
 
@@ -2778,6 +2858,98 @@ mod unit_tests {
             indivisible.symbolic_dim_info.contains_key(&D::Out),
             "nothing was written"
         );
+    }
+
+    /// ⛔ A ZERO GRANULARITY IS NOT ONE OF IBM'S `DT_CHECK`s, IT IS THE DIVISOR OF ONE. All three
+    /// sites that scale by `maxSize_ / granularity_` open with `DT_CHECK(maxSize_ % granularity_
+    /// == 0)` or the equivalent, so a zero granularity divides by zero while the check's own
+    /// argument is being evaluated and no check is ever reached. Measured on the compiled authority
+    /// under `-fsanitize=undefined -fno-sanitize-recover=all`, each aborting with
+    /// `runtime error: division by zero`:
+    ///
+    /// | reached through | authority | Rust |
+    /// |---|---|---|
+    /// | `scaleFromMaxToGranularity` | `dsc/dims.cpp:623` | absent |
+    /// | `pruneMaxSymbolicVolumes` | `dsc/dims.cpp:748` | absent |
+    /// | `makeDimNotSymbolic` | `dsc/dims.cpp:784` | absent |
+    ///
+    /// All three take the granularity from a `SymbolicDimInfo` whose two fields are plain `i32`s
+    /// defaulting to `-1`, so zero is representable and this refusal cannot move to construction.
+    #[test]
+    fn a_zero_granularity_is_refused_at_all_three_scaling_sites() {
+        let zero = SymbolicDimInfo {
+            max_size: 64,
+            granularity: 0,
+        };
+
+        // `dsc/dims.cpp:623`, reached through the corelet view asking for the granularity.
+        let mut scaled = DataStructDims::default();
+        scaled.y = size(64.0);
+        scaled.compound();
+        scaled.symbolic_dim_info.insert(D::Y, zero);
+        scaled
+            .corelet_split
+            .insert(D::Y, vec![DimVal(32), DimVal(32)]);
+        assert_eq!(
+            scaled.primary_dim_to_val_for_component(
+                D::Y,
+                SenComponent::NoComponent,
+                None,
+                Some(CoreletId(0)),
+                &PaddingFormType::default(),
+                DimDensity::FULL,
+                true,
+            ),
+            None
+        );
+
+        // `dsc/dims.cpp:748`, where the granularity comes from the reference object.
+        let mut reference = DataStructDims::default();
+        reference.symbolic_dim_info.insert(D::Mb, zero);
+        reference.symbolic_dim_info.insert(
+            D::Y,
+            SymbolicDimInfo {
+                max_size: 8,
+                granularity: 8,
+            },
+        );
+        let mut pruned = DataStructDims::default();
+        pruned.symbolic_dim_info.insert(
+            D::Y,
+            SymbolicDimInfo {
+                max_size: 8,
+                granularity: 8,
+            },
+        );
+        pruned
+            .max_symbolic_volume
+            .insert(BTreeSet::from([D::Mb, D::Y]), SymbolicVolume(2048));
+        let before = pruned.clone();
+        assert_eq!(pruned.prune_max_symbolic_volumes(&reference), None);
+        assert_eq!(pruned, before, "nothing was written");
+
+        // `dsc/dims.cpp:784`, on the object's own entry.
+        let mut concrete = DataStructDims::default();
+        concrete.y = size(64.0);
+        concrete.compound();
+        concrete.symbolic_dim_info.insert(D::Y, zero);
+        let before = concrete.clone();
+        assert_eq!(concrete.make_dim_not_symbolic(D::Y), None);
+        assert_eq!(concrete, before, "nothing was written");
+
+        // A granularity that does divide the max still reaches the two checks that ARE IBM's.
+        let mut divides = DataStructDims::default();
+        divides.y = size(64.0);
+        divides.compound();
+        divides.symbolic_dim_info.insert(
+            D::Y,
+            SymbolicDimInfo {
+                max_size: 64,
+                granularity: 16,
+            },
+        );
+        assert_eq!(divides.make_dim_not_symbolic(D::Y), Some(()));
+        assert_eq!(divides.y, size(16.0), "64 scaled down by a ratio of four");
     }
 
     /// `operator==` (`dsc/dims.cpp:832-835`) compares dim and kind, and `std::hash` keys an
