@@ -8,7 +8,8 @@ use crate::schedule::ddc::{ExPhase, Verbosity};
 use crate::schedule::dims::{DimDensity, PaddingFormType, PrimaryDimTypes};
 use crate::schedule::dsc::DesignSpaceConfig;
 use crate::schedule::dsc2::{
-    AllocateNode, DataStageId, GroupId, IndirectAllocType, LdsIdx, SyncNode, TransferNode,
+    AllocateNode, DataStageId, GroupId, IndirectAllocType, LdsIdx, ScheduleTree, SyncNode,
+    TransferNode,
 };
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1515,11 +1516,59 @@ impl L3DlOpsScheduler {
         }
     }
 }
+
+/// Replaces: e029g6_L3DlOpsScheduler_verify
+///
+/// `:504-505`. The scheduler's two self-checks, each a `DT_CHECK_MSG` at its one call site
+/// (`.cpp:4607`, `:8030`). ⭐ ASSOCIATED FUNCTIONS: the one field either reads is `verbose`, and only
+/// to gate a `std::cout` naming the offender (`.cpp:6374`, `:6397`) — a diagnostic does not go to a
+/// stream in this crate (cf. [`print_fold_params`](crate::schedule::ddc::print_fold_params)), so no
+/// `self` supplies anything and the `bool` is the whole result.
+/// ⚠️ NO RUST CALLER YET: `run` is `e029g7`'s open anchor and `buildLoopOrder` has no unit.
+impl L3DlOpsScheduler {
+    /// Replaces: e029g6_L3DlOpsScheduler_verify.verifyLoopOrder
+    ///
+    /// `.cpp:6366-6383`. Does the loop order name each dimension at most once?
+    /// ⛔ UNFALSIFIABLE ON ITS ONE PRODUCER: `buildLoopOrder`'s `pushBackToLoopOrder` erases the dim
+    /// from `remainingDims` (`.cpp:4386-4389`) and all ten push sites are guarded by
+    /// `remainingDims.count(dim)`, so what it verifies at `.cpp:4607` cannot repeat one and the later
+    /// `std::swap` (`.cpp:4590`) only permutes it. ⛔ AN EMPTY ORDER VERIFIES: non-emptiness is
+    /// `createChunkLoopNodes`'s separate check (`.cpp:4615`), deliberately not folded in here.
+    pub fn verify_loop_order(loop_order: &[PrimaryDimTypes]) -> bool {
+        // `.cpp:6371-6380`, short-circuiting where the authority carries on to print every later
+        // repeat — the same verdict once the print is gone.
+        let mut visited_dims = BTreeSet::new();
+        loop_order.iter().all(|dim| visited_dims.insert(*dim))
+    }
+
+    /// Replaces: e029g6_L3DlOpsScheduler_verify.verifyScheduleTree
+    ///
+    /// `.cpp:6385-6406`. A non-empty tree whose nodes all have distinct names.
+    /// ⛔ IT AUDITS L3'S OWN MINTING: the uniquifier appending `__1`/`__2` runs in `Ddc::run_v1`
+    /// (`dsc/dsc2.cpp:2982-2991`, `ddc/ddcv1.cpp:3790`), which `runDdc` calls AFTER `l3_scheduler.run`
+    /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-42`), so two default-empty `name_`s
+    /// (`dsc/dsc2.h:461`) collide here. ⛔ IT TAKES THE TREE, NOT THE `DesignSpaceConfig`:
+    /// `scheduleTree_` is its only member read and `e027`'s anchor for it is open (`dsc.rs:2121`).
+    pub fn verify_schedule_tree(schedule_tree: &ScheduleTree) -> bool {
+        // `.cpp:6386`.
+        if schedule_tree.is_empty() {
+            return false;
+        }
+        // `.cpp:6388-6389`, `traverseTreeDFS()` with every default: no start node, no node-type
+        // filter and `comp = ALL` (`dsc/dsc2.h:638-641`).
+        let mut all_names = BTreeSet::new();
+        schedule_tree
+            .traverse_dfs(&[], SenComponent::All)
+            .into_iter()
+            .all(|node| all_names.insert(node.base().name.as_str()))
+    }
+}
+
 #[cfg(test)]
 mod equivalence {
     use super::*;
     use crate::schedule::dims::PadType;
-    use crate::schedule::dsc2::TransferNode;
+    use crate::schedule::dsc2::{ChildNode, InsertionPoint, TransferNode};
 
     /// `:63-73` against both real construction sites — `{executionStep}` and `{0}`
     /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:31`, `L3DlOpsScheduler_standalone.cpp:192`).
@@ -2173,6 +2222,65 @@ mod equivalence {
             metadata.chunk_dstgid,
             Some(L3DlOpsScheduler::DATA_STAGE_CHUNK_IDX),
             "`.cpp:6421`"
+        );
+    }
+
+    /// `.cpp:6366-6383` on the three orders its one caller can hand it (`.cpp:4607`): the distinct
+    /// one `buildLoopOrder` produces, a repeat, and the empty vector that verifies.
+    #[test]
+    fn a_loop_order_verifies_exactly_when_no_dimension_repeats() {
+        assert!(
+            L3DlOpsScheduler::verify_loop_order(&[]),
+            "nothing repeats in an empty order, and non-emptiness is `.cpp:4615`'s check"
+        );
+        assert!(L3DlOpsScheduler::verify_loop_order(&[
+            PrimaryDimTypes::X,
+            PrimaryDimTypes::Y,
+            PrimaryDimTypes::In,
+        ]));
+        assert!(
+            !L3DlOpsScheduler::verify_loop_order(&[
+                PrimaryDimTypes::X,
+                PrimaryDimTypes::Y,
+                PrimaryDimTypes::X,
+            ]),
+            "`isGood = false` at `.cpp:6378`"
+        );
+    }
+
+    /// `.cpp:6385-6406`: the empty tree's `false` (`:6386`), two distinctly named children, and the
+    /// collision L3's own minting has to avoid before the DDC's uniquifier ever runs.
+    #[test]
+    fn a_schedule_tree_verifies_only_when_non_empty_with_distinct_node_names() {
+        let mut tree = ScheduleTree::default();
+        assert!(
+            !L3DlOpsScheduler::verify_schedule_tree(&tree),
+            "a root with no children is `.cpp:6386`, and `isDSC2()` is the same reading"
+        );
+
+        let push = |tree: &mut ScheduleTree, name: &str| {
+            let node = ChildNode::Sync(L3DlOpsScheduler::create_sync_node(
+                BTreeSet::new(),
+                name.to_owned(),
+                false,
+                false,
+            ));
+            assert!(
+                tree.head_mut()
+                    .base_class
+                    .add_child_node(InsertionPoint::Back, node)
+                    .is_none(),
+                "a push to the back is never refused"
+            );
+        };
+        push(&mut tree, "core_loop_sync");
+        push(&mut tree, "chunk_loop_sync");
+        assert!(L3DlOpsScheduler::verify_schedule_tree(&tree));
+
+        push(&mut tree, "core_loop_sync");
+        assert!(
+            !L3DlOpsScheduler::verify_schedule_tree(&tree),
+            "`hasUniqueName = false` at `.cpp:6401`"
         );
     }
 }
