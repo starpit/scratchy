@@ -6755,6 +6755,7 @@ impl CondValType {
     pub const ALL: [Self; 3] = [Self::Int, Self::First, Self::Last];
 
     /// Field: e039_LoopCond.condValTypeToString
+    /// Field: e030_LoopCond.condValTypeToString
     ///
     /// The spelling `LoopCond::condValTypeToString` gives this form (`dsc/dsc2.h:656`, defined
     /// `dsc/dsc2.cpp:21-23`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
@@ -6767,6 +6768,7 @@ impl CondValType {
     }
 
     /// Field: e039_LoopCond.stringToCondValType
+    /// Field: e030_LoopCond.stringToCondValType
     ///
     /// `LoopCond::stringToCondValType`, the flip of the above (`dsc/dsc2.h:657`, built with
     /// `flipMap` at `dsc/dsc2.cpp:24-25`). ⭐ AN ABSENT SPELLING IS A LIVE ANSWER HERE, not an
@@ -6951,12 +6953,17 @@ impl CondVal {
 /// One term of a condition node's guard: WHICH iteration of one loop dim the guarded region applies
 /// to (`dsc/dsc2.h:654-673`).
 ///
-/// ⛔ PARTIAL, AND `e018_LoopCond`/`e039_LoopCond` STAY OPEN BELOW: `loopComp_` is the `const
-/// LoopNode*` this term is a condition ON, used as pure pointer identity — compared against a loop
-/// (`ddc/ddc_transformation_util.cpp:266`, `:555`, `dsc/dsc2.cpp:2071`, `:2128`), inserted into a set
-/// (`:329`) and keyed into a map (`dsc/dsc2Pcfg.cpp:746`). Rust has no schedule-node identity yet
-/// because `ScheduleNode::prev_`, `BlockNode::next_` and `ScheduleTree::head_` are one unlanded
-/// cyclic unit, and an index or a name will not do for a pointer compare.
+/// ⛔ PARTIAL, AND `e039_LoopCond`/`e030_LoopCond`/`e018_LoopCond` STAY OPEN BELOW: `loopComp_` is
+/// the `const LoopNode*` this term is a condition ON, used as pure pointer identity — compared
+/// against a loop (`ddc/ddc_transformation_util.cpp:266`, `:555`, `dsc/dsc2.cpp:2071`, `:2128`),
+/// inserted into a set (`:329`) and keyed into a map (`dsc/dsc2Pcfg.cpp:746`).
+///
+/// ⛔ A BORROW CANNOT SERVE NOW THAT THE TREE OWNS ITS NODES, AND A NAME CANNOT EITHER: the
+/// compare at `:266` runs inside a `traverseTreeDFSMutable` walk holding `&mut` on the node that
+/// holds this very `LoopCond` ([`ConditionNode`], `dsc/dsc2.h:690`), and while `name_` is identity
+/// on the JSON seam (`dsc/dsc2.cpp:456`, resolved at `:1445`) that same caller RENAMES its loop
+/// twelve lines before the compare (`ddc/ddc_transformation_util.cpp:251-256`) and the uniquifier
+/// runs LAST, after all scheduling (`dsc/dsc2.cpp:2986-2992` from `ddc/ddcv1.cpp:3790`).
 ///
 /// ⭐ THE VALUE HALF LANDS ANYWAY BECAUSE TWO READERS NEVER TOUCH THE LOOP: `convertCondValToInt`
 /// takes the loop's trip count as a parameter rather than following the pointer
@@ -6994,6 +7001,7 @@ impl CondVal {
 #[derive(Clone, Copy, Debug)]
 pub struct LoopCond {
     /// Field: e039_LoopCond.dim_
+    /// Field: e030_LoopCond.dim_
     /// Field: e018_LoopCond.dim_
     ///
     /// Which of `loopComp_`'s dims the term is on (`dsc/dsc2.h:660`) — a loop node carries several,
@@ -7003,6 +7011,7 @@ pub struct LoopCond {
     /// (`dsc/dsc2.h:660`), so no [`Option`] is needed: the live "no dimension" key already spells it.
     pub dim: PrimaryDimTypes,
     /// Field: e039_LoopCond.condOp_
+    /// Field: e030_LoopCond.condOp_
     /// Field: e018_LoopCond.condOp_
     ///
     /// How the loop's iteration is compared against [`cond_val`](Self::cond_val)
@@ -7010,6 +7019,8 @@ pub struct LoopCond {
     pub cond_op: LoopCondOp,
     /// Field: e039_LoopCond.condValType_
     /// Field: e039_LoopCond.condValInt_
+    /// Field: e030_LoopCond.condValType_
+    /// Field: e030_LoopCond.condValInt_
     /// Field: e018_LoopCond.condValType_
     /// Field: e018_LoopCond.condValInt_
     ///
@@ -14963,3 +14974,53 @@ mod equivalence {
 // crustify:todo: e034_LoopNode.ScheduleTree
 
 // crustify:todo: e034_LoopNode.rowId
+
+// crustify:todo: e030_LoopCond
+
+// crustify:todo: e030_LoopCond.loopComp_
+
+// ⛔ e022_DistributionStatusInfo IS THE THIRD SCHEDULING OF THE DEAD DECLARATION ABOVE, and the
+// census still holds at this revision: `loopToSplit`, `loopSplitDim`, `loopSplitDimSizes`,
+// `DistributionStatusType` and `NEED_LOOP_SPLIT` occur tree-wide — any file type — ONLY in
+// `dsc/dsc2.h:1129-1135`.
+//
+// ⭐ AND THAT IS WHY A TWO-FIELD STRUCT WOULD NOT CLOSE THESE FOUR ANCHORS: a ported
+// `DistributionStatusInfo` cannot meet the second condition for done — a real non-test caller —
+// because the authority has none to port. Filling them needs the declaration to acquire a use
+// upstream, not a Rust type to be written down here.
+
+// crustify:todo: e022_DistributionStatusInfo
+
+// crustify:todo: e022_DistributionStatusInfo.loopSplitDim
+
+// crustify:todo: e022_DistributionStatusInfo.loopSplitDimSizes
+
+// crustify:todo: e022_DistributionStatusInfo.loopToSplit
+
+// ⛔ e032_LoopDistributionInfo IS THE THIRD SCHEDULING OF e042_ ABOVE, whose `loopNode` note
+// stands and whose `.break` is still not a field. What this generation adds is WHY A BORROW CANNOT
+// SERVE even though the chain is NOT itself in the tree: `VectorOfLoopAndDim` holds `LoopNode*`,
+// non-const (`dsc/dsc2.h:1142`), into the tree that the chain's own subject lives in — and the
+// fold reads the chain at `ddc/ddc_fold.cpp:2308` while mutating
+// `allocNode->allocateCoordinates_` at `:2268` and `:2328`, a node those same loops enclose (the
+// chain is built from it at `:2254-2256`). That is two `&mut` into one owned tree, Rule 4's case,
+// not a lifetime to be annotated harder.
+//
+// ⛔ AND `nullptr` IS A VALUE HERE, NOT AN ABSENCE: `distributeElemArrToTemporalLoops` keys
+// `loopParamsAfterDistribution` on a NULL loop for every CORELET_SLICE entry
+// (`dsc/dsc2.cpp:6028-6031`), so whatever carries this field carries that key with it. ⭐ WHICH
+// MAKES THE KEY ONE CAMPAIGN-WIDE CHOICE, NOT THIS TYPE'S: the same spelling has to serve that
+// call-local map and the `Ddc`-member `loopDistributionParamInfo` (`ddc/ddc.h:553`,
+// `ddc/ddc_fold.cpp:2312`), which outlives the call. `print` stays open with the field — it
+// dereferences `loopNode->name_` (`dsc/dsc2.h:1147`).
+
+// crustify:todo: e032_LoopDistributionInfo
+
+// crustify:todo: e032_LoopDistributionInfo.break
+
+// crustify:todo: e032_LoopDistributionInfo.cat
+
+// crustify:todo: e032_LoopDistributionInfo.dimAndKind
+
+// crustify:todo: e032_LoopDistributionInfo.loopNode
+
