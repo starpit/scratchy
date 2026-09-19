@@ -4939,17 +4939,6 @@ impl DataStage {
 /// Only the last item is marked, once per iteration, and every other rolled-back item keeps
 /// `COMPLETE` from `getCurrItem`. Inert today because nothing reads the field; do not reproduce the
 /// aliasing when porting it, and do not "fix" it into a reader either.
-///
-/// ⚠️ THE SEVEN `e038_CoordPropInfoType.*` ANCHORS STAY OPEN BECAUSE THE STRUCT CANNOT LAND YET:
-/// `refNode` and `nodeToFold` are both `ScheduleNode*` (`dsc/dsc2.h:1089-1090`), e029, and its own
-/// `print` dereferences both for their `name_` (`:1099-1100`) — so that type is the pointer pair
-/// plus five carried fields, and a port without them would be a different unit. ⛔ AND ONE OF THOSE
-/// FIVE CARRIES AN AUTHORITY ASYMMETRY TO REPRODUCE: `CoordPropTracker::retry` re-queues an item
-/// with SIX of the seven initialisers and omits `scaleDown` (`ddc/ddc.h:438-441`), so the
-/// aggregate's own `= false` wins, while `addPropInfo(rhs, dims)` beside it forwards
-/// `rhs.scaleDown` (`:432-433`). A scaled value-tensor propagation therefore loses its scale-down
-/// on retry, and both retries in `buildFoldForAllocation` are on the very path that reads it
-/// (`ddc/ddc_fold.cpp:2402-2407`, `:2437`, `:2460`), queued by the site that sets it (`:1744-1748`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PropStateType {
     /// The field's own initialiser (`dsc/dsc2.h:1093`) and what both push sites state.
@@ -4958,6 +4947,110 @@ pub enum PropStateType {
     RolledBack = 1,
     Overridden = 2,
     Complete = 3,
+}
+
+/// `dsc/dsc2.h:1087-1108`. One work item of the coordinate-propagation queue: fold one schedule
+/// node's coordinates from another's, over a named set of dims. `Ddc::CoordPropTracker` holds a
+/// `std::deque` of them (`ddc/ddc.h:537`), `addPropInfo` pushes one per unseen dim set (`:402-428`)
+/// and `getCurrItem` hands the next one out (`:463-474`).
+///
+/// ⛔ THIS CARRIES FIVE OF COORDPROPINFOTYPE'S SEVEN FIELDS, so its type anchor and two field anchors
+/// stay open in all three generations. `refNode` and `nodeToFold` (`:1089-1090`) are `ScheduleNode*`
+/// held as tree identity: they key `CoordPropTracker::refsAdded_` (`ddc/ddc.h:410-418`), and
+/// `rollbackToPos` `static_cast`s `nodeToFold` to the concrete node and CLEARS its coordinates
+/// through the pointer (`:487-503`). That identity is the one `BlockNode::next_` and
+/// `ScheduleTree::head_` have to define, and both are open — e030_BlockNode, e032_ScheduleTree. The
+/// type's one method goes out with them: `print` (`:1098-1107`) dereferences both for their `name_`.
+///
+/// ⛔ THE AUTHORITY'S DEFAULT CONSTRUCTION LEAVES THOSE TWO POINTERS INDETERMINATE — neither
+/// declaration carries an initialiser — and both default-construction sites assign both on the next
+/// two lines (`ddc/ddc_fold.cpp:1222-1224`, `:1924-1926`). [`Default`] here is the five initialisers
+/// those sites do rely on, and nothing else.
+///
+/// ⛔ AND WHAT THOSE TWO SITES DO **NOT** FORWARD IS READ DOWNSTREAM. Each builds a reverse item out
+/// of `dataConnect` and a flipped `refIsProducer` only, so [`scale_down`](Self::scale_down) and
+/// [`dims_to_propagate`](Self::dims_to_propagate) come back DEFAULT on it: the reverse walk of a
+/// scaled propagation is unscaled where `gatherRelatedPTRowsBase` divides the row-split beta by
+/// `mxInfo_.blkSize` (`ddc/ddc_fold.cpp:907-911`).
+///
+/// ⛔ NO `PartialEq`: the authority declares none, and what identifies a work item is the two
+/// pointers it names.
+#[derive(Clone, Debug)]
+pub struct CoordPropInfoType {
+    /// Field: e038_CoordPropInfoType.dataConnect
+    ///
+    /// Field: e010_CoordPropInfoType.dataConnect
+    ///
+    /// Which operand of the two nodes the propagation runs over (`dsc/dsc2.h:1091`).
+    ///
+    /// ⛔ ITS TWO READERS DISAGREE ABOUT THE EMPTY NAME: `matchDataStream` reads it as a filter it
+    /// skips, `dataConnect != "" && dataConnect == di.dataConnect_` (`ddc/ddc_fold.cpp:434-435`),
+    /// while `getRelatedComputeCoord` REFUSES an empty one outright, twice — "data_connect is
+    /// missing" on an opaque compute (`:1987-1990`) and "dataconnect is missing" on every other
+    /// (`:2075-2078`). A [`DataConnect`] and not an [`Option`] of one for the same reason
+    /// [`DataInfo::data_connect`] is: the empty string is the ordinary unset state.
+    pub data_connect: DataConnect,
+    /// Field: e038_CoordPropInfoType.refIsProducer
+    ///
+    /// Field: e010_CoordPropInfoType.refIsProducer
+    ///
+    /// Whether `refNode` PRODUCES the data connect and `nodeToFold` consumes it (`dsc/dsc2.h:1092`)
+    /// — which end of a transfer or a compute the walk reads. Eight readers branch on it
+    /// (`ddc/ddc_fold.cpp:777`, `:833`, `:985`, `:1005`, `:1072`, `:1124`, `:2833`, `:2933`), and
+    /// both reverse items flip it (`:1226`, `:1928`).
+    ///
+    /// ⛔ `true` IS THE INITIALISER AND SO IS `addPropInfo`'S DEFAULT ARGUMENT (`ddc/ddc.h:406`), so a
+    /// caller that names neither queues the producer walk.
+    pub ref_is_producer: bool,
+    /// Field: e038_CoordPropInfoType.propState
+    ///
+    /// Field: e010_CoordPropInfoType.propState
+    ///
+    /// How far this item got (`dsc/dsc2.h:1093`) — see [`PropStateType`], which no reader anywhere
+    /// in the authority tree reads back.
+    pub prop_state: PropStateType,
+    /// Field: e038_CoordPropInfoType.dimsToPropagate
+    ///
+    /// Field: e010_CoordPropInfoType.dimsToPropagate
+    ///
+    /// The dims this item propagates (`dsc/dsc2.h:1094`). Every reader tests membership,
+    /// `is_any_of(dim, coordPropInfo.dimsToPropagate)` (`ddc/ddc_fold.cpp:2514`, `:3137`, `:3348`),
+    /// and `computeLoopElemOffsetsFromCoordinates` takes the whole list (`:1943`).
+    ///
+    /// ⛔ A `Vec` AND NOT A SET, BECAUSE ONLY ONE OF THE TWO PUSH SITES DEDUPS: `addPropInfo` records
+    /// each dim in `refsAdded_` as it collects it, so a repeat in its own input is skipped
+    /// (`ddc/ddc.h:409-423`), while `retry` pushes the caller's vector verbatim (`:438-441`).
+    pub dims_to_propagate: Vec<PrimaryDimTypes>,
+    /// Field: e038_CoordPropInfoType.scaleDown
+    ///
+    /// Field: e010_CoordPropInfoType.scaleDown
+    ///
+    /// Whether the reference coordinate is scaled down to the value tensor's block size before the
+    /// fold is built (`dsc/dsc2.h:1095`). Its one writer sets it while re-targeting the item at the
+    /// scale allocation (`ddc/ddc_fold.cpp:1744-1748`); `buildFoldForAllocation` then calls
+    /// `scaleDownCoord` (`:2402-2407`) and `gatherRelatedPTRowsBase` divides the row-split beta by
+    /// `mxInfo_.blkSize` (`:907-911`).
+    ///
+    /// ⛔ `retry` LOSES IT: it re-queues SIX of the seven initialisers and omits this one
+    /// (`ddc/ddc.h:438-441`), so the aggregate's own `= false` wins, while `addPropInfo(rhs, dims)`
+    /// beside it forwards `rhs.scaleDown` (`:430-434`). Both retries in `buildFoldForAllocation`
+    /// (`ddc/ddc_fold.cpp:2437`, `:2460`) are on the path that reads it.
+    pub scale_down: bool,
+}
+
+impl Default for CoordPropInfoType {
+    /// The authority's five member initialisers (`dsc/dsc2.h:1091-1095`). ⛔ NOT
+    /// `#[derive(Default)]`: `refIsProducer` starts `true`, and [`DataConnect`] derives no
+    /// [`Default`] of its own.
+    fn default() -> Self {
+        Self {
+            data_connect: DataConnect(String::new()),
+            ref_is_producer: true,
+            prop_state: PropStateType::NotProcessed,
+            dims_to_propagate: Vec::new(),
+            scale_down: false,
+        }
+    }
 }
 
 /// `dsc/dsc2.h:563-619`. One loop of the schedule tree: the dims it iterates and the two data
@@ -8474,6 +8567,8 @@ impl IndirectAllocType {
 
     /// Field: e037_AllocateNode.indirectAllocTypeToString
     ///
+    /// Field: e003_AllocateNode.indirectAllocTypeToString
+    ///
     /// The spelling `indirectAllocTypeToString` gives this role (`dsc/dsc2.h:1049-1050`, filled
     /// `dsc/dsc2.cpp:2423-2427`). ⭐ TOTAL, AND THE AUTHORITY'S MAP IS TOO — all three have an entry.
     pub fn name(self) -> &'static str {
@@ -8485,6 +8580,8 @@ impl IndirectAllocType {
     }
 
     /// Field: e037_AllocateNode.stringToIndirectAllocType
+    ///
+    /// Field: e003_AllocateNode.stringToIndirectAllocType
     ///
     /// `stringToIndirectAllocType`, the `flipMap` of the above (`dsc/dsc2.h:1051-1052`, built
     /// `dsc/dsc2.cpp:2428-2430`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
@@ -8528,6 +8625,8 @@ impl IndexTensorType {
 
     /// Field: e037_AllocateNode.indexTensorTypeToString
     ///
+    /// Field: e003_AllocateNode.indexTensorTypeToString
+    ///
     /// The spelling `indexTensorTypeToString` gives this form (`dsc/dsc2.h:1053-1054`, filled
     /// `dsc/dsc2.cpp:2432-2435`).
     pub fn name(self) -> &'static str {
@@ -8538,6 +8637,8 @@ impl IndexTensorType {
     }
 
     /// Field: e037_AllocateNode.stringToIndexTensorType
+    ///
+    /// Field: e003_AllocateNode.stringToIndexTensorType
     ///
     /// `stringToIndexTensorType`, the `flipMap` of the above (`dsc/dsc2.h:1055-1056`, built
     /// `dsc/dsc2.cpp:2436-2438`). ⛔ THE AUTHORITY'S ONLY CALLER IS AN `.at()` THAT THROWS on a miss
@@ -8764,6 +8865,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.ldsIdx_
     ///
+    /// Field: e003_AllocateNode.ldsIdx_
+    ///
     /// The labeled data structure this region holds, or [`None`] for the authority's `-1`
     /// (`dsc/dsc2.h:976`). The DDL conversion sets it for a tensor allocation
     /// (`ddc/ddl/ddl_conversion.cpp:805`) and `ForceInnermostDimensionsOp` refuses any allocation
@@ -8780,6 +8883,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.constIdx_
     ///
+    /// Field: e003_AllocateNode.constIdx_
+    ///
     /// The constant this region holds, or [`None`] for the authority's `-1` (`dsc/dsc2.h:977`). It
     /// indexes `DesignSpaceConfig::constantInfo_`, whose entry supplies the region's name
     /// (`ddc/ddcv1.cpp:26-27`), and the DDL conversion names such a node
@@ -8788,6 +8893,8 @@ pub struct AllocateNode {
     /// Field: e028_AllocateNode.component_
     ///
     /// Field: e037_AllocateNode.component_
+    ///
+    /// Field: e003_AllocateNode.component_
     ///
     /// Which memory the region is in (`dsc/dsc2.h:979`), taken from the `AllocateOp`'s storage
     /// (`ddc/ddl/ddl_conversion.cpp:806`).
@@ -8803,6 +8910,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.padding_
     ///
+    /// Field: e003_AllocateNode.padding_
+    ///
     /// The padding form of each dim of the region (`dsc/dsc2.h:981`), written from the `AllocateOp`
     /// (`ddc/ddl/ddl_conversion.cpp:793`). `getSizeDataStageForNode` passes it on to size the
     /// allocation (`dsc/dsc2.cpp:3613`).
@@ -8814,6 +8923,10 @@ pub struct AllocateNode {
     /// Field: e037_AllocateNode.layoutDimOrder_
     ///
     /// Field: e037_AllocateNode.maxDimSizes_
+    ///
+    /// Field: e003_AllocateNode.layoutDimOrder_
+    ///
+    /// Field: e003_AllocateNode.maxDimSizes_
     ///
     /// The dims the region is laid out over, each with its own size limit — [`None`] for the
     /// authority's negative "no limit" (`dsc/dsc2.h:982-983`). Read [`MaxDimSize`] before touching a
@@ -8889,6 +9002,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.isStartAddrSymbolic_
     ///
+    /// Field: e003_AllocateNode.isStartAddrSymbolic_
+    ///
     /// Whether the region's start address is a symbol rather than a placed address
     /// (`dsc/dsc2.h:987`).
     ///
@@ -8899,6 +9014,8 @@ pub struct AllocateNode {
     /// Field: e028_AllocateNode.bufferOffsetCoreCorelet_
     ///
     /// Field: e037_AllocateNode.bufferOffsetCoreCorelet_
+    ///
+    /// Field: e003_AllocateNode.bufferOffsetCoreCorelet_
     ///
     /// The buffer stride per core and corelet (`dsc/dsc2.h:988`), read as
     /// `.at(coord.at(0)).at(corelet0Id)` beside the start address
@@ -8958,6 +9075,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.indirectAllocType_
     ///
+    /// Field: e003_AllocateNode.indirectAllocType_
+    ///
     /// Which half of an indirect access this region is (`dsc/dsc2.h:990-994`); see
     /// [`IndirectAllocType`]. It is what [`page_size`](Self::page_size) dispatches on.
     pub indirect_alloc_type: IndirectAllocType,
@@ -8965,12 +9084,16 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.indexTensorType_
     ///
+    /// Field: e003_AllocateNode.indexTensorType_
+    ///
     /// What an index tensor's entries hold (`dsc/dsc2.h:995-998`); see [`IndexTensorType`]. It is
     /// only meaningful under [`IndirectAllocType::IndexTensor`].
     pub index_tensor_type: IndexTensorType,
     /// Field: e028_AllocateNode.gapStickSpread_
     ///
     /// Field: e037_AllocateNode.gapStickSpread_
+    ///
+    /// Field: e003_AllocateNode.gapStickSpread_
     ///
     /// Per dim, how many sticks that dim's data is spread across (`dsc/dsc2.h:1006`); see
     /// [`StickSpread`] for the multiplier/divisor split between its two readers.
@@ -9008,6 +9131,8 @@ pub struct AllocateNode {
     ///
     /// Field: e037_AllocateNode.allocateCoordinates_
     ///
+    /// Field: e003_AllocateNode.allocateCoordinates_
+    ///
     /// How this region's dims are folded (`dsc/dsc2.h:1008`) — the coordinate every other node's is
     /// derived from. `buildFoldFromAllocation` is the writer (`ddc/ddc_fold.cpp:2748-2769`, which
     /// walks the allocation's fold params and calls `addFold` per level), and
@@ -9021,6 +9146,8 @@ pub struct AllocateNode {
     /// Field: e028_AllocateNode.sliceViewCoordinates_
     ///
     /// Field: e037_AllocateNode.sliceViewCoordinates_
+    ///
+    /// Field: e003_AllocateNode.sliceViewCoordinates_
     ///
     /// How the SLICE VIEW of this region's dims are folded (`dsc/dsc2.h:1009`) — the core-local view
     /// `buildFoldFromAllocation` builds beside the full one (`ddc/ddc_fold.cpp:2771-2790`).
@@ -12141,6 +12268,50 @@ mod equivalence {
         assert_eq!(dst_used.data.num_dims(), 2, "reshaped by the clone");
         assert_eq!(dst_used.data.get_data(&at_origin), Some(vec![7, 8, 9]));
     }
+
+    /// [`CoordPropInfoType`]'s five initialisers, and the two fields the reverse item its two
+    /// default-construction sites build does NOT forward (`ddc/ddc_fold.cpp:1222-1226`, `:1924-1928`).
+    ///
+    /// ⭐ MEASURED against the authority at `a0d29abbed` by a probe over the real header, which
+    /// default-constructs the struct, aggregate-initialises `retry`'s six (`ddc/ddc.h:438-441`) and
+    /// copies a `scaleDown = true` source the way the reverse sites do:
+    /// `default dataConnect=[] refIsProducer=1 propState=0 dims=0 scaleDown=0`,
+    /// `retry   dataConnect=[dc0] refIsProducer=0 propState=0 dims=1 scaleDown=0`,
+    /// `reverse dataConnect=[dc1] refIsProducer=0 propState=0 dims=0 scaleDown=0`.
+    #[test]
+    fn the_reverse_item_forwards_neither_scale_down_nor_dims() {
+        let fresh = CoordPropInfoType::default();
+        assert_eq!(fresh.data_connect, DataConnect(String::new()));
+        assert!(fresh.ref_is_producer, "the authority's `= true`");
+        assert_eq!(fresh.prop_state, PropStateType::NotProcessed);
+        assert!(fresh.dims_to_propagate.is_empty());
+        assert!(!fresh.scale_down);
+
+        let retried = CoordPropInfoType {
+            data_connect: DataConnect("dc0".to_string()),
+            ref_is_producer: false,
+            prop_state: PropStateType::NotProcessed,
+            dims_to_propagate: vec![PrimaryDimTypes::X],
+            ..CoordPropInfoType::default()
+        };
+        assert!(!retried.scale_down, "`retry` omits the seventh initialiser");
+
+        let source = CoordPropInfoType {
+            data_connect: DataConnect("dc1".to_string()),
+            dims_to_propagate: vec![PrimaryDimTypes::X, PrimaryDimTypes::Y],
+            scale_down: true,
+            ..CoordPropInfoType::default()
+        };
+        let reverse = CoordPropInfoType {
+            data_connect: source.data_connect.clone(),
+            ref_is_producer: !source.ref_is_producer,
+            ..CoordPropInfoType::default()
+        };
+        assert_eq!(reverse.data_connect, DataConnect("dc1".to_string()));
+        assert!(!reverse.ref_is_producer);
+        assert!(!reverse.scale_down, "so the reverse walk is unscaled");
+        assert!(reverse.dims_to_propagate.is_empty());
+    }
 }
 
 // crustify:todo: e030_BlockNode
@@ -12189,21 +12360,18 @@ mod equivalence {
 
 // crustify:todo: e037_AllocateNode.tempStorageForCompute_
 
+// ⛔ THREE `CoordPropInfoType` ANCHORS STAY OPEN IN EVERY GENERATION, ON SCHEDULE-NODE IDENTITY:
+// `refNode` and `nodeToFold` (`dsc/dsc2.h:1089-1090`) are `ScheduleNode*` used as `refsAdded_` keys
+// and `static_cast` to the concrete node to clear its coordinates (`ddc/ddc.h:410-418`, `:487-503`),
+// and each generation's TYPE anchor stays with them because `print` (`:1098-1107`) dereferences both.
+// The other five fields are carried above, and `e016_CoordPropInfoType`'s type anchor stays open for
+// the same reason.
+
 // crustify:todo: e038_CoordPropInfoType
-
-// crustify:todo: e038_CoordPropInfoType.dataConnect
-
-// crustify:todo: e038_CoordPropInfoType.dimsToPropagate
 
 // crustify:todo: e038_CoordPropInfoType.nodeToFold
 
-// crustify:todo: e038_CoordPropInfoType.propState
-
-// crustify:todo: e038_CoordPropInfoType.refIsProducer
-
 // crustify:todo: e038_CoordPropInfoType.refNode
-
-// crustify:todo: e038_CoordPropInfoType.scaleDown
 
 // crustify:todo: e039_LoopCond
 
@@ -12255,3 +12423,26 @@ mod equivalence {
 // crustify:todo: e042_LoopDistributionInfo.loopNode
 
 // crustify:todo: e043_LoopCondComposite
+
+// ⛔ e003_AllocateNode'S TWO OPEN FIELD ANCHORS ARE e028_'S AND e037_'S: `allocUsers_`
+// (`dsc/dsc2.h:1007`) and `tempStorageForCompute_` (`:978`) are schedule-node pointer identity. The
+// TYPE anchor stays open with them, with the five methods that operate on that list, and with the two
+// uncarried members this generation's scan does not name at all — `startAddressCoreCorelet_`
+// (`:985-986`) and `relatedIndirectAccessAlloc_` (`:999-1001`).
+//
+// ⚠️ THAT SCAN NAMES 15 OF THE CLASS'S 21 MEMBERS, plus its 4 static string maps. All six it omits —
+// the two above and `numBuffers_` (`:984`), `backGapCore_` (`:989`), `ignoreSymbolicVolumeLimits_`
+// (`:1002-1003`) and `nonUnifiedAllocInHBM_` (`:1004-1005`), the last four CARRIED above — either
+// carry a trailing `//` comment or wrap onto a second line; e028_'s own scan did name two of them.
+
+// crustify:todo: e003_AllocateNode
+
+// crustify:todo: e003_AllocateNode.allocUsers_
+
+// crustify:todo: e003_AllocateNode.tempStorageForCompute_
+
+// crustify:todo: e010_CoordPropInfoType
+
+// crustify:todo: e010_CoordPropInfoType.nodeToFold
+
+// crustify:todo: e010_CoordPropInfoType.refNode
