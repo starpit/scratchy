@@ -29,9 +29,15 @@ pub type GroupType = Vec<SliceCore>;
 /// ⛔ IBM'S ELEMENT IS AN `int` WHOSE `-1` IS AN IN-BAND FILLER, NOT A CORE. `addCore` resizes with
 /// `-1` (`:30`), so every slice below the one it was handed and above the ones already placed reads
 /// back `-1`, and both end accessors return that `-1` to their callers as if it were a core id
-/// (`:37`, `:47`). The enum keeps the filler and a core distinguishable where IBM's `int` cannot —
-/// and unlike the DSC dims' `-1`, nothing in this class computes with it, so it is an absence
-/// rather than a value.
+/// (`:37` and `:48`, both of the `coreIds.front()` reads). The enum keeps the filler and a core
+/// distinguishable where IBM's `int` cannot — and unlike the DSC dims' `-1`, nothing in this class
+/// computes with it, so it is an absence rather than a value.
+///
+/// ⭐ AND WHAT MAKES THE ENUM TOTAL IS THAT [`CoreId`] IS A `u8`: the authority's `addCore` accepts
+/// `-1` AS A CORE ID, and then its own filler and that core are indistinguishable — `addCore(-1, 1)`
+/// measured `cores=[-1,-1]`, both ends `-1` on both corelets. No caller can reach it
+/// (`coreIdToWkSlice_`'s keys are real core ids, `.cpp:2756`), and `SliceCore::Core(CoreId)` cannot
+/// spell it, so the two meanings stay apart here for a reason IBM's `int` does not supply.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SliceCore {
     /// The `resize` filler (`:30`): a slice of the reduced dims that no `addCore` named.
@@ -49,7 +55,9 @@ pub enum SliceCore {
 /// coordinate; this is the mixed-radix product over every reduced dim of the group.
 /// ⭐ UNSIGNED WHERE IBM IS `int`, WHICH MAKES BOTH OF ITS THROWS UNSPELLABLE: `addCore(c, -1)`
 /// resizes to zero and then reaches `.at(SIZE_MAX)` (`std::out_of_range`), and any slice below `-1`
-/// resizes to a `size_t` near its maximum (`std::length_error`) — `:30-31`.
+/// resizes to a `size_t` near its maximum (`std::length_error`) — `:30-31`. Both throws are
+/// measured, not inferred: `addCore(7, -1)` and `addCore(7, -2)` on a compiled oracle over the
+/// verbatim class body answered exactly those two exception types.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReduceSliceIdx(pub usize);
 
@@ -62,11 +70,19 @@ pub struct ReduceSliceIdx(pub usize);
 /// [`Self::from_corelet_id`] is that one arm, and it is the only way into this type.
 /// ⛔ NOT [`CoreletId`], WHICH IS NOT A CLOSED PAIR: it keys every per-corelet tracker and counts up
 /// to `numCoreletsUsed_DSC2_`, while these two methods accept nothing but `0` and `1`.
+///
+/// ⛔ NARROWING FIRST REORDERS THE AUTHORITY'S TWO REFUSALS, AND ONLY THE REFUSAL IS PRESERVED, NOT
+/// ITS REASON. `DT_CHECK(!coreIds.empty())` precedes the corelet test in both accessors (`:35`,
+/// `:44`), so an EMPTY group asked for corelet `2` throws on the emptiness — measured
+/// `DtException: !coreIds.empty()`, never `Unknown corelet id.`. Here the corelet is narrowed before
+/// the group is reached, so that same pair answers `None` from this function instead. Both halves are
+/// `DtException` in the authority and neither is recoverable there, so the port trades which one is
+/// named for making the `DT_ERROR` arm unspellable at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReductionCorelet {
     /// Corelet `0`, which reads the group forwards: start at the lowest slice, end at the highest.
     Corelet0,
-    /// Corelet `1`, which reads it backwards (`.cpp:5828`, `constexpr int corelet1Id = 1`).
+    /// Corelet `1`, which reads it backwards (`.cpp:5827`, `constexpr int corelet1Id = 1`).
     Corelet1,
 }
 
@@ -99,22 +115,28 @@ pub struct CrossCoreReductionGroup {
     /// Field: e012_CrossCoreReductionGroup.coreIds
     ///
     /// The group's cores indexed by their slice of the reduced dims (`:27`). Public in the
-    /// authority too, and [`Self::add_core`] is its only writer tree-wide.
+    /// authority too, and [`Self::add_core`] is its only writer tree-wide — `coreIds` has no use
+    /// outside the class in the authority either: its eleven hits are all inside `:27-52`. The two
+    /// end accessors' asymmetry is a consequence of that one writer and not of this type; see
+    /// [`Self::end_core_at_corelet`].
     pub core_ids: GroupType,
 }
 
 impl CrossCoreReductionGroup {
-    /// Replaces: e066_addCore
+    /// Replaces: e012_CrossCoreReductionGroup.addCore
     ///
     /// Place `core` at `slice`, filling any lower slice no core has claimed (`:29-32`).
     ///
     /// ⛔ IBM'S `resize` SHRINKS AS WELL AS GROWS, AND THIS PORT KEEPS THAT. A slice below the
     /// current length drops every core above it — `add_core(c0, 3)` then `add_core(c1, 1)` leaves
-    /// two slices, not four, and `c0` is gone. Whether the one caller reaches it is a property of
-    /// `coreIdToWkSlice_`, not of this method: that map iterates by core id (`.cpp:2756`) while the
-    /// position is the reduced dims' mixed-radix index (`.cpp:2758-2764`), so nothing makes the
-    /// positions arrive ascending. Not corrected here, because the correction is a choice about
-    /// which core wins and the authority states none.
+    /// two slices, not four, and `c0` is gone — measured on the authority as `cores=[-1,5]`, not
+    /// reasoned from `resize`'s contract. Whether the one caller reaches it is a property of
+    /// `coreIdToWkSlice_`, not of this method: that map is a `std::map<int, ...>` keyed by core id
+    /// (`dsc/superdsc.h:70`), so it iterates ascending in the CORE, while the position is the reduced
+    /// dims' mixed-radix index (`.cpp:2758-2764`) whose per-dim term is a layout stride the work
+    /// division chose (`dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:4337-4341`) — nothing ties
+    /// the two orders together. Not corrected here, because the correction is a choice about which
+    /// core wins and the authority states none.
     /// ⭐ THE `push` IS IBM'S `.at(slice) = coreId` (`:31`): a resize to `slice + 1` makes the
     /// written slot the last one, so resize-to-`slice`-then-push is the same two lines with no
     /// index to be out of bounds.
@@ -152,7 +174,7 @@ impl CrossCoreReductionGroup {
         &self.core_ids
     }
 
-    /// Replaces: e067_getStartCoreAtCorelet
+    /// Replaces: e012_CrossCoreReductionGroup.getStartCoreAtCorelet
     ///
     /// Which core this corelet's reduction chain starts at: the lowest slice for corelet `0`, the
     /// highest for corelet `1` (`:34-42`).
@@ -167,16 +189,22 @@ impl CrossCoreReductionGroup {
         }
     }
 
-    /// Replaces: e068_getEndCoreAtCorelet
+    /// Replaces: e012_CrossCoreReductionGroup.getEndCoreAtCorelet
     ///
     /// Which core this corelet's reduction chain finishes at — the opposite end from
     /// [`Self::start_core_at_corelet`] (`:43-51`). The transfer core of a cross-core reduction's
     /// output, and the core whose HBM address gets the corelet offset (`.cpp:2783`, `.cpp:5831`).
     ///
     /// ⛔ `None` IS `DT_CHECK(!coreIds.empty())` (`:44`), AS ABOVE.
-    /// ⭐ CORELET `0`'S END IS ALWAYS A REAL CORE AND CORELET `1`'S NEED NOT BE: `add_core` writes
-    /// the last slot every time, so the back of a non-empty group is the core placed most recently,
-    /// while the front is slice `0` and reads `Unfilled` until some core claims it.
+    /// ⭐ CORELET `0`'S END IS A REAL CORE AFTER ANY SEQUENCE OF [`Self::add_core`] CALLS AND CORELET
+    /// `1`'S NEED NOT BE: `add_core` writes the last slot every time, so the back of a non-empty
+    /// group is the core placed most recently, while the front is slice `0` and reads `Unfilled`
+    /// until some core claims it. Measured over all 64 orderings of three `addCore` calls on the
+    /// authority: corelet `0`'s end was a real core in all 64, corelet `1`'s the `-1` filler in 27.
+    /// ⛔ THAT IS `add_core`'S INVARIANT, NOT THE TYPE'S. [`Self::core_ids`] is `pub`, as IBM's
+    /// `coreIds` is (`:27`), so a direct write can leave a non-empty group whose back is `Unfilled`;
+    /// this accessor reports that faithfully instead of refusing it, because the authority's
+    /// `coreIds.back()` does the same.
     pub fn end_core_at_corelet(&self, corelet: ReductionCorelet) -> Option<SliceCore> {
         match corelet {
             ReductionCorelet::Corelet0 => self.core_ids.last().copied(),
@@ -197,96 +225,14 @@ impl CrossCoreReductionGroup {
 mod unit_tests {
     use super::*;
 
-    /// `.cpp:2767` — the one fill site, fed ascending. Slice `1` is claimed by no core, so it holds
-    /// the `-1` filler while the two claimed slices hold theirs.
-    #[test]
-    fn the_fill_places_each_core_at_its_reduced_slice_and_leaves_the_gap_unfilled() {
-        let mut group = CrossCoreReductionGroup::default();
-        assert!(group.is_empty(), "a default-constructed group has no cores");
-        group.add_core(CoreId(4), ReduceSliceIdx(0));
-        group.add_core(CoreId(5), ReduceSliceIdx(2));
-        assert_eq!(
-            group.cores(),
-            [
-                SliceCore::Core(CoreId(4)),
-                SliceCore::Unfilled,
-                SliceCore::Core(CoreId(5)),
-            ]
-        );
-        assert!(!group.is_empty());
-        assert_eq!(group.core_ids.len(), 3);
-    }
-
-    /// ⛔ THE AUTHORITY'S `resize` TRUNCATES (`:30`), AND THIS PINS THAT AS IBM'S BEHAVIOUR, NOT AS
-    /// DESIRABLE. Core 4 was placed at slice 3; placing core 5 at slice 1 shortens the vector to
-    /// two and core 4 is gone from the group entirely.
-    #[test]
-    fn a_descending_slice_truncates_and_drops_the_cores_above_it() {
-        let mut group = CrossCoreReductionGroup::default();
-        group.add_core(CoreId(4), ReduceSliceIdx(3));
-        assert_eq!(group.core_ids.len(), 4);
-        group.add_core(CoreId(5), ReduceSliceIdx(1));
-        assert_eq!(
-            group.cores(),
-            [SliceCore::Unfilled, SliceCore::Core(CoreId(5))],
-            "IBM's resize shrinks, so slice 3's core does not survive"
-        );
-        assert!(
-            !group.cores().contains(&SliceCore::Core(CoreId(4))),
-            "the dropped core is dropped, not moved"
-        );
-    }
-
-    /// `:36-40` against `:45-49` — the two corelets read the same group from opposite ends, so each
-    /// one's start is the other's end.
-    #[test]
-    fn the_two_corelets_read_the_group_from_opposite_ends() {
-        let mut group = CrossCoreReductionGroup::default();
-        group.add_core(CoreId(4), ReduceSliceIdx(0));
-        group.add_core(CoreId(5), ReduceSliceIdx(1));
-        let (first, last) = (
-            Some(SliceCore::Core(CoreId(4))),
-            Some(SliceCore::Core(CoreId(5))),
-        );
-        assert_eq!(
-            group.start_core_at_corelet(ReductionCorelet::Corelet0),
-            first
-        );
-        assert_eq!(group.end_core_at_corelet(ReductionCorelet::Corelet0), last);
-        assert_eq!(
-            group.start_core_at_corelet(ReductionCorelet::Corelet1),
-            last
-        );
-        assert_eq!(group.end_core_at_corelet(ReductionCorelet::Corelet1), first);
-    }
-
-    /// `:35` and `:44` — `DT_CHECK(!coreIds.empty())`. All four reads of an empty group are the
-    /// throw, and `None` spells only that: a group WITH a slice no core claimed answers
-    /// `Some(Unfilled)` instead.
-    #[test]
-    fn an_empty_group_is_the_dt_check_throw_and_an_unclaimed_slice_is_not() {
-        let empty = CrossCoreReductionGroup::default();
-        for corelet in [ReductionCorelet::Corelet0, ReductionCorelet::Corelet1] {
-            assert_eq!(empty.start_core_at_corelet(corelet), None);
-            assert_eq!(empty.end_core_at_corelet(corelet), None);
-        }
-        let mut group = CrossCoreReductionGroup::default();
-        group.add_core(CoreId(4), ReduceSliceIdx(1));
-        assert_eq!(
-            group.end_core_at_corelet(ReductionCorelet::Corelet1),
-            Some(SliceCore::Unfilled),
-            "corelet 1's end is slice 0, which is the -1 filler here"
-        );
-        assert_eq!(
-            group.end_core_at_corelet(ReductionCorelet::Corelet0),
-            Some(SliceCore::Core(CoreId(4))),
-            "corelet 0's end is the slot add_core just wrote, so never the filler"
-        );
-    }
-
     /// `:41` and `:50` — `DT_ERROR("Unknown corelet id.")`. The loop at `.cpp:2781` would reach it
     /// with corelet 2 on a three-corelet DSC; the narrowing is the only entry to
     /// [`ReductionCorelet`], so that arm cannot be spelled past it.
+    ///
+    /// ⭐ THE VERDICT HERE IS THE NARROWING'S AND NOT THE AUTHORITY'S, WHICH IS WHY IT IS ONE OF
+    /// e012'S TWO UNIT TESTS: `from_corelet_id` answers before any group exists, so there is no C++
+    /// call to place beside it. Every claim about the class body itself is decided by executing IBM's
+    /// `:24-53` and lives in `mod equivalence`.
     #[test]
     fn a_corelet_past_the_second_is_the_unknown_corelet_error() {
         assert_eq!(
@@ -300,6 +246,37 @@ mod unit_tests {
         for unknown in [2, 3, u8::MAX] {
             assert_eq!(ReductionCorelet::from_corelet_id(CoreletId(unknown)), None);
         }
+    }
+
+    /// ⛔ CORELET `0`'S END BEING A REAL CORE IS [`CrossCoreReductionGroup::add_core`]'S INVARIANT AND
+    /// NOT THE TYPE'S, BECAUSE [`CrossCoreReductionGroup::core_ids`] IS `pub` AS IBM'S `coreIds` IS
+    /// (`:27`). A direct write reaches a non-empty group whose back is the filler — a state no
+    /// sequence of `add_core` calls can produce, measured over all 64 in `mod equivalence` — and
+    /// `:46`'s `coreIds.back()` reports it rather than refusing it.
+    ///
+    /// No C++ call decides this one either: the authority has no caller that writes `coreIds`
+    /// directly, its eleven hits all sitting inside `:27-52`, so the state is reachable in both
+    /// languages and observed in neither.
+    #[test]
+    fn a_public_write_to_core_ids_reaches_an_unfilled_end_that_add_core_cannot() {
+        let mut group = CrossCoreReductionGroup::default();
+        group.add_core(CoreId(4), ReduceSliceIdx(0));
+        assert_eq!(
+            group.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(SliceCore::Core(CoreId(4))),
+            "add_core's own last write is the back, so it is never the filler"
+        );
+
+        group.core_ids.push(SliceCore::Unfilled);
+        assert_eq!(
+            group.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(SliceCore::Unfilled),
+            "the accessor reports the back it was handed, as coreIds.back() does"
+        );
+        assert!(
+            !group.is_empty(),
+            "and this is not the empty-group refusal: isEmpty is still false (:52)"
+        );
     }
 }
 
@@ -1925,6 +1902,283 @@ mod equivalence {
     use super::*;
     use crate::schedule::dims::PadType;
     use crate::schedule::dsc2::{ChildNode, InsertionPoint, TransferNode};
+
+    /// e012 `:29-32` — every ordering of three `addCore` calls over slices `0..4`, cores 1, 2 and 3 in
+    /// call order, transcribed from a compiled oracle whose class body is the authority's `:24-53`
+    /// included verbatim (`clang++ -std=c++17`, rev `a0d29abbed`). `.` is IBM's `-1` resize filler, a
+    /// digit is that core id, and the sequence number is the base-4 `s0 s1 s2`.
+    ///
+    /// ⛔ THIS IS WHERE `resize`'S TRUNCATION LIVES, AND ROW `233` IS THE ONE TO READ: it renders
+    /// `"..13"`, so core 2 — placed at slice 3 — is OVERWRITTEN by the shrink to length 2 and then
+    /// core 3 extends past it again; the core does not move down and it does not come back.
+    /// ⭐ AND IT MEASURES BOTH END ACCESSORS' CLAIMS AT ONCE: corelet `0`'s end was a real core in all
+    /// 64 rows and corelet `1`'s was the filler in 27 of them, the two counts
+    /// [`CrossCoreReductionGroup::end_core_at_corelet`] cites.
+    #[test]
+    fn every_ordering_of_three_fills_matches_the_executed_authority() {
+        // Row `i` is the group after `addCore(1, i / 16)`, `addCore(2, (i / 4) % 4)` and
+        // `addCore(3, i % 4)`. The trailing comment is the oracle's own stdout, unedited.
+        const AUTHORITY: [&str; 64] = [
+            "3",    // 000  start0=3 end0=3 start1=3 end1=3
+            "23",   // 001  start0=2 end0=3 start1=3 end1=2
+            "2.3",  // 002  start0=2 end0=3 start1=3 end1=2
+            "2..3", // 003  start0=2 end0=3 start1=3 end1=2
+            "3",    // 010  start0=3 end0=3 start1=3 end1=3
+            "13",   // 011  start0=1 end0=3 start1=3 end1=1
+            "123",  // 012  start0=1 end0=3 start1=3 end1=1
+            "12.3", // 013  start0=1 end0=3 start1=3 end1=1
+            "3",    // 020  start0=3 end0=3 start1=3 end1=3
+            "13",   // 021  start0=1 end0=3 start1=3 end1=1
+            "1.3",  // 022  start0=1 end0=3 start1=3 end1=1
+            "1.23", // 023  start0=1 end0=3 start1=3 end1=1
+            "3",    // 030  start0=3 end0=3 start1=3 end1=3
+            "13",   // 031  start0=1 end0=3 start1=3 end1=1
+            "1.3",  // 032  start0=1 end0=3 start1=3 end1=1
+            "1..3", // 033  start0=1 end0=3 start1=3 end1=1
+            "3",    // 100  start0=3 end0=3 start1=3 end1=3
+            "23",   // 101  start0=2 end0=3 start1=3 end1=2
+            "2.3",  // 102  start0=2 end0=3 start1=3 end1=2
+            "2..3", // 103  start0=2 end0=3 start1=3 end1=2
+            "3",    // 110  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 111  start0=-1 end0=3 start1=3 end1=-1
+            ".23",  // 112  start0=-1 end0=3 start1=3 end1=-1
+            ".2.3", // 113  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 120  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 121  start0=-1 end0=3 start1=3 end1=-1
+            ".13",  // 122  start0=-1 end0=3 start1=3 end1=-1
+            ".123", // 123  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 130  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 131  start0=-1 end0=3 start1=3 end1=-1
+            ".13",  // 132  start0=-1 end0=3 start1=3 end1=-1
+            ".1.3", // 133  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 200  start0=3 end0=3 start1=3 end1=3
+            "23",   // 201  start0=2 end0=3 start1=3 end1=2
+            "2.3",  // 202  start0=2 end0=3 start1=3 end1=2
+            "2..3", // 203  start0=2 end0=3 start1=3 end1=2
+            "3",    // 210  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 211  start0=-1 end0=3 start1=3 end1=-1
+            ".23",  // 212  start0=-1 end0=3 start1=3 end1=-1
+            ".2.3", // 213  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 220  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 221  start0=-1 end0=3 start1=3 end1=-1
+            "..3",  // 222  start0=-1 end0=3 start1=3 end1=-1
+            "..23", // 223  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 230  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 231  start0=-1 end0=3 start1=3 end1=-1
+            "..3",  // 232  start0=-1 end0=3 start1=3 end1=-1
+            "..13", // 233  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 300  start0=3 end0=3 start1=3 end1=3
+            "23",   // 301  start0=2 end0=3 start1=3 end1=2
+            "2.3",  // 302  start0=2 end0=3 start1=3 end1=2
+            "2..3", // 303  start0=2 end0=3 start1=3 end1=2
+            "3",    // 310  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 311  start0=-1 end0=3 start1=3 end1=-1
+            ".23",  // 312  start0=-1 end0=3 start1=3 end1=-1
+            ".2.3", // 313  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 320  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 321  start0=-1 end0=3 start1=3 end1=-1
+            "..3",  // 322  start0=-1 end0=3 start1=3 end1=-1
+            "..23", // 323  start0=-1 end0=3 start1=3 end1=-1
+            "3",    // 330  start0=3 end0=3 start1=3 end1=3
+            ".3",   // 331  start0=-1 end0=3 start1=3 end1=-1
+            "..3",  // 332  start0=-1 end0=3 start1=3 end1=-1
+            "...3", // 333  start0=-1 end0=3 start1=3 end1=-1
+        ];
+
+        // The expectation is the C++ run's rendering, read back through the oracle's own alphabet, so
+        // no accessor of this port is asked to confirm another accessor of this port.
+        fn oracle_slot(rendered: char) -> SliceCore {
+            match rendered {
+                '.' => SliceCore::Unfilled,
+                digit => SliceCore::Core(CoreId(digit as u8 - b'0')),
+            }
+        }
+
+        let mut corelet1_end_was_the_filler = 0;
+        for (seq, expected) in AUTHORITY.iter().enumerate() {
+            let slices = [seq / 16, (seq / 4) % 4, seq % 4];
+            let mut group = CrossCoreReductionGroup::default();
+            for (core, slice) in [1u8, 2, 3].into_iter().zip(slices) {
+                group.add_core(CoreId(core), ReduceSliceIdx(slice));
+            }
+
+            let rendered: String = group
+                .cores()
+                .iter()
+                .copied()
+                .map(|slice_core| match slice_core {
+                    SliceCore::Unfilled => '.',
+                    SliceCore::Core(CoreId(core)) => char::from(b'0' + core),
+                })
+                .collect();
+            assert_eq!(&rendered, expected, "slices {slices:?} (sequence {seq})");
+
+            let front = oracle_slot(expected.chars().next().expect("no row is empty"));
+            let back = oracle_slot(expected.chars().last().expect("no row is empty"));
+            assert_eq!(
+                group.start_core_at_corelet(ReductionCorelet::Corelet0),
+                Some(front),
+                "`:37` coreIds.front(), slices {slices:?}"
+            );
+            assert_eq!(
+                group.end_core_at_corelet(ReductionCorelet::Corelet1),
+                Some(front),
+                "`:48` the same front, read as corelet 1's end, slices {slices:?}"
+            );
+            assert_eq!(
+                group.end_core_at_corelet(ReductionCorelet::Corelet0),
+                Some(back),
+                "`:46` coreIds.back(), slices {slices:?}"
+            );
+            assert_eq!(
+                group.start_core_at_corelet(ReductionCorelet::Corelet1),
+                Some(back),
+                "`:39` the same back, read as corelet 1's start, slices {slices:?}"
+            );
+            assert!(!group.is_empty(), "three fills always leave a core");
+
+            assert_ne!(
+                back,
+                SliceCore::Unfilled,
+                "corelet 0's end was a real core in all 64 oracle rows, slices {slices:?}"
+            );
+            if front == SliceCore::Unfilled {
+                corelet1_end_was_the_filler += 1;
+            }
+        }
+        assert_eq!(
+            corelet1_end_was_the_filler, 27,
+            "the oracle's 64 rows report end1=-1 in exactly 27"
+        );
+    }
+
+    /// e012 `.cpp:2755` and `.cpp:2767` — the shapes the callers actually build, every value taken from
+    /// the same oracle: `std::vector<CrossCoreReductionGroup> groupInfo(numGroups)` measured
+    /// `size=3 all_empty=1`, and the four named fills measured `cores=[4,-1,5]`, `cores=[-1,-1,-1,4]`
+    /// then `cores=[-1,5]`, `cores=[-1,-1,5]` and `cores=[-1,0]`.
+    ///
+    /// ⭐ THE LAST ROW IS WHAT MAKES [`SliceCore`] NECESSARY RATHER THAN TIDY: the authority answers
+    /// `end(0)=0` for a group holding core id zero and `end(0)=-1` for an unclaimed slice, two
+    /// different verdicts that one `int` spells four characters apart and a `CoreId` cannot spell at
+    /// all — [`sys_arch_spec::CoreId`] is a `u8`.
+    #[test]
+    fn the_named_group_shapes_match_the_executed_authority() {
+        // `.cpp:2755` — the group vector is default-constructed, one entry per reduction group.
+        let group_info = vec![CrossCoreReductionGroup::default(); 3];
+        assert_eq!(group_info.len(), 3);
+        assert!(group_info.iter().all(|group| group.is_empty()));
+
+        let fill = |calls: &[(u8, usize)]| {
+            let mut group = CrossCoreReductionGroup::default();
+            for &(core, slice) in calls {
+                group.add_core(CoreId(core), ReduceSliceIdx(slice));
+            }
+            group
+        };
+        let filler = SliceCore::Unfilled;
+        let core = |id| SliceCore::Core(CoreId(id));
+
+        // ascending_with_gap: cores=[4,-1,5] start(0)=4 end(0)=5 start(1)=5 end(1)=4
+        let ascending = fill(&[(4, 0), (5, 2)]);
+        assert_eq!(ascending.cores(), [core(4), filler, core(5)]);
+        assert_eq!(
+            ascending.start_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(core(4))
+        );
+        assert_eq!(
+            ascending.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(core(5))
+        );
+        assert_eq!(
+            ascending.start_core_at_corelet(ReductionCorelet::Corelet1),
+            Some(core(5))
+        );
+        assert_eq!(
+            ascending.end_core_at_corelet(ReductionCorelet::Corelet1),
+            Some(core(4))
+        );
+
+        // descending_before: cores=[-1,-1,-1,4]; descending_after: cores=[-1,5] — the shrink drops 4.
+        assert_eq!(fill(&[(4, 3)]).cores(), [filler, filler, filler, core(4)]);
+        let descending = fill(&[(4, 3), (5, 1)]);
+        assert_eq!(descending.cores(), [filler, core(5)]);
+        assert!(
+            !descending.cores().contains(&core(4)),
+            "the dropped core is dropped, not moved down"
+        );
+
+        // same_slice_twice: cores=[-1,-1,5] — the second write to slice 2 overwrites and the length
+        // does not change, which is the case `resize` + `push` has to get right without an `at`.
+        assert_eq!(fill(&[(4, 2), (5, 2)]).cores(), [filler, filler, core(5)]);
+
+        // core_zero_at_slice_1: cores=[-1,0] end(0)=0
+        let zero = fill(&[(0, 1)]);
+        assert_eq!(zero.cores(), [filler, core(0)]);
+        assert_eq!(
+            zero.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(core(0)),
+            "core id zero is a core"
+        );
+        assert_ne!(
+            zero.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(filler)
+        );
+
+        // getCores returns a fresh vector IBM's callers could mutate (measured: the copy's slice 0
+        // went to 9 while the group's stayed 4). Borrowed here, so that divergence is unspellable and
+        // `.to_vec()` is the caller's opt-in.
+        let mut independent = zero.cores().to_vec();
+        independent[0] = core(9);
+        assert_eq!(independent, [core(9), core(0)]);
+        assert_eq!(zero.cores(), [filler, core(0)], "the group is untouched");
+    }
+
+    /// e012 `:35`/`:44` against `:41`/`:50` — the authority checks EMPTINESS FIRST, and the oracle
+    /// measures every combination: `empty_start_corelet_0` and `empty_end_corelet_1` both throw
+    /// `!coreIds.empty()`; `nonempty_start_corelet_2` and `nonempty_end_corelet_2` both throw
+    /// `Unknown corelet id.`; and `empty_start_corelet_2` — empty group, corelet 2, both faults
+    /// available — throws `!coreIds.empty()`, never the corelet message.
+    ///
+    /// ⛔ THE PORT REVERSES THAT PRECEDENCE, AND WHAT IT LOSES IS THE REASON AND NOT THE REFUSAL:
+    /// [`ReductionCorelet::from_corelet_id`] answers before a group is in hand, so the last row is
+    /// decided by the narrowing and the emptiness is never consulted. Both languages still refuse.
+    /// This test pins that difference as measured rather than leaving it to
+    /// [`ReductionCorelet`]'s doc comment to assert.
+    #[test]
+    fn the_emptiness_check_precedes_the_corelet_check_in_the_authority() {
+        let empty = CrossCoreReductionGroup::default();
+        assert!(empty.is_empty());
+        assert!(empty.cores().is_empty());
+        for corelet in [ReductionCorelet::Corelet0, ReductionCorelet::Corelet1] {
+            assert_eq!(
+                empty.start_core_at_corelet(corelet),
+                None,
+                "`:35` DT_CHECK(!coreIds.empty())"
+            );
+            assert_eq!(
+                empty.end_core_at_corelet(corelet),
+                None,
+                "`:44` DT_CHECK(!coreIds.empty())"
+            );
+        }
+
+        // The corelet-2 row the port CAN still reach: the narrowing refuses it whether or not a group
+        // exists, which is the whole of the reordering.
+        assert_eq!(ReductionCorelet::from_corelet_id(CoreletId(2)), None);
+
+        // only_slice_1: cores=[-1,4] start(0)=-1 — `None` spells the DT_CHECK and nothing else, so an
+        // unclaimed slice is `Some(Unfilled)` and stays distinguishable from an empty group.
+        let mut group = CrossCoreReductionGroup::default();
+        group.add_core(CoreId(4), ReduceSliceIdx(1));
+        assert_eq!(
+            group.start_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(SliceCore::Unfilled)
+        );
+        assert_eq!(
+            group.end_core_at_corelet(ReductionCorelet::Corelet0),
+            Some(SliceCore::Core(CoreId(4)))
+        );
+    }
 
     /// `:63-73` against both real construction sites — `{executionStep}` and `{0}`
     /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:31`, `L3DlOpsScheduler_standalone.cpp:192`).
