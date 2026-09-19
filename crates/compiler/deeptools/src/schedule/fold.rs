@@ -1822,9 +1822,11 @@ impl<D> FoldManager<D> {
     /// `collectFoldFunctionAtLevel(int pos, std::vector<FoldFunction<Dtype>*>&)` (`:1726-1766`) —
     /// every node at depth `pos`, `pos == 0` being the root alone (`:1731-1732`).
     ///
+    /// ⭐ `pub(crate)` FOR ONE CALLER: `CoordinateType::debug_print` walks a coordinate's levels
+    /// through it (`dsc/dsc2.h:373-374`), which is the authority's only use outside this class.
     /// ⛔ ITS 2^20-ITERATION TIMEOUT (`:1735`, `:1763`) IS NOT PORTED. It guards against a cyclic
     /// `child_ff_` graph, and a [`Box`]ed child cannot be one.
-    fn collect_at_level(&self, pos: usize) -> Option<Vec<&FoldFunc<D>>> {
+    pub(crate) fn collect_at_level(&self, pos: usize) -> Option<Vec<&FoldFunc<D>>> {
         // `DT_CHECK(pos < dim_prop_.size())` (`:1728`) — measured, `collectFoldFunctionAtLevel(1)` on
         // a one-dimension manager throws.
         if pos >= self.dim_prop.len() {

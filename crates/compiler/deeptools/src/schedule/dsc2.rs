@@ -1,9 +1,12 @@
 //! Re-ported from the C++ authority. See crustify-scheduler/AGENT-BRIEF.md.
 
 use crate::schedule::ddc::LatchDataId;
-use crate::schedule::dims::{DataStructDims, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes};
+use crate::schedule::dims::{
+    DataStructDims, PadType, PaddingFormType, PrimaryDimAndKind, PrimaryDimTypes,
+};
 use crate::schedule::fold::{
-    BaseFuncType, FoldDimIndex, FoldDimPos, FoldDimProp, FoldDimSize, FoldManager,
+    BaseFuncType, FoldDimIndex, FoldDimPos, FoldDimProp, FoldDimSize, FoldFunc, FoldManager,
+    PrintContent,
 };
 use core::num::{NonZeroUsize, Wrapping};
 use std::collections::btree_map::Entry;
@@ -3554,23 +3557,809 @@ mod unit_tests {
         // of those two forms already ignores it and no producer writes one.
         assert_eq!(CondVal::from_wire(CondValType::Last, 4), CondVal::Last);
     }
+
+    /// `addFold` reaches `coordinates_[dim]` before anything can fail (`dsc/dsc2.h:126`), so a refusal
+    /// leaves the dim's key behind with an empty tower — the state
+    /// [`CoordinateType::clear_fold_for_dim`] produces deliberately. Measured on the authority through
+    /// its own refusal, the `UNKNOWN_COORD` `DT_ERROR` (`:140`), which this port cannot spell; the
+    /// refusal reachable here is [`FoldManager::build_affine_dim`]'s, a position past the end of the
+    /// tower.
+    #[test]
+    fn a_refused_fold_leaves_the_dims_key_behind() {
+        let mut coord = CoordinateType::default();
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::Y,
+                CoordinateCategory::Spatial,
+                FoldDimSize(9),
+                "unknown",
+                Alpha(1),
+                Beta(1),
+                FoldDimPos(5),
+            ),
+            None,
+            "position 5 of an empty tower"
+        );
+        assert!(coord.has_coord_for_dim(PrimaryDimTypes::Y));
+        assert_eq!(coord.coordinates()[&PrimaryDimTypes::Y].num_dims(), 0);
+        assert_eq!(coord.num_of_spatial_folds(PrimaryDimTypes::Y), 0);
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::Y,
+                CoordinateCategory::Spatial,
+                FoldDimSize(9),
+                "unknown",
+                Alpha(1),
+                Beta(1),
+                FoldDimPos(0),
+            ),
+            Some(()),
+            "the control: the same call at a position the tower has"
+        );
+    }
+
+    /// The five node fields a coordinate is (`dsc/dsc2.h:852`, `:948-949`, `:1008-1009`), each starting
+    /// as an empty one, and `TransferNode`'s own copy carrying its coordinate across
+    /// (`dsc/dsc2.cpp:1387-1420`) while the pad info it does NOT copy stays default.
+    #[test]
+    fn the_five_node_coordinate_fields_start_empty_and_a_transfer_copies_its_own() {
+        let compute = ComputeNode::default();
+        assert!(compute.input_coordinates.is_empty());
+        assert_eq!(compute.output_coordinate, CoordinateType::default());
+
+        let allocate = AllocateNode::default();
+        assert_eq!(allocate.allocate_coordinates, CoordinateType::default());
+        assert_eq!(allocate.slice_view_coordinates, CoordinateType::default());
+
+        let mut transfer = TransferNode::default();
+        assert_eq!(transfer.transfer_coordinates, CoordinateType::default());
+        assert_eq!(
+            transfer.transfer_coordinates.add_fold(
+                PrimaryDimTypes::X,
+                CoordinateCategory::Spatial,
+                FoldDimSize(4),
+                "core",
+                Alpha(10),
+                Beta(1),
+                FoldDimPos(0),
+            ),
+            Some(())
+        );
+        let copy = transfer.clone();
+        assert_eq!(
+            copy.transfer_coordinates.tensor_dims(),
+            vec![PrimaryDimTypes::X]
+        );
+        assert_eq!(
+            copy.transfer_coordinates
+                .num_of_spatial_folds(PrimaryDimTypes::X),
+            1
+        );
+        assert_eq!(
+            copy.padding_info,
+            TransferPadInfo::default(),
+            "the control: the field the authority's copy does not carry"
+        );
+    }
+
+    /// `coordinates_` and `getTensorDims()` are one map and its keys (`:431`, `:246-252`), so the dim
+    /// order `printCoordinates` exports (`:265`) is the same order both readers give — which is why the
+    /// field is a [`BTreeMap`] and the dims come out in enum order rather than insertion order.
+    #[test]
+    fn the_dim_order_is_the_enum_order_not_the_insertion_order() {
+        let mut coord = CoordinateType::default();
+        for dim in [PrimaryDimTypes::Y, PrimaryDimTypes::In, PrimaryDimTypes::X] {
+            assert_eq!(
+                coord.add_fold(
+                    dim,
+                    CoordinateCategory::Spatial,
+                    FoldDimSize(2),
+                    dim.name(),
+                    Alpha(1),
+                    Beta(0),
+                    FoldDimPos(0),
+                ),
+                Some(())
+            );
+        }
+        assert_eq!(
+            coord.tensor_dims(),
+            vec![PrimaryDimTypes::In, PrimaryDimTypes::X, PrimaryDimTypes::Y]
+        );
+        assert_eq!(
+            coord.coordinates().keys().copied().collect::<Vec<_>>(),
+            coord.tensor_dims()
+        );
+    }
+
+    /// `setPadding(PaddingFormType)` (`:240`) replaces every dim's form at once, where
+    /// [`CoordinateType::set_padding`] replaces one — IBM's two overloads, which differ only in their
+    /// argument and so need two names here.
+    #[test]
+    fn the_padding_form_setter_replaces_every_dims_form() {
+        let mut coord = CoordinateType::default();
+        coord.set_padding(PrimaryDimTypes::X, PadType::PaddedNoZeroPad);
+        coord.set_padding(PrimaryDimTypes::Y, PadType::PaddedWZeroPad);
+        assert_eq!(coord.padding(PrimaryDimTypes::X), PadType::PaddedNoZeroPad);
+
+        let mut replacement = PaddingFormType::default();
+        replacement.set_padding(PrimaryDimTypes::Y, PadType::PaddedFullSpan);
+        coord.set_padding_form(replacement.clone());
+        assert_eq!(
+            coord.padding(PrimaryDimTypes::X),
+            PadType::NoPad,
+            "the form X had is gone, not merged"
+        );
+        assert_eq!(coord.padding(PrimaryDimTypes::Y), PadType::PaddedFullSpan);
+        assert_eq!(coord.padding_form(), &replacement);
+    }
 }
 
-// crustify:todo: e012_CoordinateType
+/// Replaces: CoordinateCategory
+///
+/// Which third of a dim's fold tower one level belongs to — IBM's `CoordinateCategory`
+/// (`dsc/dsc2.h:66-71`), the argument [`CoordinateType::add_fold`] counts the level under. The
+/// spatial levels are the outermost, then the temporal ones, then the element-arrangement ones
+/// (`ddc/ddc_fold.cpp:2754-2765`, whose `i > temporalFoldEnds` / `i > spatialFoldEnds` chain hands the
+/// low positions `SPATIAL_COORD`), which is what makes the three counts a pair of thresholds rather
+/// than a per-level tag.
+///
+/// ⛔ IBM'S FOURTH LITERAL, `UNKNOWN_COORD = 0` (`:67`), IS NOT A CATEGORY AND IS NOT A VARIANT HERE.
+/// It has two jobs in the authority and neither is a value this enum must carry: it is
+/// `getFoldCategory`'s out-of-range answer (`:224-226`), which
+/// [`fold_category`](CoordinateType::fold_category) spells [`None`]; and it is the initialiser a
+/// caller gives a local before a TOTAL if/else chain overwrites it — all seven sites do that
+/// (`ddc/ddc_fold.cpp:579-586`, `:669`, `:2754-2765`, `:3266-3276`, `:3626`,
+/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7492`, `:7708`).
+///
+/// ⛔ AND LEAVING IT OUT IS WHAT MAKES A DESTRUCTIVE ERROR UNSPELLABLE.
+/// `DT_ERROR("[CoordinateType::addFold] Unsupported coordinate category.")` (`:140`) fires AFTER the
+/// fold level and its alpha and beta are in place (`:124-137`), so the authority throws out of a
+/// coordinate that now holds a level no count covers: measured on the reference, a fourth level added
+/// with `UNKNOWN_COORD` survives the throw as position 0 with the label it was given, the three
+/// counts unchanged, and `getCoordinateCategoryOfPos(dim, 0)` reporting `SPATIAL_COORD` for it. On a
+/// dim with no tower the same call creates the key before throwing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CoordinateCategory {
+    /// `SPATIAL_COORD` (`:68`) — a level counted in `numOfSpatialFolds_`, outermost.
+    Spatial,
+    /// `TEMPORAL_COORD` (`:69`) — a level counted in `numOfTemporalFolds_`, after the spatial ones.
+    Temporal,
+    /// `ELEM_ARR_COORD` (`:70`) — a level counted in `numOfElemArrFolds_`, innermost.
+    ElemArr,
+}
 
-// crustify:todo: e012_CoordinateType.coordinates_
+impl CoordinateCategory {
+    /// The three categories in the authority's discriminant order (`:68-70`).
+    pub const ALL: [Self; 3] = [Self::Spatial, Self::Temporal, Self::ElemArr];
+}
 
-// crustify:todo: e012_CoordinateType.coreIdToWkSlice_
+/// Replaces: e011_CoordinateType
+/// Replaces: e012_CoordinateType
+///
+/// `dsc/dsc2.h:75-440`. How one node sees a tensor's dims folded: per dim, a tower of affine fold
+/// levels, how many of those levels are spatial, temporal and element-arrangement, and that dim's
+/// padding form. Five node fields are one of these — a transfer's `transferCoordinates_` (`:852`), a
+/// compute node's `inputCoordinates_` and `outputCoordinate_` (`:948-949`) and an allocation's
+/// `allocateCoordinates_` and `sliceViewCoordinates_` (`:1008-1009`) — and `ddc/ddc_fold.cpp` is the
+/// pass that fills them: `:2748-2769` builds an allocation's tower out of its fold params,
+/// `:4300-4370` propagates a compute node's input tower onto its output.
+///
+/// ⭐ NON-GENERIC WHERE IBM IS A TEMPLATE. `CoordinateType<Dtype>` has exactly one instantiation,
+/// `CoordinateType<CoordinateBaseType>`, and that macro is `int64_t` (`:442`) — 62 uses tree-wide and
+/// no other payload — so the fold payload is [`i64`] and what a level carries is [`Alpha`] and
+/// [`Beta`].
+///
+/// ⛔ `coordinates_` IS PUBLIC IN THE AUTHORITY AND PRIVATE HERE, AND THAT IS WHAT MAKES EVERY LEVEL
+/// OF EVERY TOWER AFFINE. [`add_fold`](Self::add_fold) is the only builder and it only ever calls
+/// [`FoldManager::build_affine_dim`]; no site outside this class builds through the field — the uses
+/// of `coordinates_.at(...)` elsewhere read alphas, betas, sizes and labels (`ddc/ddc_fold.cpp:906`,
+/// `:1192-1197`, `:4016-4024`, `dsc/dsc2.cpp:3848-3871`), and the one non-const binding,
+/// `auto& allocFoldCurrDim = ...coordinates_[currDim.dim_]` (`ddc/ddc_fold.cpp:2276`), is never read
+/// again. [`coordinates`](Self::coordinates) is that read access. The invariant is load-bearing:
+/// [`Clone`] is total only because of it.
+///
+/// ⛔ AND THE JSON IMPORTER IS NOT PORTED. `dsc_import_json` (`:318-358`) rebuilds a coordinate from
+/// the object [`print_coordinates`](Self::print_coordinates) writes, through
+/// `FoldManager::importFromJson` and `FoldDimProp::importFromJson`
+/// (`util/foldManager/foldInfrastructure.h:1553`, `:141`) — neither of which is ported either,
+/// because this crate has no JSON reader. Nothing else in the class needs one: the scheduler mints
+/// coordinates with [`add_fold`](Self::add_fold).
+#[derive(Debug, Default, Eq)]
+pub struct CoordinateType {
+    /// Field: e011_CoordinateType.coordinates_
+    /// Field: e012_CoordinateType.coordinates_
+    ///
+    /// One affine fold tower per folded dim (`:431`). Ordered, and the order reaches IBM's exported
+    /// JSON (`:265`), which is why it is a [`BTreeMap`].
+    coordinates: BTreeMap<PrimaryDimTypes, FoldManager<i64>>,
+    /// Field: e011_CoordinateType.coreIdToWkSlice_
+    /// Field: e012_CoordinateType.coreIdToWkSlice_
+    ///
+    /// Which work slice of each dim a core covers, for the cores this coordinate is addressed by
+    /// (`:432`). Public in the authority too.
+    ///
+    /// ⛔ EMPTY MEANS "USE THE DSC'S", NOT "NO CORES". Every reader spells that out —
+    /// `coordinates.coreIdToWkSlice_.empty() ? sdsc_->coreIdToWkSlice_ : coordinates.coreIdToWkSlice_`
+    /// (`ddc/ddcv1.cpp:2690-2700`, `ddc/ddc_fold.cpp:1376-1378`) — and a non-empty one is a CUSTOM map
+    /// that `buildFoldFromAllocation` refuses to propagate coordinates through when it varies on the
+    /// corelet-split dim (`ddc/ddc_fold.cpp:3110-3120`). The distinction is this map's emptiness and
+    /// nothing else, so it stays a map rather than becoming an [`Option`].
+    /// ⛔ AND [`clear`](Self::clear) DOES NOT TOUCH IT (`:81-96`) — measured: the folds, the counts and
+    /// the padding all go, this map stays.
+    pub core_id_to_wk_slice: BTreeMap<CoreId, BTreeMap<PrimaryDimTypes, WkSliceIdx>>,
+    /// Field: e011_CoordinateType.foldConstructed_
+    /// Field: e012_CoordinateType.foldConstructed_
+    ///
+    /// Whether the pass that builds this coordinate decided the tower is finished (`:436`), set by
+    /// [`complete_fold_construction`](Self::complete_fold_construction) once every dim the allocation
+    /// needs is covered (`ddc/ddc_fold.cpp:3282-3284`) and read as a precondition downstream
+    /// (`ddc/ddc_fold.cpp:1340`, `:2481`).
+    ///
+    /// ⛔ NOT PART OF EQUALITY: `operator==` (`:188-213`) never compares it, measured — two towers
+    /// built alike compare equal with one of them marked constructed.
+    fold_constructed: bool,
+    /// Field: e011_CoordinateType.numOfSpatialFolds_
+    /// Field: e012_CoordinateType.numOfSpatialFolds_
+    ///
+    /// How many of a dim's levels are spatial (`:437`), counted up by [`add_fold`](Self::add_fold).
+    /// Positions `0..spatial` are the spatial ones.
+    num_of_spatial_folds: BTreeMap<PrimaryDimTypes, usize>,
+    /// Field: e011_CoordinateType.numOfTemporalFolds_
+    /// Field: e012_CoordinateType.numOfTemporalFolds_
+    ///
+    /// How many of a dim's levels are temporal (`:438`) — positions `spatial..spatial + temporal`.
+    num_of_temporal_folds: BTreeMap<PrimaryDimTypes, usize>,
+    /// Field: e011_CoordinateType.numOfElemArrFolds_
+    /// Field: e012_CoordinateType.numOfElemArrFolds_
+    ///
+    /// How many of a dim's levels are element-arrangement ones (`:439`). ⛔ NO READER USES IT AS A
+    /// THRESHOLD: every position at or past `spatial + temporal` is element arrangement whatever this
+    /// says (`:160-163`, `:231-232`), so an entry that disagrees with `getNumDims()` is invisible to
+    /// the two category readers and visible to `printCoordinates` and `operator==`.
+    num_of_elem_arr_folds: BTreeMap<PrimaryDimTypes, usize>,
+    /// Field: e011_CoordinateType.padding_
+    /// Field: e012_CoordinateType.padding_
+    ///
+    /// Each dim's padding form (`:440`). ⛔ COMPARED ONLY FOR THE DIMS THAT HAVE A TOWER: `operator==`
+    /// reads `getPadding(coordDim)` inside its `coordinates_` loop (`:202`), so a padding form on a
+    /// dim with no folds is not part of equality — and
+    /// [`clear_fold_for_dim`](Self::clear_fold_for_dim) deliberately leaves such a form behind
+    /// (`:97-99`).
+    padding: PaddingFormType,
+}
 
-// crustify:todo: e012_CoordinateType.foldConstructed_
+impl CoordinateType {
+    /// `clear()` (`:81-96`) — drop every dim's tower, every count and every padding form, and mark the
+    /// coordinate unconstructed.
+    ///
+    /// ⛔ IT DOES NOT CLEAR [`core_id_to_wk_slice`](Self::core_id_to_wk_slice), so this is not
+    /// `*self = Self::default()`. Measured: a coordinate cleared after a core map was written still
+    /// answers that map.
+    /// ⭐ THE `delete` LOOP (`:82-91`) HAS NO COUNTERPART. It frees the `FoldDimProp*`s `addFold`
+    /// allocated, walking them out with `getAllDimProFromPos`; here a [`FoldDimProp`] is owned by
+    /// value inside [`FoldManager`], so dropping the manager is the whole job — and the destructor
+    /// that calls this (`:79`) is [`Drop`] doing the same.
+    pub fn clear(&mut self) {
+        self.coordinates.clear();
+        self.num_of_spatial_folds.clear();
+        self.num_of_temporal_folds.clear();
+        self.num_of_elem_arr_folds.clear();
+        self.padding.clear();
+        self.fold_constructed = false;
+    }
 
-// crustify:todo: e012_CoordinateType.numOfElemArrFolds_
+    /// `clearFoldForDim(dim)` (`:98-114`) — zero one dim's three counts and reset its tower to a
+    /// zero-dimension fold space, keeping the dim's key and its padding form.
+    ///
+    /// ⛔ THE KEY SURVIVING IS OBSERVABLE, AND A COPY THEN DROPS IT.
+    /// [`has_coord_for_dim`](Self::has_coord_for_dim) still answers `true` and
+    /// [`tensor_dims`](Self::tensor_dims) still lists the dim, but [`Clone`] skips a tower with no
+    /// levels, so the copy has neither — measured, and the two therefore compare unequal.
+    /// ⛔ AND A COUNT IS ZEROED ONLY IF THE DIM ALREADY HAD ONE (`:101-111`): the authority's
+    /// `count(dim)` guards mean this never inserts, which is why it adds nothing.
+    pub fn clear_fold_for_dim(&mut self, dim: PrimaryDimTypes) {
+        for counts in [
+            &mut self.num_of_spatial_folds,
+            &mut self.num_of_temporal_folds,
+            &mut self.num_of_elem_arr_folds,
+        ] {
+            if let Some(count) = counts.get_mut(&dim) {
+                *count = 0;
+            }
+        }
+        if let Some(fold_manager) = self.coordinates.get_mut(&dim) {
+            fold_manager.reset();
+        }
+    }
 
-// crustify:todo: e012_CoordinateType.numOfSpatialFolds_
+    /// `completeFoldConstruction()` (`:116`) — mark the tower finished (`ddc/ddc_fold.cpp:3282-3284`).
+    pub fn complete_fold_construction(&mut self) {
+        self.fold_constructed = true;
+    }
 
-// crustify:todo: e012_CoordinateType.numOfTemporalFolds_
+    /// `foldConstructed()` (`:117`).
+    pub fn fold_constructed(&self) -> bool {
+        self.fold_constructed
+    }
 
-// crustify:todo: e012_CoordinateType.padding_
+    /// `addFold(dim, coordCat, foldCardinality, foldLabel, alpha, beta, pos)` (`:118-142`) — insert one
+    /// affine fold level into `dim`'s tower at `pos` and count it under `coord_cat`.
+    ///
+    /// The one production shape is a loop from the last fold param down to the first, always at
+    /// position 0, which leaves the levels in fold-param order with the spatial ones outermost
+    /// (`ddc/ddc_fold.cpp:2757-2769`).
+    ///
+    /// ⛔ [`None`] IS THE FOLD MANAGER'S OWN TWO REFUSALS AND NOTHING ELSE: a `pos` past the end of the
+    /// tower or a negative one ([`FoldManager::build_affine_dim`]), and an alpha or beta inserted at a
+    /// level that is not affine ([`FoldManager::insert_alpha_beta`]). The category's `DT_ERROR`
+    /// (`:140`) is not among them — [`CoordinateCategory`] has no variant for it.
+    /// ⛔ AND A REFUSAL LEAVES THE DIM'S KEY BEHIND, because `coordinates_[dim]` default-constructs
+    /// before anything can fail (`:126`). Measured on the reference, which creates the key and then
+    /// throws.
+    /// ⛔ THE CARDINALITY IS [`FoldDimSize`], NOT [`Cardinality`]: IBM takes an `int` and stores it in
+    /// `FoldDimProp::factor_`, a `uint32_t` (`util/foldManager/foldInfrastructure.h:153`), so a
+    /// negative cardinality is a wrap there and unspellable here.
+    ///
+    /// Transposing the alpha and the beta is `E0308` — measured 2026-09-19 by compiling the block
+    /// below against the built rlibs, one error, "arguments to this method are incorrect", rather than
+    /// inferred from the annotation, which stable rustdoc does not check. The control beside it passes
+    /// the same two values the right way round through the same public path, so the failure is
+    /// attributable to the order and not to a renamed method or a moved parameter.
+    /// ```compile_fail,E0308
+    /// use deeptools::schedule::dims::PrimaryDimTypes;
+    /// use deeptools::schedule::dsc2::{Alpha, Beta, CoordinateCategory, CoordinateType};
+    /// use deeptools::schedule::fold::{FoldDimPos, FoldDimSize};
+    /// let mut coord = CoordinateType::default();
+    /// coord.add_fold(
+    ///     PrimaryDimTypes::X,
+    ///     CoordinateCategory::Spatial,
+    ///     FoldDimSize(4),
+    ///     "core",
+    ///     Beta(1),
+    ///     Alpha(10),
+    ///     FoldDimPos(0),
+    /// );
+    /// ```
+    /// ```
+    /// use deeptools::schedule::dims::PrimaryDimTypes;
+    /// use deeptools::schedule::dsc2::{Alpha, Beta, CoordinateCategory, CoordinateType};
+    /// use deeptools::schedule::fold::{FoldDimPos, FoldDimSize};
+    /// let mut coord = CoordinateType::default();
+    /// assert_eq!(
+    ///     coord.add_fold(
+    ///         PrimaryDimTypes::X,
+    ///         CoordinateCategory::Spatial,
+    ///         FoldDimSize(4),
+    ///         "core",
+    ///         Alpha(10),
+    ///         Beta(1),
+    ///         FoldDimPos(0),
+    ///     ),
+    ///     Some(())
+    /// );
+    /// ```
+    pub fn add_fold(
+        &mut self,
+        dim: PrimaryDimTypes,
+        coord_cat: CoordinateCategory,
+        fold_cardinality: FoldDimSize,
+        fold_label: &str,
+        alpha: Alpha,
+        beta: Beta,
+        pos: FoldDimPos,
+    ) -> Option<()> {
+        let fold_dim = FoldDimProp::new(fold_cardinality, fold_label);
+        let fold_for_curr_dim = self.coordinates.entry(dim).or_default();
+        fold_for_curr_dim.build_affine_dim(&fold_dim, pos)?;
+        fold_for_curr_dim.insert_alpha_beta(&alpha.0, &beta.0, pos)?;
+        let counts = match coord_cat {
+            CoordinateCategory::Spatial => &mut self.num_of_spatial_folds,
+            CoordinateCategory::Temporal => &mut self.num_of_temporal_folds,
+            CoordinateCategory::ElemArr => &mut self.num_of_elem_arr_folds,
+        };
+        *counts.entry(dim).or_default() += 1;
+        Some(())
+    }
+
+    /// `getNumOfSpatialFolds(dim)` (`:144-146`) — zero for a dim with no entry.
+    pub fn num_of_spatial_folds(&self, dim: PrimaryDimTypes) -> usize {
+        self.num_of_spatial_folds.get(&dim).copied().unwrap_or(0)
+    }
+
+    /// `getNumOfTemporalFolds(dim)` (`:147-149`).
+    pub fn num_of_temporal_folds(&self, dim: PrimaryDimTypes) -> usize {
+        self.num_of_temporal_folds.get(&dim).copied().unwrap_or(0)
+    }
+
+    /// `getNumOfElemArrFolds(dim)` (`:150-152`).
+    pub fn num_of_elem_arr_folds(&self, dim: PrimaryDimTypes) -> usize {
+        self.num_of_elem_arr_folds.get(&dim).copied().unwrap_or(0)
+    }
+
+    /// `getCoordinateCategoryOfPos(dim, pos)` (`:154-164`) — which category the level at `pos` is
+    /// counted under, by the two thresholds the counts define. `dsc/dsc2.cpp:3857` is the caller,
+    /// asking whether a fold is an element-arrangement one before it multiplies that level's
+    /// cardinality into a dim size.
+    ///
+    /// ⛔ [`None`] IS THE TWO THROWS AND NOTHING ELSE: `coordinates_.at(dim)` on a dim with no tower
+    /// (`:157`) and `DT_CHECK(pos < coord.getNumDims())` (`:158`). This method has no `UNKNOWN_COORD`
+    /// arm — its three branches are total over everything that passes the check.
+    /// ⛔ A NEGATIVE `pos` PASSES THAT CHECK AND IS REPORTED AS A CATEGORY, and this port keeps that:
+    /// measured, position `-1` of a three-level tower answers `SPATIAL_COORD`. Which is why `pos` is a
+    /// raw [`FoldDimPos`] here and NOT one of its two resolutions — neither the from-the-end
+    /// [`resolve`](FoldDimPos::resolve) nor [`index`](FoldDimPos::index).
+    /// ⛔ AND IT DISAGREES WITH [`fold_category`](Self::fold_category) ON EXACTLY THAT POSITION, which
+    /// is a difference between the two methods rather than a defect in either.
+    pub fn coordinate_category_of_pos(
+        &self,
+        dim: PrimaryDimTypes,
+        pos: FoldDimPos,
+    ) -> Option<CoordinateCategory> {
+        let num_dims = i64::try_from(self.coordinates.get(&dim)?.num_dims()).ok()?;
+        let pos = i64::from(pos.0);
+        if pos >= num_dims {
+            return None;
+        }
+        Some(self.category_at(dim, pos))
+    }
+
+    /// `getFoldCategory(dim, pos)` (`:222-234`) — the same two thresholds, but answering
+    /// `UNKNOWN_COORD` for a position outside the tower instead of throwing. Its three callers read a
+    /// level's category off one coordinate and add a fold to another with it
+    /// (`ddc/ddc_fold.cpp:4016-4024`, `:4301-4310`, `:4322-4370`).
+    ///
+    /// ⛔ [`None`] IS BOTH OF THE AUTHORITY'S TWO OUTCOMES HERE — `UNKNOWN_COORD` (`:225`) and the
+    /// `coordinates_.at(dim)` throw (`:224`) — and that collapse is safe because it is not observable
+    /// downstream: all three callers hand the answer straight to `addFold`, whose `DT_ERROR` on
+    /// `UNKNOWN_COORD` (`:140`) ends the run exactly as the `.at` would have. The sentinel cannot
+    /// travel further than that in the authority, and here it cannot be spelled at all, since
+    /// [`add_fold`](Self::add_fold) takes a [`CoordinateCategory`] that has no such variant.
+    /// ⛔ AND ONLY ONE OF THE THREE CALLERS CAN REACH IT: `:4301` and `:4322` bound their loop by the
+    /// very tower they then read (`inputFm` IS `computeCoord.coordinates_.at(dim)`), while `:4017`
+    /// bounds it by a DIFFERENT coordinate's tower, so a longer right-hand side asks this coordinate
+    /// for a level it does not have.
+    pub fn fold_category(
+        &self,
+        dim: PrimaryDimTypes,
+        pos: FoldDimPos,
+    ) -> Option<CoordinateCategory> {
+        let num_dims = i64::try_from(self.coordinates.get(&dim)?.num_dims()).ok()?;
+        let pos = i64::from(pos.0);
+        if pos < 0 || pos >= num_dims {
+            return None;
+        }
+        Some(self.category_at(dim, pos))
+    }
+
+    /// The two thresholds both category readers apply (`:159-163`, `:227-233`), over a position each
+    /// has already accepted.
+    fn category_at(&self, dim: PrimaryDimTypes, pos: i64) -> CoordinateCategory {
+        let spatial = self.num_of_spatial_folds(dim) as i64;
+        let temporal = self.num_of_temporal_folds(dim) as i64;
+        if pos < spatial {
+            CoordinateCategory::Spatial
+        } else if pos < spatial + temporal {
+            CoordinateCategory::Temporal
+        } else {
+            CoordinateCategory::ElemArr
+        }
+    }
+
+    /// `setNumOfTemporalFoldPerDim(dim, num)` (`:215-217`) — overwrite a dim's temporal count.
+    ///
+    /// ⛔ NO CALLER TREE-WIDE, AND THE AUTHORITY SAYS SO ITSELF: "TEMP. remove these two after fold
+    /// type vector is used" (`:214`). Ported because it is this class's own method over this class's
+    /// own field, and because what it does to the category readers is a fact about them — measured,
+    /// setting the temporal count to 4 on a three-level tower moves BOTH inner positions into
+    /// `TEMPORAL_COORD` and leaves the element-arrangement count describing nothing.
+    /// ⛔ [`None`] IS `numOfTemporalFolds_.at(dim)` (`:216`): a dim that has never been counted under
+    /// this category throws rather than gaining an entry.
+    pub fn set_num_of_temporal_fold_per_dim(
+        &mut self,
+        dim: PrimaryDimTypes,
+        num: usize,
+    ) -> Option<()> {
+        *self.num_of_temporal_folds.get_mut(&dim)? = num;
+        Some(())
+    }
+
+    /// `setNumOfElemArrFoldPerDim(dim, num)` (`:218-220`) — the same for the element-arrangement
+    /// count, with the same absent caller and the same [`None`].
+    pub fn set_num_of_elem_arr_fold_per_dim(
+        &mut self,
+        dim: PrimaryDimTypes,
+        num: usize,
+    ) -> Option<()> {
+        *self.num_of_elem_arr_folds.get_mut(&dim)? = num;
+        Some(())
+    }
+
+    /// `setPadding(dim, pad)` (`:236-238`).
+    pub fn set_padding(&mut self, dim: PrimaryDimTypes, pad: PadType) {
+        self.padding.set_padding(dim, pad);
+    }
+
+    /// `setPadding(padding)` (`:240`) — replace every dim's form at once. Named apart from
+    /// [`set_padding`](Self::set_padding) because IBM's two overloads differ only in their argument.
+    pub fn set_padding_form(&mut self, padding: PaddingFormType) {
+        self.padding = padding;
+    }
+
+    /// `getPadding(dim)` (`:242-244`) — `NoPad` for a dim with no form.
+    pub fn padding(&self, dim: PrimaryDimTypes) -> PadType {
+        self.padding.padding(dim)
+    }
+
+    /// `getPadding()` (`:245`) — every dim's form. Borrowed where IBM returns a copy; a caller that
+    /// needs an independent one writes `.clone()`.
+    pub fn padding_form(&self) -> &PaddingFormType {
+        &self.padding
+    }
+
+    /// `getTensorDims()` (`:246-252`) — every dim that has a tower, in dim order.
+    ///
+    /// ⛔ A DIM WHOSE TOWER WAS CLEARED IS STILL ONE OF THEM, exactly as in
+    /// [`has_coord_for_dim`](Self::has_coord_for_dim).
+    pub fn tensor_dims(&self) -> Vec<PrimaryDimTypes> {
+        self.coordinates.keys().copied().collect()
+    }
+
+    /// `hasCoordForDim(dim)` (`:254-256`) — whether this dim has an entry, which is not the same as
+    /// having a level: see [`clear_fold_for_dim`](Self::clear_fold_for_dim).
+    pub fn has_coord_for_dim(&self, dim: PrimaryDimTypes) -> bool {
+        self.coordinates.contains_key(&dim)
+    }
+
+    /// The `coordinates_` field's read access (`:431`), which is public in the authority and how every
+    /// pass outside this class reaches a level's alpha, beta, size or label.
+    ///
+    /// ⛔ SHARED ON PURPOSE. A `&mut` here would let a caller build a Map or Constant level and break
+    /// the all-affine invariant [`Clone`] rests on; no in-scope site needs one, and the two that
+    /// `const_cast` (`dsc/dsc2.cpp:3849`, `ddc/ddc_fold.cpp:4016`) do it only because IBM's readers are
+    /// not `const`.
+    pub fn coordinates(&self) -> &BTreeMap<PrimaryDimTypes, FoldManager<i64>> {
+        &self.coordinates
+    }
+
+    /// `printCoordinates(out, printContent, ps)` (`:257-315`) — the coordinate as the JSON object
+    /// `dsc_import_json` reads back, `ps` indenting every line of it.
+    ///
+    /// ⛔ [`None`] IS [`FoldManager::print`]'s REFUSAL and nothing this method decides.
+    /// ⭐ A DIM WITH NO LEVELS PRINTS ITS VALUE WHERE THE OTHERS PRINT AN OBJECT — `"folds" : "0"` —
+    /// because a zero-dimension manager prints just its datum and ignores the prefix. Measured, and it
+    /// is why the output is not JSON-uniform across dims.
+    /// ⛔ IBM'S `int foldLevelcount = foldManager.getNumDims()` (`:266`) IS DEAD HERE AND ONLY HERE:
+    /// nothing in this body reads it. `debugPrint` computes the same thing and uses it as its loop
+    /// bound (`:365`).
+    pub fn print_coordinates(
+        &self,
+        out: &mut String,
+        print_content: PrintContent,
+        ps: &str,
+    ) -> Option<()> {
+        let indent = "  ";
+        let ps1 = format!("{ps}{indent}");
+        let ps2 = format!("{ps1}{indent}");
+        let ps3 = format!("{ps2}{indent}");
+        out.push('\n');
+        out.push_str(ps);
+        out.push_str("\"coordinates_\" : {\n");
+        out.push_str(&ps1);
+        out.push_str("\"coordInfo\" : {\n");
+        let mut remaining = self.coordinates.len();
+        for (&curr_dim, fold_manager) in &self.coordinates {
+            out.push_str(&ps2);
+            out.push_str(&format!("\"{}\" : {{\n", curr_dim.name()));
+            for (key, count) in [
+                ("spatial", self.num_of_spatial_folds(curr_dim)),
+                ("temporal", self.num_of_temporal_folds(curr_dim)),
+                ("elemArr", self.num_of_elem_arr_folds(curr_dim)),
+            ] {
+                out.push_str(&ps3);
+                out.push_str(&format!("\"{key}\" : {count},\n"));
+            }
+            out.push_str(&ps3);
+            out.push_str(&format!(
+                "\"padding\" : \"{}\",\n",
+                self.padding.padding_as_str(curr_dim)
+            ));
+            out.push_str(&ps3);
+            out.push_str("\"folds\" : ");
+            fold_manager.print(out, &ps3, print_content)?;
+            out.push('\n');
+            out.push_str(&ps2);
+            out.push('}');
+            remaining -= 1;
+            if remaining > 0 {
+                out.push_str(", ");
+            }
+            out.push('\n');
+        }
+        out.push_str(&ps1);
+        out.push_str("},\n");
+        out.push_str(&ps1);
+        out.push_str("\"coreIdToWkSlice_\" : { \n");
+        let mut remaining = self.core_id_to_wk_slice.len();
+        for (core_id, wk_slice) in &self.core_id_to_wk_slice {
+            out.push_str(&ps2);
+            out.push_str(&format!("\"{}\" : {{ ", core_id.0));
+            let mut inner = wk_slice.len();
+            for (dim, slice) in wk_slice {
+                out.push_str(&format!("\"{}\" : {}", dim.name(), slice.0));
+                inner -= 1;
+                if inner > 0 {
+                    out.push_str(", ");
+                }
+            }
+            out.push_str(" }");
+            remaining -= 1;
+            if remaining > 0 {
+                out.push_str(", ");
+            }
+            out.push('\n');
+        }
+        out.push_str(&ps1);
+        out.push_str("} \n");
+        out.push_str(ps);
+        out.push_str("}\n");
+        Some(())
+    }
+
+    /// `debugPrint(out, printContent, ps)` (`:360-425`) — the human-readable dump the fold passes write
+    /// under `coordPropReportLevel_ > 2` (`ddc/ddc_fold.cpp:593`, `:2773`, `:3283`, `:4381`).
+    ///
+    /// ⭐ IBM'S `printContent` AND `ps` ARE GONE BECAUSE THE BODY NEVER READS EITHER. Measured: the
+    /// output with `(true, "IGNORED")` is byte-identical to the output with the defaults, and every
+    /// call site passes the defaults anyway.
+    /// ⛔ [`None`] IS `foldDims.at(i)` (`:372`) AND `collectFoldFunctionAtLevel`'s `DT_CHECK` (`:374`),
+    /// both unreachable from here: the loop is bounded by the same `getNumDims()` that sizes the one
+    /// and guards the other.
+    /// ⛔ AND THE `WkSplit_leaf` ARM (`:377-378`) IS UNREACHABLE RATHER THAN UNPORTED, for the reason
+    /// [`FoldManager::build_dim`] gives: nothing builds a WkSplit level, so no tower holds one. A
+    /// Constant or Map level cannot be here either — [`add_fold`](Self::add_fold) builds affine levels
+    /// only — which leaves the two affine arms as the whole of this dump.
+    pub fn debug_print(&self, out: &mut String) -> Option<()> {
+        out.push_str("\nDDC Coordinates<int64_t>: ");
+        out.push_str(&format!("{} coordinate entries", self.coordinates.len()));
+        for (&curr_dim, fold_manager) in &self.coordinates {
+            out.push_str(&format!("\n\nPrimary Dim= {}", curr_dim.name()));
+            let fold_dims = fold_manager.fold_dim_props();
+            for pos in 0..fold_manager.num_dims() {
+                out.push_str("\n  Fold dimension= ");
+                fold_dims.get(pos)?.print(out);
+                for fold_function in fold_manager.collect_at_level(pos)? {
+                    match fold_function {
+                        FoldFunc::AffineNonLeaf(affine) => {
+                            out.push_str("\n    Affine:");
+                            affine.print_meta_data(out, "");
+                        }
+                        FoldFunc::AffineLeaf(affine) => {
+                            out.push_str("\n    Affine: ");
+                            affine.print_meta_data(out, "");
+                        }
+                        FoldFunc::ConstantNonLeaf(_) => out.push_str("\n    Constant "),
+                        FoldFunc::ConstantLeaf(_)
+                        | FoldFunc::MapNonLeaf(_)
+                        | FoldFunc::MapLeaf(_) => {}
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "\n  #Spatial  = {}\n  #Temporal = {}\n  #ElemArr  = {}",
+                self.num_of_spatial_folds(curr_dim),
+                self.num_of_temporal_folds(curr_dim),
+                self.num_of_elem_arr_folds(curr_dim)
+            ));
+            out.push_str(&format!(
+                "\n  Padding: {{ ({}, {}) }}",
+                curr_dim.name(),
+                self.padding.padding_as_str(curr_dim)
+            ));
+        }
+        if !self.core_id_to_wk_slice.is_empty() {
+            out.push_str("\n  coreIdToWkSlice_ : { \n");
+            let mut remaining = self.core_id_to_wk_slice.len();
+            for (core_id, wk_slice) in &self.core_id_to_wk_slice {
+                out.push_str(&format!("    {} : {{ ", core_id.0));
+                let mut inner = wk_slice.len();
+                for (dim, slice) in wk_slice {
+                    out.push_str(&format!("{} : {}", dim.name(), slice.0));
+                    inner -= 1;
+                    if inner > 0 {
+                        out.push_str(", ");
+                    }
+                }
+                out.push_str(" }");
+                remaining -= 1;
+                if remaining > 0 {
+                    out.push_str(", ");
+                }
+                out.push('\n');
+            }
+            out.push_str("  } \n");
+        }
+        Some(())
+    }
+}
+
+impl Clone for CoordinateType {
+    /// `operator=(const CoordinateType&)` (`:166-184`) and the copy constructor that delegates to it
+    /// (`:186`) — the only way a coordinate is copied in the authority, and what every node's own copy
+    /// reaches.
+    ///
+    /// ⛔ IT IS A REBUILD, NOT A MEMBERWISE COPY, AND IT DROPS A DIM WHOSE TOWER HAS NO LEVELS. The
+    /// authority clears, then walks each dim's levels from the innermost out and replays them through
+    /// `addFold` (`:170-179`), so a dim with zero levels contributes no call and never reaches the
+    /// copy's `coordinates_` — measured: a coordinate whose one dim was cleared with
+    /// [`clear_fold_for_dim`](Self::clear_fold_for_dim) copies to an empty one that compares UNEQUAL to
+    /// its source, while the padding form for that same dropped dim survives.
+    /// ⭐ THE REPLAY IS A LEVEL-FOR-LEVEL IDENTITY ON AN AFFINE TOWER, which is what lets this be a
+    /// [`Clone`] at all: `addFold` re-inserts each level at position 0 in innermost-to-outermost order,
+    /// so the copy's sizes, labels, alphas and betas come back in the source's order — measured against
+    /// the reference for a three-level tower. Cloning the [`FoldManager`] instead of replaying it is
+    /// therefore the same tower, and it needs neither `getAlphaBeta` nor the `insertAlphaBeta` that
+    /// could refuse. The invariant it rests on is [`coordinates`](Self::coordinates) being read-only.
+    /// ⛔ BUT THE COUNTS ARE RECOMPUTED, NOT COPIED, and that is visible whenever they disagree with the
+    /// tower: the replay counts each level under the category the SOURCE reports for its position, so a
+    /// temporal count raised past the tower's depth by
+    /// [`set_num_of_temporal_fold_per_dim`](Self::set_num_of_temporal_fold_per_dim) comes back as the
+    /// number of positions that actually read as temporal.
+    fn clone(&self) -> Self {
+        let mut copy = Self::default();
+        for (&dim, fold_manager) in &self.coordinates {
+            let num_dims = fold_manager.num_dims();
+            if num_dims == 0 {
+                continue;
+            }
+            copy.coordinates.insert(dim, fold_manager.clone());
+            for pos in 0..num_dims {
+                let counts = match self.category_at(dim, pos as i64) {
+                    CoordinateCategory::Spatial => &mut copy.num_of_spatial_folds,
+                    CoordinateCategory::Temporal => &mut copy.num_of_temporal_folds,
+                    CoordinateCategory::ElemArr => &mut copy.num_of_elem_arr_folds,
+                };
+                *counts.entry(dim).or_default() += 1;
+            }
+        }
+        copy.padding = self.padding.clone();
+        copy.core_id_to_wk_slice = self.core_id_to_wk_slice.clone();
+        copy.fold_constructed = self.fold_constructed;
+        copy
+    }
+}
+
+impl PartialEq for CoordinateType {
+    /// `operator==(const CoordinateType&)` (`:188-213`) — the same dims, each with the same three
+    /// counts, the same padding form and the same tower, plus the same core-to-work-slice map.
+    ///
+    /// ⛔ IT IGNORES `foldConstructed_`, measured — two coordinates built alike are equal with one of
+    /// them marked constructed. A derived [`PartialEq`] would compare it.
+    /// ⛔ AND IT COMPARES PADDING ONLY FOR THE DIMS THAT HAVE A TOWER (`:202`), so a form left behind on
+    /// a dim with no folds is invisible to equality — which is exactly the state
+    /// [`clear_fold_for_dim`](Self::clear_fold_for_dim) leaves. A derived one would compare that too.
+    fn eq(&self, rhs: &Self) -> bool {
+        if self.coordinates.len() != rhs.coordinates.len() {
+            return false;
+        }
+        for (&coord_dim, lhs_fm) in &self.coordinates {
+            let Some(rhs_fm) = rhs.coordinates.get(&coord_dim) else {
+                return false;
+            };
+            if self.num_of_spatial_folds(coord_dim) != rhs.num_of_spatial_folds(coord_dim)
+                || self.num_of_temporal_folds(coord_dim) != rhs.num_of_temporal_folds(coord_dim)
+                || self.num_of_elem_arr_folds(coord_dim) != rhs.num_of_elem_arr_folds(coord_dim)
+                || self.padding(coord_dim) != rhs.padding(coord_dim)
+            {
+                return false;
+            }
+            if lhs_fm != rhs_fm {
+                return false;
+            }
+        }
+        self.core_id_to_wk_slice == rhs.core_id_to_wk_slice
+    }
+}
 
 /// `dsc2::ScheduleNode` (`dsc/dsc2.h:444-524`) — the base every node in a schedule tree derives
 /// from. `BlockNode` (`:526`) derives from it and owns the children; `LoopNode` (`:563`) and
@@ -5628,14 +6417,13 @@ pub struct TransferRepetition {
 /// numbering, which listed ten of its fields; those are renumbered onto e034 below, and this batch
 /// adds `repetition_`, `paddingInfo_` and the four `DataInfo` operands.
 ///
-/// ⛔ THIS CARRIES SIXTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED. The
-/// other four, with the reason:
+/// ⛔ THIS CARRIES SEVENTEEN OF TRANSFERNODE'S OWN TWENTY DECLARED FIELDS AND NOTHING INHERITED. The
+/// other three, with the reason:
 ///  * `lastFusableParentLoopSrc_` (`:830`) and `lastFusableParentLoopDst_` (`:831`) are
 ///    `const LoopNode*` held as POINTER IDENTITY, which needs e029_ScheduleNode's `name_`, exactly as
 ///    `DataInfo::bufferSwitchPosition_` does;
 ///  * `coreletViews_` (`:851`) is a map of `CoreletView`, four `UnitView`s (`:847-850`) —
-///    e029_ScheduleNode;
-///  * `transferCoordinates_` (`:852`) is `CoordinateType<CoordinateBaseType>` — e012.
+///    e029_ScheduleNode.
 ///
 /// ⚠️ AND THE OPEN ANCHORS DO NOT MATCH THAT SET, in both directions, because the scheduler's field
 /// scan takes one declarator per declaration:
@@ -5836,6 +6624,17 @@ pub struct TransferNode {
     ///
     /// ⛔ AND IT IS WHY THIS TYPE HAS NO `Clone` DERIVE — see [`clone`](Self::clone).
     pub padding_info: TransferPadInfo,
+    /// Field: e034_TransferNode.transferCoordinates_
+    ///
+    /// How this transfer's dims are folded (`dsc/dsc2.h:852`). `buildFoldForTransferNode` is the
+    /// writer — it copies the allocation's coordinate for each transferred dim and then rebuilds the
+    /// levels the transfer itself splits (`ddc/ddc_fold.cpp:1340-1420`) — and `getTransferFoldParams`
+    /// and the LDS lowering are the readers (`ddc/ddc_fold.cpp:906`, `dsc/dsc2.cpp:3848-3871`).
+    ///
+    /// ⛔ AND IT IS COPIED BY [`clone`](Self::clone) WHERE `paddingInfo_` IS NOT: IBM's copy
+    /// constructor is implicit, so every member with a real copy is copied, and
+    /// [`CoordinateType`]'s is the authority's `operator=` replay.
+    pub transfer_coordinates: CoordinateType,
 }
 
 impl Default for TransferNode {
@@ -5865,6 +6664,7 @@ impl Default for TransferNode {
             core_id_to_gtr_info: BTreeMap::new(),
             transfer_size: BTreeMap::new(),
             padding_info: TransferPadInfo::default(),
+            transfer_coordinates: CoordinateType::default(),
         }
     }
 }
@@ -5906,6 +6706,7 @@ impl Clone for TransferNode {
             core_id_to_gtr_info: self.core_id_to_gtr_info.clone(),
             transfer_size: self.transfer_size.clone(),
             padding_info: TransferPadInfo::default(),
+            transfer_coordinates: self.transfer_coordinates.clone(),
         }
     }
 }
@@ -6057,8 +6858,6 @@ impl TransferNode {
 // crustify:todo: e034_TransferNode.lastFusableParentLoopSrc_
 
 // crustify:todo: e034_TransferNode.srcIndirectLoopsAndSize_
-
-// crustify:todo: e034_TransferNode.transferCoordinates_
 
 /// How many folds one compute node engages — `numFoldsEngaged` (`dsc/dsc2.h:940`, `int`), filled
 /// from `sysDef.numFoldsPerUnit` (`ddc/ddcv1.cpp:1887`).
@@ -6721,15 +7520,13 @@ pub struct ComputeCoreletView {
 ///
 /// ⛔ THIS CARRIES COMPUTENODE'S OWN DECLARED FIELDS AND NOTHING INHERITED — IBM derives it from
 /// `InheritWithClone<ScheduleNode, ComputeNode>` and its constructor tags the base with `COMPUTE`
-/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. THREE field anchors stay OPEN,
-/// every one blocked on a type another agent owns and none on this class: `inputCoordinates_` and
-/// `outputCoordinate_` are `CoordinateType<CoordinateBaseType>` (`:948-949`) — e023 under the
-/// current numbering, whose own anchors in this file still read `e012` — and the third is
-/// `instrAttribute_.computeMaskLoopOffsets_` below. ⛔ THE ONE DEP `port.json` NAMES,
-/// `e023_CoordinateType`, WAS UNSATISFIED WHEN THIS WAS WRITTEN: it is `std::map<PrimaryDimTypes,
-/// FoldManager<Dtype>>` (`dsc/dsc2.h:431`) and `FoldManager` had not landed. ⭐ IT HAS NOW —
-/// e026_FoldManager, `src/schedule/fold.rs` — so that dep is satisfied and the two coordinate anchors
-/// are open work rather than blocked work.
+/// (`dsc/dsc2.h:900-901`), and the base's thirteen fields are e029's. ONE field anchor stays OPEN:
+/// `instrAttribute_.computeMaskLoopOffsets_` below, which is a TREE fact, not a node fact.
+/// ⭐ `inputCoordinates_` AND `outputCoordinate_` (`:948-949`) ARE CARRIED NOW. They were blocked on
+/// `CoordinateType` — `e023_CoordinateType` under the numbering `port.json` used, `e012` in the
+/// anchors this file carried, and `e011` in the one that filled it — which is
+/// `std::map<PrimaryDimTypes, FoldManager<Dtype>>` (`dsc/dsc2.h:431`) and needed e026_FoldManager
+/// first. Both have landed in `src/schedule/dsc2.rs` and `src/schedule/fold.rs`.
 /// ⭐ `coreletViews_` AND ITS TWO SEPARATELY ANCHORED HALVES ARE PORTED HERE and were not portable
 /// when e024 ran: `ScheduleNode::UnitView` (`:943-947`) landed with e029 in `625e761da`.
 /// ⭐ AND `inputsLdsAndLoopOffsets_` / `outputsLdsAndLoopOffsets_` (`:937-938`) ARE CARRIED NOW: the
@@ -6849,6 +7646,25 @@ pub struct ComputeNode {
     /// (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:546-547`). The per-core answer
     /// comes from [`UnitView::sizes_for_core`] inside the view, not from a second key.
     pub corelet_views: BTreeMap<CoreletId, ComputeCoreletView>,
+    /// Field: e035_ComputeNode.inputCoordinates_
+    ///
+    /// How each input operand's dims are folded, one coordinate per input (`dsc/dsc2.h:948`) —
+    /// parallel to [`inputs`](Self::inputs) on the same index.
+    ///
+    /// ⛔ THE PROPAGATION READS THIS AND WRITES [`output_coordinate`](Self::output_coordinate), PER
+    /// LEVEL AND PER CATEGORY: `buildFoldForComputeNode` takes the input tower's category at each
+    /// position with `getFoldCategory` and adds the matching level to the output
+    /// (`ddc/ddc_fold.cpp:4300-4370`), which is the one path on which
+    /// [`CoordinateType::fold_category`]'s `UNKNOWN_COORD` can be reached — see its note.
+    pub input_coordinates: Vec<CoordinateType>,
+    /// Field: e035_ComputeNode.outputCoordinate_
+    ///
+    /// How the output operand's dims are folded (`dsc/dsc2.h:949`).
+    ///
+    /// ⛔ SINGULAR WHERE [`input_coordinates`](Self::input_coordinates) IS A VECTOR, and the
+    /// authority's field name says so: one coordinate however many entries
+    /// [`outputs`](Self::outputs) has.
+    pub output_coordinate: CoordinateType,
     /// Field: e035_ComputeNode.repetitionWithOffset_
     ///
     /// `dsc/dsc2.h:954`.
@@ -6873,6 +7689,8 @@ impl Default for ComputeNode {
             is_opaque_op: false,
             corelet_views: BTreeMap::new(),
             repetition_with_offset: RepetitionWithOffset::default(),
+            input_coordinates: Vec::new(),
+            output_coordinate: CoordinateType::default(),
         }
     }
 }
@@ -7065,10 +7883,6 @@ impl ComputeNode {
         formats
     }
 }
-
-// crustify:todo: e035_ComputeNode.inputCoordinates_
-
-// crustify:todo: e035_ComputeNode.outputCoordinate_
 
 /// Replaces: e044_ConditionNode
 ///
@@ -7860,17 +8674,17 @@ pub struct StickSpread(pub i32);
 /// the L3 scheduler reads its addresses back
 /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4926-4950`).
 ///
-/// ⛔ THIS CARRIES 15 OF ALLOCATENODE'S 21 FIELDS, so the `e028_AllocateNode` and
+/// ⛔ THIS CARRIES 17 OF ALLOCATENODE'S 21 FIELDS, so four `e028_AllocateNode` and
 /// `e037_AllocateNode` anchors below stay open. Three are schedule-node pointer identity, e013's
 /// `name_` and the tree it hangs on: `tempStorageForCompute_` (`:978`), the `ComputeNode` whose
 /// temporary this region is; `relatedIndirectAccessAlloc_` (`:999-1001`), the other half of an
 /// indirect access; and `allocUsers_` (`:1007`), the reference-counted list of nodes that read or
 /// write the region. All three serialize by node name and re-resolve through `nodeNamePtrMap`
 /// (`dsc/dsc2.cpp:840-843`, `:919-920`, `:934-944`, `:1743-1745`, `:1798-1801`, `:1811-1823`). The
-/// other three need types this campaign has not scoped: `startAddressCoreCorelet_` (`:985-986`) is
-/// a `FoldManager<int64_t>`, and `allocateCoordinates_` and `sliceViewCoordinates_` (`:1008-1009`)
-/// are `CoordinateType`, e012, which is built on the same `util/foldManager/` — and the authority's
-/// own JSON round trip leaves the slice view a "TO DO" on both sides (`dsc/dsc2.cpp:1828`).
+/// fourth is `startAddressCoreCorelet_` (`:985-986`), a `FoldManager<int64_t>`; ⭐ THAT TYPE HAS
+/// SINCE LANDED as e026_FoldManager (`src/schedule/fold.rs`), so it is open work rather than blocked
+/// work, as are the two coordinates' own former blockers — `allocateCoordinates_` and
+/// `sliceViewCoordinates_` (`:1008-1009`) are CARRIED below.
 ///
 /// ⛔ NAME IDENTITY WOULD NOT SUBSTITUTE FOR THE POINTER IN `allocUsers_`, and one pass proves it:
 /// `cloneComputeForOffsetAdjustment` pushes a `clone()`d compute straight onto the list
@@ -8144,6 +8958,32 @@ pub struct AllocateNode {
     /// (`dsm/translators/perfDscToSdsc/perfDscToSdsc.cpp:1870`), which this campaign does not scope,
     /// so on our path it is whatever the JSON importer read (`dsc/dsc2.cpp:1804-1805`).
     pub non_unified_alloc_in_hbm: bool,
+    /// Field: e028_AllocateNode.allocateCoordinates_
+    ///
+    /// Field: e037_AllocateNode.allocateCoordinates_
+    ///
+    /// How this region's dims are folded (`dsc/dsc2.h:1008`) — the coordinate every other node's is
+    /// derived from. `buildFoldFromAllocation` is the writer (`ddc/ddc_fold.cpp:2748-2769`, which
+    /// walks the allocation's fold params and calls `addFold` per level), and
+    /// `buildFoldForTransferNode` and the compute propagation are the readers
+    /// (`ddc/ddc_fold.cpp:1340-1420`, `:4300-4370`).
+    ///
+    /// ⛔ ITS `foldConstructed_` IS THE GATE THE READERS CHECK FIRST (`ddc/ddc_fold.cpp:1340`,
+    /// `:2481`), so an allocation whose tower is half built is distinguishable from one with no tower
+    /// at all — see [`CoordinateType::fold_constructed`].
+    pub allocate_coordinates: CoordinateType,
+    /// Field: e028_AllocateNode.sliceViewCoordinates_
+    ///
+    /// Field: e037_AllocateNode.sliceViewCoordinates_
+    ///
+    /// How the SLICE VIEW of this region's dims are folded (`dsc/dsc2.h:1009`) — the core-local view
+    /// `buildFoldFromAllocation` builds beside the full one (`ddc/ddc_fold.cpp:2771-2790`).
+    ///
+    /// ⛔ THE AUTHORITY'S JSON ROUND TRIP DROPS IT: both halves leave it a "TO DO"
+    /// (`dsc/dsc2.cpp:1828`), so a DSC that has been through a file has an EMPTY slice view where the
+    /// one the fold pass built was not. Nothing here restores it; the field is carried so the pass
+    /// that builds it has somewhere to put it.
+    pub slice_view_coordinates: CoordinateType,
 }
 
 impl Default for AllocateNode {
@@ -8167,6 +9007,8 @@ impl Default for AllocateNode {
             gap_stick_spread: BTreeMap::new(),
             ignore_symbolic_volume_limits: false,
             non_unified_alloc_in_hbm: false,
+            allocate_coordinates: CoordinateType::default(),
+            slice_view_coordinates: CoordinateType::default(),
         }
     }
 }
@@ -8240,10 +9082,6 @@ impl AllocateNode {
 // crustify:todo: e028_AllocateNode
 
 // crustify:todo: e028_AllocateNode.allocUsers_
-
-// crustify:todo: e028_AllocateNode.allocateCoordinates_
-
-// crustify:todo: e028_AllocateNode.sliceViewCoordinates_
 
 // crustify:todo: e028_AllocateNode.startAddressCoreCorelet_
 
@@ -10421,6 +11259,698 @@ mod equivalence {
              that core with no corelets"
         );
     }
+
+    /// The one production coordinate build: `ddc/ddc_fold.cpp:2755-2769` walks an allocation's fold
+    /// params from the last down to the first and always inserts at position 0, which leaves the levels
+    /// in fold-param order with the spatial ones outermost. Three params, one level of each category, is
+    /// the shape every case below was measured against.
+    const FOLD_PARAMS: [(FoldDimSize, &str, Alpha, Beta); 3] = [
+        (FoldDimSize(4), "core", Alpha(10), Beta(1)),
+        (FoldDimSize(3), "corelet", Alpha(20), Beta(2)),
+        (FoldDimSize(5), "elem_arr_0", Alpha(30), Beta(3)),
+    ];
+
+    fn canonical_tower(coord: &mut CoordinateType, dim: PrimaryDimTypes) {
+        for pos in (0..FOLD_PARAMS.len()).rev() {
+            let (cardinality, label, alpha, beta) = FOLD_PARAMS[pos];
+            let category = match pos {
+                0 => CoordinateCategory::Spatial,
+                1 => CoordinateCategory::Temporal,
+                _ => CoordinateCategory::ElemArr,
+            };
+            assert_eq!(
+                coord.add_fold(
+                    dim,
+                    category,
+                    cardinality,
+                    label,
+                    alpha,
+                    beta,
+                    FoldDimPos(0)
+                ),
+                Some(())
+            );
+        }
+    }
+
+    /// A dim's levels read back the way the passes outside this class read them — through
+    /// `coordinates_.at(dim)` (`ddc/ddc_fold.cpp:1192-1197`, `dsc/dsc2.cpp:3848-3871`).
+    fn levels(coord: &CoordinateType, dim: PrimaryDimTypes) -> Vec<(u32, String, i64, i64)> {
+        let fold_manager = &coord.coordinates()[&dim];
+        (0..fold_manager.num_dims())
+            .map(|pos| {
+                let pos = FoldDimPos(i32::try_from(pos).unwrap());
+                let (alpha, beta) = fold_manager.alpha_beta(pos).unwrap();
+                (
+                    fold_manager.fold_dim_size(pos).unwrap().0,
+                    fold_manager.fold_dim_prop(pos).unwrap().label().to_string(),
+                    *alpha,
+                    *beta,
+                )
+            })
+            .collect()
+    }
+
+    fn counts(coord: &CoordinateType, dim: PrimaryDimTypes) -> (usize, usize, usize) {
+        (
+            coord.num_of_spatial_folds(dim),
+            coord.num_of_temporal_folds(dim),
+            coord.num_of_elem_arr_folds(dim),
+        )
+    }
+
+    /// `dsc/dsc2.h:118-142` and `:154-164` and `:222-234`, executed: the levels come back in fold-param
+    /// order carrying the alpha and beta each was given, and the two count thresholds put one level in
+    /// each category.
+    ///
+    /// ⛔ AND THE TWO CATEGORY READERS DISAGREE ON A NEGATIVE POSITION. `getFoldCategory` answers
+    /// `UNKNOWN_COORD` off both ends of the tower — this port's [`None`] — while
+    /// `getCoordinateCategoryOfPos`, whose `DT_CHECK` is one-sided (`:158`), reports position `-1` as
+    /// `SPATIAL_COORD`.
+    #[test]
+    fn the_canonical_tower_is_one_level_of_each_category() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+
+        assert_eq!(
+            levels(&coord, PrimaryDimTypes::X),
+            vec![
+                (4, "core".to_string(), 10, 1),
+                (3, "corelet".to_string(), 20, 2),
+                (5, "elem_arr_0".to_string(), 30, 3),
+            ],
+            "numDims=3, in fold-param order"
+        );
+        assert_eq!(
+            (0..3)
+                .map(|pos| (
+                    coord.coordinate_category_of_pos(PrimaryDimTypes::X, FoldDimPos(pos)),
+                    coord.fold_category(PrimaryDimTypes::X, FoldDimPos(pos)),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    Some(CoordinateCategory::Spatial),
+                    Some(CoordinateCategory::Spatial)
+                ),
+                (
+                    Some(CoordinateCategory::Temporal),
+                    Some(CoordinateCategory::Temporal)
+                ),
+                (
+                    Some(CoordinateCategory::ElemArr),
+                    Some(CoordinateCategory::ElemArr)
+                ),
+            ],
+            "the two readers agree inside the tower"
+        );
+        assert_eq!(counts(&coord, PrimaryDimTypes::X), (1, 1, 1));
+
+        assert_eq!(
+            coord.fold_category(PrimaryDimTypes::X, FoldDimPos(-1)),
+            None,
+            "foldCat(-1)=UNKNOWN"
+        );
+        assert_eq!(
+            coord.fold_category(PrimaryDimTypes::X, FoldDimPos(3)),
+            None,
+            "foldCat(3)=UNKNOWN"
+        );
+        assert_eq!(
+            coord.coordinate_category_of_pos(PrimaryDimTypes::X, FoldDimPos(-1)),
+            Some(CoordinateCategory::Spatial),
+            "catOfPos(-1)=SPATIAL — the disagreement"
+        );
+
+        assert!(coord.has_coord_for_dim(PrimaryDimTypes::X));
+        assert!(!coord.has_coord_for_dim(PrimaryDimTypes::Y));
+        assert_eq!(coord.tensor_dims(), vec![PrimaryDimTypes::X]);
+        assert!(!coord.fold_constructed());
+        coord.complete_fold_construction();
+        assert!(coord.fold_constructed());
+    }
+
+    /// `operator=` (`:166-184`) and `clear()` (`:81-96`), executed. The copy is a level-for-level replay
+    /// through `addFold`, so the sizes, labels, alphas and betas come back in the source's order, and
+    /// the core map, the constructed flag and the padding form all survive it.
+    ///
+    /// ⛔ `clear()` LEAVES `coreIdToWkSlice_` ALONE, so it is not `*self = Self::default()` — measured:
+    /// one core entry written before the clear is still there after it, while the towers, the counts and
+    /// the padding are gone.
+    #[test]
+    fn a_copy_replays_the_tower_and_clear_keeps_the_core_map() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+        coord.complete_fold_construction();
+        coord
+            .core_id_to_wk_slice
+            .entry(CoreId(7))
+            .or_default()
+            .insert(PrimaryDimTypes::X, WkSliceIdx(2));
+        coord.set_padding(PrimaryDimTypes::X, PadType::PaddedNoZeroPad);
+
+        let copy = coord.clone();
+        assert_eq!(
+            levels(&copy, PrimaryDimTypes::X),
+            vec![
+                (4, "core".to_string(), 10, 1),
+                (3, "corelet".to_string(), 20, 2),
+                (5, "elem_arr_0".to_string(), 30, 3),
+            ],
+            "the replay is an identity on an affine tower"
+        );
+        assert_eq!(counts(&copy, PrimaryDimTypes::X), (1, 1, 1));
+        assert_eq!(
+            (
+                copy.core_id_to_wk_slice[&CoreId(7)][&PrimaryDimTypes::X],
+                copy.fold_constructed(),
+                copy.padding(PrimaryDimTypes::X),
+            ),
+            (WkSliceIdx(2), true, PadType::PaddedNoZeroPad)
+        );
+        assert_eq!(coord, copy, "equal=1");
+
+        coord.clear();
+        assert_eq!(
+            (
+                coord.coordinates().len(),
+                coord.core_id_to_wk_slice.len(),
+                coord.num_of_spatial_folds(PrimaryDimTypes::X),
+                coord.padding(PrimaryDimTypes::X),
+                coord.fold_constructed(),
+            ),
+            (0, 1, 0, PadType::NoPad, false)
+        );
+    }
+
+    /// `clearFoldForDim(dim)` (`:98-114`), executed: the dim keeps its key and its padding form and
+    /// loses its levels and its counts.
+    ///
+    /// ⛔ AND A COPY THEN DROPS THE KEY, because the replay has no level to make a call out of — so the
+    /// copy is not equal to its source, while the padding form for the dropped dim survives into it.
+    #[test]
+    fn a_cleared_fold_keeps_its_key_until_it_is_copied() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+        coord.set_padding(PrimaryDimTypes::X, PadType::PaddedNoZeroPad);
+        coord.clear_fold_for_dim(PrimaryDimTypes::X);
+
+        assert_eq!(
+            (
+                coord.coordinates().len(),
+                coord.coordinates()[&PrimaryDimTypes::X].num_dims(),
+                counts(&coord, PrimaryDimTypes::X),
+                coord.padding(PrimaryDimTypes::X),
+                coord.has_coord_for_dim(PrimaryDimTypes::X),
+            ),
+            (1, 0, (0, 0, 0), PadType::PaddedNoZeroPad, true)
+        );
+
+        let copy = coord.clone();
+        assert_eq!(
+            (
+                copy.coordinates().len(),
+                copy.has_coord_for_dim(PrimaryDimTypes::X),
+                copy.padding(PrimaryDimTypes::X),
+            ),
+            (0, false, PadType::PaddedNoZeroPad)
+        );
+        assert_ne!(copy, coord, "equalToSource=0");
+    }
+
+    /// ⛔ `operator=` RECOMPUTES THE THREE COUNTS RATHER THAN COPYING THEM (`:170-179`), which is
+    /// observable the moment they disagree with the tower. Measured: a temporal count raised to 4 on a
+    /// three-level tower makes BOTH inner positions read as temporal, and the copy comes back with the
+    /// counts those positions imply — 1 spatial, 2 temporal, 0 element-arrangement — so a coordinate
+    /// copied out of that state is NOT equal to the one it came from.
+    ///
+    /// ⭐ THE ELEMENT-ARRANGEMENT COUNT IS INVISIBLE TO BOTH CATEGORY READERS, since every position at
+    /// or past `spatial + temporal` is element arrangement whatever it says: raising it to 7 moves no
+    /// position, and the copy puts it back to 1.
+    #[test]
+    fn a_copy_recomputes_the_counts_from_the_sources_own_categories() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+        assert_eq!(
+            coord.set_num_of_temporal_fold_per_dim(PrimaryDimTypes::X, 4),
+            Some(())
+        );
+        assert_eq!(counts(&coord, PrimaryDimTypes::X), (1, 4, 1), "the source");
+
+        let copy = coord.clone();
+        assert_eq!(
+            (
+                counts(&copy, PrimaryDimTypes::X),
+                copy.coordinates()[&PrimaryDimTypes::X].num_dims(),
+            ),
+            ((1, 2, 0), 3)
+        );
+        assert_ne!(coord, copy, "equalAfterCopy=0");
+
+        let mut wide = CoordinateType::default();
+        canonical_tower(&mut wide, PrimaryDimTypes::X);
+        assert_eq!(
+            wide.set_num_of_elem_arr_fold_per_dim(PrimaryDimTypes::X, 7),
+            Some(())
+        );
+        assert_eq!(counts(&wide, PrimaryDimTypes::X), (1, 1, 7));
+        assert_eq!(
+            (0..3)
+                .map(|pos| wide.coordinate_category_of_pos(PrimaryDimTypes::X, FoldDimPos(pos)))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(CoordinateCategory::Spatial),
+                Some(CoordinateCategory::Temporal),
+                Some(CoordinateCategory::ElemArr),
+            ],
+            "no position moved"
+        );
+        assert_eq!(counts(&wide.clone(), PrimaryDimTypes::X), (1, 1, 1));
+    }
+
+    /// `setNumOfTemporalFoldPerDim` and `setNumOfElemArrFoldPerDim` (`:215-220`), executed: both go
+    /// through `.at(dim)` on their OWN count map, so neither will insert.
+    ///
+    /// ⛔ WHICH MEANS A DIM THAT HAS A TOWER CAN STILL REFUSE THEM — measured, the temporal setter throws
+    /// on a dim whose only level was added as spatial, because that dim has no temporal entry to
+    /// overwrite. Having a coordinate is not having a count.
+    #[test]
+    fn the_count_setters_refuse_a_dim_with_no_count_of_that_category() {
+        let mut coord = CoordinateType::default();
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::X,
+                CoordinateCategory::Spatial,
+                FoldDimSize(4),
+                "core",
+                Alpha(10),
+                Beta(1),
+                FoldDimPos(0),
+            ),
+            Some(())
+        );
+
+        assert_eq!(
+            coord.set_num_of_temporal_fold_per_dim(PrimaryDimTypes::In, 4),
+            None,
+            "a dim with no tower at all"
+        );
+        assert_eq!(
+            coord.set_num_of_elem_arr_fold_per_dim(PrimaryDimTypes::In, 4),
+            None
+        );
+        assert_eq!(
+            coord.set_num_of_temporal_fold_per_dim(PrimaryDimTypes::X, 2),
+            None,
+            "and a dim with a spatial-only tower"
+        );
+        assert_eq!(
+            counts(&coord, PrimaryDimTypes::X),
+            (1, 0, 0),
+            "the control: the spatial count it does have"
+        );
+    }
+
+    /// `:157-158` and `:224`, executed: both category readers refuse a dim with no tower, and
+    /// `getCoordinateCategoryOfPos` also refuses a position at or past its depth.
+    #[test]
+    fn the_category_readers_refuse_an_absent_dim_and_a_position_past_the_end() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+
+        assert_eq!(
+            coord.coordinate_category_of_pos(PrimaryDimTypes::In, FoldDimPos(0)),
+            None
+        );
+        assert_eq!(
+            coord.fold_category(PrimaryDimTypes::In, FoldDimPos(0)),
+            None
+        );
+        assert_eq!(
+            coord.coordinate_category_of_pos(PrimaryDimTypes::X, FoldDimPos(3)),
+            None
+        );
+        assert_eq!(
+            coord.coordinate_category_of_pos(PrimaryDimTypes::X, FoldDimPos(2)),
+            Some(CoordinateCategory::ElemArr),
+            "the control: the last position it does have"
+        );
+    }
+
+    /// `operator==` (`:188-213`), executed.
+    ///
+    /// ⛔ IT NEVER READS `foldConstructed_` — two towers built alike are equal with one of them marked
+    /// constructed — AND IT DOES READ `coreIdToWkSlice_`, so one core entry on one side is enough to
+    /// separate them.
+    #[test]
+    fn equality_ignores_the_constructed_flag_and_reads_the_core_map() {
+        let mut lhs = CoordinateType::default();
+        let mut rhs = CoordinateType::default();
+        canonical_tower(&mut lhs, PrimaryDimTypes::X);
+        canonical_tower(&mut rhs, PrimaryDimTypes::X);
+        lhs.complete_fold_construction();
+        assert_eq!(lhs, rhs, "== ignores foldConstructed");
+
+        rhs.complete_fold_construction();
+        rhs.core_id_to_wk_slice
+            .entry(CoreId(1))
+            .or_default()
+            .insert(PrimaryDimTypes::X, WkSliceIdx(0));
+        assert_ne!(lhs, rhs, "== sees coreIdToWkSlice_");
+    }
+
+    /// Two dims, one with the canonical three levels and a padding form and one with a single spatial
+    /// level, plus a core map two cores wide — the object `printCoordinates` (`:257-315`) writes and
+    /// `dsc_import_json` reads back, transcribed from the executed authority.
+    ///
+    /// ⭐ THE PUNCTUATION IS THE POINT: `"folds" : ` carries a SECOND space because `FoldManager::print`
+    /// opens with one of its own, a non-last dim's closing brace is followed by `", "` with a TRAILING
+    /// space before the newline, and `"coreIdToWkSlice_" : { ` and its closing `} ` both end in a space.
+    /// Only `PrintContent(false)` is measured here; the value block a `true` adds is
+    /// [`FoldManager::print`]'s and is measured there.
+    #[test]
+    fn print_coordinates_matches_the_authority() {
+        let mut coord = CoordinateType::default();
+        canonical_tower(&mut coord, PrimaryDimTypes::X);
+        coord.set_padding(PrimaryDimTypes::X, PadType::PaddedNoZeroPad);
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::Y,
+                CoordinateCategory::Spatial,
+                FoldDimSize(2),
+                "core_y",
+                Alpha(7),
+                Beta(0),
+                FoldDimPos(0),
+            ),
+            Some(())
+        );
+        for (core, dim, slice) in [
+            (CoreId(3), PrimaryDimTypes::X, WkSliceIdx(1)),
+            (CoreId(3), PrimaryDimTypes::Y, WkSliceIdx(0)),
+            (CoreId(5), PrimaryDimTypes::X, WkSliceIdx(2)),
+        ] {
+            coord
+                .core_id_to_wk_slice
+                .entry(core)
+                .or_default()
+                .insert(dim, slice);
+        }
+
+        let mut out = String::new();
+        assert_eq!(
+            coord.print_coordinates(&mut out, PrintContent(false), ""),
+            Some(())
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "\n",
+                "\"coordinates_\" : {\n",
+                "  \"coordInfo\" : {\n",
+                "    \"x\" : {\n",
+                "      \"spatial\" : 1,\n",
+                "      \"temporal\" : 1,\n",
+                "      \"elemArr\" : 1,\n",
+                "      \"padding\" : \"padded_nozeropad\",\n",
+                "      \"folds\" :  {\n",
+                "        \"dim_prop_func\" : [\n",
+                "          { \"Affine\" : {\"alpha_\" : 10, \"beta_\" : 1} },\n",
+                "          { \"Affine\" : {\"alpha_\" : 20, \"beta_\" : 2} },\n",
+                "          { \"Affine\" : {\"alpha_\" : 30, \"beta_\" : 3} }\n",
+                "        ],\n",
+                "        \"dim_prop_attr\" : [\n",
+                "          { \"factor_\" : 4, \"label_\" : \"core\" },\n",
+                "          { \"factor_\" : 3, \"label_\" : \"corelet\" },\n",
+                "          { \"factor_\" : 5, \"label_\" : \"elem_arr_0\" }\n",
+                "        ]\n",
+                "      }\n",
+                "    }, \n",
+                "    \"y\" : {\n",
+                "      \"spatial\" : 1,\n",
+                "      \"temporal\" : 0,\n",
+                "      \"elemArr\" : 0,\n",
+                "      \"padding\" : \"nopad\",\n",
+                "      \"folds\" :  {\n",
+                "        \"dim_prop_func\" : [\n",
+                "          { \"Affine\" : {\"alpha_\" : 7, \"beta_\" : 0} }\n",
+                "        ],\n",
+                "        \"dim_prop_attr\" : [\n",
+                "          { \"factor_\" : 2, \"label_\" : \"core_y\" }\n",
+                "        ]\n",
+                "      }\n",
+                "    }\n",
+                "  },\n",
+                "  \"coreIdToWkSlice_\" : { \n",
+                "    \"3\" : { \"x\" : 1, \"y\" : 0 }, \n",
+                "    \"5\" : { \"x\" : 2 }\n",
+                "  } \n",
+                "}\n",
+            )
+        );
+
+        let mut out = String::new();
+        assert_eq!(coord.debug_print(&mut out), Some(()));
+        assert_eq!(
+            out,
+            concat!(
+                "\n",
+                "DDC Coordinates<int64_t>: 2 coordinate entries\n",
+                "\n",
+                "Primary Dim= x\n",
+                "  Fold dimension= \"factor_\" : 4, \"label_\" : \"core\"\n",
+                "    Affine:\"alpha_\" : 10, \"beta_\" : 1\n",
+                "  Fold dimension= \"factor_\" : 3, \"label_\" : \"corelet\"\n",
+                "    Affine:\"alpha_\" : 20, \"beta_\" : 2\n",
+                "  Fold dimension= \"factor_\" : 5, \"label_\" : \"elem_arr_0\"\n",
+                "    Affine: \"alpha_\" : 30, \"beta_\" : 3\n",
+                "  #Spatial  = 1\n",
+                "  #Temporal = 1\n",
+                "  #ElemArr  = 1\n",
+                "  Padding: { (x, padded_nozeropad) }\n",
+                "\n",
+                "Primary Dim= y\n",
+                "  Fold dimension= \"factor_\" : 2, \"label_\" : \"core_y\"\n",
+                "    Affine: \"alpha_\" : 7, \"beta_\" : 0\n",
+                "  #Spatial  = 1\n",
+                "  #Temporal = 0\n",
+                "  #ElemArr  = 0\n",
+                "  Padding: { (y, nopad) }\n",
+                "  coreIdToWkSlice_ : { \n",
+                "    3 : { x : 1, y : 0 }, \n",
+                "    5 : { x : 2 }\n",
+                "  } \n",
+            ),
+            "debugPrint — and the two levels of one tower that differ only in whether a space follows \
+             `Affine:` are the leaf/non-leaf arms (`:379-384`), not a typo"
+        );
+    }
+
+    /// ⛔ `ps` PREFIXES EVERY LINE OF THE OBJECT INCLUDING THE FIRST AND THE LAST, and nothing inside
+    /// the fold manager's own block gets it twice (`:258-314`) — measured with a two-character prefix so
+    /// the indentation is distinguishable from it.
+    #[test]
+    fn print_coordinates_threads_the_prefix_through_every_line() {
+        let mut coord = CoordinateType::default();
+        assert_eq!(
+            coord.add_fold(
+                PrimaryDimTypes::Y,
+                CoordinateCategory::Spatial,
+                FoldDimSize(2),
+                "core_y",
+                Alpha(7),
+                Beta(0),
+                FoldDimPos(0),
+            ),
+            Some(())
+        );
+        coord
+            .core_id_to_wk_slice
+            .entry(CoreId(3))
+            .or_default()
+            .insert(PrimaryDimTypes::Y, WkSliceIdx(0));
+
+        let mut out = String::new();
+        assert_eq!(
+            coord.print_coordinates(&mut out, PrintContent(false), ".."),
+            Some(())
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "\n",
+                "..\"coordinates_\" : {\n",
+                "..  \"coordInfo\" : {\n",
+                "..    \"y\" : {\n",
+                "..      \"spatial\" : 1,\n",
+                "..      \"temporal\" : 0,\n",
+                "..      \"elemArr\" : 0,\n",
+                "..      \"padding\" : \"nopad\",\n",
+                "..      \"folds\" :  {\n",
+                "..        \"dim_prop_func\" : [\n",
+                "..          { \"Affine\" : {\"alpha_\" : 7, \"beta_\" : 0} }\n",
+                "..        ],\n",
+                "..        \"dim_prop_attr\" : [\n",
+                "..          { \"factor_\" : 2, \"label_\" : \"core_y\" }\n",
+                "..        ]\n",
+                "..      }\n",
+                "..    }\n",
+                "..  },\n",
+                "..  \"coreIdToWkSlice_\" : { \n",
+                "..    \"3\" : { \"y\" : 0 }\n",
+                "..  } \n",
+                "..}\n",
+            )
+        );
+    }
+
+    /// ⛔ AN EMPTY COORDINATE STILL PRINTS ITS TWO EMPTY SUB-OBJECTS, while `debugPrint` prints ONE LINE
+    /// with no trailing newline and no core block at all — the `if (!coreIdToWkSlice_.empty())` guard
+    /// (`:411`) has no counterpart in `printCoordinates`.
+    #[test]
+    fn an_empty_coordinate_prints_its_shell() {
+        let coord = CoordinateType::default();
+
+        let mut out = String::new();
+        assert_eq!(
+            coord.print_coordinates(&mut out, PrintContent(false), ""),
+            Some(())
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "\n",
+                "\"coordinates_\" : {\n",
+                "  \"coordInfo\" : {\n",
+                "  },\n",
+                "  \"coreIdToWkSlice_\" : { \n",
+                "  } \n",
+                "}\n",
+            )
+        );
+
+        let mut out = String::new();
+        assert_eq!(coord.debug_print(&mut out), Some(()));
+        assert_eq!(out, "\nDDC Coordinates<int64_t>: 0 coordinate entries");
+    }
+
+    /// ⛔ A DIM WHOSE TOWER WAS CLEARED PRINTS A STRING WHERE THE OTHERS PRINT AN OBJECT —
+    /// `"folds" : "0"` — because a zero-dimension [`FoldManager`] prints just its datum and ignores both
+    /// the prefix and `printContent`. The output is therefore not JSON-uniform across dims, and
+    /// `debugPrint` drops the dim's `Fold dimension=` lines entirely while still counting it as an
+    /// entry and still printing its padding.
+    #[test]
+    fn a_dim_with_no_levels_prints_its_datum() {
+        let mut coord = CoordinateType::default();
+        for (dim, cardinality, label, alpha) in [
+            (PrimaryDimTypes::X, FoldDimSize(4), "core", Alpha(10)),
+            (PrimaryDimTypes::Y, FoldDimSize(2), "core_y", Alpha(7)),
+        ] {
+            let beta = if dim == PrimaryDimTypes::X {
+                Beta(1)
+            } else {
+                Beta(0)
+            };
+            assert_eq!(
+                coord.add_fold(
+                    dim,
+                    CoordinateCategory::Spatial,
+                    cardinality,
+                    label,
+                    alpha,
+                    beta,
+                    FoldDimPos(0),
+                ),
+                Some(())
+            );
+        }
+        coord.clear_fold_for_dim(PrimaryDimTypes::X);
+
+        assert_eq!(
+            coord.tensor_dims(),
+            vec![PrimaryDimTypes::X, PrimaryDimTypes::Y],
+            "tensorDims: 4 5 — the cleared dim is still one of them"
+        );
+
+        let expected = concat!(
+            "\n",
+            "\"coordinates_\" : {\n",
+            "  \"coordInfo\" : {\n",
+            "    \"x\" : {\n",
+            "      \"spatial\" : 0,\n",
+            "      \"temporal\" : 0,\n",
+            "      \"elemArr\" : 0,\n",
+            "      \"padding\" : \"nopad\",\n",
+            "      \"folds\" : \"0\"\n",
+            "    }, \n",
+            "    \"y\" : {\n",
+            "      \"spatial\" : 1,\n",
+            "      \"temporal\" : 0,\n",
+            "      \"elemArr\" : 0,\n",
+            "      \"padding\" : \"nopad\",\n",
+            "      \"folds\" :  {\n",
+            "        \"dim_prop_func\" : [\n",
+            "          { \"Affine\" : {\"alpha_\" : 7, \"beta_\" : 0} }\n",
+            "        ],\n",
+            "        \"dim_prop_attr\" : [\n",
+            "          { \"factor_\" : 2, \"label_\" : \"core_y\" }\n",
+            "        ]\n",
+            "      }\n",
+            "    }\n",
+            "  },\n",
+            "  \"coreIdToWkSlice_\" : { \n",
+            "  } \n",
+            "}\n",
+        );
+        let mut out = String::new();
+        assert_eq!(
+            coord.print_coordinates(&mut out, PrintContent(false), ""),
+            Some(())
+        );
+        assert_eq!(out, expected);
+
+        let mut with_content = String::new();
+        assert_eq!(
+            coord.print_coordinates(&mut with_content, PrintContent(true), ""),
+            Some(())
+        );
+        assert_eq!(
+            with_content.find("\"folds\" : \"0\"\n"),
+            expected.find("\"folds\" : \"0\"\n"),
+            "the zero-dim block is the same under either flag"
+        );
+        assert!(
+            with_content.contains(
+                "\"data_\" : {\n          \"[0]\" :\"0\",\n          \"[1]\" :\"7\"\n        }\n"
+            ),
+            "the control: the dim that DOES have a level gains a value block"
+        );
+
+        let mut out = String::new();
+        assert_eq!(coord.debug_print(&mut out), Some(()));
+        assert_eq!(
+            out,
+            concat!(
+                "\n",
+                "DDC Coordinates<int64_t>: 2 coordinate entries\n",
+                "\n",
+                "Primary Dim= x\n",
+                "  #Spatial  = 0\n",
+                "  #Temporal = 0\n",
+                "  #ElemArr  = 0\n",
+                "  Padding: { (x, nopad) }\n",
+                "\n",
+                "Primary Dim= y\n",
+                "  Fold dimension= \"factor_\" : 2, \"label_\" : \"core_y\"\n",
+                "    Affine: \"alpha_\" : 7, \"beta_\" : 0\n",
+                "  #Spatial  = 1\n",
+                "  #Temporal = 0\n",
+                "  #ElemArr  = 0\n",
+                "  Padding: { (y, nopad) }",
+            ),
+            "no core map, so no core block and no trailing newline"
+        );
+    }
 }
 
 // crustify:todo: e030_BlockNode
@@ -10466,10 +11996,6 @@ mod equivalence {
 // crustify:todo: e037_AllocateNode
 
 // crustify:todo: e037_AllocateNode.allocUsers_
-
-// crustify:todo: e037_AllocateNode.allocateCoordinates_
-
-// crustify:todo: e037_AllocateNode.sliceViewCoordinates_
 
 // crustify:todo: e037_AllocateNode.tempStorageForCompute_
 
