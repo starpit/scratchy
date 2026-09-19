@@ -126,21 +126,31 @@ PAGE = r"""<!DOCTYPE html>
 <title>Model architectures &middot; scratchy</title>
 <meta name="description" content="Every model architecture scratchy supports, written in its math DSL, diffable side by side.">
 <link rel="icon" href="favicon.png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@carbon/styles@1/css/styles.min.css">
 <link rel="stylesheet" href="styles.css">
+<script type="module" src="https://1.www.s81c.com/common/carbon/web-components/tag/v2/latest/ui-shell.min.js"></script>
+<script>
+(function () {
+  var mq = window.matchMedia('(prefers-color-scheme: dark)');
+  function apply(dark) {
+    document.documentElement.classList.remove('cds--g100', 'cds--white');
+    document.documentElement.classList.add(dark ? 'cds--g100' : 'cds--white');
+  }
+  apply(mq.matches);
+  mq.addEventListener('change', function (e) { apply(e.matches); });
+})();
+</script>
 </head>
 <body>
-<header class="header-global">
-  <a class="brand" href="index.html">scratchy</a>
-  <nav class="navlinks">
-    <a href="architectures.html" aria-current="page">Models</a>
-    <a href="book/index.html">Docs</a>
-    <a href="book/COMPILER.html">Compiler</a>
-    <a href="{repo}">GitHub</a>
-  </nav>
-</header>
+<cds-header aria-label="scratchy">
+  <cds-header-name href="index.html" prefix="▚">scratchy</cds-header-name>
+  <cds-header-nav menu-bar-label="scratchy navigation">
+    <cds-header-nav-item href="architectures.html" active>Models</cds-header-nav-item>
+    <cds-header-nav-item href="book/index.html">Docs</cds-header-nav-item>
+    <cds-header-nav-item href="book/COMPILER.html">Compiler</cds-header-nav-item>
+    <cds-header-nav-item href="{repo}">GitHub</cds-header-nav-item>
+  </cds-header-nav>
+</cds-header>
 
 <main class="archpage">
   <h1>Model architectures</h1>
