@@ -4769,9 +4769,16 @@ pub struct LoopCondConjunction {
 }
 
 impl LoopCondConjunction {
-    /// The one-term conjunction all five minters start from (`ddc/ddl/ddl_conversion.cpp:317-319`,
-    /// `ddc/ddcv1.cpp:3638`, `ddc/ddc_transformation.cpp:1056-1060`,
-    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811-4815`, `dsc/dsc2.cpp:1436-1438`).
+    /// The one-term conjunction a fresh condition's clause starts from — FOUR of the SIX producers of
+    /// a new clause (`ddc/ddl/ddl_conversion.cpp:317-319`, `dsc/dsc2.cpp:5092-5098`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811-4815`, and
+    /// `ddc/ddc_transformation.cpp:1056-1065` by way of the `:919` seed above).
+    ///
+    /// ⛔ THE OTHER TWO EMPLACE THE CLAUSE EMPTY AND FILL IT AFTERWARDS, which is the state above:
+    /// the SAMV minter's walk over enclosing loops may match no dim (`ddc/ddcv1.cpp:3638-3649`) and
+    /// the JSON importer takes one term per array element (`dsc/dsc2.cpp:1436-1438`). ⛔ AND THAT
+    /// SECOND ONE IS NOT A MINT AT ALL — it is the import half of the round trip, so it was never
+    /// evidence for how a condition is built.
     pub fn new(term: LoopCond) -> Self {
         Self {
             first: term,
@@ -4841,6 +4848,12 @@ impl LoopCondDisjunction {
 
     /// One further clause, ORed on the end — `adjustConditionForSplitLoop`'s outer `push_back`
     /// (`dsc/dsc2.cpp:2134`).
+    ///
+    /// ⛔ AND NOT ONLY ON THE SPLIT PATH: the chunk-condition minter emplaces one clause per
+    /// enclosing loop of the dim, outer to inner (`dsc/dsc2.cpp:5077-5104`), so a MINT alone reaches
+    /// two clauses and `:81`'s `size() > 1` disjunct is live with no loop splitting anywhere. Its own
+    /// `DT_CHECK` caps that at two and names THIS field as what would have to change to lift the cap
+    /// (`:5049-5052`).
     pub fn or_clause(mut self, clause: LoopCondConjunction) -> Self {
         self.rest.push(clause);
         self
@@ -4873,8 +4886,15 @@ impl LoopCondDisjunction {
         core::iter::once(&self.first).chain(self.rest.iter())
     }
 
-    /// How many clauses, never zero. Bridge 1 dispatches its whole condition lowering on this being
-    /// more than one (`SNControlFlowLowering.cpp:81`).
+    /// How many clauses, never zero.
+    ///
+    /// ⛔ NOT BRIDGE 1'S PATH SELECTOR, THOUGH IT IS ONE THIRD OF ONE: `:81` is
+    /// `twoLevelOrOfAnds_.size() > 1 || cond.negated_ || has_else_branch`
+    /// (`SNControlFlowLowering.cpp:81`), and `has_else_branch` is only `children.size() == 2`
+    /// (`:1052`) — so a SINGLE un-negated clause takes the multi-clause path whenever the condition
+    /// node has an else region, and a lowering dispatched on this count alone would send those to the
+    /// single-clause body (`:203-272`), which creates its `scf.if` with no else region at all
+    /// (`:258-259`, `:262-263`).
     pub fn clause_count(&self) -> NonZeroUsize {
         NonZeroUsize::MIN.saturating_add(self.rest.len())
     }
@@ -4910,10 +4930,15 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// ⛔ PARTIAL, AND THE `e022`/`e043` ANCHORS STAY OPEN BELOW: every term is [`LoopCond`]'s value
 /// half, so a composite still cannot name the loops it is a condition ON, and
 /// `adjustConditionForSplitLoop` selects and rebuilds its terms by that pointer
-/// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`). ⚠️ THAT DISPATCH HAS A FIFTH REFUSAL THE E025 ANCHOR
-/// DOES NOT LIST: `(LE, FIRST)` and `(GE, LAST)` fall through to
-/// `DT_ERROR("Unsupported condition operation")` (`:2136`) even though, on an index that cannot
-/// leave its own bounds, they are the `EQ` case `:2131` handles.
+/// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`).
+///
+/// ⚠️ AND THAT DISPATCH HAS NO FIFTH REFUSAL: it has the FOUR the e025 anchor lists, and that
+/// anchor's fourth IS `:2136` — "anything outside `EQ` / `NE` / `(GT,FIRST)` / `(LT,LAST)`". What is
+/// worth recording is WHICH pairs reach it, because there are only two: over the six operators a
+/// ported condition can spell times `FIRST`/`LAST`, `:2087-2101` takes the four always-true/false
+/// pairings and `:2136` is left with `(LE, FIRST)` and `(GE, LAST)` alone. ⭐ BOTH ARE EQUALITIES on
+/// an index that cannot leave its own bounds, so each belongs in the ANDed-term arm `:2109-2113` —
+/// NOT in the new-OR-clause arm `:2114-2134`, which yields the other shape entirely.
 ///
 /// ⛔ TWO CARRIERS, and both must reach this type: `ConditionNode::loopCond_` (`dsc/dsc2.h:690`) and
 /// `DdlInterface::CondProp::loopCond_` (`ddc/ddl/ddl_conversion.h:420-421`).
@@ -9740,6 +9765,144 @@ mod equivalence {
                 .count(),
             3,
             "and of or, and of not, or of not"
+        );
+    }
+
+    /// Which arm of `adjustConditionForSplitLoop`'s dispatch a `(CondOp, CondValType)` pair takes
+    /// (`dsc/dsc2.cpp:2082-2137`), in the authority's own order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SplitArm {
+        /// `DT_ERROR("Unsupported loop condition value.")` (`:2084`).
+        UnsupportedValue,
+        /// The four always-true/always-false pairings (`:2087-2101`).
+        AlwaysConstant,
+        /// `twoLevelOrOfAnds_.at(iOr).push_back(newCond)` — a term ANDed into this clause (`:2113`).
+        AndTerm,
+        /// `twoLevelOrOfAnds_.push_back(newDisjunctiveClause)` — a clause ORed one level up
+        /// (`:2126-2134`).
+        OrClause,
+        /// `DT_ERROR("Unsupported condition operation")` (`:2136`).
+        UnsupportedOp,
+    }
+
+    fn split_arm(cond_op: LoopCondOp, cond_val: CondVal) -> SplitArm {
+        let cond_val_type = cond_val.val_type();
+        if cond_val_type != CondValType::First && cond_val_type != CondValType::Last {
+            return SplitArm::UnsupportedValue;
+        }
+        if matches!(
+            (cond_op, cond_val_type),
+            (LoopCondOp::Gt, CondValType::Last)
+                | (LoopCondOp::Lt, CondValType::First)
+                | (LoopCondOp::Le, CondValType::Last)
+                | (LoopCondOp::Ge, CondValType::First)
+        ) {
+            return SplitArm::AlwaysConstant;
+        }
+        if cond_op == LoopCondOp::Eq {
+            return SplitArm::AndTerm;
+        }
+        if cond_op == LoopCondOp::Ne
+            || matches!(
+                (cond_op, cond_val_type),
+                (LoopCondOp::Gt, CondValType::First) | (LoopCondOp::Lt, CondValType::Last)
+            )
+        {
+            return SplitArm::OrClause;
+        }
+        SplitArm::UnsupportedOp
+    }
+
+    /// ⛔ THE `:2136` REFUSAL IS TWO PAIRS, AND BOTH ARE THE EQUALITY ARM'S: over the eighteen
+    /// `(LoopCondOp, CondVal)` combinations a ported condition can spell, the split dispatch reaches
+    /// `DT_ERROR("Unsupported condition operation")` (`dsc/dsc2.cpp:2136`) on exactly `(LE, FIRST)`
+    /// and `(GE, LAST)` — the e025 anchor's FOURTH refusal, not a fifth — and written as the `EQ`
+    /// each of them is, both land in the ANDed-term arm `:2113` and not the new-clause arm `:2134`.
+    #[test]
+    fn the_split_dispatchs_last_refusal_is_two_pairs_and_both_are_the_equality_arm() {
+        let vals = [
+            CondVal::Iteration(IterationIdx(0)),
+            CondVal::First,
+            CondVal::Last,
+        ];
+        let pairs = || {
+            LoopCondOp::ALL
+                .into_iter()
+                .flat_map(|op| vals.into_iter().map(move |val| (op, val)))
+        };
+
+        assert_eq!(
+            pairs()
+                .filter(|&(op, val)| split_arm(op, val) == SplitArm::UnsupportedOp)
+                .collect::<Vec<_>>(),
+            vec![
+                (LoopCondOp::Le, CondVal::First),
+                (LoopCondOp::Ge, CondVal::Last),
+            ]
+        );
+
+        // ⛔ AND THE ARM AN EQUALITY TAKES IS THE OTHER SHAPE: `index <= First` and `index >= Last`
+        // AND a term into the clause they already sit in, where `:2134` would OR a whole new clause.
+        for val in [CondVal::First, CondVal::Last] {
+            assert_eq!(split_arm(LoopCondOp::Eq, val), SplitArm::AndTerm, "{val:?}");
+        }
+
+        // ⛔ AND THE SWEEP IS NOT ALL-REFUSING, which is the only way the two assertions above mean
+        // anything: the eighteen pairs spread over all five arms.
+        let tally = |arm: SplitArm| pairs().filter(|&(op, val)| split_arm(op, val) == arm).count();
+        assert_eq!(
+            [
+                tally(SplitArm::UnsupportedValue),
+                tally(SplitArm::AlwaysConstant),
+                tally(SplitArm::AndTerm),
+                tally(SplitArm::OrClause),
+                tally(SplitArm::UnsupportedOp),
+            ],
+            [6, 4, 2, 4, 2]
+        );
+    }
+
+    /// `constructConditionalOperation`'s path selector as the authority writes it
+    /// (`SNControlFlowLowering.cpp:81`), with `has_else_branch` as its caller computes it —
+    /// `children.size() == 2` (`:1052`).
+    fn takes_multi_clause_path(cond: &LoopCondComposite, has_else_branch: bool) -> bool {
+        cond.or_of_ands.clause_count().get() > 1 || cond.negated || has_else_branch
+    }
+
+    /// ⛔ THE CLAUSE COUNT IS NOT BRIDGE 1'S PATH SELECTOR: over the eight
+    /// `(clauses, negated, else region)` states, `:81` and a `clause_count() > 1` dispatch disagree on
+    /// THREE — every single-clause condition that is negated or carries an else region — and the
+    /// single-clause body those three would be sent to creates its `scf.if` with no else region at
+    /// all (`SNControlFlowLowering.cpp:258-259`, `:262-263`).
+    #[test]
+    fn bridge_ones_condition_path_is_not_selected_by_the_clause_count_alone() {
+        let last = |dim| LoopCond {
+            dim,
+            cond_op: LoopCondOp::Eq,
+            cond_val: CondVal::Last,
+        };
+        let one = LoopCondDisjunction::new(LoopCondConjunction::new(last(PrimaryDimTypes::X)));
+        let two = one
+            .clone()
+            .or_clause(LoopCondConjunction::new(last(PrimaryDimTypes::Y)));
+
+        let mut disagreements = Vec::new();
+        for or_of_ands in [one, two] {
+            for negated in [false, true] {
+                for has_else_branch in [false, true] {
+                    let cond: LoopCondComposite = or_of_ands.clone().into();
+                    let cond = if negated { cond.negate() } else { cond };
+                    let count = cond.or_of_ands.clause_count().get();
+                    if takes_multi_clause_path(&cond, has_else_branch) != (count > 1) {
+                        disagreements.push((count, negated, has_else_branch));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            disagreements,
+            vec![(1, false, true), (1, true, false), (1, true, true)]
         );
     }
 
