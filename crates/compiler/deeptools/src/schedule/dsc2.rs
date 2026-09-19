@@ -4210,23 +4210,12 @@ impl CoordinateCategory {
 /// ⛔ `coordinates_` IS PUBLIC IN THE AUTHORITY AND PRIVATE HERE, AND THAT IS WHAT MAKES EVERY LEVEL
 /// OF EVERY TOWER AFFINE. [`add_fold`](Self::add_fold) is the only builder and it only ever calls
 /// [`FoldManager::build_affine_dim`]; no site outside this class BUILDS through the field. ⛔ BUT ONE
-/// WRITES: `Ddc::buildFoldForTransfer` binds it non-const and adds the PE/SFP split offset onto the
-/// innermost level, `fm.insertBeta(transferSizePerDim.at(dim) + fm.getBeta(fm.getNumDims() - 1),
-/// fm.getNumDims() - 1)` (`ddc/ddc_fold.cpp:4711-4718`), which is why
-/// [`insert_beta`](Self::insert_beta) stands beside the shared [`coordinates`](Self::coordinates).
-/// It is the only mutation any site performs through the field, and it cannot break the invariant:
-/// `insertBeta` is `DT_ERROR` on a non-affine level
-/// (`util/foldManager/foldInfrastructure.h:2309-2310`). The other non-const bindings either only read
-/// — `getAlphaBeta`, `getFoldDimSize`, `getFoldDimProp`, `gatherFoldParams` (`ddc/ddc_fold.cpp:906`,
-/// `:1192-1197`, `:2995`, `:3337`, `:4016-4024`, `:4300`, `:4320`, `dsc/dsc2.cpp:3848-3871`, `:6721`)
-/// — or mint a dim's key with `operator[]` and never read the reference, each followed by its own
-/// `addFold` (`ddc/ddc_fold.cpp:2277`, `dbo/src/Utils/sdsc_bundle/GatherBuffers.cpp:133`,
-/// `dbo/src/Utils/sdsc_bundle/ProgramCorrection.cpp:1128`).
-///
-/// ⭐ THE INVARIANT IS LOAD-BEARING, BUT NOT FOR [`Clone`]'s TOTALITY — that clones each tower
-/// structurally and is total unconditionally. What rests on it is [`Clone`]'s EQUIVALENCE to the
-/// authority's `operator=`, which replays every level through `getAlphaBeta` + `addFold`
-/// (`:166-184`) and so only agrees while every level is affine.
+/// WRITES — `Ddc::buildFoldForTransfer` adds the PE/SFP split offset onto the innermost level with
+/// `fm.insertBeta(...)` (`ddc/ddc_fold.cpp:4711-4718`) — which is why
+/// [`insert_beta`](Self::insert_beta) stands beside the shared [`coordinates`](Self::coordinates);
+/// every other binding of the field only reads or mints a dim's key. ⭐ AND [`Clone`]'s TOTALITY
+/// NEVER RESTED ON THE INVARIANT: it clones each tower structurally. Its EQUIVALENCE to the
+/// authority's `operator=` replay does (`:166-184`).
 ///
 /// ⛔ AND THE JSON IMPORTER IS NOT PORTED. `dsc_import_json` (`:318-358`) rebuilds a coordinate from
 /// the object [`print_coordinates`](Self::print_coordinates) writes, through
@@ -4593,13 +4582,11 @@ impl CoordinateType {
     }
 
     /// `coordinates_.at(dim).insertBeta(new_beta, pos)` as `Ddc::buildFoldForTransfer` performs it
-    /// (`ddc/ddc_fold.cpp:4711-4718`) — move one affine level's beta on one dim's tower, leaving that
-    /// level's alpha, size, label and the three counts alone.
-    ///
-    /// ⛔ THE ONLY WRITE ANY SITE MAKES THROUGH `coordinates_`, and narrow by construction:
-    /// `insertBeta` is `DT_ERROR` on a non-affine level (`foldInfrastructure.h:2309-2310`), so it
-    /// cannot introduce the level [`coordinates`](Self::coordinates) withholds a `&mut` to prevent.
-    /// ⛔ [`None`] IS A DIM WITH NO TOWER (`.at` throwing) or [`FoldManager::insert_beta`]'s refusal.
+    /// (`ddc/ddc_fold.cpp:4711-4718`) — the ONLY write any site makes through `coordinates_`, moving
+    /// one affine level's beta and leaving its alpha, size, label and the three counts alone.
+    /// ⛔ NARROW BY CONSTRUCTION: `insertBeta` is `DT_ERROR` on a non-affine level
+    /// (`foldInfrastructure.h:2309-2310`), so it cannot introduce the Map or Constant level
+    /// [`coordinates`](Self::coordinates) withholds a `&mut` for. [`None`] is a dim with no tower.
     pub fn insert_beta(
         &mut self,
         dim: PrimaryDimTypes,
@@ -5363,11 +5350,10 @@ pub struct LoopInfo {
 /// (`dsc/designSpaceConfig.h:105`); id 0 is the core stage, whose name `getSizeDataStageForNode`
 /// `DT_CHECK`s to be `"core"` (`dsc/dsc2.cpp:3638-3639`).
 ///
-/// ⛔ `e022_DataStage` RESOLVES IN NO CAMPAIGN'S `UNITS.tsv`, SO THE RENUMBERING WENT THE WRONG WAY.
-/// This class's id is `e014_DataStage` (`crustify/crates.json:259`, `crustify-scheduler/UNITS.tsv:26`)
-/// and `e022` is locally `DistributionStatusInfo` (`crates.json:260`, `UNITS.tsv:47`), itself homed in
-/// this file — so the mis-spelling counted this type at zero. Both ids are anchored, the live one
-/// first.
+/// ⛔ BOTH ANCHORS ABOVE STAND AND NEITHER IS A STRAY DUPLICATE. `crustify/crates.json:259` and
+/// `crustify-scheduler/UNITS.tsv:26` spell this class `e014_DataStage`; the `e022` it had been
+/// anchored under alone resolves in no campaign's `UNITS.tsv` and is locally `DistributionStatusInfo`
+/// (`UNITS.tsv:47`), still open at the bottom of this file.
 ///
 /// ⛔ [`name`](Self::name) IS THE STEADY STATE'S NAME ALONE, and WHETHER THE EPILOGUE CARRIES A
 /// DIFFERENT ONE DEPENDS ON WHO MINTED THE STAGE. The `+ "el"` suffix belongs to the stages the DDC
