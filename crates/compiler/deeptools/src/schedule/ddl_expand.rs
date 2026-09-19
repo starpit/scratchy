@@ -23,6 +23,7 @@ use crate::schedule::dsc2::{
     BitWidth, CondVal, CondValType, DataFormats, IterationIdx, LdsIdx, LoopCondComposite,
     LoopCondOp,
 };
+use crate::schedule::fold::FoldManager;
 use crate::schedule::metadata::Metadata;
 
 /// Replaces: e017_DdlArch
@@ -37,9 +38,10 @@ pub struct DdlArch {
     /// `$DEEPTOOLS_PATH/ddc/ddl_templates/` before parsing (`ddc/ddl/ddl_conversion.cpp:51`, `:79`).
     ///
     /// ⚠️ A STRING WHERE A CLOSED SET EXISTS, AND THE SET CANNOT BE NAMED FROM `src/` YET: `build.rs`
-    /// censuses the 32 vendored templates into a `Template` enum in `$OUT_DIR/generated.rs`, and
-    /// `src/lib.rs` does not include that file — it still names the deleted `crate::arch` and
-    /// `crate::schedule::ddl::conversion`. Wiring it is unscheduled work.
+    /// censuses the 32 vendored templates into a `Template` enum in `$OUT_DIR/generated.rs`, which no
+    /// module includes — and which could not compile if one did, because the text `build.rs` emits
+    /// still names the deleted `crate::arch::IsaGen` (`build.rs:2583`) and
+    /// `crate::schedule::ddl::conversion` (`:2995`). Wiring it is unscheduled work.
     pub filename: String,
     /// Field: e017_DdlArch.dedicatedArch
     ///
@@ -276,6 +278,49 @@ impl CondProp {
     }
 }
 
+/// One core-to-core communication op's ring — `DdlInterface::CoreToCore`
+/// (`ddc/ddl/ddl_conversion.h:447-451`), the value of the blocked `coreToCore_definitions_`.
+///
+/// ⭐ ALL THREE FIELDS ARE CARRIED, and [`FoldManager`] is why: it is e026_FoldManager, filled in
+/// `src/schedule/fold.rs`, which instantiates exactly this `i64` payload. What is blocked is the map
+/// that holds this type (`:452-453`), by its `mlir::Operation*` KEY alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreToCore {
+    /// The dim the ring walks (`:448`): the first mapped, non-dropped dim of the op's `dimensions`,
+    /// overridden by the one dim split across cores when there is one
+    /// (`ddc/ddl/ddl_conversion.cpp:1915-1926`), with [`PrimaryDimTypes::Undefined`] the authority's
+    /// own `PrimaryDimTypesCount` initialiser. Read through [`Self::communication_dim`].
+    pub dim: PrimaryDimTypes,
+    /// Which core this one sends to, per coordinate of the SuperDsc's fold space (`:449`): Map over
+    /// core and corelet, Constant over every further `sdscFoldProps_` level, then one `insertData`
+    /// per used core (`ddc/ddl/ddl_conversion.cpp:1941-1949`, `:1977-1997`).
+    ///
+    /// ⛔ ZERO FOLD DIMS IS THE PRE-BUILD STATE THE AUTHORITY ASSERTS, not an empty ring:
+    /// `DT_CHECK(nextCore_.hasZeroFoldDim() && prevCore_.hasZeroFoldDim())` (`:1939-1940`) says the
+    /// entry `operator[]` has just default-constructed — which is what [`Default`] gives here.
+    pub next_core: FoldManager<i64>,
+    /// Which core this one receives from (`:450`), built alongside [`Self::next_core`] — and on
+    /// corelet 1 the two swap, because cl0's ring runs up the core ids and cl1's runs down
+    /// (`ddc/ddl/ddl_conversion.cpp:1959`, `:1977-1997`).
+    pub prev_core: FoldManager<i64>,
+}
+
+impl CoreToCore {
+    /// The communication dim once the fill loop has mapped one
+    /// (`ddc/ddl/ddl_conversion.cpp:1915-1926`).
+    ///
+    /// ⛔ ABSENT IS THE REFUSAL AND NOT A STATE: the sentinel surviving that loop is
+    /// `emitError("None of the dimensions is mapped")` and `DT_ERROR` (`:1929-1932`), so every later
+    /// read — the first is `numWkSlicesPerDim_.at(dim_)` (`:1934`) — has a dim.
+    pub fn communication_dim(&self) -> Option<PrimaryDimTypes> {
+        if self.dim == PrimaryDimTypes::Undefined {
+            None
+        } else {
+            Some(self.dim)
+        }
+    }
+}
+
 // ── `e019_DdlInterface`: what blocks its own fifteen fields ──────────────────────────────────────
 //
 // The nested element types above are `DdlInterface`'s (`ddc/ddl/ddl_conversion.h:288-462`), but the
@@ -283,20 +328,20 @@ impl CondProp {
 // identity this port cannot yet spell, and the fifteenth alone is a shell.
 //
 //   * keyed by `mlir::Value`, i.e. by the `NameId` declared only inside `$OUT_DIR/generated.rs`,
-//     which `src/lib.rs` does not include: `dim_association_` (`:342-343`), `type_definition_`
-//     (`:366-367`), `tensor_definition_` (`:376-377`), `operation_definition_` (`:389-390`),
-//     `datastage_definition_` (`:392-393`), `ext_constant_definition_` (`:395-396`),
-//     `alloc_storage_` (`:398-399`), `operand_constant_tensor_` (`:405-406`), `resolvedConditions_`
-//     (`:425-426`).
+//     which no module includes and which could not compile if one did (its text names the deleted
+//     `crate::arch::IsaGen` and `crate::schedule::ddl::conversion`, `build.rs:2583`, `:2995`):
+//     `dim_association_` (`:342-343`), `type_definition_` (`:366-367`), `tensor_definition_`
+//     (`:376-377`), `operation_definition_` (`:389-390`), `datastage_definition_` (`:392-393`),
+//     `ext_constant_definition_` (`:395-396`), `alloc_storage_` (`:398-399`),
+//     `operand_constant_tensor_` (`:405-406`), `resolvedConditions_` (`:425-426`).
 //   * valued by a non-owning schedule-tree pointer, for which this port has no node identity — the
 //     same blocker `ConstantInfo` records in `src/schedule/dsc2.rs`, with `e030_BlockNode.next_` and
 //     `e032_ScheduleTree.head_` still open: `alloc_storage_` (`dsc2::AllocateNode*`, `:398`),
 //     `transfer_acc_pat_dims_` (`:401-403`, keyed by `const dsc2::TransferNode*`), `loop_labels_`
 //     (`:409-410`, `dsc2::LoopNode*`), `region2blocks_` (`:412-413`, keyed by `mlir::Region*` — the
 //     deleted `RegionId` — and valued by `dsc2::BlockNode*`), `sync_definitions_` (`:440-441`).
-//   * keyed by `mlir::Operation*`: `coreToCore_definitions_` (`:452-453`). Its VALUE type
-//     `FoldManager<int64_t>` is no longer the blocker — that is e026_FoldManager, filled in
-//     `src/schedule/fold.rs` — so what is left open here is the key alone.
+//   * keyed by `mlir::Operation*`: `coreToCore_definitions_` (`:452-453`) — ONLY the key. Its value
+//     type is [`CoreToCore`] above, `FoldManager<int64_t>` fields and all.
 //   * `core_chunk_loop_label_` (`:411`) is the one portable field, a `std::string`. One of fifteen is
 //     a shell, and `clear()` (`:458-461`) — a placement-new re-run of the constructor — has nothing
 //     to clear on one.
@@ -306,10 +351,15 @@ impl CondProp {
 // `ddc/ddl/ddl_conversion.cpp:2083-2105`) walks `tensor_definition_` through an `AliasOneTensorOfOp`'s
 // operands.
 //
-// `SyncProp` (`:432-439`) and `CoreToCore` (`:447-451`) are not ported for the same reason: one of
-// `SyncProp`'s two fields is `syncsPerCl_` (`:437`), whose `SendRecv` is two
-// `std::vector<dsc2::SyncNode*>` (`:433-436`), and two of `CoreToCore`'s three are
-// `FoldManager<int64_t>` (`:449-450`). Each would carry one field of its own declaration.
+// `SyncProp` (`:432-439`) is the one nested type that stays unported, and for a blocker of its own:
+// one of its two fields is `syncsPerCl_` (`:437`), whose `SendRecv` is two
+// `std::vector<dsc2::SyncNode*>` (`:433-436`), so it would carry one field of its own declaration.
+//
+// ⭐ THE TWO FIELD-LEVEL TODOs BELOW ARE NOT ONE KIND. `transfer_acc_pat_dims_` is a real field,
+// blocked twice over — bullet two above. `.Count` IS NOT A FIELD: it is `MetaDimKind::Count` on the
+// third line of `DimProp::isMetaDim`'s wrapped return (`ddc/ddl/ddl_conversion.h:332`), swept up by
+// the scheduler's end-of-line field regex (`crustify/campaigns/scheduler/plan.py:67`). Nothing can
+// fill it; it stands because an anchor is never deleted, and UNITS.tsv is the ledger that counts.
 
 // crustify:todo: e019_DdlInterface
 
@@ -1158,5 +1208,43 @@ mod unit_tests {
         assert!(!ConstraintCmp::Equal.holds(DimVal(8), DimVal(9)));
         assert!(ConstraintCmp::Less.holds(DimVal(8), DimVal(9)));
         assert!(!ConstraintCmp::Less.holds(DimVal(9), DimVal(9)));
+    }
+
+    /// One `core_to_core_communication` op's fill in the authority's own order: the `DT_CHECK` on a
+    /// fresh entry, the Map/Map fold space over core and corelet, and the cl1 swap
+    /// (`ddc/ddl/ddl_conversion.cpp:1939-1949`, `:1959`, `:1977-1988`).
+    #[test]
+    fn core_to_core_starts_unmapped_and_rings_its_two_corelets_opposite_ways() {
+        use crate::schedule::fold::{BaseFuncType, FoldDimIndex, FoldDimProp, FoldDimSize};
+
+        let mut c2c = CoreToCore::default();
+        assert_eq!(c2c.dim, PrimaryDimTypes::Undefined);
+        assert_eq!(c2c.communication_dim(), None);
+        assert!(c2c.next_core.has_zero_fold_dim());
+        assert!(c2c.prev_core.has_zero_fold_dim());
+
+        let props = [
+            FoldDimProp::new(FoldDimSize(2), "core"),
+            FoldDimProp::new(FoldDimSize(2), "corelet"),
+        ];
+        for fold in [&mut c2c.next_core, &mut c2c.prev_core] {
+            assert_eq!(
+                fold.build_fold_space(&props, &[BaseFuncType::Map; 2]),
+                Some(())
+            );
+        }
+        c2c.dim = PrimaryDimTypes::Ki;
+        assert_eq!(c2c.communication_dim(), Some(PrimaryDimTypes::Ki));
+
+        // Core 0 sends to core 1 on corelet 0 and receives from it on corelet 1.
+        let (cl0, cl1) = (
+            [FoldDimIndex(0), FoldDimIndex(0)],
+            [FoldDimIndex(0), FoldDimIndex(1)],
+        );
+        assert_eq!(c2c.next_core.insert_data(1, &cl0), Some(()));
+        assert_eq!(c2c.prev_core.insert_data(1, &cl1), Some(()));
+        assert_eq!(c2c.next_core.get_data(&cl0), Some(1));
+        assert_eq!(c2c.prev_core.get_data(&cl1), Some(1));
+        assert!(!c2c.next_core.has_zero_fold_dim());
     }
 }
