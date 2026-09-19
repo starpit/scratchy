@@ -303,6 +303,54 @@ impl Constraints {
     }
 }
 
+/// Which data stage a [`Datastage::constraints`] entry is relative to — the authority's `int` key,
+/// whose `-1` is "reference is tensor, not a datastage" (`ddc/ddc_metadata.h:73`,
+/// `ddc/ddl/ddl_conversion.cpp:1800`).
+///
+/// ⛔ ONE AUTHORITY KEY, ONE RUST KEY: [`new`](Self::new) folds every negative id onto
+/// [`Absolute`](Self::Absolute), so nothing can sit beside the `constraints_[-1]` bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstraintRef {
+    /// `-1`: the bound is on the size itself, not on a ratio (`ddc/ddcv1.cpp:689`, `:837`).
+    #[default]
+    Absolute,
+    /// A stage the authority's `refDsId >= 0` admits as a reference (`ddc/ddcv1.cpp:748`, `:750`).
+    Relative(RelativeStage),
+}
+
+/// A data stage a constraint can be relative to, non-negative because [`ConstraintRef::new`] is the
+/// only way to mint one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RelativeStage(DataStageId);
+
+impl RelativeStage {
+    /// The stage id, as the reference's own metadata is looked up by (`ddc/ddcv1.cpp:750`).
+    pub const fn get(self) -> DataStageId {
+        self.0
+    }
+}
+
+impl ConstraintRef {
+    /// The authority's key as written: a negative id IS the absolute one
+    /// (`ddc/ddl/ddl_conversion.cpp:1800-1838`, `ddc/ddcv1.cpp:748`).
+    pub const fn new(reference: DataStageId) -> Self {
+        if reference.0 < 0 {
+            Self::Absolute
+        } else {
+            Self::Relative(RelativeStage(reference))
+        }
+    }
+
+    /// The stage this is relative to — the authority's `refDsId < 0 ? nullptr : ...`
+    /// (`ddc/ddcv1.cpp:796-798`).
+    pub const fn relative(self) -> Option<DataStageId> {
+        match self {
+            Self::Absolute => None,
+            Self::Relative(stage) => Some(stage.0),
+        }
+    }
+}
+
 /// What the data-stage exploration knows about one INTERNAL data stage — `Metadata::Datastage`
 /// (`ddc/ddc_metadata.h:32-81`).
 ///
@@ -315,29 +363,28 @@ pub struct Datastage {
     /// Field: e038_Metadata.constraints_
     ///
     /// Per reference stage, per dimension set, what that set is constrained to
-    /// (`ddc/ddc_metadata.h:73-76`).
-    ///
-    /// ⭐ AN ABSENT REFERENCE IS THE AUTHORITY'S `-1` KEY — "reference is tensor, not a datastage"
-    /// (`ddc/ddl/ddl_conversion.cpp:1800`), written as `constraints_[-1]` (`ddc/ddcv1.cpp:689`) and
-    /// read as `refDsId < 0 ? nullptr : ...` (`:796-798`). The relative keys come from the loop that
-    /// divides this stage, `constraints_[loop->numId_]` (`:610`).
-    /// ⛔ SO [`None`] IS THE ONLY SPELLING OF THAT KEY, never `Some(DataStageId(-1))`: the writer at
-    /// `:610` cannot produce one, because `numId_` is `-1` only on a parametric loop
-    /// (`ddc/ddl/ddl_conversion.cpp:1129`) and `:599` skips those before reaching it.
-    /// ⭐ AN ORDERED OUTER MAP STANDS IN FOR THE AUTHORITY'S `unordered_map`, AND THE ONE READER
-    /// THAT WALKS IT CANNOT SEE THE DIFFERENCE: `checkConstraints` iterates every reference key
-    /// (`ddc/ddcv1.cpp:795`) but writes nothing — it and its inner `checkConstraintsImpl` are a pure
-    /// conjunction that returns on the first violation (`:795-921`) — so the verdict is the same
-    /// under every permutation.
-    /// ⛔ WHAT THE ORDER WOULD DECIDE IS WHICH `DT_ERROR` A MALFORMED TABLE REPORTS, and [`None`]
-    /// sorting before every [`Some`] fixes that where a hash map leaves it open: an absolute entry
-    /// carrying [`Constraints::must_be_multiple`] with no [`Constraints::min`] throws (`:849-852`)
-    /// where another entry might have answered `false` first.
+    /// (`ddc/ddc_metadata.h:73-76`). [`ConstraintRef::Absolute`] is the authority's `-1` key
+    /// (`ddc/ddcv1.cpp:689`, read as `refDsId < 0 ? nullptr : ...` at `:796-798`); the relative keys
+    /// come from the loop that divides this stage, `constraints_[loop->numId_]` (`:610`).
+    /// ⛔ THE KEY TYPE IS WHAT KEEPS THE TWO SPELLINGS APART, NOT A CONVENTION: five sites write the
+    /// key from a node id or from a `-1`-seeded local (`:610`, `:649`, `:656`, `:754`,
+    /// `ddc/ddl/ddl_conversion.cpp:1838`) and three test its sign before using it (`:634`, `:748`,
+    /// `:796`), so a negative id must land in the absolute bucket rather than beside it.
+    /// ⭐ AN ORDERED OUTER MAP STANDS IN FOR THE AUTHORITY'S `unordered_map`, AND NEITHER WALKER CAN
+    /// SEE THE DIFFERENCE: `checkConstraints` is a pure conjunction over every reference key that
+    /// returns on the first violation (`ddc/ddcv1.cpp:795-921`), and the swap step does write and
+    /// erase (`:738-780`) but each source key's reciprocal lands in a DIFFERENT stage's map and the
+    /// `loopDimKind_` merge answers the same either way (`:768-776`).
+    /// ⛔ WHAT THE ORDER WOULD DECIDE IS WHICH `DT_ERROR` A MALFORMED TABLE REPORTS, and
+    /// [`ConstraintRef::Absolute`] sorting before every [`Relative`](ConstraintRef::Relative) fixes
+    /// that where a hash map leaves it open: an absolute entry carrying
+    /// [`Constraints::must_be_multiple`] with no [`Constraints::min`] throws (`:849-852`) where
+    /// another entry might have answered `false` first.
     /// ⭐ AND IT IS UNREACHABLE EITHER WAY, by the flag's whole writer census: of the five sites that
     /// set it (`ddc/ddcv1.cpp:618`, `:650`, `:657`, `:767`, `:1226`) only `:1226` writes under the
     /// absolute key — `constraints_[-1]` from `:1119` — and `:1224` calls `updateMin` two lines
     /// above it.
-    pub constraints: BTreeMap<Option<DataStageId>, BTreeMap<BTreeSet<PrimaryDimTypes>, Constraints>>,
+    pub constraints: BTreeMap<ConstraintRef, BTreeMap<BTreeSet<PrimaryDimTypes>, Constraints>>,
     /// Field: e026_Metadata.strategyMinimize_
     ///
     /// Minimise this stage's size rather than maximise it (`ddc/ddc_metadata.h:77`, the DDL's
@@ -1047,7 +1094,7 @@ mod unit_tests {
             .insert(PrimaryDimTypes::Mb, numerator);
         let relative = datastage
             .constraints
-            .entry(Some(numerator))
+            .entry(ConstraintRef::new(numerator))
             .or_default()
             .entry(BTreeSet::from([PrimaryDimTypes::Mb]))
             .or_default();
@@ -1057,7 +1104,7 @@ mod unit_tests {
 
         datastage
             .constraints
-            .entry(None)
+            .entry(ConstraintRef::Absolute)
             .or_default()
             .entry(BTreeSet::from([PrimaryDimTypes::Mb]))
             .or_default()
@@ -1065,15 +1112,56 @@ mod unit_tests {
 
         assert_eq!(datastage.constraints.len(), 2);
         assert_eq!(
-            datastage.constraints[&Some(numerator)][&BTreeSet::from([PrimaryDimTypes::Mb])].max,
+            datastage.constraints[&ConstraintRef::new(numerator)]
+                [&BTreeSet::from([PrimaryDimTypes::Mb])]
+                .max,
             ConstraintValue::new(1.0)
         );
-        assert!(datastage.constraints[&None][&BTreeSet::from([PrimaryDimTypes::Mb])].cannot_be_symbolic);
+        let absolute = &datastage.constraints[&ConstraintRef::Absolute]
+            [&BTreeSet::from([PrimaryDimTypes::Mb])];
+        assert!(absolute.cannot_be_symbolic);
         // The absolute entry is not a relative one: it carries no bound at all.
+        assert_eq!(absolute.max, None);
+    }
+
+    /// `ddc/ddl/ddl_conversion.cpp:1800-1838` — `refDsId` is a `-1`-SEEDED LOCAL, overwritten only
+    /// when the DDL reference names a datastage, so an entry written through it with a tensor
+    /// reference is the same `constraints_[-1]` bucket `ddc/ddcv1.cpp:689` writes with the literal.
+    /// A key type that could spell `-1` twice would split that bucket in two and hide each write
+    /// from the other's reader (`:748`, `:796-798`).
+    #[test]
+    fn a_negative_reference_id_is_the_absolute_constraint_key() {
+        assert_eq!(ConstraintRef::new(DataStageId(-1)), ConstraintRef::Absolute);
+        assert_eq!(ConstraintRef::default(), ConstraintRef::Absolute);
+        assert_eq!(ConstraintRef::new(DataStageId(-1)).relative(), None);
         assert_eq!(
-            datastage.constraints[&None][&BTreeSet::from([PrimaryDimTypes::Mb])].max,
-            None
+            ConstraintRef::new(Metadata::CORE_DSTGID).relative(),
+            Some(Metadata::CORE_DSTGID)
         );
+
+        let mut datastage = Datastage::default();
+        let dims = BTreeSet::from([PrimaryDimTypes::Mb]);
+        // `ddc/ddcv1.cpp:689`, the literal key, then `ddl_conversion.cpp:1838` with the local left
+        // at its `-1` seed: the authority's `unordered_map<int, ..>` has ONE bucket for the two.
+        datastage
+            .constraints
+            .entry(ConstraintRef::Absolute)
+            .or_default()
+            .entry(dims.clone())
+            .or_default()
+            .update_min(ConstraintValue::new(4.0).expect("4 is not NaN"));
+        datastage
+            .constraints
+            .entry(ConstraintRef::new(DataStageId(-1)))
+            .or_default()
+            .entry(dims.clone())
+            .or_default()
+            .update_max(ConstraintValue::new(8.0).expect("8 is not NaN"));
+
+        assert_eq!(datastage.constraints.len(), 1);
+        let absolute = &datastage.constraints[&ConstraintRef::Absolute][&dims];
+        assert_eq!(absolute.min, ConstraintValue::new(4.0));
+        assert_eq!(absolute.max, ConstraintValue::new(8.0));
     }
 
     /// `ddc/ddcv1.cpp:443-535` — the same forced count is read through THREE predicates, and `0` is
@@ -1390,10 +1478,11 @@ mod unit_tests {
         );
     }
 
-    /// ⭐ WHAT THE [`Option`] KEY BUYS BEYOND SPELLING THE `-1`: `checkConstraints` walks the whole
-    /// outer map (`ddc/ddcv1.cpp:795`) and the authority's `unordered_map` gives the hash's order,
-    /// while [`None`] sorts before every [`Some`] here — so the absolute entries are visited first,
-    /// always, and the one thing that order decides is fixed rather than left to a hash.
+    /// ⭐ WHAT THE KEY TYPE BUYS BEYOND FOLDING THE `-1`: `checkConstraints` walks the whole outer map
+    /// (`ddc/ddcv1.cpp:795`) and the authority's `unordered_map` gives the hash's order, while
+    /// [`ConstraintRef::Absolute`] sorts before every [`Relative`](ConstraintRef::Relative) here — so
+    /// the absolute entries are visited first, always, and the one thing that order decides is fixed
+    /// rather than left to a hash.
     ///
     /// ⛔ AND THE ORDER IS NOT THE VERDICT: that lambda writes nothing and returns on the first
     /// violation (`:795-921`), so any permutation answers the same. What it decides is which
@@ -1402,9 +1491,9 @@ mod unit_tests {
     fn a_datastages_absolute_constraints_are_visited_before_its_relative_ones() {
         let mut datastage = Datastage::default();
         for key in [
-            Some(Metadata::CHUNK_DSTGID),
-            None,
-            Some(Metadata::CORE_DSTGID),
+            ConstraintRef::new(Metadata::CHUNK_DSTGID),
+            ConstraintRef::Absolute,
+            ConstraintRef::new(Metadata::CORE_DSTGID),
         ] {
             datastage
                 .constraints
@@ -1418,9 +1507,9 @@ mod unit_tests {
         assert_eq!(
             datastage.constraints.keys().copied().collect::<Vec<_>>(),
             vec![
-                None,
-                Some(Metadata::CORE_DSTGID),
-                Some(Metadata::CHUNK_DSTGID),
+                ConstraintRef::Absolute,
+                ConstraintRef::new(Metadata::CORE_DSTGID),
+                ConstraintRef::new(Metadata::CHUNK_DSTGID),
             ]
         );
     }
