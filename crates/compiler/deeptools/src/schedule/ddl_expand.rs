@@ -8,12 +8,22 @@
 //! censuses all 32 templates. [`DdlArch`] is that table's ROW TYPE at run time.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::RangeInclusive;
 
+use sys_arch_spec::arch_enums::SenComponent;
 use sys_arch_spec::fields::Gen;
 use sys_arch_spec::{CoreId, CoreletId};
 
-use crate::schedule::dims::{MetaDimKind, PrimaryDimTypes};
-use crate::schedule::dsc2::{BitWidth, DataFormats, LdsIdx, LoopCondComposite};
+use crate::schedule::ddc::Verbosity;
+use crate::schedule::dims::{
+    DimDensity, DimVal, MetaDimKind, PadType, PaddingFormType, PrimaryDimTypes,
+};
+use crate::schedule::dsc::{DesignSpaceConfig, NumCoresUsed};
+use crate::schedule::dsc2::{
+    BitWidth, CondVal, CondValType, DataFormats, IterationIdx, LdsIdx, LoopCondComposite,
+    LoopCondOp,
+};
+use crate::schedule::metadata::Metadata;
 
 /// Replaces: e017_DdlArch
 ///
@@ -307,6 +317,371 @@ impl CondProp {
 
 // crustify:todo: e019_DdlInterface.transfer_acc_pat_dims_
 
+/// Replaces: e018_DdlConversion
+///
+/// The DDL↔DSC conversion (`ddc/ddl/ddl_conversion.h:482-559`): it picks a `.ddl` template for the
+/// DSC's op func, parses it, and expands it into schedule-tree nodes.
+///
+/// ⛔ THREE OF ITS SEVEN FIELDS ARE CARRIED — and UNITS.tsv's "0 declared fields" is a field-scan
+/// defect, they are declared at `:511-517`. The four that are not:
+///   * `const SuperDsc& sdsc` (`:512`) and `const DesignSpaceConfigGlobal& dscGlobal_` (`:513`):
+///     neither is a unit in UNITS.tsv and neither is in `src/`.
+///   * `DdlInterface ddlInterface` (`:514`) is `e019_DdlInterface`, whose anchor is open above with
+///     fourteen of its fifteen fields blocked.
+///   * `DdlModuleOp ddlParser_` (`:515`) is the MLIR module and context; the template parse is
+///     build-side, in `build.rs` with `ddl/{ast,parse,selection,smc}.rs`.
+///
+/// ⛔ AND THOSE FOUR ARE WHAT KEEPS FIFTEEN OF THE EIGHTEEN METHODS OFF THIS TYPE.
+/// `ddlInterface`'s `mlir::Value`-keyed maps block `processOp` (`ddc/ddl/ddl_conversion.cpp:582`),
+/// `processRegion` (`:2008`), `processTransformations` (`:2036`), `processPaddedDimensionOp`
+/// (`:102`), `processDimensionOp` (`:187`), `processTypes` (`:447`), `addInternalTensor` (`:473`),
+/// `matchDdl2Dsc` (`:2110`), `parseDdl2Dsc` (`:2770`), `getTensor` (`:2825`),
+/// `getTensorAndAllocation` (`:2847`), `convertDsc2Ddl` (`:2881`), `checkMetaDimensions` (`:3537`),
+/// `checkAccessPattern` (`:3649`) and `processAccessPatterns` (`:3728`); and `dsc.computeOp_` — an
+/// open `Field:` anchor in `src/schedule/dsc.rs` — blocks `selectAndParseDdlTemplate` (`:42`),
+/// whose 121-row table is already `ddl/selection.rs`'s build-side `OP_FUNC_TEMPLATES`. What lands
+/// here is `processExpression` whole, plus every arm of `processCondition` and
+/// `verifyDdlConstraints` that reads only this type's three fields and the DDL op's own attributes.
+///
+/// ⛔ NO `Default`: [`min_num_cores_met`](Self::min_num_cores_met) cannot answer on a DSC that has
+/// not been through DSM, and a defaulted one has not.
+/// ⛔ AND NO `Clone` EITHER, because [`Metadata`] has none: its `core_dstgid`/`chunk_dstgid` are
+/// `const int`, which deletes the authority's copy-assignment (`ddc/ddc_metadata.h:211-212`).
+#[derive(Debug)]
+pub struct DdlConversion {
+    /// Field: e018_DdlConversion.dsc
+    ///
+    /// The DSC being built (`ddc/ddl/ddl_conversion.h:511`) — a `DesignSpaceConfig&` there, OWNED
+    /// here: the object the conversion mutates is one value, per AGENT-BRIEF rule 4.
+    pub dsc: DesignSpaceConfig,
+    /// Field: e018_DdlConversion.metadata_
+    ///
+    /// The conversion metadata (`:516`), owned on the same terms.
+    pub metadata: Metadata,
+    /// Field: e018_DdlConversion.verbose_
+    ///
+    /// The verbosity level the `Ddc` hands down (`:517`).
+    pub verbose: Verbosity,
+}
+
+impl DdlConversion {
+    /// The constructor's three carriable initialisers (`ddc/ddl/ddl_conversion.h:551-558`).
+    pub fn new(dsc: DesignSpaceConfig, metadata: Metadata, verbose: Verbosity) -> Self {
+        Self {
+            dsc,
+            metadata,
+            verbose,
+        }
+    }
+
+    /// `processExpression` (`ddc/ddl/ddl_conversion.cpp:2072-2079`): a DDL attribute string as a
+    /// number. Absent is its `DT_ERROR`, which fires unless `strtof` consumed all of it bar
+    /// surrounding whitespace.
+    ///
+    /// ⚠️ ONE FORM DIVERGES: `strtof` also admits C's hex-float (`0x1p3`) and Rust's parse does not.
+    /// No vendored template states one — `build.rs` censuses all 32.
+    pub fn process_expression(expr: &str) -> Option<f32> {
+        expr.trim().parse::<f32>().ok()
+    }
+
+    /// A `ddl.condition`'s `value_expr` (`ddc/ddl/ddl_conversion.cpp:265-273`): one of the named
+    /// forms, else a number.
+    ///
+    /// ⛔ THE CALLER NARROWS A `float` TO AN `int` (`:273`), so `2.7` is iteration 2 — and the three
+    /// other callers of [`process_expression`] keep the fraction (`:1840`, `:1843`, `:1847`).
+    pub fn parse_cond_val(value_expr: &str) -> Option<CondVal> {
+        match CondValType::from_name(value_expr) {
+            Some(val_type) => Some(CondVal::from_wire(val_type, CondVal::ABSENT_VAL_INT)),
+            None => {
+                let val = Self::process_expression(value_expr)?;
+                Some(CondVal::Iteration(IterationIdx(val as i32)))
+            }
+        }
+    }
+
+    /// A condition on a DROPPED dim (`ddc/ddl/ddl_conversion.cpp:274-292`): the dim does not exist,
+    /// so it is a loop of size one and the guard resolves against iteration zero.
+    ///
+    /// ⭐ `FIRST`/`LAST` BOTH BECOME ZERO (`:277-280`), which is why they cannot stay a [`CondVal`].
+    /// ⛔ AND IBM'S IF-CHAIN HAS NO ELSE, leaving `resolvedValue_` uninitialised on a seventh
+    /// operator; [`LoopCondOp`] has only these six, which is also what `:259-263` narrowed to.
+    pub fn resolve_dropped_dim_condition(cond_op: LoopCondOp, cond_val: CondVal) -> bool {
+        let val = match cond_val {
+            CondVal::Iteration(idx) => idx.0,
+            CondVal::First | CondVal::Last => 0,
+        };
+        match cond_op {
+            LoopCondOp::Eq => val == 0,
+            LoopCondOp::Ne => val != 0,
+            LoopCondOp::Lt => val < 0,
+            LoopCondOp::Le => val <= 0,
+            LoopCondOp::Gt => val > 0,
+            LoopCondOp::Ge => val >= 0,
+        }
+    }
+
+    /// `ConditionNotOp` (`ddc/ddl/ddl_conversion.cpp:321-342`), whose three arms are this enum's
+    /// three variants in the authority's own dispatch order.
+    pub fn negate_condition(&self, cond: CondProp) -> CondProp {
+        match cond {
+            CondProp::Resolved(value) => CondProp::Resolved(!value),
+            CondProp::Loop(loop_cond) => CondProp::Loop(loop_cond.negate()),
+            CondProp::CoreCl(core_cl) => self.complement_core_cl(core_cl),
+        }
+    }
+
+    /// The `condNot` complement of a core/corelet condition (`ddc/ddl/ddl_conversion.cpp:327-341`):
+    /// over every used core, a stated corelet set is toggled member by member and an unstated core
+    /// gains corelet 0, and 1 as well when more than one corelet is used.
+    ///
+    /// ⛔ THE UNSTATED-CORE ARM IS NOT THE COMPLEMENT OF THE EMPTY SET — it hard-codes at most two
+    /// corelets whatever `numCoreletsUsed_DSC2_` says (`:338-340`), while the toggle arm spans all
+    /// of them. ⭐ AN UNSTATED COUNT TOGGLES NOTHING, faithfully: IBM's bound is its `-1`.
+    pub fn complement_core_cl(
+        &self,
+        mut core_cl: BTreeMap<CoreId, BTreeSet<CoreletId>>,
+    ) -> CondProp {
+        let count = self.dsc.num_corelets_used_dsc2.map_or(0, |used| used.0);
+        for &core in &self.dsc.core_ids_used {
+            match core_cl.get_mut(&core) {
+                Some(corelets) => {
+                    for cl in (0..count)
+                        .filter_map(|cl| u8::try_from(cl).ok())
+                        .map(CoreletId)
+                    {
+                        if !corelets.remove(&cl) {
+                            corelets.insert(cl);
+                        }
+                    }
+                    if corelets.is_empty() {
+                        core_cl.remove(&core);
+                    }
+                }
+                None => {
+                    let corelets = core_cl.entry(core).or_default();
+                    corelets.insert(CoreletId(0));
+                    if count > 1 {
+                        corelets.insert(CoreletId(1));
+                    }
+                }
+            }
+        }
+        CondProp::core_cl(core_cl)
+    }
+
+    /// `ConditionAndOp` over already-resolved operands (`ddc/ddl/ddl_conversion.cpp:342-434`).
+    /// Absent is its "And/or op is mixing incompatible types" (`:371-372`, `:407-408`) or a loop
+    /// composition outside the two-level OR of ANDs (`:380-389`, `:393-399`).
+    pub fn and_conditions(operands: impl IntoIterator<Item = CondProp>) -> Option<CondProp> {
+        Self::compose_conditions(true, operands)
+    }
+
+    /// `ConditionOrOp`, the same fold (`ddc/ddl/ddl_conversion.cpp:342-434`) and the same absences.
+    pub fn or_conditions(operands: impl IntoIterator<Item = CondProp>) -> Option<CondProp> {
+        Self::compose_conditions(false, operands)
+    }
+
+    /// The `isAnd` fold both of the above are (`ddc/ddl/ddl_conversion.cpp:343-434`).
+    ///
+    /// ⭐ A RESOLVED OPERAND IS THE JUNCTION'S IDENTITY OR ITS ANNIHILATOR and nothing else: the
+    /// annihilator returns straight out (`:346-360`) and the identity is dropped, whether it arrived
+    /// first (`:373-376`, `:409-412`) or later, where IBM's merge block simply finds nothing to do.
+    /// ⛔ THE TAIL NORMALISATION IS NOW ONLY THE EMPTY OPERAND LIST (`:438-441`): the other two
+    /// states it caught are unspellable — see [`CondProp`].
+    fn compose_conditions(
+        is_and: bool,
+        operands: impl IntoIterator<Item = CondProp>,
+    ) -> Option<CondProp> {
+        let mut composed: Option<CondProp> = None;
+        for operand in operands {
+            if let CondProp::Resolved(value) = operand
+                && value != is_and
+            {
+                return Some(CondProp::Resolved(value));
+            }
+            let Some(current) = composed.take() else {
+                composed = Some(operand);
+                continue;
+            };
+            composed = Some(match (current, operand) {
+                (CondProp::Resolved(_), later) => later,
+                (earlier, CondProp::Resolved(_)) => earlier,
+                (CondProp::Loop(earlier), CondProp::Loop(later)) => {
+                    CondProp::Loop(Self::compose_loop_conditions(is_and, earlier, later)?)
+                }
+                (CondProp::CoreCl(earlier), CondProp::CoreCl(later)) => {
+                    CondProp::core_cl(Self::compose_core_cl_conditions(is_and, earlier, later))
+                }
+                _ => return None,
+            });
+        }
+        Some(composed.unwrap_or(CondProp::Resolved(false)))
+    }
+
+    /// The loop half of that fold (`ddc/ddl/ddl_conversion.cpp:380-403`), which is the three
+    /// grammar types composing: AND appends terms to one clause, OR appends clauses.
+    ///
+    /// ⭐ THE TWO REFUSALS ARE THE TWO NARROWINGS: `without_negation` is IBM's `negated_` half and
+    /// `into_conjunction` its `size() != 1` half, so nothing here re-tests them.
+    fn compose_loop_conditions(
+        is_and: bool,
+        earlier: LoopCondComposite,
+        later: LoopCondComposite,
+    ) -> Option<LoopCondComposite> {
+        let earlier = earlier.without_negation()?;
+        let later = later.without_negation()?;
+        if is_and {
+            Some(
+                earlier
+                    .into_conjunction()?
+                    .and(later.into_conjunction()?)
+                    .into(),
+            )
+        } else {
+            Some(earlier.or(later).into())
+        }
+    }
+
+    /// The core/corelet half (`ddc/ddl/ddl_conversion.cpp:413-430`): AND intersects per core and
+    /// drops a core the operand omits or empties, OR unions.
+    ///
+    /// ⛔ IBM'S AND ARM IS UNDEFINED BEHAVIOUR — it `erase`s the current element of the `std::map`
+    /// it is ranging over and then increments that iterator (`:417-418`, `:422`). `retain` is the
+    /// well-defined reading of what it means.
+    fn compose_core_cl_conditions(
+        is_and: bool,
+        mut earlier: BTreeMap<CoreId, BTreeSet<CoreletId>>,
+        later: BTreeMap<CoreId, BTreeSet<CoreletId>>,
+    ) -> BTreeMap<CoreId, BTreeSet<CoreletId>> {
+        if is_and {
+            earlier.retain(|core, corelets| match later.get(core) {
+                Some(theirs) => {
+                    *corelets = corelets.intersection(theirs).copied().collect();
+                    !corelets.is_empty()
+                }
+                None => false,
+            });
+        } else {
+            for (core, corelets) in later {
+                earlier.entry(core).or_default().extend(corelets);
+            }
+        }
+        earlier
+    }
+
+    /// `ddl.constraint {min_num_cores = N}` (`ddc/ddl/ddl_conversion.cpp:2558-2564`): whether the
+    /// DSC uses at least that many cores. Absent where the DSC has not stated a count, which is the
+    /// indeterminate `int` the authority compares.
+    pub fn min_num_cores_met(&self, min_num_cores: NumCoresUsed) -> Option<bool> {
+        Some(self.dsc.num_cores_used? >= min_num_cores)
+    }
+
+    /// `ddl.constraint {min_num_valid =, max_num_valid =}` (`ddc/ddl/ddl_conversion.cpp:2603-2605`)
+    /// as the range a count of active variables must fall in.
+    ///
+    /// ⭐ THE UNSTATED MAXIMUM IS 100, NOT UNBOUNDED, and that number is the authority's own
+    /// `value_or` (`:2604`). The count itself needs `operation_definition_` and `labeledDs_`
+    /// (`:2575-2601`), so it is not answerable here.
+    pub fn num_valid_range(
+        min_num_valid: Option<u32>,
+        max_num_valid: Option<u32>,
+    ) -> RangeInclusive<u32> {
+        min_num_valid.unwrap_or(0)..=max_num_valid.unwrap_or(100)
+    }
+
+    /// `ddl.constraint {relative_op_order = true}` (`ddc/ddl/ddl_conversion.cpp:2621-2637`): the
+    /// operands that ARE bound must appear in strictly increasing compute-op order.
+    ///
+    /// ⛔ `relative_op_order = false` IS NOT THIS FORM at all — the authority tests
+    /// `has_value() && value()` and falls through to the `cmp` arm (`:2624-2625`).
+    pub fn relative_op_order_met(bound: impl IntoIterator<Item = ComputeOpIdx>) -> bool {
+        let mut highest: Option<ComputeOpIdx> = None;
+        for idx in bound {
+            if highest.is_some_and(|seen| idx <= seen) {
+                return false;
+            }
+            highest = Some(idx);
+        }
+        true
+    }
+
+    /// The size a property-less `ddl.constraint {cmp =, value =}` tests, for one bound DDL dim
+    /// (`ddc/ddl/ddl_conversion.cpp:2710-2748`): a padding scalar, or the core stage's steady-state
+    /// dim under the padding form its meta-dim kind names.
+    ///
+    /// ⛔ THREE ABSENCES, TWO OF WHICH LEAVE THE CONSTRAINT SATISFIED: a dropped dim (`:2715`) and a
+    /// dim with no padding entry (`:2722`) are the authority's `continue` — and that entry is
+    /// required by `Padded` and `PadValid` too, which then do not read it. The third,
+    /// [`MetaDimKind::Undefined`], is its "Constraint on unsupported dim kind" (`:2745-2746`).
+    pub fn dim_constraint_size(&self, dim_prop: &DimProp) -> Option<DimVal> {
+        let dim = dim_prop.mapped_dim()?;
+        let ref_ds = &self.dsc.data_stage_param.get(&Metadata::CORE_DSTGID)?.ss;
+        let kind = dim_prop.meta_dim_kind();
+        if matches!(kind, MetaDimKind::Unpadded | MetaDimKind::WindowDim) {
+            return ref_ds.primary_dim_to_val(dim);
+        }
+        let padded_as = |pad| {
+            ref_ds.primary_dim_to_val_for_component(
+                dim,
+                SenComponent::NoComponent,
+                None,
+                None,
+                &PaddingFormType::new(dim, pad),
+                DimDensity::FULL,
+                false,
+            )
+        };
+        let pad_info = ref_ds.padding_sizes.get(&dim)?;
+        match kind {
+            MetaDimKind::PadFront => Some(DimVal(pad_info.pad_front)),
+            MetaDimKind::PadBack => Some(DimVal(pad_info.pad_back)),
+            MetaDimKind::Stride => Some(DimVal(pad_info.stride)),
+            MetaDimKind::Dilation => Some(DimVal(pad_info.dilation)),
+            MetaDimKind::Padded => padded_as(PadType::PaddedFullSpanWUnneeded),
+            MetaDimKind::PadValid => padded_as(PadType::PaddedNoZeroPad),
+            MetaDimKind::Unpadded | MetaDimKind::WindowDim | MetaDimKind::Undefined => None,
+        }
+    }
+}
+
+/// A `ddl.constraint`'s `cmp` attribute (`ddc/ddl/ddl_conversion.cpp:2641`), which
+/// `verifyDdlConstraints` admits in exactly two spellings.
+///
+/// ⛔ A CLOSED SET THE AUTHORITY KEEPS AS A `StringRef`, compared against `"equal"` and `"less"` and
+/// aborting on anything else (`:2658`, `:2749-2755`, `:2697`). The variant names are the literals',
+/// and `build.rs` already emits this type under this name from its own census (`build.rs:3158-3160`,
+/// `:3209`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstraintCmp {
+    #[default]
+    Equal,
+    Less,
+}
+
+impl ConstraintCmp {
+    /// The DDL's spelling. Absent is the authority's `"cmp" type not yet supported`
+    /// (`ddc/ddl/ddl_conversion.cpp:2697`, `:2755`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "equal" => Some(Self::Equal),
+            "less" => Some(Self::Less),
+            _ => None,
+        }
+    }
+
+    /// Whether the measured size satisfies the constraint's stated value
+    /// (`ddc/ddl/ddl_conversion.cpp:2749-2752`).
+    ///
+    /// ⛔ ONLY `Equal` REACHES THE `dim_idx` AND `property` FORMS (`:2658`, `:2687`); a `less` there
+    /// is the same abort as an unknown spelling.
+    pub fn holds(self, size: DimVal, value: DimVal) -> bool {
+        match self {
+            Self::Equal => size == value,
+            Self::Less => size < value,
+        }
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
@@ -459,5 +834,329 @@ mod unit_tests {
         assert_eq!(cond.resolved_value(), None);
         assert!(matches!(cond, CondProp::CoreCl(got) if got == cores));
         assert_eq!(CondProp::Resolved(true).resolved_value(), Some(true));
+    }
+
+    use crate::schedule::dsc::NumCoreletsUsed;
+    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction};
+
+    /// A conversion over a DSC and metadata that have not been filled — every test below states the
+    /// fields its own arm reads.
+    fn conversion() -> DdlConversion {
+        DdlConversion::new(
+            DesignSpaceConfig::default(),
+            Metadata::default(),
+            Verbosity(0),
+        )
+    }
+
+    /// One condition term, for the loop-composition tests below.
+    fn term(dim: PrimaryDimTypes) -> LoopCond {
+        LoopCond {
+            dim,
+            cond_op: LoopCondOp::Eq,
+            cond_val: CondVal::Last,
+        }
+    }
+
+    /// `strtof` must have consumed the whole string bar whitespace, else `DT_ERROR`
+    /// (`ddc/ddl/ddl_conversion.cpp:2074-2078`).
+    #[test]
+    fn process_expression_wants_the_whole_string_and_nothing_else() {
+        assert_eq!(DdlConversion::process_expression(" 2.5 "), Some(2.5));
+        assert_eq!(DdlConversion::process_expression("-3"), Some(-3.0));
+        assert_eq!(DdlConversion::process_expression("2.5 cores"), None);
+        assert_eq!(DdlConversion::process_expression(""), None);
+    }
+
+    /// The named forms win, and anything else is a number truncated into the caller's `int`
+    /// (`ddc/ddl/ddl_conversion.cpp:265-273`).
+    #[test]
+    fn parse_cond_val_prefers_the_named_forms_and_truncates_the_rest() {
+        assert_eq!(DdlConversion::parse_cond_val("first"), Some(CondVal::First));
+        assert_eq!(DdlConversion::parse_cond_val("last"), Some(CondVal::Last));
+        assert_eq!(
+            DdlConversion::parse_cond_val("2.7"),
+            Some(CondVal::Iteration(IterationIdx(2)))
+        );
+        assert_eq!(DdlConversion::parse_cond_val("outermost"), None);
+    }
+
+    /// A dropped dim is a loop of size one, so `FIRST`/`LAST` are iteration zero and the operator is
+    /// applied against it (`ddc/ddl/ddl_conversion.cpp:274-292`).
+    #[test]
+    fn a_dropped_dim_resolves_its_condition_against_iteration_zero() {
+        for cond_val in [CondVal::First, CondVal::Last] {
+            assert!(DdlConversion::resolve_dropped_dim_condition(
+                LoopCondOp::Eq,
+                cond_val
+            ));
+            assert!(!DdlConversion::resolve_dropped_dim_condition(
+                LoopCondOp::Ne,
+                cond_val
+            ));
+        }
+        let two = CondVal::Iteration(IterationIdx(2));
+        assert!(DdlConversion::resolve_dropped_dim_condition(
+            LoopCondOp::Gt,
+            two
+        ));
+        assert!(!DdlConversion::resolve_dropped_dim_condition(
+            LoopCondOp::Le,
+            two
+        ));
+    }
+
+    /// `condNot` over a core/corelet condition: a stated core's corelets toggle and an unstated core
+    /// gains 0 and 1 (`ddc/ddl/ddl_conversion.cpp:327-341`) — and a complement that empties every
+    /// used core is the tail's `resolvedValue_ = false`.
+    #[test]
+    fn negating_a_core_condition_toggles_every_used_core() {
+        let mut conv = conversion();
+        conv.dsc.core_ids_used = vec![CoreId(0), CoreId(1)];
+        conv.dsc.num_corelets_used_dsc2 = Some(NumCoreletsUsed(2));
+        let stated = BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]);
+        let expected = BTreeMap::from([
+            (CoreId(0), BTreeSet::from([CoreletId(1)])),
+            (CoreId(1), BTreeSet::from([CoreletId(0), CoreletId(1)])),
+        ]);
+        assert!(
+            matches!(conv.negate_condition(CondProp::CoreCl(stated)), CondProp::CoreCl(got) if got == expected)
+        );
+
+        let mut solo = conversion();
+        solo.dsc.core_ids_used = vec![CoreId(0)];
+        solo.dsc.num_corelets_used_dsc2 = Some(NumCoreletsUsed(1));
+        let full = BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]);
+        assert_eq!(
+            solo.negate_condition(CondProp::CoreCl(full))
+                .resolved_value(),
+            Some(false)
+        );
+    }
+
+    /// `condNot`'s other two arms invert only their own half
+    /// (`ddc/ddl/ddl_conversion.cpp:322-326`).
+    #[test]
+    fn negating_a_resolved_or_loop_condition_flips_only_its_own_half() {
+        let conv = conversion();
+        assert_eq!(
+            conv.negate_condition(CondProp::Resolved(true))
+                .resolved_value(),
+            Some(false)
+        );
+        let guard: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::Y)).into();
+        assert!(
+            matches!(conv.negate_condition(CondProp::Loop(guard)), CondProp::Loop(got) if got.negated)
+        );
+    }
+
+    /// `ConditionAndOp` appends the operand's terms to one clause, and a negated operand is the
+    /// "two-level OR of ANDs" refusal (`ddc/ddl/ddl_conversion.cpp:380-392`).
+    #[test]
+    fn an_and_of_loop_conditions_appends_terms_to_one_clause() {
+        let earlier: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::Y)).into();
+        let later: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::X)).into();
+        let composed = DdlConversion::and_conditions([
+            CondProp::Loop(earlier.clone()),
+            CondProp::Loop(later.clone()),
+        ]);
+        assert!(matches!(composed, Some(CondProp::Loop(got))
+            if got.or_of_ands.clause_count().get() == 1
+                && got.or_of_ands.clauses().next().is_some_and(|c| c.term_count().get() == 2)));
+        assert!(
+            DdlConversion::and_conditions([
+                CondProp::Loop(earlier.negate()),
+                CondProp::Loop(later),
+            ])
+            .is_none()
+        );
+    }
+
+    /// `ConditionOrOp` appends clauses (`ddc/ddl/ddl_conversion.cpp:401-403`), and the core/corelet
+    /// half unions on OR and intersects per core on AND (`:413-430`).
+    #[test]
+    fn an_or_appends_clauses_and_a_core_condition_unions_or_intersects() {
+        let earlier: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::Y)).into();
+        let later: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::X)).into();
+        let composed =
+            DdlConversion::or_conditions([CondProp::Loop(earlier), CondProp::Loop(later)]);
+        assert!(
+            matches!(composed, Some(CondProp::Loop(got)) if got.or_of_ands.clause_count().get() == 2)
+        );
+
+        let one = CondProp::CoreCl(BTreeMap::from([
+            (CoreId(0), BTreeSet::from([CoreletId(0)])),
+            (CoreId(1), BTreeSet::from([CoreletId(0)])),
+        ]));
+        let two = CondProp::CoreCl(BTreeMap::from([(
+            CoreId(0),
+            BTreeSet::from([CoreletId(1)]),
+        )]));
+        assert!(matches!(
+            DdlConversion::or_conditions([one.clone(), two.clone()]),
+            Some(CondProp::CoreCl(got))
+                if got == BTreeMap::from([
+                    (CoreId(0), BTreeSet::from([CoreletId(0), CoreletId(1)])),
+                    (CoreId(1), BTreeSet::from([CoreletId(0)])),
+                ])
+        ));
+        assert_eq!(
+            DdlConversion::and_conditions([one, two]).and_then(|cond| cond.resolved_value()),
+            Some(false)
+        );
+    }
+
+    /// A resolved operand is the junction's identity, whichever side it arrives on, or its
+    /// annihilator — and an empty junction is the tail normalisation
+    /// (`ddc/ddl/ddl_conversion.cpp:346-360`, `:373-376`, `:438-441`).
+    #[test]
+    fn a_resolved_operand_is_its_junctions_identity_or_its_annihilator() {
+        let core = CondProp::CoreCl(BTreeMap::from([(
+            CoreId(0),
+            BTreeSet::from([CoreletId(0)]),
+        )]));
+        assert!(matches!(
+            DdlConversion::and_conditions([CondProp::Resolved(true), core.clone()]),
+            Some(CondProp::CoreCl(_))
+        ));
+        assert!(matches!(
+            DdlConversion::and_conditions([core.clone(), CondProp::Resolved(true)]),
+            Some(CondProp::CoreCl(_))
+        ));
+        assert_eq!(
+            DdlConversion::and_conditions([core.clone(), CondProp::Resolved(false)])
+                .and_then(|cond| cond.resolved_value()),
+            Some(false)
+        );
+        assert_eq!(
+            DdlConversion::or_conditions([core, CondProp::Resolved(true)])
+                .and_then(|cond| cond.resolved_value()),
+            Some(true)
+        );
+        assert_eq!(
+            DdlConversion::and_conditions(std::iter::empty())
+                .and_then(|cond| cond.resolved_value()),
+            Some(false)
+        );
+    }
+
+    /// "And/or op is mixing incompatible types", both ways round
+    /// (`ddc/ddl/ddl_conversion.cpp:371-372`, `:407-408`).
+    #[test]
+    fn mixing_a_loop_and_a_core_condition_is_refused() {
+        let guard: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::Y)).into();
+        let core = CondProp::CoreCl(BTreeMap::from([(
+            CoreId(0),
+            BTreeSet::from([CoreletId(0)]),
+        )]));
+        assert!(
+            DdlConversion::and_conditions([CondProp::Loop(guard.clone()), core.clone()]).is_none()
+        );
+        assert!(DdlConversion::or_conditions([core, CondProp::Loop(guard)]).is_none());
+    }
+
+    /// `min_num_cores` compares against `numCoresUsed_`, which DSM has not written on a fresh DSC
+    /// (`ddc/ddl/ddl_conversion.cpp:2558-2564`).
+    #[test]
+    fn min_num_cores_is_unanswerable_until_dsm_writes_the_count() {
+        let mut conv = conversion();
+        assert_eq!(conv.min_num_cores_met(NumCoresUsed(1)), None);
+        conv.dsc.num_cores_used = Some(NumCoresUsed(4));
+        assert_eq!(conv.min_num_cores_met(NumCoresUsed(4)), Some(true));
+        assert_eq!(conv.min_num_cores_met(NumCoresUsed(5)), Some(false));
+    }
+
+    /// The unstated bounds are 0 and 100 (`ddc/ddl/ddl_conversion.cpp:2603-2604`).
+    #[test]
+    fn an_unstated_num_valid_maximum_is_a_hundred() {
+        assert_eq!(DdlConversion::num_valid_range(Some(1), Some(1)), 1..=1);
+        assert_eq!(DdlConversion::num_valid_range(Some(1), None), 1..=100);
+        assert_eq!(DdlConversion::num_valid_range(None, Some(2)), 0..=2);
+    }
+
+    /// Strictly increasing, starting from `INT_MIN` so the first bound operand always passes
+    /// (`ddc/ddl/ddl_conversion.cpp:2621-2637`).
+    #[test]
+    fn relative_op_order_wants_strictly_increasing_indices() {
+        assert!(DdlConversion::relative_op_order_met([
+            ComputeOpIdx(0),
+            ComputeOpIdx(3),
+            ComputeOpIdx(7)
+        ]));
+        assert!(!DdlConversion::relative_op_order_met([
+            ComputeOpIdx(3),
+            ComputeOpIdx(3)
+        ]));
+        assert!(!DdlConversion::relative_op_order_met([
+            ComputeOpIdx(7),
+            ComputeOpIdx(3)
+        ]));
+        assert!(DdlConversion::relative_op_order_met(std::iter::empty()));
+    }
+
+    /// The property-less dim constraint reads the core stage's steady state: the plain dim, a
+    /// padding scalar, or the dim under the form its kind names
+    /// (`ddc/ddl/ddl_conversion.cpp:2710-2748`).
+    #[test]
+    fn a_dim_constraint_reads_the_core_stages_steady_state() {
+        use crate::schedule::dims::{DataStructDims, DimPaddingSizes, DimSize};
+        use crate::schedule::dsc2::DataStage;
+
+        let mut conv = conversion();
+        conv.dsc.data_stage_param.insert(
+            Metadata::CORE_DSTGID,
+            DataStage {
+                ss: DataStructDims {
+                    mb: DimSize::new(8.0),
+                    padding_sizes: BTreeMap::from([(
+                        PrimaryDimTypes::Mb,
+                        DimPaddingSizes {
+                            pad_front: 3,
+                            ..DimPaddingSizes::default()
+                        },
+                    )]),
+                    ..DataStructDims::default()
+                },
+                ..DataStage::default()
+            },
+        );
+
+        let unpadded = DimProp {
+            dim: PrimaryDimTypes::Mb,
+            ..DimProp::default()
+        };
+        assert_eq!(conv.dim_constraint_size(&unpadded), Some(DimVal(8)));
+
+        let mut pad_front = unpadded.clone();
+        pad_front.set_meta_dim_kind(MetaDimKind::PadFront);
+        assert_eq!(conv.dim_constraint_size(&pad_front), Some(DimVal(3)));
+
+        let mut padded = unpadded.clone();
+        padded.set_meta_dim_kind(MetaDimKind::Padded);
+        assert_eq!(conv.dim_constraint_size(&padded), Some(DimVal(11)));
+
+        let mut dropped = pad_front.clone();
+        dropped.drop_dim = true;
+        assert_eq!(conv.dim_constraint_size(&dropped), None);
+
+        let mut undefined = unpadded;
+        undefined.set_meta_dim_kind(MetaDimKind::Undefined);
+        assert_eq!(conv.dim_constraint_size(&undefined), None);
+    }
+
+    /// `verifyDdlConstraints` admits two `cmp` spellings and aborts on the rest
+    /// (`ddc/ddl/ddl_conversion.cpp:2749-2755`).
+    #[test]
+    fn constraint_cmp_admits_only_equal_and_less() {
+        assert_eq!(
+            ConstraintCmp::from_name("equal"),
+            Some(ConstraintCmp::Equal)
+        );
+        assert_eq!(ConstraintCmp::from_name("less"), Some(ConstraintCmp::Less));
+        assert_eq!(ConstraintCmp::from_name("greater"), None);
+        assert!(ConstraintCmp::Equal.holds(DimVal(8), DimVal(8)));
+        assert!(!ConstraintCmp::Equal.holds(DimVal(8), DimVal(9)));
+        assert!(ConstraintCmp::Less.holds(DimVal(8), DimVal(9)));
+        assert!(!ConstraintCmp::Less.holds(DimVal(9), DimVal(9)));
     }
 }
