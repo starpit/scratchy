@@ -178,7 +178,25 @@
        ],
        "members": {
         "types": [
-         "e025_Ddc"
+         "e016_Ddc"
+        ]
+       }
+      }
+     }
+    },
+    "ddl_expand": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/ddl_expand.rs": {
+       "tu": "crustify-scheduler/cpp/ddl_conversion.h",
+       "headers": [
+        "ddc/ddl/ddl_conversion.h"
+       ],
+       "members": {
+        "types": [
+         "e017_DdlArch",
+         "e018_DdlConversion",
+         "e019_DdlInterface"
         ]
        }
       }
@@ -194,11 +212,11 @@
        ],
        "members": {
         "types": [
-         "e002_PrimaryDimAndKind",
-         "e003_PaddingFormType",
-         "e004_DimPaddingSizes",
-         "e005_SymbolicDimInfo",
-         "e012_DataStructDims"
+         "e015_DataStructDims",
+         "e021_DimPaddingSizes",
+         "e039_PaddingFormType",
+         "e040_PrimaryDimAndKind",
+         "e044_SymbolicDimInfo"
         ]
        }
       }
@@ -214,7 +232,7 @@
        ],
        "members": {
         "types": [
-         "e027_DesignSpaceConfig"
+         "e020_DesignSpaceConfig"
         ]
        }
       }
@@ -230,29 +248,29 @@
        ],
        "members": {
         "types": [
-         "e006_GroupTagRegInfo",
-         "e007_FoldParamInfoType",
-         "e008_LoopDistributionParamType",
-         "e022_DataStage",
-         "e023_CoordinateType",
-         "e024_TransferPadInfo",
-         "e028_ConstantInfo",
-         "e029_ScheduleNode",
-         "e030_BlockNode",
-         "e031_LoopNode",
-         "e032_ScheduleTree",
-         "e033_DataInfo",
-         "e034_TransferNode",
-         "e035_ComputeNode",
-         "e036_SyncNode",
-         "e037_AllocateNode",
-         "e038_CoordPropInfoType",
-         "e039_LoopCond",
-         "e040_StickMaskNode",
-         "e041_DistributionStatusInfo",
-         "e042_LoopDistributionInfo",
-         "e043_LoopCondComposite",
-         "e044_ConditionNode"
+         "e003_AllocateNode",
+         "e004_BlockNode",
+         "e005_ComputeNode",
+         "e006_ConditionNode",
+         "e009_ConstantInfo",
+         "e010_CoordPropInfoType",
+         "e011_CoordinateType",
+         "e013_DataInfo",
+         "e014_DataStage",
+         "e022_DistributionStatusInfo",
+         "e027_FoldParamInfoType",
+         "e028_GroupTagRegInfo",
+         "e030_LoopCond",
+         "e031_LoopCondComposite",
+         "e032_LoopDistributionInfo",
+         "e033_LoopDistributionParamType",
+         "e034_LoopNode",
+         "e041_ScheduleNode",
+         "e042_ScheduleTree",
+         "e043_StickMaskNode",
+         "e045_SyncNode",
+         "e046_TransferNode",
+         "e047_TransferPadInfo"
         ]
        }
       }
@@ -268,16 +286,16 @@
        ],
        "members": {
         "types": [
-         "e009_FoldDimProp",
-         "e010_FoldFunction",
-         "e013_ConstFoldFunction_NonLeaf",
-         "e014_ConstFoldFunction_Leaf",
-         "e015_AffineFoldFunction_NonLeaf",
-         "e016_AffineFoldFunction_Leaf",
-         "e017_MapFoldFunction_NonLeaf",
-         "e018_MapFoldFunction_Leaf",
-         "e019_WkSplitFoldFunction_Leaf",
-         "e020_FoldManager"
+         "e001_AffineFoldFunction_Leaf",
+         "e002_AffineFoldFunction_NonLeaf",
+         "e007_ConstFoldFunction_Leaf",
+         "e008_ConstFoldFunction_NonLeaf",
+         "e024_FoldDimProp",
+         "e025_FoldFunction",
+         "e026_FoldManager",
+         "e035_MapFoldFunction_Leaf",
+         "e036_MapFoldFunction_NonLeaf",
+         "e048_WkSplitFoldFunction_Leaf"
         ]
        }
       }
@@ -293,7 +311,31 @@
        ],
        "members": {
         "types": [
-         "e021_MapWithFMHelper"
+         "e037_MapWithFMHelper"
+        ]
+       }
+      }
+     }
+    },
+    "l3": {
+     "rust_path": "crates/compiler/deeptools/src/schedule",
+     "rs": {
+      "src/schedule/l3.rs": {
+       "tu": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "headers": [
+        "dcg/dcg_fe/scheduler/L3DlOpsScheduler.h"
+       ],
+       "members": {
+        "types": [
+         "e012_CrossCoreReductionGroup",
+         "e029_L3DlOpsScheduler",
+         "e029g1_L3DlOpsScheduler_sync",
+         "e029g2_L3DlOpsScheduler_opfunc",
+         "e029g3_L3DlOpsScheduler_coord",
+         "e029g4_L3DlOpsScheduler_stages",
+         "e029g5_L3DlOpsScheduler_paged",
+         "e029g6_L3DlOpsScheduler_verify",
+         "e029g7_L3DlOpsScheduler_run"
         ]
        }
       }
@@ -309,8 +351,8 @@
        ],
        "members": {
         "types": [
-         "e001_FailedAlloc",
-         "e026_Metadata"
+         "e023_FailedAlloc",
+         "e038_Metadata"
         ]
        }
       }
@@ -326,7 +368,7 @@
        ],
        "members": {
         "types": [
-         "e011_WkSplitParam"
+         "e049_WkSplitParam"
         ]
        }
       }

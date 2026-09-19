@@ -31,6 +31,12 @@ HOME = {
     "foldInfrastructure.h": "schedule/fold.rs",
     "mapWithFMHelper.h": "schedule/fold_helper.rs",
     "wkDivisionParams.h": "schedule/wk_division.rs",
+    # sc2: the node-MINTING half. ddl_conversion expands the parsed DDL into tree nodes
+    # (ddl_conversion.cpp:1065 mints a dsc2::LoopNode and registers it in loop_labels_);
+    # L3DlOpsScheduler owns the decisions no template states, createSynchronization first —
+    # the 748 above-LX syncs have no template behind them.
+    "ddl_conversion.h": "schedule/ddl_expand.rs",
+    "L3DlOpsScheduler.h": "schedule/l3.rs",
     "dsc2.h": "schedule/dsc2.rs",
     "designSpaceConfig.h": "schedule/dsc.rs",
     "dims.h": "schedule/dims.rs",
@@ -38,6 +44,25 @@ HOME = {
     "ddc.h": "schedule/ddc.rs",
 }
 BUDGETS = {"max_syms": 8, "max_loc": 320, "max_types": 5, "min_fields": 20}
+# ⛔ A CLASS WITH 130 METHODS IS NOT ONE UNIT. e018_DesignSpaceConfig proved it at 27 FIELDS: three
+# attempts, ~4.5h, nothing committed, each time inventing a type. L3DlOpsScheduler has 130 methods in a
+# 485-line class, so it is split BY CONCERN, read off its own method names. The first group carries the
+# class's fields; later groups carry only their methods. Ordering inside a class does not matter — they
+# share one Rust module and may reference each other freely.
+SPLIT = {
+    "L3DlOpsScheduler": [
+        ("sync",      ["createSynchronization", "createSynchronizationDSC"]),
+        ("opfunc",    ["isOpFunc", "isOpCrossCoreReduction"]),
+        ("coord",     ["propagateCoordinate", "sliceCoordinateForCorelet", "isDimensionCoreletSplit"]),
+        ("stages",    ["setChunkDataStageParams", "setSuperChunkDataStageParams",
+                       "updateChunkDataStagesFromCandidates"]),
+        ("paged",     ["processPagedTensorTransfers", "processHbmPagedTensors",
+                       "processDscHbmPagedTensors", "optimizeHbmTransfers",
+                       "optimizeHbmLdsOutputInScheduleTree", "isPagedLds"]),
+        ("verify",    ["verifyScheduleTree", "verifyLoopOrder"]),
+        ("run",       ["run", "prepDsc"]),
+    ],
+}
 MIN_BODY = 4          # a 3-line class is a tag or a typedef, not a unit of work
 FIELD = re.compile(r"\b([a-zA-Z][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;\s*$")
 
@@ -108,7 +133,9 @@ def main():
     AUTH = pathlib.Path("/Users/nickm/git/deeptools-src")
     impl_text = {}
     for rel in ("dsc/dsc2.cpp", "dsc/designSpaceConfig.cpp", "dsc/dims.cpp",
-                "ddc/ddcv1.cpp", "ddc/ddc_fold.cpp", "ddc/ddc_metadata.cpp"):
+                "ddc/ddcv1.cpp", "ddc/ddc_fold.cpp", "ddc/ddc_metadata.cpp",
+                "ddc/ddl/ddl_conversion.cpp", "ddc/ddl/ddl.cpp",
+                "dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp"):
         p = AUTH / rel
         if p.exists():
             impl_text[rel] = p.read_text(errors="replace")
@@ -255,6 +282,25 @@ def main():
             f"{c['first']}-{c['last']}", HOME[c["header"]],
             ",".join(x for x in c["deps"] if depth[x] < depth[c["name"]]), note,
         ]))
+    for base, groups in SPLIT.items():
+        if base not in cs:
+            continue
+        b = cs[base]
+        for gi, (tag, meths) in enumerate(groups, 1):
+            nm = f"{base}_{tag}"
+            e = f"e{numbering[base]:03d}g{gi}_{nm}"
+            rows.append("\t".join([
+                e, str(depth[base]), str(b["loc"]),
+                f"dcg/dcg_fe/scheduler/{b['header']}", f"{b['first']}-{b['last']}",
+                HOME[b["header"]], "",
+                f"METHOD GROUP of {base}: " + ", ".join(meths) + ". Port every method whose name "
+                f"begins with one of those, from the authority .cpp, WITH the state it reads. "
+                f"⛔ {base} has 130 methods — it is split by concern because a unit an agent cannot "
+                f"finish burns hours and commits nothing (e018 proved it at 27 fields, three times). "
+                f"The `{groups[0][0]}` group carries the class's fields; this group carries its "
+                f"methods. They share one Rust module, so order between groups does not matter.",
+                base, "" if tag != groups[0][0] else ",".join(b["fields"]),
+            ]))
     UNITS.write_text("\n".join(rows) + "\n")
 
     by_layer: dict[int, list] = {}
@@ -296,6 +342,34 @@ def main():
                 } for c in b],
             } for hdr, b in batches],
         })
+
+    for base, groups in SPLIT.items():
+        if base not in cs:
+            continue
+        b = cs[base]
+        extra = [{
+            "name": f"e{numbering[base]:03d}g{gi}_{base}_{tag}",
+            "defined_in": f"crustify-scheduler/cpp/{b['header']}",
+            "kind": "type", "source_kind": "struct", "layer": depth[base] + 1, "loc": b["loc"],
+            "deps": {"types": [{"name": b["entry"],
+                                "defined_in": f"crustify-scheduler/cpp/{b['header']}",
+                                "scope": "port"}], "symbols": []},
+            "fallback": [], "back_fill": [], "generates": [],
+            "field_anchors": meths,
+        } for gi, (tag, meths) in enumerate(groups, 1)]
+        tgt = depth[base] + 1
+        w = next((w for w in waves
+                  if any(i["layer"] == tgt for bb in w["batches"] for i in bb["items"])), None)
+        if w is None:
+            w = {"unit_count": 0, "batches": []}
+            waves.append(w)
+            waves.sort(key=lambda w: min((i["layer"] for bb in w["batches"]
+                                          for i in bb["items"]), default=tgt))
+        for it in extra:
+            w["batches"].append({"kind": "type",
+                                 "source_file": f"crustify-scheduler/cpp/{b['header']}",
+                                 "items": [it]})
+        w["unit_count"] += len(extra)
 
     items = [i for w in waves for b in w["batches"] for i in b["items"]]
     doc = {

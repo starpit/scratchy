@@ -12,12 +12,83 @@
   "min_fields": 20
  },
  "summary": {
-  "unit_count": 16,
-  "layer_count": 5,
-  "batch_count": 10,
-  "file_count": 5
+  "unit_count": 28,
+  "layer_count": 6,
+  "batch_count": 21,
+  "file_count": 7
  },
  "waves": [
+  {
+   "unit_count": 3,
+   "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e012_CrossCoreReductionGroup",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 30,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "GroupType",
+        "coreIds"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/ddl_conversion.h",
+     "items": [
+      {
+       "name": "e017_DdlArch",
+       "defined_in": "crustify-scheduler/cpp/ddl_conversion.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 5,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      },
+      {
+       "name": "e019_DdlInterface",
+       "defined_in": "crustify-scheduler/cpp/ddl_conversion.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 0,
+       "loc": 175,
+       "deps": {
+        "types": [],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "Count",
+        "transfer_acc_pat_dims_"
+       ]
+      }
+     ]
+    }
+   ]
+  },
   {
    "unit_count": 2,
    "batches": [
@@ -26,7 +97,7 @@
      "source_file": "crustify-scheduler/cpp/foldInfrastructure.h",
      "items": [
       {
-       "name": "e022_FoldManager",
+       "name": "e026_FoldManager",
        "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
        "kind": "type",
        "source_kind": "struct",
@@ -35,12 +106,12 @@
        "deps": {
         "types": [
          {
-          "name": "e020_FoldDimProp",
+          "name": "e024_FoldDimProp",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          },
          {
-          "name": "e021_FoldFunction",
+          "name": "e025_FoldFunction",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          }
@@ -102,7 +173,7 @@
      "source_file": "crustify-scheduler/cpp/mapWithFMHelper.h",
      "items": [
       {
-       "name": "e032_MapWithFMHelper",
+       "name": "e037_MapWithFMHelper",
        "defined_in": "crustify-scheduler/cpp/mapWithFMHelper.h",
        "kind": "type",
        "source_kind": "struct",
@@ -111,7 +182,7 @@
        "deps": {
         "types": [
          {
-          "name": "e020_FoldDimProp",
+          "name": "e024_FoldDimProp",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          }
@@ -170,22 +241,22 @@
        "deps": {
         "types": [
          {
-          "name": "e020_FoldDimProp",
+          "name": "e024_FoldDimProp",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          },
          {
-          "name": "e021_FoldFunction",
+          "name": "e025_FoldFunction",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          },
          {
-          "name": "e022_FoldManager",
+          "name": "e026_FoldManager",
           "defined_in": "crustify-scheduler/cpp/foldInfrastructure.h",
           "scope": "port"
          },
          {
-          "name": "e034_PaddingFormType",
+          "name": "e039_PaddingFormType",
           "defined_in": "crustify-scheduler/cpp/dims.h",
           "scope": "port"
          }
@@ -221,14 +292,108 @@
    ]
   },
   {
-   "unit_count": 9,
+   "unit_count": 10,
    "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029_L3DlOpsScheduler",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 3,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e011_CoordinateType",
+          "defined_in": "crustify-scheduler/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e014_DataStage",
+          "defined_in": "crustify-scheduler/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e027_FoldParamInfoType",
+          "defined_in": "crustify-scheduler/cpp/dsc2.h",
+          "scope": "port"
+         },
+         {
+          "name": "e040_PrimaryDimAndKind",
+          "defined_in": "crustify-scheduler/cpp/dims.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "ScheduleDimTableType",
+        "TransferAccessPatternPerDimType",
+        "TransferAccessPatternType",
+        "accessPatternPerDim_",
+        "allocate_",
+        "apply_row_offset_",
+        "burstEfficiency",
+        "chunk_dstgid",
+        "compAndAllocNode",
+        "consIdAndAllocNode",
+        "constraints_",
+        "consumers_",
+        "core_dstgid",
+        "coresSetToGtrGroupNameMap",
+        "dataConnects_",
+        "dataStageChunkIdx",
+        "dataStageCoreIdx",
+        "dataStageIbrIdx",
+        "dataStageOnePageIdx",
+        "dataStageSuperChunkIdx",
+        "datastages_",
+        "datatransfers_",
+        "dscMetadata",
+        "exphases",
+        "externalNodes_",
+        "externalTransfers_",
+        "force_num_elements_",
+        "gtrCurrGroupName",
+        "inOutRegAllocs_",
+        "insertBefore",
+        "internalRegAlloc_",
+        "internalRegs_",
+        "isSoft",
+        "ldsIdxAndAllocNode",
+        "lxBelowBlockNodeName",
+        "lxBufferType",
+        "lxBufferTypeMode",
+        "max_",
+        "max_unroll_",
+        "memTrackers",
+        "mustBeMultiple_",
+        "nearestNumeratorIdx_",
+        "newAllocations_",
+        "opaqueOps_",
+        "producers_",
+        "relevantDimsAndNumerator_",
+        "rowSplitDim",
+        "transfer_",
+        "values_",
+        "verbose"
+       ]
+      }
+     ]
+    },
     {
      "kind": "type",
      "source_file": "crustify-scheduler/cpp/ddc.h",
      "items": [
       {
-       "name": "e015_Ddc",
+       "name": "e016_Ddc",
        "defined_in": "crustify-scheduler/cpp/ddc.h",
        "kind": "type",
        "source_kind": "struct",
@@ -288,7 +453,7 @@
      "source_file": "crustify-scheduler/cpp/ddc_metadata.h",
      "items": [
       {
-       "name": "e033_Metadata",
+       "name": "e038_Metadata",
        "defined_in": "crustify-scheduler/cpp/ddc_metadata.h",
        "kind": "type",
        "source_kind": "struct",
@@ -391,7 +556,7 @@
        ]
       },
       {
-       "name": "e036_ScheduleNode",
+       "name": "e041_ScheduleNode",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -460,7 +625,7 @@
        ]
       },
       {
-       "name": "e029_LoopNode",
+       "name": "e034_LoopNode",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -486,7 +651,7 @@
        ]
       },
       {
-       "name": "e037_ScheduleTree",
+       "name": "e042_ScheduleTree",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -524,7 +689,7 @@
           "scope": "port"
          },
          {
-          "name": "e034_PaddingFormType",
+          "name": "e039_PaddingFormType",
           "defined_in": "crustify-scheduler/cpp/dims.h",
           "scope": "port"
          }
@@ -585,14 +750,42 @@
    ]
   },
   {
-   "unit_count": 3,
+   "unit_count": 11,
    "batches": [
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/ddl_conversion.h",
+     "items": [
+      {
+       "name": "e018_DdlConversion",
+       "defined_in": "crustify-scheduler/cpp/ddl_conversion.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 78,
+       "deps": {
+        "types": [
+         {
+          "name": "e013_DataInfo",
+          "defined_in": "crustify-scheduler/cpp/dsc2.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": []
+      }
+     ]
+    },
     {
      "kind": "type",
      "source_file": "crustify-scheduler/cpp/dsc2.h",
      "items": [
       {
-       "name": "e025_LoopCond",
+       "name": "e030_LoopCond",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -601,7 +794,7 @@
        "deps": {
         "types": [
          {
-          "name": "e029_LoopNode",
+          "name": "e034_LoopNode",
           "defined_in": "crustify-scheduler/cpp/dsc2.h",
           "scope": "port"
          }
@@ -622,7 +815,7 @@
        ]
       },
       {
-       "name": "e018_DistributionStatusInfo",
+       "name": "e022_DistributionStatusInfo",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -631,7 +824,7 @@
        "deps": {
         "types": [
          {
-          "name": "e029_LoopNode",
+          "name": "e034_LoopNode",
           "defined_in": "crustify-scheduler/cpp/dsc2.h",
           "scope": "port"
          }
@@ -648,7 +841,7 @@
        ]
       },
       {
-       "name": "e027_LoopDistributionInfo",
+       "name": "e032_LoopDistributionInfo",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -657,12 +850,12 @@
        "deps": {
         "types": [
          {
-          "name": "e029_LoopNode",
+          "name": "e034_LoopNode",
           "defined_in": "crustify-scheduler/cpp/dsc2.h",
           "scope": "port"
          },
          {
-          "name": "e035_PrimaryDimAndKind",
+          "name": "e040_PrimaryDimAndKind",
           "defined_in": "crustify-scheduler/cpp/dims.h",
           "scope": "port"
          }
@@ -680,6 +873,229 @@
        ]
       }
      ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g1_L3DlOpsScheduler_sync",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "createSynchronization",
+        "createSynchronizationDSC"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g2_L3DlOpsScheduler_opfunc",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "isOpFunc",
+        "isOpCrossCoreReduction"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g3_L3DlOpsScheduler_coord",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "propagateCoordinate",
+        "sliceCoordinateForCorelet",
+        "isDimensionCoreletSplit"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g4_L3DlOpsScheduler_stages",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "setChunkDataStageParams",
+        "setSuperChunkDataStageParams",
+        "updateChunkDataStagesFromCandidates"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g5_L3DlOpsScheduler_paged",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "processPagedTensorTransfers",
+        "processHbmPagedTensors",
+        "processDscHbmPagedTensors",
+        "optimizeHbmTransfers",
+        "optimizeHbmLdsOutputInScheduleTree",
+        "isPagedLds"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g6_L3DlOpsScheduler_verify",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "verifyScheduleTree",
+        "verifyLoopOrder"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "type",
+     "source_file": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+     "items": [
+      {
+       "name": "e029g7_L3DlOpsScheduler_run",
+       "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+       "kind": "type",
+       "source_kind": "struct",
+       "layer": 4,
+       "loc": 485,
+       "deps": {
+        "types": [
+         {
+          "name": "e029_L3DlOpsScheduler",
+          "defined_in": "crustify-scheduler/cpp/L3DlOpsScheduler.h",
+          "scope": "port"
+         }
+        ],
+        "symbols": []
+       },
+       "fallback": [],
+       "back_fill": [],
+       "generates": [],
+       "field_anchors": [
+        "run",
+        "prepDsc"
+       ]
+      }
+     ]
     }
    ]
   },
@@ -691,7 +1107,7 @@
      "source_file": "crustify-scheduler/cpp/dsc2.h",
      "items": [
       {
-       "name": "e026_LoopCondComposite",
+       "name": "e031_LoopCondComposite",
        "defined_in": "crustify-scheduler/cpp/dsc2.h",
        "kind": "type",
        "source_kind": "struct",
@@ -700,7 +1116,7 @@
        "deps": {
         "types": [
          {
-          "name": "e025_LoopCond",
+          "name": "e030_LoopCond",
           "defined_in": "crustify-scheduler/cpp/dsc2.h",
           "scope": "port"
          }
