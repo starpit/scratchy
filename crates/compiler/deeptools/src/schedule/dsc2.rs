@@ -332,6 +332,7 @@ impl NodeType {
     ];
 
     /// Field: e029_ScheduleNode.nodeTypeToString
+    /// Field: e041_ScheduleNode.nodeTypeToString
     ///
     /// The spelling `ScheduleNode::nodeTypeToString` gives this kind
     /// (`dsc/dsc2.h:457`, defined `dsc/dsc2.cpp:1878-1888`).
@@ -356,6 +357,7 @@ impl NodeType {
     }
 
     /// Field: e029_ScheduleNode.stringToNodeType
+    /// Field: e041_ScheduleNode.stringToNodeType
     ///
     /// `ScheduleNode::stringToNodeType`, the flip of the above — IBM builds it with `flipMap`
     /// (`dsc/dsc2.h:458`, `dsc/dsc2.cpp:1889-1890`). An unknown spelling is absent, where IBM's
@@ -443,6 +445,7 @@ impl NodeType {
 pub struct Size {
     /// Field: e029_ScheduleNode.dim_
     /// Field: e013_ScheduleNode.dim_
+    /// Field: e041_ScheduleNode.dim_
     ///
     /// ⚠️ THE SCHEDULER'S `.dim_` ANCHOR COVERS TWO C++ FIELDS, so both sites carry it. This is
     /// `ScheduleNode::Size::dim_` (`dsc/dsc2.h:487`), which is a dim of the data structure the extent
@@ -453,6 +456,7 @@ pub struct Size {
     pub dim: PrimaryDimTypes,
     /// Field: e029_ScheduleNode.size_
     /// Field: e013_ScheduleNode.size_
+    /// Field: e041_ScheduleNode.size_
     pub size: DimSize,
 }
 
@@ -2851,6 +2855,7 @@ mod unit_tests {
             data_format: DataFormats::Sen169Fp16,
             name: "stzJumpAddr".to_string(),
             is_data_symbolic: true,
+            ..ConstantInfo::default()
         };
         let copied = symbolic.clone();
         assert_eq!(copied.data_format, DataFormats::Sen169Fp16);
@@ -2862,7 +2867,7 @@ mod unit_tests {
     /// (`dsc/designSpaceConfig.h:90`): the padding path reuses the entry named `padval` and requires
     /// its format to agree with the labeled ds's (`dsc/dsc2.cpp:5228-5235`), and a constant named
     /// `useZeroMean` turns an `EXX2` op into `EXX2_ZEROMEAN` (`ddc/ddcv1.cpp:2064-2072`) — that
-    /// second one also tests the datum, which is `data_`, unported.
+    /// second one also tests the datum, [`data`](ConstantInfo::data), which neither entry here builds.
     #[test]
     fn a_constants_name_is_the_key_both_in_scope_readers_match_on() {
         let constants = BTreeMap::from([
@@ -2872,6 +2877,7 @@ mod unit_tests {
                     data_format: DataFormats::Sen143Fp8,
                     name: "useZeroMean".to_string(),
                     is_data_symbolic: false,
+                    ..ConstantInfo::default()
                 },
             ),
             (
@@ -2880,6 +2886,7 @@ mod unit_tests {
                     data_format: DataFormats::Sen169Fp16,
                     name: "padval".to_string(),
                     is_data_symbolic: false,
+                    ..ConstantInfo::default()
                 },
             ),
         ]);
@@ -4368,8 +4375,8 @@ impl PartialEq for CoordinateType {
 /// it directly. Those eight are the whole hierarchy, and [`NodeType`] is its discriminant — the
 /// importer's `new`-per-kind chain is the exhaustive list (`dsc/dsc2.cpp:1337-1358`).
 ///
-/// ⛔ THIS CARRIES 3 OF SCHEDULENODE'S 4 FIELDS, so the `e029_ScheduleNode`/`e013_ScheduleNode`
-/// anchors below stay open. `prev_` (`dsc/dsc2.h:515`) is a `BlockNode*` pointing back at the parent
+/// ⛔ THIS CARRIES 3 OF SCHEDULENODE'S 4 FIELDS, so the `e041_ScheduleNode`, `e029_ScheduleNode` and
+/// `e013_ScheduleNode` anchors below stay open. `prev_` (`dsc/dsc2.h:515`) is a `BlockNode*` pointing back at the parent
 /// that OWNS this node, through `BlockNode::next_`, a `VectorOfChildren` of `unique_ptr`s (`:538`).
 /// Every reader of it is a tree operation, not a question about one node: `getPrev` and
 /// `getMutableParent` hand it straight out (`:463-464`), `getOwnerLoop` climbs it to the nearest
@@ -4380,6 +4387,16 @@ impl PartialEq for CoordinateType {
 /// need is the one `ScheduleTree::head_` (`dsc/dsc2.h:623`) and `BlockNode::next_` have to define,
 /// and both of those anchors are open — `e030_BlockNode.next_` and `e032_ScheduleTree.head_`, whose
 /// superseded `e015_`/`e007_` duplicates this changeset removed.
+///
+/// ⛔ NINE OF THE `e041_ScheduleNode` GENERATION'S TWENTY-ONE FIELD ANCHORS STAY OPEN, AND ONLY TWO OF
+/// THEM NAME A MEMBER — the scheduler's field scan is not a declaration parser. The two are `prev_`
+/// above and `UnitView::LoopInfo::loop_` (`dsc/dsc2.h:501`), the `const LoopNode*` that stops
+/// [`UnitView`]'s `print` as well. FIVE ARE THE CLASS'S `friend` CLASSES — `BlockNode`, `Ddc`,
+/// `DesignSpaceConfig`, `L3DlOpsScheduler` and `ScheduleTree` (`:518-522`) — while the sixth friend, a
+/// function (`:523`), is not scanned. THE LAST TWO ARE METHOD PARAMETERS carrying a default argument,
+/// `comp` (`:470`, `:472`) and `clId` (`:470`, `:474`), and `coreId` carries one on those same two
+/// declarations (`:470`, `:473`) yet is not scanned. Nor is the real member `sizesWithGaps_` (`:509`),
+/// which the two earlier generations do name and [`UnitView::sizes_with_gaps`] carries.
 ///
 /// ⛔ AND `name_` IS NOT THAT IDENTITY IN MEMORY, ONLY ON THE JSON SEAM. Names are made unique by
 /// `finalizeScheduleTree`, which appends `__1`, `__2`, … as it walks and `DT_ERROR`s on a node with
@@ -4407,6 +4424,7 @@ impl PartialEq for CoordinateType {
 pub struct ScheduleNode {
     /// Field: e029_ScheduleNode.nodeType_
     /// Field: e013_ScheduleNode.nodeType_
+    /// Field: e041_ScheduleNode.nodeType_
     ///
     /// Which kind of node this is (`dsc/dsc2.h:460`). PRIVATE because the authority's is `const`:
     /// it is fixed by the constructor and there is no path that rewrites it, which is what lets the
@@ -4421,6 +4439,7 @@ pub struct ScheduleNode {
     node_type: NodeType,
     /// Field: e029_ScheduleNode.name_
     /// Field: e013_ScheduleNode.name_
+    /// Field: e041_ScheduleNode.name_
     ///
     /// The node's name (`dsc/dsc2.h:461`). It is the node's identity ON THE JSON SEAM: the exporter
     /// writes a `LoopInfo`'s loop as `li.loop_->name_` (`dsc/dsc2.cpp:209-210`) and the importer
@@ -4435,6 +4454,7 @@ pub struct ScheduleNode {
     pub name: String,
     /// Field: e029_ScheduleNode.relevantComps_
     /// Field: e013_ScheduleNode.relevantComps_
+    /// Field: e041_ScheduleNode.relevantComps_
     ///
     /// Which components, cores and corelets this node is relevant to (`dsc/dsc2.h:516`) — a
     /// component, then that component's cores, then each core's corelets.
@@ -4677,6 +4697,7 @@ impl ScheduleNode {
 pub struct UnitView {
     /// Field: e029_ScheduleNode.sizesNoGaps_
     /// Field: e013_ScheduleNode.sizesNoGaps_
+    /// Field: e041_ScheduleNode.sizesNoGaps_
     ///
     /// The unit's extents, innermost first, with no per-core gap folded in (`dsc/dsc2.h:506`).
     /// `buildUnitView` fills the stick dims first, clamped to what is left of the stick's capacity,
@@ -4693,6 +4714,7 @@ pub struct UnitView {
     pub sizes_no_gaps: Vec<Size>,
     /// Field: e029_ScheduleNode.compositeLoops_
     /// Field: e013_ScheduleNode.compositeLoops_
+    /// Field: e041_ScheduleNode.compositeLoops_
     ///
     /// The enclosing loops up to and including the last fusable parent (`dsc/dsc2.h:507`). Unlike
     /// [`Self::outer_loops`] this one also carries loops that touch NONE of the data structure's
@@ -4700,6 +4722,7 @@ pub struct UnitView {
     pub composite_loops: Vec<LoopInfo>,
     /// Field: e029_ScheduleNode.outerLoops_
     /// Field: e013_ScheduleNode.outerLoops_
+    /// Field: e041_ScheduleNode.outerLoops_
     ///
     /// The enclosing loops beyond the fusion boundary (`dsc/dsc2.h:508`). Only loops that address a
     /// dim of this data structure reach it — the `else if (compLoop)` arm that admits an unrelated
@@ -4760,6 +4783,7 @@ impl UnitView {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoopInfo {
     /// Field: e029_ScheduleNode.dim_
+    /// Field: e041_ScheduleNode.dim_
     ///
     /// Which dimension of the data structure this entry is about (`dsc/dsc2.h:502`). Its initialiser
     /// is `PrimaryDimTypesCount`, [`PrimaryDimTypes::Undefined`] here, which is a live value and not
@@ -4768,6 +4792,7 @@ pub struct LoopInfo {
     pub dim: PrimaryDimTypes,
     /// Field: e029_ScheduleNode.sizeIdx_
     /// Field: e013_ScheduleNode.sizeIdx_
+    /// Field: e041_ScheduleNode.sizeIdx_
     ///
     /// Which entry of [`UnitView::sizes_no_gaps`] this loop steps (`dsc/dsc2.h:503`), as
     /// `calculateSizeIdxAndOffset` resolved it (`dsc/dsc2.cpp:2732-2746`).
@@ -4782,6 +4807,7 @@ pub struct LoopInfo {
     pub size_idx: Option<SizeIdx>,
     /// Field: e029_ScheduleNode.elemOffset_
     /// Field: e013_ScheduleNode.elemOffset_
+    /// Field: e041_ScheduleNode.elemOffset_
     ///
     /// How many elements of the extent at [`Self::size_idx`] one trip of this loop moves
     /// (`dsc/dsc2.h:504`) — see [`ElemOffset`] for the currency and its rescale.
@@ -4804,6 +4830,26 @@ pub struct LoopInfo {
 // crustify:todo: e013_ScheduleNode.loop_
 
 // crustify:todo: e013_ScheduleNode.prev_
+
+// crustify:todo: e041_ScheduleNode
+
+// crustify:todo: e041_ScheduleNode.loop_
+
+// crustify:todo: e041_ScheduleNode.prev_
+
+// crustify:todo: e041_ScheduleNode.BlockNode
+
+// crustify:todo: e041_ScheduleNode.Ddc
+
+// crustify:todo: e041_ScheduleNode.DesignSpaceConfig
+
+// crustify:todo: e041_ScheduleNode.L3DlOpsScheduler
+
+// crustify:todo: e041_ScheduleNode.ScheduleTree
+
+// crustify:todo: e041_ScheduleNode.clId
+
+// crustify:todo: e041_ScheduleNode.comp
 
 /// Replaces: e022_DataStage
 ///
@@ -9092,18 +9138,17 @@ impl AllocateNode {
 /// `DesignSpaceConfig::constantInfo_`, keyed by the [`ConstantId`] an
 /// [`AllocateNode::const_idx`] points back at (`dsc/designSpaceConfig.h:90`).
 ///
-/// ⛔ THIS CARRIES 3 OF CONSTANTINFO'S 5 FIELDS, so the `e028_ConstantInfo` and `e030_ConstantInfo`
-/// anchors below stay open. `data_` (`dsc/dsc2.h:49-50`) is a
-/// `FoldManager<std::vector<int64_t>>`, and `util/foldManager/` is the blocker e008 and e012 are
-/// already held by — the re-scheduled `e028_ConstantInfo` no longer lists that field at all, so only
-/// the `e030` anchor still names it. `allocations_` (`dsc/dsc2.h:52`) is a
+/// ⛔ THIS CARRIES 4 OF CONSTANTINFO'S 5 FIELDS, so the `e009_ConstantInfo`, `e028_ConstantInfo` and
+/// `e030_ConstantInfo` anchors below stay open. `data_` (`dsc/dsc2.h:49-50`) is carried now that
+/// `util/foldManager/` is ported ([`FoldManager`], `e026_FoldManager`), and the `e009` scan does not
+/// name it at all, so only the `e030` anchor did. `allocations_` (`dsc/dsc2.h:52`) is a
 /// `std::map<SenComponents, AllocateNode*>` of NON-OWNING aliases into the schedule tree: the DDL
 /// conversion hangs the minted node on its parent block and aliases it here in the same breath
 /// (`ddc/ddl/ddl_conversion.cpp:826-832`), and the PE/SFP work split clones a node into a second
 /// component the same way, refusing a component that already has one
 /// (`ddc/ddc_transformation_util.cpp:1407-1417`). What blocks it is that this port has no node
-/// IDENTITY to alias WITH: there is no `ScheduleNode` base, no parent or child link, and
-/// [`AllocateNode`]'s own pointer fields are open anchors above. An owned
+/// IDENTITY to alias WITH: [`ScheduleNode`] carries no parent or child link — its `prev_` anchor is
+/// still open — and [`AllocateNode`]'s own pointer fields are open anchors above. An owned
 /// `BTreeMap<SenComponent, AllocateNode>` would give the constant a second copy of a node the tree
 /// owns, and the placement written through the tree would not be visible here — which is exactly
 /// what its readers draw back out of it: `fillDataInfo` (`ddc/ddcv1.cpp:2386-2388`) and the L3
@@ -9125,21 +9170,24 @@ impl AllocateNode {
 /// tests the two states separately, `!count(storage) || !at(storage)` (`:2618-2619`), returning
 /// `nullptr` for both under `allowMissingAlloc` and `DT_ERROR`ing otherwise.
 ///
-/// ⛔ ITS ONE METHOD STAYS OUT WITH THOSE TWO FIELDS: the copy assignment's four member assignments
-/// are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)` (`dsc/dsc2.h:54-60`), so
-/// two of the four are unported. It calls `clone` rather than `data_ = rhs.data_` because
-/// `FoldManager`'s own assignment `DT_ERROR`s unless the two fold spaces already agree in
-/// dimensionality and cardinality (`util/foldManager/foldInfrastructure.h:922-933`), which a fresh
-/// destination never does; `clone` destroys the destination's fold space and rebuilds it (`:987`).
-/// See [`is_data_symbolic`](Self::is_data_symbolic) for the field that assignment drops.
+/// ⛔ ITS ONE METHOD IS [`assign`](Self::assign) AND IT IS NOT [`Clone`]: the copy assignment's four
+/// member assignments are `dataFormat_`, `name_`, `allocations_` and `data_.clone(rhs.data_)`
+/// (`dsc/dsc2.h:54-60`), so one of the four — the alias map — has no field here, and the fifth,
+/// [`is_data_symbolic`](Self::is_data_symbolic), is assigned by neither of the four. See
+/// [`assign`](Self::assign) for the two divergences from the copy constructor, both measured against
+/// the authority.
 ///
-/// ⛔ NO `PartialEq`: the authority's own duplicate test compares `name_`, `dataFormat_` AND the
-/// datum's element count (`ddc/ddl/ddl_conversion.cpp:706-714`), so an equality over the carried
-/// fields alone would answer "the same constant" for two constants holding different values.
+/// ⛔ NO `PartialEq`: the authority declares none, and its own duplicate test is not an equality —
+/// it compares `name_`, `dataFormat_` and the datum's element COUNT, not the datum
+/// (`ddc/ddl/ddl_conversion.cpp:706-714`). A derive would compare the whole datum plus
+/// [`is_data_symbolic`](Self::is_data_symbolic), and [`FoldManager`]'s own `operator==` ignores the
+/// fold dimensions' LABELS (`util/foldManager/foldInfrastructure.h:1101-1169`), so neither reading is
+/// the one that test takes.
 #[derive(Clone, Debug)]
 pub struct ConstantInfo {
     /// Field: e028_ConstantInfo.dataFormat_
     /// Field: e030_ConstantInfo.dataFormat_
+    /// Field: e009_ConstantInfo.dataFormat_
     ///
     /// The format the datum's values are encoded in — the field's own comment says so, "values
     /// encoded in the specified format" (`dsc/dsc2.h:47`, `:50`).
@@ -9172,6 +9220,7 @@ pub struct ConstantInfo {
     pub data_format: DataFormats,
     /// Field: e028_ConstantInfo.name_
     /// Field: e030_ConstantInfo.name_
+    /// Field: e009_ConstantInfo.name_
     ///
     /// The constant's name (`dsc/dsc2.h:48`) — the DDL's own for a defined constant
     /// (`ddc/ddl/ddl_conversion.cpp:694-695`) or the external constant's (`:700`) — which is also
@@ -9192,8 +9241,33 @@ pub struct ConstantInfo {
     /// carries (`ddc/ddl/ddl_conversion.cpp:694-695`), and those three literals are compared against
     /// it rather than enumerating it.
     pub name: String,
+    /// Field: e030_ConstantInfo.data_
+    ///
+    /// The constant's values, one payload per point of the core/corelet/SDSC fold space — the field's
+    /// own comment is "core/corelet/sdsc folds, values encoded in the specified format"
+    /// (`dsc/dsc2.h:49-50`), the format being [`data_format`](Self::data_format).
+    ///
+    /// ⛔ ONE PAYLOAD IS A WHOLE `Vec<i64>`, NOT ONE VALUE, and the element COUNT is what two readers
+    /// check: the external-constant match refuses a DSC entry whose `getSingleData().size()` differs
+    /// from the DDL's `numElems` (`ddc/ddl/ddl_conversion.cpp:711`) and the replication factor divides
+    /// by it (`ddc/ddcv1.cpp:454`). `Vec<i64>` and not a newtype because it is the payload
+    /// [`FoldManager`] is instantiated at (`util/foldManager/foldInfrastructure.h:886`), the one list
+    /// payload in scope.
+    ///
+    /// ⛔ ITS BUILT SHAPE IS `buildAllConstantFoldSpace`'s AND NOTHING ELSE'S: both writers hand it
+    /// the SDSC's own fold props and then insert at one coordinate
+    /// (`ddc/ddl/ddl_conversion.cpp:687-693`, `dsc/dsc2.cpp:5295-5299`), so every level is a constant
+    /// fold and [`FoldManager::build_affine_dim`] is not reachable from here — which is why the
+    /// payload has none.
+    ///
+    /// ⭐ AND `hasZeroFoldDim()` IS THE STATE ITS READERS BRANCH ON, not a value: the PCFG translator
+    /// `DT_CHECK`s it false before cloning the datum per core and corelet (`dsc/dsc2Pcfg.cpp:1365`,
+    /// `:1944`) and the DSC's own print skips a constant that has it (`dsc/designSpaceConfig.cpp:4787`)
+    /// — so the default-constructed zero-dimension space is a distinguishable "no datum built yet".
+    pub data: FoldManager<Vec<i64>>,
     /// Field: e028_ConstantInfo.isDataSymbolic_
     /// Field: e030_ConstantInfo.isDataSymbolic_
+    /// Field: e009_ConstantInfo.isDataSymbolic_
     ///
     /// Whether the datum holds a [`VariableSymbol`] still to be resolved rather than a value
     /// (`dsc/dsc2.h:51`). `stzJumpAddr` is the worked example: its datum is the reserved dynamic
@@ -9229,15 +9303,52 @@ pub struct ConstantInfo {
 impl Default for ConstantInfo {
     /// The authority's member initialisers (`dsc/dsc2.h:47-51`). ⛔ THE FORMAT IS `INVALID`, not
     /// [`DataFormats::default()`] — that is `ComputeNode::dataFormat_`'s initialiser
-    /// (`dsc/dsc2.h:934`), a different field's.
+    /// (`dsc/dsc2.h:934`), a different field's. [`data`](ConstantInfo::data) has no initialiser at
+    /// all and is default-constructed, which is a zero-dimension fold space holding one empty vector —
+    /// measured: `getNumDims() == 0`, `hasZeroFoldDim()` true, and `getData({})` empty.
     fn default() -> Self {
         Self {
             data_format: DataFormats::Invalid,
             name: String::new(),
+            data: FoldManager::<Vec<i64>>::new(),
             is_data_symbolic: false,
         }
     }
 }
+
+impl ConstantInfo {
+    /// `operator=(const ConstantInfo&)` (`dsc/dsc2.h:54-60`) — the authority's copy ASSIGNMENT, which
+    /// is NOT [`Clone`] here: that is its copy CONSTRUCTOR, and declaring this one is what suppresses
+    /// the implicit move constructor so `emplace(myId, std::move(myConstInfo))`
+    /// (`ddc/ddl/ddl_conversion.cpp:725`) resolves to the constructor while
+    /// `dsc.constantInfo_[constId] = constInfo` (`dsc/dsc2.cpp:5307`) resolves to this. Named after
+    /// [`FoldManager::assign`], the same operator's port one layer down.
+    ///
+    /// ⛔ FOUR ASSIGNMENTS FOR FIVE MEMBERS: IT DROPS
+    /// [`is_data_symbolic`](Self::is_data_symbolic) (`dsc/dsc2.h:55-58`), so the DESTINATION'S OWN
+    /// FLAG STANDS. Measured both ways — a source whose flag is true leaves a fresh destination
+    /// `false`, where [`Clone`] carries `true`; a source whose flag is false leaves a destination
+    /// whose flag is `true` still `true`.
+    ///
+    /// ⛔ AND IT CLONES THE DATUM RATHER THAN ASSIGNING IT, because [`FoldManager::assign`] refuses a
+    /// fold space of a different dimensionality or cardinality
+    /// (`util/foldManager/foldInfrastructure.h:922-933`) and a fresh destination always is one.
+    /// `clone` with no ignored dimension clears the destination and rebuilds rhs's space
+    /// (`:987-1019`), which is [`FoldManager`]'s own [`Clone`]. Measured: a one-dimension destination
+    /// takes a two-dimension source whole.
+    ///
+    /// ⛔ THE FOURTH ASSIGNMENT HAS NO FIELD HERE: `allocations_ = rhs.allocations_` (`:57`) — see the
+    /// type's note and the open `e009_ConstantInfo.allocations_` anchor below.
+    pub fn assign(&mut self, rhs: &Self) {
+        self.data_format = rhs.data_format;
+        self.name = rhs.name.clone();
+        self.data = rhs.data.clone();
+    }
+}
+
+// crustify:todo: e009_ConstantInfo
+
+// crustify:todo: e009_ConstantInfo.allocations_
 
 // crustify:todo: e028_ConstantInfo
 
@@ -9246,8 +9357,6 @@ impl Default for ConstantInfo {
 // crustify:todo: e030_ConstantInfo
 
 // crustify:todo: e030_ConstantInfo.allocations_
-
-// crustify:todo: e030_ConstantInfo.data_
 
 /// A transfer's zero-pad size in elements — the `int` a `FoldManager<int>` level carries
 /// (`dsc/dsc2.h:810-811`), and the currency of both readers as well as of the `alphas` and `betas`
@@ -11950,6 +12059,87 @@ mod equivalence {
             ),
             "no core map, so no core block and no trailing newline"
         );
+    }
+
+    /// `ConstantInfo fresh;` — `data_` has no initialiser (`dsc/dsc2.h:49-50`), so the datum is
+    /// `FoldManager`'s default. Measured: `fmt=2 name= sym=0 numDims=0 zeroFold=1 data0=[]`.
+    #[test]
+    fn constant_info_default_datum_is_a_zero_dimension_empty_vector() {
+        let fresh = ConstantInfo::default();
+        assert_eq!(fresh.data_format, DataFormats::Invalid);
+        assert_eq!(fresh.name, "");
+        assert!(!fresh.is_data_symbolic);
+        assert_eq!(fresh.data.num_dims(), 0);
+        assert!(fresh.data.has_zero_fold_dim());
+        assert_eq!(fresh.data.get_data(&[]), Some(Vec::new()));
+    }
+
+    /// `operator=` (`dsc/dsc2.h:54-60`) against its own two measured cases: onto a fresh destination,
+    /// and onto one that already carries a different flag and a one-dimension datum.
+    #[test]
+    fn constant_info_assign_drops_the_symbolic_flag_and_clones_the_datum() {
+        let mut src = ConstantInfo {
+            data_format: DataFormats::IeeeFp32,
+            name: "padval".to_string(),
+            is_data_symbolic: true,
+            ..ConstantInfo::default()
+        };
+        assert_eq!(
+            src.data.build_all_constant_fold_space(&[
+                FoldDimProp::new(FoldDimSize(2), "core"),
+                FoldDimProp::new(FoldDimSize(3), "corelet"),
+            ]),
+            Some(())
+        );
+        let at_origin = [FoldDimIndex(0), FoldDimIndex(0)];
+        assert_eq!(src.data.insert_data(vec![7, 8, 9], &at_origin), Some(()));
+
+        // `dstFresh = src` — measured `fmt=1 name=padval sym=0 numDims=2 data0=[7,8,9]`, where the
+        // copy CONSTRUCTOR of the same source gives `sym=1`.
+        let mut dst_fresh = ConstantInfo::default();
+        dst_fresh.assign(&src);
+        assert_eq!(dst_fresh.data_format, DataFormats::IeeeFp32);
+        assert_eq!(dst_fresh.name, "padval");
+        assert!(!dst_fresh.is_data_symbolic, "`operator=` drops the flag");
+        assert!(
+            src.clone().is_data_symbolic,
+            "the copy constructor carries it"
+        );
+        assert_eq!(dst_fresh.data.get_data(&at_origin), Some(vec![7, 8, 9]));
+
+        // `dstUsed = srcNoFlag` — measured `sym=1` before AND after, with `numDims` 1 then 2.
+        let mut dst_used = ConstantInfo {
+            data_format: DataFormats::Sen169Fp16,
+            name: "was-here".to_string(),
+            is_data_symbolic: true,
+            ..ConstantInfo::default()
+        };
+        assert_eq!(
+            dst_used
+                .data
+                .build_all_constant_fold_space(&[FoldDimProp::new(FoldDimSize(5), "other")]),
+            Some(())
+        );
+        assert_eq!(
+            dst_used.data.insert_data(vec![99], &[FoldDimIndex(0)]),
+            Some(())
+        );
+        let mut src_no_flag = src.clone();
+        src_no_flag.is_data_symbolic = false;
+        assert_eq!(
+            dst_used.data.assign(&src_no_flag.data),
+            None,
+            "which is why the authority clones the datum instead of assigning it"
+        );
+        dst_used.assign(&src_no_flag);
+        assert!(
+            dst_used.is_data_symbolic,
+            "the destination's own flag stands"
+        );
+        assert_eq!(dst_used.data_format, DataFormats::IeeeFp32);
+        assert_eq!(dst_used.name, "padval");
+        assert_eq!(dst_used.data.num_dims(), 2, "reshaped by the clone");
+        assert_eq!(dst_used.data.get_data(&at_origin), Some(vec![7, 8, 9]));
     }
 }
 
