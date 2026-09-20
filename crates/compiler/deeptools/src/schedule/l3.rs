@@ -1814,7 +1814,7 @@ impl L3DlOpsScheduler {
     /// (`dsc/dsc2.cpp:2982-2991`, `ddc/ddcv1.cpp:3790`), which `runDdc` calls AFTER `l3_scheduler.run`
     /// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:29-42`), so two default-empty `name_`s
     /// (`dsc/dsc2.h:461`) collide here. ⛔ IT TAKES THE TREE, NOT THE `DesignSpaceConfig`:
-    /// `scheduleTree_` is its only member read and `e027`'s anchor for it is open (`dsc.rs:2121`).
+    /// `scheduleTree_` is its only member read and `e020`'s anchor for it is open (`dsc.rs:2200`).
     pub fn verify_schedule_tree(schedule_tree: &ScheduleTree) -> bool {
         // `.cpp:6386`.
         if schedule_tree.is_empty() {
@@ -3142,30 +3142,37 @@ mod equivalence {
         );
     }
 
-    /// `.cpp:6385-6406`: the empty tree's `false` (`:6386`), two distinctly named children, and the
-    /// collision L3's own minting has to avoid before the DDC's uniquifier ever runs.
+    /// `.cpp:6385-6406`: the empty tree's `false` (`:6386`), two distinctly named children, the
+    /// collision L3's own minting has to avoid before the DDC's uniquifier ever runs, and the two
+    /// shapes a flat tree cannot tell apart — a duplicate nested one level down, which is the only
+    /// shape the call site ever sees (`.cpp:8029-8031`, after `createChunkLoopNodes`), and the
+    /// root's own default-empty `name_`.
     #[test]
     fn a_schedule_tree_verifies_only_when_non_empty_with_distinct_node_names() {
+        use crate::schedule::dsc2::BlockNode;
+
         let mut tree = ScheduleTree::default();
         assert!(
             !L3DlOpsScheduler::verify_schedule_tree(&tree),
             "a root with no children is `.cpp:6386`, and `isDSC2()` is the same reading"
         );
 
-        let push = |tree: &mut ScheduleTree, name: &str| {
-            let node = ChildNode::Sync(L3DlOpsScheduler::create_sync_node(
+        let sync = |name: &str| {
+            ChildNode::Sync(L3DlOpsScheduler::create_sync_node(
                 BTreeSet::new(),
                 name.to_owned(),
                 false,
                 false,
-            ));
+            ))
+        };
+        let attach = |block: &mut BlockNode, node: ChildNode| {
             assert!(
-                tree.head_mut()
-                    .base_class
-                    .add_child_node(InsertionPoint::Back, node)
-                    .is_none(),
+                block.add_child_node(InsertionPoint::Back, node).is_none(),
                 "a push to the back is never refused"
             );
+        };
+        let push = |tree: &mut ScheduleTree, name: &str| {
+            attach(&mut tree.head_mut().base_class, sync(name));
         };
         push(&mut tree, "core_loop_sync");
         push(&mut tree, "chunk_loop_sync");
@@ -3176,6 +3183,23 @@ mod equivalence {
             !L3DlOpsScheduler::verify_schedule_tree(&tree),
             "`hasUniqueName = false` at `.cpp:6401`"
         );
+
+        // The walk DESCENDS (`dsc/dsc2.cpp:2225`, `:2251-2253`), so the duplicate hides one level
+        // down — under the `root_level_operations` block the DDL conversion puts at the head
+        // (`ddc/ddl/ddl_conversion.cpp:2779-2782`) — and only a walk that recurses sees it.
+        let mut nested = ScheduleTree::default();
+        push(&mut nested, "chunk_loop_sync");
+        let mut block = BlockNode::default();
+        block.base_class.name = "root_level_operations".to_owned();
+        attach(&mut block, sync("chunk_loop_sync"));
+        attach(&mut nested.head_mut().base_class, ChildNode::Block(block));
+        assert!(!L3DlOpsScheduler::verify_schedule_tree(&nested));
+
+        // The head is the one node no walk returns (`dsc/dsc2.cpp:2225`), so its own default-empty
+        // `name_` (`dsc/dsc2.h:461`) is not in the set an unnamed child collides with.
+        let mut unnamed = ScheduleTree::default();
+        push(&mut unnamed, "");
+        assert!(L3DlOpsScheduler::verify_schedule_tree(&unnamed));
     }
 
     /// A DSC holding the core data stage every chunk-stage writer requires (`.cpp:1410-1411`) and the
