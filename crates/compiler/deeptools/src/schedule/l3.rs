@@ -278,6 +278,43 @@ mod unit_tests {
             "and this is not the empty-group refusal: isEmpty is still false (:52)"
         );
     }
+
+    /// ⛔ THE FP8 BATCH MATMUL OUR EMITTER WRITES IS `BATCHMATMUL_FP8_FWD`, NOT THE MULTI-BATCH ONE:
+    /// `lower_subtile_tape_to_superdsc.rs:5308-5322` suffixes `OpFunc::BatchMatmul`'s name with an
+    /// operand's `Df`, so the spelling is `"batchmatmulfp8"`, while `"batchmatmulfp8mb"` occurs in
+    /// this repo only in transcribed spelling tables and reaches no emission site. Both do land in
+    /// the same non-XRF arm, so the minimum-parameter reading held for the wrong op.
+    ///
+    /// No C++ call decides this one — the verdict is our own emitted spelling's, against the parse
+    /// boundary — which is why it is a unit test and not one of this group's two equivalence tests.
+    #[test]
+    fn the_fp8_batch_matmul_we_emit_is_the_non_xrf_family_and_is_not_the_multi_batch_op() {
+        assert_eq!(
+            OpFunc::from_spelling("batchmatmulfp8"),
+            Some(OpFunc::BatchmatmulFp8Fwd),
+            "the spelling our own fp8 path writes for a batch matmul"
+        );
+        assert_eq!(
+            OpFunc::from_spelling("batchmatmulfp8mb"),
+            Some(OpFunc::BatchmatmulFp8FwdMb),
+            "and the multi-batch one is a distinct op, distinctly spelled"
+        );
+
+        for op in [OpFunc::BatchmatmulFp8Fwd, OpFunc::BatchmatmulFp8FwdMb] {
+            assert!(
+                L3DlOpsScheduler::is_op_func_bmm_fp8_non_xrf(op),
+                "{op:?} takes the 256/128/64 input-channel chain (`.cpp:965-973`)"
+            );
+            assert!(
+                !L3DlOpsScheduler::is_op_func_bmm_fp8_xrf(op),
+                "{op:?} is not the XRF arm's flat 64 (`.cpp:983-984`)"
+            );
+        }
+        assert!(
+            L3DlOpsScheduler::is_op_func_bmm_fp8_xrf(OpFunc::BatchmatmulXrfFp8Fwd),
+            "the control: the two fp8 arms really are different sets"
+        );
+    }
 }
 
 /// Which design space configuration of the `SuperDsc` one [`Metadata`] describes — the `const int
@@ -1368,20 +1405,12 @@ impl L3DlOpsScheduler {
     ];
 }
 
-/// `.cpp:739-869`, the sixteen `isOpFunc*` predicates (`:288-303`) — which family a compute op's
-/// [`OpFunc`] belongs to, asked by the ordered dispatch in `getMinParamForDimFromOpFunc`
-/// (`.cpp:1137-1169`).
-///
-/// ⭐ ASSOCIATED FUNCTIONS, NOT METHODS: every one is a `const` member that reads no field, and each
-/// set it tests is a function-local `static const` — one table for all schedulers, so no `self`
-/// supplies anything. Same shape as [`Self::burst_efficiency`] and [`Self::create_sync_node`].
-///
-/// ⛔ THE FOURTEEN LEAF SETS ARE DISJOINT AND NAME ONLY 74 OF [`OpFunc`]'S 176 VARIANTS, and that
-/// matters twice over: the dispatch is an `if / else if` chain, so an op in two families would take
-/// whichever arm comes first, and each of the other 102 ops falls out of it with a minimum parameter
-/// of `1` (`.cpp:1168`). ⛔ THREE OF THE 102 ARE SPELLED `BATCHMATMUL_*` — `BATCHMATMULV2`,
-/// `BATCHMATMUL_MXFP4W_FWD` and `BATCHMATMUL_MXFP8_FWD` are NOT bmm to this scheduler, so a matmul
-/// flavour added to the vocabulary stays unrecognised until one of these sets is extended by hand.
+/// `.cpp:739-868`, the sixteen `isOpFunc*` predicates (`:288-303`) — which family a compute op's
+/// [`OpFunc`] belongs to, asked by the ordered `if / else if` dispatch in
+/// `getMinParamForDimFromOpFunc` (`.cpp:1137-1170`), so an op in two families takes the first arm.
+/// ⛔ THE FOURTEEN LEAF SETS ARE DISJOINT AND COVER 74 OF THE 176 VARIANTS; the other 102 fall out
+/// with a minimum of `1` (`.cpp:1169`), THREE OF THEM SPELLED `BATCHMATMUL_*`. The group's type
+/// anchor stays open on `isOpCrossCoreReduction`: it reads `labeledDs_` and `numWkSlicesPerDim_`.
 impl L3DlOpsScheduler {
     /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
     ///
@@ -1462,8 +1491,10 @@ impl L3DlOpsScheduler {
 
     /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
     ///
-    /// `.cpp:784-789`. The three FP8 batch matmuls that do NOT go through the XRF — ⭐ INCLUDING
-    /// `BATCHMATMUL_FP8_FWD_MB`, the multi-batch one, which is on our own fp8 decode path.
+    /// `.cpp:784-789`. The three FP8 batch matmuls that do NOT go through the XRF — and the arm OUR
+    /// OWN fp8 path lands in, because the emitter writes `"batchmatmulfp8"` =
+    /// `BATCHMATMUL_FP8_FWD` (`lower_subtile_tape_to_superdsc.rs:5308-5322`), so its input-channel
+    /// minimum is the 256/128/64 chain (`.cpp:965-973`) and not the XRF's flat 64 (`.cpp:983-984`).
     pub fn is_op_func_bmm_fp8_non_xrf(op_func_name: OpFunc) -> bool {
         matches!(
             op_func_name,
@@ -1476,7 +1507,7 @@ impl L3DlOpsScheduler {
     /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
     ///
     /// `.cpp:791-795`. The two FP8 batch matmuls that DO — the XRF and per-channel-XRF pair, split
-    /// out because they get their own arm of the bmm minimum (`.cpp:983-990`).
+    /// out because they get their own arm of the bmm minimum (`.cpp:983-984`).
     pub fn is_op_func_bmm_fp8_xrf(op_func_name: OpFunc) -> bool {
         matches!(
             op_func_name,
@@ -1611,7 +1642,7 @@ impl L3DlOpsScheduler {
 
     /// Replaces: e029g2_L3DlOpsScheduler_opfunc.isOpFunc
     ///
-    /// `.cpp:865-869`. Any op that walks a window across its input with a stride — every convolution,
+    /// `.cpp:865-868`. Any op that walks a window across its input with a stride — every convolution,
     /// every pooling op, and the depthwise conv. Its one call site is the `DT_CHECK_MSG` that guards
     /// `computeMinParamForPaddedDim` (`.cpp:873-874`), so it states a precondition rather than
     /// choosing a minimum.
@@ -2687,7 +2718,7 @@ mod equivalence {
         assert!(receive.is_soft, "and it is soft too (`.cpp:3974`)");
     }
 
-    /// `.cpp:739-869` — the fourteen leaf `isOpFunc*` sets against every one of [`OpFunc`]'s 176
+    /// `.cpp:739-868` — the fourteen leaf `isOpFunc*` sets against every one of [`OpFunc`]'s 176
     /// variants. ⛔ WHAT MAKES THIS MORE THAN A SECOND READING OF THE SAME LITERALS: the families
     /// must PARTITION, because `getMinParamForDimFromOpFunc` is an `if / else if` chain
     /// (`.cpp:1143-1166`) and an op in two of them would silently take the earlier arm; and each
@@ -2756,7 +2787,7 @@ mod equivalence {
         assert_eq!(
             classified, 74,
             "the sixteen predicates name 74 of the 176 op-funcs; every other one falls through to a \
-             minimum parameter of 1 (`.cpp:1168`)"
+             minimum parameter of 1 (`.cpp:1169`)"
         );
 
         for (name, holds, count) in &leaves {
@@ -2786,7 +2817,7 @@ mod equivalence {
         }
     }
 
-    /// `.cpp:753-767`, `:804-808`, `:865-869` — the three predicates that are unions. Each holds
+    /// `.cpp:753-767`, `:804-808`, `:865-868` — the three predicates that are unions. Each holds
     /// exactly what its parts hold, and its cardinality is the sum of theirs: 16 convolutions, 18
     /// batch matmuls, 20 strided-window ops. ⛔ AND THE NEGATIVE THAT COSTS THE MOST: three ops
     /// SPELLED `BATCHMATMUL_*` are in none of the five format sets, so `isOpFuncBmm` rejects them and
