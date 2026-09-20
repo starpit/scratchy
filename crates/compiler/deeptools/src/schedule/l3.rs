@@ -6,12 +6,13 @@
 
 use crate::schedule::ddc::{ExPhase, Verbosity};
 use crate::schedule::dims::{
-    DataStructDims, DimDensity, DimSize, DimVal, PaddingFormType, PrimaryDimTypes,
+    DataStructDims, DimDensity, DimSize, DimVal, PaddingFormType, PrimaryDimAndKind,
+    PrimaryDimTypes,
 };
 use crate::schedule::dsc::{DesignSpaceConfig, NumCoreletsUsed};
 use crate::schedule::dsc2::{
-    AllocateNode, ChildNode, DataStageId, GroupId, IndirectAllocType, InsertionPoint, LdsIdx,
-    NodePath, ScheduleTree, SyncNode, TransferNode,
+    AllocateNode, ChildNode, DataStage, DataStageId, GroupId, IndirectAllocType, InsertionPoint,
+    LdsIdx, LoopNode, NodePath, ScheduleTree, SyncNode, TransferNode,
 };
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1228,6 +1229,56 @@ impl L3DlOpsScheduler {
         }
         // `.cpp:84-85`.
         Some(dsc.corelet_d.primary_dim_to_val(dim)? < dsc.core_d.primary_dim_to_val(dim)?)
+    }
+
+    /// Replaces: e029_L3DlOpsScheduler.constructDatastage
+    ///
+    /// `:536`, defined `.cpp:7724-7735`. MINT a data stage: copy `ref_data_stage` in at the lowest
+    /// free id from `data_stage_param.len()` up, naming the copy's halves `"<id>"` and `"<id>el"`.
+    /// ⛔ THE SEARCH STARTS AT `size()`, NOT AT `max + 1` — keys `{0,1,5}` mint **3** and keys `{5}`
+    /// mint **1**, so the caller's later `erase(denId)` (`.cpp:7676`) leaves a hole the next mint takes.
+    /// ⛔ BY VALUE BECAUSE THE SOLE CALLER'S ARGUMENT IS A REFERENCE INTO THE MAP THIS INSERTS INTO
+    /// (`chunkDs`, `.cpp:7530`, passed at `:7548`); C++ survives that on `std::map` node stability.
+    pub fn construct_datastage(
+        dsc: &mut DesignSpaceConfig,
+        ref_data_stage: DataStage,
+    ) -> DataStageId {
+        let mut id = DataStageId(dsc.data_stage_param.len() as i32);
+        while dsc.data_stage_param.contains_key(&id) {
+            id.0 += 1;
+        }
+        let new_ds = dsc.data_stage_param.entry(id).or_insert(ref_data_stage);
+        new_ds.ss.name = id.0.to_string();
+        new_ds.el.name = format!("{}el", id.0);
+        id
+    }
+
+    /// Replaces: e029_L3DlOpsScheduler.constructLoopNode
+    ///
+    /// `:537`, defined `.cpp:7737-7755`. MINT the loop over `dims` for one stage pair, named
+    /// `loop_ds<num>_ds<den>` with every dim's spelling appended — this campaign's canonical loop name
+    /// (`ddc/ddl/ddl_conversion.cpp:1065`). Owned by value; IBM's `new` hands the tree the same node.
+    /// ⛔ `.cpp:7739-7741`'s `DT_ERROR` ON AN EMPTY DIM LIST IS UNSPELLABLE HERE: the first dim is a
+    /// parameter. ⛔ AND THE KIND DOES NOT REACH THE NAME (`.cpp:7752-7753` reads `dim_` alone), so one
+    /// dim twice under two kinds names it `…_out_out`, and an absent id is IBM's `-1` in the name.
+    pub fn construct_loop_node(
+        num_id: Option<DataStageId>,
+        den_id: Option<DataStageId>,
+        first_dim: PrimaryDimAndKind,
+        more_dims: &[PrimaryDimAndKind],
+    ) -> LoopNode {
+        let dims: Vec<PrimaryDimAndKind> = std::iter::once(first_dim)
+            .chain(more_dims.iter().copied())
+            .collect();
+        let spelling = |id: Option<DataStageId>| id.map_or(-1, |id| id.0);
+        let mut name = format!("loop_ds{}_ds{}", spelling(num_id), spelling(den_id));
+        for entry in &dims {
+            name.push('_');
+            name.push_str(entry.dim.name());
+        }
+        let mut node = LoopNode::new(num_id, den_id, dims, false);
+        node.base_class.base_class.name = name;
+        node
     }
 
     /// Replaces: e029_L3DlOpsScheduler.isValidDimParam
@@ -3834,6 +3885,198 @@ mod equivalence {
 
         assert_eq!(lines, AUTHORITY);
     }
+
+    /// `.cpp:7724-7735` against a compiled oracle whose body is the authority's own lines included
+    /// verbatim (`clang++ -std=c++17 -fsanitize=undefined`, rev `a0d29abbed`): nine key sets, then a
+    /// repeat mint and the erase `.cpp:7676` performs. Each row is the minted id and then every
+    /// stage's two names and both halves' `out_`, so THE COPY is the witness.
+    /// ⛔ `gap015` AND `lone5` ARE THE ROWS TO READ: the id comes off `size()`, so keys `{0,1,5}` mint
+    /// 3 — INSIDE the gap — and a map keyed `{5}` alone mints 1, BELOW its only key.
+    /// ⭐ `reffromsamemap` IS THE CALLER'S OWN SHAPE (`.cpp:7530`, passed at `:7548`): the reference
+    /// stage is one already in the map, and it keeps its own name while the copy is renamed.
+    #[test]
+    fn construct_datastage_mints_the_id_the_executed_authority_mints() {
+        const AUTHORITY: [&str; 11] = [
+            "ds empty id=0 map= 0:[0|0el|64,48]",
+            "ds dense0 id=1 map= 0:[core|core|20,21] 1:[1|1el|64,48]",
+            "ds dense012 id=3 map= 0:[core|core|20,21] 1:[core|core|30,31] 2:[core|core|40,41] 3:[3|3el|64,48]",
+            "ds gap015 id=3 map= 0:[core|core|20,21] 1:[core|core|30,31] 3:[3|3el|64,48] 5:[core|core|70,71]",
+            "ds lone5 id=1 map= 1:[1|1el|64,48] 5:[core|core|70,71]",
+            "ds nozero123 id=4 map= 1:[core|core|30,31] 2:[core|core|40,41] 3:[core|core|50,51] 4:[4|4el|64,48]",
+            "ds negative id=2 map= -1:[core|core|10,11] 0:[core|core|20,21] 2:[2|2el|64,48]",
+            "ds reffromsamemap id=2 map= 0:[core|core|20,21] 1:[core|core|30,31] 2:[2|2el|30,31]",
+            "ds refishighkey id=3 map= 0:[core|core|20,21] 1:[core|core|30,31] 3:[3|3el|110,111] 9:[core|core|110,111]",
+            "ds twice first=3 second=4 map= 0:[core|core|20,21] 1:[core|core|30,31] 2:[core|core|40,41] 3:[3|3el|0,0] 4:[4|4el|0,0]",
+            "ds afterErase third=5 map= 0:[core|core|20,21] 1:[core|core|30,31] 2:[core|core|40,41] 4:[4|4el|0,0] 5:[5|5el|0,0]",
+        ];
+
+        let half = |name: &str, out: f64| DataStructDims {
+            name: name.to_owned(),
+            out: DimSize::new(out),
+            ..DataStructDims::default()
+        };
+        let stage = |name: &str, ss_out: f64, el_out: f64| DataStage {
+            ss: half(name, ss_out),
+            el: half(name, el_out),
+        };
+        let dump = |dsc: &DesignSpaceConfig| {
+            let out = |dims: &DataStructDims| dims.out.map_or(-1.0, DimSize::get);
+            dsc.data_stage_param
+                .iter()
+                .map(|(id, ds)| {
+                    format!(
+                        " {}:[{}|{}|{},{}]",
+                        id.0,
+                        ds.ss.name,
+                        ds.el.name,
+                        out(&ds.ss),
+                        out(&ds.el)
+                    )
+                })
+                .collect::<String>()
+        };
+        let make = |keys: &[i32]| DesignSpaceConfig {
+            data_stage_param: keys
+                .iter()
+                .map(|&key| {
+                    // `+ 2` because `DimSize` REFUSES IBM's negative unfilled encoding at
+                    // construction, so a bare `key * 10` witness would render the `-1` key's absence
+                    // and not the copy. The oracle carries the same `(key + 2) * 10`.
+                    let witness = f64::from(key + 2) * 10.0;
+                    (DataStageId(key), stage("core", witness, witness + 1.0))
+                })
+                .collect(),
+            ..DesignSpaceConfig::default()
+        };
+
+        let mut lines = Vec::new();
+        for (label, keys, ref_key) in [
+            ("empty", &[][..], None),
+            ("dense0", &[0][..], None),
+            ("dense012", &[0, 1, 2][..], None),
+            ("gap015", &[0, 1, 5][..], None),
+            ("lone5", &[5][..], None),
+            ("nozero123", &[1, 2, 3][..], None),
+            ("negative", &[-1, 0][..], None),
+            ("reffromsamemap", &[0, 1][..], Some(1)),
+            ("refishighkey", &[0, 1, 9][..], Some(9)),
+        ] {
+            let mut dsc = make(keys);
+            let reference = match ref_key {
+                Some(key) => dsc.data_stage_param[&DataStageId(key)].clone(),
+                None => stage("chunk", 64.0, 48.0),
+            };
+            let id = L3DlOpsScheduler::construct_datastage(&mut dsc, reference);
+            lines.push(format!("ds {label} id={} map={}", id.0, dump(&dsc)));
+        }
+
+        // Two mints in a row, then the hole `.cpp:7676`'s `erase(denId)` leaves behind.
+        let mut dsc = make(&[0, 1, 2]);
+        let reference = stage("chunk", 0.0, 0.0);
+        let first = L3DlOpsScheduler::construct_datastage(&mut dsc, reference.clone());
+        let second = L3DlOpsScheduler::construct_datastage(&mut dsc, reference.clone());
+        lines.push(format!(
+            "ds twice first={} second={} map={}",
+            first.0,
+            second.0,
+            dump(&dsc)
+        ));
+        dsc.data_stage_param.remove(&first);
+        let third = L3DlOpsScheduler::construct_datastage(&mut dsc, reference);
+        lines.push(format!(
+            "ds afterErase third={} map={}",
+            third.0,
+            dump(&dsc)
+        ));
+
+        assert_eq!(lines, AUTHORITY);
+    }
+
+    /// `.cpp:7737-7755` against the same compiled oracle: the minted loop's name, its two ids and its
+    /// dim count. IBM's sixth case is `constructLoopNode(1, 2, {})`, which `DT_ERROR`s at `.cpp:7740`
+    /// and has no row here because [`L3DlOpsScheduler::construct_loop_node`] cannot be handed it.
+    /// ⛔ `samedim` IS THE ROW THAT PINS THE NAME'S SOURCE: two entries differing only in
+    /// `MetaDimKind` name the loop `_out_out`, so the kind is absent from an otherwise unique name.
+    #[test]
+    fn construct_loop_node_names_the_loop_the_executed_authority_names() {
+        use crate::schedule::dims::MetaDimKind;
+
+        const AUTHORITY: [&str; 5] = [
+            "loop one name=loop_ds1_ds3_out num=1 den=3 dims=1",
+            "loop three name=loop_ds0_ds7_out_ij_mb num=0 den=7 dims=3",
+            "loop sentinel name=loop_ds-1_ds-1_undefined num=-1 den=-1 dims=1",
+            "loop samedim name=loop_ds2_ds2_out_out num=2 den=2 dims=2",
+            "loop kindsonly name=loop_ds4_ds5_x1_y num=4 den=5 dims=2",
+        ];
+
+        let dim = |dim, kind| PrimaryDimAndKind::new(dim, kind);
+        let unpadded = |d| dim(d, MetaDimKind::Unpadded);
+        let cases: [(
+            &str,
+            Option<i32>,
+            Option<i32>,
+            PrimaryDimAndKind,
+            Vec<PrimaryDimAndKind>,
+        ); 5] = [
+            (
+                "one",
+                Some(1),
+                Some(3),
+                unpadded(PrimaryDimTypes::Out),
+                vec![],
+            ),
+            (
+                "three",
+                Some(0),
+                Some(7),
+                unpadded(PrimaryDimTypes::Out),
+                vec![unpadded(PrimaryDimTypes::Ij), unpadded(PrimaryDimTypes::Mb)],
+            ),
+            (
+                "sentinel",
+                None,
+                None,
+                unpadded(PrimaryDimTypes::Undefined),
+                vec![],
+            ),
+            (
+                "samedim",
+                Some(2),
+                Some(2),
+                unpadded(PrimaryDimTypes::Out),
+                vec![dim(PrimaryDimTypes::Out, MetaDimKind::Padded)],
+            ),
+            (
+                "kindsonly",
+                Some(4),
+                Some(5),
+                dim(PrimaryDimTypes::X1, MetaDimKind::PadBack),
+                vec![dim(PrimaryDimTypes::Y, MetaDimKind::PadFront)],
+            ),
+        ];
+
+        let lines: Vec<String> = cases
+            .iter()
+            .map(|(label, num_id, den_id, first_dim, more_dims)| {
+                let node = L3DlOpsScheduler::construct_loop_node(
+                    num_id.map(DataStageId),
+                    den_id.map(DataStageId),
+                    *first_dim,
+                    more_dims,
+                );
+                let spelling = |id: Option<DataStageId>| id.map_or(-1, |id| id.0);
+                format!(
+                    "loop {label} name={} num={} den={} dims={}",
+                    node.base_class.base_class.name,
+                    spelling(node.num_id),
+                    spelling(node.den_id),
+                    node.dims.len()
+                )
+            })
+            .collect();
+
+        assert_eq!(lines, AUTHORITY);
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -3888,6 +4131,29 @@ mod equivalence {
 // crustify:todo: e029g2_L3DlOpsScheduler_opfunc
 
 // crustify:todo: e029g2_L3DlOpsScheduler_opfunc.isOpCrossCoreReduction
+
+// ⛔ e029g3 IS BLOCKED, BUT NOT ON THE TREE SURGERY, which is what the reason on record said:
+// "`moveChildNode`/`deleteChildNode` still blocked on an unported `cleanupAllocation`" is false at
+// BOTH of `sliceCoordinateForCorelet`'s ends. `moveChildNode` takes the NON-DESTRUCTIVE arm
+// (`dsc/dsc2.cpp:2038`), which landed here as `BlockNode::take_child_node` and is stated in capitals
+// in `dsc2.rs:6596` and `:16307`; and the one destructive `deleteChildNode` (`.cpp:7670`) runs
+// `cleanupAllocation` over a loop that is EMPTY by then — `.cpp:7668-7669` moves `allocNode` back out
+// first, and `cleanupAllocation` collects only COMPUTE and TRANSFER descendants
+// (`dsc/dsc2.cpp:2568-2573`) — so that call is a no-op at this site. `getMutableParent()` is not
+// retired either: `NodePath` and `ScheduleTree::parent_of` are this campaign's answer to it. The two
+// whole functions this group owns EXCLUSIVELY are ported above with their own anchors —
+// `constructDatastage` (`.cpp:7724-7735`) and `constructLoopNode` (`:7737-7755`), each called from
+// exactly one place tree-wide, both inside this body (`.cpp:7548`, `:7575`).
+// ⛔ WHAT BLOCKS THE 195-LINE BODY IS FIVE READS IT HAS NO ANSWER FOR: `labeledDs_`'s `dsType_` and
+// `scale_` (`.cpp:7539`, `e020_DesignSpaceConfig.labeledDs_`, open in `crate::schedule::dsc`),
+// `mySDsc.numWkSlicesPerDim_` (`:7653`) from a `SuperDsc` with no home in this campaign, and three
+// unported callees — `getLxBelowBlockNode` (`:7598`), `dsc2::loopRelevantForDim` (`:7606`) and
+// `dsc2::distributeElemArrToTemporalLoops` (`:7640`), whose out-parameter
+// `LoopDistributionParamPerNodeType` is keyed by RAW `LoopNode*` (`:7647-7648`).
+// ⛔ AND `propagateCoordinate` STAYS OUT ON THE POINTER GRAPH, as recorded: it seeds from
+// `lds.memOrg_.at(HBM).allocateNode_`, and this tree has no `memOrg_`, an `allocUsers_` documented
+// unportable on `AllocateNode`, and no `PartialEq` on a node by decision — which is what its
+// `unordered_set<ScheduleNode*>` dedup needs.
 
 // crustify:todo: e029g3_L3DlOpsScheduler_coord
 
