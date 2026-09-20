@@ -225,6 +225,7 @@ impl CrossCoreReductionGroup {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::schedule::dsc2::DataStage;
 
     /// `:41` and `:50` — `DT_ERROR("Unknown corelet id.")`. The loop at `.cpp:2781` would reach it
     /// with corelet 2 on a three-corelet DSC; the narrowing is the only entry to
@@ -315,6 +316,57 @@ mod unit_tests {
             L3DlOpsScheduler::is_op_func_bmm_fp8_xrf(OpFunc::BatchmatmulXrfFp8Fwd),
             "the control: the two fp8 arms really are different sets"
         );
+    }
+
+    /// ⛔ SIX OF IBM'S TEN `addOrUpdateCoreletSplitInParams` CALLS WRITE A STAGE BORROWED OUT OF THE
+    /// `dsc` PASSED BESIDE IT — `.cpp:2801`, `:2802`, `:2891`, `:2892`, `:2924`, `:2925` — and the
+    /// ported two-argument form could not spell one of them: `error[E0502]`. The body below is
+    /// `.cpp:2800-2802` verbatim. The verdict is the borrow checker's, plus `.cpp:116`'s equal share
+    /// and `:111-113`'s skip, so it is a unit test and not one of this group's equivalence tests.
+    #[test]
+    fn the_authoritys_in_place_corelet_split_is_expressible_and_still_skips_an_unfilled_dim() {
+        const SUPER_CHUNK_IDX: DataStageId = DataStageId(2);
+
+        let mut dsc = DesignSpaceConfig {
+            num_corelets_used: Some(NumCoreletsUsed(3)),
+            // Both dims are corelet-split, read off `coreletD_` and `d_` because no core data stage
+            // is present (`.cpp:84-85`).
+            corelet_d: DataStructDims {
+                i: DimSize::new(4.0),
+                j: DimSize::new(4.0),
+                ..DataStructDims::default()
+            },
+            core_d: DataStructDims {
+                i: DimSize::new(12.0),
+                j: DimSize::new(12.0),
+                ..DataStructDims::default()
+            },
+            ..DesignSpaceConfig::default()
+        };
+        let mut stage = DataStage::default();
+        stage.ss.i = DimSize::new(12.0);
+        stage.el = stage.ss.clone();
+        dsc.data_stage_param.insert(SUPER_CHUNK_IDX, stage);
+
+        let split = CoreletSplit::of(&dsc).expect("a filled corelet count is both reads");
+        let ds_super_chunk = dsc
+            .data_stage_param
+            .get_mut(&SUPER_CHUNK_IDX)
+            .expect("the stage `.cpp:2800` binds");
+        assert_eq!(split.apply(&mut ds_super_chunk.ss), Some(()));
+        assert_eq!(split.apply(&mut ds_super_chunk.el), Some(()));
+
+        for params in [&ds_super_chunk.ss, &ds_super_chunk.el] {
+            assert_eq!(
+                params.corelet_split.get(&PrimaryDimTypes::I),
+                Some(&vec![DimVal(4); 3]),
+                "one equal share per corelet (`.cpp:116`, `:122-123`)"
+            );
+            assert!(
+                !params.corelet_split.contains_key(&PrimaryDimTypes::J),
+                "a dim this stage leaves unfilled is skipped before the map is touched"
+            );
+        }
     }
 }
 
@@ -1888,6 +1940,47 @@ fn corelet_split_dimensions(dsc: &DesignSpaceConfig) -> Option<Vec<PrimaryDimTyp
     Some(dims)
 }
 
+/// `.cpp:107-110` read once, then `.cpp:111-124` written. Splitting the read from the write is what
+/// lets IBM's six in-place calls be spelled at all — `.cpp:2801`, `:2802`, `:2891`, `:2892`, `:2924`
+/// and `:2925` each pass a stage borrowed out of the very `dsc` beside it, so no
+/// `&DesignSpaceConfig` may be live across the write. All six are under
+/// `setSuperChunkDataStageParams`, whose only remaining blocker is `SuperDsc`. IBM's read is
+/// loop-invariant (`.cpp:110`), so hoisting it moves nothing.
+struct CoreletSplit {
+    dims: Vec<PrimaryDimTypes>,
+    num_corelets_used: NumCoreletsUsed,
+}
+
+impl CoreletSplit {
+    /// `.cpp:107-108` and `:110`, both of the reads, taken while the DSC is still borrowable.
+    fn of(dsc: &DesignSpaceConfig) -> Option<Self> {
+        Some(Self {
+            dims: corelet_split_dimensions(dsc)?,
+            num_corelets_used: dsc.num_corelets_used?,
+        })
+    }
+
+    /// `.cpp:109`, `:111-124` — the loop, whose arms
+    /// [`add_or_update_corelet_split_in_params`] documents.
+    fn apply(&self, params: &mut DataStructDims) -> Option<()> {
+        for &dim in &self.dims {
+            let num_corelets_per_core = i32::try_from(self.num_corelets_used.0).ok()?;
+            let val = params.primary_dim_to_val(dim)?;
+            if val == DimVal(-1) {
+                continue;
+            }
+            if val.0.checked_rem(num_corelets_per_core)? != 0 {
+                return None;
+            }
+            let corelet_val = DimVal(val.0.checked_div(num_corelets_per_core)?);
+            let split = params.corelet_split.entry(dim).or_default();
+            split.clear();
+            split.resize(usize::try_from(num_corelets_per_core).ok()?, corelet_val);
+        }
+        Some(())
+    }
+}
+
 /// `.cpp:105-126`, `addOrUpdateCoreletSplitInParams`. Give every corelet-split dim an equal share of
 /// this stage's extent, one entry per corelet, replacing whatever share was recorded before.
 ///
@@ -1903,21 +1996,7 @@ fn add_or_update_corelet_split_in_params(
     params: &mut DataStructDims,
     dsc: &DesignSpaceConfig,
 ) -> Option<()> {
-    for dim in corelet_split_dimensions(dsc)? {
-        let num_corelets_per_core = i32::try_from(dsc.num_corelets_used?.0).ok()?;
-        let val = params.primary_dim_to_val(dim)?;
-        if val == DimVal(-1) {
-            continue;
-        }
-        if val.0.checked_rem(num_corelets_per_core)? != 0 {
-            return None;
-        }
-        let corelet_val = DimVal(val.0.checked_div(num_corelets_per_core)?);
-        let split = params.corelet_split.entry(dim).or_default();
-        split.clear();
-        split.resize(usize::try_from(num_corelets_per_core).ok()?, corelet_val);
-    }
-    Some(())
+    CoreletSplit::of(dsc)?.apply(params)
 }
 
 /// `.cpp:128-148`, `voidPaddingIfChunking`. Where this stage chunks a padded dim — or chunks the
@@ -2115,13 +2194,13 @@ impl L3DlOpsScheduler {
     /// `.cpp:2806-2817`, `addSuperChunkDataStage` (`:397`). Seed the super-chunk stage from the chunk
     /// stage, both halves renamed.
     ///
-    /// ⛔ ABSENT IS IBM'S TWO `DT_CHECK`s, AND THEY ARE NOT ONE FACT: the id must have been minted
-    /// (`.cpp:2807`), which is [`Self::data_stage_super_chunk_idx`] being [`Some`], AND THIS DSC must
-    /// already hold an entry at it (`.cpp:2807-2808`). The mint is guarded on the scheduler-wide
-    /// field while the entry it creates is per DSC — `getNewDataStageIndex` ends with
-    /// `dsc.dataStageParam_[newIdx]` (`.cpp:6622`) and `createChunkLoopNodes` only mints while the
-    /// field is still `-1` (`.cpp:4645-4648`) — so the second DSC of a multi-DSC op reaches this with
-    /// a valid id and no entry of its own. That is why the two checks stay two.
+    /// ⛔ ABSENT ARE IBM'S TWO `DT_CHECK`s, WHICH ARE THREE FACTS: the id must have been minted
+    /// (`.cpp:2807`) and THIS DSC must already hold an entry at it (`.cpp:2808`) — one check's two
+    /// conjuncts, not two checks — plus the chunk stage's own (`.cpp:2810-2811`), the
+    /// `get(&DATA_STAGE_CHUNK_IDX)?`. The first two stay apart because the mint is guarded on the
+    /// scheduler-wide field while the entry is per DSC: `getNewDataStageIndex` ends with
+    /// `dsc.dataStageParam_[newIdx]` (`.cpp:6622`) and `createChunkLoopNodes` mints only while the
+    /// field is still `-1` (`.cpp:4645-4648`), so DSC 1 of a multi-DSC op has the id and no entry.
     /// ⛔ AND THE ENTRY IS OVERWRITTEN, NOT MERGED: the whole stage is assigned (`.cpp:2816`), so
     /// anything `exploreSuperChunkDataStageParams` had written into it is gone.
     pub fn add_super_chunk_data_stage(&self, dsc: &mut DesignSpaceConfig) -> Option<()> {
@@ -2143,7 +2222,7 @@ impl L3DlOpsScheduler {
 
     /// Replaces: e029g4_L3DlOpsScheduler_stages.updateChunkDataStagesFromCandidates
     ///
-    /// `.cpp:2819-2827` (`:391-396`). Write the chunk data stage from one selected point of the
+    /// `.cpp:2819-2827` (`:391-395`). Write the chunk data stage from one selected point of the
     /// candidate space, and under [`BufferType::SpatialDouble`] bring the super-chunk stage back into
     /// step with it.
     ///
