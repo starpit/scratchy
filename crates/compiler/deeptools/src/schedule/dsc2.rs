@@ -4334,6 +4334,47 @@ mod unit_tests {
         );
     }
 
+    /// ⛔ `DSC2ToDataflowIR.cpp:142-146` GUARDS ITS `at(1)` READ WITH A COUNT OF THE OTHER LIST:
+    /// `children` is the filtered `getNextView` (`:87-89`) while `getElseCoreCl` is `next_.at(1)`
+    /// (`dsc/dsc2.cpp:2007-2011`), so a two-region node whose "else" region is irrelevant to the
+    /// component views as ONE child and still reads `at(1)` without throwing. Only a MISSING region
+    /// is [`None`]; a filtered-out one is `Some` of the empty map that `.empty()` at `:146` reads.
+    #[test]
+    fn the_else_region_read_indexes_the_region_list_and_not_the_filtered_view() {
+        let mut cond = ConditionNode::default();
+        let mut then_region = BlockNode::default();
+        then_region.base_class.relevant_comps_mut().insert(
+            SenComponent::Lx,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(0)]))]),
+        );
+        let mut else_region = BlockNode::default();
+        else_region.base_class.relevant_comps_mut().insert(
+            SenComponent::Pe,
+            BTreeMap::from([(CoreId(0), BTreeSet::from([CoreletId(1)]))]),
+        );
+        assert!(cond.add_then_region(then_region).is_none());
+        assert!(cond.add_else_region(else_region).is_none());
+
+        assert_eq!(
+            cond.next_view(SenComponent::Lx).len(),
+            1,
+            "the filtered view bridge 1 counts sees only the `then` region"
+        );
+        assert_eq!(
+            cond.else_core_cl(SenComponent::Lx),
+            Some(BTreeMap::new()),
+            "while `next_.at(1)` still answers, with the empty map `:146` tests"
+        );
+
+        let mut alone = ConditionNode::default();
+        assert!(alone.add_then_region(BlockNode::default()).is_none());
+        assert_eq!(alone.next_view(SenComponent::All).len(), 1);
+        assert!(
+            alone.else_core_cl(SenComponent::Lx).is_none(),
+            "only an absent region is the `at(1)` throw"
+        );
+    }
+
     /// `isParametricLoop_` and `parametricLdsIdx_` are private with one getter and one setter each
     /// (`dsc/dsc2.h:604-619`), and `markAsParametricLoop` only ever SETS — the authority has no
     /// clearing path, which is why there is no `mark_as_non_parametric` here. The index is `-1` until
@@ -10544,15 +10585,19 @@ impl ComputeNode {
 }
 
 /// Replaces: e044_ConditionNode
+/// Replaces: e006_ConditionNode
 ///
 /// `dsc/dsc2.h:685-719`. A two-way branch in the schedule tree: a `BlockNode` whose at most two
 /// children are the "then" and the "else" region (`:688`, `:698-699`) — in THAT order, because
 /// `getThenBranchNode` is `next_[0]` and `getElseBranchNode` is `next_[1]` (`:707-718`).
 ///
-/// `e025_ConditionNode` is this same class under the superseded numbering, and e025 is now `Ddc`
-/// (`crustify-scheduler/UNITS.tsv:26`) — a COLLISION, not a merely stale number. Both of its filled
-/// anchors and its open type anchor are RENUMBERED onto e044 here (`UNITS.tsv:45`); none is deleted
-/// and none changes meaning.
+/// ⛔ AND THE NUMBER HAS COLLIDED TWICE, WHICH IS WHY BOTH ANCHOR LINES STAND. This class is
+/// `crustify-scheduler/UNITS.tsv:50` in the live numbering, where the superseded e025 names
+/// `FoldFunction` (`:14`) rather than the `Ddc` it named when the older line was written (that is
+/// e016, at `:30`), and the superseded e044 names `SymbolicDimInfo` (`:9`, anchored in `dims.rs`).
+/// `driver.sh:99` credits a filled anchor only when the WHOLE id matches a UNITS.tsv row, so the
+/// stale line alone scored this unit unported and silenced its anchor-loss alarm. Nothing is
+/// deleted and nothing changes meaning.
 ///
 /// ⭐ AND BOTH GUARDS NOW LAND, BECAUSE THE BLOCK WAS ON THE TERM AND NOT ON THIS FIELD: `loopCond_`
 /// (`:690`) is [`LoopCondComposite`], whose value half landed first and whose loop link — the one gap
@@ -10597,12 +10642,13 @@ impl ComputeNode {
 /// exact pair of empties to the CONSTANT FALSE (`ddc/ddl/ddl_conversion.cpp:438-441`) before any node
 /// is minted.
 ///
-/// ⭐ AND ALL EIGHT OF THIS CLASS'S METHODS NOW LAND, BECAUSE `next_` LANDED WITH IT. Each one
-/// reaches the child list, and the list is [`BlockNode`]'s: `addChildNode` (the `override` that
-/// refuses anything but a `BLOCK` and any third child, `dsc/dsc2.cpp:2143-2150`), `addThenRegion` and
-/// `addElseRegion` (one refusal and two more, `:2152-2155`, `:2157-2167`), `getThenBranchNode`,
-/// `getElseBranchNode`, `getThenCoreCl`, `getElseCoreCl` and `getNextView`, which widens the base
-/// view to `ALL, -1, -1` whenever the guard is a loop condition (`:1995-2001`).
+/// ⭐ AND ALL EIGHT OF THIS CLASS'S CHILD-LIST METHODS NOW LAND, BECAUSE `next_` LANDED WITH IT
+/// (the ninth is `hasCoreClCond`, above). Each reaches the child list, and the list is
+/// [`BlockNode`]'s: `addChildNode` (the `override` that refuses anything but a `BLOCK` and any
+/// third child, `dsc/dsc2.cpp:2143-2150`), `addThenRegion` and `addElseRegion` (one refusal and two
+/// more, `:2152-2155`, `:2157-2167`), `getThenBranchNode`, `getElseBranchNode`, `getThenCoreCl`,
+/// `getElseCoreCl` and `getNextView`, which widens the base view to `ALL, -1, -1` whenever the
+/// guard is a loop condition (`:1995-2001`).
 ///
 /// ⛔ AND THE HEADER'S "max 2 children in next_, of type BLOCK" (`dsc/dsc2.h:687-688`) IS A TYPE HERE
 /// RATHER THAN A COMMENT: [`Self::add_child_node`] takes a [`BlockNode`] BY VALUE, and it is the only
@@ -10614,19 +10660,23 @@ impl ComputeNode {
 /// `nullptr`: `getThenCoreCl` is `next_.at(0)` and `getElseCoreCl` is `next_.at(1)`
 /// (`dsc/dsc2.cpp:2004-2011`) over a `VectorOfChildren` deriving from `std::vector`
 /// (`dsc/dsc2.h:529`), so each throws `std::out_of_range` on the very node
-/// `getThenBranchNode`/`getElseBranchNode` report absent (`:707-718`). ⛔ AND BRIDGE 1 REACHES THE
-/// `at(1)` UNGUARDED: `DSC2ToDataflowIR.cpp:144-146` calls `getThenCoreCl` and `getElseCoreCl` in
-/// consecutive statements behind nothing but `DT_CHECK_MSG(1 <= num_regions && num_regions <= 2)`, so
-/// a ONE-region condition node throws there — while the V3 lowering of the same read guards it with
-/// `if (max_num_regions == 2)` (`SNControlFlowLowering.cpp:1116`). [`Self::then_core_cl`] and
-/// [`Self::else_core_cl`] answer [`None`], which is what the guarded site tests for.
+/// `getThenBranchNode`/`getElseBranchNode` report absent (`:707-718`).
+/// ⛔ AND BRIDGE 1'S `at(1)` READ IS GUARDED BY A COUNT OF THE OTHER LIST, NOT LEFT UNGUARDED:
+/// `DSC2ToDataflowIR.cpp:143-146` sits under `if (uniform_region.getNumRegions() < children.size())`
+/// (`:142`), where `children` is the FILTERED `getNextView` (`:87-89`) while `at(1)` indexes `next_`,
+/// so the `DT_CHECK_MSG(1 <= num_regions && num_regions <= 2)` above it (`:134`) bounds the view and
+/// not the vector: throwing needs a ZERO-region uniformize op AND a second region genuinely absent.
+/// [`Self::else_core_cl`] is [`None`] for that absent region and `Some` of an EMPTY map for a region
+/// merely filtered out, which is the difference the `.empty()` at `:146` reads — while the V3
+/// lowering guards the same read on `max_num_regions == 2` (`SNControlFlowLowering.cpp:1116`).
 ///
 /// ⚠️ AND THE SCHEDULER'S FOUR FIELD ANCHORS FOR THIS UNIT NAME ONE FIELD: `loopCond_`, beside
 /// `comp`, `coreId` and `siblingRefNode`, which are method-signature continuations of the class
 /// already tallied on e042 below — two ending `) const;` (`dsc/dsc2.h:702`, `:704`) and one ending
 /// `) override;` (`:697`), which that tally's `) const;` count does not reach. `coreClCond_` itself
-/// is absent from the list because its declaration carries a trailing comment (`:691-692`), the
-/// class tallied on e031. Both real fields are carried here regardless.
+/// is absent from the list because its declaration carries a trailing comment (`:691-692`) — the
+/// class tallied on `DataInfo.constEleOffsets_` above, not on the composite. Both real fields are
+/// carried here regardless.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
 /// `InheritWithClone` (`:685`).
@@ -10643,6 +10693,7 @@ pub struct ConditionNode {
     /// read-only conversion, which is what the ~25 sites holding a `const BlockNode*` need.
     base_class: BlockNode,
     /// Field: e044_ConditionNode.loopCond_
+    /// Field: e006_ConditionNode.loopCond_
     ///
     /// The loop guard (`dsc/dsc2.h:690`), ABSENT exactly when this node's condition is the
     /// core/corelet one. ⭐ `= {}` IS HOW THE DDL DROPS ONE it resolved to a constant
@@ -10650,6 +10701,7 @@ pub struct ConditionNode {
     /// not a guard that holds trivially — which is why [`LoopCondComposite`] has no `Default`.
     pub loop_cond: Option<LoopCondComposite>,
     /// Field: e044_ConditionNode.coreClCond_
+    /// Field: e006_ConditionNode.coreClCond_
     ///
     /// The cores and corelets the "then" region applies to (`dsc/dsc2.h:691-692`).
     ///
@@ -10801,8 +10853,9 @@ impl ConditionNode {
             .map(|node| node.base().relevant_core_cl_of_comp(comp))
     }
 
-    /// `getElseCoreCl(comp)` (`dsc/dsc2.cpp:2007-2011`). [`None`] is the `next_.at(1)` throw — the one
-    /// bridge 1 reaches unguarded at `DSC2ToDataflowIR.cpp:146`.
+    /// `getElseCoreCl(comp)` (`dsc/dsc2.cpp:2007-2011`). [`None`] is the `next_.at(1)` throw, which
+    /// bridge 1 reaches only through the region-count guard at `DSC2ToDataflowIR.cpp:142`, and only
+    /// on a node whose second region is ABSENT rather than filtered out — see the type's note.
     pub fn else_core_cl(
         &self,
         comp: SenComponent,
