@@ -230,13 +230,17 @@ impl OperationProp {
 }
 
 /// One resolved DDL condition — `DdlInterface::CondProp` (`ddc/ddl/ddl_conversion.h:419-424`), as
-/// the three states its four fields spell and no more.
+/// the three states its four fields spell on the way OUT of `processCondition`.
 ///
-/// ⛔ THE FOURTH STATE IS A `DT_ERROR`, SO IT IS NOT A STATE: `processCondition`'s and/or arm refuses
-/// a mix of [`Self::Loop`] and [`Self::CoreCl`] twice (`ddc/ddl/ddl_conversion.cpp:371-372`,
-/// `:407-408`), and its tail normalises "none of the three" into `resolvedValue_ = false`
-/// (`:438-441`). ⭐ `resolvedValue_` HAS NO INITIALISER — only `isResolvedToBool_` does (`h:420`) —
-/// and is read only under it, so [`Self::Resolved`] is the pair and the undefined read is gone.
+/// ⛔ THE FOURTH STATE IS REAL, AND IT IS TRANSIENT. "None of the three" — unresolved, no loop, no
+/// core — is what the AND arm's `erase` leaves behind (`ddc/ddl/ddl_conversion.cpp:419`, `:424`),
+/// and the tail that normalises it into `resolvedValue_ = false` runs ONCE, after the operand loop
+/// closes (`:438-441` against `:433`). So it is spelled here as an EMPTY [`Self::CoreCl`], it lives
+/// only inside [`DdlConversion::and_conditions`]'s fold, and [`Self::core_cl`] is that tail.
+/// ⭐ WHAT IS NOT A STATE IS A MIX of [`Self::Loop`] and [`Self::CoreCl`], which the same arm
+/// refuses twice (`:371-372`, `:407-408`). ⭐ `resolvedValue_` HAS NO INITIALISER — only
+/// `isResolvedToBool_` does (`h:420`) — and is read only under it, so [`Self::Resolved`] is the pair
+/// and the undefined read is gone.
 ///
 /// ⛔ NO `negate`: the `condNot` complement of [`Self::CoreCl`] needs `coreIdsUsed_` and
 /// `numCoreletsUsed_DSC2_` off the DSC (`ddc/ddl/ddl_conversion.cpp:328-341`), so it is
@@ -249,14 +253,17 @@ pub enum CondProp {
     /// `loopCond_` (`:421`), non-empty by [`LoopCondComposite`]'s own shape — which discharges the
     /// `twoLevelOrOfAnds_.empty()` half of the tail normalisation above.
     Loop(LoopCondComposite),
-    /// `coreClCond_`, the core/corelet set the "then" region runs on (`:422-423`). Never empty — see
-    /// [`Self::core_cl`].
+    /// `coreClCond_`, the core/corelet set the "then" region runs on (`:422-423`). Empty only as the
+    /// transient above: [`Self::core_cl`] never yields an empty map, and it is what every value that
+    /// leaves this module goes through.
     CoreCl(BTreeMap<CoreId, BTreeSet<CoreletId>>),
 }
 
 impl CondProp {
-    /// The core/corelet state with the authority's tail normalisation applied: an empty map is
-    /// `resolvedValue_ = false` (`ddc/ddl/ddl_conversion.cpp:438-441`).
+    /// The core/corelet state with `processCondition`'s tail normalisation applied: an empty map is
+    /// `resolvedValue_ = false` (`ddc/ddl/ddl_conversion.cpp:438-441`). ⛔ THAT TAIL IS REACHED ONCE
+    /// PER `processCondition`, so this is a constructor for a FINISHED condition and never a step of
+    /// one — see [`DdlConversion::compose_conditions`].
     pub fn core_cl(cores: BTreeMap<CoreId, BTreeSet<CoreletId>>) -> Self {
         if cores.is_empty() {
             Self::Resolved(false)
@@ -378,7 +385,8 @@ impl CoreToCore {
 ///   * `DdlModuleOp ddlParser_` (`:515`) is the MLIR module and context; the template parse is
 ///     build-side, in `build.rs` with `ddl/{ast,parse,selection,smc}.rs`.
 ///
-/// ⛔ AND THOSE FOUR ARE WHAT KEEPS FIFTEEN OF THE EIGHTEEN METHODS OFF THIS TYPE.
+/// ⛔ AND THOSE FOUR, WITH ONE OPEN FIELD OF `dsc`, ARE WHAT KEEPS SIXTEEN OF THE NINETEEN METHODS
+/// OFF THIS TYPE — the class declares nineteen besides its constructor (`:483-509`, `:520-541`).
 /// `ddlInterface`'s `mlir::Value`-keyed maps block `processOp` (`ddc/ddl/ddl_conversion.cpp:582`),
 /// `processRegion` (`:2008`), `processTransformations` (`:2036`), `processPaddedDimensionOp`
 /// (`:102`), `processDimensionOp` (`:187`), `processTypes` (`:447`), `addInternalTensor` (`:473`),
@@ -533,8 +541,11 @@ impl DdlConversion {
     /// ⭐ A RESOLVED OPERAND IS THE JUNCTION'S IDENTITY OR ITS ANNIHILATOR and nothing else: the
     /// annihilator returns straight out (`:346-360`) and the identity is dropped, whether it arrived
     /// first (`:373-376`, `:409-412`) or later, where IBM's merge block simply finds nothing to do.
-    /// ⛔ THE TAIL NORMALISATION IS NOW ONLY THE EMPTY OPERAND LIST (`:438-441`): the other two
-    /// states it caught are unspellable — see [`CondProp`].
+    /// ⛔ AND BOTH REPLACEMENTS ARE GUARDED BY `if (myCp.isResolvedToBool_)` (`:374`, `:410`), WHICH
+    /// AN ACCUMULATOR THE AND ARM HAS EMPTIED IS NOT: it keeps absorbing operands as the empty set,
+    /// and only the tail at `:438-441` — OUTSIDE the operand loop, which closes at `:433` — makes it
+    /// `false`. So the accumulator holds an empty [`CondProp::CoreCl`] and [`CondProp::core_cl`] is
+    /// applied to the RESULT, once.
     fn compose_conditions(
         is_and: bool,
         operands: impl IntoIterator<Item = CondProp>,
@@ -557,12 +568,16 @@ impl DdlConversion {
                     CondProp::Loop(Self::compose_loop_conditions(is_and, earlier, later)?)
                 }
                 (CondProp::CoreCl(earlier), CondProp::CoreCl(later)) => {
-                    CondProp::core_cl(Self::compose_core_cl_conditions(is_and, earlier, later))
+                    CondProp::CoreCl(Self::compose_core_cl_conditions(is_and, earlier, later))
                 }
                 _ => return None,
             });
         }
-        Some(composed.unwrap_or(CondProp::Resolved(false)))
+        Some(match composed {
+            Some(CondProp::CoreCl(cores)) => CondProp::core_cl(cores),
+            Some(composed) => composed,
+            None => CondProp::Resolved(false),
+        })
     }
 
     /// The loop half of that fold (`ddc/ddl/ddl_conversion.cpp:380-403`), which is the three
@@ -593,8 +608,11 @@ impl DdlConversion {
     /// drops a core the operand omits or empties, OR unions.
     ///
     /// ⛔ IBM'S AND ARM IS UNDEFINED BEHAVIOUR — it `erase`s the current element of the `std::map`
-    /// it is ranging over and then increments that iterator (`:417-418`, `:422`). `retain` is the
-    /// well-defined reading of what it means.
+    /// it is ranging over (`:419`, `:424`) and then increments that iterator (`:416`). `retain` is
+    /// the well-defined reading of what it means, and `mod equivalence` MEASURES the fault: the same
+    /// sweep run without its filter aborts under AddressSanitizer with a heap-use-after-free read at
+    /// `:416` of storage freed at `:419`, and over a core-shape table that disagrees 352 of 3,768
+    /// operand sequences reach it — so those have NO authority answer to port.
     fn compose_core_cl_conditions(
         is_and: bool,
         mut earlier: BTreeMap<CoreId, BTreeSet<CoreletId>>,
@@ -1087,6 +1105,33 @@ mod unit_tests {
         );
     }
 
+    /// ⛔ AN AND WHOSE CORES HAVE ALREADY INTERSECTED AWAY STAYS AWAY. The emptied accumulator is
+    /// UNRESOLVED, so neither identity replacement can fire on it (`ddc/ddl/ddl_conversion.cpp:374`,
+    /// `:410`); it absorbs the remaining core operands as the empty set (`:415-425`, ranging over an
+    /// empty map) and only the tail outside the loop resolves it (`:438-441`, `:433`).
+    #[test]
+    fn an_and_that_empties_its_cores_cannot_be_revived_by_a_later_operand() {
+        let on_core = |core: u8| {
+            CondProp::CoreCl(BTreeMap::from([(
+                CoreId(core),
+                BTreeSet::from([CoreletId(0)]),
+            )]))
+        };
+        // Core 0 AND core 1 holds on no core at all, so ANDing core 0 back on is still false.
+        assert_eq!(
+            DdlConversion::and_conditions([on_core(0), on_core(1), on_core(0)])
+                .and_then(|cond| cond.resolved_value()),
+            Some(false)
+        );
+        // And a loop operand then meets `twoLevelOrOfAnds_.size() != 1` on an accumulator with no
+        // clauses at all (`:380`), which is the "two-level OR of ANDs" refusal, not a composition.
+        let guard: LoopCondComposite = LoopCondConjunction::new(term(PrimaryDimTypes::Y)).into();
+        assert!(
+            DdlConversion::and_conditions([on_core(0), on_core(1), CondProp::Loop(guard)])
+                .is_none()
+        );
+    }
+
     /// "And/or op is mixing incompatible types", both ways round
     /// (`ddc/ddl/ddl_conversion.cpp:371-372`, `:407-408`).
     #[test]
@@ -1243,5 +1288,157 @@ mod unit_tests {
         assert_eq!(c2c.next_core.get_data(&cl0), Some(1));
         assert_eq!(c2c.prev_core.get_data(&cl1), Some(1));
         assert!(!c2c.next_core.has_zero_fold_dim());
+    }
+}
+
+#[cfg(test)]
+mod equivalence {
+    use super::*;
+    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction, LoopCondDisjunction};
+
+    /// e018 `:345-442` — every `ConditionAndOp` and `ConditionOrOp` over one, two or three operands
+    /// drawn from the nine shapes `processCondition` can return, against a compiled oracle whose body
+    /// is that line range `#include`d VERBATIM into a splice harness over stand-in types
+    /// (`clang++ -std=c++17 -fsanitize=address,undefined`, rev `a0d29abbed`).
+    ///
+    /// ⛔ THE THREE CORE SHAPES ARE NESTED ON ONE CORE ID ON PURPOSE: an AND that drops a core id or
+    /// empties a corelet set runs the authority into the use-after-free
+    /// [`DdlConversion::compose_core_cl_conditions`] cites, so no such sequence has an answer to
+    /// compare against — 352 of 3,768 over a table widened with three disagreeing core shapes.
+    /// ⭐ SO THE DIVERGENCE THAT REVIEW FOUND IS NOT HERE, IT IS IN `mod unit_tests`: this sweep is
+    /// what says the rest of the fold — both merge blocks, both loop narrowings and all 932 refusals
+    /// — is unaffected by the fix.
+    #[test]
+    fn every_junction_over_three_operands_matches_the_executed_authority() {
+        // The oracle's own stdout: `oracle: cases=1638 refused=932 digest=2000986257151244995`.
+        const CASES: usize = 1638;
+        const REFUSED: usize = 932;
+        const DIGEST: u64 = 2_000_986_257_151_244_995;
+
+        let clause = |dim| {
+            LoopCondConjunction::new(LoopCond {
+                dim,
+                cond_op: LoopCondOp::Eq,
+                cond_val: CondVal::Last,
+            })
+        };
+        let guard = |dim| -> LoopCondComposite { clause(dim).into() };
+        let cores = |corelets: &[u8]| {
+            CondProp::CoreCl(BTreeMap::from([(
+                CoreId(0),
+                corelets.iter().copied().map(CoreletId).collect(),
+            )]))
+        };
+        // Named exactly as the oracle's shape table names them, because the digest covers the names.
+        let shapes: [(&str, CondProp); 9] = [
+            ("true", CondProp::Resolved(true)),
+            ("false", CondProp::Resolved(false)),
+            ("loop[y]", CondProp::Loop(guard(PrimaryDimTypes::Y))),
+            ("loop[x]", CondProp::Loop(guard(PrimaryDimTypes::X))),
+            (
+                "loop[y|x]",
+                CondProp::Loop(
+                    LoopCondDisjunction::new(clause(PrimaryDimTypes::Y))
+                        .or_clause(clause(PrimaryDimTypes::X))
+                        .into(),
+                ),
+            ),
+            (
+                "!loop[y]",
+                CondProp::Loop(guard(PrimaryDimTypes::Y).negate()),
+            ),
+            ("core{0:0}", cores(&[0])),
+            ("core{0:0,1}", cores(&[0, 1])),
+            ("core{0:0,1,2}", cores(&[0, 1, 2])),
+        ];
+
+        // The oracle's own alphabet, read back: a term renders as the integer its dim stood for in
+        // the C++ shape table, so no accessor of this port confirms another accessor of this port.
+        fn render(cond: &CondProp) -> String {
+            let mut out = String::from(match cond {
+                CondProp::Resolved(true) => "resolved(true)",
+                CondProp::Resolved(false) => "resolved(false)",
+                _ => "unresolved",
+            });
+            out.push_str(" loop[");
+            let mut negated = false;
+            if let CondProp::Loop(composite) = cond {
+                negated = composite.negated;
+                for conjunction in composite.or_of_ands.clauses() {
+                    out.push('(');
+                    for cond_term in conjunction.terms() {
+                        let term_id = if cond_term.dim == PrimaryDimTypes::X {
+                            2
+                        } else {
+                            1
+                        };
+                        out.push_str(&format!("{term_id},"));
+                    }
+                    out.push(')');
+                }
+            }
+            out.push_str(if negated { "]! core{" } else { "] core{" });
+            if let CondProp::CoreCl(core_cl) = cond {
+                for (core, corelets) in core_cl {
+                    out.push_str(&format!("{}:", core.0));
+                    for corelet in corelets {
+                        out.push_str(&format!("{},", corelet.0));
+                    }
+                    out.push(';');
+                }
+            }
+            out.push('}');
+            out
+        }
+
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        let (mut cases, mut refused) = (0usize, 0usize);
+        for is_and in [true, false] {
+            for first in &shapes {
+                for second in 0..=shapes.len() {
+                    let last = if second < shapes.len() {
+                        shapes.len()
+                    } else {
+                        0
+                    };
+                    for third in 0..=last {
+                        let mut name = String::from(if is_and { "and(" } else { "or(" });
+                        let mut operands = vec![first.1.clone()];
+                        name.push_str(first.0);
+                        if let Some(second) = shapes.get(second) {
+                            operands.push(second.1.clone());
+                            name.push(',');
+                            name.push_str(second.0);
+                            if let Some(third) = shapes.get(third) {
+                                operands.push(third.1.clone());
+                                name.push(',');
+                                name.push_str(third.0);
+                            }
+                        }
+                        name.push(')');
+
+                        let composed = if is_and {
+                            DdlConversion::and_conditions(operands)
+                        } else {
+                            DdlConversion::or_conditions(operands)
+                        };
+                        cases += 1;
+                        let outcome = match &composed {
+                            Some(cond) => render(cond),
+                            None => {
+                                refused += 1;
+                                String::from("REFUSED")
+                            }
+                        };
+                        for byte in format!("{name} => {outcome}\n").bytes() {
+                            digest ^= u64::from(byte);
+                            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!((cases, refused), (CASES, REFUSED));
+        assert_eq!(digest, DIGEST);
     }
 }
