@@ -4560,6 +4560,102 @@ mod unit_tests {
             "the component entry outlives a filter that excludes its every core"
         );
     }
+
+    /// `dsc/dsc2.cpp:2013-2029` through the owning tree, over the interleave
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3805-3834` performs: two iterations, each
+    /// FRONT-inserting a send and BACK-inserting its receive and linking that pair's two ends. The
+    /// authority's own order, compiled over its extracted body at rev `a0d29abbed`, is
+    /// `send1, send0, a, b, recv0, recv1` — the sends REVERSED and nested around the seeds.
+    ///
+    /// ⛔ THE CONTROL IS THE SAME TREE BUILT WITH [`BlockNode::add_child_node`]: iteration 1's front
+    /// insert moves what iteration 0 stored, so `send0`'s end resolves to `b` and `recv0`'s to `send1`
+    /// — two wrong nodes, with no refusal and no panic to show it.
+    #[test]
+    fn insert_child_keeps_stored_paths_where_add_child_node_moves_them() {
+        let leaf = |name: &str| {
+            let mut node = SyncNode::default();
+            node.base_class.name = name.to_owned();
+            ChildNode::Sync(node)
+        };
+        let order = |tree: &ScheduleTree| {
+            tree.head()
+                .base_class
+                .children()
+                .iter()
+                .map(|child| child.base().name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let end_of = |tree: &ScheduleTree, index: usize| {
+            let path = NodePath::new([index]);
+            let end = tree
+                .node_at(&path)?
+                .as_sync()?
+                .other_end_of_the_signals
+                .first()?;
+            Some(tree.node_at(end)?.base().name.clone())
+        };
+        let root = NodePath::default();
+
+        let mut tree = ScheduleTree::default();
+        for name in ["a", "b"] {
+            let _ = tree.insert_child(&root, InsertionPoint::Back, leaf(name));
+        }
+        for i in 0..2 {
+            let send = tree.insert_child(&root, InsertionPoint::Front, leaf(&format!("send{i}")));
+            let receive = tree.insert_child(&root, InsertionPoint::Back, leaf(&format!("recv{i}")));
+            let (Some(send), Some(receive)) = (send.path().cloned(), receive.path().cloned())
+            else {
+                continue;
+            };
+            // `:3827-3828`, the two ends linked in consecutive statements.
+            if let Some(node) = tree.node_at_mut(&send).and_then(ChildNode::as_sync_mut) {
+                node.other_end_of_the_signals.push(receive.clone());
+            }
+            if let Some(node) = tree.node_at_mut(&receive).and_then(ChildNode::as_sync_mut) {
+                node.other_end_of_the_signals.push(send);
+            }
+        }
+
+        assert_eq!(order(&tree), "send1,send0,a,b,recv0,recv1");
+        assert_eq!(end_of(&tree, 0).as_deref(), Some("recv1"));
+        assert_eq!(end_of(&tree, 1).as_deref(), Some("recv0"), "`.cpp:3827`");
+        assert_eq!(end_of(&tree, 4).as_deref(), Some("send0"), "`.cpp:3828`");
+        assert_eq!(end_of(&tree, 5).as_deref(), Some("send1"));
+
+        // The control: `add_child_node` on the root block, which cannot see a stored path.
+        let mut moved = ScheduleTree::default();
+        for name in ["a", "b"] {
+            let _ = moved
+                .head_mut()
+                .base_class
+                .add_child_node(InsertionPoint::Back, leaf(name));
+        }
+        for i in 0..2 {
+            let block = &mut moved.head_mut().base_class;
+            let _ = block.add_child_node(InsertionPoint::Front, leaf(&format!("send{i}")));
+            let receive = NodePath::new([block.children().len()]);
+            let _ = block.add_child_node(InsertionPoint::Back, leaf(&format!("recv{i}")));
+            let send = NodePath::new([0]);
+            if let Some(node) = moved.node_at_mut(&send).and_then(ChildNode::as_sync_mut) {
+                node.other_end_of_the_signals.push(receive.clone());
+            }
+            if let Some(node) = moved.node_at_mut(&receive).and_then(ChildNode::as_sync_mut) {
+                node.other_end_of_the_signals.push(send);
+            }
+        }
+        assert_eq!(
+            order(&moved),
+            "send1,send0,a,b,recv0,recv1",
+            "the ORDER is right"
+        );
+        assert_eq!(
+            end_of(&moved, 1).as_deref(),
+            Some("b"),
+            "and the LINK is not"
+        );
+        assert_eq!(end_of(&moved, 4).as_deref(), Some("send1"));
+    }
 }
 
 /// Replaces: CoordinateCategory
@@ -6385,14 +6481,39 @@ impl NodeRelevance {
 /// [`BlockNode::add_child_node`] handing the node back.
 ///
 /// ⚠️ AND AN INDEX IS ONLY VALID UNTIL THE LIST CHANGES, where the authority's pointer survives a
-/// sibling insertion. Every live caller resolves the sibling and inserts in the same statement, so
-/// none of them holds one across a mutation.
+/// sibling insertion. Every live caller resolves the SIBLING and inserts in the same statement, so
+/// none of them holds one across a mutation — but a STORED [`NodePath`] is a different question, and
+/// `createSynchronizationDSC` does hold those across its own front insertions
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3805-3834`). [`ScheduleTree::insert_child`] is the
+/// insertion that repairs them, and the one every caller that stores a path must use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertionPoint {
     Front,
     Back,
     Before(usize),
     After(usize),
+}
+
+/// What [`ScheduleTree::insert_child`] answers: the position the node became, or the node itself back.
+///
+/// ⭐ THE PATH IS THE LOAD-BEARING HALF. The authority keeps the `dsc2::SyncNode*` it just inserted
+/// and uses it twice more — as the next insert's `siblingRefNode` and as the other end of a signal
+/// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3927-3928`, `:3939-3956`) — so an insertion that does
+/// not say which position it took cannot be chained, where a returned pointer can.
+#[derive(Debug)]
+pub enum InsertedChild {
+    At(NodePath),
+    Refused(ChildNode),
+}
+
+impl InsertedChild {
+    /// The position, or [`None`] for the refusal — what a chained insert takes as its next sibling.
+    pub fn path(&self) -> Option<&NodePath> {
+        match self {
+            Self::At(path) => Some(path),
+            Self::Refused(_) => None,
+        }
+    }
 }
 
 /// Field: e041_ScheduleNode.prev_
@@ -6428,6 +6549,20 @@ impl NodePath {
         let mut path = self.clone();
         path.0.push(index);
         path
+    }
+
+    /// This path after a child is inserted at `index` in the child list at `parent`.
+    ///
+    /// ⛔ THIS IS WHAT A POSITION COSTS WHERE THE AUTHORITY HAS AN ADDRESS. Only a path that runs
+    /// THROUGH the changed list moves, and only its step INTO that list: the steps above it name
+    /// unchanged ancestors and the steps below it index lists this insertion did not touch.
+    fn shift_for_insertion(&mut self, parent: &[usize], index: usize) {
+        if self.0.len() <= parent.len() || !self.0.starts_with(parent) {
+            return;
+        }
+        if self.0[parent.len()] >= index {
+            self.0[parent.len()] += 1;
+        }
     }
 }
 
@@ -7192,6 +7327,58 @@ impl ScheduleTree {
     pub fn node_at_mut(&mut self, path: &NodePath) -> Option<&mut ChildNode> {
         let (index, ancestors) = path.indices().split_last()?;
         self.children_at_mut(ancestors)?.get_mut(*index)
+    }
+
+    /// `addChildNode` THROUGH THE OWNING TREE (`dsc/dsc2.cpp:2013-2029`): it answers WHERE the node
+    /// landed, and it moves every stored [`NodePath`] the insertion displaced.
+    ///
+    /// ⛔ [`BlockNode::add_child_node`] ALONE SILENTLY MISLINKS, and the authority has a live case —
+    /// `createSynchronizationDSC` FRONT-inserts a send and BACK-inserts its receive twice over
+    /// (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:3805-3834`), so iteration 1's front insert shifts
+    /// the pair iteration 0 already stored. A `ScheduleNode*` survives that; a position does not.
+    /// [`InsertedChild::Refused`] is `add_child_node`'s own refusal plus a parent that does not resolve.
+    #[must_use = "a refused insertion hands the node back and it is lost if dropped"]
+    pub fn insert_child(
+        &mut self,
+        parent: &NodePath,
+        at: InsertionPoint,
+        node: ChildNode,
+    ) -> InsertedChild {
+        let Some(index) = self
+            .block_at_mut(parent.indices())
+            .and_then(|block| block.insertion_point(at))
+        else {
+            return InsertedChild::Refused(node);
+        };
+        Self::shift_stored_paths(&mut self.head.base_class.next, parent.indices(), index);
+        match self.block_at_mut(parent.indices()) {
+            // The shift changes no child list's length, so this repeats the resolution above.
+            Some(block) => {
+                block.next.insert(index, node);
+                InsertedChild::At(parent.child(index))
+            }
+            None => InsertedChild::Refused(node),
+        }
+    }
+
+    /// Every stored [`NodePath`] in the tree, moved past an insertion. ⭐ THERE ARE EXACTLY TWO SUCH
+    /// FIELDS, both on [`SyncNode`]: [`implicit_sync_ref_transfer`](SyncNode::implicit_sync_ref_transfer)
+    /// and [`other_end_of_the_signals`](SyncNode::other_end_of_the_signals). The walk is unfiltered and
+    /// descends through condition nodes, because a displaced path is displaced whatever holds it.
+    fn shift_stored_paths(children: &mut [ChildNode], parent: &[usize], index: usize) {
+        for child in children.iter_mut() {
+            if let Some(sync) = child.as_sync_mut() {
+                if let Some(transfer) = sync.implicit_sync_ref_transfer.as_mut() {
+                    transfer.shift_for_insertion(parent, index);
+                }
+                for end in sync.other_end_of_the_signals.iter_mut() {
+                    end.shift_for_insertion(parent, index);
+                }
+            }
+            if let Some(grandchildren) = child.children_mut() {
+                Self::shift_stored_paths(grandchildren, parent, index);
+            }
+        }
     }
 
     /// The ancestor loops of a path, innermost first, the root last — `getOwnerLoop` repeated, which is

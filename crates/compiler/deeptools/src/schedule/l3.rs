@@ -10,8 +10,8 @@ use crate::schedule::dims::{
 };
 use crate::schedule::dsc::{DesignSpaceConfig, NumCoreletsUsed};
 use crate::schedule::dsc2::{
-    AllocateNode, DataStageId, GroupId, IndirectAllocType, LdsIdx, ScheduleTree, SyncNode,
-    TransferNode,
+    AllocateNode, ChildNode, DataStageId, GroupId, IndirectAllocType, InsertionPoint, LdsIdx,
+    NodePath, ScheduleTree, SyncNode, TransferNode,
 };
 use crate::schedule::metadata::{ConstraintValue, ForcedNumElements};
 use std::collections::{BTreeMap, BTreeSet};
@@ -996,8 +996,8 @@ impl L3DlOpsScheduler {
     /// ⭐ BY VALUE AND WITHOUT `self`, where the authority returns `new dsc2::SyncNode` from a `const`
     /// member that reads no field (`.cpp:655`): the tree owns its nodes as
     /// [`ChildNode`](crate::schedule::dsc2::ChildNode)s, so a caller holding `&mut self` inserts it.
-    /// ⛔ IT DOES NOT PAIR THE ENDS — neither does the authority; each call site pushes
-    /// `otherEndOfTheSignals_` itself (`.cpp:3975-3976`), `e036_SyncNode`'s open anchor.
+    /// ⛔ IT DOES NOT PAIR THE ENDS — neither does the authority; every call site pushes
+    /// `otherEndOfTheSignals_` itself, which is [`Self::link_sync_ends`].
     pub fn create_sync_node(
         units: BTreeSet<SenComponent>,
         name: String,
@@ -1010,6 +1010,152 @@ impl L3DlOpsScheduler {
         node.is_receive = is_receive;
         node.is_soft = is_soft;
         node
+    }
+
+    /// The two ends of ONE pair, each pushed onto the other's list — the consecutive-statement idiom
+    /// all eleven writers use (`.cpp:3927-3928`, `:3943-3944`, `:3976-3977`, `:3827-3828` …).
+    ///
+    /// ⛔ NOT A METHOD ON `SyncNode`, WHICH CANNOT HOLD THE INVARIANT: the pair is two positions in a
+    /// tree neither node owns, and the authority's own asymmetric writers (a whole range at
+    /// `ddc/ddl/ddl_conversion.cpp:2813-2815`, one end per row at `:1785-1788`) are why.
+    pub fn link_sync_ends(tree: &mut ScheduleTree, send: &NodePath, receive: &NodePath) {
+        if let Some(node) = tree.node_at_mut(send).and_then(ChildNode::as_sync_mut) {
+            node.other_end_of_the_signals.push(receive.clone());
+        }
+        if let Some(node) = tree.node_at_mut(receive).and_then(ChildNode::as_sync_mut) {
+            node.other_end_of_the_signals.push(send.clone());
+        }
+    }
+
+    /// One insert in a CHAIN — after `at`, answering where it landed so the next can reference it,
+    /// which is what the authority's `siblingRefNode` being the previously inserted node spells.
+    fn insert_sync_after(
+        tree: &mut ScheduleTree,
+        parent: &NodePath,
+        at: usize,
+        node: SyncNode,
+    ) -> Option<NodePath> {
+        tree.insert_child(parent, InsertionPoint::After(at), ChildNode::Sync(node))
+            .path()
+            .cloned()
+    }
+
+    /// `.cpp:3912-3957`, `addL3LUAndLXLUSyncNodeSequence` (`:290-291`): TWO hard pairs — L3LU→LXLU and
+    /// then LXLU→L3LU — chained in after `insert_after`, in mint order. Answers the four positions.
+    ///
+    /// ⭐ THE CHAIN IS WHY EACH INSERT REFERENCES THE PREVIOUS ONE and not `insertAfterNode`
+    /// (`.cpp:3948-3956`): four `After(insertAfterNode)` calls would land the run REVERSED. Measured.
+    /// ⛔ THE LINKS ARE WRITTEN AFTER THE INSERTS, where the authority writes them before
+    /// (`:3927-3928`, `:3943-3944`): a detached node has no position yet, and the four inserts run at
+    /// strictly increasing indices, so no already-stored path moves. [`None`] is an unresolved anchor.
+    pub fn add_l3lu_and_lxlu_sync_node_sequence(
+        tree: &mut ScheduleTree,
+        insert_after: &NodePath,
+    ) -> Option<[NodePath; 4]> {
+        let (&sibling, ancestors) = insert_after.indices().split_last()?;
+        let parent = NodePath::new(ancestors.iter().copied());
+        tree.node_at(insert_after)?;
+
+        let l3lu_to_lxlu_send = Self::create_sync_node(
+            BTreeSet::from([SenComponent::L3lu]),
+            format!(
+                "sync_send_{}_to_{}",
+                SenComponent::L3lu.spelling(),
+                SenComponent::Lxlu.spelling()
+            ),
+            false,
+            false,
+        );
+        let l3lu_to_lxlu_receive = Self::create_sync_node(
+            BTreeSet::from([SenComponent::Lxlu]),
+            format!(
+                "sync_receive_{}_from_{}",
+                SenComponent::Lxlu.spelling(),
+                SenComponent::L3lu.spelling()
+            ),
+            true,
+            false,
+        );
+        let lxlu_to_l3lu_send = Self::create_sync_node(
+            BTreeSet::from([SenComponent::Lxlu]),
+            format!(
+                "sync_send_{}_to_{}",
+                SenComponent::Lxlu.spelling(),
+                SenComponent::L3lu.spelling()
+            ),
+            false,
+            false,
+        );
+        let lxlu_to_l3lu_receive = Self::create_sync_node(
+            BTreeSet::from([SenComponent::L3lu]),
+            format!(
+                "sync_receive_{}_from_{}",
+                SenComponent::L3lu.spelling(),
+                SenComponent::Lxlu.spelling()
+            ),
+            true,
+            false,
+        );
+
+        let first = Self::insert_sync_after(tree, &parent, sibling, l3lu_to_lxlu_send)?;
+        let second = Self::insert_sync_after(
+            tree,
+            &parent,
+            *first.indices().last()?,
+            l3lu_to_lxlu_receive,
+        )?;
+        let third =
+            Self::insert_sync_after(tree, &parent, *second.indices().last()?, lxlu_to_l3lu_send)?;
+        let fourth = Self::insert_sync_after(
+            tree,
+            &parent,
+            *third.indices().last()?,
+            lxlu_to_l3lu_receive,
+        )?;
+        Self::link_sync_ends(tree, &first, &second);
+        Self::link_sync_ends(tree, &third, &fourth);
+        Some([first, second, third, fourth])
+    }
+
+    /// `.cpp:3959-3985`, `addL3LUAndLXLUSoftSyncNodeSequence` (`:292-293`): ONE pair, both ends SOFT,
+    /// chained in after `insert_after`. Answers the two positions.
+    ///
+    /// ⛔ SOFT IS THE SECOND FLAG AND A RECEIVE IS THE FIRST (`:275-276`), so the send is
+    /// `(false, true)` and the receive `(true, true)` (`.cpp:3967`, `:3974`) — a transposition swaps
+    /// which end is soft and which waits. The names carry `soft` too, which is what the JSON sees.
+    pub fn add_l3lu_and_lxlu_soft_sync_node_sequence(
+        tree: &mut ScheduleTree,
+        insert_after: &NodePath,
+    ) -> Option<[NodePath; 2]> {
+        let (&sibling, ancestors) = insert_after.indices().split_last()?;
+        let parent = NodePath::new(ancestors.iter().copied());
+        tree.node_at(insert_after)?;
+
+        let send = Self::create_sync_node(
+            BTreeSet::from([SenComponent::L3lu]),
+            format!(
+                "sync_soft_send_{}_to_{}",
+                SenComponent::L3lu.spelling(),
+                SenComponent::Lxlu.spelling()
+            ),
+            false,
+            true,
+        );
+        let receive = Self::create_sync_node(
+            BTreeSet::from([SenComponent::Lxlu]),
+            format!(
+                "sync_soft_receive_{}_from_{}",
+                SenComponent::Lxlu.spelling(),
+                SenComponent::L3lu.spelling()
+            ),
+            true,
+            true,
+        );
+
+        let first = Self::insert_sync_after(tree, &parent, sibling, send)?;
+        let second = Self::insert_sync_after(tree, &parent, *first.indices().last()?, receive)?;
+        Self::link_sync_ends(tree, &first, &second);
+        Some([first, second])
     }
 
     /// Replaces: e029g3_L3DlOpsScheduler_coord.isDimensionCoreletSplit
@@ -3495,6 +3641,168 @@ mod equivalence {
             None
         );
     }
+
+    /// `.cpp:3912-3957` and `:3959-3985` against a compiled oracle: the two bodies, `createSyncNode`
+    /// (`:652-663`), `BlockNode::addChildNode` (`dsc/dsc2.cpp:2013-2029`) and
+    /// `senComponentsToString` (`sys-arch-spec/arch_enums.cpp:11-118`) `sed`-extracted BYTE-EXACT at
+    /// rev `a0d29abbed`, each cross-checked against an independent `awk` slicer, spliced into a
+    /// `clang++ -std=c++17` probe over a stand-in tree. 25 case lines, FNV-1a digest
+    /// 9800641465134917767; two mutated controls diverge to 3849020653625001519 — dropping the chain
+    /// (every insert referencing the anchor) REVERSES the run, and back-inserting the root sends
+    /// instead of front-inserting them un-nests the outermost pairs.
+    #[test]
+    fn e029g1_the_sync_node_sequences_agree_with_the_executed_authority() {
+        // The oracle's own stdout, unedited.
+        const AUTHORITY: [&str; 25] = [
+            "hard order before,anchor,sync_send_l3lu_to_lxlu,sync_receive_lxlu_from_l3lu,sync_send_lxlu_to_l3lu,sync_receive_l3lu_from_lxlu,after",
+            "hard [2] sync_send_l3lu_to_lxlu units=l3lu recv=0 soft=0 ends=sync_receive_lxlu_from_l3lu parent=parent",
+            "hard [3] sync_receive_lxlu_from_l3lu units=lxlu recv=1 soft=0 ends=sync_send_l3lu_to_lxlu parent=parent",
+            "hard [4] sync_send_lxlu_to_l3lu units=lxlu recv=0 soft=0 ends=sync_receive_l3lu_from_lxlu parent=parent",
+            "hard [5] sync_receive_l3lu_from_lxlu units=l3lu recv=1 soft=0 ends=sync_send_lxlu_to_l3lu parent=parent",
+            "soft order before,anchor,sync_soft_send_l3lu_to_lxlu,sync_soft_receive_lxlu_from_l3lu,after",
+            "soft [2] sync_soft_send_l3lu_to_lxlu units=l3lu recv=0 soft=1 ends=sync_soft_receive_lxlu_from_l3lu parent=parent",
+            "soft [3] sync_soft_receive_lxlu_from_l3lu units=lxlu recv=1 soft=1 ends=sync_soft_send_l3lu_to_lxlu parent=parent",
+            "tail order before,anchor,sync_send_l3lu_to_lxlu,sync_receive_lxlu_from_l3lu,sync_send_lxlu_to_l3lu,sync_receive_l3lu_from_lxlu",
+            "tail [2] sync_send_l3lu_to_lxlu units=l3lu recv=0 soft=0 ends=sync_receive_lxlu_from_l3lu parent=parent",
+            "tail [3] sync_receive_lxlu_from_l3lu units=lxlu recv=1 soft=0 ends=sync_send_l3lu_to_lxlu parent=parent",
+            "tail [4] sync_send_lxlu_to_l3lu units=lxlu recv=0 soft=0 ends=sync_receive_l3lu_from_lxlu parent=parent",
+            "tail [5] sync_receive_l3lu_from_lxlu units=l3lu recv=1 soft=0 ends=sync_send_lxlu_to_l3lu parent=parent",
+            "both order anchor,sync_soft_send_l3lu_to_lxlu,sync_soft_receive_lxlu_from_l3lu,sync_send_l3lu_to_lxlu,sync_receive_lxlu_from_l3lu,sync_send_lxlu_to_l3lu,sync_receive_l3lu_from_lxlu",
+            "both [1] sync_soft_send_l3lu_to_lxlu units=l3lu recv=0 soft=1 ends=sync_soft_receive_lxlu_from_l3lu parent=parent",
+            "both [2] sync_soft_receive_lxlu_from_l3lu units=lxlu recv=1 soft=1 ends=sync_soft_send_l3lu_to_lxlu parent=parent",
+            "both [3] sync_send_l3lu_to_lxlu units=l3lu recv=0 soft=0 ends=sync_receive_lxlu_from_l3lu parent=parent",
+            "both [4] sync_receive_lxlu_from_l3lu units=lxlu recv=1 soft=0 ends=sync_send_l3lu_to_lxlu parent=parent",
+            "both [5] sync_send_lxlu_to_l3lu units=lxlu recv=0 soft=0 ends=sync_receive_l3lu_from_lxlu parent=parent",
+            "both [6] sync_receive_l3lu_from_lxlu units=l3lu recv=1 soft=0 ends=sync_send_lxlu_to_l3lu parent=parent",
+            "root order sync_send_l3su_to_l3lu_outermost_1,sync_send_l3su_to_l3lu_outermost_0,a,b,sync_receive_l3lu_from_l3su_outermost_0,sync_receive_l3lu_from_l3su_outermost_1",
+            "root [0] sync_send_l3su_to_l3lu_outermost_1 units=l3su recv=0 soft=0 ends=sync_receive_l3lu_from_l3su_outermost_1 parent=head",
+            "root [1] sync_send_l3su_to_l3lu_outermost_0 units=l3su recv=0 soft=0 ends=sync_receive_l3lu_from_l3su_outermost_0 parent=head",
+            "root [4] sync_receive_l3lu_from_l3su_outermost_0 units=l3lu recv=1 soft=0 ends=sync_send_l3su_to_l3lu_outermost_0 parent=head",
+            "root [5] sync_receive_l3lu_from_l3su_outermost_1 units=l3lu recv=1 soft=0 ends=sync_send_l3su_to_l3lu_outermost_1 parent=head",
+        ];
+
+        let root = NodePath::default();
+        let tree_named = |name: &str, seeds: &[&str]| {
+            let mut tree = ScheduleTree::default();
+            tree.head_mut().base_class.base_class.name = name.to_owned();
+            for seed in seeds {
+                let mut node = TransferNode::default();
+                node.base_class.name = (*seed).to_owned();
+                let _ = tree.insert_child(&root, InsertionPoint::Back, ChildNode::Transfer(node));
+            }
+            tree
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let mut report = |tag: &str, tree: &ScheduleTree| {
+            let children = tree.head().base_class.children();
+            lines.push(format!(
+                "{tag} order {}",
+                children
+                    .iter()
+                    .map(|child| child.base().name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            for (index, child) in children.iter().enumerate() {
+                let Some(sync) = child.as_sync() else {
+                    continue;
+                };
+                let units = sync
+                    .units
+                    .iter()
+                    .map(|unit| unit.spelling())
+                    .collect::<Vec<_>>();
+                let ends = sync
+                    .other_end_of_the_signals
+                    .iter()
+                    .map(|end| {
+                        tree.node_at(end)
+                            .map_or("<null>", |node| node.base().name.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                lines.push(format!(
+                    "{tag} [{index}] {} units={} recv={} soft={} ends={} parent={}",
+                    child.base().name,
+                    units.join("+"),
+                    u8::from(sync.is_receive),
+                    u8::from(sync.is_soft),
+                    ends.join("+"),
+                    tree.head().base_class.base_class.name
+                ));
+            }
+        };
+
+        let anchor = NodePath::new([1]);
+        let mut hard = tree_named("parent", &["before", "anchor", "after"]);
+        assert!(
+            L3DlOpsScheduler::add_l3lu_and_lxlu_sync_node_sequence(&mut hard, &anchor).is_some()
+        );
+        report("hard", &hard);
+
+        let mut soft = tree_named("parent", &["before", "anchor", "after"]);
+        assert!(
+            L3DlOpsScheduler::add_l3lu_and_lxlu_soft_sync_node_sequence(&mut soft, &anchor)
+                .is_some()
+        );
+        report("soft", &soft);
+
+        // `getInsertionNode`'s own answer when the innermost transfer tails its block.
+        let mut tail = tree_named("parent", &["before", "anchor"]);
+        assert!(
+            L3DlOpsScheduler::add_l3lu_and_lxlu_sync_node_sequence(&mut tail, &anchor).is_some()
+        );
+        report("tail", &tail);
+
+        // Both sequences into ONE parent: the soft pair's anchor is still the original node, so it
+        // lands INSIDE the hard run — the case a cached index rather than a path gets wrong.
+        let mut both = tree_named("parent", &["anchor"]);
+        let first = NodePath::new([0]);
+        assert!(
+            L3DlOpsScheduler::add_l3lu_and_lxlu_sync_node_sequence(&mut both, &first).is_some()
+        );
+        assert!(
+            L3DlOpsScheduler::add_l3lu_and_lxlu_soft_sync_node_sequence(&mut both, &first)
+                .is_some()
+        );
+        report("both", &both);
+
+        // `.cpp:3805-3834`, the root-level double pair, whose own method is unported: the FRONT/BACK
+        // interleave is what makes [`ScheduleTree::insert_child`]'s path repair load-bearing.
+        let mut outermost = tree_named("head", &["a", "b"]);
+        for i in 0..2 {
+            let send = L3DlOpsScheduler::create_sync_node(
+                BTreeSet::from([SenComponent::L3su]),
+                format!(
+                    "sync_send_{}_to_{}_outermost_{i}",
+                    SenComponent::L3su.spelling(),
+                    SenComponent::L3lu.spelling()
+                ),
+                false,
+                false,
+            );
+            let receive = L3DlOpsScheduler::create_sync_node(
+                BTreeSet::from([SenComponent::L3lu]),
+                format!(
+                    "sync_receive_{}_from_{}_outermost_{i}",
+                    SenComponent::L3lu.spelling(),
+                    SenComponent::L3su.spelling()
+                ),
+                true,
+                false,
+            );
+            let send = outermost.insert_child(&root, InsertionPoint::Front, ChildNode::Sync(send));
+            let receive =
+                outermost.insert_child(&root, InsertionPoint::Back, ChildNode::Sync(receive));
+            let (Some(send), Some(receive)) = (send.path().cloned(), receive.path().cloned())
+            else {
+                continue;
+            };
+            L3DlOpsScheduler::link_sync_ends(&mut outermost, &send, &receive);
+        }
+        report("root", &outermost);
+
+        assert_eq!(lines, AUTHORITY);
+    }
 }
 
 // crustify:todo: e029_L3DlOpsScheduler
@@ -3528,6 +3836,17 @@ mod equivalence {
 // crustify:todo: e029_L3DlOpsScheduler.opaqueOps_
 
 // crustify:todo: e029_L3DlOpsScheduler.producers_
+
+// ⛔ e029g1 IS BLOCKED, BUT NOT ON PAIRING A SYNC'S TWO ENDS, which is what the reason on record said:
+// `e036_SyncNode.otherEndOfTheSignals_` is FILLED as `Vec<NodePath>`, and the two whole-function
+// callees this group owns exclusively — `addL3LUAndLXLUSyncNodeSequence` (`.cpp:3912-3957`) and
+// `addL3LUAndLXLUSoftSyncNodeSequence` (`:3959-3985`), reached only from `createSynchronizationDSC`,
+// at `:3536`, `:3600`, `:3607`, `:3630`, `:3635` and `:3907` — are ported above with it.
+// ⛔ WHAT BLOCKS THE 424-LINE BODY IS STATE IT READS, all of it already open elsewhere:
+// `e020_DesignSpaceConfig.labeledDs_` and `.scheduleTree_` (`crate::schedule::dsc`),
+// `AllocateNode.allocUsers_` (`e003`, `e028` and `e037`, all three open), and six unported helpers
+// of its own — `getAllLabeledDsIndicesSet`, `getHbmPinnedLabeledDsIndicesSet`,
+// `getLxNeighborLabeledDsIndicesSet`, `getInsertionNode`, `getLxBelowBlockNode`, `isOutputLabeledDs`.
 
 // crustify:todo: e029g1_L3DlOpsScheduler_sync
 
