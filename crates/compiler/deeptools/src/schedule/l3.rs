@@ -1786,16 +1786,16 @@ impl L3DlOpsScheduler {
 /// for it. Same technique and the same reason as [`Self::is_paged_lds`].
 ///
 /// ⛔ `emplace` KEEPS A TABLE ALREADY FILED UNDER THAT INDEX (`.cpp:6419`), so this is
-/// `entry().or_default()` and NOT an insert. The two ids are reassigned on the next two lines either
-/// way (`.cpp:6420-6421`), but `newAllocations_` — the map's only other writer (`.cpp:583-587`) — is
-/// not, and `dscMetadata` is never cleared. The difference is invisible at both construction sites,
-/// each of which runs one `SuperDsc` through a fresh scheduler
-/// (`dbo/src/Utils/sdsc_bundle/SchedulerStages.cpp:30-32`,
-/// `dcg/dcg_fe/scheduler/L3DlOpsScheduler_standalone.cpp:192-198`), and reachable from Rust, where
-/// this function and [`Self::dsc_metadata`] are both public.
+/// `entry().or_default()` and NOT an insert: the two ids are reassigned either way
+/// (`.cpp:6420-6421`), but `newAllocations_`, filed by the map's only other writer at `.cpp:590`,
+/// is not, and `dscMetadata` is never cleared. All FOUR construction sites run one `SuperDsc`
+/// through a fresh scheduler — `deeprt/deeprt.cpp:2171` constructs inside its own per-`SuperDsc`
+/// loop (`:2159-2174`) — so no C++ run reaches a second `prepDsc`; Rust does, both this and
+/// [`Self::dsc_metadata`] being public.
 ///
-/// ⭐ COPYING THE ABSENCE IS THE COPY: neither count has a member initialiser
-/// (`dsc/designSpaceConfig.h:74`, `:104`), and `.cpp:6415` copies whatever `numCoreletsUsed_` holds.
+/// ⛔ AND THE TWO COUNTS' ABSENCES ARE NOT ONE ABSENCE: only DSM's is a bare `int`
+/// (`dsc/designSpaceConfig.h:74`); DM's carries `= -1` (`:104`), so `.cpp:6415` does not copy an
+/// absence onto an absence — it destroys a defined value, unconditionally.
 impl L3DlOpsScheduler {
     /// Replaces: e029g7_L3DlOpsScheduler_run.prepDsc
     ///
@@ -3183,6 +3183,44 @@ mod equivalence {
         );
     }
 
+    /// `.cpp:6415` when DM's count is already filed. Transcribed from the authority's own two
+    /// declarations under `clang++ -std=c++17`: a default-constructed DSC prints `DSC2_=-1`
+    /// (`dsc/designSpaceConfig.h:104`), and over `numCoreletsUsed_` of 3, 1 and 0 against a
+    /// `numCoreletsUsed_DSC2_` pre-set to 7 the copy prints `3`, `1`, `0` — never 7, and never the
+    /// `-1` it started from. `0` is a real count, which is why absence is [`None`] and not a zero.
+    #[test]
+    fn prep_dsc_overwrites_dms_count_over_anything_already_filed() {
+        use crate::schedule::dsc::NumCoreletsUsed;
+
+        assert_eq!(
+            DesignSpaceConfig::default().num_corelets_used_dsc2,
+            None,
+            "`fresh: DSC2_=-1`, which is `dsc/designSpaceConfig.h:104`'s own initialiser"
+        );
+
+        let counts = [NumCoreletsUsed(3), NumCoreletsUsed(1), NumCoreletsUsed(0)];
+        let mut dscs: Vec<DesignSpaceConfig> = counts
+            .iter()
+            .map(|count| DesignSpaceConfig {
+                num_corelets_used: Some(*count),
+                num_corelets_used_dsc2: Some(NumCoreletsUsed(7)),
+                ..DesignSpaceConfig::default()
+            })
+            .collect();
+
+        let mut scheduler =
+            L3DlOpsScheduler::new(vec![ExPhase(0)], Verbosity(0), LxBufferTypeMode::Auto).unwrap();
+        scheduler.prep_dsc(&mut dscs);
+
+        for (dsc_idx, count) in counts.into_iter().enumerate() {
+            assert_eq!(
+                dscs[dsc_idx].num_corelets_used_dsc2,
+                Some(count),
+                "`dsc0: used=3 DSC2_=3`, `dsc1: used=1 DSC2_=1`, `dsc2: used=0 DSC2_=0`"
+            );
+        }
+    }
+
     /// `.cpp:6366-6383` on the three orders its one caller can hand it (`.cpp:4607`): the distinct
     /// one `buildLoopOrder` produces, a repeat, and the empty vector that verifies.
     #[test]
@@ -4292,7 +4330,24 @@ mod equivalence {
 
 // crustify:todo: e029g5_L3DlOpsScheduler_paged.optimizeHbmLdsOutputInScheduleTree
 
+// ⛔ e029g7 IS BLOCKED AT `run`, BUT NOT ON "TWENTY-TWO CALLEES WITH ZERO PORTED COUNTERPARTS
+// BETWEEN THEM", which is what the reason on record said: `run`'s LAST statement is ported.
+// `verifyScheduleTree` (`.cpp:8030`) is `Self::verify_schedule_tree` above, narrowed to the
+// `scheduleTree_` that is the only member of the DSC its body reads (`.cpp:6385-6407`);
+// `traverseTreeDFS` (`:8022`) is `ScheduleTree::traverse_dfs` (`dsc2.rs:7303`); and
+// `dataStageParam_.count(dataStageCoreIdx)` (`:7952`) is a `contains_key` on a field
+// `crate::schedule::dsc` already carries. The census was taken against a tree that did not hold
+// them: e029g6 landed in a PARALLEL batch of the same wave, so neither batch saw the other's work.
+// ⛔ WHAT BLOCKS THE BODY IS 21 OF ITS 23 CALLEES, seven of them anchors open in this very file —
+// `optimizeHbmLdsOutputInScheduleTree` (`:7975`), `optimizeHbmTransfers` (`:7979`) and
+// `processHbmPagedTensors` (`:7986`) are g5's, `createSynchronization` (`:7982`) is g1's,
+// `propagateCoordinate` (`:8013`) is g3's, and `setChunkDataStageParams` (`:7968`) and
+// `setSuperChunkDataStageParams` (`:7971`) are g4's — so a body written now is 21 `todo!`s, RULE 5.
+// ⛔ AND `enableChunkExplore` IS `run`'s OWN STATE WITH NO ANCHOR ANYWHERE: a TU-static `bool`
+// (`.cpp:43`) whose only writer is `run` itself, off `DISABLE_ABOVE_LX_CHUNK_EXPLORE`
+// (`.cpp:7925-7929`), and whose only reader is `setChunkDataStageParams` (`.cpp:1542`). It is a
+// field on this class when the two land, and it is on neither group's anchor list.
+
 // crustify:todo: e029g7_L3DlOpsScheduler_run
 
 // crustify:todo: e029g7_L3DlOpsScheduler_run.run
-
