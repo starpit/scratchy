@@ -8168,8 +8168,12 @@ pub struct LoopCondDisjunction {
 }
 
 impl LoopCondDisjunction {
-    /// The one-clause disjunction, which is every minter's whole condition: all five push exactly
-    /// one clause.
+    /// The one-clause disjunction, which is FOUR OF THE FIVE MINTERS' whole condition
+    /// (`ddc/ddl/ddl_conversion.cpp:317-319`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811-4815`,
+    /// `ddc/ddc_transformation.cpp:1056-1065`, `ddc/ddcv1.cpp:3638-3649`, each one `emplace_back`
+    /// outside any loop) — and only the FIRST CLAUSE of the fifth's, which pushes one per enclosing
+    /// loop of the dim: see [`or_clause`](Self::or_clause).
     pub fn new(clause: LoopCondConjunction) -> Self {
         Self {
             first: clause,
@@ -8284,8 +8288,8 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// let _ = LoopCondComposite::default();
 /// ```
 ///
-/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — the one-clause guard every minter
-/// builds, reached the only way a value of this type exists:
+/// ⭐ AND ITS POSITIVE CONTROL, which rustdoc DOES enforce — a one-clause guard, which is what four
+/// of the five minters build, reached the only way a value of this type exists:
 ///
 /// ```
 /// use deeptools::schedule::dims::PrimaryDimTypes;
@@ -16705,6 +16709,197 @@ mod equivalence {
             (digest.cases, digest.refusals, digest.grown, digest.hash),
             (864, 216, 72, 13_047_670_775_146_661_399),
             "executed dsc/dsc2.cpp:2061-2141"
+        );
+    }
+
+    /// The chunk-condition minter's clause loop (`dsc/dsc2.cpp:5077-5110`) against the EXECUTED
+    /// authority, and the case that says A MINT ALONE REACHES TWO CLAUSES. `dsc/dsc2.cpp:5071-5110`
+    /// was `sed`-extracted BYTE-EXACT into a clang++ probe whose only additions are stand-in carriers
+    /// for what the loop reads — a `ConditionNode` holding `loopCond_`, a `LoopNode` with
+    /// `numId_`/`denId_`, and `dataStageParam_.at(denId_).ss_.primaryDimToVal_st(dim)` — then swept
+    /// over one and two enclosing loops × four `dsDen`/`dsChunk` ratio pairs × six chunk indices: 48
+    /// cases, FNV-1a digest 14066724094678247332. All 24 two-loop cases carry TWO clauses, of one term
+    /// and then two.
+    ///
+    /// ⛔ AND IT REFUTES THE READING THAT A MINT PUSHES EXACTLY ONE CLAUSE, which holds for the other
+    /// four minters (`ddc/ddl/ddl_conversion.cpp:317-319`,
+    /// `dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:4811-4815`, `ddc/ddc_transformation.cpp:1056-1065`,
+    /// `ddc/ddcv1.cpp:3638-3649`, each one `emplace_back` outside any loop) and fails for this one,
+    /// whose `DT_CHECK_MSG` caps the count at TWO and names `twoLevelOrOfAnds_` as the field that
+    /// would have to change to lift the cap (`:5049-5051`).
+    ///
+    /// ⛔ TWO TRUNCATION CONTROLS PIN WHAT THAT READING WOULD HAVE COST, each reproduced against the
+    /// probe by keeping ONE of the clauses the authority pushed. The outer clause alone,
+    /// `outer < chunkIdx / count`, digest 11612540073348797124, admits every iteration of the last
+    /// outer chunk it should have bounded; the inner clause alone,
+    /// `inner <= rem / count && outer == chunkIdx / count`, digest 10576621844934821574, admits only
+    /// that one outer chunk and drops all the earlier ones. Both are ONE clause and neither is the
+    /// disjunction, so a clause count cannot tell either from the mint — only these digests can.
+    #[test]
+    fn the_chunk_condition_minter_agrees_with_the_executed_authority() {
+        /// FNV-1a 64 over one canonical, `'\n'`-terminated line per case, same seed as the probe.
+        struct Digest {
+            hash: u64,
+            cases: u64,
+            two_clause: u64,
+        }
+
+        impl Digest {
+            fn new() -> Self {
+                Self {
+                    hash: 14_695_981_039_346_656_037,
+                    cases: 0,
+                    two_clause: 0,
+                }
+            }
+
+            fn feed(&mut self, line: &str) {
+                for byte in line.bytes() {
+                    self.hash ^= u64::from(byte);
+                    self.hash = self.hash.wrapping_mul(1_099_511_628_211);
+                }
+                self.cases += 1;
+            }
+        }
+
+        /// The probe's `LoopNode::path`, which spells a stand-in loop's position the way [`NodePath`]
+        /// does, so the two loops are `0` and `0.0` on both sides.
+        fn loop_tag(path: &NodePath) -> String {
+            path.indices()
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(".")
+        }
+
+        /// The probe's `term`: the authority's two value fields spelled apart again, and dims and
+        /// operators as their own discriminants, so no name table has to agree.
+        fn canon_term(term: &LoopCond) -> String {
+            let (val_type, val_int) = match term.cond_val {
+                CondVal::Iteration(IterationIdx(index)) => (0, index),
+                CondVal::First => (1, -1),
+                CondVal::Last => (2, -1),
+            };
+            format!(
+                "l{}d{}o{}v{}i{}",
+                loop_tag(&term.loop_comp),
+                term.dim as i32,
+                term.cond_op as i32,
+                val_type,
+                val_int
+            )
+        }
+
+        fn canon(or_of_ands: &LoopCondDisjunction) -> String {
+            or_of_ands
+                .clauses()
+                .map(|clause| clause.terms().map(canon_term).collect::<Vec<_>>().join("&"))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        // One dim for the whole mint: every term the loop builds is on `dim` (`dsc/dsc2.cpp:5096`,
+        // `:5100`).
+        const DIM: PrimaryDimTypes = PrimaryDimTypes::Y;
+        // The probe's `uniqueChunkIndices.at(i)` (`:5068`).
+        const CHUNK_INDICES: [i32; 6] = [0, 1, 3, 7, 12, 23];
+        // The probe's `(outer, inner)` `dsDen.ss_ / dsChunkSs` ratios — the `count` of `:5087-5088`.
+        const COUNTS: [(i32, i32); 4] = [(4, 1), (2, 2), (3, 1), (1, 1)];
+
+        // Two perfectly nested loops on `DIM`, the inner one the outer's only child.
+        let outer = NodePath::new([0]);
+        let inner = NodePath::new([0, 0]);
+
+        let mut port = Digest::new();
+        let mut outer_only = Digest::new();
+        let mut inner_only = Digest::new();
+        for num_curr_dim_loop_nodes in 1..=2usize {
+            for (outer_count, inner_count) in COUNTS {
+                for chunk_idx in CHUNK_INDICES {
+                    // `currDimLoopNodesInnerToOuter` (`:5046-5048`) with the `count` each loop's
+                    // denominator data stage gives it, in the same order.
+                    let mut loops = vec![(&inner, inner_count)];
+                    if num_curr_dim_loop_nodes == 2 {
+                        loops.push((&outer, outer_count));
+                    }
+
+                    // `:5073-5075`.
+                    let mut remaining_cond_val = chunk_idx;
+                    let mut last_cond_val = chunk_idx;
+                    let mut last_dim_loop_node: Option<&NodePath> = None;
+                    let mut or_of_ands: Option<LoopCondDisjunction> = None;
+                    // `:5077` — outer to inner.
+                    for idx in (0..loops.len()).rev() {
+                        let (curr_dim_loop_node, count) = loops[idx];
+                        let curr_cond_val = remaining_cond_val / count; // `:5089`
+                        let is_innermost_loop = idx == 0; // `:5093`
+                        // `:5094-5095`.
+                        let curr_cond_op = if is_innermost_loop {
+                            LoopCondOp::Le
+                        } else {
+                            LoopCondOp::Lt
+                        };
+                        // `:5096-5098`.
+                        let mut and_loop_conds = LoopCondConjunction::new(LoopCond {
+                            loop_comp: curr_dim_loop_node.clone(),
+                            dim: DIM,
+                            cond_op: curr_cond_op,
+                            cond_val: CondVal::Iteration(IterationIdx(curr_cond_val)),
+                        });
+                        // `:5099-5103`.
+                        if let Some(last) = last_dim_loop_node {
+                            and_loop_conds = and_loop_conds.and_term(LoopCond {
+                                loop_comp: last.clone(),
+                                dim: DIM,
+                                cond_op: LoopCondOp::Eq,
+                                cond_val: CondVal::Iteration(IterationIdx(last_cond_val)),
+                            });
+                        }
+                        // `:5104`, and the one line [`LoopCondDisjunction::new`] alone cannot spell.
+                        or_of_ands = Some(match or_of_ands {
+                            None => LoopCondDisjunction::new(and_loop_conds),
+                            Some(so_far) => so_far.or_clause(and_loop_conds),
+                        });
+                        remaining_cond_val %= count; // `:5107`
+                        last_cond_val = curr_cond_val; // `:5108`
+                        last_dim_loop_node = Some(curr_dim_loop_node); // `:5109`
+                    }
+
+                    let or_of_ands = or_of_ands.expect("one loop node on the dim at the least");
+                    let head = format!(
+                        "n={num_curr_dim_loop_nodes} c={outer_count}/{inner_count} x={chunk_idx} -> "
+                    );
+                    port.two_clause += u64::from(or_of_ands.clause_count().get() == 2);
+                    port.feed(&format!(
+                        "{head}[{}] {}\n",
+                        or_of_ands.clause_count(),
+                        canon(&or_of_ands)
+                    ));
+                    for (control, kept) in [
+                        (&mut outer_only, or_of_ands.clauses().next()),
+                        (&mut inner_only, or_of_ands.clauses().last()),
+                    ] {
+                        let one = LoopCondDisjunction::new(
+                            kept.expect("a disjunction is never empty").clone(),
+                        );
+                        control.feed(&format!("{head}[1] {}\n", canon(&one)));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            (port.cases, port.two_clause, port.hash),
+            (48, 24, 14_066_724_094_678_247_332),
+            "executed dsc/dsc2.cpp:5071-5110"
+        );
+        assert_eq!(
+            outer_only.hash, 11_612_540_073_348_797_124,
+            "the outer clause alone — the probe's control A"
+        );
+        assert_eq!(
+            inner_only.hash, 10_576_621_844_934_821_574,
+            "the inner clause alone — the probe's control B"
         );
     }
 }
