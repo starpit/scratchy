@@ -1979,6 +1979,7 @@ mod unit_tests {
 
         node.loop_cond = Some(
             LoopCondConjunction::new(LoopCond {
+                loop_comp: NodePath::new([0]),
                 dim: PrimaryDimTypes::Y,
                 cond_op: LoopCondOp::Eq,
                 cond_val: CondVal::Last,
@@ -4312,6 +4313,7 @@ mod unit_tests {
 
         cond.loop_cond = Some(LoopCondComposite::from(LoopCondConjunction::new(
             LoopCond {
+                loop_comp: NodePath::new([0]),
                 dim: PrimaryDimTypes::X,
                 cond_op: LoopCondOp::Eq,
                 cond_val: CondVal::First,
@@ -4505,6 +4507,71 @@ mod unit_tests {
         );
     }
 
+    /// [`LoopCond::loop_comp`] read back through [`ScheduleTree::loop_at_path`]: the path NAMES its
+    /// loop and reaches both dereferences the authority spells (`->name_`, `->dims_`), the empty path
+    /// is the head, and a path onto a non-loop node or off the tree answers nothing at all.
+    #[test]
+    fn a_loop_condition_names_the_loop_it_is_a_condition_on() {
+        let mut tree = ScheduleTree::default();
+        let mut inner = LoopNode::default();
+        inner.base_class.base_class.name = "inner".to_owned();
+        inner.dims = vec![PrimaryDimAndKind::new(
+            PrimaryDimTypes::Ij,
+            crate::schedule::dims::MetaDimKind::WindowDim,
+        )];
+        assert!(
+            tree.head_mut()
+                .base_class
+                .add_child_node(InsertionPoint::Back, ChildNode::Loop(inner))
+                .is_none()
+        );
+        assert!(
+            tree.head_mut()
+                .base_class
+                .add_child_node(InsertionPoint::Back, ChildNode::Sync(SyncNode::default()))
+                .is_none()
+        );
+
+        let term = LoopCond {
+            loop_comp: NodePath::new([0]),
+            dim: PrimaryDimTypes::Ij,
+            cond_op: LoopCondOp::Eq,
+            cond_val: CondVal::First,
+        };
+        assert_eq!(
+            tree.loop_at_path(&term.loop_comp)
+                .map(|on| (on.base_class.base_class.name.as_str(), on.dims.len())),
+            Some(("inner", 1)),
+            "the term's path names its own loop, and both dereferences read through it"
+        );
+        assert!(
+            tree.loop_at_path(&NodePath::default())
+                .is_some_and(|head| std::ptr::eq(head, tree.head())),
+            "the empty path IS the head loop, not an absence"
+        );
+        for not_a_loop in [
+            NodePath::new([1]),
+            NodePath::new([0, 0]),
+            NodePath::new([7]),
+        ] {
+            assert!(
+                tree.loop_at_path(&not_a_loop).is_none(),
+                "a sync node, a path into the loop's empty body and one off the tree all refuse"
+            );
+            assert!(tree.loop_at_path_mut(&not_a_loop).is_none());
+        }
+
+        if let Some(on) = tree.loop_at_path_mut(&term.loop_comp) {
+            on.base_class.base_class.name = "renamed".to_owned();
+        }
+        assert_eq!(
+            tree.loop_at_path(&term.loop_comp)
+                .map(|on| on.base_class.base_class.name.as_str()),
+            Some("renamed"),
+            "`ddc/ddc_transformation_util.cpp:251-256` renames the loop a condition points at"
+        );
+    }
+
     /// [`SyncNode::components_from_other_ends`] over ends that are NOT a sync node of this tree — the
     /// one place the port must answer where the authority dereferences a `const SyncNode*` come what
     /// may: an out-of-range index, a path past a leaf, the ROOT (which [`ScheduleTree::node_at`] never
@@ -4622,6 +4689,42 @@ mod unit_tests {
         assert_eq!(end_of(&tree, 1).as_deref(), Some("recv0"), "`.cpp:3827`");
         assert_eq!(end_of(&tree, 4).as_deref(), Some("send0"), "`.cpp:3828`");
         assert_eq!(end_of(&tree, 5).as_deref(), Some("send1"));
+
+        // The third stored-path field, on a term of a condition node's guard. ⛔ WITHOUT that leg of
+        // `shift_stored_paths` the stale index lands on the condition node itself, so the term names no
+        // loop at all: measured, the assertion below answers `None`.
+        let mut guarded = LoopNode::default();
+        guarded.base_class.base_class.name = "guarded".to_owned();
+        let at = tree.insert_child(&root, InsertionPoint::Back, ChildNode::Loop(guarded));
+        let Some(guarded) = at.path().cloned() else {
+            unreachable!("the head block takes a loop child")
+        };
+        let mut cond = ConditionNode::default();
+        cond.loop_cond = Some(LoopCondComposite {
+            or_of_ands: LoopCondDisjunction::new(LoopCondConjunction::new(LoopCond {
+                loop_comp: guarded,
+                dim: PrimaryDimTypes::Ij,
+                cond_op: LoopCondOp::Eq,
+                cond_val: CondVal::First,
+            })),
+            negated: false,
+        });
+        let _ = tree.insert_child(&root, InsertionPoint::Back, ChildNode::Condition(cond));
+        let _ = tree.insert_child(&root, InsertionPoint::Front, leaf("send2"));
+        let term = tree
+            .head()
+            .base_class
+            .children()
+            .iter()
+            .find_map(ChildNode::as_condition)
+            .and_then(|cond| cond.loop_cond.as_ref())
+            .map(|guard| &guard.or_of_ands.first.first);
+        assert_eq!(
+            term.and_then(|term| tree.loop_at_path(&term.loop_comp))
+                .map(|on| on.base_class.base_class.name.as_str()),
+            Some("guarded"),
+            "the guard's term still names its loop across an insertion that moved that loop"
+        );
 
         // The control: `add_child_node` on the root block, which cannot see a stored path.
         let mut moved = ScheduleTree::default();
@@ -7361,10 +7464,12 @@ impl ScheduleTree {
         }
     }
 
-    /// Every stored [`NodePath`] in the tree, moved past an insertion. ⭐ THERE ARE EXACTLY TWO SUCH
-    /// FIELDS, both on [`SyncNode`]: [`implicit_sync_ref_transfer`](SyncNode::implicit_sync_ref_transfer)
-    /// and [`other_end_of_the_signals`](SyncNode::other_end_of_the_signals). The walk is unfiltered and
-    /// descends through condition nodes, because a displaced path is displaced whatever holds it.
+    /// Every stored [`NodePath`] in the tree, moved past an insertion. ⭐ THERE ARE THREE SUCH FIELDS:
+    /// [`implicit_sync_ref_transfer`](SyncNode::implicit_sync_ref_transfer) and
+    /// [`other_end_of_the_signals`](SyncNode::other_end_of_the_signals) on [`SyncNode`], and
+    /// [`loop_comp`](LoopCond::loop_comp) on every term of a [`ConditionNode`]'s guard. The walk is
+    /// unfiltered and descends through condition nodes, because a displaced path is displaced whatever
+    /// holds it.
     fn shift_stored_paths(children: &mut [ChildNode], parent: &[usize], index: usize) {
         for child in children.iter_mut() {
             if let Some(sync) = child.as_sync_mut() {
@@ -7375,10 +7480,32 @@ impl ScheduleTree {
                     end.shift_for_insertion(parent, index);
                 }
             }
+            if let Some(guard) = child
+                .as_condition_mut()
+                .and_then(|cond| cond.loop_cond.as_mut())
+            {
+                for term in guard.terms_mut() {
+                    term.loop_comp.shift_for_insertion(parent, index);
+                }
+            }
             if let Some(grandchildren) = child.children_mut() {
                 Self::shift_stored_paths(grandchildren, parent, index);
             }
         }
+    }
+
+    /// The loop a path NAMES, not the one enclosing it — what [`LoopCond::loop_comp`] is for, and the
+    /// dereference the authority spells `loopComp_->dims_` (`SNControlFlowLowering.cpp:93`, `:209`)
+    /// and `loopComp_->name_` (`dsc/dsc2.cpp:457`, `ddc/ddc_transformation_util.cpp:558`). The empty
+    /// path is the head, and [`None`] is a path that resolves to something other than a loop.
+    pub fn loop_at_path(&self, path: &NodePath) -> Option<&LoopNode> {
+        self.loop_at(path.indices())
+    }
+
+    /// The mutable form — the rename at `ddc/ddc_transformation_util.cpp:251-256` reaches its loop
+    /// this way.
+    pub fn loop_at_path_mut(&mut self, path: &NodePath) -> Option<&mut LoopNode> {
+        self.loop_at_mut(path.indices())
     }
 
     /// The ancestor loops of a path, innermost first, the root last — `getOwnerLoop` repeated, which is
@@ -7848,30 +7975,17 @@ impl CondVal {
     }
 }
 
+/// Replaces: e039_LoopCond
+/// Replaces: e030_LoopCond
+/// Replaces: e018_LoopCond
+///
 /// One term of a condition node's guard: WHICH iteration of one loop dim the guarded region applies
 /// to (`dsc/dsc2.h:654-673`).
 ///
-/// ⛔ PARTIAL, AND `e039_LoopCond`/`e030_LoopCond`/`e018_LoopCond` STAY OPEN BELOW: `loopComp_` is
-/// the `const LoopNode*` this term is a condition ON, used as pure pointer identity — compared
-/// against a loop (`ddc/ddc_transformation_util.cpp:266`, `:555`, `dsc/dsc2.cpp:2071`, `:2128`),
-/// inserted into a set (`:329`) and keyed into a map (`dsc/dsc2Pcfg.cpp:746`).
-///
-/// ⛔ A BORROW CANNOT SERVE NOW THAT THE TREE OWNS ITS NODES, AND A NAME CANNOT EITHER: the
-/// compare at `:266` runs inside a `traverseTreeDFSMutable` walk holding `&mut` on the node that
-/// holds this very `LoopCond` ([`ConditionNode`], `dsc/dsc2.h:690`), and while `name_` is identity
-/// on the JSON seam (`dsc/dsc2.cpp:456`, resolved at `:1445`) that same caller RENAMES its loop
-/// twelve lines before the compare (`ddc/ddc_transformation_util.cpp:251-256`) and the uniquifier
-/// runs LAST, after all scheduling (`dsc/dsc2.cpp:2986-2992` from `ddc/ddcv1.cpp:3790`).
-///
-/// ⭐ THE VALUE HALF LANDS ANYWAY BECAUSE TWO READERS NEVER TOUCH THE LOOP: `convertCondValToInt`
-/// takes the loop's trip count as a parameter rather than following the pointer
-/// (`dsc/dsc2Pcfg.cpp:788-806`), and the reverse-DDL emitter writes a LITERAL `"label"` where the
-/// loop's name belongs (`ddc/ddl/ddl_conversion.cpp:3272-3281`).
-///
-/// ⛔ NO `Default`, unlike the authority's `LoopCond() = default` (`dsc/dsc2.h:672`): that
-/// constructor exists for the JSON importer, which overwrites all five fields before the value is
-/// used (`dsc/dsc2.cpp:1438-1449`), and its [`CondOp::Default`] operator is a state
-/// [`LoopCondOp`] has no variant for.
+/// ⛔ NO `Default`, unlike the authority's `LoopCond() = default` (`:672`): that constructor belongs
+/// to the JSON importer, which overwrites every field before the value is read
+/// (`dsc/dsc2.cpp:1438-1449`), and its `CondOp::DEFAULT` operator is a state [`LoopCondOp`] has no
+/// variant for.
 ///
 /// ```compile_fail
 /// // E0599, for the reader only: stable rustdoc parses the code an annotation names and ignores
@@ -7886,24 +8000,40 @@ impl CondVal {
 ///
 /// ```
 /// use deeptools::schedule::dims::PrimaryDimTypes;
-/// use deeptools::schedule::dsc2::{CondVal, LoopCond, LoopCondOp};
+/// use deeptools::schedule::dsc2::{CondVal, LoopCond, LoopCondOp, NodePath};
 /// let _ = LoopCond {
+///     loop_comp: NodePath::new([0]),
 ///     dim: PrimaryDimTypes::Y,
 ///     cond_op: LoopCondOp::Eq,
 ///     cond_val: CondVal::Last,
 /// };
 /// ```
 ///
-/// ⛔ NO `PartialEq` EITHER, and the authority declares none: two terms agreeing on dim, operator and
-/// value are the same condition only on the same loop, and that is the field this type is missing.
-#[derive(Clone, Copy, Debug)]
+/// ⭐ `PartialEq` IS EARNED BY THE LOOP LINK, and was withheld only for the want of it: two terms
+/// agreeing on dim, operator and value are the same condition exactly when they are on the same
+/// loop, which [`loop_comp`](Self::loop_comp) now says. The authority derives none — it compares the
+/// pointer by hand (`dsc/dsc2.cpp:2071`, `:2128`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopCond {
+    /// Field: e039_LoopCond.loopComp_
+    /// Field: e030_LoopCond.loopComp_
+    /// Field: e018_LoopCond.loopComp_
+    ///
+    /// The loop this term is a condition ON (`dsc/dsc2.h:659`) — pure pointer identity in the
+    /// authority (compared at `ddc/ddc_transformation_util.cpp:266`, `:555`, `dsc/dsc2.cpp:2071`,
+    /// `:2128`, set-inserted at `:329`, map-keyed at `dsc/dsc2Pcfg.cpp:746`, dereferenced for
+    /// `name_` at `ddc/ddc_transformation_util.cpp:558` and `dsc/dsc2.cpp:457` and for `dims_` by
+    /// bridge 1 at `SNControlFlowLowering.cpp:93`, `:209`), so the POSITION in the owning
+    /// [`ScheduleTree`]. Never absent: all five minters supply a loop, and the SAMV minter's climb
+    /// stops before the root (`ddc/ddcv1.cpp:3639`).
+    pub loop_comp: NodePath,
     /// Field: e039_LoopCond.dim_
     /// Field: e030_LoopCond.dim_
     /// Field: e018_LoopCond.dim_
     ///
-    /// Which of `loopComp_`'s dims the term is on (`dsc/dsc2.h:660`) — a loop node carries several,
-    /// and bridge 1 resolves the pair to one MLIR loop (`SNControlFlowLowering.cpp:92-94`).
+    /// Which of [`loop_comp`](Self::loop_comp)'s dims the term is on (`dsc/dsc2.h:660`) — a loop node
+    /// carries several, and bridge 1 resolves the pair to one MLIR loop
+    /// (`SNControlFlowLowering.cpp:92-94`).
     ///
     /// ⭐ [`PrimaryDimTypes::Undefined`] IS THE AUTHORITY'S OWN INITIALISER, `PrimaryDimTypesCount`
     /// (`dsc/dsc2.h:660`), so no [`Option`] is needed: the live "no dimension" key already spells it.
@@ -7927,10 +8057,6 @@ pub struct LoopCond {
     pub cond_val: CondVal,
 }
 
-// crustify:todo: e018_LoopCond
-
-// crustify:todo: e018_LoopCond.loopComp_
-
 /// One conjunction of a condition node's guard — one entry of `twoLevelOrOfAnds_`
 /// (`dsc/dsc2.h:676`): the [`LoopCond`] terms that must ALL hold for the guarded region to run.
 ///
@@ -7944,7 +8070,7 @@ pub struct LoopCond {
 /// dim is seeded before the filter that fills it (`ddc/ddc_transformation.cpp:919`, `:1056-1065`),
 /// and the SAMV minter's is a walk over enclosing loops that may match no dim at all
 /// (`ddc/ddcv1.cpp:3638-3649`). A mandatory first term is the check nobody wrote.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopCondConjunction {
     first: LoopCond,
     rest: Vec<LoopCond>,
@@ -7988,13 +8114,32 @@ impl LoopCondConjunction {
     /// Its terms in declaration order, which is OBSERVABLE and therefore not a set: the PCFG
     /// translator spells a condition node's NAME from the dims it walks in this order
     /// (`dsc/dsc2Pcfg.cpp:721-725`).
-    pub fn terms(&self) -> impl Iterator<Item = LoopCond> + '_ {
-        core::iter::once(self.first).chain(self.rest.iter().copied())
+    pub fn terms(&self) -> impl Iterator<Item = &LoopCond> + '_ {
+        core::iter::once(&self.first).chain(self.rest.iter())
     }
 
     /// How many terms, never zero.
     pub fn term_count(&self) -> NonZeroUsize {
         NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+
+    /// This clause with every term on `target` replaced by `replacement` — the clause rebuild of
+    /// `adjustConditionForSplitLoop` (`dsc/dsc2.cpp:2126-2132`).
+    ///
+    /// ⛔ EVERY MATCH, NOT THE FIRST: the authority's own comment says "the condition that refers to
+    /// the original base loop", singular, and its loop says otherwise.
+    fn rebuilt(&self, target: &NodePath, replacement: &LoopCond) -> Self {
+        let pick = |term: &LoopCond| {
+            if term.loop_comp == *target {
+                replacement.clone()
+            } else {
+                term.clone()
+            }
+        };
+        Self {
+            first: pick(&self.first),
+            rest: self.rest.iter().map(pick).collect(),
+        }
     }
 }
 
@@ -8013,7 +8158,7 @@ impl From<LoopCond> for LoopCondConjunction {
 /// DELETES A CHECK IN BOTH DSC-TO-DATAFLOW-IR
 /// LOWERINGS, each re-asserting `twoLevelOrOfAnds_.empty()` inside the arm the same predicate
 /// already selected (`SNControlFlowLowering.cpp:1049`, `:1079`; `DSC2ToDataflowIR.cpp:91`, `:113`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopCondDisjunction {
     first: LoopCondConjunction,
     rest: Vec<LoopCondConjunction>,
@@ -8089,6 +8234,10 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
     }
 }
 
+/// Replaces: e043_LoopCondComposite
+/// Replaces: e022_LoopCondComposite
+/// Replaces: e031_LoopCondComposite
+///
 /// A condition node's loop guard: `LoopCondComposite` (`dsc/dsc2.h:675-683`), an OR of ANDs under
 /// one overall negation — which is the shape the DDL's own diagnostic names, "two-level OR of ANDs,
 /// with optionally an overall negation" (`ddc/ddl/ddl_conversion.cpp:385-388`).
@@ -8110,18 +8259,13 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// `coreClCond_` instead) and through `hasCoreClCond()`'s else arm
 /// (`ddc/ddc_transformation_util.cpp:489`, `:592`).
 ///
-/// ⛔ PARTIAL, AND THE `e022`/`e043`/`e031` ANCHORS STAY OPEN BELOW: every term is [`LoopCond`]'s
-/// value half, so a composite still cannot name the loops it is a condition ON, and
-/// `adjustConditionForSplitLoop` selects and rebuilds its terms by that pointer
-/// (`dsc/dsc2.cpp:2071-2076`, `:2126-2132`).
-///
-/// ⚠️ AND THAT DISPATCH HAS NO FIFTH REFUSAL: it has the FOUR the e044 anchor lists, and that
-/// anchor's fourth IS `:2136` — "anything outside `EQ` / `NE` / `(GT,FIRST)` / `(LT,LAST)`". What is
-/// worth recording is WHICH pairs reach it, because there are only two: over the six operators a
-/// ported condition can spell times `FIRST`/`LAST`, `:2087-2101` takes the four always-true/false
-/// pairings and `:2136` is left with `(LE, FIRST)` and `(GE, LAST)` alone. ⭐ BOTH ARE EQUALITIES on
-/// an index that cannot leave its own bounds, so each belongs in the ANDed-term arm `:2109-2113` —
-/// NOT in the new-OR-clause arm `:2114-2134`, which yields the other shape entirely.
+/// ⚠️ ONLY TWO PAIRS REACH THE LAST REFUSAL OF
+/// [`adjust_condition_for_split_loop`](Self::adjust_condition_for_split_loop)
+/// (`dsc/dsc2.cpp:2136`), AND THE PORT KEEPS IT: over the six operators a ported condition can spell
+/// times `FIRST`/`LAST`, `:2088-2101` takes the four always-true/false pairings and the two arms take
+/// `EQ`, `NE`, `(GT,FIRST)` and `(LT,LAST)`, leaving `(LE,FIRST)` and `(GE,LAST)`. Both ARE equalities
+/// on an index that cannot leave its own bounds, but simplifying them HERE would make the port accept
+/// a DDL the authority rejects, and the parser is where the authority says it belongs (`:2092-2095`).
 ///
 /// ⛔ TWO CARRIERS, and both must reach this type: `ConditionNode::loopCond_` (`dsc/dsc2.h:690`) and
 /// `DdlInterface::CondProp::loopCond_` (`ddc/ddl/ddl_conversion.h:420-421`).
@@ -8143,9 +8287,10 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// ```
 /// use deeptools::schedule::dims::PrimaryDimTypes;
 /// use deeptools::schedule::dsc2::{
-///     CondVal, LoopCond, LoopCondComposite, LoopCondConjunction, LoopCondOp,
+///     CondVal, LoopCond, LoopCondComposite, LoopCondConjunction, LoopCondOp, NodePath,
 /// };
 /// let term = LoopCond {
+///     loop_comp: NodePath::new([0]),
 ///     dim: PrimaryDimTypes::Y,
 ///     cond_op: LoopCondOp::Eq,
 ///     cond_val: CondVal::Last,
@@ -8155,9 +8300,9 @@ impl From<LoopCondConjunction> for LoopCondDisjunction {
 /// assert_eq!(cond.or_of_ands.clause_count().get(), 1);
 /// ```
 ///
-/// ⛔ NO `PartialEq`, for [`LoopCond`]'s reason: two guards agreeing on dims, operators and values
-/// are the same guard only on the same loops, and that is the field the terms are missing.
-#[derive(Clone, Debug)]
+/// ⭐ `PartialEq` IS EARNED HERE TOO, for [`LoopCond`]'s reason: the loops its terms are on are what
+/// two otherwise-agreeing guards needed to be the same guard, and they now say so.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoopCondComposite {
     /// Field: e043_LoopCondComposite.twoLevelOrOfAnds_
     /// Field: e022_LoopCondComposite.twoLevelOrOfAnds_
@@ -8199,6 +8344,87 @@ impl LoopCondComposite {
         } else {
             Some(self.or_of_ands)
         }
+    }
+
+    /// Every term of every clause, mutably. ⭐ THE CALLER IS NOT A PORT OF ANYTHING: an insertion into
+    /// the owning tree displaces the positions these terms hold, which a `LoopNode*` would not notice
+    /// — see [`ScheduleTree::insert_child`].
+    fn terms_mut(&mut self) -> impl Iterator<Item = &mut LoopCond> + '_ {
+        core::iter::once(&mut self.or_of_ands.first)
+            .chain(self.or_of_ands.rest.iter_mut())
+            .flat_map(|clause| core::iter::once(&mut clause.first).chain(clause.rest.iter_mut()))
+    }
+
+    /// Rewrite this guard when `orig_loop` is split into `new_first` followed by `new_rest`
+    /// (`dsc/dsc2.cpp:2061-2141`). [`None`] wherever the authority `DT_ERROR`s, and by value so that
+    /// the partial rewrite it leaves behind on that path is unobservable.
+    ///
+    /// ⛔ `new_first` SPLIT OUT IS THE AUTHORITY'S `DT_CHECK_MSG(!newLoops.empty())` (`:2064`) MADE
+    /// STRUCTURAL, and it is also the loop the rebuild at `:2128` compares against — NOT `orig_loop`,
+    /// which is indistinguishable only because both live callers pass them equal
+    /// (`ddc/ddc_transformation_util.cpp:311`, `ddc/ddl/ddl_conversion.cpp:1562`).
+    pub fn adjust_condition_for_split_loop(
+        mut self,
+        orig_loop: &NodePath,
+        new_first: &NodePath,
+        new_rest: &[NodePath],
+    ) -> Option<Self> {
+        // The authority captures both sizes first, so neither a term appended to the current clause
+        // nor a clause appended to the disjunction is revisited (`:2066-2069`). `appended` is that
+        // cap for the outer level: every new clause lands after every original one, in push order.
+        let mut appended = Vec::new();
+        let clauses =
+            core::iter::once(&mut self.or_of_ands.first).chain(self.or_of_ands.rest.iter_mut());
+        for clause in clauses {
+            for i_and in 0..clause.term_count().get() {
+                let base = {
+                    let term = match i_and.checked_sub(1) {
+                        None => &mut clause.first,
+                        Some(index) => &mut clause.rest[index],
+                    };
+                    if term.loop_comp != *orig_loop {
+                        continue; // `:2071-2073`
+                    }
+                    term.loop_comp = new_first.clone(); // `:2076`
+                    term.clone()
+                };
+                if new_rest.is_empty() {
+                    continue; // `:2077`
+                }
+                let cond_op = base.cond_op;
+                let cond_val = match base.cond_val {
+                    // `:2082-2086`
+                    CondVal::Iteration(_) => return None,
+                    first_or_last => first_or_last,
+                };
+                match (cond_op, cond_val) {
+                    // Always false or always true, which the DDL parser is meant to have folded
+                    // (`:2088-2101`).
+                    (LoopCondOp::Gt, CondVal::Last)
+                    | (LoopCondOp::Lt, CondVal::First)
+                    | (LoopCondOp::Le, CondVal::Last)
+                    | (LoopCondOp::Ge, CondVal::First) => return None,
+                    _ => {}
+                }
+                let mut new_cond = base; // `:2103`
+                for loop_path in new_rest {
+                    new_cond.loop_comp = loop_path.clone(); // `:2108`
+                    match (cond_op, cond_val) {
+                        // One more ANDed term in THIS clause (`:2109-2113`).
+                        (LoopCondOp::Eq, _) => clause.rest.push(new_cond.clone()),
+                        // One more disjunctive clause, this one rebuilt (`:2114-2134`).
+                        (LoopCondOp::Ne, _)
+                        | (LoopCondOp::Gt, CondVal::First)
+                        | (LoopCondOp::Lt, CondVal::Last) => {
+                            appended.push(clause.rebuilt(new_first, &new_cond));
+                        }
+                        _ => return None, // `:2136`
+                    }
+                }
+            }
+        }
+        self.or_of_ands.rest.extend(appended);
+        Some(self)
     }
 }
 
@@ -8562,8 +8788,6 @@ impl LoopDistributionCat {
 }
 
 // crustify:todo: e021_LoopDistributionInfo
-
-// crustify:todo: e022_LoopCondComposite
 
 /// Replaces: dsc2::memories
 ///
@@ -10324,9 +10548,9 @@ impl ComputeNode {
 /// and none changes meaning.
 ///
 /// ⭐ AND BOTH GUARDS NOW LAND, BECAUSE THE BLOCK WAS ON THE TERM AND NOT ON THIS FIELD: `loopCond_`
-/// (`:690`) is [`LoopCondComposite`], which landed carrying its value half with `loopComp_` still
-/// open on [`LoopCond`] — schedule-node pointer identity, recorded there, on the type that is
-/// missing the pointer. Carrying the composite here adds no gap of its own.
+/// (`:690`) is [`LoopCondComposite`], whose value half landed first and whose loop link — the one gap
+/// this field used to inherit — is now [`LoopCond::loop_comp`], a position in the owning tree.
+/// Carrying the composite here adds no gap of its own, and no longer waits on someone else's.
 ///
 /// ⭐ WHAT THIS TYPE ADDS IS THE [`Option`], AND THAT IS THE DISCRIMINATOR ITSELF: `hasCoreClCond()`
 /// IS `loopCond_.twoLevelOrOfAnds_.empty()` (`:693-695`) and never looks at `coreClCond_`, and a
@@ -10892,6 +11116,7 @@ pub struct MaskSplit {
 pub struct StickMaskView {
     /// Field: e027_StickMaskNode.maskA_
     /// Field: e040_StickMaskNode.maskA_
+    /// Field: e043_StickMaskNode.maskA_
     ///
     /// The within-slice (wsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2463-2472`).
     ///
@@ -10905,11 +11130,13 @@ pub struct StickMaskView {
     pub mask_a: MaskSplit,
     /// Field: e027_StickMaskNode.maskB_
     /// Field: e040_StickMaskNode.maskB_
+    /// Field: e043_StickMaskNode.maskB_
     ///
     /// The cross-slice (xsl) dim's mask (`dsc/dsc2.h:1068`, `dsc/dsc2.cpp:2473-2489`).
     pub mask_b: MaskSplit,
     /// Field: e027_StickMaskNode.transitionSliceId_
     /// Field: e040_StickMaskNode.transitionSliceId_
+    /// Field: e043_StickMaskNode.transitionSliceId_
     ///
     /// The slice `mask_b` transitions at (`dsc/dsc2.h:1069`): bridge 1 emits `(A)` for every slice
     /// before it, `(A|B)` at it, and `(1)` after (`SNStickMaskLowering.cpp:51-58`).
@@ -10925,6 +11152,7 @@ pub struct StickMaskView {
 
 /// Replaces: e027_StickMaskNode
 /// Replaces: e040_StickMaskNode
+/// Replaces: e043_StickMaskNode
 ///
 /// `dsc/dsc2.h:1059-1072`. A SAMV node: the mask an LXLU transfer applies to the tail of a stick so
 /// that the elements past the tensor's real extent read the mask value instead. `constructSAMVNodes`
@@ -10933,16 +11161,20 @@ pub struct StickMaskView {
 /// [`first_stick_coord_to_mask_per_dim`](Self::first_stick_coord_to_mask_per_dim) — into the "else"
 /// region (`ddc/ddcv1.cpp:3527-3665`).
 ///
-/// ⛔ THIS CARRIES FOUR OF STICKMASKNODE'S FIVE FIELDS, so the `e027_StickMaskNode` anchor below
-/// stays open. `affectedTransfers_` (`:1065`) is a `vector<const dsc2::TransferNode*>` held as
-/// schedule-node pointer identity, and its JSON round trip goes through each transfer's `name_`
-/// (`dsc/dsc2.cpp:980-987`), e013's field.
+/// ⛔ THIS CARRIES FOUR OF STICKMASKNODE'S FIVE FIELDS, so the type TODOs below stay open — but NOT
+/// for the reason this doc gave. `affectedTransfers_` (`:1065`) is a `vector<const
+/// dsc2::TransferNode*>` into the tree that owns it, the class [`NodePath`] answers and both of
+/// [`SyncNode`]'s cross-node fields now carry. What blocks it is that NOTHING IN SCOPE WOULD WRITE
+/// IT: its one writer walks the tree for LXLU transfers (`ddc/ddcv1.cpp:3534-3576`) and all three
+/// readers are whole-tree functions — the component fill (`dsc/dsc2.cpp:2721-2725`), the JSON pair
+/// (`:980-987`, `:1857-1863`) and the PCFG translator (`dsc/dsc2Pcfg.cpp:2207`). Carrying it here
+/// would be a field with no writer, which is the defect this campaign indicted, not a port.
 ///
-/// ⚠️ AND THE SCHEDULER RE-LABELLED THIS UNIT `e040_StickMaskNode` WITHOUT EVER PUTTING THAT ANCHOR
-/// IN THE TREE — no revision of this file has carried an `e040` anchor, so the second label is added
+/// ⚠️ AND THE SCHEDULER HAS RE-LABELLED THIS UNIT TWICE WITHOUT EVER PUTTING EITHER NEW ANCHOR IN
+/// THE TREE — no revision of this file carried the second label or the third, so both are added
 /// here beside the first rather than replacing it. The remainder schedule did not notice: it matches
-/// a landed unit by CLASS NAME, not by number, so `e027_StickMaskNode` satisfied it — but an anchor
-/// is keyed by its eNNN name, so nothing in the tree answered for `e040` at all.
+/// a landed unit by CLASS NAME, not by number, so the first label satisfied it — but an anchor is
+/// keyed by its eNNN name, so nothing in the tree answered for the other two at all.
 ///
 /// ⛔ NO `PartialEq`: node identity in the authority is the pointer. `Clone` is IBM's own, through
 /// `InheritWithClone` (`:1059`), and the DDC leans on it for the reset copy (`ddc/ddcv1.cpp:3663`).
@@ -10954,6 +11186,7 @@ pub struct StickMaskNode {
     pub base_class: ScheduleNode,
     /// Field: e027_StickMaskNode.maskValConstId_
     /// Field: e040_StickMaskNode.maskValConstId_
+    /// Field: e043_StickMaskNode.maskValConstId_
     ///
     /// The constant holding the value written into the masked elements (`dsc/dsc2.h:1061`), taken
     /// from `DesignSpaceConfig::maskingConstId_` (`ddc/ddcv1.cpp:3531`).
@@ -10964,6 +11197,7 @@ pub struct StickMaskNode {
     pub mask_val_const_id: Option<ConstantId>,
     /// Field: e027_StickMaskNode.dataFormat_
     /// Field: e040_StickMaskNode.dataFormat_
+    /// Field: e043_StickMaskNode.dataFormat_
     ///
     /// The precision of the masked tensor (`dsc/dsc2.h:1062`), copied from the affected transfer's
     /// labeled data structure (`ddc/ddcv1.cpp:3577`).
@@ -10974,6 +11208,7 @@ pub struct StickMaskNode {
     pub data_format: DataFormats,
     /// Field: e027_StickMaskNode.stickLayout_
     /// Field: e040_StickMaskNode.stickLayout_
+    /// Field: e043_StickMaskNode.stickLayout_
     ///
     /// What one stick is made of: each dim inside it with its extent in elements (`dsc/dsc2.h:1063`),
     /// range-built out of `getStickSizes` (`ddc/ddcv1.cpp:3546-3547`) — the conversion [`Size`]
@@ -10984,6 +11219,7 @@ pub struct StickMaskNode {
     pub stick_layout: Vec<Size>,
     /// Field: e027_StickMaskNode.firstStickCoordToMaskPerDim_
     /// Field: e040_StickMaskNode.firstStickCoordToMaskPerDim_
+    /// Field: e043_StickMaskNode.firstStickCoordToMaskPerDim_
     ///
     /// Per dim, the first coordinate inside the stick the mask covers (`dsc/dsc2.h:1064`).
     ///
@@ -11095,9 +11331,13 @@ impl StickMaskNode {
 
 // crustify:todo: e040_StickMaskNode
 
+// crustify:todo: e043_StickMaskNode
+
 // crustify:todo: e027_StickMaskNode.affectedTransfers_
 
 // crustify:todo: e040_StickMaskNode.affectedTransfers_
+
+// crustify:todo: e043_StickMaskNode.affectedTransfers_
 
 /// Which half of an indirect access an allocation is — `AllocateNode::IndirectAllocType`
 /// (`dsc/dsc2.h:990-994`). It is the paged-access discriminator the L3 scheduler reads: `isPagedLds`
@@ -13462,6 +13702,7 @@ mod equivalence {
 
     fn term(dim: PrimaryDimTypes, cond_op: LoopCondOp, cond_val: CondVal) -> Cond {
         Cond::Term(LoopCond {
+            loop_comp: NodePath::new([0]),
             dim,
             cond_op,
             cond_val,
@@ -13516,7 +13757,7 @@ mod equivalence {
     /// the state that guard sends to `coreClCond_` instead.
     fn flat_eval(cond: &Cond) -> Option<FlatComposite> {
         match cond {
-            Cond::Term(loop_cond) => Some((vec![vec![*loop_cond]], false)),
+            Cond::Term(loop_cond) => Some((vec![vec![loop_cond.clone()]], false)),
             Cond::Not(inner) => {
                 let (clauses, negated) = flat_eval(inner)?;
                 Some((clauses, !negated))
@@ -13532,7 +13773,7 @@ mod equivalence {
     /// composite or a multi-clause disjunction to be a conjunction.
     fn layered_conjunction(cond: &Cond) -> Option<LoopCondConjunction> {
         match cond {
-            Cond::Term(loop_cond) => Some(LoopCondConjunction::new(*loop_cond)),
+            Cond::Term(loop_cond) => Some(LoopCondConjunction::new(loop_cond.clone())),
             Cond::And(lhs, rhs) => Some(layered_conjunction(lhs)?.and(layered_conjunction(rhs)?)),
             Cond::Not(_) | Cond::Or(..) => layered_disjunction(cond)?.into_conjunction(),
         }
@@ -13723,7 +13964,11 @@ mod equivalence {
 
         // ⛔ AND THE SWEEP IS NOT ALL-REFUSING, which is the only way the two assertions above mean
         // anything: the eighteen pairs spread over all five arms.
-        let tally = |arm: SplitArm| pairs().filter(|&(op, val)| split_arm(op, val) == arm).count();
+        let tally = |arm: SplitArm| {
+            pairs()
+                .filter(|&(op, val)| split_arm(op, val) == arm)
+                .count()
+        };
         assert_eq!(
             [
                 tally(SplitArm::UnsupportedValue),
@@ -13751,6 +13996,7 @@ mod equivalence {
     #[test]
     fn bridge_ones_condition_path_is_not_selected_by_the_clause_count_alone() {
         let last = |dim| LoopCond {
+            loop_comp: NodePath::new([0]),
             dim,
             cond_op: LoopCondOp::Eq,
             cond_val: CondVal::Last,
@@ -14067,6 +14313,7 @@ mod equivalence {
             if !loop_empty {
                 node.loop_cond = Some(
                     LoopCondConjunction::new(LoopCond {
+                        loop_comp: NodePath::new([0]),
                         dim: PrimaryDimTypes::Y,
                         cond_op: LoopCondOp::Eq,
                         cond_val: CondVal::Last,
@@ -15427,6 +15674,7 @@ mod equivalence {
     fn tree_loop_guard() -> LoopCondComposite {
         LoopCondComposite::from(LoopCondDisjunction::new(LoopCondConjunction::new(
             LoopCond {
+                loop_comp: NodePath::new([0]),
                 dim: PrimaryDimTypes::X,
                 cond_op: LoopCondOp::Eq,
                 cond_val: CondVal::First,
@@ -16295,6 +16543,167 @@ mod equivalence {
             "the filter dropped — the probe's control B"
         );
     }
+
+    /// [`LoopCondComposite::adjust_condition_for_split_loop`] against the EXECUTED authority.
+    /// `dsc/dsc2.cpp:2061-2141` was `sed`-extracted BYTE-EXACT into a clang++ probe whose only
+    /// additions are stand-in carriers for the fields the body reads, then swept over four `newLoops`
+    /// shapes × six clause shapes × two probe loops × six operators × three values: 864 cases, 216 of
+    /// them a `DT_ERROR` and 72 growing the disjunction, FNV-1a digest 13047670775146661399.
+    ///
+    /// ⛔ TWO MUTATED CONTROLS PIN THE READINGS THIS COULD HAVE HAD, reproduced against the probe
+    /// rather than asserted in prose. Replacing only the FIRST term on the substituted loop — which is
+    /// what the authority's own singular comment describes, "the condition that refers to the original
+    /// base loop" (`:2122-2126`) — moves 20 cases, digest 10095501199756929849. Rebuilding against
+    /// `origLoop` instead of `newLoops.at(0)` (`:2128`) moves 24, EVERY ONE of them the `nl=3` shape
+    /// where the two differ, digest 5505612850859547279 — and both live callers pass them equal
+    /// (`ddc/ddc_transformation_util.cpp:311`, `ddc/ddl/ddl_conversion.cpp:1562`), so no case the tree
+    /// can reach tells them apart.
+    #[test]
+    fn adjust_condition_for_split_loop_agrees_with_the_executed_authority() {
+        /// FNV-1a 64 over one canonical, `'\n'`-terminated line per case, same seed as the probe.
+        struct Digest {
+            hash: u64,
+            cases: u64,
+            refusals: u64,
+            grown: u64,
+        }
+
+        impl Digest {
+            fn new() -> Self {
+                Self {
+                    hash: 14_695_981_039_346_656_037,
+                    cases: 0,
+                    refusals: 0,
+                    grown: 0,
+                }
+            }
+
+            fn feed(&mut self, line: &str) {
+                for byte in line.bytes() {
+                    self.hash ^= u64::from(byte);
+                    self.hash = self.hash.wrapping_mul(1_099_511_628_211);
+                }
+                self.cases += 1;
+            }
+        }
+
+        /// The probe's `loopIdx`: each stand-in loop is one child of the root, so the first index IS
+        /// the tag, and an unresolvable path prints `-1` exactly where a null pointer did.
+        fn loop_tag(path: &NodePath) -> i64 {
+            path.indices().first().map_or(-1, |index| *index as i64)
+        }
+
+        /// The probe's `term`: the authority's two value fields spelled apart again, and dims and
+        /// operators as their own discriminants, so no name table has to agree.
+        fn canon_term(term: &LoopCond) -> String {
+            let (val_type, val_int) = match term.cond_val {
+                CondVal::Iteration(IterationIdx(index)) => (0, index),
+                CondVal::First => (1, -1),
+                CondVal::Last => (2, -1),
+            };
+            format!(
+                "l{}d{}o{}v{}i{}",
+                loop_tag(&term.loop_comp),
+                term.dim as i32,
+                term.cond_op as i32,
+                val_type,
+                val_int
+            )
+        }
+
+        fn canon(cond: &LoopCondComposite) -> String {
+            cond.or_of_ands
+                .clauses()
+                .map(|clause| clause.terms().map(canon_term).collect::<Vec<_>>().join("&"))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        let path = |index: usize| NodePath::new([index]);
+        // The probe's `newLoopsFor`. The LAST shape is the only one whose first new loop is not the
+        // original, and it is the whole of what control B cannot reproduce.
+        let new_loops: [(usize, Vec<NodePath>); 4] = [
+            (0, vec![]),
+            (0, vec![path(1)]),
+            (0, vec![path(1), path(2)]),
+            (3, vec![path(1)]),
+        ];
+        let unrelated = LoopCond {
+            loop_comp: path(2),
+            dim: PrimaryDimTypes::Out,
+            cond_op: LoopCondOp::Eq,
+            cond_val: CondVal::Iteration(IterationIdx(5)),
+        };
+        // A SECOND term on the original loop, so a clause can carry two of them: this is what makes
+        // the duplicate replacement control A misreads observable, and what lets one term's appended
+        // terms be read by the next term's rebuild.
+        let on_orig = LoopCond {
+            loop_comp: path(0),
+            dim: PrimaryDimTypes::Ij,
+            cond_op: LoopCondOp::Eq,
+            cond_val: CondVal::Last,
+        };
+        const VALUES: [CondVal; 3] = [
+            CondVal::Iteration(IterationIdx(3)),
+            CondVal::First,
+            CondVal::Last,
+        ];
+
+        let mut digest = Digest::new();
+        for (nl, (first_tag, rest)) in new_loops.iter().enumerate() {
+            for shape in 0..6 {
+                for tag in 0..2usize {
+                    for (op_index, op) in LoopCondOp::ALL.into_iter().enumerate() {
+                        for (val_index, val) in VALUES.into_iter().enumerate() {
+                            let clause = |term| LoopCondConjunction::new(term);
+                            let term = LoopCond {
+                                loop_comp: path(tag),
+                                dim: PrimaryDimTypes::In,
+                                cond_op: op,
+                                cond_val: val,
+                            };
+                            let cond: LoopCondComposite = match shape {
+                                0 => clause(term).into(),
+                                1 => clause(term).and_term(unrelated.clone()).into(),
+                                2 => clause(unrelated.clone()).and_term(term).into(),
+                                3 => LoopCondDisjunction::new(clause(term))
+                                    .or_clause(clause(unrelated.clone()))
+                                    .into(),
+                                4 => clause(on_orig.clone()).and_term(term).into(),
+                                _ => clause(term).and_term(on_orig.clone()).into(),
+                            };
+                            let before = cond.or_of_ands.clause_count();
+                            let adjusted = cond.adjust_condition_for_split_loop(
+                                &path(0),
+                                &path(*first_tag),
+                                rest,
+                            );
+                            let body = match &adjusted {
+                                None => {
+                                    digest.refusals += 1;
+                                    "THROW".to_string()
+                                }
+                                Some(cond) => {
+                                    digest.grown +=
+                                        u64::from(cond.or_of_ands.clause_count() > before);
+                                    canon(cond)
+                                }
+                            };
+                            digest.feed(&format!(
+                                "nl={nl} sh={shape} T={tag}/{op_index}/{val_index} -> {body}\n"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            (digest.cases, digest.refusals, digest.grown, digest.hash),
+            (864, 216, 72, 13_047_670_775_146_661_399),
+            "executed dsc/dsc2.cpp:2061-2141"
+        );
+    }
 }
 
 // ⛔ THE TWO BLOCKNODE AND TWO LOOPNODE TYPE ANCHORS STAY OPEN ON DesignSpaceConfig, AND NINE OF
@@ -16391,10 +16800,6 @@ mod equivalence {
 
 // crustify:todo: e038_CoordPropInfoType.refNode
 
-// crustify:todo: e039_LoopCond
-
-// crustify:todo: e039_LoopCond.loopComp_
-
 // ⛔ e041_DistributionStatusInfo IS A DEAD DECLARATION: the four anchors below stay open because
 // there is nothing to port, not because the work is pending. `DistributionStatusInfo`,
 // `DistributionStatusType`, `NEED_LOOP_SPLIT`, `loopToSplit`, `loopSplitDim` and `loopSplitDimSizes`
@@ -16439,8 +16844,6 @@ mod equivalence {
 // crustify:todo: e042_LoopDistributionInfo.dimAndKind
 
 // crustify:todo: e042_LoopDistributionInfo.loopNode
-
-// crustify:todo: e043_LoopCondComposite
 
 // ⛔ e003_AllocateNode'S TWO OPEN FIELD ANCHORS ARE e028_'S AND e037_'S: `allocUsers_`
 // (`dsc/dsc2.h:1007`) and `tempStorageForCompute_` (`:978`) are schedule-node pointer identity. The
@@ -16507,14 +16910,13 @@ mod equivalence {
 
 // crustify:todo: e034_LoopNode.rowId
 
-// crustify:todo: e030_LoopCond
-
-// crustify:todo: e030_LoopCond.loopComp_
-
 // ⛔ e022_DistributionStatusInfo IS THE THIRD SCHEDULING OF THE DEAD DECLARATION ABOVE, and the
 // census still holds at this revision: `loopToSplit`, `loopSplitDim`, `loopSplitDimSizes`,
 // `DistributionStatusType` and `NEED_LOOP_SPLIT` occur tree-wide — any file type — ONLY in
-// `dsc/dsc2.h:1129-1135`.
+// `dsc/dsc2.h:1129-1135`. ⭐ AND SO DOES THE ENUMERATOR THE EARLIER CENSUS LEFT OUT: `SUCCESS`
+// (`:1129`) occurs nowhere else in the tree except as prose in an unrelated runtime document
+// (`mock_rt/doc/senTF.md:18`, `:30`), so the type's ZERO-valued status is as dead as its other one
+// and nothing selects between them.
 //
 // ⭐ AND THAT IS WHY A TWO-FIELD STRUCT WOULD NOT CLOSE THESE FOUR ANCHORS: a ported
 // `DistributionStatusInfo` cannot meet the second condition for done — a real non-test caller —
@@ -16529,14 +16931,29 @@ mod equivalence {
 
 // crustify:todo: e022_DistributionStatusInfo.loopToSplit
 
-// ⛔ e032_LoopDistributionInfo IS THE THIRD SCHEDULING OF e042_ ABOVE, whose `loopNode` note
-// stands and whose `.break` is still not a field. What this generation adds is WHY A BORROW CANNOT
-// SERVE even though the chain is NOT itself in the tree: `VectorOfLoopAndDim` holds `LoopNode*`,
-// non-const (`dsc/dsc2.h:1142`), into the tree that the chain's own subject lives in — and the
-// fold reads the chain at `ddc/ddc_fold.cpp:2308` while mutating
-// `allocNode->allocateCoordinates_` at `:2268` and `:2328`, a node those same loops enclose (the
-// chain is built from it at `:2254-2256`). That is two `&mut` into one owned tree, Rule 4's case,
-// not a lifetime to be annotated harder.
+// ⛔ e032_LoopDistributionInfo IS THE THIRD SCHEDULING OF e042_ ABOVE, whose `loopNode` note stands
+// and whose `.break` is still not a field. ⛔ BUT THIS GENERATION'S OWN ADDITION IS FALSE, and it is
+// the reading a reviewer reaches for first: it read `VectorOfLoopAndDim` as holding `LoopNode*`
+// "into the tree that the chain's own subject lives in", which would make the field this campaign's
+// landed `NodePath` — the answer `ScheduleNode::prev_`, `SyncNode`'s two cross-node fields and
+// `LoopCond::loopComp_` all now carry. IT IS NOT.
+// `L3DlOpsScheduler::sliceCoordinateForCorelet` (`dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:7518`)
+// builds its chain around a loop WITH NO HOME IN ANY TREE: `constructLoopNode` returns a bare `new
+// dsc2::LoopNode` (`:7737-7755`, called at `:7574-7575`), `:7586-7588` pushes it into `relatedLoops`
+// while it is still unparented, `:7635-7636` splices it in only "temporarily" by the comment's own
+// word, and `:7668-7670` moves the subject back out and then `deleteChildNode`s it — which FREES it,
+// because a child list owns `unique_ptr` and the destructive default runs `next_.erase`
+// (`dsc/dsc2.cpp:2188-2207`) over the pointer `addChildNode` adopted (`:2027`).
+//
+// ⛔ AND THE CHAIN IS READ AFTER THAT DELETE: `:7679-7695` walks `relatedLoops` in reverse, skips the
+// freed entry by comparing `currLoop == newLoop` and never dereferencing it (`:7681-7683`), then
+// dereferences `numId_`/`denId_` and keys `loopParamsAfterDistribution.at(currLoop)` on every OTHER
+// entry (`:7685-7692`). So the field has to express a node minted outside the tree, briefly inside
+// it, then destroyed and still compared — which is not a path into the owning tree, and not an index
+// either. The fold's chain is the in-tree one, and it refuses a reference for the DIFFERENT reason
+// the earlier note gave for all of them: it is read at `ddc/ddc_fold.cpp:2308` while
+// `allocNode->allocateCoordinates_` is mutated at `:2268` and `:2328`, the node the chain is built
+// from at `:2254-2256`. Two writers, two reasons, and neither is a lifetime to annotate harder.
 //
 // ⛔ AND `nullptr` IS A VALUE HERE, NOT AN ABSENCE: `distributeElemArrToTemporalLoops` keys
 // `loopParamsAfterDistribution` on a NULL loop for every CORELET_SLICE entry
@@ -16556,16 +16973,15 @@ mod equivalence {
 
 // crustify:todo: e032_LoopDistributionInfo.loopNode
 
-// crustify:todo: e031_LoopCondComposite
-//
-// ⛔ e031 IS e022 AND e043 — ONE `LoopCondComposite` (`dsc/dsc2.h:675-683`), THREE GENERATIONS OF
-// ENTITY ID. Its two field anchors are FILLED at the type above; the TYPE anchor stays open for all
-// three because `adjustConditionForSplitLoop` (`dsc/dsc2.cpp:2061-2141`) is the struct's only
-// method and its four `loopComp_` touches ARE its whole body: the `!= origLoop` filter that decides
-// which terms it rewrites (`:2071`), the substitution (`:2076`), the per-new-loop rewrite (`:2108`)
-// and the `!= newLoops.at(0)` clause rebuild (`:2128`). So it wants the field [`LoopCond`] still
-// carries as open (`e018_`/`e030_`/`e039_LoopCond.loopComp_`) — a PARALLEL entity, not this one.
+// ⭐ e031 IS e022 AND e043 — ONE `LoopCondComposite` (`dsc/dsc2.h:675-683`), THREE GENERATIONS OF
+// ENTITY ID, AND ALL THREE ARE NOW CLOSED, type anchors included: the two field anchors were already
+// filled at the type above, and `adjustConditionForSplitLoop` (`dsc/dsc2.cpp:2061-2141`) — the
+// struct's only method — landed with this changeset, because the field it wanted did. Its four
+// `loopComp_` touches ARE its whole body: the `!= origLoop` filter that decides which terms it
+// rewrites (`:2071`), the substitution (`:2076`), the per-new-loop rewrite (`:2108`) and the
+// `!= newLoops.at(0)` clause rebuild (`:2128`) — and that last one is the one no live caller can
+// see, since both pass the two loops equal (`ddc/ddc_transformation_util.cpp:311`,
+// `ddc/ddl/ddl_conversion.cpp:1562`), so only the compiled oracle's third sweep arm separates them.
 //
 // ⚠️ AND `e031` NAMES A SECOND, UNRELATED TYPE IN THIS FILE: `Field: e031_LoopNode.numId_` is an
 // EARLIER generation's e031, so grep an entity id WITH its type name and never alone.
-

@@ -890,7 +890,7 @@ mod unit_tests {
     }
 
     use crate::schedule::dsc::NumCoreletsUsed;
-    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction};
+    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction, NodePath};
 
     /// A conversion over a DSC and metadata that have not been filled — every test below states the
     /// fields its own arm reads.
@@ -905,6 +905,7 @@ mod unit_tests {
     /// One condition term, for the loop-composition tests below.
     fn term(dim: PrimaryDimTypes) -> LoopCond {
         LoopCond {
+            loop_comp: NodePath::new([0]),
             dim,
             cond_op: LoopCondOp::Eq,
             cond_val: CondVal::Last,
@@ -1282,7 +1283,7 @@ mod unit_tests {
 #[cfg(test)]
 mod equivalence {
     use super::*;
-    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction, LoopCondDisjunction};
+    use crate::schedule::dsc2::{LoopCond, LoopCondConjunction, LoopCondDisjunction, NodePath};
 
     /// e018 `:345-442` — every `ConditionAndOp` and `ConditionOrOp` over one, two or three operands
     /// drawn from the nine shapes `processCondition` can return, against a compiled oracle whose body
@@ -1305,6 +1306,7 @@ mod equivalence {
 
         let clause = |dim| {
             LoopCondConjunction::new(LoopCond {
+                loop_comp: NodePath::new([0]),
                 dim,
                 cond_op: LoopCondOp::Eq,
                 cond_val: CondVal::Last,
