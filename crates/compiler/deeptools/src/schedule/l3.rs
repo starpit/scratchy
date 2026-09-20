@@ -1756,37 +1756,19 @@ impl L3DlOpsScheduler {
     }
 }
 
-/// `.cpp:6596-6604`, `isPagedLds` (`:433`) — whether one labeled data structure is the PAGED VALUE
-/// tensor of an indirect access, which is what `getAllPagedLdsIndices` filters a DSC's tensors with
-/// (`.cpp:6735`) and what `addOnePageDataStage` then reads a page size out of (`.cpp:6686-6697`). Its
-/// sibling `isIndexLds` asks the same question of the ADDRESSES (`.cpp:6582-6594`) and belongs to
-/// another group.
-///
-/// ⛔ THE PARAMETER IS THE HBM ALLOCATION, NOT THE `LabeledDsInfo`, BECAUSE THE LINK BETWEEN THEM IS
-/// A POINTER THIS CRATE DOES NOT CARRY: `lds.memOrg_.at(HBM).allocateNode_` is a
-/// `dsc2::AllocateNode*` (`dsc/dscdefn.h:313`) inside the `MemOrg` map `LabeledDsInfo::memOrg_`
-/// (`dsc/dscdefn.h:337`), and the schedule tree owns its nodes as
-/// [`ChildNode`](crate::schedule::dsc2::ChildNode)s, so no type outside the tree holds a node's
-/// address. Same technique and the same reason as [`AllocateNode::page_size`], which takes
-/// `relatedIndirectAccessAlloc_` as an argument.
-///
-/// ⭐ SO BOTH OF THE AUTHORITY'S ABSENCES COLLAPSE INTO ONE [`None`], AND NEITHER LOSES ANYTHING: no
-/// `HBM` key in `memOrg_` (`.cpp:6597`) and a null `allocateNode_` under one (`.cpp:6599`) reach the
-/// same `return false` (`.cpp:6603`).
-///
-/// ⛔ AND `component_` IS TESTED HERE WHERE THE AUTHORITY TESTS THE MAP KEY, BECAUSE THEY ARE ONE
-/// FACT AND THE TEST IS LOAD-BEARING. `createAllocateNode` writes `component_` from the storage it is
-/// asked for (`.cpp:550`) and its caller files the node under that same storage (`.cpp:6958-6964`
-/// with `.cpp:6975`), so the key and the field agree; and the collector that gathers these very nodes
-/// off the schedule tree spells the predicate over the node alone instead —
-/// `indirectAllocType_ == VALUE_TENSOR && component_ == HBM` (`.cpp:6786-6789`). ⛔ WITHOUT IT AN LX
-/// ALLOCATION COULD ANSWER TRUE: `.cpp:6965-6966` copies an HBM allocation's `indirectAllocType_`
-/// onto an LX one for the same tensor, so a non-`NO_INDIRECTION` type is not HBM's alone.
+/// ⛔ THE PARAMETER IS THE HBM ALLOCATION, NOT THE `LabeledDsInfo`: the link between them is a raw
+/// `dsc2::AllocateNode*` (`lds.memOrg_.at(HBM).allocateNode_`, `dsc/dscdefn.h:313`) and the tree
+/// owns its nodes as [`ChildNode`](crate::schedule::dsc2::ChildNode)s — same technique and reason
+/// as [`AllocateNode::page_size`]. ⭐ SO BOTH OF THE AUTHORITY'S ABSENCES COLLAPSE INTO ONE
+/// [`None`]: no `HBM` key (`.cpp:6597`) and a null `allocateNode_` under one (`.cpp:6599`) reach
+/// the same `return false` (`.cpp:6603`).
 impl L3DlOpsScheduler {
     /// Replaces: e029g5_L3DlOpsScheduler_paged.isPagedLds
     ///
-    /// `.cpp:6596-6604`. Whether this is the paged VALUE tensor of an indirect access — the data, not
-    /// the addresses into it. The block above has the parameter and both absences.
+    /// `.cpp:6596-6604`. The paged VALUE tensor of an indirect access — the data, not the addresses
+    /// into it (`isIndexLds` asks that, `:6582-6594`, and matches no scheduled group's prefix).
+    /// ⭐ `component_` STANDS IN FOR THE AUTHORITY'S MAP KEY, and is its own spelling of this
+    /// predicate over a node alone (`.cpp:6786-6789`): every writer files under the key it names.
     pub fn is_paged_lds(hbm_allocate: Option<&AllocateNode>) -> bool {
         hbm_allocate.is_some_and(|allocate| {
             allocate.indirect_alloc_type == IndirectAllocType::ValueTensor
@@ -3072,10 +3054,12 @@ mod equivalence {
         );
     }
 
-    /// `.cpp:6596-6604`. The VALUE half of an indirect access is paged; the index half beside it is
-    /// not, a direct allocation is not, the LX allocation that inherits the very same
-    /// `indirectAllocType_` (`.cpp:6965-6966`) is not, and an absent HBM allocation — IBM's missing
-    /// `memOrg_` key and its null `allocateNode_` alike — is not.
+    /// `.cpp:6596-6604` against a compiled oracle over the authority's own body (`clang++ -std=c++17`,
+    /// rev `a0d29abbed`, 17 rows, FNV-1a `9915735270273910359`, which a `VALUE_TENSOR`→`INDEX_TENSOR`
+    /// mutation of that body moves). The VALUE half of an indirect access is paged, the index half is
+    /// not, a direct allocation is not, and an absent HBM allocation — IBM's missing `memOrg_` key and
+    /// its null `allocateNode_` alike — is not. ⛔ THE ORACLE'S 4 DIVERGENCES ARE UNREACHABLE: every
+    /// writer of `indirectAllocType_` files under the key `component_` names (`dsc/dsc2.cpp:1831-1834`).
     #[test]
     fn only_a_value_tensor_allocation_in_hbm_is_a_paged_lds() {
         let allocate = |indirect: IndirectAllocType, component: SenComponent| AllocateNode {
@@ -3084,28 +3068,29 @@ mod equivalence {
             ..AllocateNode::default()
         };
 
-        assert!(L3DlOpsScheduler::is_paged_lds(Some(&allocate(
-            IndirectAllocType::ValueTensor,
-            SenComponent::Hbm
-        ))));
-
-        for indirect in [
-            IndirectAllocType::NoIndirection,
-            IndirectAllocType::IndexTensor,
+        for component in [
+            SenComponent::Hbm,
+            SenComponent::Lx,
+            SenComponent::L3luibr,
+            SenComponent::L3suibr,
         ] {
-            assert!(
-                !L3DlOpsScheduler::is_paged_lds(Some(&allocate(indirect, SenComponent::Hbm))),
-                "{indirect:?} is not the paged value tensor (`.cpp:6600`)"
-            );
-        }
-
-        assert!(
-            !L3DlOpsScheduler::is_paged_lds(Some(&allocate(
+            for indirect in [
+                IndirectAllocType::NoIndirection,
+                // What `.cpp:6965-6966` copies onto an LX node, rejected by the FIRST conjunct.
+                IndirectAllocType::IndexTensor,
                 IndirectAllocType::ValueTensor,
-                SenComponent::Lx
-            ))),
-            "an LX node carries the same indirectAllocType_ (`.cpp:6965`)"
-        );
+            ] {
+                // The authority reads the type alone (`.cpp:6599-6600`); the narrowing is the
+                // component, which is the HBM map key the node was reached through.
+                let authority = indirect == IndirectAllocType::ValueTensor;
+                let narrowed = authority && component == SenComponent::Hbm;
+                assert_eq!(
+                    L3DlOpsScheduler::is_paged_lds(Some(&allocate(indirect, component))),
+                    narrowed,
+                    "{indirect:?} under the HBM key with component_ {component:?}"
+                );
+            }
+        }
 
         assert!(
             !L3DlOpsScheduler::is_paged_lds(None),
@@ -4269,6 +4254,31 @@ mod equivalence {
 // crustify:todo: e029g4_L3DlOpsScheduler_stages.setChunkDataStageParams
 
 // crustify:todo: e029g4_L3DlOpsScheduler_stages.setSuperChunkDataStageParams
+
+// ⛔ e029g5 IS BLOCKED, BUT NOT ON EITHER REASON ON RECORD. `SuperDsc&` is not one: all five bodies
+// touch exactly ONE of its members, `dscs_`, and `prepDsc` landed above on that very reading
+// (`.cpp:6411-6423`). Nor is collecting nodes off a walk to mutate after it: that is `NodePath`, an
+// owned `Vec<usize>` that creates no second borrow, which `ScheduleTree::insert_child` repairs
+// across every insertion and which this campaign has already landed for three other cross-node
+// pointers.
+// ⛔ WHAT BLOCKS THEM IS STATE THIS CRATE'S `DesignSpaceConfig` DOES NOT CARRY, all of it open
+// elsewhere — `e020_DesignSpaceConfig.scheduleTree_` and `.labeledDs_`:
+//   * `processDscHbmPagedTensors` reads `scheduleTree_` (`.cpp:6756`, `:6761`) and `labeledDs_`
+//     through `getPagedDimensions` (`:6751`, body `:6712`);
+//   * `processHbmPagedTensors` is its two-line caller (`:6741-6743`), blocked only through it;
+//   * `optimizeHbmLdsOutputInScheduleTree` reads both (`:4020`, `:4034`, `:4079`; `:4026`);
+//   * `optimizeHbmTransfers` reads both (`:4119`, `:4129`; `:4138`) plus `isOpCrossCoreReduction`,
+//     e029g2's own open anchor;
+//   * `processPagedTensorTransfers` takes its nodes as parameters and reads `labeledDs_` (`:6884`,
+//     `:6890`) and `relatedIndirectAccessAlloc_` (`:6886`), e003_AllocateNode's uncarried member.
+// ⛔ AND `scheduleTree_` IS NOT THIS BATCH'S FIELD TO INSTALL: `DesignSpaceConfig` derives `Clone`
+// and `ScheduleTree` deliberately derives nothing, because the authority's own copy aborts —
+// `DT_ERROR("Not yet able to deep copy a schedule tree")` (`dsc/dsc2.cpp:2285-2287`). Carrying the
+// field is e020's work and it changes every holder.
+// ⭐ SEVEN UNSCHEDULED CALLEES GO WITH THEM, matching no group's prefix in `UNITS.tsv`:
+// `getPagedDimensions`, `getAllPagedLdsIndices`, `createPagedDimChunkLoops`,
+// `createStoreIndexTensorToLx`, `createStoreIndexTensorToIbr`, `convertTransferDirectToIndirect`
+// and `getParentLoopNodes`.
 
 // crustify:todo: e029g5_L3DlOpsScheduler_paged
 

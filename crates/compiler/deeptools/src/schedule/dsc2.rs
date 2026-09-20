@@ -3946,9 +3946,9 @@ mod unit_tests {
 
     /// `deleteChildNode(ownerDsc, node, /*nonDestructive*/ true)` is `childIt->release()` before the
     /// erase (`dsc/dsc2.cpp:2202-2206`) — take the node out and hand it to the caller, which is the
-    /// arm `moveChildNode` uses (`:2038`). The DESTRUCTIVE arm is blocked on
-    /// `DesignSpaceConfig::cleanupAllocation` and stays off this type, and it is the arm that cleans
-    /// up BEFORE it discovers the node is not a child at all (`:2189` against `:2191-2199`).
+    /// arm `moveChildNode` uses (`:2038`). The DESTRUCTIVE arm stays off this type for a `COMPUTE` or
+    /// `TRANSFER` node, the two kinds `cleanupAllocation` dispatches on (`:2568-2584`), and it is the
+    /// arm that cleans up BEFORE it discovers the node is not a child at all (`:2189` vs `:2191-2199`).
     #[test]
     fn taking_a_child_out_hands_it_over_and_an_index_past_the_end_is_refused() {
         let mut block = BlockNode::default();
@@ -6692,8 +6692,8 @@ impl NodePath {
 ///
 /// ⛔ ONE OF THIS CLASS'S SIX METHODS IS BLOCKED ON THE UNPORTED `DesignSpaceConfig`, which is why the
 /// TODO anchors for this type at the end of this file stay open. `deleteChildNode`'s DESTRUCTIVE arm
-/// calls `ownerDsc->cleanupAllocation(nodeToDelete)` (`dsc/dsc2.cpp:2188-2190`) and
-/// `DesignSpaceConfig::cleanupAllocation` (`dsc/designSpaceConfig.h:262`) is unported. ⭐ THE OTHER
+/// calls `cleanupAllocation` (`dsc/dsc2.cpp:2188-2190`), unported and dispatching on `COMPUTE` and
+/// `TRANSFER` alone (`:2568-2584`), so only those two kinds are blocked. ⭐ THE OTHER
 /// HALF IS HERE: `nonDestructive` is `childIt->release()` before the erase (`:2202-2206`), i.e. "take
 /// the node out and hand it to the caller", which is [`Self::take_child_node`] — and it is the arm
 /// `moveChildNode` uses (`:2038`), so `moveChildNode` never reaches that cleanup and is NOT blocked on
@@ -6899,9 +6899,12 @@ impl BlockNode {
     /// what lets a move be spelled as a take plus an [`Self::add_child_node`] — two operations on
     /// two objects, where the authority's one takes the destination parent as a third pointer.
     ///
-    /// ⛔ THE DESTRUCTIVE ARM IS NOT HERE: it needs `DesignSpaceConfig::cleanupAllocation`
-    /// (`dsc/designSpaceConfig.h:262`), which is unported, and dropping the returned node is not the
-    /// same thing — that cleanup unregisters the allocation from the DSC.
+    /// ⛔ THE DESTRUCTIVE ARM IS MISSING FOR TWO NODE KINDS ONLY: `cleanupAllocation` dispatches on
+    /// `COMPUTE` and `TRANSFER` alone (`dsc/dsc2.cpp:2568-2584`), so for any other kind — and for a
+    /// block with no such descendant, whose `traverseTreeDFSMutable` filter comes back empty — the
+    /// destructive delete IS this take plus a drop. For those two it is not, because the cleanup
+    /// unregisters the allocation from the DSC and `DesignSpaceConfig::cleanupAllocation`
+    /// (`dsc/designSpaceConfig.h:262`) is unported.
     #[must_use = "the node is removed from the tree and is lost if dropped"]
     pub fn take_child_node(&mut self, child: usize) -> Option<ChildNode> {
         (child < self.next.len()).then(|| self.next.remove(child))
@@ -16712,7 +16715,9 @@ mod equivalence {
 // unreachable:
 //  * `BlockNode::deleteChildNode`'s DESTRUCTIVE arm calls `ownerDsc->cleanupAllocation(nodeToDelete)`
 //    (`dsc/dsc2.cpp:2188-2190`) and `DesignSpaceConfig::cleanupAllocation`
-//    (`dsc/designSpaceConfig.h:262`) is unported. The NON-destructive arm is
+//    (`dsc/designSpaceConfig.h:262`) is unported — for a `COMPUTE` or `TRANSFER` node only, the two
+//    kinds that cleanup dispatches on (`:2568-2584`); for every other kind it is a provable no-op, so
+//    the destructive delete is a take plus a drop. The NON-destructive arm is
 //    [`BlockNode::take_child_node`] and has landed. ⛔ `moveChildNode` IS NOT BLOCKED ON THAT — it
 //    deletes NONDESTRUCTIVELY (`:2038`), the arm that SKIPS the cleanup. What it waits on is its own
 //    order, `addChildNode` before a delete matching the first child of equal address (`:2036-2038`,
