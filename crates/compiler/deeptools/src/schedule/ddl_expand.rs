@@ -232,15 +232,11 @@ impl OperationProp {
 /// One resolved DDL condition — `DdlInterface::CondProp` (`ddc/ddl/ddl_conversion.h:419-424`), as
 /// the three states its four fields spell on the way OUT of `processCondition`.
 ///
-/// ⛔ THE FOURTH STATE IS REAL, AND IT IS TRANSIENT. "None of the three" — unresolved, no loop, no
-/// core — is what the AND arm's `erase` leaves behind (`ddc/ddl/ddl_conversion.cpp:419`, `:424`),
-/// and the tail that normalises it into `resolvedValue_ = false` runs ONCE, after the operand loop
-/// closes (`:438-441` against `:433`). So it is spelled here as an EMPTY [`Self::CoreCl`], it lives
-/// only inside [`DdlConversion::and_conditions`]'s fold, and [`Self::core_cl`] is that tail.
-/// ⭐ WHAT IS NOT A STATE IS A MIX of [`Self::Loop`] and [`Self::CoreCl`], which the same arm
-/// refuses twice (`:371-372`, `:407-408`). ⭐ `resolvedValue_` HAS NO INITIALISER — only
-/// `isResolvedToBool_` does (`h:420`) — and is read only under it, so [`Self::Resolved`] is the pair
-/// and the undefined read is gone.
+/// ⛔ THE FOURTH STATE IS REAL AND TRANSIENT — unresolved, no loop, no cores: the AND arm's `erase`
+/// mints it (`ddc/ddl/ddl_conversion.cpp:419`, `:424`) and the tail resolving it to `false` runs once
+/// OUTSIDE the operand loop (`:438-441` against `:433`), so it is an empty [`Self::CoreCl`] confined
+/// to the fold below; the `DT_ERROR` is a MIX of [`Self::Loop`] and [`Self::CoreCl`] (`:371-372`,
+/// `:407-408`). ⭐ `resolvedValue_` has no initialiser and is read only under `isResolvedToBool_`.
 ///
 /// ⛔ NO `negate`: the `condNot` complement of [`Self::CoreCl`] needs `coreIdsUsed_` and
 /// `numCoreletsUsed_DSC2_` off the DSC (`ddc/ddl/ddl_conversion.cpp:328-341`), so it is
@@ -260,10 +256,8 @@ pub enum CondProp {
 }
 
 impl CondProp {
-    /// The core/corelet state with `processCondition`'s tail normalisation applied: an empty map is
-    /// `resolvedValue_ = false` (`ddc/ddl/ddl_conversion.cpp:438-441`). ⛔ THAT TAIL IS REACHED ONCE
-    /// PER `processCondition`, so this is a constructor for a FINISHED condition and never a step of
-    /// one — see [`DdlConversion::compose_conditions`].
+    /// The core/corelet state with `processCondition`'s tail applied ONCE — a FINISHED condition, not
+    /// a fold step: an empty map is `resolvedValue_ = false` (`ddc/ddl/ddl_conversion.cpp:438-441`).
     pub fn core_cl(cores: BTreeMap<CoreId, BTreeSet<CoreletId>>) -> Self {
         if cores.is_empty() {
             Self::Resolved(false)
@@ -538,14 +532,11 @@ impl DdlConversion {
 
     /// The `isAnd` fold both of the above are (`ddc/ddl/ddl_conversion.cpp:343-434`).
     ///
-    /// ⭐ A RESOLVED OPERAND IS THE JUNCTION'S IDENTITY OR ITS ANNIHILATOR and nothing else: the
-    /// annihilator returns straight out (`:346-360`) and the identity is dropped, whether it arrived
-    /// first (`:373-376`, `:409-412`) or later, where IBM's merge block simply finds nothing to do.
-    /// ⛔ AND BOTH REPLACEMENTS ARE GUARDED BY `if (myCp.isResolvedToBool_)` (`:374`, `:410`), WHICH
-    /// AN ACCUMULATOR THE AND ARM HAS EMPTIED IS NOT: it keeps absorbing operands as the empty set,
-    /// and only the tail at `:438-441` — OUTSIDE the operand loop, which closes at `:433` — makes it
-    /// `false`. So the accumulator holds an empty [`CondProp::CoreCl`] and [`CondProp::core_cl`] is
-    /// applied to the RESULT, once.
+    /// ⭐ A RESOLVED OPERAND IS THE IDENTITY OR THE ANNIHILATOR: the annihilator returns straight out
+    /// (`:346-360`), the identity is dropped, first (`:373-376`, `:409-412`) or later. ⛔ BUT BOTH
+    /// REPLACEMENTS ARE GUARDED BY `if (myCp.isResolvedToBool_)` (`:374`, `:410`), WHICH AN EMPTIED
+    /// ACCUMULATOR IS NOT: it absorbs the rest as the empty set, and only the tail at `:438-441` —
+    /// outside the loop closing at `:433` — resolves it, so [`CondProp::core_cl`] runs on the RESULT.
     fn compose_conditions(
         is_and: bool,
         operands: impl IntoIterator<Item = CondProp>,
@@ -607,12 +598,9 @@ impl DdlConversion {
     /// The core/corelet half (`ddc/ddl/ddl_conversion.cpp:413-430`): AND intersects per core and
     /// drops a core the operand omits or empties, OR unions.
     ///
-    /// ⛔ IBM'S AND ARM IS UNDEFINED BEHAVIOUR — it `erase`s the current element of the `std::map`
-    /// it is ranging over (`:419`, `:424`) and then increments that iterator (`:416`). `retain` is
-    /// the well-defined reading of what it means, and `mod equivalence` MEASURES the fault: the same
-    /// sweep run without its filter aborts under AddressSanitizer with a heap-use-after-free read at
-    /// `:416` of storage freed at `:419`, and over a core-shape table that disagrees 352 of 3,768
-    /// operand sequences reach it — so those have NO authority answer to port.
+    /// ⛔ IBM'S AND ARM IS UNDEFINED BEHAVIOUR — it `erase`s the element it is ranging over (`:419`,
+    /// `:424`) then increments that iterator (`:416`), which `mod equivalence` MEASURES under
+    /// AddressSanitizer. `retain` is the well-defined reading; 352 of 3,768 sequences have no answer.
     fn compose_core_cl_conditions(
         is_and: bool,
         mut earlier: BTreeMap<CoreId, BTreeSet<CoreletId>>,
