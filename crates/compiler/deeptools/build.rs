@@ -20,6 +20,15 @@ mod selection;
 #[path = "ddl/smc.rs"]
 #[allow(dead_code)]
 mod smc;
+// ⭐⭐ THE DATAFLOWIR VOCABULARY IS TABLEGEN DATA, NOT A PORT. Bridge 1's five lowering units are all
+// MLIR construction — `OpBuilder` into a `ModuleOp` — and every one reported BLOCKED because this
+// crate had no `Value`, no `Operation`, no op and no `Type` since `islands/dataflow_ir/` went in the
+// nuke. I was about to price a hand-port of 1,529 lines of `.td` across three dialects; the vendored
+// `td/` and this parser already existed on `worktree-dsl-driven-dfir` and were never carried forward.
+// Same shape as the `.ddl` templates: the `.td` IS the data, `td.rs` reads it, `build.rs` emits it.
+#[path = "src/td.rs"]
+#[allow(dead_code)]
+mod td;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -411,9 +420,48 @@ fn main() {
          {arm_inside_loop} arms sit inside a loop"
     );
 
-    let dest =
-        Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).join("generated.rs");
+    let out_dir = Path::new(&std::env::var("OUT_DIR").expect("cargo sets OUT_DIR")).to_path_buf();
+    let dest = out_dir.join("generated.rs");
     std::fs::write(&dest, out).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+
+    // ⭐⭐ THE DATAFLOWIR OP VOCABULARY, FROM THE VENDORED `.td`. Bridge 1's five lowering units all
+    // build MLIR through an `OpBuilder` and every one reported BLOCKED on RULE 2 — this crate had no
+    // op, no `Type`, no `Value` after `islands/dataflow_ir/` went in the nuke. ⛔ THAT IS NOT A PORT:
+    // the `.td` is DATA exactly as the `.ddl` templates are, and `td.rs` (vendored here from
+    // `worktree-dsl-driven-dfir`, where it had sat unused by this line for ten days) parses it. I was
+    // pricing a hand-port of 1,529 `.td` lines across Dataflow/Uniform/VectorChain when the parser
+    // already existed.
+    println!("cargo:rerun-if-changed=td");
+    let mut spec = td::TdSpec::default();
+    let mut tds: Vec<_> = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("td"))
+        .expect("read td/")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "td"))
+        .collect();
+    tds.sort();
+    for f in &tds {
+        println!("cargo:rerun-if-changed={}", f.display());
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read td/{name}: {e}"));
+        td::parse_td(&mut spec, &name, &text);
+    }
+    // ⛔ AN UNPARSED `.td` MAKES THE VOCABULARY A LIE — `parse_td` implements an ODS subset and
+    // records what it skips (`multiclass`, `foreach`, `!cast<`). A file using one declares ops that
+    // never reach the table, so a lowering emitting that op is refused for the wrong reason. Surfaced
+    // here, where it is knowable, rather than as a wrong RULE 2 refusal in an agent's report.
+    for u in &spec.unsupported {
+        println!("cargo:warning=td: UNSUPPORTED TableGen, ops from it are missing: {u}");
+    }
+    println!(
+        "cargo:warning=td: {} ops from {} files, {} unsupported constructs",
+        spec.ops.len(),
+        tds.len(),
+        spec.unsupported.len()
+    );
+    let td_dest = out_dir.join("td_generated.rs");
+    std::fs::write(&td_dest, td::emit(&spec))
+        .unwrap_or_else(|e| panic!("write {}: {e}", td_dest.display()));
 }
 
 fn collect_mnemonics(ops: &[ast::Operation], into: &mut BTreeSet<String>) {
@@ -3136,7 +3184,7 @@ fn constraint_forms(op: &ast::Operation) -> Vec<String> {
     if let Some(cores) = attr_int(op, "min_num_cores") {
         forms.push(format!(
             "crate::schedule::ddl::conversion::DdlConstraint::MinNumCores(\
-             crate::schedule::l3::dsc::CoreCount({cores}))"
+             crate::schedule::ddl::conversion::CoreCount({cores}))"
         ));
     }
     let (min, max) = (attr_int(op, "min_num_valid"), attr_int(op, "max_num_valid"));
@@ -3207,7 +3255,7 @@ fn constraint_forms(op: &ast::Operation) -> Vec<String> {
                 forms.push(format!(
                     "crate::schedule::ddl::conversion::DdlConstraint::DimSize {{ \
                      cmp: crate::schedule::ddl::conversion::ConstraintCmp::{spelled}, \
-                     value: crate::bridges::superdsc_to_dataflow_ir::shape_constraints::Extent({value}) }}"
+                     value: crate::schedule::ddl::conversion::Extent({value}) }}"
                 ));
             }
         }
