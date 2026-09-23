@@ -3626,7 +3626,6 @@ dependencies = [
  "cudaforge",
  "dirs 7.0.0",
  "minijinja",
- "scratchy-models",
 ]
 
 [[package]]

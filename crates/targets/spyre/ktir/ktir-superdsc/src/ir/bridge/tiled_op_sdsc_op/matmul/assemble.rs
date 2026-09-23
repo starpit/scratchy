@@ -555,6 +555,95 @@ pub fn assemble_matmul_off_phys_m_maybe_epilogue<
     )
 }
 
+/// ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD LEG — [`assemble_matmul_off_phys_m_maybe_epilogue`] with the REQUESTS
+/// on the `x` axis, so one op serves the whole batch. See
+/// [`super::opspec::matmul_opspec_fold_requests`] for the walks and the two refusals.
+///
+/// Every argument but `requests` means what it means in the per-request sibling, and the OFFSETS are
+/// request 0's — the axis reaches the rest, which is the entire difference.
+///
+/// ⛔ `requests: None` BUILDS THE PER-REQUEST OP BYTE FOR BYTE, through the same
+/// [`super::opspec::matmul_opspec_off_operands_phys`] door with the same `phys_mb`. That is not a
+/// convenience: at ONE request there is nothing to collapse and a size-1 `x` would be a PHANTOM dim —
+/// the class `matmul_dims` records as breaking dxp's contraction inference — so the solo-decode bundle
+/// that runs at 41 tok/s must come out of this call unchanged, and it can only be unchanged if it is
+/// the same builder with the same arguments rather than a second spelling of it.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_matmul_fold_requests_maybe_epilogue<
+    O: crate::sdsc_abstract::KindTag,
+    E: crate::sdsc_abstract::KindTag,
+>(
+    op_name: &str,
+    m: MatM,
+    n: MatN,
+    k: MatK,
+    batch: MatY,
+    requests: Option<crate::sdsc_abstract::FoldRequests>,
+    form: SharedKernelBmmForm,
+    a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
+    a_place: OperandPlacement,
+    w: &Stk<crate::sdsc_abstract::KernelTag>,
+    w_off: crate::addr::DevOff,
+    o: &Stk<O>,
+    o_off: crate::addr::DevOff,
+    epi: Option<(&Stk<E>, crate::addr::DevOff)>,
+    epi_op_func: crate::superdsc_opspec::EpilogueOpFunc,
+    broadcast_dims: &[(&str, crate::superdsc_opspec::Scale)],
+    broadcast_batch: bool,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let (a_off_raw, w_off_raw, o_off_raw) = (
+        a_place.off().into_raw_elems(),
+        w_off.into_raw_elems(),
+        o_off.into_raw_elems(),
+    );
+    let (a_name, w_name, o_name) = (a.name(), w.name(), o.name());
+    let op = match requests {
+        Some(x) => super::opspec::matmul_opspec_fold_requests::<Fp16>(
+            m,
+            n,
+            k,
+            batch,
+            x,
+            form,
+            a_name,
+            w_name,
+            o_name,
+            a_off_raw,
+            w_off_raw,
+            o_off_raw,
+            <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
+        ),
+        None => super::opspec::matmul_opspec_off_operands_phys::<Fp16>(
+            m,
+            n,
+            k,
+            batch,
+            form,
+            a_name,
+            w_name,
+            o_name,
+            a_off_raw,
+            w_off_raw,
+            o_off_raw,
+            <Fp16 as crate::superdsc_opspec::DataFormat>::DF,
+            Some(a_place.head_pitch()),
+        ),
+    }
+    .unwrap_or_else(|e| panic!("assemble_matmul {op_name}: {e}"));
+    assemble_from_opspec_maybe_epilogue(
+        op_name,
+        op,
+        epi,
+        epi_op_func,
+        broadcast_dims,
+        broadcast_batch,
+        sym_id_base,
+        layout,
+    )
+}
+
 /// [`assemble_matmul_off`] with a fused pointwise epilogue — see [`assemble_from_opspec_with_epilogue`].
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_matmul_off_with_epilogue<

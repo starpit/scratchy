@@ -56,9 +56,9 @@
 //! broadcast), lining up 1:1 with the worker's pre-tiled rows. Not yet verified on real hardware.
 
 use super::matmul::{
-    SharedKernelBmmForm, assemble_matmul_off_maybe_epilogue,
-    assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
-    assemble_matmul_off_with_epilogue,
+    SharedKernelBmmForm, assemble_matmul_fold_requests_maybe_epilogue,
+    assemble_matmul_off_maybe_epilogue, assemble_matmul_off_phys_m_maybe_epilogue,
+    assemble_matmul_off_phys_m_with_epilogue, assemble_matmul_off_with_epilogue,
 };
 use super::reduce::assemble_reduce_off;
 use crate::addr::{Head, Idx, Nest};
@@ -273,6 +273,24 @@ impl BlockNests {
     fn at_request(&self, r: u32) -> BlockNests {
         BlockNests { req: r, ..*self }
     }
+    /// ⭐⭐⭐⭐⭐ THE REQUEST STEP OF ONE OF THIS BLOCK'S BUFFERS — **DIFFERENCED OUT OF THE LAW THAT
+    /// PLACES IT**, which is what the collapsed fold's `x` axis is checked against.
+    ///
+    /// `place` is asked twice, at request 0 and request 1, through [`Self::at_request`] — the same door
+    /// the per-request legs reach their own offsets by. So the quantity handed to
+    /// [`crate::sdsc_abstract::FoldRequests`] is the row law's own answer and not a stick width written
+    /// at a call site: if a buffer's request were ever anything but the row law's MINOR coordinate, the
+    /// step would not be one row and the builder would refuse the op by name.
+    ///
+    /// `None` when request 1 is placed BEFORE request 0 — no law here does that, and one that did could
+    /// not carry an `x` axis at all.
+    fn request_step(&self, place: impl Fn(&BlockNests) -> crate::addr::DevOff) -> Option<u32> {
+        let (first, second) = (
+            place(&self.at_request(0)).into_raw_elems(),
+            place(&self.at_request(1)).into_raw_elems(),
+        );
+        second.checked_sub(first)
+    }
     /// Head-major `[nqh*mq, hd]` — the online-softmax buffers. Head `h`, slab `s`.
     /// The online-softmax buffers are rank-2 `[rows, hd]` with the heads stacked ON THE ROW AXIS, so
     /// head `h` begins at ROW `h*mq`. Describing them as rank-3 `[nqh, mq, hd]` gives the head a stride
@@ -380,6 +398,54 @@ impl GatheredFold {
     /// was staged for.
     fn requests(self) -> u32 {
         self.scratch.mq()
+    }
+    /// ⭐⭐⭐⭐⭐ WHETHER THIS PASS'S LEGS ARE **ONE OP FOR THE WHOLE BATCH** — true above one request.
+    ///
+    /// ⛔ AT ONE REQUEST THE ANSWER MUST BE `false`, AND NOT AS AN OPTIMISATION. A size-1 `x` is a
+    /// PHANTOM dim, which `matmul_dims` records as breaking dxp's contraction inference (the same class
+    /// as the `y` phantom that was the mq>1 prefill collapse), and the solo-decode bundle this arm emits
+    /// at `mq == 1` is the one that is proven on hardware at 41 tok/s. So the axis is only ever declared
+    /// where it carries more than one position.
+    ///
+    /// The op NAME and the op COUNT both read this one predicate, so a collapsed bundle cannot carry
+    /// per-request names and a per-request bundle cannot lose them.
+    fn collapses(self) -> bool {
+        self.requests() > 1
+    }
+    /// The pass's request AXIS for one leg, from the two operands' own differenced steps — `None` when
+    /// [`Self::collapses`] is false, where the caller emits the shipped per-request op instead.
+    ///
+    /// A step the placement law cannot answer (`None` from [`BlockNests::request_step`]) is a build
+    /// failure here rather than a silently un-collapsed pass: a law that places request 1 before request
+    /// 0 would make the whole form wrong, and quietly falling back would hide it.
+    fn requests_axis(
+        self,
+        a_step: Option<u32>,
+        o_step: Option<u32>,
+    ) -> Result<Option<crate::sdsc_abstract::FoldRequests>, SuperDscError> {
+        if !self.collapses() {
+            return Ok(None);
+        }
+        let (a, o) = match (a_step, o_step) {
+            (Some(a), Some(o)) => (a, o),
+            _ => {
+                return Err(SuperDscError(
+                    "the collapsed fold's request step is NEGATIVE on one of its operands: request 1 \
+                     is placed before request 0, so the request is not the row law's minor coordinate \
+                     and an `x` axis cannot reach it."
+                        .into(),
+                ));
+            }
+        };
+        crate::sdsc_abstract::FoldRequests::of_gathered_pass(self.scratch, a, o)
+            .map(Some)
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "the gathered scratch's row is {} element(s), whose one-stick sub-row count does \
+                     not fit the descriptor's extent width — the `x` axis would step a truncated page.",
+                    self.scratch.cols(),
+                ))
+            })
     }
     /// ⭐⭐⭐⭐⭐ THE KERNEL BASE for (this window, kv head `kvh`, request `r`) — **the POOL'S OWN ADDRESS
     /// plus request `r`'s row**, with no arithmetic spelled here.
@@ -980,7 +1046,14 @@ fn assemble_attn_block(
             MatK::of_head_slab(FeatIdx::SLAB_FEATS),
             MatN::of_kv_window(width),
         );
-        for r in 0..gf.requests() {
+        // ⭐⭐⭐⭐⭐ ONE OP FOR THE WHOLE BATCH — the request stops being a per-op base offset and becomes
+        // the `x` AXIS it always was, so this loop runs ONCE above one request.
+        //
+        // `ops_this_arm` is 1 when the axis is live and `mq` when it is not, and BOTH come from the same
+        // `Option`: at `mq == 1` there is nothing to collapse, a size-1 `x` would be a phantom dim, and
+        // the arm emits the shipped solo-decode op byte for byte through the same builder.
+        let ops_this_arm = if gf.collapses() { 1 } else { gf.requests() };
+        for r in 0..ops_this_arm {
             let rn = nests.at_request(r);
             for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
                 let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
@@ -1002,12 +1075,22 @@ fn assemble_attn_block(
                         (&sc_h, rn.score_rows(h0, width).off())
                     };
                     // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
-                    let name = if nslab == 1 {
-                        format!("attn_{tag}sc_g{}_r{r}_o{t}", kvh.get())
+                    //
+                    // ⭐ AND THE REQUEST SEGMENT IS DROPPED EXACTLY WHEN THE OP STOPS BEING ONE
+                    // REQUEST'S. A collapsed op that still said `_r0` would read, in every descriptor
+                    // diff and every `[mark]` line, as the shipped per-request op with seven siblings
+                    // missing — which is the one reading that must not be available.
+                    let rseg = if gf.collapses() {
+                        String::new()
                     } else {
-                        format!("attn_{tag}sc_g{}s{s}_r{r}_o{t}", kvh.get())
+                        format!("_r{r}")
                     };
-                    ops.push(assemble_matmul_off_phys_m_with_epilogue(
+                    let name = if nslab == 1 {
+                        format!("attn_{tag}sc_g{}{rseg}_o{t}", kvh.get())
+                    } else {
+                        format!("attn_{tag}sc_g{}s{s}{rseg}_o{t}", kvh.get())
+                    };
+                    ops.push(assemble_matmul_fold_requests_maybe_epilogue(
                         // THE KV HEAD AND THE REQUEST AS SEPARATE NAME SEGMENTS, so the descriptor
                         // projections that collapse `g{n}` / `r{n}` to one reported row keep working.
                         &name,
@@ -1026,6 +1109,15 @@ fn assemble_attn_block(
                             rn.token_stream_by_slab(h0, s),
                             rn.score_rows(h0, width),
                         ),
+                        // ⭐⭐⭐ THE REQUEST AXIS, WITH BOTH OPERANDS' STEPS DIFFERENCED OUT OF THE SAME
+                        // TWO LAWS this call already passes as the `y` placements — the stream for the
+                        // activation, the score rows for the output. Nothing here says "one stick": the
+                        // laws answer, and the builder refuses the op by name if the answer is not the
+                        // stride the walk will take.
+                        gf.requests_axis(
+                            nests.request_step(|n| n.token_stream_by_slab(h0, s).off()),
+                            nests.request_step(|n| n.score_rows(h0, width).off()),
+                        )?,
                         score_form,
                         &rb(qs, mq_n, hd),
                         rn.token_stream_by_slab(h0, s),
@@ -1037,8 +1129,10 @@ fn assemble_attn_block(
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
                         &rb(sc, rows_n, width_n),
                         rn.score_rows(h0, width).off(),
-                        epi_h,
-                        epi_off,
+                        // THE MASK (slab 0) OR `sc` ITSELF (every later slab) — always present on this
+                        // leg, so the `Option` the collapsed assembler shares with the value leg is
+                        // `Some` here by construction, not by a choice made at this call.
+                        Some((epi_h, epi_off)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
@@ -1441,19 +1535,30 @@ fn assemble_attn_block(
             MatK::of_kv_window(width),
             MatN::of_head_slab(FeatIdx::SLAB_FEATS),
         );
-        for r in 0..gf.requests() {
+        // ONE OP FOR THE WHOLE BATCH, on the same terms as the score leg above — and it is the SAME
+        // predicate, because `GatheredFold::collapses` is a property of the PASS: a collapsed score leg
+        // beside a per-request value leg would compute every request's probabilities and then apply
+        // request 0's values to all of them.
+        let ops_this_arm = if gf.collapses() { 1 } else { gf.requests() };
+        for r in 0..ops_this_arm {
             let rn = nests.at_request(r);
             for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
                 let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
                 let h0 = qh0.get();
                 for s in 0..nests.slabs() {
-                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
-                    let name = if nests.slabs() == 1 {
-                        format!("attn_{tag}ov_g{}_r{r}_o{t}", kvh.get())
+                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move; the
+                    // request segment goes exactly when the op stops being one request's.
+                    let rseg = if gf.collapses() {
+                        String::new()
                     } else {
-                        format!("attn_{tag}ov_g{}s{s}_r{r}_o{t}", kvh.get())
+                        format!("_r{r}")
                     };
-                    ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
+                    let name = if nests.slabs() == 1 {
+                        format!("attn_{tag}ov_g{}{rseg}_o{t}", kvh.get())
+                    } else {
+                        format!("attn_{tag}ov_g{}s{s}{rseg}_o{t}", kvh.get())
+                    };
+                    ops.push(assemble_matmul_fold_requests_maybe_epilogue(
                         &name,
                         MatM::single_row(),
                         n,
@@ -1473,6 +1578,14 @@ fn assemble_attn_block(
                                 s,
                             ),
                         ),
+                        // The request axis, from THIS leg's own two buffers: the probability rows it
+                        // reads and the accumulator rows it writes. Both place the request as the row
+                        // law's minor coordinate, so both steps are one row — and the builder is what
+                        // says so, not this call.
+                        gf.requests_axis(
+                            nests.request_step(|n| n.score_rows(h0, width).off()),
+                            nests.request_step(|n| n.head_major(h0, s)),
+                        )?,
                         bmm_form,
                         &rb(expb, rows_n, width_n),
                         rn.score_rows(h0, width),

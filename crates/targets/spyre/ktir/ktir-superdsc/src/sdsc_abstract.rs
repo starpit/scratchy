@@ -1120,6 +1120,64 @@ impl MatY {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S **REQUEST** AXIS (`x`) — the count, the kernel's per-request stride
+/// and each operand's OWN differenced request step, as ONE value.
+///
+/// ⛔ IT IS A SECOND AXIS, NOT A RESPELLING OF `y`, because the fold needs both at once: a GQA group
+/// SHARES its kv head's gathered page (a weight-REUSE axis ⇒ `y`), and the requests inside that group
+/// each read their OWN page (a NO-REUSE axis ⇒ `x`). `ddc/ddl_templates/bmm.ddl`'s kernel global
+/// layout carries the `%nrd` (x, x1) dims and no `%wrd` (i, j, mb, y) dim at all, which is why the
+/// per-request kernel on `y` had no layout to be resolved against — see
+/// [`crate::ir::bridge::tiled_op_sdsc_op::matmul::walk`]'s `XAxis`.
+///
+/// ⛔ AND THE TWO STEPS ARE **DIFFERENCED OUT OF THE BUFFERS**, never written down. Under the rank-4
+/// walk `[y, x, mb, stick]` the `x` axis strides `mb_dev * stick_dev`, i.e. exactly ONE ROW at the
+/// `mb = 1` the collapsed legs compute — so the form is legal only for buffers whose request really
+/// IS the row law's minor coordinate. The builder compares each declared step against that derived
+/// stride and returns `Err` (a `cargo build` failure naming the op) on a mismatch, which is the same
+/// discipline [`BatchStrides`] applies to `y`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FoldRequests {
+    requests: u32,
+    /// The kernel's `in` DEVICE extent — [`PageScratch::kernel_in_device_extent`], the ONLY quantity
+    /// that makes `x` step one whole gathered page plane.
+    kernel_in_dev: u32,
+    /// The ACTIVATION's own request step, in elements, differenced out of its placement law.
+    a_step: u32,
+    /// The OUTPUT's own request step, from its own law (they are separate buffers).
+    o_step: u32,
+}
+
+impl FoldRequests {
+    /// THE ONE DOOR: the pass's own gathered scratch supplies the count AND the kernel stride, so a
+    /// request count and a page stride from two different passes cannot be paired. The two steps come
+    /// from the operands' own placement laws, differenced.
+    pub fn of_gathered_pass(
+        scratch: PageScratch,
+        a_step: u32,
+        o_step: u32,
+    ) -> Option<FoldRequests> {
+        Some(FoldRequests {
+            requests: scratch.mq(),
+            kernel_in_dev: u32::try_from(scratch.kernel_in_device_extent()).ok()?,
+            a_step,
+            o_step,
+        })
+    }
+    pub const fn requests(self) -> u32 {
+        self.requests
+    }
+    pub const fn kernel_in_dev(self) -> u32 {
+        self.kernel_in_dev
+    }
+    pub const fn activation_step(self) -> u32 {
+        self.a_step
+    }
+    pub const fn output_step(self) -> u32 {
+        self.o_step
+    }
+}
+
 /// PHYSICAL ROWS PER STICK PLANE OF THE ACTIVATION — the pitch half of an [`OperandPlacement`]:
 /// the op computes [`MatM`] rows but the activation is PACKED with this many rows per stick plane.
 /// It becomes the input's `mb` device extent, which is what the operand's DECLARED WALK and
@@ -6417,6 +6475,21 @@ impl PageScratch {
     /// Elements in one row — one whole page plane. This is `skip_addr`.
     pub const fn cols(self) -> u64 {
         self.plane.elems()
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE KERNEL `in` **DEVICE** EXTENT the collapsed fold declares — one scratch ROW in
+    /// one-stick sub-rows ([`PagePlaneExtent::sub_rows`]), and the only term that puts the request axis
+    /// on a whole page plane.
+    ///
+    /// Under the per-request kernel walk `[x, in, out]` (rank-3 ⇒ row-major over the DEVICE extents)
+    /// the strides are `out → 1`, `in → out_dev`, `x → in_dev * out_dev`. Both legs sweep ONE STICK of
+    /// `out`, so `out_dev` stays the swept stick and `in` steps one stick — the feature step on the Kᵗ
+    /// plane and the slot step on the V plane, each already the pool's own. That leaves `in_dev` as the
+    /// sole carrier of the request stride: `in_dev * stick == cols` by construction here, so the `x`
+    /// step is [`Self::cols`] — the same `skip_addr` the gather's index entries are spaced by — rather
+    /// than a product spelled at a call site.
+    pub const fn kernel_in_device_extent(self) -> u64 {
+        self.plane.sub_rows()
     }
 
     /// The whole footprint in elements, what the synthetic allocator reserves.

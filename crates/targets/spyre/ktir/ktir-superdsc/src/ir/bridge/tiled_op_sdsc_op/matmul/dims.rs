@@ -1,7 +1,7 @@
 //! Matmul family: the TileOp dim-vocabulary (`matmul_dims`) and the cost-model-splitter adapter
 //! (`matmul_split_map`) that `opspec`'s builders feed into `TileOp::tile`. See `super`'s module doc.
 
-use super::walk::{InAxis, MbAxis, OutAxis, WalkAxis, YAxis};
+use super::walk::{InAxis, MbAxis, OutAxis, WalkAxis, XAxis, YAxis};
 use crate::superdsc_opspec::{DataFormat, Df};
 
 /// Build the iteration `ItDim`s for a matmul. `mb`=M (out), `out`=N (out,stick),
@@ -57,6 +57,37 @@ pub fn matmul_dims<DF: DataFormat>(
             df: Df::Fp16, // batch axis is not a stick axis — basis unused.
         });
     }
+    dims
+}
+
+/// [`matmul_dims`] PLUS the no-reuse REQUEST axis `x` — the collapsed fold's dim set.
+///
+/// ⛔ `x` IS DELIBERATELY INVISIBLE TO THE SPLITTERS, AND THAT IS THE POINT. The refuted
+/// per-request form put the requests on `y`, where the work division spends them: with `mb` pinned
+/// to 1 and a one-stick `out` the batch split IS `numCoresUsed_`, so every core got its own weight
+/// start and the launch faulted one flit past the per-core patch table. `matmul_split_map_inner`
+/// reads only `{y, mb, out, in}`, so an `x` it never sees is never split: every core takes the SAME
+/// kernel base and walks the requests inside its own program. The mechanism that faulted is absent
+/// rather than guarded.
+///
+/// ⛔ AND IT IS AN `ItDim` LIKE ANY OTHER, so `emit_sdsc` fills `N_.x_` from it (`"x" => it.x_ = v`)
+/// and the LX residency estimate multiplies by it (`matmul_resident`'s `plan.extent("x")`) — both of
+/// which already existed for the dim vocabulary's sake and had no producer.
+pub fn matmul_dims_with_requests<DF: DataFormat>(
+    m: u32,
+    n_ext: &crate::superdsc_opspec::StickExtent<DF>,
+    k_ext: &crate::superdsc_opspec::StickExtent<DF>,
+    batch: u32,
+    requests: crate::sdsc_abstract::QueryRowCount,
+) -> Vec<crate::superdsc_opspec::ItDim> {
+    let mut dims = matmul_dims::<DF>(m, n_ext, k_ext, batch);
+    dims.push(crate::superdsc_opspec::ItDim {
+        name: XAxis::NAME,
+        size: requests.get(),
+        is_reduction: false,
+        is_stick: false,
+        df: Df::Fp16, // the request axis is not a stick axis — basis unused.
+    });
     dims
 }
 

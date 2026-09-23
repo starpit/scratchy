@@ -460,6 +460,96 @@ impl Walk3<YAxis, MbAxis, OutAxis> {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE REQUEST AXIS (`x`) — the NO-REUSE batch dim, and the ONLY axis a matmul's KERNEL is
+/// allowed to vary along.
+///
+/// ⛔⛔⛔ THIS IS THE DISTINCTION THE REFUTED FORM GOT WRONG, AND IT IS READABLE IN THE VENDOR'S OWN
+/// TEMPLATE. `ddc/ddl_templates/bmm.ddl` declares its dimensions in two named groups:
+/// ```text
+/// %wrd:4 = ddl.dimension{} : … // weight reuse dimension -- i, j mb, y
+/// %nrd:3 = ddl.dimension{} : … // no reuse dimension -- x, x1
+/// %global_layout_kernel = ddl.layout(%ki, %kj, %in, %out, %nrd#0, %nrd#1, %nrd#2) {}
+/// ```
+/// The kernel's global layout contains the `%nrd` dims and **NOT ONE `%wrd` DIM** — so `mb` and `y`
+/// are axes the weight is REUSED across, and a kernel coordinate along either is not expressible in
+/// the layout the bake resolves against. `x` is. That is why the per-request 3-D kernel on `y`
+/// faulted at `job_bin_ptr + numCoresUsed_*128` on every rung while the vendor's own 16- and
+/// 24-batch `batchmatmul` fixtures (`dcg/dcg_fe/scheduler/test/sdsc_bmm_autoBuffer.json`,
+/// `senulator/progs/pcfg_dm20_mm_bertb_m2_1c2_fp16/sdsc.json`, both with a restickified per-batch
+/// kernel) carry their batch on `x_`.
+///
+/// ⭐ AND THE COLLAPSED FOLD NEEDS BOTH AXES AT ONCE, which is why this is a new axis and not a
+/// re-spelling of `y`: a GQA group SHARES one kv head's page (a reuse axis ⇒ `y`) while the requests
+/// inside it each read their OWN page (a no-reuse axis ⇒ `x`). One axis cannot be both, and that —
+/// not the row count — is why the fold ran one launch per request.
+pub(crate) struct XAxis;
+impl WalkAxis for XAxis {
+    const NAME: &'static str = "x";
+}
+
+/// A rank-4 declared walk `[A, B, C, S]`, sticked on `S` (the last axis, by construction). Same
+/// sealing as [`Walk2`]/[`Walk3`]: the order lives in the TYPE and only the named constructors below
+/// can mint one.
+pub(crate) struct Walk4<A: WalkAxis, B: WalkAxis, C: WalkAxis, S: WalkAxis> {
+    _order: PhantomData<(A, B, C, S)>,
+}
+
+impl<A: WalkAxis, B: WalkAxis, C: WalkAxis, S: WalkAxis> Walk4<A, B, C, S> {
+    /// The `layoutDimOrder_` this walk declares, in walk order.
+    pub(crate) fn order(&self) -> [&'static str; 4] {
+        [A::NAME, B::NAME, C::NAME, S::NAME]
+    }
+    /// The stick axis — always the walk's LAST axis.
+    pub(crate) fn stick(&self) -> &'static str {
+        S::NAME
+    }
+}
+
+impl Walk4<YAxis, XAxis, MbAxis, InAxis> {
+    /// ⭐ THE COLLAPSED FOLD'S ACTIVATION walk `[y, x, mb, in]`, stick `in` — a rank-4 view, so
+    /// `for_view_df` classifies it `Flat` and each axis strides by the product of the DEVICE extents
+    /// after it:
+    /// ```text
+    ///   mb → in                    (one stick: the op computes ONE row per request)
+    ///   x  → mb_dev * in  = stick  — ONE ROW, which is exactly how far apart two requests are in
+    ///                                every head-major/token-stream buffer the fold reads
+    ///   y  → x_dev * mb_dev * in   — the operand's OWN head stride once `x_dev` is its pitch
+    /// ```
+    /// So the request term stops being a per-op base offset and becomes the axis it always was,
+    /// while `y` keeps the head stride the shipped per-request form already checks.
+    pub(crate) fn input_requests_under_gqa() -> Self {
+        Walk4 {
+            _order: PhantomData,
+        }
+    }
+}
+
+impl Walk4<YAxis, XAxis, MbAxis, OutAxis> {
+    /// The collapsed fold's OUTPUT walk `[y, x, mb, out]`, stick `out` — the same stride assignment
+    /// as [`Walk4::input_requests_under_gqa`] on the N stick.
+    pub(crate) fn output_requests_under_gqa() -> Self {
+        Walk4 {
+            _order: PhantomData,
+        }
+    }
+}
+
+impl Walk3<XAxis, InAxis, OutAxis> {
+    /// ⭐⭐⭐⭐⭐ THE PER-REQUEST KERNEL walk `[x, in, out]`, stick `out` — the gathered scratch, whose
+    /// request rows ARE the batch the weight varies over.
+    ///
+    /// `Flat` (rank-3) ⇒ row-major over the DEVICE extents: `out → 1`, `in → out_dev`,
+    /// `x → in_dev * out_dev`. With `out_dev` left at the swept one stick, `in` strides one stick —
+    /// the feature/slot step both planes really have — and `in_dev` ALONE sets the request stride.
+    /// Declaring it as the scratch row's own sub-row count ([`crate::sdsc_abstract::PageScratch`])
+    /// is what makes `x` step exactly one gathered page plane.
+    pub(crate) fn kernel_per_request() -> Self {
+        Walk3 {
+            _order: PhantomData,
+        }
+    }
+}
+
 /// One work-slice corner component ALONG A NAMED AXIS, in device elements. The axis is the
 /// TYPE, so a start-address term cannot be composed without saying which axis it steps —
 /// the per-core fp8 kernel offset takes `Corner<InAxis>`/`Corner<OutAxis>`, and handing it

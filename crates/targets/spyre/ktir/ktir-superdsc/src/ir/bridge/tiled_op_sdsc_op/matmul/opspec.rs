@@ -153,6 +153,186 @@ pub fn matmul_opspec_off_operands_phys<DF: DataFormat>(
     )
 }
 
+/// ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S OP — ONE matmul over the WHOLE BATCH, with the requests on the
+/// no-reuse `x` axis and a per-request KERNEL, and everything else exactly the shipped per-request op.
+///
+/// ## What moves and what does not
+/// The shipped gathered fold emits this same op `mq` times, once per request, each with `mb = 1`, `y`
+/// on the GQA group and a kernel base one scratch row further in. Here the request becomes the AXIS it
+/// always was:
+/// ```text
+///   INPUT  [y, x, mb, in]  stick in   x_dev = the activation's own pitch  (rank 4 ⇒ row-major)
+///   KERNEL [x, in, out]    stick out  in_dev = the scratch row's sub-rows (rank 3 ⇒ row-major)
+///   OUTPUT [y, x, mb, out] stick out  x_dev = the output's own pitch
+/// ```
+/// `mb` stays 1 (one query row per request), `y` keeps the GQA group and its 2-D-shared-kernel
+/// semantics on the REUSE axis, and the head strides stay the ones [`crate::sdsc_abstract::BatchStrides`]
+/// already refuses a mismatch on — the derivation is identical, `x_dev` simply carries the pitch that
+/// `mb_dev` carried when `mb` sat where `x` now does.
+///
+/// ## Why `x` and not `y`
+/// See [`super::walk::XAxis`]: `bmm.ddl`'s kernel global layout lists the `%nrd` dims (x, x1) and NOT
+/// ONE `%wrd` dim (i, j, mb, y), so a kernel coordinate along `y` has no layout to resolve against —
+/// which is what the `job_bin_ptr + numCoresUsed_*128` fault at every rung was. `x` is the axis the
+/// vendor's own per-batch `batchmatmul` fixtures carry their batch on.
+///
+/// ## The one refusal
+/// Each operand's request step must BE the derived `x` stride (`mb_dev * stick_dev`, i.e. one stick at
+/// `mb = 1`). The two steps arrive differenced out of the operands' own placement laws
+/// ([`crate::sdsc_abstract::FoldRequests`]), so this compares the law's answer against the walk's and
+/// returns `Err` — a `cargo build` failure naming the op — rather than emitting a walk that reads into
+/// another request's rows.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_opspec_fold_requests<DF: DataFormat>(
+    m: MatM,
+    n: MatN,
+    k: MatK,
+    batch: MatY,
+    requests: crate::sdsc_abstract::FoldRequests,
+    form: SharedKernelBmmForm,
+    a_name: &str,
+    w_name: &str,
+    o_name: &str,
+    a_off: u32,
+    w_off: u32,
+    o_off: u32,
+    operand_df: Df,
+) -> Result<OpSpec, String> {
+    let (m, n, k, batch_y) = (m.get(), n.get(), k.get(), batch.get());
+    let n_ext = StickExtent::<DF>::new(n)?;
+    let k_ext = StickExtent::<DF>::new(k)?;
+    // ⛔ ONE ROW PER REQUEST IS WHAT MAKES THE `x` STEP ONE ROW. At `mb > 1` the derived `x` stride
+    // would be `mb * stick` and the requests would be that far apart in no buffer the fold has.
+    if m != 1 {
+        return Err(format!(
+            "matmul_opspec_fold_requests '{o_name}': mb={m}, but the collapsed fold computes ONE row \
+             per request — the `x` axis derives its stride as `mb_dev * stick`, so any other row count \
+             places the requests somewhere no buffer here has them."
+        ));
+    }
+    let dims = super::dims::matmul_dims_with_requests::<DF>(
+        m,
+        &n_ext,
+        &k_ext,
+        batch_y,
+        crate::sdsc_abstract::QueryRowCount::of_mq(requests.requests()),
+    );
+    let tile_op = TileOp {
+        kind: crate::ir::island::tile_op::TileOpKind::Matmul,
+        dims,
+        df: Df::Fp16,
+    };
+    let tiled = tile_op
+        .tile(
+            MaxCores::<MAX_CORES>,
+            matmul_split_map_for(form),
+            OutAxis::NAME,
+        )
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    // THE TWO PITCHES, from the SAME placements that mint the offsets — `MatY::of_gqa_group` cannot be
+    // built without them, so a collapsed leg cannot be emitted without declaring where its heads are.
+    let strides = batch.batch_strides().ok_or_else(|| {
+        format!(
+            "matmul_opspec_fold_requests '{o_name}': the collapsed fold's `y` axis carries a GQA group, \
+             whose two operand head strides are what make the walk checkable — build the batch with \
+             `MatY::of_gqa_group`."
+        )
+    })?;
+    let (a_pitch, o_pitch) = (
+        strides.activation_pitch().get(),
+        strides.output_pitch().get(),
+    );
+    // ⛔ THE STRIDE THE WALK WILL USE MUST BE THE STRIDE THE OPERANDS HAVE — both axes, refused here.
+    //
+    // `x` strides `mb_dev * stick_dev` (one stick at `mb = 1`) and `y` strides `x_dev * mb_dev *
+    // stick_dev` = `pitch * stick`. The second is the SAME relation the per-request form already
+    // checks, with the pitch moved from `mb` to `x`; the first is new, and it is the one that says the
+    // request is this buffer's row-law MINOR coordinate rather than something a base offset reached.
+    let check = |want: u32, derived: u32, role: &str, axis: &str| -> Result<(), String> {
+        if want == derived {
+            return Ok(());
+        }
+        Err(format!(
+            "matmul_opspec_fold_requests '{o_name}': the collapsed {role} walk strides `{axis}` by \
+             {derived} elems, but this operand's placement law puts adjacent requests {want} elems \
+             apart. An `x`-batch would step into another request's row."
+        ))
+    };
+    check(requests.activation_step(), k, "input", "x")?;
+    check(requests.output_step(), n, "output", "x")?;
+    check(strides.activation().elems(), a_pitch * k, "input", "y")?;
+    check(strides.output().elems(), o_pitch * n, "output", "y")?;
+    let input_walk = super::walk::Walk4::input_requests_under_gqa();
+    let input = TensorArg::<4>::new(
+        true,
+        a_name.to_string(),
+        Role::Input,
+        [Scale::Active; 4],
+        plan.iter_syms(input_walk.order()),
+        input_walk.order(),
+        input_walk.stick(),
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_offset(a_off)
+    .with_device_extent(super::walk::XAxis::NAME, a_pitch)
+    .map_err(|e| e.0)?;
+    let kernel_walk = super::walk::Walk3::kernel_per_request();
+    let kernel = TensorArg::<3>::new(
+        true,
+        w_name.to_string(),
+        Role::Kernel,
+        [Scale::Active; 3],
+        plan.iter_syms(kernel_walk.order()),
+        kernel_walk.order(),
+        kernel_walk.stick(),
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_offset(w_off)
+    .with_device_extent(InAxis::NAME, requests.kernel_in_dev())
+    .map_err(|e| e.0)?;
+    let output_walk = super::walk::Walk4::output_requests_under_gqa();
+    let output = TensorArg::<4>::new(
+        false,
+        o_name.to_string(),
+        Role::Output,
+        [Scale::Active; 4],
+        plan.iter_syms(output_walk.order()),
+        output_walk.order(),
+        output_walk.stick(),
+        Allocation::Hbm,
+    )
+    .map_err(|e| e.0)?
+    .with_offset(o_off)
+    .with_device_extent(super::walk::XAxis::NAME, o_pitch)
+    .map_err(|e| e.0)?;
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    let mut args = vec![
+        AnyTensorArg::R4(input),
+        AnyTensorArg::R3(kernel),
+        AnyTensorArg::R4(output),
+    ];
+    // The operand RESIDENCY, same rule as every other builder here: the activation and the weight
+    // carry the operand format, the output stays fp16.
+    for arg in &mut args {
+        if !matches!(arg.view().role, Role::Output) {
+            arg.set_df(operand_df);
+        }
+    }
+    Ok(OpSpec {
+        op: OpFunc::matmul(batch_y),
+        is_reduction: true,
+        iter: plan,
+        args,
+        op_info: OpInfo::None,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+    })
+}
+
 /// THE KERNEL'S OPERAND POSITION in every matmul this module builds — `[a, w, o]`, so 1.
 ///
 /// ⭐ NAMED HERE, IN THE MODULE THAT ORDERS THE OPERANDS, so nobody downstream re-derives it. The
