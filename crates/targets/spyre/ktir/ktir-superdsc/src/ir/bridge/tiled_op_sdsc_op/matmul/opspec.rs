@@ -230,6 +230,28 @@ pub fn matmul_opspec_fold_requests<DF: DataFormat>(
         )
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    // ⛔⭐⭐⭐⭐⭐ EVERY REQUEST MUST OWN A CORE SLICE — the kernel's request pitch exists NOWHERE ELSE.
+    //
+    // The collapsed kernel is a GATHERED PAGE PLANE: adjacent requests are
+    // [`crate::sdsc_abstract::PageScratch::cols`] apart, `32x` the `in x out` block this op sweeps. A
+    // WALKED `x` cannot stride by that — dsc2 sizes a unit view from the allocation's capacity
+    // intersected with `maxDimSizes_`, which can only SHRINK it (`dsc/dsc2.cpp:2818-2827`), and the two
+    // channels that could declare a larger pitch are both unavailable to a folded op (see the law
+    // written out in [`super::dims::matmul_split_map_inner`]). The per-core START address CAN say it,
+    // by folding the slice corner through the declared `in` device extent below — but `per_core_addr`
+    // only moves a coordinate for a dim the work division actually split. So an unsplit `x` silently
+    // reads request 0's plane for every request, which is exactly the wrong-values form this refusal
+    // exists to make unbuildable.
+    if plan.split_of(super::walk::XAxis::NAME) != requests.requests() {
+        return Err(format!(
+            "matmul_opspec_fold_requests '{o_name}': mq={} requests, but the work division put {} \
+             slice(s) on `x`. The request axis carries a per-request KERNEL whose pitch only the \
+             per-core start address can express, so every request must own its own core slice — a \
+             walked `x` would read one request's page plane for all of them.",
+            requests.requests(),
+            plan.split_of(super::walk::XAxis::NAME),
+        ));
+    }
     // THE TWO PITCHES, from the SAME placements that mint the offsets — `MatY::of_gqa_group` cannot be
     // built without them, so a collapsed leg cannot be emitted without declaring where its heads are.
     let strides = batch.batch_strides().ok_or_else(|| {

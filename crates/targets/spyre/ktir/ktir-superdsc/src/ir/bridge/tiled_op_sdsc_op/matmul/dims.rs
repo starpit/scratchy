@@ -62,13 +62,20 @@ pub fn matmul_dims<DF: DataFormat>(
 
 /// [`matmul_dims`] PLUS the no-reuse REQUEST axis `x` — the collapsed fold's dim set.
 ///
-/// ⛔ `x` IS DELIBERATELY INVISIBLE TO THE SPLITTERS, AND THAT IS THE POINT. The refuted
-/// per-request form put the requests on `y`, where the work division spends them: with `mb` pinned
-/// to 1 and a one-stick `out` the batch split IS `numCoresUsed_`, so every core got its own weight
-/// start and the launch faulted one flit past the per-core patch table. `matmul_split_map_inner`
-/// reads only `{y, mb, out, in}`, so an `x` it never sees is never split: every core takes the SAME
-/// kernel base and walks the requests inside its own program. The mechanism that faulted is absent
-/// rather than guarded.
+/// ⛔ `x` IS SPLIT ACROSS CORES, ONE REQUEST PER SLICE, AND THAT IS A CORRECTNESS LAW. A WALKED `x`
+/// bakes and launches and computes the WRONG VALUES: the kernel is a gathered PAGE PLANE whose
+/// request pitch is `32x` the `in x out` block the op sweeps, and no walk can stride by it (the
+/// dsc2 arithmetic is written out at [`matmul_split_map_inner`]). Only the per-core START address
+/// can express that pitch, and only for a dim the work division actually split — so the requests
+/// must arrive as core slices. [`super::opspec::matmul_opspec_fold_requests`] refuses any plan
+/// whose `x` did not fully divide, making a too-wide rung a build error.
+///
+/// ⛔ AND THIS IS NOT THE MECHANISM THAT FAULTED. The refuted per-request form put the requests on
+/// `y`, and there every core got its own weight start one flit past the per-core patch table —
+/// because `y` is a `%wrd` (weight-reuse) dim that the kernel's global layout does not carry, so a
+/// per-core kernel coordinate along `y` has no layout to resolve against. `x` is `%nrd`, and it IS
+/// a kernel layout dim here (`['x','in','out']`), so a per-core kernel start along `x` resolves by
+/// construction. The distinction is the dim CLASS, not the fact of splitting.
 ///
 /// ⛔ AND IT IS AN `ItDim` LIKE ANY OTHER, so `emit_sdsc` fills `N_.x_` from it (`"x" => it.x_ = v`)
 /// and the LX residency estimate multiplies by it (`matmul_resident`'s `plan.extent("x")`) — both of
@@ -258,6 +265,41 @@ fn matmul_split_map_inner(
         ext(InAxis::NAME),
     );
     let mut map = std::collections::BTreeMap::new();
+    // ⭐⭐⭐⭐⭐ THE REQUEST AXIS IS CORE-SPLIT, NEVER WALKED — a CORRECTNESS law, not a work
+    // preference, and it is dsc2's own arithmetic that makes it one.
+    //
+    // A WALKED axis takes its element step from the unit view dsc2 builds for the operand
+    // (`dsc/dsc2.cpp:2767-2830` `buildUnitView`): per layout dim, `size` is the allocation's
+    // CAPACITY, and `maxDimSizes_` can only ever SHRINK it (`size > maxDimSize` ⇒
+    // `size = maxDimSize`; the `else` arm resets the remainder to 1 — `:2818-2827`). For an HBM
+    // allocation the capacity per dim IS this op's own `N_`, so a walked `x` strides by the
+    // product of the operand's INNER iteration extents and nothing can say otherwise. The
+    // collapsed fold's KERNEL is a GATHERED PAGE PLANE whose request pitch is
+    // [`crate::sdsc_abstract::PageScratch::cols`] — `32x` the `in x out` block the op sweeps — so
+    // a walked `x` reads request 0's plane for every request. Both channels that can declare a
+    // pitch LARGER than the walk are closed to us: `gapStickSpread_` is net-neutral (capacity
+    // `/= spread` at `:3971`, view `*= spread` at `:2898`), and `backGapCore_` lands only in
+    // `sizesWithGaps_`, which the DataflowIR lowering DROPS for a folded op
+    // (`dsc-based-utils/DSC2ToDataflowIR/V3/SNComputeLowering.cpp:543-557`, "TODO: modify this
+    // later", taken whenever `num_folds_ > 1` — i.e. always, here).
+    //
+    // The per-core START address is the channel that does carry it: `per_core_addr` folds each
+    // core's work-slice corner through [`crate::sdsc_abstract::DeviceExtents::of_view`], the ONE
+    // reader that honours a declared physical extent (`TensorArg::with_device_extent`). So the
+    // requests arrive as CORE SLICES, each with its page pitch baked into its own start, and the
+    // walk never needs a stride it cannot express. `matmul_opspec_fold_requests` refuses to build
+    // an op whose `x` did not fully divide, so a rung too wide for the cores is a `cargo build`
+    // error rather than a silent aliasing read.
+    //
+    // Every other matmul in the model has no `x` dim (`ext` answers 1), so this leaves them
+    // byte-identical.
+    let x = ext(XAxis::NAME);
+    let max_cores = if x > 1 && max_cores >= x {
+        map.insert(XAxis::NAME, x);
+        max_cores / x
+    } else {
+        max_cores
+    };
     // WHICH DIMS A MATMUL'S WORK IS SPLIT ON (`SCRATCHY_SDSC_SPLIT_TRACE=1`). This is the one thing
     // no counter here reports and the one that decides weight TRAFFIC: an `mb` split hands every
     // core the SAME stationary weight (see the HW CAP note below), so `mb=c` reads the weight c

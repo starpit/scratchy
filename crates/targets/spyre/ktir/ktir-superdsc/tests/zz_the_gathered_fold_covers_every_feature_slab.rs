@@ -133,12 +133,16 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
                 emit_at::<HD_8B>(mq)
             };
             let leg = prefix_leg(&ops, "ov");
-            // `nb = active_cap / 64` fold passes, each with `nkvh * mq * nslab` value ops.
+            // `nb = active_cap / 64` fold passes, each with `nkvh * nslab` value ops. ⛔ AND NO `mq`
+            // FACTOR: the collapsed fold carries the whole batch on one op's `x` axis, so the op count is
+            // RUNG-INVARIANT. An `mq` here would mean the abandoned per-request `_r{R}` clone form is
+            // back, which costs a program and a launch per request.
             let nb = CAP / POOL_STICK;
             assert_eq!(
                 leg.len() as u32,
-                nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the gathered value leg must emit nb*nkvh*mq*nslab ops. Got {}: {:?}",
+                nb * NKVH * nslab,
+                "hd={hd} mq={mq}: the gathered value leg must emit nb*nkvh*nslab ops, at EVERY rung. Got \
+                 {}: {:?}",
                 leg.len(),
                 leg.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
             );
@@ -159,10 +163,10 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
             }
             // ⭐ AND THE SLAB IS IN THE NAME AT hd=128 AND ABSENT AT hd=64 — the 2b's emission does not
             // move, which is the safety property for an address-moving change.
-            let with_slab = leg.iter().filter(|o| o.name.contains("s1_r")).count();
+            let with_slab = leg.iter().filter(|o| o.name.contains("s1_")).count();
             assert_eq!(
                 with_slab as u32,
-                if nslab == 1 { 0 } else { nb * NKVH * mq },
+                if nslab == 1 { 0 } else { nb * NKVH },
                 "hd={hd} mq={mq}: slab 1's ops are named `s1` — at one slab there must be none, so the \
                  shipped 2b descriptor names are byte-identical"
             );
@@ -171,17 +175,16 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
             if nslab > 1 {
                 let s0 = leg
                     .iter()
-                    .find(|o| o.name.contains("ov_g0s0_r0"))
-                    .expect("slab 0 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("ov_g0s0_"))
+                    .expect("slab 0 of kv head 0");
                 let s1 = leg
                     .iter()
-                    .find(|o| o.name.contains("ov_g0s1_r0"))
-                    .expect("slab 1 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("ov_g0s1_"))
+                    .expect("slab 1 of kv head 0");
                 assert_ne!(
                     s0.body, s1.body,
-                    "hd={hd} mq={mq}: the two slabs of (kv head 0, request 0) emit IDENTICAL \
-                     descriptors, so slab 1 writes slab 0's bytes and the upper half of every head's \
-                     output is never produced"
+                    "hd={hd} mq={mq}: the two slabs of kv head 0 emit IDENTICAL descriptors, so slab 1 \
+                     writes slab 0's bytes and the upper half of every head's output is never produced"
                 );
             }
         }
@@ -207,8 +210,9 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
             let nb = CAP / POOL_STICK;
             assert_eq!(
                 leg.len() as u32,
-                nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the gathered score leg must emit nb*nkvh*mq*nslab ops. Got {}: {:?}",
+                nb * NKVH * nslab,
+                "hd={hd} mq={mq}: the gathered score leg must emit nb*nkvh*nslab ops, at EVERY rung — the \
+                 batch rides one op's `x` axis, so the count cannot track the rung. Got {}: {:?}",
                 leg.len(),
                 leg.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
             );
@@ -231,12 +235,12 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
             if nslab > 1 {
                 let s0 = leg
                     .iter()
-                    .find(|o| o.name.contains("sc_g0s0_r0"))
-                    .expect("slab 0 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("sc_g0s0_"))
+                    .expect("slab 0 of kv head 0");
                 let s1 = leg
                     .iter()
-                    .find(|o| o.name.contains("sc_g0s1_r0"))
-                    .expect("slab 1 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("sc_g0s1_"))
+                    .expect("slab 1 of kv head 0");
                 assert_ne!(
                     s0.body, s1.body,
                     "hd={hd} mq={mq}: the two slab partials of one score row emit IDENTICAL \
@@ -263,6 +267,12 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
 /// here would either fail on shipped code or pin the wrong bound. What is checkable is that the count is
 /// exactly the two legs plus the per-block fixed cost plus the copies — so an accidental extra factor
 /// (a slab loop nested inside a slab loop, say) shows up here as a number and not as a slow build.
+///
+/// ⭐⭐⭐⭐⭐ AND THE LEG COUNT IS **RUNG-INVARIANT**, WHICH IS THE COLLAPSE'S WHOLE POINT. `nb*nkvh*nslab`
+/// per leg with no `mq` factor, swept over rungs 1, 2 and 8. The abandoned per-request `_r{R}` form
+/// multiplied this by `mq` — and since a fold run is never chunked, that multiplied the largest group in
+/// the bundle, i.e. the ~40-minute `dxp_standalone` above, by the batch width. The only thing here that
+/// still scales with the rung is the `2*mq` KV plane COPIES, which are one op each.
 #[test]
 fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
     let nb = CAP / POOL_STICK;
@@ -280,8 +290,11 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
                 .count() as u32;
             assert_eq!(
                 legs,
-                2 * nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the two gathered legs are nb*nkvh*mq*nslab ops each"
+                2 * nb * NKVH * nslab,
+                "hd={hd} mq={mq}: the two gathered legs are nb*nkvh*nslab ops each, INDEPENDENT of the \
+                 rung — swept over mq 1/2/8 here precisely so a count that quietly tracks the batch is a \
+                 failure. That is the whole point of the collapse: the group size, and therefore the BAKE \
+                 COST below, stops growing with the batch."
             );
             // TWO PLANES, one copy op per (request, entry cut) each — `ops_per_row` is 1 here.
             assert_eq!(
