@@ -161,6 +161,84 @@ fn the_rmsq_fixture_carries_its_deep_fields() {
     assert_eq!(compute.ty, WireComputeType::Fma16);
     assert_eq!(compute.data_format, DataType::Sen169Fp16);
     assert_eq!(compute.num_folds_engaged, 1);
+
+    // `dataStageParam_`: four stages, each with its steady-state/epilogue pair — the loop walk's
+    // `DimStages` input. Stage 0 is (core, core), stage 1 (chunk, chunk), and out_ = 64, y_ = 1
+    // everywhere; the split/pad maps are empty in this dump.
+    assert_eq!(op.data_stage_param.len(), 4, "four data stages");
+    let stage0 = &op.data_stage_param[&0];
+    assert_eq!(stage0.name(), "core");
+    assert_eq!(stage0.ss.name, "core");
+    assert_eq!(stage0.el.name, "core");
+    let stage1 = &op.data_stage_param[&1];
+    assert_eq!(stage1.name(), "chunk");
+    assert_eq!(stage1.ss.out_, 64.0);
+    assert_eq!(stage1.ss.y_, 1.0);
+    assert_eq!(stage1.ss.in_, -1.0, "an unset dim stays the -1 default");
+    assert!(stage1.ss.corelet_split.is_empty());
+    assert!(stage1.ss.padding_sizes.is_empty());
+    let stage2 = &op.data_stage_param[&2];
+    assert_eq!(stage2.ss.name, "2");
+    assert_eq!(stage2.el.name, "2el", "the epilogue's own name");
+
+    // `computeOp_`: one entry, the mul on the sfp unit the compute node names.
+    assert_eq!(op.compute_op.len(), 1);
+    let compute_op = &op.compute_op[0];
+    assert_eq!(compute_op.ex_unit, SenComponent::Sfp);
+    assert_eq!(compute_op.op_func_name, wire::WireOpFunc::Mul);
+    assert_eq!(compute_op.data_format, DataType::Sen169Fp16);
+    assert_eq!(compute_op.fidelity, wire::Fidelity::Regular);
+    assert_eq!(compute_op.location, wire::WireLoopName::Inner);
+    assert_eq!(
+        compute_op.input_labeled_ds,
+        ["Tensor0-idx0".to_owned(), "Tensor1-idx1".to_owned()]
+    );
+    assert_eq!(compute_op.output_labeled_ds, ["Tensor2-idx2".to_owned()]);
+    assert!(compute_op.interim_labeled_ds.is_empty());
+    assert!(compute_op.op_consts.is_empty());
+
+    // `constantInfo_`: this dump has no constants.
+    assert!(op.constant_info.is_empty());
+}
+
+/// The D fixture's `constantInfo_` — four constants, each a three-fold (core × corelet × time)
+/// `FoldManager<std::vector<int64_t>>` whose `data_` values are INT ARRAYS, the shape the
+/// string-valued fold reader cannot carry.
+#[test]
+fn the_d_fixture_carries_its_constants() {
+    let sdsc = include_str!(concat!(env!("HOME"), "/tmp/phase0/D/sdsc_10.json"));
+    let file = wire::read_file(sdsc).expect("the fixture must parse");
+    let op = &file.programs[0].ops[0];
+
+    assert_eq!(op.constant_info.len(), 4, "ffff, zero, plus1, minus1");
+    let ffff = &op.constant_info[&0];
+    assert_eq!(ffff.name, "ffff");
+    assert_eq!(ffff.data_format, DataType::Sen169Fp16);
+    assert!(!ffff.is_data_symbolic);
+    let data = ffff.data.as_ref().expect("ffff carries fold data");
+    assert_eq!(data.props.len(), 3, "core × corelet × time");
+    assert_eq!(data.props[0].label, "core");
+    // Unlike the pre fixture's 32-core startAddr fold, the constants fold at factor 1 — the
+    // same value on every core.
+    assert_eq!(data.props[0].factor, 1);
+    assert!(matches!(data.funcs[0], wire::FoldDimFunc::Const));
+    assert_eq!(data.data.get("[0, 0, 0]"), Some(&vec![65535]));
+
+    let zero = &op.constant_info[&1];
+    assert_eq!(zero.name, "zero");
+    assert_eq!(
+        zero.data.as_ref().expect("zero carries fold data").data.get("[0, 0, 0]"),
+        Some(&vec![0])
+    );
+
+    // The D fixture's own `computeOp_` is a reciprocal, not the pre fixture's mul — pin that the
+    // op func vocabulary covers both.
+    assert_eq!(op.compute_op.len(), 1);
+    assert_eq!(op.compute_op[0].op_func_name, wire::WireOpFunc::Reciprocal);
+    assert_eq!(
+        op.compute_op[0].interim_labeled_ds,
+        ["internal_tensor_lds1-idx1".to_owned()]
+    );
 }
 
 use deeptools::generated::DataType;

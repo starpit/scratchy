@@ -109,6 +109,49 @@ impl FoldedData {
     }
 }
 
+/// ONE FOLD-INDEXED INT-ARRAY VALUE — a `FoldManager<std::vector<int64_t>>` as dbo prints it.
+///
+/// ⭐ THE SAME THREE KEYS, A DIFFERENT `Dtype`. `importFromJson` is a template over the payload
+/// type (`foldInfrastructure.h:2760`): with `Dtype = std::string` the `data_` values are strings
+/// ([`FoldData`], what a `startAddr_` carries), and with `Dtype = std::vector<int64_t>` each value
+/// is a JSON **array of ints** — `"[0, 0, 0]": ["65535"]` in the D fixture's `constantInfo_`, a
+/// `FoldManager<std::vector<int64_t>>` (`dsc/dsc2.h:42-43`). The dims/func halves are identical;
+/// only the value payload differs, so this carries the same `props`/`funcs` reading with
+/// `Vec<i64>`-valued data.
+///
+/// ⚠️ ARRAY VALUES MAY ARRIVE AS STRINGS. `ImportUtil::importData` over a `vector<int64_t>` reads
+/// each entry through the integral arm, which accepts a JSON number *or* a decimal string
+/// (`util/import_utils.h:37-46`); the dumper writes `std::to_string(int64)`, i.e. strings
+/// (`foldInfrastructure.h:2697-2700`'s print sibling). Both spellings parse to the same `i64`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedIntArray {
+    /// `dim_prop_attr` — one per folded dimension, outermost first.
+    pub props: Vec<FoldDimProp>,
+    /// `dim_prop_func` — how each dimension varies, parallel to `props`.
+    pub funcs: Vec<FoldDimFunc>,
+    /// `data_` — the int arrays, keyed by the coordinate deque as printed (`"[0, 0, 0]"`).
+    pub data: BTreeMap<String, Vec<i64>>,
+}
+
+impl FoldedIntArray {
+    /// The three-key check, shared with [`FoldData`]'s: the two dimension arrays must agree
+    /// (`:2779-2780`) and every `data_` key must be a coordinate of the fold count
+    /// (`:2817-2818`).
+    fn check(props: &[FoldDimProp], data: &BTreeMap<String, Vec<i64>>) -> Result<(), Refusal> {
+        for key in data.keys() {
+            let coord = FoldedData::coordinate(key)?;
+            if coord.len() != props.len() {
+                return Err(Refusal::FoldCoordMismatch {
+                    key: key.clone(),
+                    coord: coord.len(),
+                    folds: props.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 // -- serde shapes --------------------------------------------------------------
 //
 // The wire is json11's output, which is a strict JSON subset. The shapes below are untagged so the
@@ -127,6 +170,41 @@ enum WireFold {
     },
     /// A plain string — the zero-fold form (`startAddr_` is `"0"` in the fixtures).
     Plain(String),
+}
+
+/// The three-key form with int-array values — [`FoldedIntArray`]'s serde shape. The values are
+/// `Vec<WireInt>` because each array entry goes through `ImportUtil::importData`'s integral arm
+/// (number or decimal string, `util/import_utils.h:37-46`).
+#[derive(Deserialize)]
+struct WireIntFold {
+    dim_prop_func: Vec<serde_json::Value>,
+    dim_prop_attr: Vec<WireProp>,
+    #[serde(rename = "data_", default)]
+    data: BTreeMap<String, Vec<WireInt>>,
+}
+
+/// THE SHARED `dim_prop_func` READING — one entry per call, both fold forms.
+fn fold_funcs(entries: Vec<serde_json::Value>) -> Result<Vec<FoldDimFunc>, Refusal> {
+    entries.iter().map(fold_func).collect()
+}
+
+/// THE SHARED `dim_prop_attr` READING — one entry per call, both fold forms.
+fn fold_props(entries: Vec<WireProp>) -> Result<Vec<FoldDimProp>, Refusal> {
+    let mut props = Vec::with_capacity(entries.len());
+    for prop in &entries {
+        props.push(FoldDimProp {
+            factor: u32::try_from(
+                prop.factor
+                    .as_ref()
+                    .map(|w| w.value("factor_"))
+                    .transpose()?
+                    .unwrap_or(0),
+            )
+            .map_err(|_| Refusal::NegativeFoldFactor)?,
+            label: prop.label.clone(),
+        });
+    }
+    Ok(props)
 }
 
 /// READ ONE `dim_prop_func` ENTRY — the C++ reads it as a ONE-KEY object whose key is the func
@@ -217,30 +295,14 @@ impl TryFrom<WireFold> for FoldData {
                 dim_prop_attr,
                 data,
             } => {
+                let funcs = fold_funcs(dim_prop_func)?;
+                let props = fold_props(dim_prop_attr)?;
                 // "Different number of dims between json and caller" (`:2779-2780`) — here the two
                 // wire arrays must agree with each other.
-                if dim_prop_func.len() != dim_prop_attr.len() {
+                if funcs.len() != props.len() {
                     return Err(Refusal::FoldDimMismatch {
-                        funcs: dim_prop_func.len(),
-                        props: dim_prop_attr.len(),
-                    });
-                }
-                let mut funcs = Vec::with_capacity(dim_prop_func.len());
-                for entry in &dim_prop_func {
-                    funcs.push(fold_func(entry)?);
-                }
-                let mut props = Vec::with_capacity(dim_prop_attr.len());
-                for prop in &dim_prop_attr {
-                    props.push(FoldDimProp {
-                        factor: u32::try_from(
-                            prop.factor
-                                .as_ref()
-                                .map(|w| w.value("factor_"))
-                                .transpose()?
-                                .unwrap_or(0),
-                        )
-                        .map_err(|_| Refusal::NegativeFoldFactor)?,
-                        label: prop.label.clone(),
+                        funcs: funcs.len(),
+                        props: props.len(),
                     });
                 }
                 // "Num of dimensions in coordinate not matching num folds" (`:2817-2818`).
@@ -276,4 +338,43 @@ pub(crate) fn fold_data(json: &serde_json::Value) -> Result<Option<FoldData>, Re
             .try_into()
             .map(Some),
     }
+}
+
+/// PARSE ONE INT-ARRAY FOLD VALUE — `FoldManager<std::vector<int64_t>>::importFromJson`, the
+/// [`FoldedIntArray`] sibling of [`fold_data`]. `None` for a JSON `null`; a refusal for a shape
+/// the importer would reject.
+pub(crate) fn fold_int_array(json: &serde_json::Value) -> Result<Option<FoldedIntArray>, Refusal> {
+    if let serde_json::Value::Null = json {
+        return Ok(None);
+    }
+    let wire: WireIntFold = serde_json::from_value(json.clone()).map_err(|e| {
+        Refusal::MalformedFold {
+            message: e.to_string(),
+        }
+    })?;
+    let funcs = fold_funcs(wire.dim_prop_func)?;
+    let props = fold_props(wire.dim_prop_attr)?;
+    if funcs.len() != props.len() {
+        // "Different number of dims between json and caller" (`:2779-2780`).
+        return Err(Refusal::FoldDimMismatch {
+            funcs: funcs.len(),
+            props: props.len(),
+        });
+    }
+    let mut values = BTreeMap::new();
+    for (key, entries) in wire.data {
+        // Each array entry through the integral arm: number or decimal string
+        // (`util/import_utils.h:37-46`).
+        let mut ints = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            ints.push(entry.value("data_")?);
+        }
+        values.insert(key.clone(), ints);
+    }
+    FoldedIntArray::check(&props, &values)?;
+    Ok(Some(FoldedIntArray {
+        props,
+        funcs,
+        data: values,
+    }))
 }

@@ -30,16 +30,18 @@
 //! - It ignores `next_`. The tree is rebuilt from `prev_` alone, the way the C++ importer does.
 
 mod coords;
+mod dims;
 mod enums;
 mod fold;
 mod tree;
 
 pub use coords::{CoordInfo, Coordinates};
+pub use dims::{ComputeOp, ConstantInfo, DataStage, DataStructDims, DimPaddingSizes, SymbolicDimInfo};
 pub use enums::{
-    data_format, IndirectAllocType, LdsSegment, MetaDimKind, NodeType, PadType, SenTarget,
-    WireComputeType,
+    data_format, Fidelity, IndirectAllocType, LdsSegment, MetaDimKind, NodeType, PadType,
+    SenTarget, WireComputeType, WireLoopName, WireOpFunc,
 };
-pub use fold::{FoldData, FoldDimFunc, FoldDimProp, FoldedData};
+pub use fold::{FoldData, FoldDimFunc, FoldDimProp, FoldedData, FoldedIntArray};
 pub use tree::{
     AllocateNode, ChunkSize, ComputeCoreletView, ComputeNode, CoreletView, DataConnect, DataInfo,
     DstVia, GtrInfo, Loc, LoopDim, LoopInfo, LoopNode, NodeKind, ScheduleNode, Size, SyncNode,
@@ -167,6 +169,14 @@ pub enum Refusal {
         /// serde's message.
         message: String,
     },
+    /// An unknown key inside a `dataStageParam_` entry's `ss_`/`el_` — the `DT_CHECK(0)` of
+    /// `DataStructDims::importJsonObj` (`dsc/dims.cpp:429-431`).
+    UnknownDimsField {
+        /// The key.
+        field: String,
+        /// The stage being read, for the evidence.
+        stage: String,
+    },
 }
 
 impl core::fmt::Display for Refusal {
@@ -209,6 +219,9 @@ impl core::fmt::Display for Refusal {
             Self::MalformedProgram { message } => write!(f, "malformed program: {message}"),
             Self::MalformedOp { message } => write!(f, "malformed op: {message}"),
             Self::MalformedNode { message } => write!(f, "malformed schedule node: {message}"),
+            Self::UnknownDimsField { field, stage } => {
+                write!(f, "unknown DataStructDims field {field:?} in stage {stage:?}")
+            }
         }
     }
 }
@@ -216,14 +229,18 @@ impl core::fmt::Display for Refusal {
 impl std::error::Error for Refusal {}
 
 /// THE WHOLE FILE — one entry per program, keyed by name (`{ "0_rmsq_o728": {...} }`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ `PartialEq` ONLY (see [`WireOp`]): the ops carry floating-point dims.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WireFile {
     /// The programs, in file order.
     pub programs: Vec<WireProgram>,
 }
 
 /// ONE PROGRAM — the sdsc-level fields the lowering reads, plus the ops.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ `PartialEq` ONLY (see [`WireOp`]): the ops carry floating-point dims.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WireProgram {
     /// The key the file named the program by.
     pub name: String,
@@ -239,7 +256,11 @@ pub struct WireProgram {
 }
 
 /// ONE OP — the `dscs_` entry's inner object (`rmsq_o728` in the fixture).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ `PartialEq` ONLY, NOT `Eq`: [`DataStructDims`](self::DataStructDims)'s plain members are
+/// `f64` in the C++ (`dsc/dims.h:163-204`) and stay floating-point here, so the op is not
+/// hash-keyed the way the tree's integer-only values are.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WireOp {
     /// The op's own name (the entry's key).
     pub name: String,
@@ -253,6 +274,13 @@ pub struct WireOp {
     pub num_corelets_used_dsc2: i64,
     /// `scheduleTree_` — the nodes, in file order.
     pub schedule_tree: Vec<ScheduleNode>,
+    /// `dataStageParam_` — id → the stage's steady-state/epilogue dims (`dsc/dsc2.cpp:1122-1133`).
+    pub data_stage_param: BTreeMap<i64, dims::DataStage>,
+    /// `constantInfo_` — id → the four imported constant fields (`dsc/dsc2.cpp:1134-1151`).
+    pub constant_info: BTreeMap<i64, dims::ConstantInfo>,
+    /// `computeOp_` — the compute op list, read by the design-space import
+    /// (`dsc/designSpaceConfig.cpp:7308-7370`); the dsc2 import has no arm for it.
+    pub compute_op: Vec<dims::ComputeOp>,
     /// `labeledDs_` — the labeled dataspaces the allocate nodes and DataInfos index into.
     pub labeled_ds: Vec<LabeledDs>,
 }
@@ -325,6 +353,12 @@ struct WireOpJson {
     num_corelets_used_dsc2: i64,
     #[serde(rename = "scheduleTree_", default)]
     schedule_tree: Vec<serde_json::Value>,
+    #[serde(rename = "dataStageParam_", default)]
+    data_stage_param: serde_json::Value,
+    #[serde(rename = "constantInfo_", default)]
+    constant_info: serde_json::Value,
+    #[serde(rename = "computeOp_", default)]
+    compute_op: serde_json::Value,
     #[serde(rename = "labeledDs_", default)]
     labeled_ds: Vec<WireLabeledDsJson>,
 }
@@ -522,6 +556,9 @@ fn read_op(name: &str, op: WireOpJson) -> Result<WireOp, Refusal> {
         core_ids_used: op.core_ids_used,
         num_corelets_used_dsc2: op.num_corelets_used_dsc2,
         schedule_tree: tree,
+        data_stage_param: dims::data_stage_param(&op.data_stage_param)?,
+        constant_info: dims::constant_info(&op.constant_info)?,
+        compute_op: dims::compute_ops(&op.compute_op)?,
         labeled_ds,
     })
 }

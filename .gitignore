@@ -4,6 +4,10 @@
 # crates/cli/tui is its own standalone workspace (excluded from the root one,
 # see root Cargo.toml) — its build output lands here, not under /target/.
 /crates/cli/tui/target/
+# The deeptools bridge work happens in worktrees whose sessions share one
+# machine; a private target dir keeps a parallel cargo run from going green on
+# someone else's build.
+/crates/compiler/deeptools-lowering-target/
 **/*.rs.bk
 /bench_results/
 .claude/worktrees/
