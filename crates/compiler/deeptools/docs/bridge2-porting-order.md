@@ -1,0 +1,1860 @@
+# Bridge 2 — the port list, winnowed to what scratchy's architecture needs
+
+`DataflowIR -> SentientIR`, the D1-D28 span. **384 functions to port**, out of 490 definitions in the
+span; **106 are excluded** and listed at the bottom with the reason for each.
+
+## ⛔ WHAT THE EXCLUSION CRITERION IS, AND WHAT IT IS NOT
+
+⭐ **EXCLUDED = SCRATCHY'S ARCHITECTURE WILL NEVER NEED IT**, not *we do not support it yet*. Three
+kinds, and each is a fact about our design rather than a judgement about the function:
+
+1. **C++ field accessors and data members (81).** `unsigned getElementWidth() { return
+   element_width_; }` is a struct field in Rust. There is no function to port.
+2. **MLIR pass machinery (19).** `createXPass`, `populateXConversionPatterns`, `getDependentDialects`,
+   the pass context, pattern-driver configuration. `#[forward]` runs the whole pipeline at macro
+   expansion — there is no pass manager, no pattern driver and no rewriter at run time.
+3. **MLIR printing, parsing and verification (5).** This crate EMITS and never reads back; an island
+   is emit-only and no MLIR text reaches it.
+
+⛔⛔ **NOTHING IS EXCLUDED FOR BEING HARD, UNFINISHED, OR LOOP-DEPENDENT.** The 50 loop-sensitive
+functions (22+14+14 across levels 0-2) are **DEFERRED, NOT EXCLUDED** — they stay on this list and
+are ported when tiling lands and the corpus is regenerated.
+
+⛔ **AND EVERY EXCLUSION IS LISTED, SO ANY ONE CAN BE OVERRULED.** See the bottom section.
+
+## ⛔ THE RULES OF EXECUTION
+
+- ⛔ **PORT means the WHOLE function, INCLUDING its emission.** A predicate is not a port. Levels 0-2
+  were once reported complete when what existed was one documented predicate per function with every
+  emission missing and nothing calling any of it.
+- ⛔ **If our IR cannot express a function's input, ADD THE OP TO THE ISLAND.** Deciding a function is
+  unnecessary is not the porter's judgement to make — that decision is this document's, above.
+- ⛔ **AUDIT means line by line against the C++**: every branch, constant, attribute name and value,
+  default, early return, and the order of emission.
+- ⛔ **NEVER PORT ANYTHING NEW WHILE AN AUDIT IS OUTSTANDING.**
+- ⛔ Unit tests come with the port; the vendor's own case where one exists (668 of `dcc/test`'s 825
+  `.mlir` tests carry `CHECK-SENT-IR` expectations).
+- ⛔ `cargo build -Fsuperdsc,model/granite-3.1-2b-instruct,quant/fp8-dynamic-per-channel` is the
+  acceptance gate. E2E when bridge 1 lands.
+
+## Progress
+
+`194/384 ported; 194/384 audited`
+
+Ported and audited: `AffineYieldOpLowering::matchAndRewrite` (`lower_affine_yield`, entry 001, in
+`src/bridges/dataflow_ir_to_sentient/std_affine_to_standard.rs`), `setImmutableAddrAndIncrements`
+(entry 214), and entries 002-024 — `setCoalescedBoundValues`, the six `AccessDetailsBase` setters
+that establish its access state and the seven that establish its transfer state, the
+`AccessDetailsAffine` constructor and its two setters (`setSubscriptsMap`, `setIndicesCoeffDict`),
+and `AccessDetailsAffineComposite`'s constructor plus its time setters (`setTimeAddrMap`,
+`setTimeSymbols`, `setTimeBounds`, `setTimeOffsets`, `setInterleaveGroupIndex`), all in
+`src/bridges/dataflow_ir_to_sentient/agen_access_details.rs`, and entries 025-032 — the INDIRECT
+(extract) pattern: `setStrides` and `has` (`agen_access_details.rs`), the two
+`construct*Stmt` overloads and `insertCopyAndAddStmtsHelper` (`agen_agen_to_sentient.rs`), and
+`getLoopNestLevel`, `checkIndirectMemViewForExtractOp` and `findExtractScalarOp`
+(`agen_helper.rs`), and entries 033-040 — the AgenToSentient load-consumer chain
+(`getLoadConsumer`, `setldtype`, `generateSetSendDestinationStmts`,
+`getStoreOpFromLoadStorePattern`, `findCandidateForLowering`, `addLoadChainToDeleteList`, all in
+`agen_helper.rs`) plus `isSenComponentL0LU`/`isSenComponentL0SU`
+(`dfs_dataflow_to_sentient.rs`). And entries 081-088 — the Loop Mask Tree's node layer:
+`LoopMaskNode`'s five delegating accessors (`getParentNode`, `getFirstChild`, `getNextSibling`,
+`getPrevSibling`, `getLastChild`), `LoopMaskTree::getRoot`, and the two empty destructors
+`~MaskNode`/`~LMTLoopNode` as a build-time `needs_drop` guard, in
+`src/bridges/dataflow_ir_to_sentient/vc_loop_mask_tree.rs` — where the intrusive tree became an
+arena, so the unchecked `static_cast` to the derived node is minting a `LoopMaskNodeId`, and
+`mlir::OperationNode`'s own storage and walks sit beside them unanchored, awaiting entries
+079/080/281 — and entries 106-107 have since taken it up, so the arena now carries both derived
+families.
+
+⭐ AND ENTRIES 049-056 — the six `StandardToSentient` scalar lowerings (`LowerAddIOpToSentient`,
+`LowerSubIOpToSentient`, `LowerMulIOpToSentient`, the `If` shape law, `LowerConstantIndexToSentient`,
+`LowerConstantIntToSentient`) in `src/bridges/dataflow_ir_to_sentient/std_standard_to_sentient.rs`,
+and `OperandReuse`'s two getters (`getId`, `getAbsorbtionFlag`) in `vc_operand_reuse.rs`.
+
+⭐ AND ENTRIES 041-048 — the `dataflow.opaque` lowering and the two SCF/Standard predicate maps:
+`ExtendUnitNameToCorelet`, `isSameListOfUnits`, `isTargetL3` and `lowerOpaqueOperation` in
+`src/bridges/dataflow_ir_to_sentient/dfs_dataflow_to_sentient.rs`; `getSentientCmpIPredicate`, the
+`ForOpLowering` pattern registration and `SCFToSentientLoweringPass::runOnOperation` in
+`std_scf_to_sentient.rs`; and the second `getSentientCmpIPredicate` in
+`std_standard_to_sentient.rs`.
+
+⛔ THE ISLAND GREW FOR 044, AS THE BRIEF REQUIRES. `dataflow.opaque` carried no `dbgName`, and the
+reference forwards one into the `sentient.opaque` it creates (`DataflowToSentient.cpp:2006-2007`);
+`Dataflow.td:342` declares the attribute and IBM's own input writes it
+(`dcc/test/Conversion/DataflowToSentient/opaque.mlir:35`). `Op::Opaque` became a struct payload so
+the lowering takes one typed input, and the printer emits `dbgName = ".."` first as MLIR's key order
+requires.
+
+⚠️ AND THAT ANSWER KEY FALSIFIED THREE PRINTER LINES IN THE SENTIENT ISLAND. `sentient.opaque` was
+printing `func_name = "RECIPROCAL"` (the generated enum's spelling rather than the reference's
+lowercase), `{P0 = "0"}` for the register dictionaries (the address with no `R` — `ddcv1.cpp:3350`
+writes `"R" + startAddress` and `dcc/src/Dialect/Sentient/Utils.cpp:157` strips it back off by
+position), and both dictionaries unsorted. All three are fixed, and `opaque.mlir:18` is now
+reproduced byte for byte by a unit test.
+
+⛔ 042 HAS NO CALLER AT `a0d29abbed`. A grep of every `.cpp`/`.hpp`/`.h` in the authority tree finds
+`isSameListOfUnits` exactly once, at its own definition. It is ported anyway — this document's rule
+is that deciding a function is unnecessary is not the porter's judgement — and the note on it says so.
+
+⛔ 041'S ERROR ARM IS UNREACHABLE BY CONSTRUCTION, NOT UNCHECKED. `!unit->hasAttr("corelet")` is the
+failure, and `residency_of` sends both LX halves to `Residency::Corelet { .. }` unconditionally
+(`src/units.rs:594`), so the port takes a `Corelet` and the arm has no input. Both call sites
+(`:409-411`, `:709-713`) guard on `dst_comp == LXLU || dst_comp == LXSU` before calling, which is what
+the `LxHalf` enum is.
+
+⛔ AND 047 CANNOT LOWER A MODULE YET, BY DESIGN OF THE SCHEDULE RATHER THAN OF THE PORT. Its three
+patterns are `ForOpLowering::matchAndRewrite` (entry 225, unported), `IfOpLowering::matchAndRewrite`
+(`SCFToSentient.cpp:158`) and `YieldOpLowering::matchAndRewrite` (`:241`) — and the last two are in
+neither the 384 nor the 106 exclusions. The pass is wired in with a `todo!` naming the pattern that
+owes the rewrite, because the alternative is leaving an `scf` op in a module the Sentient rung is then
+asked to schedule. The `ConversionTarget` is a THREE-valued `Legality`: `applyPartialConversion` fails
+only on ops marked ILLEGAL, and `dataflow`/`affine`/`agen` are named by neither list.
+
+⭐ AND ENTRIES 097-104 — the conditional-tree pair (`getNewDbgNameFromList`,
+`getLhsRhsOfEQPredicate`), `ConditionalSimplificationManager`'s destructor and
+`CFGSDataflowConditionalTree`'s constructor in `tf_cfgs_dataflow_conditional_tree.rs`, and
+`LocalOpNode`'s constructor with its three link reads (`getParentNode`, `getFirstChild`,
+`getNextSibling`) in `tf_flattening_local_regions.rs`.
+
+⭐ AND ENTRIES 105-108 — `LocalOpNode::getPrevSibling`, `FlatteningLocalRegionsTree`'s constructor
+and its `getRoot`, and `partitionUnits`, in `tf_flattening_local_regions.rs`. ⛔⛔ THE FAMILY MOVED
+ONTO THE SHARED ARENA HERE, which is the reconciliation entries 101-104 could not make: entry 106 is
+the `: OperationTreeBase()` the C++ names, so the tree it constructs is
+`OperationTreeBase<LocalOpNode>` from `vc_loop_mask_tree.rs` — as that layer's own banner instructs —
+instead of a second set of links, a second `getPrevSibling` walk and, at entry 180, a second
+`insertChildNode`. Entries 102-104 therefore moved from `LocalOpNode` onto the tree as one-line
+delegations, exactly as 081-083 read on `LoopMaskTree`, and `LocalOpNode` is now the payload the
+derived class adds (`units`, `is_in_region_num`). ⭐ ENTRY 107'S `DT_CHECK` SPLIT THREE WAYS: two
+conjuncts hold by construction, and `root_ != nullptr` stays an `Option` because `flatten` really does
+observe a rootless tree (`FlatteningLocalRegions.cpp:385-387`). ⛔ AND 108'S EQUALITY IS POINTER
+IDENTITY — `std::vector<Operation *>::operator==` — which is what keeps the vendor's `@diff_groups`
+four structurally identical bodies in four separate regions, in `MapVector` key order (`%0, %2, %1,
+%3`).
+
+⭐ AND ENTRIES 109-112, THE TWO RANGE PAIRS. `performFullUnroll` + `getConstantTripCount` in
+`tf_loop_unroll_for_shuffle_op.rs`, and `getMaxMutableRange` + `getMaxImmutableRange` in
+`tf_mutable_addr_splitting.rs`. ⛔⛔ 109 IS THE DECISION AND NOT THE DUPLICATION, AND THAT IS THE
+REFERENCE'S OWN SHAPE: neither overload clones a loop body — the scf one reconstructs a trip count and
+calls `loopUnrollByFactor(for_op, *trip_count)`, the affine one is the single line
+`return loopUnrollFull(for_op)` (`LoopUnrollForShuffleOp.cpp:151-165`). Those two utilities are
+upstream MLIR (`mlir/Dialect/{SCF,Affine}/Utils`), not among these 384, so `Unroll::ByFactor` /
+`Unroll::Fully` name the request the function issues and `Unroll::failed()` answers the caller's one
+question (`:135`). ⭐ THE THREE C++ FUNCTIONS COLLAPSED INTO ONE because an overload set over two loop
+kinds IS a match on a closed set — and `llvm_unreachable("unsupported loop type")` (`:148`) moved into
+`Loop::of`, where "not a loop" is an answer rather than undefined behaviour. ⛔ THE ISLAND GAINED
+`scf::Op::For` FOR EXACTLY THAT REASON (its input was inexpressible: `scf.for`'s bounds are three SSA
+VALUES where `affine.for`'s are maps, which is the whole reason one overload needs a helper and the
+other does not), wired through `operands`/`block_args`/`regions` and the printer. ⭐ AND THE NEW
+VARIANT MADE ENTRY 046's `Pattern::ForOpLowering` REACHABLE: `std_scf_to_sentient.rs`'s `pattern_for`
+was total over an `scf` that had no `scf.for` in it, so it now answers `ForOpLowering` for the op the
+pattern is registered under, and `walk_preorder` descends its region like every other. ⛔ AND 110 CARRIES
+TWO REFERENCE DEFECTS, ONE REPRODUCED AND ONE NOT: the truncating `(ub - lb) / step` under-counts when
+the step does not divide the span, and is reproduced because the factor is what the utility is asked
+for; the unguarded zero or negative trip count reaches a `uint64_t` factor behind
+`assert(unrollFactor > 0)`, and is refused instead (`TripCount` cannot hold one, and
+`Unroll::EmptyOrReversedRange` keeps the divergence visible). ⭐ 110 ALSO REFUSES EVERY ORDINARY
+`scf.for`: `arith::ConstantIntOp::classof` wants a SIGNLESS INTEGER, so `index`-typed bounds are not
+constants to it — which the island already splits as `ConstantInt` vs `Constant`, and which is
+consistent with the vendor's only test for this pass being affine throughout
+(`dcc/test/Transform/LoopUnrolForShuffleOp/ldcvti_pattern.mlir`). ⭐⭐ 111 AND 112 ARE THE SAME
+FUNCTION OVER TWO REGISTERS, AND THE REGISTERS DIVERGE BY ARCH: `EAR` is 21 bits everywhere
+(`sysdef.cpp:313`, `:336`) but `EBR` is 30 on RCUDD1A and **32** from SEN1P5 (`:321-332`, `:344-355`),
+so the immutable range is 2^40 on DD2 and 2^42 on SEN1P5 while the mutable range is 2^31 on both.
+`Arch` gained `L3_EAR_BITS`/`L3_EBR_BITS` as `Bounded<53>` — the bound is the reference's own `int64_t`
+return type, so `2^bits * bytesPerStick * 8` cannot overflow and needs no check. ⛔ THE `DT_CHECK(
+is_any_of(comp, L3LU, L3SU))` BECAME `L3Half`, and the finding that justifies it is that the two halves
+declare IDENTICAL `EAR` and `EBR` rows: the component's only function in these two queries is the
+abort, so the type is the whole of it. ⛔ AND `cl::init(-1)` IS AN `Option`, not a negative size —
+`MaxMutableSize < 0` is a sentinel test on the same variable that carries the value.
+
+⭐ 097'S CITATION IS A CALL SITE, NOT A FUNCTION. `CFGSDataflowConditionalTree.cpp:456` is inside
+`mergeConditionalBranchesInSubtree`; the function itself is `dataflow::utils::getNewDbgNameFromList`
+(`dcc/src/Dialect/dialect_utils/Dataflow/Utils.cpp:167`, 19 lines) and that is what was ported —
+head-plus-rest rather than a first-iteration flag, and a per-operation `Option<&str>` because the
+whole name is abandoned the moment one operation carries no `dbgName`.
+
+⭐ THE ISLAND GREW FOR 098, AS THE BRIEF REQUIRES. `getLhsRhsOfEQPredicate` tests
+`cmpi_op.getPredicate() != eq`, and `arith::Op::Compare` carried no predicate at all — it printed
+`arith.cmpi eq` unconditionally. `CmpIPredicate` now names the SIX signed forms
+`getSentientCmpIPredicate` accepts (`StandardToSentient.cpp:36-53`, entry 048), whose `else` is
+`DT_CHECK(0)`; the four unsigned MLIR forms are absent BY CONSTRUCTION rather than refused. `Compare`
+had no construction site crate-wide, so emission is unchanged for `Eq`.
+
+⚠️ AND THE EXTRACT HAD TRUNCATED 098: its bodies stop at `rhs = cmpi_op.getRhs(); return true;`, i.e.
+at the half of the function that produces the answer. Ported from the authority at
+`CFGSDataflowConditionalTree.cpp:519`.
+
+⭐ AND ENTRIES 073-080 — the constant-splat port name (`constValToField`), the same-block guard
+(`sameBlock`) and the use-erasing walk (`eraseOp`) in
+`src/bridges/dataflow_ir_to_sentient/vc_vector_operands.rs`; the PESFP compute-fusion pass
+(`fuseComputeOps`) in `vc_vector_chain_to_sentient_pesfp.rs`; and the Loop Mask Tree's walk, lookup
+and node layer (`LoopMaskTree::walk`, `findNodeFromOp`, `LoopMaskNode`'s constructor and its virtual
+destructor) in `vc_loop_mask_tree.rs`.
+
+⛔ 073'S RUNTIME REFUSAL IS DEAD CODE IN THE REFERENCE, AND THAT IS WHY THE DOMAIN IS A TYPE.
+`DT_ERROR` expands to `DT_CHECK_MSG(false, …)`, which THROWS (`util/dt_exception.hpp:110-121`), so
+`constValToField`'s `return ""` (`VectorOperands.cpp:261`) is unreachable and so are both callers'
+`if (value == "") { emitError; return nullopt; }` arms (`:284-287`, entries 166/167). The accepted
+domain is exactly `{0, 1, 2, 3}` — a four-variant `ConstantOperandValue` — and the `double`
+comparison chain went with it: what the chain decides is WHICH OF FOUR pseudo-unit ports
+(`SentientTypes.td:100-106`) the splat is read from, not a number.
+
+⛔⛔ 074 PROVED `kind == Constant` IS NOT `isa<arith::ConstantOp>`, AND THE TWO DISAGREE BOTH WAYS.
+`getOperandFromConstantBitstreamOp` tags a `vectorchain.constant_bitstream` operand `Constant`
+(`VectorOperands.cpp:305`) and the trivial-shuffle path re-tags an operand built over an
+`arith.constant` as `NFWD`/`ConstantBitstream` (`:317-336`). `sameBlock` asks the OP, so the port
+takes the enclosing scope as a parameter and interrogates the op class there — the precedent
+`agen_helper.rs`'s entry 038 set. ⚠️ The exemption is unreachable from the one caller today:
+`OperandReuse::setReuseInformation` guards with `type_ != Constant` (`OperandReuse.cpp:31`). Ported
+anyway.
+
+⛔ 075 CAN DELETE AN INNOCENT OP IN THE REFERENCE. `for (auto &use : op->getUses())` yields ONE ENTRY
+PER USE, so an op that reads the same result twice is pushed to `to_be_erased` twice and `e->erase()`d
+twice (`:809-819`) — a double free there, and in an arena a second erase at a stale position. The port
+deduplicates, and erases in DESCENDING position order because every position a removal invalidates is
+lexicographically greater than the one removed.
+
+⭐⭐ 076 SPLIT LEGALITY IN TWO, BECAUSE `applyPartialConversion` DOES. Sixteen patterns are installed
+(`VectorChainToSentientPESFP.cpp:1247-1255`) but only thirteen op classes are `addIllegalOp`
+(`:1262-1265`); an op that is neither legal nor explicitly illegal is still offered to the patterns
+and left alone if none matches. So `ElementWiseCompareOpLowering`, `ElementWiseSelectionOpLowering`
+and `ShuffleOpLowering` DO rewrite when they match while their ops are not required to lower —
+`Unlowered::Required` and `Unlowered::BestEffort` keep that asymmetry auditable instead of merging it
+away, and only the required work reaches the `todo!`.
+
+⭐⭐ 079 GAVE THE ARENA NODE AN `OpId`, NOT A BORROW, AND THE REFERENCE FORCED IT. A `LoopMaskTree` is
+built once per PT program unit and then threaded through three MUTATING passes — `fuseNonComputeOps`,
+`fuseComputeOps`, `lowerDanglingNonComputeOps` (`VectorChainToSentientPT.cpp:1003-1014`) — while
+`insertPTMaskOps` walks it inserting `set_mask`/`incrmask` ops (`LoweringPTMasks.cpp:74-100`). A
+`&DfirOp` held across those calls forbids exactly the rewrites the tree exists to drive, and
+`updateNode` (entry 237) exists BECAUSE a lowering replaces the op a node names. ⚠️ This diverges
+deliberately from `LocalOpNode::new` (entry 101), which took `&'p DfirOp`: that node is built, read
+and dropped inside one non-mutating walk and never asked which op it holds. And `push_child` takes the
+op by value rather than as an `Option`, so *only the synthetic root names no operation* is a type
+rather than a comment.
+
+⭐ 078 DROPPED THE `DenseMap` MEMO FOR AN ARENA SCAN, and the two answers coincide exactly: the map
+holds an entry for every node except the root (`LoopMaskTree.cpp:152`, `:179`, while `:175` inserts
+nothing) and the scan skips the root because its operation is `None`. What the map would cost is a
+second source of truth for its two writers (entries 236, 237) to keep in step — which is the bug its
+own `"op already in map - should not happen"` check exists to catch.
+
+⛔ 077'S ACTION RETURNS NOTHING, AND ONE CALLER READS AS THOUGH IT DOES NOT. `kBFS` discards the
+action's result (`(void)action(curr_node)`, `OperationTree.cpp:190`), so
+`analyzeAndInsertMaskOps`'s `signalPassFailure(); … return nullptr;` (`LoweringPTMasks.cpp:193-197`)
+does **not** stop the walk — the rest of the queue is visited and further masks are still lowered.
+Only the two GUIDED orders steer by the return value, and they are unscheduled. A test pins it.
+
+⭐ 079 PUT THE OPERATION IN THE **BASE**, WHICH IS WHERE THE REFERENCE KEEPS IT
+(`OperationNode::operation_op_`, `OperationTree.hpp:185`; `LocalOpNode(Operation *op)
+: OperationNode(op)`, `FlatteningLocalRegions.cpp:51`) — but entry 101 had already put it in the
+PAYLOAD, as a `&'p DfirOp`. In C++ there is one `insertChildNode` because the node's constructor,
+which the caller runs, has already set `operation_op_`; here the arena mints the node, so those two
+constructors reach it as TWO inserts over one shared body: `push_named_child` (an `OpId` in the base,
+so `find_node_from_op` can search it) and `push_child` (the base's `op` stays `None`; the payload
+names it). ⚠️ A tree built through the second must not be searched with `find_by_op`.
+
+⛔ **FIVE SCOPE HOLES FOUND IN THIS BATCH, NONE IN THE 384 AND NONE IN THE 106 EXCLUSIONS.**
+- The sixteen PESFP compute-pattern `matchAndRewrite` bodies (`VectorChainToSentientPESFP.cpp:328`,
+  `:569`, …) — entry 076 installs them and nothing ports them, so `fuseComputeOps` reaches a `todo!`
+  naming the first pattern it needs.
+- `VectorOperand::sameBlock`'s SECOND overload, over a
+  `SmallVectorImpl<optional<VectorOperand>>&` (`VectorOperands.cpp:670-685`), which is what
+  `VectorChainToSentientPT.cpp:142` and `VectorChainToSentientPESFP.cpp:121` actually call. Its body
+  is entry 074's applied to every element — same two failure arms, one `return success()` at the end
+  — so it is a fold over the ported one, but no caller can be built without it.
+- `VectorOperand::eraseOp`'s SECOND overload, taking a `ConversionPatternRewriter` and an
+  `erased_list` (`:829`), called from `VectorChainToSentientPESFP.cpp:1062`. It is the one that
+  deduplicates — `std::find` against both lists (`:837-841`) — which is what entry 075 had to decide
+  for itself.
+- `OperationNode::breadthFirstWalk` (`OperationTree.cpp:183`) and the six other
+  `LoopMaskNode::walk<>` specializations (`LoopMaskTree.cpp:26-93`). The BFS one is written here
+  unanchored, beside the rest of the base layer; the other six orders are not.
+- `LoopMaskNode`'s and `MaskNode`'s COPY constructors (`LoopMaskTree.hpp:33`, `:73`), and
+  `MaskNode`'s is a reference DEFECT: `MaskNode(const MaskNode &n) : LoopMaskNode(n.getOperation())`
+  copies the op and silently drops `start_val_` and `increment_`, leaving both uninitialised. Nothing
+  in the tree calls it today.
+
+⛔ **TWO HOLES IN THE VALUE-BASED SIMPLIFICATION PATH, NEITHER OF THEM MINE TO FILL.** Entry 381
+(`simplifyValueBasedConditionals`) needs the manager to be constructible and parseable, and:
+- `parseConditional` (`CFGSDataflowConditionalTree.cpp:534`) is excluded above under *MLIR
+  printing/parsing/verification*, which is a name-based misclassification — it parses no text. It
+  walks the conditional tree and fills `val_array_` with the value each iteration yields, and it is
+  the only writer of the array entry 099's destructor frees.
+- `ConditionalSimplificationManager`'s CONSTRUCTOR (`CFGSDataflowConditionalTree.hpp:55-76`, 22
+  lines) is in no batch and on no exclusion list. Entry 099 is the DESTRUCTOR at `:78`. The
+  constructor is where `is_candidate_` is decided and where `num_iterations` sizes the array, so
+  without it the destructor has nothing to own.
+
+⛔ **THREE MORE SCOPE HOLES, ALL UNDER ENTRY 261 AND ALL IN `dcc/src/Dialect/Uniform/Utils.cpp`.**
+`UniformQueryMapsCanonicalization.cpp:59` calls `simplifyQueryMapWithSameTarget` (`:1263`), which is
+the WHOLE of what the pass does to a query map — the pass without it only erases — and which in turn
+calls `getRegionOpAndIndex` (`:343`) and `getUnitsOfRegion` (`:526`). None of the three is in the 384
+or in the 106 exclusions. All three are written unanchored beside entry 261's port, the last of them
+narrowed to the two region-owning ops this island carries: the reference's walk also stops at a
+`uniform.equalize_pattern`, which `islands/dataflow_ir/dialects/uniform.rs` deliberately omits.
+
+⭐ 001/384 MOVED TO ITS OWN TRANSLATION UNIT'S HOME: `lower_affine_yield` was living in
+`dataflow_ir_to_sentient/mod.rs`, and `crustify/crates.json` homes `e001_matchAndRewrite` in
+`std_affine_to_standard.rs`. It carries its `/// Replaces:` anchor there and `mod.rs` imports it.
+
+⭐ ONE VOCABULARY, NOT TWO: 002's port and 022's arrived with their own `TimeDim` and `TimeBound`.
+022's landed first and is the one kept — its `TimeDim` is a `u32` with an `index()` accessor and its
+`kInvalid` variant is spelled `Variable`. `set_coalesced_bound_values` was rebased onto it rather
+than duplicating the pair, so `MemoryOperandIndex` and `LayoutCoeff` are all 002-008 adds to the
+shared vocabulary block.
+
+⚠️ THE AUDIT OF 002-008 CORRECTED ITS OWN CITATIONS, and one of 001's. Six field references pointed at
+the doc comment above the declaration rather than the declaration; `kMax`'s container use is
+`AccessDetails.hpp:375` not `:377`; `coalesced_bound *=` is `AccessDetails.cpp:777` not `:772`; the
+time-loop trip rule is `Helper.cpp:1815-1820`. And 001's note credited the decline to an
+`AffineParallelLowering` pattern — **dcc's copy of the pass registers no such pattern**
+(`AffineToStandard.cpp:198-206`); the reference's comment is upstream MLIR's, and dcc leaves the
+terminator alone because `scf` is already legal in its target.
+
+⚠️ **THE RE-AUDIT OF 001-024 FOUND FIVE DOCUMENTED CLAIMS THE AUTHORITY CONTRADICTS**, all in
+`agen_access_details.rs`, and no defect in the ported code itself. (1) ⛔ **024'S PROMOTION MOVES THE
+BURST OUTWARD, NOT INWARD.** `computeBurstAndGroup` scans `for (int i = time_bounds.size() - 1;
+i >= 0; --i)` (`AccessDetails.cpp:798`) over a vector whose index 0 is the OUTERMOST time dimension —
+`constructTimeLoops` builds loop `idx` inside loop `idx - 1` and stops at `loop_num = burst_index`
+(`Helper.cpp:1807-1857`), so the burst is claimed on the innermost valid dimension first and the
+promotion hands THAT dimension to the interleave group. The anchor doc said "moves the burst inward"
+and the test asserted the mirror image (burst 0 → 1, group 0), a state the scan cannot reach; it now
+replays burst 1 → 0, group 1. (2) `TimeOffsets`' `Default` was grounded in "`calculateTimeOffsets`'s
+own `const_value` fallback" — that function has no fallback, it takes `tmp_time_offsets.back()`
+unconditionally (`dialect_utils/Agen/Utils.cpp:116`); the `? … : 0` ternary at the cited lines is
+`constructIteratorCoeffDict`'s, and the real ground is that `getFlattenedAffineExpr` always emits a
+trailing constant coefficient. (3) `IndicesCoeffDict`'s `Vec` was justified by the producer's
+insertion order — a `DenseMap` preserves none; the ordered walk is `initMASData`'s over
+`ad.getIndices()` (`MutableAddrSplitting.cpp:724-737`) and the ground is positional pairing with
+`indices_`. (4) The struct's wave list stopped at entry 008 while entries 009-015's seven members are
+declared beside those. (5) The composite fixture cited `/tmp/ktir_ref/export/debug/dfir.mlir:78-84`,
+which does not exist on this host; re-pointed at
+`tests/sentient_corpus/group_0__g0_7_matmul.dfir.mlir:25-30`, with the extents it does NOT share
+stated rather than implied.
+
+⛔ **052 IS A COMMENT, NOT A FUNCTION** — `StandardToSentient.cpp:159` is the line
+`// return If(lhs) {If(rhs) true_val; else false_val} else false_val;` inside
+`ConstructIFRecursively`'s `and` branch, which the extractor read as a 0-line function called `If`.
+What it states is the SHAPE a conjunction lowers to, and that is what `NestedIf` holds; the recursion
+around it stays entry 338's. ⛔ The comment names `lhs` as the outer `if` while the code returns
+`rhs_if_op` (`:175`) — the emitted nest has the RIGHT-hand conjunct outermost.
+
+⭐ **THE THREE THAT WERE UNTICKED BY THEIR OWN AUDITS ARE NOW RE-PORTED WITH THEIR EMISSION.**
+`getLoadConsumer`, `setldtype` and `generateSetSendDestinationStmts` had been reduced to documented
+predicates; `generate_set_send_destination_stmts` now builds the `sentient.set_send_dst` and a test
+checks the three the vendor's own golden expects, verbatim
+(`dcc/test/Conversion/AgenToSentient/lx-to-sfp-bypass-1.mlir:47,55,63`).
+
+⭐ **WHAT ENTRIES 033-040 NEEDED FROM THE ISLANDS, added rather than worked around.**
+`islands/dataflow_ir/dialects/mod.rs` gained the operand/result/region/use census — `uses()` counts
+one entry per USE and descends into regions, which is what `hasOneUse()` means and what a previous
+attempt's shape-matching faked. `GenericComp` grew from 6 variants to the ones that are
+`senCompToGenericComp`'s true image, because the port could not tell `l0lu` from `l0su` while they
+folded onto one `L0`. `DfirUnit` gained `CrossPtnLink` (the fourth member of the SFP-bypass set) and
+`vectorchain::Op::Rotate` (the third rearrangement the two chain functions name). `link.rs` gained
+`PtRowUnit<ROW>`, `L0su`, `L0lu` and `CrossPtnLink` markers, because `dataflow.send %pt, %9` — a line
+in the reference's own test input — was not constructible.
+
+⛔ **THREE DISCREPANCIES THE 033-040 AUDITS FOUND IN THE REFERENCE**, each recorded beside the port
+that carries it: `getLoadConsumer`'s comment promises a `storeOp` arm the code does not have (so a
+stored load hits `emitError("unsupported loadOp consumer!")`); `generateSetSendDestinationStmts`
+binds `map_op` and never reads it; `addLoadChainToDeleteList` dereferences
+`*user->getUsers().begin()` on a rearrangement whose result nothing reads.
+
+⭐ AND ENTRIES 057-064 — `OperandReuse`'s `setReuseFlag` and `dominates` (`vc_operand_reuse.rs`),
+and the six `VectorChainHelper` units in `vc_vector_chain_helper.rs`:
+`isSentientBinaryLogicalOp`, `getInputPrecisionFromOperand`, `getResultPrecisionFromOperands`,
+`getComputePrecisionOfOp`, `hasConstantBounds` and the `merge_and_pack_type` constructor.
+
+⭐ ONE VOCABULARY, NOT TWO (AGAIN): 057/058 landed after 055/056 and were rebased onto that wave's
+`OperandTag`, `DataId` and `DataOriginId` rather than carrying a second `OperandTag` with a bare
+`int id_`. The table stays keyed by the `Val` a data origin produces — the sentinel lives in
+`DataId::Unassigned` and nowhere else, so `setReuseFlag`'s default-inserting `operator[]` gets the
+reference's `{-1, false}` from the derived `Default`. ⛔ AND `dominance_info_` DOES NOT ARRIVE WITH
+058 after all: `OpId` carries an op's path through the region tree, so `dominates` is a pure function
+of its two arguments and the reference's cached `DominanceInfo` has nothing left to hold. `dominates`
+takes two `OpId`s while the table takes a `Val`, which is the same split the C++ has (`Operation *`
+as a position here, as a map key there).
+
+⛔ 062's PACK/MERGE SHORT-CIRCUIT RUNS BEFORE THE ELEMENT-TYPE QUERY, and that order is the whole
+function: `MergeOp` appears in neither `getVectorType` nor `getCustomVectorType` (`Utils.cpp:520-702`),
+so reaching `getElementType` for one is `DT_CHECK_MSG("Type is not a known vector type")`. It is also a
+DIFFERENT answer — IBM's `gcvt.mlir` packs two `vector<128xf8E4M3FN>` and the compute reads
+`ComputePrecision = #sentient<precision fp16>`. `vectorchain.pack` and `vectorchain.merge` were added
+to the DataflowIR island for it; the pack printer is byte-exact against `fpuop.mlir:217` and the merge
+printer is derived from the `.td` and NOT byte-checked, because no vendor text writes a
+`vectorchain.merge`.
+
+⛔ AN EMPTY `affine_set` STILL HAS CONSTANT BOUNDS, and 063 must say so.
+`affine_set<(d0) : (d0 - 64 >= 0, -d0 + 63 >= 0)>` admits no integer, yet its `LB` is 64 and its `UB`
+is 63 — and it is the all-lanes-off mask of twenty `create_affine_mask` ops in
+`Conversion/VectorChainToSentientPESFP/mixed_precision.mlir`, each lowering to
+`sentient.scalar_constant {value = 0 : si64}` (`:288`, `:296`). A `LB <= UB` test in
+`hasConstantBounds` would turn twenty legal masks into an `emitOpError`.
+
+⚠️ 060/061's `fp80 -> fp8` REMAP IS UNREPRESENTABLE, WHICH IS STRONGER THAN DROPPED. MLIR's
+`Float80Type` stands in for fp8 (`VectorOperands.cpp:227-232`); `ElemType` has no F80 and
+`sen::Precision` has no `Fp80`, so the remap collapses into the type. `dlfp16` is dead in the
+reference too — `getPrecisionInString` can only produce `int<n>`, `bf16`, `mxfp<n>` or `fp<n>`.
+
+⭐ AND ENTRIES 129-136 — `TransformPagedMemView`'s de-paging base class and its use chains, all in
+`src/bridges/dataflow_ir_to_sentient/tf_transform_paged_mem_view_impl.rs` (the file's first code):
+`TPMVBase`'s three virtuals (`getUseChain`, `cloneUseChain`, `eraseMemOpAndUseChain`),
+`TPMVVector`'s constructor, `TPMVVectorLoad`'s `eraseMemOpAndUseChain` override, and three
+`TPMVComposite`/`TPMVVectorLoadStore` members — `getStoreOp`, `addTimeDimIndicesRanges`,
+`identifyTimeDimForExplicitLoops`. 13 unit tests, built from the vendor's own
+`dcc/test/Transform/TransformPagedMemView/paged_mem_view_{loads,load_and_store}.mlir` inputs. No
+equivalence tests: there is no C to call.
+
+⭐⭐ THE HEADER'S USE-CHAIN DIRECTION CONTRACT IS WRONG, AND THE TYPE FIXES IT. `TPMVBase::getUseChain`
+documents *"If `mem_op` is the first element of the returned vector, it is in order. If `mem_op` is
+the last element, it is in reverse order"* (`TransformPagedMemViewImpl.hpp:321-327`) — but BOTH dialect
+implementations put `mem_op` first, and `VectorStoreOp::cloneUseChainToNewOp` says the opposite about
+its own input two files away (*"The use chain is stored in reverse order"*, `Agen.cpp:229-230`).
+Measured: `VectorLoadOp::getUseChain` walks consumer-ward (`:115-136`) and `VectorStoreOp::getUseChain`
+walks producer-ward (`:207-222`), which is why their two `eraseOpAndUseChain` loops run in opposite
+directions (`:176-177` reversed, `:257` as-is) to compute the SAME thing — teardown consumer-first.
+`UseChain` carries the direction and `consumer_first()` is that one rule.
+
+⭐ AND THE REFERENCE'S DEAD BRANCH BECAME THE LIVE ONE. `eraseOpAndUseChain` opens
+`if (use_chain.empty()) { op->erase(); }` (`Agen.cpp:173-175`), unreachable in C++ because
+`getUseChain` asserts on a non-linear chain first. Those three asserts are one question — is the
+chain linear — and the header's own *"Empty if there isn't a use chain"* is its answer, so entry 129
+answers `UseChain::None` where the reference aborts and then that branch is exactly right: erase the
+load, leave what reads it alone.
+
+⛔ 131 AND 132 JOIN THROUGH A SYMBOL NUMBERING, AND IT IS NOW CHECKED BY A TEST.
+`addTimeDimIndicesRanges` APPENDS after `calculateIndicesRanges` on the same vector
+(`TransformPagedMemViewImpl.cpp:1010-1017`), so time dim `i` lands in slot `i + num_non_time_dims`,
+which is exactly the symbol `identifyTimeDimForExplicitLoops` looks up (`:967`) and the index
+`addConstraintsForIVRanges` reads (`:94-102`). `NonTimeDims::sym_for` holds that arithmetic once.
+⛔ The call site has TWO adjacent `int` dimension counts — `time_set_.getNumDims()` and
+`subscripts_map_.getNumDims()` (`:966`, `:1024-1025`) — so the time count arrives as the `IntegerSet`
+it is read off and the two cannot be exchanged.
+
+⛔ 131'S `DT_CHECK_MSG(b - 1 >= 0, "no special time bound values should exist")` IS A TYPE. `TimeSteps`
+is a `NonZeroU32` behind an `of(TimeBound)` door, so `kInvalid`, `kCoalesced` and the reachable
+`Steps(0)` cannot reach the subtraction and `last_index()` is total. `IvRange` widens the reference's
+`std::pair<int, int>` to `i64`: `calculateIndicesRanges` narrows an `int64_t`
+`getSingleConstantResult()` into it (`:73-75`), and the constraints these become take
+`AffineExpr::Const(i64)`.
+
+⚠️ 132'S `auto it` IS A `bool`. `if (auto it = page_dependent_time_syms_.find(...) != ...end())`
+binds the comparison, not the iterator, because `=` is looser than `!=`. The behaviour is the
+intended one; only the name misleads. Nothing was ported around it.
+
+⛔ **`TPMVBase`'S CONSTRUCTOR IS MISCLASSIFIED IN THE EXCLUSIONS.** It is binned as `comp_`
+(`…/TransformPagedMemViewImpl.hpp:30`) under *"a one-line C++ field accessor; in Rust the field
+itself"*. It is not an accessor: it is a member-initialising constructor that also seeds `mem_ops_`
+with a one-element list — and `initialize()` asserts `mem_ops_.size() == 1` in all six concrete
+classes (`:659`, `:707`, `:756`, `:1081`, `:1134`, `:1187`), so the singleton is an invariant that
+constructor establishes. Entry 136 delegates to it, so `TpmvBase::new` exists and carries NO anchor;
+the exclusion is reported rather than overruled.
+
+⛔ **AND THE EXTRACTOR KEPT ONLY TWO DEFINITIONS PER OVERRIDDEN NAME, so ten `TPMV*` overrides are in
+neither the 384 nor the 106 exclusions.** Counted in the authority: this file defines
+`eraseMemOpAndUseChain` five times (`hpp:364`, `cpp:698`, `cpp:747`, `cpp:817`, `cpp:1266`) and the
+campaign scheduled two (135 and 129); `getUseChain` three times (`hpp:328`, `cpp:673`, `cpp:721`) and
+scheduled two (133 and 126); `cloneUseChain` three times (`hpp:341`, `cpp:678`, `cpp:726`) and
+scheduled two (134 and 127); `createNewMemOp` six times over one pure virtual (`hpp:357` `= 0`, then
+`cpp:684`, `:732`, `:779`, `:1120`, `:1173`, `:1242`) and scheduled one (128). Unscheduled and
+unexcluded:
+`TPMVVectorStore::{getUseChain, cloneUseChain, eraseMemOpAndUseChain}` (`cpp:721`, `:726`, `:747`),
+`TPMVVectorLoadStore::{createNewMemOp, eraseMemOpAndUseChain}` (`cpp:779`, `:817`),
+`TPMVVectorStore::createNewMemOp` (`cpp:732`) and the three composite `createNewMemOp` overrides
+(`cpp:1120`, `:1173`, `:1242`) plus `TPMVCompositeLoadStore::eraseMemOpAndUseChain` (`cpp:1266`).
+Reported, not filled — a `Replaces:` anchor on an entry nothing scheduled would count as coverage no
+worklist asked for.
+
+⚠️ AND FOUR OF THE SIX CONCRETE CLASSES INHERIT 133/134/135 UNCHANGED, which makes the empty bodies
+live behaviour rather than fallbacks. Only `TPMVVectorLoad` and `TPMVVectorStore` override
+`getUseChain`/`cloneUseChain`; `TPMVVectorLoadStore` and every composite genuinely have no linear
+chain — a composite transfer's consumers live inside its own region, and a load-and-store pattern's
+store is reached through entry 130 instead. ⚠️ There is no trait to dispatch through yet: entries 137
+and 138 are the derived constructors, so the three virtuals are inherent methods on `TpmvBase` today
+and `erase_vector_load_and_use_chain` is `TPMVVectorLoad`'s override standing beside them as a free
+function.
+
+⭐ AND ENTRIES 121-128 — the paged-memory-view transform's page-guard and use-chain layer, all in
+`tf_transform_paged_mem_view_impl.rs`: `createInequalityCondition`, `setBuilderToInsertRef`,
+`calculateStartElementsForPage`, `createNonPagedMemView`, `cloneMemViewIfNonPaged`, `getUseChain`,
+`cloneUseChain` and `createNewMemOp`.
+
+⛔ A MUTATED `OpBuilder &` IS NOT A RETURN VALUE, and both 121 and 122 hand one back. The reference
+reassigns the caller's builder to the then-region of the `scf.if` it just built
+(`TransformPagedMemViewImpl.cpp:275`) so that whatever is emitted next lands inside the guard. Here the
+guard is a VALUE: `Condition` holds the per-dimension `BoundGuard`s and `Condition::wrap(guarded)`
+nests the statements inside-out. 122's two arms are then `InsertRef::Conditional` (wrap) and
+`InsertRef::MemOp` (hand the statements back unwrapped, for the caller to splice at the op's own
+position) — no cursor, and no way to emit into a region that was never opened.
+
+⭐ 121 IS TWO NESTED ONE-ARMED `scf.if`s AND NOT ONE `arith.andi`. The reference builds the `sge`
+guard, descends into its then-body and builds the `sle` guard there, so the four values are minted
+lb_const, lb_cond, ub_const, ub_cond and the SSA numbering follows. `BoundGuard` carries its
+predicate rather than hard-coding the pair, because 120 (`createEqualityCondition`) is the `eq`
+sibling one guard wide and belongs in this same type rather than a second one.
+
+⛔ THE ISLAND GREW `dataflow.get_paged_logical_memory_view`, WHICH IS THIS TRANSFORM'S ENTIRE INPUT —
+without it none of 123-128 had anything to run on. `PagedMemView` carries `pages: Vec<Page>`, and
+`Page` PAIRS an `idx_set` with a `start_addr`, which turns the verifier's *"there should be a start
+address and idx_set for every page"* into the pairing. `PageRect`'s per-dimension
+`PageSpan { lo, hi }` turns both *"idx_set should be hyper rectangular"* and 123's *"expected
+constant lower bound"* into the parameter type: 123 is `spans.iter().map(|span| span.lo)`, and its
+test EXECUTES that equivalence against `IntegerSet::constant_bound(Lb, dim)` rather than asserting
+it. The printer reproduces `DataflowOps.cpp:239-267` and is checked verbatim against
+`dcc/test/Dialect/Dataflow/paged_mem_view.mlir:19-22`.
+
+⚠️ AND THAT TEST FOUND A PRINTER DEFECT ONE LEVEL DOWN: `AffineExpr::Add(d1, -2)` printed
+`d1 + -2` where MLIR writes `d1 - 2`, and that is the lower half of every page whose span does not
+start at zero (`#set1` of the same file). A negative addend is now a subtraction — the same reason
+`d2 * -1` was already printed `-d2`.
+
+⭐ THE THREE ASSERTS IN 126'S WALK BECAME STOPPING CONDITIONS. `getUseChain` aborts on an op with
+more than one result and on a result with more than one use; `let [res] = results[..] else { break }`
+stops the walk at exactly those shapes, so the caller gets a chain that ends where the reference's
+assert would have fired — which is what a chain that cannot be cloned means. 127's
+`assert(isa<VectorLoadOp>(new_op))` became a parameter type instead: `VectorLoadRef` does the
+`cast<agen::VectorLoadOp>` once and 126/127/128 all take one.
+
+⭐ ONE VOCABULARY, NOT TWO (AGAIN): 121-128 landed after 129-136, in the same file, and were rebased
+onto that batch's names rather than carrying a second set. Entry 129 ported the DIALECT walk
+(`agen::VectorLoadOp::getUseChain`, `Agen.cpp:114-134`) as `vector_load_use_chain` because its
+teardown needs the same chain — so 126, whose C++ is a cast and a forward, IS that forward, and it
+answers in the `UseChain` that 133's `TPMVBase::use_chain` returns. ⛔ AND THE FORK CASE IS 129'S
+READING, WHICH IS THE STRONGER ONE: a value with two readers means there is NO chain
+(`UseChain::None`, the contract's own "Empty if there isn't a use chain",
+`TransformPagedMemViewImpl.hpp:322`), not a chain truncated at the fork — half a chain cloned into a
+guarded branch is a worse answer than none. 129's `VectorLoadOp` replaced the `VectorLoadRef` this
+batch had narrowed for itself, and gained the `getResult().getType()` that 128 rebuilds the load
+with.
+
+⭐ AND THE ISLAND GAINED THE MUTABLE HALF OF ITS OWN CENSUS, for 125/127/128: `operands_mut`,
+`results_mut`, `replace_uses_of_with` (one entry per USE, mirroring `uses()`) and
+`clone_with_fresh_results`. ⛔ `operands_mut` EXCLUDES TWO OPERANDS BY DESIGN — a link end (`Send`'s
+`to`, `Receive`'s `from`), because `link::Link` hands its two ends out once by consuming itself, and
+`vectorchain::Predicate`'s mask, which carries the type it was defined at. A send's `data` IS
+included, and that is what a chain clone re-points. ⛔ `clone_with_fresh_results` DOES NOT REMAP
+REGIONS; both callers are region-free chain ops (`Agen.cpp:114-134`).
+
+
+⭐ AND ENTRIES 065-072 — the rest of `VectorChainHelper`'s fusion and mapping layer in
+`vc_vector_chain_helper.rs` (`fuseCompareAndSelectIntoMinOrMax`, `resetSentientFMAsIfExists`,
+`redefineConstantVectors`, `getVectorBinaryToSentientBinary`,
+`getVectorElementWiseCompareOperatorToSentientBinaryOperator`, `getVectorTernaryToSentientTernary`)
+and `VectorOperand`'s two link resolvers (`getOperandFromReceiveOp`, `getOperandFromSendOp`) in
+`vc_vector_operands.rs`.
+
+⛔ 065's TWO OUT-BOOLS BECAME ONE THREE-STATE ANSWER. `bool& fusion_to_min, bool& fusion_to_max` has
+a fourth state the reference reaches only to `DT_ERROR` on it; `MinOrMaxFusion` is
+`NotFused | ToMin | ToMax` and the impossible pair is gone from the type. The arm order is the
+reference's and it carries information: `compare_gt`/`compare_ge` with the arms in the compare's own
+order is a MAX and reversed is a MIN, and `compare_lt`/`compare_le` is the transpose of that — eight
+rows, all eight pinned by a table test. `compare_eq`/`compare_neq` is the one `todo!`, and it is the
+reference's `DT_ERROR` at `VectorChainHelper.cpp:460-462`.
+
+⭐ AND 065 IS UNPORTABLE WITHOUT OPERATION EQUIVALENCE, whose comment says why:
+*"some times constant operands are duplicated, and direct match may result in spurious mismatches"*.
+`relu.mlir` is that case — `:50-51` are two separate `dense<0.0>` constants, the compare reads `%cst`
+and the selection reads `%cst_1` (`:73-74`), and it still fuses to the `max` at `:35`/`:37`.
+`dcc::OperationEquivalence` (`dcc/src/Analysis/OperationEquivalence.cpp`) is not on this list, so what
+landed is the minimum 065 needs: a `skeleton()` that clones an op, clears its regions and blanks every
+`Val`, then compares operands pairwise through their defining ops. ⛔ IT IS BLANK-AND-COMPARE RATHER
+THAN A HAND-WRITTEN PER-VARIANT TEST SO THAT NO COMPARISON CAN FALL BEHIND THE `Op` ENUM — a new
+attribute is compared the day it is added. Three divergences are documented at the function: the
+reference's `dbgName` filter has nothing to filter here, `IntegerSetAttr` equality is plain rather
+than order-insensitive, and the equivalence-class memo is omitted.
+
+⭐ 066'S WALK IS PROVABLY COMPLETE, AND THAT IS A FACT ABOUT THE ISLAND. `unit.walk<PreOrder>` visits
+every nested operation; the Rust recursion has exactly three arms because `sentient::Op::For` and
+`sentient::Op::If` are the ONLY region-carrying variants in the whole sentient island (checked across
+all seven of its dialects). `si32 = -1` is `data_id: None` — the sentinel is the absence. MAC and
+BINARY only: a unary or a ternary keeps its data IDs, which is a test.
+
+⛔ 067 IS POSITIONAL REWRITING, NOT VALUE SUBSTITUTION, and that is the difference between a port and
+a paraphrase. The reference clones the constant with an `OpBuilder` positioned at EACH USER, records
+`{owner, new result, use.getOperandNumber()}`, and only then calls `setOperand` — so one op reading a
+constant twice gets TWO clones, and a nested user gets its clone inside its own block. Both are tests.
+`!use_empty()` is a real guard: an unused vector constant is neither cloned nor erased.
+`const-vector-multiple-uses.mlir` is the golden — `%cst_1` is read six times at four depths in the
+input (`:179`, `:184`, `:185`, down to the `multiply_and_accumulate` at `:310`) and NO `dense<…>`
+survives into the expectation at `:15-24`. ⭐ AND THE SCOPE IS THE MODULE, NOT A UNIT: both call sites
+pass `module_op` (`VectorChainToSentientPT.cpp:983`, `VectorChainToSentientPESFP.cpp:1385`), so the
+port takes the whole `Program` — preamble and every unit. The `isa<VectorType,
+dataflow::CustomVectorType>` test is discharged by the variant, because `arith::Op::DenseConstant`'s
+`ty` IS a `Vector` while `Constant` is an `index` and `ConstantInt` an `i<n>`.
+
+⭐ 068 CARRIES NO `todo!` AT ALL: `vc::BinaryOp` has exactly twelve variants and the reference names
+all twelve, so its `DT_ERROR` is unreachable once the argument is a Rust enum. It is still not an
+identity — `sen::BinaryOp` has twenty, the two converts, `merge`, `pack` and the four `fcmp`s having
+no `vectorchain` counterpart. 069 is four arms for six inputs BY DESIGN: the ISA has no element-wise
+`gt`/`ge` and the caller reorders the operands instead (`VectorChainToSentientPESFP.cpp:450-485`),
+which `fcmp_select.mlir` shows both halves of — input `:136` is `compare_gt` and expectation `:48` is
+`fcmp_lt` with `opA`/`opB` swapped. ⛔ 069'S `todo!` MESSAGE SAYS "Ternary" BECAUSE THE REFERENCE'S
+DOES: it is a copy-paste from 070, kept verbatim so a grep for the text finds the C++ line.
+
+⛔ 071/072 ARE THE LINK NAME, AND THE LINK NAME IS THE OPERAND. Both resolve a peer unit plus the
+asking component into a `sen::Port`, and the reference's string arms became total matches over
+`DfirUnit`, so a nineteenth unit has to say which arm it belongs to. `generic == PT` is every
+`PtRow(_)` and `generic == CROSSPTNLINK` is one unit, both checked against `senCompToGenericComp`
+(`sys-arch-spec/arch_enums.cpp:124-211`). Goldens: `loweringXRF_with_if_branch.mlir:145` receives from
+an `l0lu` and expects `opA = #sentient<compute_port west>` (`:49`); `xrf_increments.mlir:413-457`
+receives from an `lxlu` on a PT and expects `opC = … north` (`:71`); `xrf_increments.mlir:422` sends
+to a `ptrow1` and expects `ResultForwarding = [#sentient<compute_port south>]` (`:81`).
+⭐ THE ASYMMETRY IS THE REFERENCE'S: a PE/SFP may SEND to the L0 and to either LX half, and may not
+RECEIVE from the L0 at all. ⛔ AND THE PT BRANCH OF 072 HAS NO `else` — an unmatched destination falls
+out with `link` empty into the bottom `if (link.empty())`, whose message says *"Unsupported
+destination for PE/SFP FMA"* even though the unit asking is the PT; both branches are written and the
+message is reproduced as the reference words it. Two of the four failure paths in each are
+unreachable from a resolved `DfirUnit` and are documented rather than written: `findUnitType`'s empty
+optional is a disagreement between attributes the caller resolved earlier, and
+*"Unknown receiver"*/*"Unknown destination"* is a lookup into the same table `DfirUnit::spelling`
+came out of.
+
+⛔ THE `sfpring` RE-CHECK IS A TAUTOLOGY IN THE REFERENCE ITSELF: 071's
+`stringToSenComponents.at(unit_str) == SFP` sits inside `else if (record->second == SFP)`, where
+`record->second` IS that lookup. And 072's `emitWarning` arm — SFP→SFP below DD1 — is unreachable on
+every arch this crate builds for, which is what `supports_sfp_ring` says; it is written because it is
+the function and it is where an older generation lands the day one is added to `IsaGen`.
+
+⭐ THE ISLAND GREW FOR 066/067, AS THE BRIEF REQUIRES. Both are IN-PLACE REWRITES and the islands were
+emit-only, so `dialects::vals_mut`/`operands_mut`/`regions_mut` arrived in the DataflowIR island
+(`dialects/mod.rs`) as ONE total match with no wildcard arm — a new op cannot be silently skipped by
+the rewriters — plus `Role` to tell an operand from a result, `ProgramUnits::iter_mut`, and a
+`pub(super) val_mut` on `SendEnd`/`RecvEnd`/`Predicate` for `setOperand`. ⛔ `Predicate::val_mut`
+CANNOT TOUCH ITS `ty`, so the invariant that type exists for still holds.
+
+⭐ AND ENTRIES 137-142 — the two leaf constructors of the de-paging hierarchy and its manager, the
+unit filter, and the loop-info query: `TPMVVectorLoad`/`TPMVCompositeLoad` in
+`tf_transform_paged_mem_view_impl.rs`, `TransformPagedMemViewManager::run` in
+`tf_transform_paged_mem_view_manager.rs`, `removeCoresCoreletsFoldsFromProgramUnit` and
+`isDataTransfer` in `tf_unit_filtering.rs`, and `getDataflowForLoopInfoIfIV` in `tf_utils.rs`.
+49 unit tests. No equivalence tests: there is no C to call.
+
+⛔ 137 AND 138 ARE THE **DERIVED** CONSTRUCTORS, NOT THE CLASSES THEY ARE NAMED AFTER, which is the
+same reading entry 136's anchor records: `hpp:397` is the mem-initializer `: TPMVVector(mem_op, comp)
+{}`, so `e137_TPMVVector` is `TPMVVectorLoad`'s constructor and `e138_TPMVComposite` (`hpp:519`) is
+`TPMVCompositeLoad`'s. Six leaf types exist because entry 139's ENTIRE content is choosing which one
+to build — a single struct would make that function return the same thing six times — and the five
+siblings of 137/138 carry no anchor because the extractor deduplicated them by text
+(`: TPMVVector(mem_op, comp) {}` at `hpp:397`, `:415`, `:433`; `: TPMVComposite(…)` at `:519`, `:534`,
+`:549`).
+
+⛔ 137'S SIBLING DROPS AN ARGUMENT ON PURPOSE. `TPMVVectorLoadStore(Operation *mem_op,
+agen::VectorStoreOp &store_op, SenComponents comp)` forwards `mem_op` and `comp` and keeps the store
+NOWHERE (`hpp:431-433`); `initialize` re-derives it through entry 130's `getStoreOp` and appends it to
+`mem_ops_` (`Impl.cpp:512-520`). The parameter and its fate are kept in the port, because a signature
+quietly narrowed to two arguments would hide the reason entry 130 exists.
+
+⛔ 138'S OWN INPUT HAS NO ISLAND OP, AND THAT IS RECORDED RATHER THAN INVENTED. `agen.composite_load`
+and `agen.composite_store` (`paged_mem_view_loads.mlir:331`, `paged_mem_view_stores.mlir:361`) are two
+of the eleven `agen` ops the island does not declare; only `composite_load_and_store` is present, so
+two of the three composite leaves are reachable from a vendor test and from nothing this crate emits.
+The campaign's *add the op to the island* rule was applied to entry 139's actual input — the paged view
+itself, which the 121-128 wave added — and minting two composite ops no emitter produces would be the
+stand-in the crate rules forbid.
+
+⛔ 139's DISPATCH IS ASYMMETRIC AND THE ASYMMETRY IS THE PORT. Both load-and-store arms build a
+`TPMVVectorLoadStore` over the **load** (`TransformPagedMemViewManager.cpp:32`, `:46`) — even the arm
+that reached the pattern from the store and had to walk BACK to the load, where the reference passes
+`load_op` and not the op it was handed. `Selection` carries that choice; a port that passed `op`
+through both arms would type-check and de-page the wrong op.
+
+⛔ 140's TWO FILTER FINDINGS, both recorded beside the port. `getCoreId` returns **-1** for a unit with
+no `core` attribute (`DccExtContext.cpp:78-124`) and -1 is in no filter set, so a non-empty
+`filter-cores-except` ERASES the HBM handle — modelled as `Residency::Global` having no core. And a
+`Residency::CoreWide` unit carries `corelet = 0` explicitly while a `Residency::Scratchpad` carries
+none, so `filter-corelets-except=1` erases the first and keeps the second; that is the reason
+`Residency` distinguishes them. The vendor's own `core_filtering_edge_case.mlir` (32 `lxlu-CL0`
+handles, `filter-cores-except=0`, one survivor) is reproduced as a test.
+
+⛔ 142 DEPARTS FROM THE REFERENCE ON ONE VALUE, DELIBERATELY. `(ub - lb) / step` is an `int64_t` there
+and its only consumer feeds it to `new std::optional<int64_t>[num_iterations]`
+(`CFGSDataflowConditionalTree.hpp:74-75`), so `4 to 0` sizes an array with **-4** and a zero step
+divides by zero. `Iterations` is unsigned and saturates at zero; `LoopStep` is positive by
+construction. The truncating division is kept as the reference's (`0 to 7 step 2` is three, not four),
+because the array the caller sizes with it is the reference's too. ⛔ Its `scf` arm is ported and not
+declined: `dyn_cast<scf::ForOp>` is the FIRST cast in the body (`Utils.cpp:99`) and case 3 of
+`Transform/CFGSimplificationDataflowLevel/simplify-conditional.mlir:241` is *"Same as 2. but with
+scf.for instead of affine.for"* — answering `None` there would have been a port that declines the
+reference's own test.
+
+⚠️ AND A CARRYING `scf.for` FALSIFIED THE `scf.yield` PRINTER. It printed `scf.yield %3` while the
+reference writes `scf.yield %20 : index` (`simplify-conditional.mlir:311`) and every `scf.yield` with
+operands under `dcc/test` carries its types — the same mandatory `type($results)` the `affine.yield`
+printer already carried a note about, unreachable until an `scf.for` could carry an `iter_args`.
+Fixed, with the two vendor loops as printer tests, and 001's terminator test now asserts the type list.
+
+⭐ AND ENTRIES 159-166 — the sync's destination sort and the SFP's permutation namer:
+`getUnitNameFromAListOfGetUnitOp`, `areCoreletsDifferent` and `separateBasedOnDestinationUnits` in
+`dfs_dataflow_to_sentient.rs`, `OperandReuse::insertIfNotExists` in `vc_operand_reuse.rs`,
+`getMaskValueConstantForNonPT`, `checkValidityOfPackAndShuffleLowering` and
+`getMergeTypeFromIndices` in `vc_vector_chain_helper.rs`, and `getOperandFromConstantOp` in
+`vc_vector_operands.rs`. 32 unit tests. No equivalence tests: there is no C to call.
+
+⛔ THE ISLAND GREW THREE TIMES FOR THIS WAVE, EACH FOR A FUNCTION WHOSE INPUT IT COULD NOT SPELL.
+(1) `dataflow.create_group` — 161's FOURTH bucket is `dyn_cast<CreateGroupOp>` and nothing else
+(`DataflowToSentient.cpp:780-782`), and its only caller branches on that list being non-empty
+(`:796-800`), so without the op the port would have been the same function with one arm deleted; the
+vendor writes it six units wide at `dcc/test/L3SU/sync-op-l3su.mlir:75`. (2)
+`arith::Op::DenseConstant` held `one: bool`, and 166 accepts 0, 1, **2 and 3** through
+`constValToField` (`VectorOperands.cpp:250-262`) with `dense<2>` real input
+(`VectorChainToSentientPESFP/splat.mlir:68`) — a boolean made two of the four compute ports
+unreachable, so the field is now an `i64` splat and MLIR's `%e` float spelling is emitted from it.
+(3) `vectorchain::LaneMask::as_set` — 089 and 163 each reconstructed the prefix form's elided
+`mask_set`, and two derivations of one set is one too many; 089 now reads it from there.
+
+⛔⛔ 161'S `// corelet = 1` COMMENT IS WRONG AND THE CODE IS WHAT IS PORTED. The test is
+`getAttr("corelet") == getI32IntegerAttr(0)`, so a destination with NO `corelet` — the LX scratchpad,
+`Residency::Scratchpad` — lands in `src_dst_lx_corelet1` beside the genuine corelet-1 units, and
+`lowerSyncLXL3ToLXL3` then treats that list as a corelet-1 region. The same null means `false` in 160,
+where both disjuncts need an attribute; and `Residency::CoreWide` prints `corelet = 0 : i32`
+(`UnitMaterializer.cpp:62-80` against `:142-152`), so an L3 half IS on corelet 0 to `getAttr` — which
+is why the `substr(0, 2) != "l3"` prefix test has to be decided first.
+
+⛔ 163 EMITS NOTHING AND THAT IS THE REFERENCE'S OWN SPLIT: the `sentient.scalar_constant` is created
+by the header template `getMaskValueForNonPT` (entry 229, `VectorChainHelper.hpp:114-125`), which owns
+the builder. Its answer is always 0 across the corpus — every one-dimensional `mask_set` a
+`create_affine_mask` carries in the 825 `.mlir` files is the all-lanes-live
+`(d0 - N >= 0, -d0 + (N-1) >= 0)`, so `from_slice` is one past the last slice and the range is EMPTY
+(`fnms_with_cast.mlir:11-12`, `:20`). ⛔ WHICH IS WHY `from_slice` MUST NOT BE UPPER-BOUNDED: refusing
+`64 / 8 == 8` would refuse every mask IBM writes. A negative `lb / lanes_per_slice` wraps through
+`unsigned` there and answers 0, reproduced as 0; a `to_slice` past the eight-bit slice mask is `1 << i`
+out of range and is declined, which no mask in the corpus reaches. ⛔ AND THE MASK **PARAMETER** IS
+IGNORED ON THIS SIDE where the PT folds it in — `fold_mode_df.mlir:92` carries a `%c0` this path never
+reads.
+
+⛔⛔ 165'S TABLE ORDER IS LOAD-BEARING AND IBM'S OWN TEST PROVES IT. `pack0` and `pack16` have
+IDENTICAL rows (`VectorChainHelper.cpp:374`, `:383`) and the scan returns the FIRST match, so `pack16`
+is unreachable: `dcc/test/SFP/merge_and_pack.mlir:232` writes a pack it NAMES `%pack16` and the
+reference lowers it to `binary_operator pack0`. So the 34 rows are a `Vec` and not a map, and all 34
+are pinned as one golden against that file's ordered `CHECK-SENT-IR`. ⭐ `scale` is why one table
+serves four element widths, and a row holding `-1` cannot widen; the checksum filter applies only at
+`scale == 1`; `repetition` is a member DEFAULT of eight that no row overrides (`:310`).
+
+⭐ 164'S OUT-PARAMETER BECAME A TYPE, WHICH IS WHAT 165 AND 277 TAKE. `ValidPackIndices` can only be
+minted by the four gates passing, so the checked list cannot be swapped for another on the way to the
+scan, and `DT_CHECK_MSG((pack_op || shuffle_op))` is discharged by the `PackOrShuffle` witness.
+⛔ `index > 2 * (int)indices.size()` is STRICTLY greater, so `index == 2 * size` is admitted; that is
+reproduced and noted, and nothing downstream indexes with these.
+
+⚠️ 160 HAS NO CALLER AT `a0d29abbed` — a grep of the authority tree finds the symbol once, at its own
+definition; its neighbours decide the corelet split inline or through 161. Ported anyway, as 042 was.
+
+⭐ AND ENTRIES 175-182 — `updateYieldArgs` in `vc_lowering_xrf.rs`; `opHasSideEffect` and
+`mergeShallow` in `tf_cfgs_dataflow_conditional_tree.rs`; `CanonicalizeToggleDataflowPass::
+runOnOperation` in `tf_canonicalize_toggle.rs`; and the Flattening tree's `clear`, `traverseRegion`,
+`inRegionEmpty` and `cloneOpsForRegions` in `tf_flattening_local_regions.rs`. ⛔⛔ THE ISLAND GAINED A
+WHOLE DIALECT HERE, AS THE BRIEF REQUIRES: `uniform.uniformize_regions` is the op this entire pass
+family is about, and it was inexpressible. `islands/dataflow_ir/dialects/uniform.rs` declares its four
+ops — `uniformize_regions` with a `LocalRegion` per arm (a unit list, a block argument and a body),
+`yield`, `def_immutable_mapping` and `query_map` — as the eighth `dialects::Op` variant, wired through
+`operands`/`results`/`regions`/`block_args` and the printer, and answered in 22 census arms across the
+bridge. Every one of those arms is a `dyn_cast` in the reference that a `uniform.` op fails, and each
+carries the reason it fails rather than a catch-all.
+
+⛔⛔ 180 AND 182 ARE THE FLATTENING ITSELF, AND 182 IS WHERE THE BINDER MOVES. `traverseRegion` walks a
+local region attributing every operation to every unit and stamping its parent's region index;
+`cloneOpsForRegions` then rebuilds ONE equivalence class's body, dropping the nested
+`uniform.uniformize_regions` and splicing in the operations of whichever of its regions belongs to that
+class (`:235-238`). ⛔ THE REGION AN OPERATION CAME FROM HAS TO BE FOUND BY POINTER IDENTITY, NOT BY
+`is_in_region_num`: `compute` stamps `false` — 0 — for EVERY region of a uniformized op (`:164`), so
+the field cannot tell region 1 from region 0, and `:250-251` asks the parent which of its bodies holds
+this operation instead. That is what lets `uniform.query_map(map:%285, key:%arg48)` come out reading the
+NEW region's block argument (`flatten_local_region4.mlir:757` becomes `:355`), which is the whole point
+of the pass. ⭐ AND `if (block.empty()) block.erase()` (`:269`) IS AN EMPTY `Vec` HERE, because the
+island already records a blockless region as an empty `else_body` — the vendor's own flattened
+`scf.if` at `:353-357` prints no `else`, so the case is live rather than theoretical.
+
+⛔ 180 ENDS AT A `todo!` NAMING ENTRY 247, ON THE REFERENCE'S OWN `isa<>`. `traverseRegion` hands a
+nested `uniform.uniformize_regions` to `compute` (`:137-138`), which is entry 247 at level 2 and
+unported; the walk therefore refuses exactly the input the reference routes elsewhere, and every region
+of fixtures 1-3 and fixture 4's outer region walk completely. Same shape as 178, whose one rewrite is
+`DuplicateReusedToggle`'s pattern at level 6: the driver is ported, the `todo!` names the entry that
+owes the rewrite, and it is gated on the real match condition so a program with no reused toggle is a
+checked no-op.
+
+⛔ 181 HAS NO CALLER ANYWHERE IN THE AUTHORITY TREE, AND THE REASON IS A DEFECT WORTH RECORDING. It is
+declared (`:88`), defined (`:214`) and referenced nowhere else. The place that wants it is `:269` — is
+this region empty — and it would have answered WRONGLY there, twice over: `is_in_region_num` is 0 for
+every local region's children (`:164`) so a full region reads empty, and the predicate cannot see the
+unit-class filter at `:233` that decides what actually gets cloned. Ported anyway, per this document's
+rule that deciding a function is unnecessary is not the porter's judgement, with a test that pins the
+wrong answer rather than a port that quietly corrects it.
+
+⭐ THE ISLAND ALSO GAINED `Values::clone_without_regions` (MLIR's `Operation::cloneWithoutRegions`),
+`scf::Op::If::results` and `affine::Op::If::dbg_name`. The result list is not cosmetic: 177 keeps the
+DESTINATION's terminator when `dst->getNumResults() != 0` and the source's otherwise (`:420-428`), its
+caller picks which of two candidates is the destination by the same question (`:237-247`), and
+`areShallowlyMergeable` declines outright when both bind something (`:348`) — three decisions that a
+census answering "none" for every `scf.if` would have made constant. And the `dbgName` on an
+`affine.if` is there because `mergeShallow`'s candidates are `isa<affine::AffineIfOp, scf::IfOp>`
+(`:34`), so an `affine.if` reaches `setDbgNameAttr` on the same path.
+
+⛔ AND `UNITS.tsv`'s CALLEE COLUMN IS WRONG FOR FOUR OF THESE EIGHT. 175's is `-` because the extract
+truncated the body one line early, at `setOperands`, dropping `return getXrfValue(yield_op, idx)` — so
+the real edge is 175 → 090, and the tail is the half that makes the function a function rather than a
+mutation. 178's is `e001_matchAndRewrite`, but `AffineYieldOpLowering` has nothing to do with this pass;
+the pattern it adds is `e350_matchAndRewrite`. 177's names `e052_If`, which `mergeShallow` does not
+call. 180's is `-` although the body calls `compute` at `:138`. The ports follow the authority, not the
+column.
+
+⚠️ AND ONE OF THIS BATCH'S OWN TESTS PASSED FOR THE WRONG REASON BEFORE IT PASSED FOR THE RIGHT ONE.
+182's case-4 test built its `Values` counter at zero, so the clone minted `%4` while the fixture it was
+cloning still read the ORIGINAL `%4` — printing `%4 = arith.subi %2, %4`, which looks exactly like a
+clone correctly reading a value from outside the region. It was caught by reading the output rather than
+the assertion, and the fixture now starts its counter past the program (`values_past(300)`), which is
+also why the pinned text can be read against `flatten_local_region4.mlir:345-358` line for line.
+
+⭐ AND ENTRIES 191-198 — `calculateFullShift` and `calculateDimWeights` in
+`tf_mutable_start_addr_shifting.rs`; `ProgramUnitsReductionPass::matchUnits` in
+`tf_program_units_reduction.rs`; `analyzeLoop` and `transformLoop` in
+`tf_transform_loop_to_legalize_for_sentient_lowering.rs`; `TransformPagedMemViewPass::runOnOperation`
+in `tf_transform_paged_mem_view.rs`; and `calculateIndicesRanges` and
+`createConditionsForHyperRectSubscripts` in `tf_transform_paged_mem_view_impl.rs`.
+
+⛔ 191'S TERNARY IS NOT A BOUNDS CHECK, AND ITS CONSTANT COLUMN IS NOT A LITERAL IN THE SUBSCRIPT.
+`coeffs.size() != num_dims ? coeffs.back() : 0` (`:478`) reads like an index guard; the flattened row
+is `num_dims + num_syms + num_locals + 1` wide, so it is longer than `num_dims` for every expression
+that flattens at all and the `: 0` arm is dead. What the guard shields is FAILURE — a non-affine
+subscript leaves `coeffs` EMPTY and `coeffs.back()` is then undefined behaviour. The island gained
+MLIR's flattener for this (`AffineExpr::flatten` and `FlatAffineExpr` in `islands/dataflow_ir/ty.rs`,
+`getFlattenedAffineExpr`), which names the constant column instead of counting the row's width: it is
+the whole reason 191 cannot pattern-match an `Add` against a literal, because `(d0 + 5) floordiv 8`
+has a 5 in it and a constant column of ZERO, and shifting 5 out of it would move the start address
+eight times too far. The locals carry what they stand for, so `(x floordiv 2) + (x floordiv 2)` is ONE
+column of coefficient 2 — a difference an enclosing `mod 2` can see.
+
+⛔⛔ 195'S `ub_const.value()` IS SAFE ONLY BECAUSE 194 ORDERS ITS TESTS THE WAY IT DOES. The three
+`getDefiningOp<arith::ConstantIndexOp>()`s at `:417-421` are read with no null check, and an `scf.for`
+whose bound is an `arith.select` would fault there — it cannot arrive, because `analyzeLoop` tests
+`!constant_bounds` at `:340-343` and the register file only at `:347-390`, so a non-constant `scf.for`
+on a unit that owns one leaves as `KSplitParent` and never reaches `KUnroll`. ⭐⭐ THE VENDOR PROVES IT
+ON AN INPUT WHERE BOTH TESTS MATCH: `dyn-loops-cond-bound.mlir` runs on `ptrow0` with an
+`arith.select` bound whose induction variable is read by a store on `pt_lrfreg`, and the expectation
+is an `scf.if`, not an unrolled loop. ⭐ `KSplitParent` is therefore `scf.for`-only —
+`!constant_bounds && !affine_non_const_maps` is `!cb && cb` on the affine path — and 195's
+`affine.for` arm for it is unreachable rather than merely unused.
+
+⛔⛔ AND 198'S `num_dim_vars++` RUNS BEFORE THE `continue`, which is what makes the new subscripts map
+renumber correctly for a dimension whose selected range is the whole range: the position is spent
+whether or not a condition is emitted for it. `getConstantBound(LB/UB, dim)` there is a bound on the
+loop ITERATOR, not on a view axis — `page_sel_constraints` is the page set with its dimensions
+replaced by the symbol-form subscripts map's results, one symbol per iterator — which is why
+`arg1 * 3` confined to `[0, 1]` prints `cmpi eq %arg1, 0` in
+`paged_mem_view_loads.mlir:45-56`, and why the reference's two-field skip test is a single `==` on two
+values of the same kind here. ⭐ 197 REUSES ENTRY 142 rather than re-walking the nest, and 142 is
+STRICTER than the reference's own walk — it requires the value to BE the induction variable, so a
+carried `iter_arg` answers "not an IV" — and it appends, because the time dimensions follow at
+entry 131.
+
+⭐ AND ENTRIES 151-158 — the AgenToSentient helpers for the composite regions, the extract-scalar
+pattern and the SAMV: `checkCompositeRegion`, `checkStoreOpFromExtractPattern`,
+`isLoadAndExtractScalarPattern`, `isReceiveAndExtractScalarPattern`, `updateSymbolicAccessDetails`,
+`getStoreProducer`, `constructSetActiveMaskValueOp` and `createUniformizeRegionsOp`, all in
+`agen_helper.rs`.
+
+⛔⛔ 157'S `numvalidentry` IS TWO COUNTS IN ONE FIELD AND A FULL COUNT ENCODES AS ZERO. The inner
+dimension's valid count is shifted by the bits the outer needs (or the reverse when the cross-slice
+mask is the inner one), and both counts are rewritten to 0 when they equal their own width
+(`Helper.cpp:2681`, `:2708`) — so the field never has to hold the width, and reading it as a plain
+count would place the mask a whole dimension out. ⭐ THE VENDOR'S FIVE CASES ARE THE TEST:
+`set_transfer_mask_state.mlir` gives `numvalidentry`/`sliceid_xsl`/`xslinner`/`wsllen` for three
+generic maps and the two degenerate ones, and all five are asserted. The three-pattern
+`slice_mask_map` enum is what types away `isUnmask`, `isFullMask`, `isGenericSAMV`, `getSliceIDXsl`
+and the reference's four mask-attribute `DT_CHECK_MSG`s; the reference also computes `mask_wsl_elems`
+and never reads it (`:2648`).
+
+⛔ 155 NEEDS AN OPERATION MAPPING, NOT JUST A VALUE ONE. `ir_map.lookupOrDefault(ad.getOp())` answers
+with the clone because `Operation::clone(IRMapping&)` records `map(this, newOp)` — so `OpMapping`
+joins `ValueMapping` in `agen_helper.rs`, keyed by address as the C++ keys on `Operation*`. This is
+also what promoted `AccessDetailsSymbolic` to carry its `AccessDetailsBase`: five of the six handles
+entry 155 rewrites live on the base, and `mem_ref_` had no field at all.
+
+⛔ 151 TAKES THE TERMINATOR'S OPERANDS BESIDE THE REGION. The island's `agen.yield` is a unit
+variant, and 151's store arms ask what the region YIELDS (`hasOneUse` against the yield, at
+`Helper.cpp:283-288`) — so `yielded: &[Val]` is passed alongside the body rather than reshaping the op
+at twenty match sites. Its load arm's send_data check is unreachable in the reference itself and gets
+no outcome, on the precedent entry 031's `ViewStart` set.
+
+⛔ TWO ISLAND GAPS ARE RECORDED RATHER THAN STOOD IN FOR, both in 156: there is no
+`vectorchain.coalesce`, so the coalesce-store arm and its *"must be preceded by
+dataflow.receiveOp."* have nothing to match, and no `dataflow.create_multicast_group`, so two of the
+four producer classes its `DT_CHECK` accepts cannot arrive. Each outcome exists and carries the
+reference's message; neither is given a substitute op. 158'S `"active"` ATTRIBUTE IS NOT IR — it is
+set, searched for backwards from the loop and removed by the last region, all within the pass, so it
+is a field on the returned record instead of an attribute on the emitted op.
+
+⭐ AND ENTRIES 206-213 — the chunking and shuffle info, the affine record's own initialization, the
+container's two accessors, and the four `Helper.cpp` gatekeepers: `constructChunkAndShuffleInfo`,
+`initialize`, `emplace_insert`, `getFirst` (all in `agen_access_details.rs`),
+`checkBasicConditions`, `processInterleaveOp`, `gatherAffineLoadStoreDetails` and
+`constructImmutableAddress` (all in `agen_helper.rs`).
+
+⛔⛔ 206 WORKS ON A ROW-MAJOR **COPY** AND ITS TWO CURSORS START AT `-1`. A column-major layout is
+reversed all but its trailing constant term, and the extents with it (`AccessDetails.cpp:111-123`),
+while the members keep their own order. The `chunk_dim_idx`/`chunk_stride_dim_idx` pair is
+`Option<usize>` here, and the legality test the reference indexes with one (`:191`) is skipped when
+there is none — observably the same, because `chunk_stride` is 0 in exactly that case and its `&&`
+fails. `dim == 0`'s multiplier is `INT32_MAX` verbatim (`:147-149`); a zero stride divides by zero
+there, and with no ratio the extent has nothing to fit under, so it lands on the reference's own
+*"Extent in load/store set is larger than from the layout"*.
+
+⛔ 212 PUTS THE SAME START ADDRESS IN **TWO** CONTAINERS (`Helper.cpp:570-573`) — `mutable_addrs`,
+which entry 357 rewrites, and a local copy entry 213 then reads as `updated_mem_view_start_addrs` —
+and 213'S TWO ARMS DO NOT READ THE SAME WAY: the L3 arm reads the record, the other indexes
+`updated_mem_view_start_addrs[i]` BY POSITION (`:1229`), which is in range only because of the size
+test above it and means the same thing only because 212 filled both containers from one walk. 212's
+coefficient rows are zero-filled as each iterator is first seen and written at column `i`, so a
+column means "record `i`" even for an iterator the earlier records never mentioned.
+
+⛔ ONE `todo!` IS ADDED, AND IT IS GATED ON THE ONE INPUT ENTRY 357 PROVABLY LEAVES ALONE: with no
+access details, `generateAffineAddressManipulationStmts`' own `DT_CHECK` holds trivially, both of its
+loops (`Helper.cpp:698`, `:771`) run zero times and it returns `success()`. Every other input reaches
+statements this port does not have, and no stand-in op is substituted for them.
+
+⛔ NINE OF THE REFERENCE'S TWELVE `agen` TRANSFER CLASSES AND `agen.composite_memory_interleave` HAVE
+NO ISLAND OP. 210 is handed a `CheckedOp` (any DataflowIR op, or the already-lowered
+`sentient.receive_and_store` whose only readable state is the mark) and 211 a `MemoryInterleave` (the
+`granularity` attribute and the region's ops), on the precedent of `IndirectMemView` and
+`UniformizeSource`; both matches are total and neither invents an op. 211'S IDENTITY TEST IS THE OP
+**NAME** (`:361`, `:380-381`), not the attributes, so a region holding a `load_and_send` beside a
+`receive_and_store` with matching burst and count is still refused — and its granularity default is
+the maximum and is never checked, so `l3BurstSize` itself is legal and 0 is not.
+
+
+## Level 0
+
+- [x] **PORT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, 8 lines
+- [x] **AUDIT 001/384** `matchAndRewrite` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:41`, line by line against the C++
+- [x] **PORT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, 5 lines
+- [x] **AUDIT 002/384** `setCoalescedBoundValues` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:672`, line by line against the C++
+- [x] **PORT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, 2 lines
+- [x] **AUDIT 003/384** `setIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:77`, line by line against the C++
+- [x] **PORT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, 2 lines
+- [x] **AUDIT 004/384** `setMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:81`, line by line against the C++
+- [x] **PORT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, 2 lines
+- [x] **AUDIT 005/384** `setMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:93`, line by line against the C++
+- [x] **PORT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, 2 lines
+- [x] **AUDIT 006/384** `setLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:96`, line by line against the C++
+- [x] **PORT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, 2 lines
+- [x] **AUDIT 007/384** `setMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:99`, line by line against the C++
+- [x] **PORT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, 2 lines
+- [x] **AUDIT 008/384** `setShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:104`, line by line against the C++
+- [x] **PORT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, 2 lines
+- [x] **AUDIT 009/384** `setRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:107`, line by line against the C++
+- [x] **PORT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, 2 lines
+- [x] **AUDIT 010/384** `setExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:110`, line by line against the C++
+- [x] **PORT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, 2 lines
+- [x] **AUDIT 011/384** `setExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:113`, line by line against the C++
+- [x] **PORT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, 2 lines
+- [x] **AUDIT 012/384** `setTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:116`, line by line against the C++
+- [x] **PORT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, 2 lines
+- [x] **AUDIT 013/384** `setElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:119`, line by line against the C++
+- [x] **PORT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, 2 lines
+- [x] **AUDIT 014/384** `setTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:122`, line by line against the C++
+- [x] **PORT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, 2 lines
+- [x] **AUDIT 015/384** `setTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:125`, line by line against the C++
+- [x] **PORT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, 0 lines
+- [x] **AUDIT 016/384** `AccessDetailsBase` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:218`, line by line against the C++
+- [x] **PORT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, 2 lines
+- [x] **AUDIT 017/384** `setSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:228`, line by line against the C++
+- [x] **PORT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, 2 lines
+- [x] **AUDIT 018/384** `setIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:231`, line by line against the C++
+- [x] **PORT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, 0 lines
+- [x] **AUDIT 019/384** `AccessDetailsAffine` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:259`, line by line against the C++
+- [x] **PORT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, 2 lines
+- [x] **AUDIT 020/384** `setTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:286`, line by line against the C++
+- [x] **PORT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, 2 lines
+- [x] **AUDIT 021/384** `setTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:289`, line by line against the C++
+- [x] **PORT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, 2 lines
+- [x] **AUDIT 022/384** `setTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:292`, line by line against the C++
+- [x] **PORT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, 2 lines
+- [x] **AUDIT 023/384** `setTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:295`, line by line against the C++
+- [x] **PORT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, 2 lines
+- [x] **AUDIT 024/384** `setInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:299`, line by line against the C++
+- [x] **PORT 025/384** `setStrides` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:355`, 2 lines
+- [x] **AUDIT 025/384** `setStrides` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:355`, line by line against the C++
+- [x] **PORT 026/384** `has` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:397`, 2 lines
+- [x] **AUDIT 026/384** `has` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:397`, line by line against the C++
+- [x] **PORT 027/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:230`, 4 lines
+- [x] **AUDIT 027/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:230`, line by line against the C++
+- [x] **PORT 028/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:248`, 4 lines
+- [x] **AUDIT 028/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:248`, line by line against the C++
+- [x] **PORT 029/384** `insertCopyAndAddStmtsHelper` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:502`, 17 lines
+- [x] **AUDIT 029/384** `insertCopyAndAddStmtsHelper` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:502`, line by line against the C++
+- [x] **PORT 030/384** `getLoopNestLevel` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:43`, 6 lines
+- [x] **AUDIT 030/384** `getLoopNestLevel` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:43`, line by line against the C++
+- [x] **PORT 031/384** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, 42 lines
+- [x] **AUDIT 031/384** `checkIndirectMemViewForExtractOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:388`, line by line against the C++
+- [x] **PORT 032/384** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, 20 lines
+- [x] **AUDIT 032/384** `findExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:514`, line by line against the C++
+- [x] **PORT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, 36 lines
+- [x] **AUDIT 033/384** `getLoadConsumer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1242`, line by line against the C++
+- [x] **PORT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, 60 lines
+- [x] **AUDIT 034/384** `setldtype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1647`, line by line against the C++
+- [x] **PORT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, 49 lines
+- [x] **AUDIT 035/384** `generateSetSendDestinationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2731`, line by line against the C++
+- [x] **PORT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, 8 lines
+- [x] **AUDIT 036/384** `getStoreOpFromLoadStorePattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2872`, line by line against the C++
+- [x] **PORT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, 12 lines
+- [x] **AUDIT 037/384** `findCandidateForLowering` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2884`, line by line against the C++
+- [x] **PORT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, 9 lines
+- [x] **AUDIT 038/384** `addLoadChainToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2975`, line by line against the C++
+- [x] **PORT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, 2 lines
+- [x] **AUDIT 039/384** `isSenComponentL0LU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:96`, line by line against the C++
+- [x] **PORT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, 2 lines
+- [x] **AUDIT 040/384** `isSenComponentL0SU` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:100`, line by line against the C++
+- [x] **PORT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, 11 lines
+- [x] **AUDIT 041/384** `ExtendUnitNameToCorelet` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:104`, line by line against the C++
+- [x] **PORT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, 10 lines
+- [x] **AUDIT 042/384** `isSameListOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:175`, line by line against the C++
+- [x] **PORT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, 6 lines
+- [x] **AUDIT 043/384** `isTargetL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1720`, line by line against the C++
+- [x] **PORT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, 27 lines
+- [x] **AUDIT 044/384** `lowerOpaqueOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1984`, line by line against the C++
+- [x] **PORT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, 16 lines
+- [x] **AUDIT 045/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:33`, line by line against the C++
+- [x] **PORT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, 0 lines
+- [x] **AUDIT 046/384** `ConversionPattern` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:70`, line by line against the C++
+- [x] **PORT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, 30 lines
+- [x] **AUDIT 047/384** `runOnOperation` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:251`, line by line against the C++
+- [x] **PORT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, 18 lines
+- [x] **AUDIT 048/384** `getSentientCmpIPredicate` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:36`, line by line against the C++
+- [x] **PORT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, 9 lines
+- [x] **AUDIT 049/384** `LowerAddIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:79`, line by line against the C++
+- [x] **PORT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, 10 lines
+- [x] **AUDIT 050/384** `LowerSubIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:90`, line by line against the C++
+- [x] **PORT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, 9 lines
+- [x] **AUDIT 051/384** `LowerMulIOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:102`, line by line against the C++
+- [x] **PORT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, 0 lines
+- [x] **AUDIT 052/384** `If` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:159`, line by line against the C++
+- [x] **PORT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, 8 lines
+- [x] **AUDIT 053/384** `LowerConstantIndexToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:347`, line by line against the C++
+- [x] **PORT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, 15 lines
+- [x] **AUDIT 054/384** `LowerConstantIntToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:358`, line by line against the C++
+- [x] **PORT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, 6 lines
+- [x] **AUDIT 055/384** `getId` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:65`, line by line against the C++
+- [x] **PORT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, 6 lines
+- [x] **AUDIT 056/384** `getAbsorbtionFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:73`, line by line against the C++
+- [x] **PORT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, 2 lines
+- [x] **AUDIT 057/384** `setReuseFlag` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:91`, line by line against the C++
+- [x] **PORT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, 2 lines
+- [x] **AUDIT 058/384** `dominates` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:38`, line by line against the C++
+- [x] **PORT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, 4 lines
+- [x] **AUDIT 059/384** `isSentientBinaryLogicalOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:30`, line by line against the C++
+- [x] **PORT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, 6 lines
+- [x] **AUDIT 060/384** `getInputPrecisionFromOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:36`, line by line against the C++
+- [x] **PORT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, 10 lines
+- [x] **AUDIT 061/384** `getResultPrecisionFromOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:52`, line by line against the C++
+- [x] **PORT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, 13 lines
+- [x] **AUDIT 062/384** `getComputePrecisionOfOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:65`, line by line against the C++
+- [x] **PORT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, 10 lines
+- [x] **AUDIT 063/384** `hasConstantBounds` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:80`, line by line against the C++
+- [x] **PORT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, 6 lines
+- [x] **AUDIT 064/384** `size` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:319`, line by line against the C++
+- [x] **PORT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, 49 lines
+- [x] **AUDIT 065/384** `fuseCompareAndSelectIntoMinOrMax` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:415`, line by line against the C++
+- [x] **PORT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, 13 lines
+- [x] **AUDIT 066/384** `resetSentientFMAsIfExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:468`, line by line against the C++
+- [x] **PORT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, 37 lines
+- [x] **AUDIT 067/384** `redefineConstantVectors` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:571`, line by line against the C++
+- [x] **PORT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, 17 lines
+- [x] **AUDIT 068/384** `getVectorBinaryToSentientBinary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:32`, line by line against the C++
+- [x] **PORT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, 9 lines
+- [x] **AUDIT 069/384** `getVectorElementWiseCompareOperatorToSentientBinaryOperator` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:55`, line by line against the C++
+- [x] **PORT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, 7 lines
+- [x] **AUDIT 070/384** `getVectorTernaryToSentientTernary` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:247`, line by line against the C++
+- [x] **PORT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, 54 lines
+- [x] **AUDIT 071/384** `getOperandFromReceiveOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:34`, line by line against the C++
+- [x] **PORT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, 50 lines
+- [x] **AUDIT 072/384** `getOperandFromSendOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:95`, line by line against the C++
+- [x] **PORT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, 12 lines
+- [x] **AUDIT 073/384** `constValToField` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:250`, line by line against the C++
+- [x] **PORT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, 11 lines
+- [x] **AUDIT 074/384** `sameBlock` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:652`, line by line against the C++
+- [x] **PORT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, 16 lines
+- [x] **AUDIT 075/384** `eraseOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:806`, line by line against the C++
+- [x] **PORT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, 26 lines
+- [x] **AUDIT 076/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1243`, line by line against the C++
+- [x] **PORT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, 2 lines
+- [x] **AUDIT 077/384** `walk` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:132`, line by line against the C++
+- [x] **PORT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, 4 lines
+- [x] **AUDIT 078/384** `findNodeFromOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:167`, line by line against the C++
+- [x] **PORT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, 0 lines
+- [x] **AUDIT 079/384** `OperationNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:32`, line by line against the C++
+- [x] **PORT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, 0 lines
+- [x] **AUDIT 080/384** `LoopMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:34`, line by line against the C++
+- [x] **PORT 081/384** `getParentNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:36`, 2 lines
+- [x] **AUDIT 081/384** `getParentNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:36`, line by line against the C++
+- [x] **PORT 082/384** `getFirstChild` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:39`, 2 lines
+- [x] **AUDIT 082/384** `getFirstChild` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:39`, line by line against the C++
+- [x] **PORT 083/384** `getNextSibling` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:42`, 2 lines
+- [x] **AUDIT 083/384** `getNextSibling` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:42`, line by line against the C++
+- [x] **PORT 084/384** `getPrevSibling` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:45`, 2 lines
+- [x] **AUDIT 084/384** `getPrevSibling` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:45`, line by line against the C++
+- [x] **PORT 085/384** `getLastChild` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:48`, 2 lines
+- [x] **AUDIT 085/384** `getLastChild` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:48`, line by line against the C++
+- [x] **PORT 086/384** `MaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:74`, 0 lines
+- [x] **AUDIT 086/384** `MaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:74`, line by line against the C++
+- [x] **PORT 087/384** `LMTLoopNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:94`, 0 lines
+- [x] **AUDIT 087/384** `LMTLoopNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:94`, line by line against the C++
+- [x] **PORT 088/384** `getRoot` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:109`, 2 lines
+- [x] **AUDIT 088/384** `getRoot` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:109`, line by line against the C++
+- [x] **PORT 089/384** `getMaskValueForPT` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp:17`, 196 lines
+- [x] **AUDIT 089/384** `getMaskValueForPT` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Helper.cpp:17`, line by line against the C++
+- [x] **PORT 090/384** `getXrfValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:248`, 11 lines
+- [x] **AUDIT 090/384** `getXrfValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:248`, line by line against the C++
+- [x] **PORT 091/384** `getForOpBound` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:262`, 31 lines
+- [x] **AUDIT 091/384** `getForOpBound` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:262`, line by line against the C++
+- [x] **PORT 092/384** `setSentientMacXrfRegIncrAttr` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:665`, 11 lines
+- [x] **AUDIT 092/384** `setSentientMacXrfRegIncrAttr` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:665`, line by line against the C++
+- [x] **PORT 093/384** `replaceAndEraseDummyMacOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:681`, 7 lines
+- [x] **AUDIT 093/384** `replaceAndEraseDummyMacOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:681`, line by line against the C++
+- [x] **PORT 094/384** `computeUnitPrecision` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:31`, 9 lines
+- [x] **AUDIT 094/384** `computeUnitPrecision` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:31`, line by line against the C++
+- [x] **PORT 095/384** `isOperationSelected` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34`, 2 lines
+- [x] **AUDIT 095/384** `isOperationSelected` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:34`, line by line against the C++
+- [x] **PORT 096/384** `createDummyYieldInElseReg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383`, 13 lines
+- [x] **AUDIT 096/384** `createDummyYieldInElseReg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:383`, line by line against the C++
+- [x] **PORT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, 2 lines
+- [x] **AUDIT 097/384** `getNewDbgNameFromList` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:456`, line by line against the C++
+- [x] **PORT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, 11 lines
+- [x] **AUDIT 098/384** `getLhsRhsOfEQPredicate` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:519`, line by line against the C++
+- [x] **PORT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, 2 lines
+- [x] **AUDIT 099/384** `ConditionalSimplificationManager` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:78`, line by line against the C++
+- [x] **PORT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, 5 lines
+- [x] **AUDIT 100/384** `TransformationConditionalTree` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:111`, line by line against the C++
+- [x] **PORT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, 0 lines
+- [x] **AUDIT 101/384** `OperationNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:51`, line by line against the C++
+- [x] **PORT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, 2 lines
+- [x] **AUDIT 102/384** `getParentNode` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:53`, line by line against the C++
+- [x] **PORT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, 2 lines
+- [x] **AUDIT 103/384** `getFirstChild` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:56`, line by line against the C++
+- [x] **PORT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, 2 lines
+- [x] **AUDIT 104/384** `getNextSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:59`, line by line against the C++
+- [x] **PORT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, 2 lines
+- [x] **AUDIT 105/384** `getPrevSibling` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:62`, line by line against the C++
+- [x] **PORT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, 0 lines
+- [x] **AUDIT 106/384** `OperationTreeBase` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:78`, line by line against the C++
+- [x] **PORT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, 2 lines
+- [x] **AUDIT 107/384** `getRoot` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:81`, line by line against the C++
+- [x] **PORT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, 17 lines
+- [x] **AUDIT 108/384** `partitionUnits` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:168`, line by line against the C++
+- [x] **PORT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, 7 lines
+- [x] **AUDIT 109/384** `performFullUnroll` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:141`, line by line against the C++
+- [x] **PORT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, 14 lines
+- [x] **AUDIT 110/384** `getConstantTripCount` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:167`, line by line against the C++
+- [x] **PORT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, 8 lines
+- [x] **AUDIT 111/384** `getMaxMutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:673`, line by line against the C++
+- [x] **PORT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, 8 lines
+- [x] **AUDIT 112/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:683`, line by line against the C++
+- [x] **PORT 113/384** `isEligibleForSplitting` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:832`, 20 lines
+- [x] **AUDIT 113/384** `isEligibleForSplitting` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:832`, line by line against the C++
+- [x] **PORT 114/384** `sortDataBasedOnWeight` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:855`, 4 lines
+- [x] **AUDIT 114/384** `sortDataBasedOnWeight` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:855`, line by line against the C++
+- [x] **PORT 115/384** `createNewMemViewWithMod` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:966`, 12 lines
+- [x] **AUDIT 115/384** `createNewMemViewWithMod` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:966`, line by line against the C++
+- [x] **PORT 116/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:355`, 8 lines
+- [x] **AUDIT 116/384** `getMaxImmutableRange` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:355`, line by line against the C++
+- [x] **PORT 117/384** `transformSCFToAffineLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:102`, 44 lines
+- [x] **AUDIT 117/384** `transformSCFToAffineLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:102`, line by line against the C++
+- [x] **PORT 118/384** `removeValuesFromIndices` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:36`, 7 lines
+- [x] **AUDIT 118/384** `removeValuesFromIndices` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:36`, line by line against the C++
+- [x] **PORT 119/384** `replaceDimsInMapWithSyms` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:47`, 7 lines
+- [x] **AUDIT 119/384** `replaceDimsInMapWithSyms` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:47`, line by line against the C++
+- [x] **PORT 120/384** `createEqualityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:253`, 7 lines
+- [x] **AUDIT 120/384** `createEqualityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:253`, line by line against the C++
+- [x] **PORT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, 14 lines
+- [x] **AUDIT 121/384** `createInequalityCondition` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:263`, line by line against the C++
+- [x] **PORT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, 6 lines
+- [x] **AUDIT 122/384** `setBuilderToInsertRef` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:280`, line by line against the C++
+- [x] **PORT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, 10 lines
+- [x] **AUDIT 123/384** `calculateStartElementsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:532`, line by line against the C++
+- [x] **PORT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, 10 lines
+- [x] **AUDIT 124/384** `createNonPagedMemView` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:545`, line by line against the C++
+- [x] **PORT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, 9 lines
+- [x] **AUDIT 125/384** `cloneMemViewIfNonPaged` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:633`, line by line against the C++
+- [x] **PORT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, 3 lines
+- [x] **AUDIT 126/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:673`, line by line against the C++
+- [x] **PORT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, 3 lines
+- [x] **AUDIT 127/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:678`, line by line against the C++
+- [x] **PORT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, 9 lines
+- [x] **AUDIT 128/384** `createNewMemOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:684`, line by line against the C++
+- [x] **PORT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, 3 lines
+- [x] **AUDIT 129/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:698`, line by line against the C++
+- [x] **PORT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, 6 lines
+- [x] **AUDIT 130/384** `getStoreOp` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:843`, line by line against the C++
+- [x] **PORT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, 5 lines
+- [x] **AUDIT 131/384** `addTimeDimIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:876`, line by line against the C++
+- [x] **PORT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, 10 lines
+- [x] **AUDIT 132/384** `identifyTimeDimForExplicitLoops` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:963`, line by line against the C++
+- [x] **PORT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, 2 lines
+- [x] **AUDIT 133/384** `getUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:328`, line by line against the C++
+- [x] **PORT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, 0 lines
+- [x] **AUDIT 134/384** `cloneUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:341`, line by line against the C++
+- [x] **PORT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, 0 lines
+- [x] **AUDIT 135/384** `eraseMemOpAndUseChain` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:364`, line by line against the C++
+- [x] **PORT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, 0 lines
+- [x] **AUDIT 136/384** `TPMVBase` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:389`, line by line against the C++
+- [x] **PORT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, 0 lines
+- [x] **AUDIT 137/384** `TPMVVector` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:397`, line by line against the C++
+- [x] **PORT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, 0 lines
+- [x] **AUDIT 138/384** `TPMVComposite` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:519`, line by line against the C++
+- [x] **PORT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, 48 lines
+- [x] **AUDIT 139/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.cpp:21`, line by line against the C++
+- [x] **PORT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, 20 lines
+- [x] **AUDIT 140/384** `removeCoresCoreletsFoldsFromProgramUnit` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:240`, line by line against the C++
+- [x] **PORT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, 11 lines
+- [x] **AUDIT 141/384** `isDataTransfer` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:314`, line by line against the C++
+- [x] **PORT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, 31 lines
+- [x] **AUDIT 142/384** `getDataflowForLoopInfoIfIV` — `dcc/src/Transform/Dataflow/Utils.cpp:99`, line by line against the C++
+
+## Level 1
+
+- [ ] **PORT 143/384** `constructExtentAndTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:32`, 64 lines
+- [ ] **AUDIT 143/384** `constructExtentAndTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:32`, line by line against the C++
+- [ ] **PORT 144/384** `constructLdOrStType` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:267`, 5 lines
+- [ ] **AUDIT 144/384** `constructLdOrStType` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:267`, line by line against the C++
+- [ ] **PORT 145/384** `initializeMemViewInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:274`, 16 lines
+- [ ] **AUDIT 145/384** `initializeMemViewInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:274`, line by line against the C++
+- [ ] **PORT 146/384** `constructIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:354`, 50 lines
+- [ ] **AUDIT 146/384** `constructIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:354`, line by line against the C++
+- [ ] **PORT 147/384** `constructIteratorCoefficients` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:406`, 10 lines
+- [ ] **AUDIT 147/384** `constructIteratorCoefficients` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:406`, line by line against the C++
+- [ ] **PORT 148/384** `computeBurstAndGroup` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:796`, 36 lines
+- [ ] **AUDIT 148/384** `computeBurstAndGroup` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:796`, line by line against the C++
+- [ ] **PORT 149/384** `insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:388`, 7 lines
+- [ ] **AUDIT 149/384** `insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:388`, line by line against the C++
+- [ ] **PORT 150/384** `get` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:401`, 4 lines
+- [ ] **AUDIT 150/384** `get` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:401`, line by line against the C++
+- [x] **PORT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, 89 lines
+- [x] **AUDIT 151/384** `checkCompositeRegion` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:206`, line by line against the C++
+- [x] **PORT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, 27 lines
+- [x] **AUDIT 152/384** `checkStoreOpFromExtractPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:433`, line by line against the C++
+- [x] **PORT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, 27 lines
+- [x] **AUDIT 153/384** `isLoadAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:463`, line by line against the C++
+- [x] **PORT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, 17 lines
+- [x] **AUDIT 154/384** `isReceiveAndExtractScalarPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:493`, line by line against the C++
+- [x] **PORT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, 35 lines
+- [x] **AUDIT 155/384** `updateSymbolicAccessDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1013`, line by line against the C++
+- [x] **PORT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, 159 lines
+- [x] **AUDIT 156/384** `getStoreProducer` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1285`, line by line against the C++
+- [x] **PORT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, 161 lines
+- [x] **AUDIT 157/384** `constructSetActiveMaskValueOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2567`, line by line against the C++
+- [x] **PORT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, 57 lines
+- [x] **AUDIT 158/384** `createUniformizeRegionsOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3880`, line by line against the C++
+- [x] **PORT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, 10 lines
+- [x] **AUDIT 159/384** `getUnitNameFromAListOfGetUnitOp` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:119`, line by line against the C++
+- [x] **PORT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, 6 lines
+- [x] **AUDIT 160/384** `areCoreletsDifferent` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:132`, line by line against the C++
+- [x] **PORT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, 18 lines
+- [x] **AUDIT 161/384** `separateBasedOnDestinationUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:761`, line by line against the C++
+- [x] **PORT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, 8 lines
+- [x] **AUDIT 162/384** `insertIfNotExists` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:81`, line by line against the C++
+- [x] **PORT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, 40 lines
+- [x] **AUDIT 163/384** `getMaskValueConstantForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:93`, line by line against the C++
+- [x] **PORT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, 45 lines
+- [x] **AUDIT 164/384** `checkValidityOfPackAndShuffleLowering` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:140`, line by line against the C++
+- [x] **PORT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, 109 lines
+- [x] **AUDIT 165/384** `getMergeTypeFromIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:301`, line by line against the C++
+- [x] **PORT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, 26 lines
+- [x] **AUDIT 166/384** `getOperandFromConstantOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:267`, line by line against the C++
+- [ ] **PORT 167/384** `getOperandFromConstantBitstreamOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:299`, 5 lines
+- [ ] **AUDIT 167/384** `getOperandFromConstantBitstreamOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:299`, line by line against the C++
+- [ ] **PORT 168/384** `getOperandFromNegOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:366`, 5 lines
+- [ ] **AUDIT 168/384** `getOperandFromNegOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:366`, line by line against the C++
+- [ ] **PORT 169/384** `getName` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:866`, 11 lines
+- [ ] **AUDIT 169/384** `getName` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:866`, line by line against the C++
+- [ ] **PORT 170/384** `getLayoutMapAndIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:879`, 40 lines
+- [ ] **AUDIT 170/384** `getLayoutMapAndIndices` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:879`, line by line against the C++
+- [ ] **PORT 171/384** `isMaskEquivalentToNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:123`, 4 lines
+- [ ] **AUDIT 171/384** `isMaskEquivalentToNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:123`, line by line against the C++
+- [ ] **PORT 172/384** `areXrfAccessesLegal` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:98`, 28 lines
+- [ ] **AUDIT 172/384** `areXrfAccessesLegal` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:98`, line by line against the C++
+- [ ] **PORT 173/384** `insertConstAndAddOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:296`, 10 lines
+- [ ] **AUDIT 173/384** `insertConstAndAddOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:296`, line by line against the C++
+- [ ] **PORT 174/384** `isXrfRelated` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:531`, 31 lines
+- [ ] **AUDIT 174/384** `isXrfRelated` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:531`, line by line against the C++
+- [x] **PORT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, 8 lines
+- [x] **AUDIT 175/384** `updateYieldArgs` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:690`, line by line against the C++
+- [x] **PORT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, 13 lines
+- [x] **AUDIT 176/384** `opHasSideEffect` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:38`, line by line against the C++
+- [x] **PORT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, 60 lines
+- [x] **AUDIT 177/384** `mergeShallow` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:398`, line by line against the C++
+- [x] **PORT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, 42 lines
+- [x] **AUDIT 178/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:49`, line by line against the C++
+- [x] **PORT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, 15 lines
+- [x] **AUDIT 179/384** `clear` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:112`, line by line against the C++
+- [x] **PORT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, 17 lines
+- [x] **AUDIT 180/384** `traverseRegion` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:129`, line by line against the C++
+- [x] **PORT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, 6 lines
+- [x] **AUDIT 181/384** `inRegionEmpty` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:214`, line by line against the C++
+- [x] **PORT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, 60 lines
+- [x] **AUDIT 182/384** `cloneOpsForRegions` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:223`, line by line against the C++
+- [ ] **PORT 183/384** `expandAffineApplyOps` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183`, 53 lines
+- [ ] **AUDIT 183/384** `expandAffineApplyOps` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:183`, line by line against the C++
+- [ ] **PORT 184/384** `getLoopTripCount` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:743`, 56 lines
+- [ ] **AUDIT 184/384** `getLoopTripCount` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:743`, line by line against the C++
+- [ ] **PORT 185/384** `hasMutableAddrOverflow` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:801`, 14 lines
+- [ ] **AUDIT 185/384** `hasMutableAddrOverflow` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:801`, line by line against the C++
+- [ ] **PORT 186/384** `calculatePartitionSizes` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:862`, 97 lines
+- [ ] **AUDIT 186/384** `calculatePartitionSizes` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:862`, line by line against the C++
+- [ ] **PORT 187/384** `constructConditionals` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1000`, 59 lines
+- [ ] **AUDIT 187/384** `constructConditionals` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1000`, line by line against the C++
+- [ ] **PORT 188/384** `calculateSubscriptsCoefficients` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1188`, 11 lines
+- [ ] **AUDIT 188/384** `calculateSubscriptsCoefficients` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1188`, line by line against the C++
+- [ ] **PORT 189/384** `synthesizeTimeInfo` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1256`, 22 lines
+- [ ] **AUDIT 189/384** `synthesizeTimeInfo` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1256`, line by line against the C++
+- [ ] **PORT 190/384** `createExplicitTimeLoops` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1282`, 57 lines
+- [ ] **AUDIT 190/384** `createExplicitTimeLoops` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1282`, line by line against the C++
+- [x] **PORT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, 25 lines
+- [x] **AUDIT 191/384** `calculateFullShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:462`, line by line against the C++
+- [x] **PORT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, 26 lines
+- [x] **AUDIT 192/384** `calculateDimWeights` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:560`, line by line against the C++
+- [x] **PORT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, 77 lines
+- [x] **AUDIT 193/384** `matchUnits` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:69`, line by line against the C++
+- [x] **PORT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, 127 lines
+- [x] **AUDIT 194/384** `analyzeLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:268`, line by line against the C++
+- [x] **PORT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, 38 lines
+- [x] **AUDIT 195/384** `transformLoop` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:399`, line by line against the C++
+- [x] **PORT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, 23 lines
+- [x] **AUDIT 196/384** `runOnOperation` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:41`, line by line against the C++
+- [x] **PORT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, 25 lines
+- [x] **AUDIT 197/384** `calculateIndicesRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:56`, line by line against the C++
+- [x] **PORT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, 48 lines
+- [x] **AUDIT 198/384** `createConditionsForHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:289`, line by line against the C++
+- [ ] **PORT 199/384** `createConditionsForNonHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:342`, 35 lines
+- [ ] **AUDIT 199/384** `createConditionsForNonHyperRectSubscripts` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:342`, line by line against the C++
+- [ ] **PORT 200/384** `updateTPMVInfo` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:382`, 17 lines
+- [ ] **AUDIT 200/384** `updateTPMVInfo` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:382`, line by line against the C++
+- [ ] **PORT 201/384** `setLoopIteratorOrder` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:575`, 13 lines
+- [ ] **AUDIT 201/384** `setLoopIteratorOrder` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:575`, line by line against the C++
+- [ ] **PORT 202/384** `initialize` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:658`, 13 lines
+- [ ] **AUDIT 202/384** `initialize` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:658`, line by line against the C++
+- [ ] **PORT 203/384** `removeCoresCoreletsFoldsFromDefImmutMap` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:99`, 37 lines
+- [ ] **AUDIT 203/384** `removeCoresCoreletsFoldsFromDefImmutMap` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:99`, line by line against the C++
+- [ ] **PORT 204/384** `cleanup` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:263`, 49 lines
+- [ ] **AUDIT 204/384** `cleanup` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:263`, line by line against the C++
+- [ ] **PORT 205/384** `isDataTransferToKeep` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:327`, 10 lines
+- [ ] **AUDIT 205/384** `isDataTransferToKeep` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:327`, line by line against the C++
+
+## Level 2
+
+- [x] **PORT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, 167 lines
+- [x] **AUDIT 206/384** `constructChunkAndShuffleInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:98`, line by line against the C++
+- [x] **PORT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, 57 lines
+- [x] **AUDIT 207/384** `initialize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:295`, line by line against the C++
+- [x] **PORT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, 8 lines
+- [x] **AUDIT 208/384** `emplace_insert` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:378`, line by line against the C++
+- [x] **PORT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, 7 lines
+- [x] **AUDIT 209/384** `getFirst` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:411`, line by line against the C++
+- [x] **PORT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, 133 lines
+- [x] **AUDIT 210/384** `checkBasicConditions` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:58`, line by line against the C++
+- [x] **PORT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, 80 lines
+- [x] **AUDIT 211/384** `processInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:305`, line by line against the C++
+- [x] **PORT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, 74 lines
+- [x] **AUDIT 212/384** `gatherAffineLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:538`, line by line against the C++
+- [x] **PORT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, 16 lines
+- [x] **AUDIT 213/384** `constructImmutableAddress` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1217`, line by line against the C++
+- [x] **PORT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, 43 lines
+- [x] **AUDIT 214/384** `setImmutableAddrAndIncrements` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1581`, line by line against the C++
+- [ ] **PORT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, 50 lines
+- [ ] **AUDIT 215/384** `setsttype` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1731`, line by line against the C++
+- [ ] **PORT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, 91 lines
+- [ ] **AUDIT 216/384** `constructReceiveAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2471`, line by line against the C++
+- [ ] **PORT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, 46 lines
+- [ ] **AUDIT 217/384** `lowerVectorLoadHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2899`, line by line against the C++
+- [ ] **PORT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, 9 lines
+- [ ] **AUDIT 218/384** `lowerSetTransferMaskStateOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3815`, line by line against the C++
+- [ ] **PORT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, 79 lines
+- [ ] **AUDIT 219/384** `cloneStartAddrOutsideLoop` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3942`, line by line against the C++
+- [ ] **PORT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, 38 lines
+- [ ] **AUDIT 220/384** `cleanupTriviallyRedundantSetSendDestination` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4084`, line by line against the C++
+- [ ] **PORT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, 5 lines
+- [ ] **AUDIT 221/384** `pushBackTheUnitToListIfDoesnotExist` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:143`, line by line against the C++
+- [ ] **PORT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, 18 lines
+- [ ] **AUDIT 222/384** `createUniformRegionsWithTwoRegionsNoResult` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:153`, line by line against the C++
+- [ ] **PORT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, 57 lines
+- [ ] **AUDIT 223/384** `lowerL3SyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:375`, line by line against the C++
+- [ ] **PORT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, 61 lines
+- [ ] **AUDIT 224/384** `lowerL3SyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:667`, line by line against the C++
+- [ ] **PORT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, 69 lines
+- [ ] **AUDIT 225/384** `matchAndRewrite` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:72`, line by line against the C++
+- [ ] **PORT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, 61 lines
+- [ ] **AUDIT 226/384** `createIfOpFromMapping` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:123`, line by line against the C++
+- [ ] **PORT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, 0 lines
+- [ ] **AUDIT 227/384** `OperandReuse` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:30`, line by line against the C++
+- [ ] **PORT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, 49 lines
+- [ ] **AUDIT 228/384** `validateLoweringAndSetMissingParameters` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:483`, line by line against the C++
+- [ ] **PORT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, 9 lines
+- [ ] **AUDIT 229/384** `getMaskValueForNonPT` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:114`, line by line against the C++
+- [ ] **PORT 230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196`, 24 lines
+- [ ] **AUDIT 230/384** `convertStringToType` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:196`, line by line against the C++
+- [ ] **PORT 231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:223`, 22 lines
+- [ ] **AUDIT 231/384** `convertTypeToString` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:223`, line by line against the C++
+- [ ] **PORT 232/384** `getOperandFromLoadOrStoreOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:153`, 94 lines
+- [ ] **AUDIT 232/384** `getOperandFromLoadOrStoreOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:153`, line by line against the C++
+- [ ] **PORT 233/384** `eraseOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:690`, 46 lines
+- [ ] **AUDIT 233/384** `eraseOperands` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:690`, line by line against the C++
+- [ ] **PORT 234/384** `setValue` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp:72`, 3 lines
+- [ ] **AUDIT 234/384** `setValue` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp:72`, line by line against the C++
+- [ ] **PORT 235/384** `createSentientConstants` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:34`, 31 lines
+- [ ] **AUDIT 235/384** `createSentientConstants` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:34`, line by line against the C++
+- [ ] **PORT 236/384** `addMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:136`, 16 lines
+- [ ] **AUDIT 236/384** `addMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:136`, line by line against the C++
+- [ ] **PORT 237/384** `updateNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:155`, 10 lines
+- [ ] **AUDIT 237/384** `updateNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:155`, line by line against the C++
+- [ ] **PORT 238/384** `computeLoops` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:173`, 18 lines
+- [ ] **AUDIT 238/384** `computeLoops` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:173`, line by line against the C++
+- [ ] **PORT 239/384** `insertPTMaskOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:41`, 164 lines
+- [ ] **AUDIT 239/384** `insertPTMaskOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:41`, line by line against the C++
+- [ ] **PORT 240/384** `getLayoutExpr` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:28`, 67 lines
+- [ ] **AUDIT 240/384** `getLayoutExpr` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:28`, line by line against the C++
+- [ ] **PORT 241/384** `createForOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:129`, 56 lines
+- [ ] **AUDIT 241/384** `createForOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:129`, line by line against the C++
+- [ ] **PORT 242/384** `createIfOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:189`, 56 lines
+- [ ] **AUDIT 242/384** `createIfOpWithReturnValue` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:189`, line by line against the C++
+- [ ] **PORT 243/384** `insertDummyMacOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:312`, 15 lines
+- [ ] **AUDIT 243/384** `insertDummyMacOp` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:312`, line by line against the C++
+- [ ] **PORT 244/384** `isHoistable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:82`, 9 lines
+- [ ] **AUDIT 244/384** `isHoistable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:82`, line by line against the C++
+- [ ] **PORT 245/384** `enumerateCollectionUnit` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:34`, 57 lines
+- [ ] **AUDIT 245/384** `enumerateCollectionUnit` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:34`, line by line against the C++
+- [ ] **PORT 246/384** `FlatteningLocalRegionsTree` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:79`, 0 lines
+- [ ] **AUDIT 246/384** `FlatteningLocalRegionsTree` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:79`, line by line against the C++
+- [ ] **PORT 247/384** `compute` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:151`, 15 lines
+- [ ] **AUDIT 247/384** `compute` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:151`, line by line against the C++
+- [ ] **PORT 248/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:70`, 68 lines
+- [ ] **AUDIT 248/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:70`, line by line against the C++
+- [ ] **PORT 249/384** `processComputeUnit` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:37`, 91 lines
+- [ ] **AUDIT 249/384** `processComputeUnit` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:37`, line by line against the C++
+- [ ] **PORT 250/384** `initMASData` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:707`, 31 lines
+- [ ] **AUDIT 250/384** `initMASData` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:707`, line by line against the C++
+- [ ] **PORT 251/384** `setupForPartitioning` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:819`, 6 lines
+- [ ] **AUDIT 251/384** `setupForPartitioning` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:819`, line by line against the C++
+- [ ] **PORT 252/384** `fillPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1063`, 117 lines
+- [ ] **AUDIT 252/384** `fillPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1063`, line by line against the C++
+- [ ] **PORT 253/384** `adjustForEvenImmutableAddr` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1204`, 47 lines
+- [ ] **AUDIT 253/384** `adjustForEvenImmutableAddr` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:1204`, line by line against the C++
+- [x] **PORT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, 22 lines
+- [x] **AUDIT 254/384** `offsetShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:590`, line by line against the C++
+- [x] **PORT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, 27 lines
+- [x] **AUDIT 255/384** `applyShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:616`, line by line against the C++
+- [x] **PORT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, 76 lines
+- [x] **AUDIT 256/384** `runOnOperation` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:152`, line by line against the C++
+- [x] **PORT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, 3 lines
+- [x] **AUDIT 257/384** `analyzeAndTransform` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:441`, line by line against the C++
+- [x] **PORT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, 22 lines
+- [x] **AUDIT 258/384** `addConstraintsForIVRanges` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:86`, line by line against the C++
+- [x] **PORT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, 10 lines
+- [x] **AUDIT 259/384** `createNewSubscriptsFromStartElements` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:562`, line by line against the C++
+- [x] **PORT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, 32 lines
+- [x] **AUDIT 260/384** `gatherPageDependentDimsForPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:927`, line by line against the C++
+- [x] **PORT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, 41 lines
+- [x] **AUDIT 261/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UniformQueryMapsCanonicalization.cpp:55`, line by line against the C++
+- [x] **PORT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, 98 lines
+- [x] **AUDIT 262/384** `removeCoresCoreletsFoldsFromUniformizeRegion` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:139`, line by line against the C++
+- [x] **PORT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, 18 lines
+- [x] **AUDIT 263/384** `removeAncestors` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:339`, line by line against the C++
+- [x] **PORT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, 66 lines
+- [x] **AUDIT 264/384** `createForOpWithAdditionalReturnValue` — `dcc/src/Transform/Dataflow/Utils.cpp:28`, line by line against the C++
+
+## Level 3
+
+- [ ] **PORT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, 18 lines
+- [ ] **AUDIT 265/384** `constructDetails` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:418`, line by line against the C++
+- [ ] **PORT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, 112 lines
+- [ ] **AUDIT 266/384** `coalesceTimeDimensions` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:681`, line by line against the C++
+- [ ] **PORT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, 109 lines
+- [ ] **AUDIT 267/384** `constructTimeLoopsAndVectorOperations` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1789`, line by line against the C++
+- [ ] **PORT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, 177 lines
+- [ ] **AUDIT 268/384** `constructLoadAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2167`, line by line against the C++
+- [ ] **PORT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, 114 lines
+- [ ] **AUDIT 269/384** `constructLoadAndExtractScalarOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2351`, line by line against the C++
+- [ ] **PORT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, 8 lines
+- [ ] **AUDIT 270/384** `addStoreInputToDeleteList` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2987`, line by line against the C++
+- [ ] **PORT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, 37 lines
+- [ ] **AUDIT 271/384** `lowerCompositeMemoryInterleaveOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3775`, line by line against the C++
+- [ ] **PORT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, 13 lines
+- [ ] **AUDIT 272/384** `insertInitializationStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3834`, line by line against the C++
+- [ ] **PORT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, 180 lines
+- [ ] **AUDIT 273/384** `lowerL0LXSyncOperationForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:189`, line by line against the C++
+- [ ] **PORT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, 222 lines
+- [ ] **AUDIT 274/384** `lowerL0LXSyncOperationForAGroupOfUnits` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:438`, line by line against the C++
+- [ ] **PORT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, 68 lines
+- [ ] **AUDIT 275/384** `LowerSymbolQueryMap` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:40`, line by line against the C++
+- [ ] **PORT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, 44 lines
+- [ ] **AUDIT 276/384** `setReuseInformation` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.cpp:17`, line by line against the C++
+- [ ] **PORT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, 108 lines
+- [ ] **AUDIT 277/384** `getGCVTorFCVTTypeFromIndicesAndCastInputs` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:188`, line by line against the C++
+- [ ] **PORT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, 36 lines
+- [ ] **AUDIT 278/384** `getOperandFromShuffleOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:311`, line by line against the C++
+- [ ] **PORT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, 110 lines
+- [ ] **AUDIT 279/384** `createSplatOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/Splat.cpp:70`, line by line against the C++
+- [ ] **PORT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, 7 lines
+- [ ] **AUDIT 280/384** `cleanup` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1056`, line by line against the C++
+- [ ] **PORT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, 2 lines
+- [ ] **AUDIT 281/384** `OperationTreeBase` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:105`, line by line against the C++
+- [ ] **PORT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, 4 lines
+- [ ] **AUDIT 282/384** `updateLoopMaskTreeForConstantMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:20`, line by line against the C++
+- [ ] **PORT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, 9 lines
+- [ ] **AUDIT 283/384** `updateLoopMaskTreeForDynamicMask` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringPTMasks.cpp:28`, line by line against the C++
+- [ ] **PORT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, 96 lines
+- [ ] **AUDIT 284/384** `hoistCommonConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:94`, line by line against the C++
+- [ ] **PORT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, 56 lines
+- [ ] **AUDIT 285/384** `replaceIfOpByIterArg` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:619`, line by line against the C++
+- [ ] **PORT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, 32 lines
+- [ ] **AUDIT 286/384** `runOnOperation` — `dcc/src/Transform/Dataflow/EnumerateCollectionUnit.cpp:94`, line by line against the C++
+- [ ] **PORT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, 70 lines
+- [ ] **AUDIT 287/384** `flatten` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:384`, line by line against the C++
+- [ ] **PORT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, 22 lines
+- [ ] **AUDIT 288/384** `runOnOperation` — `dcc/src/Transform/Dataflow/LoopUnrollingForPTLRFRegs.cpp:131`, line by line against the C++
+- [ ] **PORT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, 8 lines
+- [ ] **AUDIT 289/384** `initialize` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:694`, line by line against the C++
+- [ ] **PORT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, 10 lines
+- [ ] **AUDIT 290/384** `createPartitions` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:983`, line by line against the C++
+- [ ] **PORT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, 66 lines
+- [ ] **AUDIT 291/384** `calculatePartialShift` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:490`, line by line against the C++
+- [ ] **PORT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, 94 lines
+- [ ] **AUDIT 292/384** `transformSCFLoopWithNonConstantUpperBound` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:169`, line by line against the C++
+- [ ] **PORT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, 5 lines
+- [ ] **AUDIT 293/384** `runOn` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:447`, line by line against the C++
+- [ ] **PORT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, 33 lines
+- [ ] **AUDIT 294/384** `getPageValidity` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:114`, line by line against the C++
+- [ ] **PORT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, 121 lines
+- [ ] **AUDIT 295/384** `createIterArgsForConditionals` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:401`, line by line against the C++
+- [ ] **PORT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, 127 lines
+- [ ] **AUDIT 296/384** `runOnOperation` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:362`, line by line against the C++
+
+## Level 4
+
+- [ ] **PORT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, 42 lines
+- [ ] **AUDIT 297/384** `constructTimeStepsInfo` — `dcc/src/Conversion/AgenToSentient/AccessDetails.cpp:626`, line by line against the C++
+- [ ] **PORT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, 16 lines
+- [ ] **AUDIT 298/384** `constructAffineDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2787`, line by line against the C++
+- [ ] **PORT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, 15 lines
+- [ ] **AUDIT 299/384** `lowerAffineCompositeHelper` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2953`, line by line against the C++
+- [ ] **PORT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, 7 lines
+- [ ] **AUDIT 300/384** `lowerSyncForAUnit` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:733`, line by line against the C++
+- [ ] **PORT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, 8 lines
+- [ ] **AUDIT 301/384** `lowerSyncForAGroup` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:746`, line by line against the C++
+- [ ] **PORT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, 928 lines
+- [ ] **AUDIT 302/384** `lowerSyncLXL3ToLXL3` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:787`, line by line against the C++
+- [ ] **PORT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, 15 lines
+- [ ] **AUDIT 303/384** `runOnOperation` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:23`, line by line against the C++
+- [ ] **PORT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, 254 lines
+- [ ] **AUDIT 304/384** `getOperandWithPrecision` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:389`, line by line against the C++
+- [ ] **PORT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, 17 lines
+- [ ] **AUDIT 305/384** `runOnOperation` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:459`, line by line against the C++
+- [ ] **PORT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, 75 lines
+- [ ] **AUDIT 306/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:298`, line by line against the C++
+- [ ] **PORT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, 74 lines
+- [ ] **AUDIT 307/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:375`, line by line against the C++
+- [ ] **PORT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, 61 lines
+- [ ] **AUDIT 308/384** `calculateShifts` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:396`, line by line against the C++
+- [ ] **PORT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, 58 lines
+- [ ] **AUDIT 309/384** `constructValidPage` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:190`, line by line against the C++
+- [ ] **PORT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, 33 lines
+- [ ] **AUDIT 310/384** `analyzeValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:888`, line by line against the C++
+
+## Level 5
+
+- [ ] **PORT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, 33 lines
+- [ ] **AUDIT 311/384** `constructAffineCompDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2809`, line by line against the C++
+- [ ] **PORT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, 21 lines
+- [ ] **AUDIT 312/384** `lowerExtractVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3001`, line by line against the C++
+- [ ] **PORT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, 20 lines
+- [ ] **AUDIT 313/384** `lowerExtractVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3026`, line by line against the C++
+- [ ] **PORT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, 20 lines
+- [ ] **AUDIT 314/384** `lowerVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3050`, line by line against the C++
+- [ ] **PORT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, 28 lines
+- [ ] **AUDIT 315/384** `lowerVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3074`, line by line against the C++
+- [ ] **PORT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, 44 lines
+- [ ] **AUDIT 316/384** `lowerIndirectVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3169`, line by line against the C++
+- [ ] **PORT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, 46 lines
+- [ ] **AUDIT 317/384** `lowerIndirectVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3217`, line by line against the C++
+- [ ] **PORT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, 326 lines
+- [ ] **AUDIT 318/384** `lowerLDCVTIPattern` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3444`, line by line against the C++
+- [ ] **PORT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, 166 lines
+- [ ] **AUDIT 319/384** `lowerSyncForAQueryMap` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1728`, line by line against the C++
+- [ ] **PORT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, 4 lines
+- [ ] **AUDIT 320/384** `getOperand` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:378`, line by line against the C++
+- [ ] **PORT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, 92 lines
+- [ ] **AUDIT 321/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:451`, line by line against the C++
+- [ ] **PORT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, 124 lines
+- [ ] **AUDIT 322/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:546`, line by line against the C++
+- [ ] **PORT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, 19 lines
+- [ ] **AUDIT 323/384** `shiftMutableAddr` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:366`, line by line against the C++
+- [ ] **PORT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, 32 lines
+- [ ] **AUDIT 324/384** `analyzeAndConstructValidPages` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:152`, line by line against the C++
+- [ ] **PORT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, 98 lines
+- [ ] **AUDIT 325/384** `transform_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:977`, line by line against the C++
+- [ ] **PORT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, 23 lines
+- [ ] **AUDIT 326/384** `initialize_time` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:1095`, line by line against the C++
+
+## Level 6
+
+- [ ] **PORT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, 153 lines
+- [ ] **AUDIT 327/384** `gatherSymbolicLoadStoreDetails` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1051`, line by line against the C++
+- [ ] **PORT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, 127 lines
+- [ ] **AUDIT 328/384** `adjustMutableAddrInitForIndirect` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1447`, line by line against the C++
+- [ ] **PORT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, 17 lines
+- [ ] **AUDIT 329/384** `lowerCompositeLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3106`, line by line against the C++
+- [ ] **PORT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, 17 lines
+- [ ] **AUDIT 330/384** `lowerCompositeStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3127`, line by line against the C++
+- [ ] **PORT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, 17 lines
+- [ ] **AUDIT 331/384** `lowerCompositeLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3148`, line by line against the C++
+- [ ] **PORT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, 42 lines
+- [ ] **AUDIT 332/384** `lowerCompositeIndirectLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3267`, line by line against the C++
+- [ ] **PORT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, 42 lines
+- [ ] **AUDIT 333/384** `lowerCompositeIndirectStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3313`, line by line against the C++
+- [ ] **PORT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, 17 lines
+- [ ] **AUDIT 334/384** `lowerCompositeIndirectLoadAndStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3359`, line by line against the C++
+- [ ] **PORT 335/384** `insertCopyAndAddStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3861`, 13 lines
+- [ ] **AUDIT 335/384** `insertCopyAndAddStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3861`, line by line against the C++
+- [ ] **PORT 336/384** `adjustMutableAddrInitForStride` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4034`, 47 lines
+- [ ] **AUDIT 336/384** `adjustMutableAddrInitForStride` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:4034`, line by line against the C++
+- [ ] **PORT 337/384** `lowerSyncOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901`, 80 lines
+- [ ] **AUDIT 337/384** `lowerSyncOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:1901`, line by line against the C++
+- [ ] **PORT 338/384** `ConstructIFRecursively` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:113`, 125 lines
+- [ ] **AUDIT 338/384** `ConstructIFRecursively` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:113`, line by line against the C++
+- [ ] **PORT 339/384** `SimplifyOrIOp` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:389`, 43 lines
+- [ ] **AUDIT 339/384** `SimplifyOrIOp` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:389`, line by line against the C++
+- [ ] **PORT 340/384** `analyzeAndFillOperandForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:535`, 25 lines
+- [ ] **AUDIT 340/384** `analyzeAndFillOperandForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:535`, line by line against the C++
+- [ ] **PORT 341/384** `analyzeNonComputeOpsForFusion` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:610`, 86 lines
+- [ ] **AUDIT 341/384** `analyzeNonComputeOpsForFusion` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:610`, line by line against the C++
+- [ ] **PORT 342/384** `analyzeAndFillResultForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:162`, 27 lines
+- [ ] **AUDIT 342/384** `analyzeAndFillResultForwarding` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.hpp:162`, line by line against the C++
+- [ ] **PORT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, 5 lines
+- [ ] **AUDIT 343/384** `getOperandFromCastOp` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.cpp:354`, line by line against the C++
+- [ ] **PORT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, 93 lines
+- [ ] **AUDIT 344/384** `lowerDanglingNonComputeOpsPESFP` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1274`, line by line against the C++
+- [ ] **PORT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, 190 lines
+- [ ] **AUDIT 345/384** `processXrfPtrPerUnit` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:337`, line by line against the C++
+- [ ] **PORT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, 88 lines
+- [ ] **AUDIT 346/384** `lowerDanglingNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:882`, line by line against the C++
+- [ ] **PORT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, 31 lines
+- [ ] **AUDIT 347/384** `topLevelConditionsMatch` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:279`, line by line against the C++
+- [ ] **PORT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, 18 lines
+- [ ] **AUDIT 348/384** `singleOpBranchToYieldVal` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:498`, line by line against the C++
+- [ ] **PORT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, 66 lines
+- [ ] **AUDIT 349/384** `isLoopInvariant` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:681`, line by line against the C++
+- [ ] **PORT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, 170 lines
+- [ ] **AUDIT 350/384** `matchAndRewrite` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:33`, line by line against the C++
+- [ ] **PORT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, 70 lines
+- [ ] **AUDIT 351/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:226`, line by line against the C++
+- [ ] **PORT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, 25 lines
+- [ ] **AUDIT 352/384** `transformVectorLoad` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:201`, line by line against the C++
+- [ ] **PORT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, 24 lines
+- [ ] **AUDIT 353/384** `transformVectorStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:229`, line by line against the C++
+- [ ] **PORT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, 39 lines
+- [ ] **AUDIT 354/384** `transformCompLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:256`, line by line against the C++
+- [ ] **PORT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, 54 lines
+- [ ] **AUDIT 355/384** `transformCompIndLoadAndStore` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:298`, line by line against the C++
+- [ ] **PORT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, 39 lines
+- [ ] **AUDIT 356/384** `transform` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:592`, line by line against the C++
+
+## Level 7
+
+- [ ] **PORT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, 381 lines
+- [ ] **AUDIT 357/384** `generateAffineAddressManipulationStmts` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:625`, line by line against the C++
+- [ ] **PORT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, 104 lines
+- [ ] **AUDIT 358/384** `constructLoadAndSendStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:1910`, line by line against the C++
+- [ ] **PORT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, 131 lines
+- [ ] **AUDIT 359/384** `constructReceiveAndStoreStmt` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2025`, line by line against the C++
+- [ ] **PORT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, 16 lines
+- [ ] **AUDIT 360/384** `constructSymbolicDetailsAndAddrs` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:2849`, line by line against the C++
+- [ ] **PORT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, 33 lines
+- [ ] **AUDIT 361/384** `runOnOperation` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2014`, line by line against the C++
+- [ ] **PORT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, 19 lines
+- [ ] **AUDIT 362/384** `LowerSelectOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:243`, line by line against the C++
+- [ ] **PORT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, 19 lines
+- [ ] **AUDIT 363/384** `LowerLogicalOpToSentient` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:264`, line by line against the C++
+- [ ] **PORT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, 222 lines
+- [ ] **AUDIT 364/384** `patternAgnosticFuseNonComputeOpsHelper` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:96`, line by line against the C++
+- [ ] **PORT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, 83 lines
+- [ ] **AUDIT 365/384** `fillOpInfo` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1070`, line by line against the C++
+- [ ] **PORT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, 80 lines
+- [ ] **AUDIT 366/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1159`, line by line against the C++
+- [ ] **PORT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, 97 lines
+- [ ] **AUDIT 367/384** `createXrfIndexModifOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/LoweringXRF.cpp:564`, line by line against the C++
+- [ ] **PORT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, 191 lines
+- [ ] **AUDIT 368/384** `fuseNonComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:46`, line by line against the C++
+- [ ] **PORT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, 628 lines
+- [ ] **AUDIT 369/384** `fuseComputeOps` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:245`, line by line against the C++
+- [ ] **PORT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, 34 lines
+- [ ] **AUDIT 370/384** `areShallowlyMergeable` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:343`, line by line against the C++
+- [ ] **PORT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, 42 lines
+- [ ] **AUDIT 371/384** `hoistLoopInvariantConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:750`, line by line against the C++
+- [ ] **PORT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, 69 lines
+- [ ] **AUDIT 372/384** `runOnOperation` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:130`, line by line against the C++
+- [ ] **PORT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, 6 lines
+- [ ] **AUDIT 373/384** `run` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.cpp:647`, line by line against the C++
+
+## Level 8
+
+- [ ] **PORT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, 26 lines
+- [ ] **AUDIT 374/384** `lowerSymbolicVectorLoadOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3380`, line by line against the C++
+- [ ] **PORT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, 30 lines
+- [ ] **AUDIT 375/384** `lowerSymbolicVectorStoreOp` — `dcc/src/Conversion/AgenToSentient/Helper.cpp:3410`, line by line against the C++
+- [ ] **PORT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, 34 lines
+- [ ] **AUDIT 376/384** `runOnOperation` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:439`, line by line against the C++
+- [ ] **PORT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, 12 lines
+- [ ] **AUDIT 377/384** `matchAndRewrite` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:44`, line by line against the C++
+- [ ] **PORT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, 30 lines
+- [ ] **AUDIT 378/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.cpp:1374`, line by line against the C++
+- [ ] **PORT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, 54 lines
+- [ ] **AUDIT 379/384** `runOnOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.cpp:975`, line by line against the C++
+- [ ] **PORT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, 76 lines
+- [ ] **AUDIT 380/384** `shallowlyMergeConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:198`, line by line against the C++
+- [ ] **PORT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, 30 lines
+- [ ] **AUDIT 381/384** `simplifyValueBasedConditionals` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:466`, line by line against the C++
+
+## Level 9
+
+- [ ] **PORT 382/384** `fuseLoadOrStoreChainOps` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:22`, 144 lines
+- [ ] **AUDIT 382/384** `fuseLoadOrStoreChainOps` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:22`, line by line against the C++
+- [ ] **PORT 383/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CFGSimplificationDataflowLevel.cpp:77`, 80 lines
+- [ ] **AUDIT 383/384** `runOnOperation` — `dcc/src/Transform/Dataflow/CFGSimplificationDataflowLevel.cpp:77`, line by line against the C++
+
+## Level 10
+
+- [ ] **PORT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, 81 lines
+- [ ] **AUDIT 384/384** `runOnOperation` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:169`, line by line against the C++
+
+## Excluded — 106 definitions, with the reason for each
+
+⛔ Overrule any of these by moving it into a level above; the criterion is stated at the top.
+
+### a one-line C++ field accessor; in Rust the field itself — 47
+
+- `getOp` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:57`
+- `getComp` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:58`
+- `getMemRef` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:59`
+- `getMemViewStartAddr` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:60`
+- `getMemViewLayoutMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:61`
+- `getLayoutCoeffs` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:62`
+- `getTransferOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:63`
+- `getChunkSize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:64`
+- `getChunkStride` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:65`
+- `getShuffleMode` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:66`
+- `getRotationPosition` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:67`
+- `getTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:68`
+- `getElementWidth` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:69`
+- `getIndices` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:70`
+- `getMemory` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:71`
+- `getMemoryIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:72`
+- `getExtents` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:73`
+- `setOp` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:76`
+- `setMemRef` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:80`
+- `setMemory` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:84`
+- `getExpectedTotalElements` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:88`
+- `getTransferSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:89`
+- `getLdOrStSize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:90`
+- `setChunkSize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:102`
+- `setChunkStride` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:103`
+- `setLdOrStSize` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:128`
+- `getSubscriptsMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:221`
+- `getIndicesCoeffDict` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:222`
+- `getTimeOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:262`
+- `getTimeSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:263`
+- `getTimeSymbols` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:264`
+- `getTimeAddrMap` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:265`
+- `getTimeBounds` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:266`
+- `getTimeOffsets` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:267`
+- `getBurstIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:268`
+- `getInterleaveGroupIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:269`
+- `setTimeOrder` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:284`
+- `setTimeSet` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:285`
+- `setBurstIndex` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:298`
+- `getStrides` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:352`
+- `getTotalDataOriginsCount` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:33`
+- `getFirstValue` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp:76`
+- `setOperation` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:52`
+- `isLoopNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:54`
+- `isMaskNode` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:55`
+- `getStartVal` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:76`
+- `getIncrement` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:77`
+
+### a C++ data MEMBER, not a function — the extractor caught the declaration — 34
+
+- `comp_` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:47`
+- `index_mapping_` — `dcc/src/Conversion/AgenToSentient/AccessDetails.hpp:375`
+- `dcc_ext_ctx_` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:38`
+- `dcc_ext_ctx_` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:42`
+- `dcc_ext_ctx_` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.hpp:27`
+- `dominance_info_` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/OperandReuse.hpp:26`
+- `size_` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorChainHelper.cpp:208`
+- `op_` — `dcc/src/Conversion/VectorChainLowering/CommonHelpers/VectorOperands.hpp:79`
+- `dcc_ext_ctx_` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.hpp:45`
+- `reuse_info_` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.hpp:82`
+- `is_visited_` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.hpp:108`
+- `increment_` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.hpp:72`
+- `dcc_ext_ctx_` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.hpp:53`
+- `if_op_` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.hpp:56`
+- `opts_` — `dcc/src/Transform/Dataflow/CFGSimplificationDataflowLevel.cpp:69`
+- `dcc_ext_ctx_` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:47`
+- `opts_` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:39`
+- `dcc_ext_ctx_` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:54`
+- `opts_` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:84`
+- `mem_index_` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:94`
+- `weight_` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:111`
+- `opts_` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:61`
+- `mem_index_` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:71`
+- `weight_` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:83`
+- `base_unit_program_` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:43`
+- `dcc_ext_ctx_` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:55`
+- `curr_unit_corelet_id_` — `dcc/src/Transform/Dataflow/ProgramUnitsReduction.cpp:91`
+- `opts_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemView.cpp:34`
+- `comp_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:30`
+- `subscripts_map_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:45`
+- `mem_index_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:50`
+- `access_details_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewImpl.hpp:458`
+- `comp_` — `dcc/src/Transform/Dataflow/TransformPagedMemView/TransformPagedMemViewManager.hpp:24`
+- `opts_` — `dcc/src/Transform/Dataflow/UnitFiltering.cpp:43`
+
+### returns the MLIR pass context — scratchy has no pass context — 9
+
+- `dccExtContext` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.hpp:521`
+- `dccExtContext` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:91`
+- `dccExtContext` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.hpp:38`
+- `dccExtContext` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPESFP/VectorChainToSentientPESFP.hpp:51`
+- `dccExtContext` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/VectorChainToSentientPT.hpp:59`
+- `dccExtContext` — `dcc/src/Transform/Dataflow/CanonicalizeToggle.cpp:94`
+- `dccExtContext` — `dcc/src/Transform/Dataflow/LoopUnrollForShuffleOp.cpp:66`
+- `dccExtContext` — `dcc/src/Transform/Dataflow/MutableAddrSplitting.cpp:219`
+- `dccExtContext` — `dcc/src/Transform/Dataflow/MutableStartAddrShifting.cpp:125`
+
+### MLIR pass construction — no pass pipeline exists at runtime — 6
+
+- `createAffineToStandardPass` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:239`
+- `createAgenToSentientPass` — `dcc/src/Conversion/AgenToSentient/AgenToSentient.cpp:252`
+- `createDataflowToSentientPass` — `dcc/src/Conversion/DataflowToSentient/DataflowToSentient.cpp:2051`
+- `createSCFToSentientPass` — `dcc/src/Conversion/SCFToSentient/SCFToSentient.cpp:285`
+- `createStandardToSentientPass` — `dcc/src/Conversion/StandardToSentient/StandardToSentient.cpp:476`
+- `createSymbolToSentientPass` — `dcc/src/Conversion/SymbolToSentient/SymbolToSentient.cpp:187`
+
+### MLIR printing/parsing/verification — this crate emits and never reads back — 5
+
+- `print` — `dcc/src/Conversion/VectorChainLowering/VectorChainToSentientPT/Analysis/LoopMaskTree.cpp:96`
+- `parseConditional` — `dcc/src/Transform/Dataflow/Analysis/CFGSDataflowConditionalTree.cpp:534`
+- `printUnitToOpsMap` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:189`
+- `printEquivalenceClasses` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:202`
+- `printTree` — `dcc/src/Transform/Dataflow/FlatteningLocalRegions.cpp:288`
+
+### fills an MLIR RewritePatternSet — no pattern driver exists — 3
+
+- `populateAffineToStdConversionPatterns` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:198`
+- `populateAffineToVectorConversionPatterns` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:208`
+- `populateDuplicateReusedTogglePatterns` — `dcc/src/Transform/Dataflow/DuplicateReusedToggle.cpp:207`
+
+### configures an MLIR pattern driver — scratchy has no driver — 1
+
+- `runOnOperation` — `dcc/src/Conversion/AffineToStandard/AffineToStandard.cpp:222`
+
+### a pass driver whose whole body is pipeline plumbing — 1
+
+- `runOnOperation` — `dcc/src/Transform/Dataflow/TransformLoopToLegalizeForSentientLowering.cpp:455`
+

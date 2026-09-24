@@ -36,6 +36,9 @@ members = [
     "crates/compiler",
     "crates/compiler/macros",
     "crates/compiler/subtile",
+    # IBM deeptools IRs and the bridges between them (SuperDSC → DataflowIR).
+    # No scratchy dependency — see its Cargo.toml.
+    "crates/compiler/deeptools",
     "crates/targets/cuda/cost-sweep",
     "crates/targets/metal",
     "crates/targets/metal/compiler",

@@ -1,0 +1,127 @@
+The --from-dfir patch to dbo-opt. LOCAL ONLY — this is NOT upstream, and the
+pod's stock dbo-opt does not have it ("Did you mean '--from-ktir'?").
+
+WHAT IT IS. Stock dbo-opt has two ways in: --from-ktir, which prepends the
+dataflow scheduler to produce DataflowIR; and the SDSC-bundle path. There is no
+way in for a producer that emits DataflowIR *directly*, which is what scratchy
+does. -kEmitSpyreCode on bare DataflowIR fails in mem_track.cpp on
+eps.size() >= 1, because nothing has grown the trackers to the run's program
+count or seeded the state the SDSC would have provided.
+
+So the flag adds no stage and changes no existing one. It reuses the KTIR
+pathway from the point the scheduler would have left off: the outer branch
+becomes (from_ktir || from_dfir) and the scheduler half is nested under an inner
+(from_ktir). Everything from dbo-grow-trackers down -- GrowTrackers,
+ExtractInputSymbols, AdaptSchedulerDfir, WrapProgramDfir -- is shared and
+untouched.
+
+Base: ~/tmp/dt (pristine, no from_dfir anywhere).
+Patched tree: ~/tmp/dt_src. Three files, +50/-22.
+Apply with: patch -p1 < dt-from-dfir.patch   (from the deeptools source root)
+
+THE STANDING DEBT: needing this at all means our DataflowIR enters the compiler
+somewhere the shipped compiler does not accept input. The fix is on our side --
+emit at a point the stock tool already takes -- not on the compiler's. Kept only
+because the user said so explicitly, and disclosed with every result produced
+using it.
+
+--- a/dbo/src/Pipeline/Pipeline.h	2026-08-13 21:48:30
++++ b/dbo/src/Pipeline/Pipeline.h	2026-09-04 14:05:42
+@@ -169,6 +169,18 @@
+   /// Prepend the dataflow scheduler, so the input is KTIR rather than
+   /// DataflowIR.
+   bool from_ktir = false;
++  /// The input is already DataflowIR: run the KTIR path from the point the
++  /// scheduler would have left off, with no scheduler and no device
++  /// declaration.
++  ///
++  /// There is otherwise no way in for a producer that emits DataflowIR
++  /// directly. -kEmitSpyreCode on bare DataflowIR fails in mem_track.cpp with
++  /// eps.size() >= 1, because nothing has grown the trackers to the run's
++  /// program count or seeded the state the SDSC would have provided. Both are
++  /// done by the passes below this branch, and what the SDSC would supply is
++  /// seeded by dbo-adapt-scheduler-dfir, which reads the DataflowIR itself --
++  /// so this pathway is the second half of the KTIR one, entered directly.
++  bool from_dfir = false;
+   /// Device description the scheduler's ensure-device-declaration pass reads.
+   /// Optional: empty takes defaultDeviceFile().
+   std::string device_file;
+--- a/dbo/src/Pipeline/Pipeline.cpp	2026-08-13 21:48:30
++++ b/dbo/src/Pipeline/Pipeline.cpp	2026-09-04 14:06:20
+@@ -130,24 +130,29 @@
+   pm.addPass(mlir::dbo::createCreateTrackersPass(state.memTrackers,
+                                                  state.dscGlobal()));
+ 
+-  if (dbo_options.from_ktir) {
+-    // Schedule the KTIR down to DataflowIR, then reduce it to the program
+-    // modules the stage below runs on and seed what the SDSC would otherwise
+-    // have provided, one entry per program.
+-    if (!debug_dir.empty())
+-      pm.addPass(createDumpIrPass(debug_dir, "ktir.mlir"));
+-    scheduler::EnsureDeviceDeclarationPassOptions device_options;
+-    device_options.deviceFileName = dbo_options.device_file.empty()
+-                                        ? defaultDeviceFile()
+-                                        : dbo_options.device_file;
+-    pm.addPass(scheduler::createEnsureDeviceDeclarationPass(device_options));
+-    scheduler::buildKTDPToDFIRPipeline(
+-        pm, scheduler::SchedulerExtContext::dummyContext());
+-    // The DataflowIR is consumed in-process, so it is only written out to be
+-    // read: the scheduler's own emit-split-dfir pass is not part of this
+-    // pipeline.
+-    if (!debug_dir.empty())
+-      pm.addPass(createDumpIrPass(debug_dir, "dfir.mlir"));
++  // Both DataflowIR pathways share everything from dbo-grow-trackers down. They
++  // differ only in where the DataflowIR came from: the scheduler produces it
++  // here, or it arrived as the input.
++  if (dbo_options.from_ktir || dbo_options.from_dfir) {
++    if (dbo_options.from_ktir) {
++      // Schedule the KTIR down to DataflowIR, then reduce it to the program
++      // modules the stage below runs on and seed what the SDSC would otherwise
++      // have provided, one entry per program.
++      if (!debug_dir.empty())
++        pm.addPass(createDumpIrPass(debug_dir, "ktir.mlir"));
++      scheduler::EnsureDeviceDeclarationPassOptions device_options;
++      device_options.deviceFileName = dbo_options.device_file.empty()
++                                          ? defaultDeviceFile()
++                                          : dbo_options.device_file;
++      pm.addPass(scheduler::createEnsureDeviceDeclarationPass(device_options));
++      scheduler::buildKTDPToDFIRPipeline(
++          pm, scheduler::SchedulerExtContext::dummyContext());
++      // The DataflowIR is consumed in-process, so it is only written out to be
++      // read: the scheduler's own emit-split-dfir pass is not part of this
++      // pipeline.
++      if (!debug_dir.empty())
++        pm.addPass(createDumpIrPass(debug_dir, "dfir.mlir"));
++    }
+ 
+     // The programs now exist, so the run's phase count does: one per program.
+     // The trackers are grown to it and the front end's LX reserved across all
+--- a/dbo/tools/dbo-opt/dbo-opt.cpp	2026-08-13 21:48:30
++++ b/dbo/tools/dbo-opt/dbo-opt.cpp	2026-09-04 14:06:20
+@@ -68,6 +68,12 @@
+       llvm::cl::desc("Input is KTIR: prepend the dataflow scheduler to produce "
+                      "the DataflowIR the codegen stages consume"),
+       llvm::cl::location(dboOptions().from_ktir), llvm::cl::init(false));
++  static llvm::cl::opt<bool, /*ExternalStorage=*/true> fromDfir(
++      "from-dfir",
++      llvm::cl::desc("Input is already DataflowIR: run the codegen stages over "
++                     "it directly, with no scheduler and no device "
++                     "declaration"),
++      llvm::cl::location(dboOptions().from_dfir), llvm::cl::init(false));
+   static llvm::cl::opt<std::string, /*ExternalStorage=*/true> deviceFile(
+       "device",
+       llvm::cl::desc("Device architecture filename for the scheduler. Unset "
+@@ -120,7 +126,12 @@
+         // built when the pipeline runs, well after this returns.
+         if (!state.parseProgirOptions(optionsStr)) return mlir::failure();
+ 
+-        if (dboOptions().from_ktir) {
++        if (dboOptions().from_ktir || dboOptions().from_dfir) {
++          // initForKtir sets up the arch description and nothing else; the rest
++          // of what the SDSC would supply is seeded by
++          // dbo-adapt-scheduler-dfir, which reads the DataflowIR -- so it is as
++          // right for an input that already IS DataflowIR as for one the
++          // scheduler produced.
+           if (!state.loaded()) state.initForKtir();
+         } else {
+           // An SDSC bundle: the SDSCs it names are read from the export
