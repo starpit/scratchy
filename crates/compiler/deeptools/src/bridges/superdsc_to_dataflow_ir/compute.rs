@@ -761,10 +761,15 @@ pub enum ComputeInput<'i> {
     Memory(MemoryOperand<'i>),
     /// `SFPRING`.
     Ring(Ring<'i>),
-    /// `LATCH` — `getFromLatchMap(latch_id)`, which is the lowering's own state and so the caller's.
+    /// `LATCH` — `getFromLatchMap(latch_id)` (`SNComputeLowering.cpp:725`).
+    ///
+    /// ⛔⛔ THE MAP IS THE WALK'S STATE, NOT THE CALLER'S. The [`Val`] only exists once an earlier
+    /// statement of THIS unit latched it, so the id is what travels and [`Handlers::latched`] is
+    /// consulted at walk time — see [`Handlers::latches`], the reference's `global_latch_map`
+    /// (`DSC2ToDataflowIR.cpp:336`, `:424`).
     Latch {
-        /// The value the map holds.
-        data: Val,
+        /// `latchDataId_` — the map's key.
+        id: i64,
         /// `loopEleOffsets_.at(clId)`, read only when the execution unit is the LXLU.
         offsets: &'i [LoopOffset],
     },
@@ -876,12 +881,15 @@ pub fn compute_input_operand<A: Arch>(
             Computed::of(Received::receive(into, vals.mint(), from, ty).operand(), ty)
         }
         // `if (compute_op.exUnit_ == LXLU)` — the latched vector is broadcast at QUARTER width, and
-        // the ONE loop offset is taken with no search at all (`:723-745`).
-        ComputeInput::Latch { data, offsets } => {
+        // the ONE loop offset is taken with no search at all (`:723-745`). ⛔ `DT_CHECK_MSG(data,
+        // "latch value cannot be empty")` (`SNTransferLowering.cpp:2158` is the same sentence on the
+        // load side) IS THIS [`None`]: a latch id nothing has latched yet.
+        ComputeInput::Latch { id, offsets } => {
+            let data = ctx.handlers.latched(*id)?;
             if matches!(ctx.ex_unit, GenericComp::Lxlu) {
-                broadcast_over_lanes(vals, into, ctx, *data, offsets.first()?.iv, 4)
+                broadcast_over_lanes(vals, into, ctx, data, offsets.first()?.iv, 4)
             } else {
-                Computed::of(*data, ty)
+                Computed::of(data, ty)
             }
         }
     };
@@ -1156,6 +1164,10 @@ pub fn compute_output_operand(
             }));
         }
         ComputeOutput::Latch(latch) => {
+            // `addToLatchMap(latch_id, compute_result)` (`SNComputeLowering.cpp:904`) — written here,
+            // in the walk, exactly where the reference writes it; [`Stored::Latched`] reports the pair
+            // again for the caller.
+            ctx.handlers.latch(i64::from(latch.get()), compute_result.val());
             return Some(Stored::Latched {
                 latch: *latch,
                 data: compute_result.val(),
@@ -1872,7 +1884,7 @@ pub fn unary_operation<A: Arch>(
     into: &mut Vec<Op>,
     ctx: &OperandContext<'_>,
     which: &UnaryOp<'_>,
-    input: (&ComputeInput<'_>, OutputFormat),
+    input: (ComputeInput<'_>, OutputFormat),
     mask: MaskValue,
     outputs: &[(ComputeOutput<'_>, OutputFormat)],
 ) -> Option<Vec<Stored>> {
@@ -1885,7 +1897,7 @@ pub fn unary_operation<A: Arch>(
             result_ty: input_ty,
             ..*ctx
         },
-        source,
+        &source,
         format.operand,
     )
     .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct unary operation input operand"));
@@ -2052,54 +2064,61 @@ pub fn unary_operation<A: Arch>(
 pub enum ComputeFamily<'f> {
     /// `IMA8`|`IMA4`|`FMA4`|`FMA8`|`FMA16`|`FMA32`|`FNMS` → entry 099, and the only arm that writes
     /// `precision`.
+    ///
+    /// ⭐ THE OPERANDS ARE **OWNED**, because a [`ComputeInput`] may embed the `'f` unit handles a
+    /// view only receives inside [`super::driver::ScheduleView::roots`] — see
+    /// [`super::driver::TransferStatement`], whose four seams are boxed for the same reason.
     Mac {
         /// `compute_op.type_`.
         mac: MacOp,
         /// The three operands, whose `lds` categories decide the `mx` prefix.
-        inputs: &'f [(ComputeInput<'f>, MacInputFormat); 3],
+        inputs: Box<[(ComputeInput<'f>, MacInputFormat); 3]>,
         /// `compute_mask_`, or the dynamic map a PT may carry.
         mask: ComputeMask<'f>,
         /// `compute_op.outputs_`.
-        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+        outputs: Box<[(ComputeOutput<'f>, OutputFormat)]>,
     },
     /// `FMUL`|`FSUB`|`PACKMERGE`|`FABSMAX`|the six comparisons|`SELECT`|`OR`|`AND` → entry 100.
     BinaryOrTernary {
         /// `compute_op.type_`, with `FMUL`'s `mode_` folded in.
-        which: &'f BinaryOrTernary<'f>,
+        which: Box<BinaryOrTernary<'f>>,
         /// Two operands, or three where the `SELECT`'s condition is one of them.
-        inputs: &'f [(ComputeInput<'f>, OutputFormat)],
+        inputs: Box<[(ComputeInput<'f>, OutputFormat)]>,
         /// `getComputeOperandFormats(*dsc_).back()`.
         result_format: DataType,
         /// `compute_mask_`.
         mask: MaskValue,
         /// `compute_op.outputs_`.
-        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+        outputs: Box<[(ComputeOutput<'f>, OutputFormat)]>,
     },
     /// `FMAX`|`FMIN` → entry 095.
     MinOrMax {
         /// Which of the pair.
         which: MinOrMax,
         /// The two operands it compares and then selects between.
-        inputs: &'f [(ComputeInput<'f>, OutputFormat); 2],
+        inputs: Box<[(ComputeInput<'f>, OutputFormat); 2]>,
         /// `getComputeOperandFormats(*dsc_).back()`.
         result_format: DataType,
         /// `compute_mask_`.
         mask: MaskValue,
         /// `compute_op.outputs_`.
-        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+        outputs: Box<[(ComputeOutput<'f>, OutputFormat)]>,
     },
     /// `FEST`|`ICVT`|`SPLAT`|`REDUCE`|`SHUFFLE`|`FLOOR` → entry 101.
     Unary {
         /// `compute_op.type_`, with the `mode_` each arm dispatches on folded in.
-        which: &'f UnaryOp<'f>,
+        which: Box<UnaryOp<'f>>,
         /// The one operand and the format it is converted to.
-        input: (&'f ComputeInput<'f>, OutputFormat),
+        input: (ComputeInput<'f>, OutputFormat),
         /// `compute_mask_`.
         mask: MaskValue,
         /// `compute_op.outputs_`.
-        outputs: &'f [(ComputeOutput<'f>, OutputFormat)],
+        outputs: Box<[(ComputeOutput<'f>, OutputFormat)]>,
     },
     /// The 29 opaque types → entry 053, which stores nothing and cannot refuse.
+    ///
+    /// ⭐ THE TABLES STAY BORROWED: they are the caller's own records, hold no unit handles, and a
+    /// `&'c` reference coerces to the statement's `'s` — see [`super::driver::TransferStatement`].
     Opaque {
         /// `getOpaqueFunctionName(type_)`.
         func: OpaqueFunc,
@@ -2148,7 +2167,7 @@ pub fn compute_operation<A: Arch>(
             mask,
             outputs,
         } => {
-            let stored = mac_operation::<A>(vals, into, ctx, mac, inputs, mask, outputs)
+            let stored = mac_operation::<A>(vals, into, ctx, mac, &inputs, mask, &outputs)
                 .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct MAC operation"));
             // `for (i) { category = REGULAR_TENSOR; if (myLdsIdx_ != -1) { category = ..; if
             //  (category != REGULAR_TENSOR) { precision = "mx" + precision; break; } } }` — an
@@ -2176,11 +2195,11 @@ pub fn compute_operation<A: Arch>(
                 vals,
                 into,
                 ctx,
-                which,
-                inputs,
+                &which,
+                &inputs,
                 result_format,
                 mask,
-                outputs,
+                &outputs,
             )
             .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct binary operation")),
             precision: None,
@@ -2198,10 +2217,10 @@ pub fn compute_operation<A: Arch>(
                 into,
                 ctx,
                 which,
-                inputs,
+                &inputs,
                 result_format,
                 mask,
-                outputs,
+                &outputs,
             )
             .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct binary operation")),
             precision: None,
@@ -2212,7 +2231,7 @@ pub fn compute_operation<A: Arch>(
             mask,
             outputs,
         } => ComputeOperation {
-            stored: unary_operation::<A>(vals, into, ctx, which, input, mask, outputs)
+            stored: unary_operation::<A>(vals, into, ctx, &which, input, mask, &outputs)
                 .unwrap_or_else(|| emit_error(ctx.name, "Unable to construct unary operation")),
             precision: None,
         },
@@ -3117,6 +3136,7 @@ mod unit_tests {
             units: Vec::new(),
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         }
     }
 
@@ -3478,7 +3498,7 @@ mod unit_tests {
                 sign_extend: SignExtend::Yes,
                 repetition: 8,
             },
-            (&ComputeInput::One, format),
+            (ComputeInput::One, format),
             MaskValue::Live8,
             &[(ComputeOutput::Latch(latch), format)],
         )
@@ -3544,23 +3564,27 @@ mod unit_tests {
             elements: Elements(elements),
         };
         let scaled = Some((DataType::Sen143Fp8, TensorCategory::Scaled));
-        let inputs = [
-            (ComputeInput::One, format(64, scaled)),
-            (ComputeInput::One, format(128, None)),
-            (ComputeInput::Zero, format(32, None)),
-        ];
-        let outputs = [(
-            ComputeOutput::Latch(Latch::new(3).expect("latch 3")),
-            OutputFormat {
-                lds: None,
-                operand: DataType::Sen169Fp16,
-            },
-        )];
-        let mac = |mask| ComputeFamily::Mac {
-            mac: MacOp::Fma8,
-            inputs: &inputs,
-            mask,
-            outputs: &outputs,
+        // ⛔ THE ARRAYS ARE BUILT **INSIDE** THE CLOSURE: every raw part is `Copy`, but
+        // `ComputeInput`/`ComputeOutput` are not, so a capture would move on the first call.
+        let mac = |mask| {
+            let inputs = [
+                (ComputeInput::One, format(64, scaled)),
+                (ComputeInput::One, format(128, None)),
+                (ComputeInput::Zero, format(32, None)),
+            ];
+            let outputs = [(
+                ComputeOutput::Latch(Latch::new(3).expect("latch 3")),
+                OutputFormat {
+                    lds: None,
+                    operand: DataType::Sen169Fp16,
+                },
+            )];
+            ComputeFamily::Mac {
+                mac: MacOp::Fma8,
+                inputs: Box::new(inputs),
+                mask,
+                outputs: Box::new(outputs),
+            }
         };
 
         let mut vals = Values::default();

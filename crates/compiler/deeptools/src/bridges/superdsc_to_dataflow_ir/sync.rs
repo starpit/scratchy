@@ -507,6 +507,7 @@ mod unit_tests {
             )],
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         };
         let mut vals = Values::default();
 

@@ -44,3 +44,7 @@ pub mod sync;
 
 /// THE STICK MASK — the SAMV set-transfer-mask-state op.
 pub mod stick_mask;
+
+/// THE WIRE VIEW — the port's `Dsc`/`ScheduleView` traits over the scheduled wire
+/// (`crate::wire`), so the lowering walks a parsed `sdsc.json` instead of its own fixtures.
+pub mod wire_view;

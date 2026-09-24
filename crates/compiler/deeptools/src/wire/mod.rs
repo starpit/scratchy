@@ -39,7 +39,7 @@ pub use coords::{CoordInfo, Coordinates};
 pub use dims::{ComputeOp, ConstantInfo, DataStage, DataStructDims, DimPaddingSizes, SymbolicDimInfo};
 pub use enums::{
     data_format, Fidelity, IndirectAllocType, LdsSegment, MetaDimKind, NodeType, PadType,
-    SenTarget, WireComputeType, WireLoopName, WireOpFunc,
+    ScaledLdsCategory, SenTarget, WireComputeType, WireLoopName, WireOpFunc,
 };
 pub use fold::{FoldData, FoldDimFunc, FoldDimProp, FoldedData, FoldedIntArray};
 pub use tree::{
@@ -52,6 +52,8 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use sys_arch_spec::arch_enums::SenComponent;
+
+use crate::generated::DataType;
 
 pub use crate::bridges::superdsc_to_dataflow_ir::control_flow::PrimaryDim;
 
@@ -286,7 +288,9 @@ pub struct WireOp {
 }
 
 /// ONE `labeledDs_` ENTRY — the fields of `importLabeledDs` the tree's own validation reads
-/// (`dsc/dsc2.cpp:1852-1859`: the `memOrg_` → `allocateNode_` back-pointer).
+/// (`dsc/dsc2.cpp:1852-1859`: the `memOrg_` → `allocateNode_` back-pointer), plus the format the
+/// lowering reads off `LabeledDsInfo` when it builds an `EndFormat`/`MacInputFormat`
+/// (`SNTransferLowering.cpp`'s `labeledDsInfo_->dataFormat_`/`scaledLdsCategory_`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabeledDs {
     /// `ldsIdx_`.
@@ -298,6 +302,11 @@ pub struct LabeledDs {
     /// `segment_` — optional: the dumper writes it only in the full labeledDs form
     /// (`dsc/dataOpDsc.cpp:1347-1349`); some dumps omit it and the C++ import leaves the default.
     pub segment: Option<LdsSegment>,
+    /// `dataFormat_` — default `IEEE_FP32` when the dumper writes nothing
+    /// (`dsc/labeledDsInfo.h`'s member initializer).
+    pub data_format: DataType,
+    /// `scaledLdsCategory_` — default `regular_tensor`.
+    pub scaled_lds_category: ScaledLdsCategory,
     /// `memOrg_` — component → the allocation entry, whose `allocateNode_` is a node NAME the
     /// reader resolves during the allocate scan.
     pub mem_org: BTreeMap<SenComponent, MemOrgEntry>,
@@ -374,8 +383,23 @@ struct WireLabeledDsJson {
     ds_type: String,
     #[serde(rename = "segment_", default)]
     segment: Option<String>,
+    #[serde(rename = "dataFormat_", default = "default_data_format")]
+    data_format: String,
+    #[serde(rename = "scaledLdsCategory_", default = "default_scaled_lds_category")]
+    scaled_lds_category: String,
     #[serde(rename = "memOrg_", default)]
     mem_org: BTreeMap<String, WireMemOrgJson>,
+}
+
+/// `dataFormat_`'s member initializer (`dsc/labeledDsInfo.h`) — `IEEE_FP32` when the dumper
+/// writes nothing.
+fn default_data_format() -> String {
+    "IEEE_FP32".into()
+}
+
+/// `scaledLdsCategory_`'s member initializer — `regular_tensor` when the dumper writes nothing.
+fn default_scaled_lds_category() -> String {
+    "regular_tensor".into()
 }
 
 /// `memOrg_`'s serde shape.
@@ -540,11 +564,24 @@ fn read_op(name: &str, op: WireOpJson) -> Result<WireOp, Refusal> {
                 },
             )?),
         };
+        let data_format = enums::data_format(&lds.data_format).ok_or(Refusal::UnknownSpelling {
+            spelling: lds.data_format.clone(),
+            field: "labeledDs_ dataFormat_",
+        })?;
+        let scaled_lds_category =
+            ScaledLdsCategory::from_spelling(&lds.scaled_lds_category).ok_or(
+                Refusal::UnknownSpelling {
+                    spelling: lds.scaled_lds_category.clone(),
+                    field: "labeledDs_ scaledLdsCategory_",
+                },
+            )?;
         labeled_ds.push(LabeledDs {
             lds_idx: lds.lds_idx,
             ds_name: lds.ds_name.clone(),
             ds_type: lds.ds_type.clone(),
             segment,
+            data_format,
+            scaled_lds_category,
             mem_org,
         });
     }

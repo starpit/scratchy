@@ -23,6 +23,9 @@
 // ⛔ ONE `crustify:todo:` PER SCHEDULED UNIT. Replace each with the ported function
 // carrying `/// Replaces: eNNN_name`. A surviving TODO is open work.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
 use super::control_flow::{PrimaryDim, mlir_loop_from_sn_loop_node};
 use crate::arch::{Arch, Bytes, Target};
 use crate::generated::DataType;
@@ -133,6 +136,16 @@ pub struct Handlers {
     /// `PTXRF`'s handler, bound in the same breath as `LRFREG` in every arm that has one
     /// (`DSC2ToDataflowIRUtils.hpp:178-179`). ⛔ NOT AN [`Option`], for the reason above.
     pub pt_xrf: Val,
+    /// The reference's `global_latch_map` — one per program unit (`DSC2ToDataflowIR.cpp:336`,
+    /// `:424`), written by whatever latches a value and read by whatever needs it later in the same
+    /// unit's walk (`SNDSCLowering.hpp:126-140`: `addToLatchMap` overwrites, `getFromLatchMap`
+    /// answers null on a miss).
+    ///
+    /// ⛔⛔ THIS IS THE LATCH SEAM. `ComputeInput::Latch` and `LoadSource::Latch` name a latch by its
+    /// `latchDataId_`, and the [`Val`] only exists once an earlier statement of THIS unit's walk
+    /// latched it — so no view can pre-arrange it and the walk must consult this map. Interior
+    /// mutability, because the reads happen inside `&Handlers` borrows the walk already holds.
+    pub latches: RefCell<BTreeMap<i64, Val>>,
 }
 
 impl Handlers {
@@ -143,6 +156,17 @@ impl Handlers {
             .iter()
             .find(|(bound, _)| *bound == unit)
             .map(|(_, held)| *held)
+    }
+
+    /// `addToLatchMap(key, val)` — the reference's overwrite-always write (`SNDSCLowering.hpp:126`).
+    pub fn latch(&self, key: i64, val: Val) {
+        self.latches.borrow_mut().insert(key, val);
+    }
+
+    /// `getFromLatchMap(key)` — the reference's null-on-a-miss read (`SNDSCLowering.hpp:134-140`).
+    #[must_use]
+    pub fn latched(&self, key: i64) -> Option<Val> {
+        self.latches.borrow().get(&key).copied()
     }
 }
 
@@ -1128,6 +1152,7 @@ mod unit_tests {
             ],
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         };
         let mut vals = Values::default();
 

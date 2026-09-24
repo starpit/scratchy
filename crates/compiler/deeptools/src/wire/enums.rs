@@ -517,6 +517,43 @@ impl LdsSegment {
     }
 }
 
+/// WHICH SCALED-LDS CATEGORY A LABELED DATASPACE IS —
+/// `LabeledDsInfo::stringToScaledLdsCategory` (`dsc/dscdefn.cpp:133-140`), the
+/// `scaledLdsCategory_` of a `labeledDs_` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaledLdsCategory {
+    /// `regular_tensor` — the default (`dsc/dscdefn.h:356`).
+    RegularTensor,
+    /// `value_tensor`.
+    ValueTensor,
+    /// `scale_tensor` — for MX scale.
+    ScaleTensor,
+}
+
+impl ScaledLdsCategory {
+    /// `LabeledDsInfo::scaledLdsCategoryToString` (`dsc/dscdefn.cpp:133-137`).
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::RegularTensor => "regular_tensor",
+            Self::ValueTensor => "value_tensor",
+            Self::ScaleTensor => "scale_tensor",
+        }
+    }
+
+    /// `LabeledDsInfo::stringToScaledLdsCategory` (`dsc/dscdefn.cpp:138-140`) — the parse
+    /// boundary.
+    #[must_use]
+    pub fn from_spelling(text: &str) -> Option<Self> {
+        Some(match text {
+            "regular_tensor" => Self::RegularTensor,
+            "value_tensor" => Self::ValueTensor,
+            "scale_tensor" => Self::ScaleTensor,
+            _ => return None,
+        })
+    }
+}
+
 /// WHICH TARGET A DSC IS FOR — `EnumsConversion::stringToSenTargets`
 /// (`util/sendefs/sendefs.cpp:121-128`), the `target_` at the sdsc level and each op's own
 /// `target_`.

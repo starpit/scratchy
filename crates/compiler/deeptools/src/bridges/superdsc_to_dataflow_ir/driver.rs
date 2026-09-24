@@ -397,6 +397,13 @@ impl Raised {
 
 /// ENTRY 104'S ARGUMENTS, WHICH ARE TOO MANY TO INLINE INTO A STATEMENT — the transfer, the handles
 /// it is lowered against, and the four seams it calls back into.
+///
+/// ⛔⛔ THE FOUR SEAMS ARE **OWNED**, AND THAT IS WHAT LETS A REAL VIEW EXIST. The reference's leaves
+/// read `dsc_lowering` back out at walk time (`SNTransferLowering.cpp:2676`), so the closures its
+/// entry 104 calls are built against handles that only exist once the unit's preamble has run — a
+/// view cannot pre-build them against its own `'c` data and hand back `&'c dyn Fn` traits for them.
+/// `Box<dyn Fn .. + 's>` is the same call with the lifetime the handles actually have, moved into
+/// the statement the same walk lowers.
 pub struct TransferStatement<'s> {
     /// `component_to_handler_`.
     pub handlers: &'s Handlers,
@@ -405,20 +412,24 @@ pub struct TransferStatement<'s> {
     /// `getLocalUnitOp(comp_)`.
     pub own: Val,
     /// `getContiguousStickCounts(..)` per corelet.
-    pub blocks: &'s dyn Fn(Option<Corelet>) -> Vec<(PrimaryDim, StickCounts)>,
+    pub blocks: Box<dyn Fn(Option<Corelet>) -> Vec<(PrimaryDim, StickCounts)> + 's>,
     /// The source end, from entry 098.
-    pub send:
-        &'s dyn Fn(&mut Values, &mut Vec<Op>, &mut ContiguousSticks, Val) -> Option<LoadAndSend>,
+    pub send: Box<
+        dyn Fn(&mut Values, &mut Vec<Op>, &mut ContiguousSticks, Val) -> Option<LoadAndSend> + 's,
+    >,
     /// The destination store, from entry 091.
-    pub store: &'s dyn Fn(&mut Values, &mut Vec<Op>, Component) -> LoadAndStore,
+    pub store: Box<dyn Fn(&mut Values, &mut Vec<Op>, Component) -> LoadAndStore + 's>,
     /// One receiving end, from entry 102.
-    pub receive: &'s dyn Fn(
-        &mut Values,
-        &mut Vec<Op>,
-        &mut ContiguousSticks,
-        usize,
-        RecvEnd,
-    ) -> Option<ReceiveAndStore>,
+    pub receive: Box<
+        dyn Fn(
+                &mut Values,
+                &mut Vec<Op>,
+                &mut ContiguousSticks,
+                usize,
+                RecvEnd,
+            ) -> Option<ReceiveAndStore>
+            + 's,
+    >,
 }
 
 /// WHICH OF THE THREE CONDITION ARMS A `CONDITION` NODE TAKES — `hasCoreClCond()` and
@@ -475,14 +486,17 @@ pub enum Statement<'s> {
     /// cannot state, since the loop itself belongs to entry 088's tree.
     Block(Vec<Statement<'s>>),
     /// `COMPUTE` — entry 103's arguments.
+    ///
+    /// ⭐ OWNED, AND `OperandContext` IS [`Copy`]: the context embeds `&'s Handlers` minted by the
+    /// unit's preamble, which no view can hold at its own `'c` — see [`TransferStatement`].
     Compute {
         /// `SNComputeLowering(dsc_lowering, node, precision)`'s operand context.
-        ctx: &'s OperandContext<'s>,
+        ctx: OperandContext<'s>,
         /// Which of the five families `type_` routes to.
         family: ComputeFamily<'s>,
     },
     /// `TRANSFER`.
-    Transfer(&'s TransferStatement<'s>),
+    Transfer(Box<TransferStatement<'s>>),
     /// `SYNC` — entry 076's arguments.
     Sync {
         /// `sync->signal_`.
@@ -686,7 +700,7 @@ pub fn construct_operations_recursively<'s, A: Arch>(
             }
             Statement::Compute { ctx, family } => {
                 let mut ops = Vec::new();
-                let computed = compute_operation::<A>(vals, &mut ops, ctx, family);
+                let computed = compute_operation::<A>(vals, &mut ops, &ctx, family);
                 if let Some(written) = computed.as_ref().and_then(|made| made.precision) {
                     built.precision = Some(written);
                 }
@@ -704,9 +718,9 @@ pub fn construct_operations_recursively<'s, A: Arch>(
                     &transfer.transfer,
                     transfer.own,
                     |corelet| (transfer.blocks)(corelet),
-                    transfer.send,
-                    transfer.store,
-                    transfer.receive,
+                    &transfer.send,
+                    &transfer.store,
+                    &transfer.receive,
                 );
                 let refused = made.is_none();
                 built.placed.push(Placed::Leaf {
@@ -1083,14 +1097,17 @@ pub fn run_translator<'c, A: Arch, D: Dsc<'c>>(
 /// and the only way to notice would be at run time — so the type does not admit one.
 pub enum Emitted<'s> {
     /// `COMPUTE` — entry 103's arguments.
+    ///
+    /// ⭐ OWNED, AND `OperandContext` IS [`Copy`]: the context embeds `&'s Handlers` minted by the
+    /// unit's preamble, which no view can hold at its own `'c` — see [`TransferStatement`].
     Compute {
         /// `SNComputeLowering(dsc_lowering, node, precision)`'s operand context.
-        ctx: &'s OperandContext<'s>,
+        ctx: OperandContext<'s>,
         /// Which of the five families `type_` routes to.
         family: ComputeFamily<'s>,
     },
     /// `TRANSFER`.
-    Transfer(&'s TransferStatement<'s>),
+    Transfer(Box<TransferStatement<'s>>),
     /// `SYNC` — entry 076's arguments.
     Sync {
         /// `sync->signal_`.
@@ -2181,6 +2198,7 @@ mod unit_tests {
             units: Vec::new(),
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         };
         let result_ty = Vector {
             len: 64,
@@ -2221,16 +2239,16 @@ mod unit_tests {
             &mut vals,
             vec![
                 Statement::Loop(vec![Statement::Compute {
-                    ctx: &mac_ctx,
+                    ctx: mac_ctx,
                     family: ComputeFamily::Mac {
                         mac: MacOp::Fma8,
-                        inputs: &inputs,
+                        inputs: Box::new(inputs),
                         mask: ComputeMask::Static(MaskValue::Live8),
-                        outputs: &outputs,
+                        outputs: Box::new(outputs),
                     },
                 }]),
                 Statement::Compute {
-                    ctx: &opaque_ctx,
+                    ctx: opaque_ctx,
                     family: ComputeFamily::Opaque {
                         func: OpaqueFunc::Reciprocal,
                         read_write: &[],
@@ -2394,12 +2412,31 @@ mod unit_tests {
     }
 
     /// ONE ROOT-LEVEL MAC — ⛔ THE FIXTURES ARE THE CALLER'S AND THE HANDLES ARE THE CALLEE'S, which is
-    /// the whole reason [`ScheduleView`]'s `'c: 's` cannot be a `for<'s>` closure bound.
+    /// the whole reason [`ScheduleView`]'s `'c: 's` cannot be a `for<'s>` closure bound. ⭐ THE LEAF IS
+    /// **BUILT** IN `roots`, from copyable raw parts, because a statement's payloads are owned — the
+    /// same shape a wire view takes.
     #[derive(Clone, Copy)]
     struct MacAtTheRoot<'c> {
-        ctx: &'c OperandContext<'c>,
-        inputs: &'c [(ComputeInput<'c>, MacInputFormat); 3],
-        outputs: &'c [(ComputeOutput<'c>, OutputFormat)],
+        ctx: OperandContext<'c>,
+        inputs: [(InputKind, MacInputFormat); 3],
+        outputs: [(Latch, OutputFormat); 1],
+    }
+
+    /// THE FIXTURE'S INPUTS, BY VARIANT — `One` and `Zero` alone, which is all this MAC needs.
+    #[derive(Clone, Copy)]
+    enum InputKind {
+        One,
+        Zero,
+    }
+
+    impl InputKind {
+        /// The [`ComputeInput`] this fixture variant spells.
+        const fn spelled(self) -> ComputeInput<'static> {
+            match self {
+                InputKind::One => ComputeInput::One,
+                InputKind::Zero => ComputeInput::Zero,
+            }
+        }
     }
 
     impl<'c> ScheduleView<'c> for MacAtTheRoot<'c> {
@@ -2407,13 +2444,17 @@ mod unit_tests {
         where
             'c: 's,
         {
+            let inputs = self.inputs.map(|(kind, format)| (kind.spelled(), format));
+            let outputs = self
+                .outputs
+                .map(|(latch, format)| (ComputeOutput::Latch(latch), format));
             vec![Scheduled::Leaf(Emitted::Compute {
                 ctx: self.ctx,
                 family: ComputeFamily::Mac {
                     mac: MacOp::Fma8,
-                    inputs: self.inputs,
+                    inputs: Box::new(inputs),
                     mask: ComputeMask::Static(MaskValue::Live8),
-                    outputs: self.outputs,
+                    outputs: Box::new(outputs),
                 },
             })]
         }
@@ -2520,6 +2561,7 @@ mod unit_tests {
             units: Vec::new(),
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         };
         let ctx = OperandContext {
             name: "fma8_0",
@@ -2538,23 +2580,23 @@ mod unit_tests {
         };
         let inputs = [
             (
-                ComputeInput::One,
+                InputKind::One,
                 format(64, Some((DataType::Sen143Fp8, TensorCategory::Scaled))),
             ),
-            (ComputeInput::One, format(128, None)),
-            (ComputeInput::Zero, format(32, None)),
+            (InputKind::One, format(128, None)),
+            (InputKind::Zero, format(32, None)),
         ];
         let outputs = [(
-            ComputeOutput::Latch(Latch::new(3).expect("latch 3")),
+            Latch::new(3).expect("latch 3"),
             OutputFormat {
                 lds: None,
                 operand: DataType::Sen169Fp16,
             },
         )];
         let mac = MacAtTheRoot {
-            ctx: &ctx,
-            inputs: &inputs,
-            outputs: &outputs,
+            ctx,
+            inputs,
+            outputs,
         };
         let cores = [Core::checked(0).expect("core 0")];
 

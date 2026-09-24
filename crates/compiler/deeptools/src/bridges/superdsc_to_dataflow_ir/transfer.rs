@@ -2468,8 +2468,14 @@ where
                 ty: load.read.result_ty,
             }));
 
-            // `for (dst_idx) if (dst_via.loc_.unit_ == LXLUVALUE) addToLatchMap(latch_id, ..)`.
+            // `for (dst_idx) if (dst_via.loc_.unit_ == LXLUVALUE) addToLatchMap(latch_id, ..)` — ⛔ THE
+            // WRITE HAPPENS HERE, exactly where the reference makes it (`:958`), against the ONE
+            // **UNREPLICATED** load result; the pairs are recorded again in
+            // [`SwitchedLoad::latches`] for the caller's buffer-switch bookkeeping.
             latches = load.read.latches.iter().map(|latch| (*latch, loaded)).collect();
+            for (latch, value) in &latches {
+                handlers.latch(i64::from(latch.get()), *value);
+            }
 
             // `if (transfer_->replicationFactor_ != 1) .. else load_op = load_op_wo_repl;`
             let (mut value, mut value_ty) = if load.read.replication.get() == 1 {
@@ -3479,11 +3485,11 @@ pub enum ContiguousTransfer {
 /// ⛔ AND `LATCH` PREEMPTS BOTH: it is tested before the mode is even asked for (`:5798`), so a
 /// latched transfer never reaches [`buffering_or_streaming_mode`] and its own refusal.
 pub enum LoadSource<'s> {
-    /// `LATCH` — `getFromLatchMap(latchDataId_)`, already bound by the load that filled it.
+    /// `LATCH` — `getFromLatchMap(latchDataId_)` (`SNTransferLowering.cpp:2155-2159`).
     ///
-    /// ⛔ THE TWO `DT_CHECK`s ARE THIS VARIANT'S ARGUMENT: `latch_id != -1` and a non-empty map hit
-    /// (`:5800-5803`) are both absences of a [`Val`], so a caller that has neither cannot build this.
-    Latch(Val),
+    /// ⛔ THE MAP IS THE WALK'S STATE — see [`Handlers::latches`]. `latch_id != -1` and a non-empty
+    /// map hit are both absences of a [`Val`] here, so a caller that has neither cannot build this.
+    Latch(i64),
     /// `mode == 2 || mode == 1` — entry 080 emits the whole chain, including its own send.
     Switched {
         /// The buffer-switch loop the address rides in.
@@ -3867,8 +3873,10 @@ fn load_and_send(
     source: LoadSource<'_>,
 ) -> Option<Chain> {
     let (data, data_ty) = match source {
-        LoadSource::Latch(latched) => {
-            // ⛔ NO CONVERSION AND NO CHAIN — the reference returns success from inside this arm.
+        LoadSource::Latch(id) => {
+            // ⛔ NO CONVERSION AND NO CHAIN — the reference returns success from inside this arm,
+            // and its `DT_CHECK_MSG(data, ..)` is this [`None`].
+            let latched = handlers.latched(id)?;
             ops.push(DfirOp::Dataflow(dataflow::Op::Send {
                 to: read.to,
                 data: latched,
@@ -4564,8 +4572,14 @@ fn receive_and_store(
     };
 
     match dest {
-        // `addToLatchMap(latch_id, data); return success();` — before the mode is even read.
-        StoreDest::Latch(latch) => Some(Written::Latched(latch, data.val())),
+        // `addToLatchMap(latch_id, data); return success();` — before the mode is even read. ⛔ THE
+        // WRITE HAPPENS HERE, in the walk, exactly where the reference makes it (`:1661`) — a
+        // [`Written::Latched`] that only reported the pair would leave the map empty for the compute
+        // that reads this latch later in the same unit.
+        StoreDest::Latch(latch) => {
+            handlers.latch(i64::from(latch.get()), data.val());
+            Some(Written::Latched(latch, data.val()))
+        }
         StoreDest::Switched { switch, step } => {
             let store = StreamingStore {
                 storage: write.storage,
@@ -6794,6 +6808,7 @@ mod unit_tests {
             )],
             own_lrf: Val(1),
             pt_xrf: Val(2),
+            latches: Default::default(),
         }
     }
 
@@ -7131,6 +7146,7 @@ mod unit_tests {
             )],
             own_lrf: Val(51),
             pt_xrf: Val(52),
+            latches: Default::default(),
         }
     }
 
