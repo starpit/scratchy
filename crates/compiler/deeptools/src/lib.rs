@@ -56,6 +56,9 @@ pub mod generated {
 /// THE UNITS A PROGRAM DECLARES, and what each one is next to.
 pub mod units;
 
+/// THE SCHEDULED-SUPERDSC WIRE FORMAT — dbo's dumped `sdsc.json`, parsed into typed Rust.
+pub mod wire;
+
 /// THE WORKLOAD POINT, AS CONSTANTS — which rung of the ladder a program is baked for.
 pub mod workload;
 

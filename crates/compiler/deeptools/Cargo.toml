@@ -25,6 +25,15 @@ license.workspace = true
 # nothing. Each edge must forward the choice instead of making it.
 sys-arch-spec = { path = "sys-arch-spec", default-features = false }
 
+# THE SCHEDULED-SUPERDSC WIRE FORMAT — dbo's `dumpProgram` JSON (`RunSchedulerOnSdsc.cpp:244`).
+#
+# ⭐ THE ONE PARSER IN THIS CRATE THAT READS A LIVE FILE AT RUNTIME. Everything else is generated at
+# build time by `build.rs`; this is the C++-schedules/Rust-lowers split's input side, and it is kept
+# in `src/wire/` with its own module docs because it is a BOUNDARY: its output is typed enums and
+# newtypes, never raw strings, so a malformed program is a refused parse and not a wrong lowering.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 # ⛔ THE `.ddl` TEXT IS PARSED HERE AND NOWHERE ELSE. `build.rs` turns `ddl_templates/*.ddl` into
 # const tables, because parsing text is the one thing in this crate that cannot be a constant. The
 # parser lives in `ddl/`, OUTSIDE `src/`, so its `String`s cannot reach the emitter.

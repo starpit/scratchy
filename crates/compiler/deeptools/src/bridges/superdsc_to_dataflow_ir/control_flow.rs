@@ -93,6 +93,31 @@ impl PrimaryDim {
             PrimaryDim::Y => "y",
         }
     }
+
+    /// `EnumsConversion::stringToPrimaryDim` (`dsc/dims.cpp:36-37`) — the parse boundary, added for
+    /// the wire reader. The flipped map cannot miss; an unknown spelling here is [`None`], which
+    /// the reader turns into a refusal the way `flipMap`'s `.at()` turns into a throw.
+    ///
+    /// ⚠️ `undefined` — `PrimaryDimTypesCount`'s own spelling — parses to [`None`] too, for the
+    /// same reason the variant does not exist: it is the count-and-unset sentinel, not a dim.
+    #[must_use]
+    pub fn from_spelling(text: &str) -> Option<Self> {
+        Some(match text {
+            "in" => Self::In,
+            "out" => Self::Out,
+            "i" => Self::I,
+            "j" => Self::J,
+            "ij" => Self::Ij,
+            "mb" => Self::Mb,
+            "ki" => Self::Ki,
+            "kj" => Self::Kj,
+            "kij" => Self::Kij,
+            "x" => Self::X,
+            "x1" => Self::X1,
+            "y" => Self::Y,
+            _ => return None,
+        })
+    }
 }
 
 /// WHICH COMPARISON A SCHEDULE CONDITION MAKES — `CondOp` (`dsc/dscdefn.h:95-107`).

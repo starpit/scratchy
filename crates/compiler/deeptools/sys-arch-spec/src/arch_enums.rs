@@ -1286,3 +1286,277 @@ pub enum SenComponent {
     /// Queue-group interface.
     Qgi = 105,
 }
+impl SenComponent {
+    /// Every component, in the order the enum declares them —
+    /// `enum SenComponents` (`sys-arch-spec/arch_enums.h:13-125`).
+    pub const ALL: [Self; 107] = [
+        Self::NoComponent,
+        Self::Hbm,
+        Self::Lx,
+        Self::L0,
+        Self::Sfp,
+        Self::Pe,
+        Self::Pt,
+        Self::Ring,
+        Self::Zero,
+        Self::L3,
+        Self::L3lu,
+        Self::L3su,
+        Self::Lxlu0,
+        Self::Lxsu0,
+        Self::Lxlu1,
+        Self::Lxsu1,
+        Self::L0lu0,
+        Self::L0su0,
+        Self::L0lu1,
+        Self::L0su1,
+        Self::Sfp0,
+        Self::Sfp1,
+        Self::Pe0,
+        Self::Pe1,
+        Self::Ptrow0_0,
+        Self::Ptrow1_0,
+        Self::Ptrow2_0,
+        Self::Ptrow3_0,
+        Self::Ptrow4_0,
+        Self::Ptrow5_0,
+        Self::Ptrow6_0,
+        Self::Ptrow7_0,
+        Self::Ptrow0_1,
+        Self::Ptrow1_1,
+        Self::Ptrow2_1,
+        Self::Ptrow3_1,
+        Self::Ptrow4_1,
+        Self::Ptrow5_1,
+        Self::Ptrow6_1,
+        Self::Ptrow7_1,
+        Self::Lxlusufifo,
+        Self::L0lu,
+        Self::L0su,
+        Self::Lxlu,
+        Self::Lxsu,
+        Self::L3ibr,
+        Self::Ptxrf,
+        Self::Ptirf,
+        Self::Lrfreg,
+        Self::Ptrow0,
+        Self::Ptrow1,
+        Self::Ptrow2,
+        Self::Ptrow3,
+        Self::Ptrow4,
+        Self::Ptrow5,
+        Self::Ptrow6,
+        Self::Ptrow7,
+        Self::Ptnorth,
+        Self::Ptwest,
+        Self::Ptsouth,
+        Self::Sfpring,
+        Self::All,
+        Self::One,
+        Self::L0lurow0,
+        Self::L0lurow1,
+        Self::L0lurow2,
+        Self::L0lurow3,
+        Self::L0lurow4,
+        Self::L0lurow5,
+        Self::L0lurow6,
+        Self::L0lurow7,
+        Self::Latch,
+        Self::Constant,
+        Self::Nfwd0,
+        Self::Nfwd2,
+        Self::Pelrf,
+        Self::Sfplrf,
+        Self::Ptarf,
+        Self::L0lurow0_0,
+        Self::L0lurow1_0,
+        Self::L0lurow2_0,
+        Self::L0lurow3_0,
+        Self::L0lurow4_0,
+        Self::L0lurow5_0,
+        Self::L0lurow6_0,
+        Self::L0lurow7_0,
+        Self::L0lurow0_1,
+        Self::L0lurow1_1,
+        Self::L0lurow2_1,
+        Self::L0lurow3_1,
+        Self::L0lurow4_1,
+        Self::L0lurow5_1,
+        Self::L0lurow6_1,
+        Self::L0lurow7_1,
+        Self::Lxvirtualibr,
+        Self::L3luibr,
+        Self::L3suibr,
+        Self::Sfpstate,
+        Self::Pestate,
+        Self::Crossptnlink,
+        Self::L0Scale,
+        Self::Lxluscalereg,
+        Self::Lxluvalue,
+        Self::PeLrfreg,
+        Self::SfpLrfreg,
+        Self::PtLrfreg,
+        Self::Qgi,
+    ];
+
+    /// This component's spelling — `EnumsConversion::senComponentsToString`
+    /// (`sys-arch-spec/arch_enums.cpp:11-119`).
+    ///
+    /// ⛔ `enum SenComponents` starts at `NO_COMPONENT = -1`, so the table cannot be indexed
+    /// by the discriminant the way [`OpFunc::SPELLINGS`] is; the arms are kept in enum
+    /// order so a reordered table is still a reviewable diff against the C++.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::NoComponent => "no_component",
+            Self::Hbm => "hbm",
+            Self::Lx => "lx",
+            Self::L0 => "l0",
+            Self::Sfp => "sfp",
+            Self::Pe => "pe",
+            Self::Pt => "pt",
+            Self::Ring => "ring",
+            Self::Zero => "zero",
+            Self::L3 => "l3",
+            Self::L3lu => "l3lu",
+            Self::L3su => "l3su",
+            Self::Lxlu0 => "lxlu0",
+            Self::Lxsu0 => "lxsu0",
+            Self::Lxlu1 => "lxlu1",
+            Self::Lxsu1 => "lxsu1",
+            Self::L0lu0 => "l0lu0",
+            Self::L0su0 => "l0su0",
+            Self::L0lu1 => "l0lu1",
+            Self::L0su1 => "l0su1",
+            Self::Sfp0 => "sfp0",
+            Self::Sfp1 => "sfp1",
+            Self::Pe0 => "pe0",
+            Self::Pe1 => "pe1",
+            Self::Ptrow0_0 => "ptrow0_0",
+            Self::Ptrow1_0 => "ptrow1_0",
+            Self::Ptrow2_0 => "ptrow2_0",
+            Self::Ptrow3_0 => "ptrow3_0",
+            Self::Ptrow4_0 => "ptrow4_0",
+            Self::Ptrow5_0 => "ptrow5_0",
+            Self::Ptrow6_0 => "ptrow6_0",
+            Self::Ptrow7_0 => "ptrow7_0",
+            Self::Ptrow0_1 => "ptrow0_1",
+            Self::Ptrow1_1 => "ptrow1_1",
+            Self::Ptrow2_1 => "ptrow2_1",
+            Self::Ptrow3_1 => "ptrow3_1",
+            Self::Ptrow4_1 => "ptrow4_1",
+            Self::Ptrow5_1 => "ptrow5_1",
+            Self::Ptrow6_1 => "ptrow6_1",
+            Self::Ptrow7_1 => "ptrow7_1",
+            Self::Lxlusufifo => "lxlusufifio",
+            Self::L0lu => "l0lu",
+            Self::L0su => "l0su",
+            Self::Lxlu => "lxlu",
+            Self::Lxsu => "lxsu",
+            Self::L3ibr => "l3ibr",
+            Self::Ptxrf => "ptxrf",
+            Self::Ptirf => "ptirf",
+            Self::Lrfreg => "lrfreg",
+            Self::Ptrow0 => "ptrow0",
+            Self::Ptrow1 => "ptrow1",
+            Self::Ptrow2 => "ptrow2",
+            Self::Ptrow3 => "ptrow3",
+            Self::Ptrow4 => "ptrow4",
+            Self::Ptrow5 => "ptrow5",
+            Self::Ptrow6 => "ptrow6",
+            Self::Ptrow7 => "ptrow7",
+            Self::Ptnorth => "ptnorth",
+            Self::Ptwest => "ptwest",
+            Self::Ptsouth => "ptsouth",
+            Self::Sfpring => "sfpring",
+            Self::All => "all",
+            Self::One => "one",
+            Self::L0lurow0 => "l0lurow0",
+            Self::L0lurow1 => "l0lurow1",
+            Self::L0lurow2 => "l0lurow2",
+            Self::L0lurow3 => "l0lurow3",
+            Self::L0lurow4 => "l0lurow4",
+            Self::L0lurow5 => "l0lurow5",
+            Self::L0lurow6 => "l0lurow6",
+            Self::L0lurow7 => "l0lurow7",
+            Self::Latch => "latch",
+            Self::Constant => "constant",
+            Self::Nfwd0 => "nfwd0",
+            Self::Nfwd2 => "nfwd2",
+            Self::Pelrf => "pelrf",
+            Self::Sfplrf => "sfplrf",
+            Self::Ptarf => "ptarf",
+            Self::L0lurow0_0 => "l0lurow0_0",
+            Self::L0lurow1_0 => "l0lurow1_0",
+            Self::L0lurow2_0 => "l0lurow2_0",
+            Self::L0lurow3_0 => "l0lurow3_0",
+            Self::L0lurow4_0 => "l0lurow4_0",
+            Self::L0lurow5_0 => "l0lurow5_0",
+            Self::L0lurow6_0 => "l0lurow6_0",
+            Self::L0lurow7_0 => "l0lurow7_0",
+            Self::L0lurow0_1 => "l0lurow0_1",
+            Self::L0lurow1_1 => "l0lurow1_1",
+            Self::L0lurow2_1 => "l0lurow2_1",
+            Self::L0lurow3_1 => "l0lurow3_1",
+            Self::L0lurow4_1 => "l0lurow4_1",
+            Self::L0lurow5_1 => "l0lurow5_1",
+            Self::L0lurow6_1 => "l0lurow6_1",
+            Self::L0lurow7_1 => "l0lurow7_1",
+            Self::Lxvirtualibr => "lxvirtualibr",
+            Self::L3luibr => "l3luibr",
+            Self::L3suibr => "l3suibr",
+            Self::Sfpstate => "sfpstate",
+            Self::Pestate => "pestate",
+            Self::Crossptnlink => "crossptnlink",
+            Self::L0Scale => "l0scale",
+            Self::Lxluscalereg => "lxluscalereg",
+            Self::Lxluvalue => "lxluvalue",
+            Self::PeLrfreg => "pe_lrfreg",
+            Self::SfpLrfreg => "sfp_lrfreg",
+            Self::PtLrfreg => "pt_lrfreg",
+            Self::Qgi => "qgi",
+        }
+    }
+
+    /// `EnumsConversion::stringToSenComponents` (`sys-arch-spec/arch_enums.cpp:121-122`)
+    /// — the parse boundary. An unknown spelling is `None`, never a panic, so a wire
+    /// reader built on this turns it into a refusal at ITS boundary.
+    #[must_use]
+    pub fn from_spelling(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.spelling() == text)
+    }
+}
+
+/// The spelling table is INJECTIVE, so `stringToSenComponents` is a function — a duplicate
+/// spelling would make [`SenComponent::from_spelling`] silently pick the first arm and turn
+/// one component's wire name into another's. Pinned here because the C++ map is keyed and
+/// cannot drift; this `match` can.
+const _: () = {
+    /// `&str` equality is not const-stable yet; compare the bytes instead.
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut i = 0;
+    while i < SenComponent::ALL.len() {
+        let mut j = i + 1;
+        while j < SenComponent::ALL.len() {
+            assert!(
+                !str_eq(SenComponent::ALL[i].spelling(), SenComponent::ALL[j].spelling()),
+                "two SenComponents share a spelling"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
