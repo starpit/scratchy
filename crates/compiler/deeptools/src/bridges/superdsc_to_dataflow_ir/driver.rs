@@ -501,6 +501,9 @@ pub enum Statement<'s> {
     Sync {
         /// `sync->signal_`.
         signal: SyncSignal,
+        /// `sync->name_` — free-form, which the scheduled bridge reads off the wire and the
+        /// template bridge does not have ([`None`] there, printing the census spelling).
+        name: Option<&'s str>,
         /// Which of the three sync statements this is.
         kind: SyncKind<'s>,
     },
@@ -733,9 +736,9 @@ pub fn construct_operations_recursively<'s, A: Arch>(
                     return built;
                 }
             }
-            Statement::Sync { signal, kind } => {
+            Statement::Sync { signal, name, kind } => {
                 let mut ops = Vec::new();
-                construct_sync_operation(vals, &mut ops, signal, kind);
+                construct_sync_operation(vals, &mut ops, signal, name, kind);
                 // ⛔ ENTRY 076 HANDS BACK NOTHING, AND ITS ONE `failure()` IS AN EMPTY UNIT SET —
                 // which is exactly the case where it signals no one and emits no op.
                 let refused = ops.is_empty();
@@ -1112,6 +1115,9 @@ pub enum Emitted<'s> {
     Sync {
         /// `sync->signal_`.
         signal: SyncSignal,
+        /// `sync->name_` — free-form, which the scheduled bridge reads off the wire and the
+        /// template bridge does not have ([`None`] there, printing the census spelling).
+        name: Option<&'s str>,
         /// Which of the three sync statements this is.
         kind: SyncKind<'s>,
     },
@@ -1134,7 +1140,7 @@ impl<'s> Emitted<'s> {
         match self {
             Emitted::Compute { ctx, family } => Statement::Compute { ctx, family },
             Emitted::Transfer(transfer) => Statement::Transfer(transfer),
-            Emitted::Sync { signal, kind } => Statement::Sync { signal, kind },
+            Emitted::Sync { signal, name, kind } => Statement::Sync { signal, name, kind },
             Emitted::StickMask {
                 view,
                 name,
@@ -2265,6 +2271,7 @@ mod unit_tests {
                 Statement::Condition(CondStatement::Loops {
                     then_: Box::new(Statement::Sync {
                         signal: SyncSignal::InputToLxsuToLxluToSync,
+                        name: None,
                         kind: SyncKind::Receive {
                             units: SyncUnits::Plain(vec![Retrieved::Reused(Val(9))]),
                         },

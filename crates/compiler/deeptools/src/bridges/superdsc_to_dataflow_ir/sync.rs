@@ -364,29 +364,46 @@ fn one_handle(vals: &mut Values, ops: &mut Vec<DfirOp>, units: SyncUnits) -> Opt
 /// **076/110** `SNSyncLowering.cpp:205` — the `sync_send`, `sync_recv` or implicit sync itself, over
 /// one handle or over a `create_group` of every other end.
 ///
-/// ⛔ `wait_immediately` REACHES NO ATTRIBUTE: [`dataflow::Op::SyncSend`]'s printer states
-/// `wait_immediately_for_async_transfers = true` for every send, with its own cited reason, and a
-/// `ddl.sync` carries no soft flag for this to disagree with.
+/// ⚠️ THE SEND AND RECV EACH TAKE THE NODE'S OWN NAME: the reference passes
+/// `builder.getStringAttr(sync->name_)` on every send and every recv (`:225`, `:231`, `:245`, `:249`)
+/// — free-form, whatever the schedule named the node. The template bridge has no such name, so it
+/// passes [`None`] and the op prints the signal's census spelling instead. The scheduled bridge
+/// (see `wire_view`) passes the wire's node name and the printed `dbgName` matches the reference.
+///
+/// ⛔ `wait_immediately` REACHES THE SEND'S ATTRIBUTE AS READ: `sync->isSoft_ == 0`
+/// (`SNSyncLowering.cpp:212-213`). A `ddl.sync` is always hard, so the template bridge's produce
+/// statements spell `true`; a scheduled soft sync spells `false` through here.
 /// ⛔ THE IMPLICIT ARM'S `DT_CHECK_MSG(coreArch >= RCUDD1A_ISA)` IS A TYPE FACT: [`crate::arch::IsaGen`]
 /// has no generation below it, so there is no arch this can refuse on.
 pub fn construct_sync_operation(
     vals: &mut Values,
     ops: &mut Vec<DfirOp>,
     signal: SyncSignal,
+    name: Option<&str>,
     kind: SyncKind<'_>,
 ) {
+    let dbg_name = name.map(str::to_owned);
     match kind {
         SyncKind::Produce {
-            wait_immediately: _,
+            wait_immediately,
             units,
         } => {
             if let Some(to) = one_handle(vals, ops, units) {
-                ops.push(DfirOp::Dataflow(dataflow::Op::SyncSend { to, signal }));
+                ops.push(DfirOp::Dataflow(dataflow::Op::SyncSend {
+                    to,
+                    signal,
+                    dbg_name,
+                    wait_immediately,
+                }));
             }
         }
         SyncKind::Receive { units } => {
             if let Some(from) = one_handle(vals, ops, units) {
-                ops.push(DfirOp::Dataflow(dataflow::Op::SyncRecv { from, signal }));
+                ops.push(DfirOp::Dataflow(dataflow::Op::SyncRecv {
+                    from,
+                    signal,
+                    dbg_name,
+                }));
             }
         }
         SyncKind::Implicit {
@@ -403,7 +420,7 @@ pub fn construct_sync_operation(
             l0_memory,
             tile_size,
             elem,
-            signal.spelling(),
+            name.unwrap_or_else(|| signal.spelling()),
         ),
     }
 }
@@ -436,6 +453,7 @@ mod unit_tests {
             &mut vals,
             &mut ops,
             signal,
+            None,
             SyncKind::Produce {
                 wait_immediately: true,
                 units: SyncUnits::Plain(vec![
@@ -454,6 +472,8 @@ mod unit_tests {
                 DfirOp::Dataflow(dataflow::Op::SyncSend {
                     to: Val(2),
                     signal,
+                    dbg_name: None,
+                    wait_immediately: true,
                 }),
             ]
         );
@@ -463,6 +483,7 @@ mod unit_tests {
             &mut vals,
             &mut ops,
             signal,
+            None,
             SyncKind::Receive {
                 units: SyncUnits::Uniform(Some(first)),
             },
@@ -472,6 +493,7 @@ mod unit_tests {
             vec![DfirOp::Dataflow(dataflow::Op::SyncRecv {
                 from: first,
                 signal,
+                dbg_name: None,
             })]
         );
         // ⛔ AND NO OTHER END IS THE REFERENCE'S TRAILING `return failure()`: nothing is emitted.
@@ -480,6 +502,7 @@ mod unit_tests {
             &mut vals,
             &mut ops,
             signal,
+            None,
             SyncKind::Produce {
                 wait_immediately: false,
                 units: SyncUnits::Uniform(None),

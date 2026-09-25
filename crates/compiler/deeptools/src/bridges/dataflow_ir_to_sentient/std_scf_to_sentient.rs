@@ -579,6 +579,8 @@ mod unit_tests {
             legality(&DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(0),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             })),
             Legality::Unmentioned
         );
@@ -634,6 +636,8 @@ mod unit_tests {
             vec![DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(0),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             })],
             vec![
                 DfirOp::Arith(arith::Op::Constant {

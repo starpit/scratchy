@@ -587,6 +587,8 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(3),
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             }),
         ];
         assert!(!is_same_list_of_units(&keys, &[Val(3), Val(4)]));

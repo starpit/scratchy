@@ -713,10 +713,13 @@ fn nest<
             step_body.push(Op::Dataflow(dataflow::Op::SyncSend {
                 to: mover,
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             }));
             step_body.push(Op::Dataflow(dataflow::Op::SyncRecv {
                 from: mover,
                 signal: crate::generated::SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
             }));
         }
         step_body.extend(inner);

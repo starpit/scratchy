@@ -1826,16 +1826,19 @@ mod unit_tests {
                             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                                 from: Val(5),
                                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                                dbg_name: None,
                             }),
                             load_and_send(Val(30), Val(31), to_pt),
                             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                                 from: Val(5),
                                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                                dbg_name: None,
                             }),
                             load_and_send(Val(32), Val(33), to_pt),
                             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                                 from: Val(5),
                                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                                dbg_name: None,
                             }),
                             load_and_send(Val(34), Val(35), to_l0su),
                         ],

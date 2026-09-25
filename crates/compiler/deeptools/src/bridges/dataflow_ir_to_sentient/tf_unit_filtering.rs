@@ -663,10 +663,13 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(5),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             }),
             DfirOp::Dataflow(dataflow::Op::SyncRecv {
                 from: Val(4),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
             }),
             DfirOp::Dataflow(dataflow::Op::ImplicitSync {
                 view: Val(10),
@@ -998,6 +1001,7 @@ mod unit_tests {
         let recv = DfirOp::Dataflow(dataflow::Op::SyncRecv {
             from: Val(430),
             signal: SyncSignal::InputToLxsuToLxluToSync,
+            dbg_name: None,
         });
         let mut module = vec![
             group.clone(),
@@ -1015,6 +1019,8 @@ mod unit_tests {
             DfirOp::Dataflow(dataflow::Op::SyncSend {
                 to: Val(470),
                 signal: SyncSignal::InputToLxsuToLxluToSync,
+                dbg_name: None,
+                wait_immediately: true,
             }),
             recv.clone(),
         ];

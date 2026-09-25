@@ -518,6 +518,24 @@ pub enum Op {
         to: Val,
         /// Which signal, for the debug name.
         signal: SyncSignal,
+        /// `dbgName` — the sync's own name, which outranks `signal` when both are known.
+        ///
+        /// ⛔ ADDED FOR THE SCHEDULED BRIDGE, AND IT PRINTS. `constructSyncOperation` passes
+        /// `builder.getStringAttr(sync->name_)` — the schedule node's free-form name — on every send
+        /// it builds (`SNSyncLowering.cpp:225`, `:231`), and the reference's own IR carries it:
+        /// `dataflow.sync_send %438 {dbgName = "sync_send_lxlu_to_l3lu",
+        /// wait_immediately_for_async_transfers = true} : index`. The template bridge has no such
+        /// name and passes [`None`], which prints the signal's census spelling — the only name a
+        /// `ddl.sync` has. See [`ImplicitSync::dbg_name`], the same fact one node kind over.
+        dbg_name: Option<String>,
+        /// `wait_immediately_for_async_transfers` — `sync->isSoft_ == 0`.
+        ///
+        /// ⛔ CARRIED BECAUSE THE SCHEDULED BRIDGE READS IT. The dialect declares the attribute
+        /// `OptionalAttr<BoolAttr>` (`Dataflow.td:200`) and the reference computes it from the sync
+        /// node's softness (`SNSyncLowering.cpp:212-213`) — a `ddl.sync` is always a hard signal, so
+        /// the template bridge's `true` is that fact spelled. A scheduled soft sync must be able to
+        /// state `false`; see the TRAP on the printer arm for why `true` is the safe default.
+        wait_immediately: bool,
     },
 
     /// `dataflow.sync_recv %unit : index` — blocking.
@@ -526,6 +544,13 @@ pub enum Op {
         from: Val,
         /// Which signal, for the debug name.
         signal: SyncSignal,
+        /// `dbgName` — the sync's own name, which outranks `signal` when both are known.
+        ///
+        /// ⛔ ADDED FOR THE SCHEDULED BRIDGE, AND IT PRINTS. Same fact as
+        /// [`SyncSend::dbg_name`]: `constructSyncOperation` passes `getStringAttr(sync->name_)`
+        /// on every receive too (`SNSyncLowering.cpp:245`, `:249`), and the reference's IR carries
+        /// it (`{dbgName = "sync_receive_lxlu_from_l3lu"}`). [`None`] prints the census spelling.
+        dbg_name: Option<String>,
     },
 
     /// `dataflow.implicit_sync_on_streaming_buffer %view, %dst, %size : ..` — synchronisation at the
@@ -787,34 +812,41 @@ pub(crate) fn emit(out: &mut String, op: &Op, depth: usize) {
                 print::vector(*ty)
             );
         }
-        Op::SyncSend { to, signal } => {
+        Op::SyncSend {
+            to,
+            signal,
+            dbg_name,
+            wait_immediately,
+        } => {
+            // ⛔⛔ THE WAIT MODE IS OPTIONAL IN THE DIALECT AND MANDATORY TO LOWER.
+            // `Dataflow.td:200` declares it `OptionalAttr<BoolAttr>`, but
+            // `DataflowToSentient.cpp:219-222` fails outright when a send has none: "Unknown
+            // async transfers modes for sentient".
+            //
+            // ⭐ `true` IS WHAT EVERY `ddl.sync` SPELLS, because a `ddl.sync` is always hard:
+            // the reference computes the flag as `sync->isSoft_ == 0` (`SNSyncLowering.cpp:212-213`)
+            // and no vendored template states a soft one. It "controls whether the sender waits for
+            // outstanding asynchronous transfers before signalling" (`:191-192`) — and a signal
+            // that does not wait can be observed before the transfer it is announcing lands.
+            // `false` needs something else to order the transfers, and only a SCHEDULED soft sync
+            // states one; that is why the flag is a field and not a literal here.
+            let name = dbg_name.as_deref().unwrap_or_else(|| signal.spelling());
             let _ = writeln!(
                 out,
-                // ⛔⛔ THE WAIT MODE IS OPTIONAL IN THE DIALECT AND MANDATORY TO LOWER.
-                // `Dataflow.td:200` declares it `OptionalAttr<BoolAttr>`, but
-                // `DataflowToSentient.cpp:219-222` fails outright when a send has none: "Unknown
-                // async transfers modes for sentient".
-                //
-                // ⭐ `true` IS THE ONLY SAFE ANSWER HERE, and it is what the scheduler writes for
-                // every send in its own output. It "controls whether the sender waits for
-                // outstanding asynchronous transfers before signalling" (`:191-192`) — and a
-                // `ddl.sync` exists to say the data has ARRIVED, so a signal that does not wait can
-                // be observed before the transfer it is announcing lands. `false` is an
-                // optimisation that needs something else to order the transfers, and no vendored
-                // template states one: `ddl.sync` carries `units`, `signal_name` and `receive`, and
-                // nothing about async waits.
                 "dataflow.sync_send {} {{dbgName = \"{}\", \
-                 wait_immediately_for_async_transfers = true}} : index",
+                 wait_immediately_for_async_transfers = {}}} : index",
                 print::val(*to),
-                signal.spelling()
+                name,
+                wait_immediately
             );
         }
-        Op::SyncRecv { from, signal } => {
+        Op::SyncRecv { from, signal, dbg_name } => {
+            let name = dbg_name.as_deref().unwrap_or_else(|| signal.spelling());
             let _ = writeln!(
                 out,
                 "dataflow.sync_recv {} {{dbgName = \"{}\"}} : index",
                 print::val(*from),
-                signal.spelling()
+                name
             );
         }
         Op::ImplicitSync {

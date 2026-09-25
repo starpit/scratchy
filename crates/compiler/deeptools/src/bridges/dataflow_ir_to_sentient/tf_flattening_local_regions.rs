@@ -1361,6 +1361,7 @@ mod unit_tests {
                         DfirOp::Dataflow(dataflow::Op::SyncRecv {
                             from: Val(286),
                             signal: SyncSignal::InputToLxsuToLxluToSync,
+                            dbg_name: None,
                         }),
                         DfirOp::Uniform(uniform::Op::Yield {
                             operands: Vec::new(),
@@ -1393,6 +1394,7 @@ mod unit_tests {
                         DfirOp::Dataflow(dataflow::Op::SyncRecv {
                             from: Val(296),
                             signal: SyncSignal::InputToLxsuToLxluToSync,
+                            dbg_name: None,
                         }),
                         DfirOp::Uniform(uniform::Op::Yield {
                             operands: Vec::new(),
