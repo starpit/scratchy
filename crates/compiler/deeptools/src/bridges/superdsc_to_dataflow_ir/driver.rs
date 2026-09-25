@@ -888,7 +888,7 @@ pub fn convert_v3<'c, A: Arch, D: Dsc<'c>>(
     grid: Grid,
     components: &Used<DfirUnit>,
     fold_dims: &[NumFolds],
-    dscs: &[D],
+    dscs: &'c [D],
 ) -> Converted<A> {
     let scaffold = start_dataflow_ir_generation(name, grid);
     let mut assembled = Assembled::new();
@@ -936,7 +936,7 @@ pub fn convert_v4<'c, A: Arch, D: Dsc<'c>>(
     grid: Grid,
     components: &Used<DfirUnit>,
     fold_dims: &[NumFolds],
-    dscs: &[D],
+    dscs: &'c [D],
 ) -> Converted<A> {
     let scaffold = start_dataflow_ir_generation(name, grid);
     let mut assembled = Assembled::new();
@@ -1073,7 +1073,7 @@ pub fn run_translator<'c, A: Arch, D: Dsc<'c>>(
     name: ProgramName,
     grid: Grid,
     fold_dims: &[NumFolds],
-    dscs: &[D],
+    dscs: &'c [D],
 ) -> Translated<A> {
     let components = sen_components();
     let kinds: Vec<DscKind> = dscs.iter().map(|dsc| dsc.kind()).collect();
@@ -1838,7 +1838,13 @@ pub trait Dsc<'c>: 'c {
     fn folds_needed(&self, comp: DfirUnit) -> bool;
 
     /// `dsc.scheduleTree_.getHead()->getNextView(..)` (`:298`, `:380`), with what entry 096 needs.
-    fn view(&self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self>;
+    ///
+    /// ⭐ `&'c self`, AND THAT IS THE WHOLE REASON THE VIEW CAN EXIST. A view's leaves carry
+    /// `&'s`-borrowed payloads — [`Scheduled::Band`]'s `transfers` and [`RootArgs::transfers`]'s
+    /// address tables — which must live as long as the `'s` the statement walk runs under; the
+    /// only region that can guarantee that is the one the DSC itself was borrowed at, so the view
+    /// is handed out at `'c` and the drivers take `dscs: &'c [D]` to lend each one for that long.
+    fn view(&'c self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self>;
 }
 
 /// WHAT ONE DRIVER LEFT IN THE MODULE — entry 003's scaffold, closed by entry 004 over every unit the
@@ -2733,7 +2739,7 @@ mod unit_tests {
             false
         }
 
-        fn view(&self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self> {
+        fn view(&'c self, comp: DfirUnit, at: Viewed) -> Viewing<'c, Self> {
             self.asked.borrow_mut().push((comp, at));
             Viewing {
                 transfers: Vec::new(),
