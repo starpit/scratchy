@@ -41,21 +41,30 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 ROOT="$(cd -- "${HERE}/.." &>/dev/null && pwd)"
 
-# Every id verified against the HuggingFace API with its download size
+# Every id verified against the HuggingFace API with its download size.
+# The quant column is the FEATURE to enable (`quant/<name>`), not the preset
+# to synthesize: `mlx` is the umbrella feature for every MLX affine preset,
+# and the arch's own quantizations.json ∩ SCRATCHY_QUANTS decides which
+# variants actually compile for the selected model — one per (base, preset)
+# the arch declares. `mlx` here rather than a per-model preset keeps the
+# build line uniform across models whose checkpoints sit on different
+# group sizes (granite 4-bit builds are g32, most others g64) — and the
+# variant that serves the requested HF repo is the one `scr serve` loads.
 MODELS_DEFAULT=(
-  "granite-3.3-2b-instruct=mlx-community/granite-3.3-2b-instruct-4bit:mlx-affine-b4-g64"  #  1.4 GB
-  "llama-3.2-3b=mlx-community/Llama-3.2-3B-Instruct-4bit:mlx-affine-b4-g64"               #  1.8 GB
-  "granite-3.3-8b-instruct=mlx-community/granite-3.3-8b-instruct-4bit:mlx-affine-b4-g64"  #  4.6 GB
-  "qwen2.5-7b=mlx-community/Qwen2.5-7B-Instruct-4bit:mlx-affine-b4-g64"                   #  4.3 GB
-  "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx-affine-b4-g64"            # 15.4 GB
-  "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx-affine-b4-g64"                    # 18.4 GB
-  "qwen3.5-35b-a3b=mlx-community/Qwen3.5-35B-A3B-4bit:mlx-affine-b4-g64"                  # 20.4 GB
+  "granite-3.3-2b-instruct=mlx-community/granite-3.3-2b-instruct-4bit:mlx"  #  1.4 GB
+  "llama-3.2-3b=mlx-community/Llama-3.2-3B-Instruct-4bit:mlx"               #  1.8 GB
+  "granite-3.3-8b-instruct=mlx-community/granite-3.3-8b-instruct-4bit:mlx"  #  4.6 GB
+  "qwen2.5-7b=mlx-community/Qwen2.5-7B-Instruct-4bit:mlx"                   #  4.3 GB
+  "gemma-4-26b-a4b-it=mlx-community/gemma-4-26b-a4b-it-4bit:mlx"            # 15.4 GB
+  "gemma-4-31b-it=mlx-community/gemma-4-31b-it-4bit:mlx"                    # 18.4 GB
+  "qwen3.5-35b-a3b=mlx-community/Qwen3.5-35B-A3B-4bit:mlx"                  # 20.4 GB
   # Frontier-ish: Moonlight is a DeepSeek-V3-architecture MoE (16B total, ~3B
   # active), so it exercises the MLA + MoE path at a size a 36 GB machine can
-  # host. Listed twice on purpose — same model, two quantizations — which is the
-  # only quantization axis in this matrix, since the gemma4 and qwen3.5 families
-  # declare mlx-affine-b4-g64 and nothing else.
-  "moonlight-16b-a3b-instruct=mlx-community/Moonlight-16B-A3B-Instruct-4-bit:mlx-affine-b4-g64"        #  9.0 GB
+  # host. Listed twice on purpose — same model, two quantizations. deepseek-v3
+  # declares only ggml, so the mlx umbrella synthesizes nothing there and the
+  # dense base serves the 4-bit repo; the fp8-block row needs its own feature
+  # because fp8-block-128x128 is outside the mlx umbrella.
+  "moonlight-16b-a3b-instruct=mlx-community/Moonlight-16B-A3B-Instruct-4-bit:mlx"        #  9.0 GB
   "moonlight-16b-a3b-instruct-fp8-block=starpit/moonlight-16b-a3b-instruct-fp8-block:fp8-block-128x128" # 16.7 GB
   # DeepSeek-V2-Lite has no public 4-bit MLX build, so it would be bf16 at
   # 31.4 GB and exhaust a 36 GB machine once the KV cache is allocated. The
