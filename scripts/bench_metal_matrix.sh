@@ -195,7 +195,7 @@ EOF
 
 # ---- machine block ----------------------------------------------------------
 python3 - "${JSON}" "${chip}" "${SCENARIOS}" "${EXEC_OK}" <<'PY'
-import json, subprocess, sys, time
+import json, os, subprocess, sys, time
 out, chip, scenarios, exec_ok = sys.argv[1:5]
 sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
 sysctl = lambda k: sh("sysctl", "-n", k)
