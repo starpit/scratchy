@@ -156,10 +156,13 @@ done
 (( OFFLINE )) && export HF_HUB_OFFLINE=1
 
 # The machine block below (a python heredoc) reads the scaling config through
-# the environment rather than a growing argv.
-SM_CONC="${CONCURRENCIES}" SM_INPUT_LENS="${INPUT_LENS}" SM_OUTPUT_LENS="${OUTPUT_LENS}" \
-SM_BASE_IN="${BASE_INPUT}" SM_BASE_OUT="${BASE_OUTPUT}" SM_BASE_CONC="${BASE_CONCURRENCY}" \
-    true
+# the environment rather than a growing argv. ASSIGNED then EXPORTED — a
+# `VAR=x cmd` prefix scopes to that one command, and the heredoc python is a
+# separate process that would never see them; a bare `export VAR` with no
+# assignment exports nothing.
+SM_CONC="${CONCURRENCIES}"; SM_INPUT_LENS="${INPUT_LENS}"; SM_OUTPUT_LENS="${OUTPUT_LENS}"
+SM_BASE_IN="${BASE_INPUT}"; SM_BASE_OUT="${BASE_OUTPUT}"; SM_BASE_CONC="${BASE_CONCURRENCY}"
+export SM_CONC SM_INPUT_LENS SM_OUTPUT_LENS SM_BASE_IN SM_BASE_OUT SM_BASE_CONC
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
