@@ -10,7 +10,10 @@
 # results into one file. Two consequences worth knowing:
 #
 #   * It never starts or stops a server. `scr bench startup --exec` spawns and
-#     reaps its own children, so this script cannot leak one.
+#     reaps its own children, so this script cannot leak one. (Exception: the
+#     scaling stage and the warm stage below each run ONE resident server per
+#     model, solo, torn down before the next starts — the same rule
+#     bench_serve_compare.sh bakes in.)
 #   * It adds exactly one measurement of its own: BUILD TIME and BINARY SIZE per model. scratchy
 #     compiles one model into the binary, so size is a per-model fact, and the
 #     build is the cost side of doing that work ahead of time. Every startup
@@ -23,6 +26,7 @@
 #   t_ready, ttft_from_send, tpot      scr bench startup --exec
 #   peak RSS, major faults             scr bench startup --exec  (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve
+#   scaling curves: tok/s, TPOT, TTFT  scr bench serve   (per-axis sweeps, see below)
 #
 # The cache ladder, the eviction proof, the priming launch, per-child resource
 # attribution and the validity gates all live in `--exec`. See
@@ -71,6 +75,28 @@ OFFLINE=0
 SKIP_BUILD=0
 OUT_DIR=""
 KV_CACHE_DTYPE=""
+# ---- scaling stage ----------------------------------------------------------
+# One axis at a time from a base cell, NOT a full factorial: 8 models × 6 conc
+# rungs × 4 input rungs × 4 output rungs is ~200 cells and none of the 3-way
+# cells would tell you anything the marginal curves don't. What a scaling
+# benchmark plots is the MARGINAL curve per axis, others pinned at base.
+SCALING=1
+CONCURRENCIES="1,2,4,8,16,32"
+INPUT_LENS="128,512,2048,8192"
+OUTPUT_LENS="16,64,256,1024"
+BASE_INPUT=512
+BASE_OUTPUT=128
+BASE_CONCURRENCY=8
+# A cell's num_prompts: enough requests that concurrency is actually offered
+# for a while, without making the input-len=8192 cells take forever.
+NUM_PROMPTS_SCALING=0   # 0 = auto: max(24, 3*concurrency)
+WARMUPS=1
+# Unique seed per cell, one seed space per model: same --seed means identical
+# random prompts, so the prefix cache serves later cells and TTFT collapses
+# toward 0 — this bit before (see bench_serve_compare.sh's BENCH LESSONS).
+# Seeds are stable across models (model index salts the space) so a re-run of
+# one model reproduces its own cells.
+SEED_BASE=1000
 # `--exec` picks purge on macOS and fadvise on Linux by itself
 EVICT=""
 EVICT_PATH=()
@@ -103,12 +129,28 @@ while [[ $# -gt 0 ]]; do
         --offline)        OFFLINE=1; shift ;;
         --skip-build)     SKIP_BUILD=1; shift ;;
         --out-dir)        OUT_DIR="$2"; shift 2 ;;
+        --no-scaling)     SCALING=0; shift ;;
+        --concurrencies)  CONCURRENCIES="$2"; shift 2 ;;
+        --input-lens)     INPUT_LENS="$2"; shift 2 ;;
+        --output-lens)    OUTPUT_LENS="$2"; shift 2 ;;
+        --base-input)     BASE_INPUT="$2"; shift 2 ;;
+        --base-output)    BASE_OUTPUT="$2"; shift 2 ;;
+        --base-concurrency) BASE_CONCURRENCY="$2"; shift 2 ;;
+        --num-prompts-scaling) NUM_PROMPTS_SCALING="$2"; shift 2 ;;
+        --warmups)        WARMUPS="$2"; shift 2 ;;
+        --seed-base)      SEED_BASE="$2"; shift 2 ;;
         -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
 [[ ${#MODELS[@]} -eq 0 ]] && MODELS=("${MODELS_DEFAULT[@]}")
 (( OFFLINE )) && export HF_HUB_OFFLINE=1
+
+# The machine block below (a python heredoc) reads the scaling config through
+# the environment rather than a growing argv.
+SM_CONC="${CONCURRENCIES}" SM_INPUT_LENS="${INPUT_LENS}" SM_OUTPUT_LENS="${OUTPUT_LENS}" \
+SM_BASE_IN="${BASE_INPUT}" SM_BASE_OUT="${BASE_OUTPUT}" SM_BASE_CONC="${BASE_CONCURRENCY}" \
+    true
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
@@ -136,6 +178,7 @@ fi
 echo "machine : ${chip}"
 echo "models  : ${#MODELS[@]}"
 echo "rungs   : ${SCENARIOS}"
+echo "scaling : $(( SCALING ? 1 : 0 ))"
 echo "output  : ${JSON}"
 (( EXEC_OK )) || cat <<EOF
 
@@ -170,7 +213,18 @@ json.dump({
   "repo": {"sha": sh("git", "rev-parse", "HEAD"),
            "branch": sh("git", "rev-parse", "--abbrev-ref", "HEAD"),
            "dirty": bool(sh("git", "status", "--porcelain"))},
-  "config": {"scenarios": scenarios.split(",")},
+  "config": {"scenarios": scenarios.split(","),
+             "scaling": {"rungs": {
+                "concurrency": [int(x) for x in os.environ["SM_CONC"].split(",") if x],
+                "input_len":   [int(x) for x in os.environ["SM_INPUT_LENS"].split(",") if x],
+                "output_len":  [int(x) for x in os.environ["SM_OUTPUT_LENS"].split(",") if x]},
+                "base": {"input_len": int(os.environ["SM_BASE_IN"]),
+                         "output_len": int(os.environ["SM_BASE_OUT"]),
+                         "concurrency": int(os.environ["SM_BASE_CONC"])},
+                "note": "one axis swept at a time, others pinned at base; "
+                        "concurrency is OFFERED (max-concurrency), the effective "
+                        "decode batch is the scheduler's decision and is not "
+                        "recorded here"}},
   "methodology": "docs/BENCHMARKING.md — rung definitions, fairness rules and disclosed asymmetries live there, not here",
   "models": [],
 }, open(out, "w"), indent=2)
@@ -287,12 +341,176 @@ for entry in "${MODELS[@]}"; do
         kill -KILL "${sp}" 2>/dev/null || true
         wait "${sp}" 2>/dev/null || true
         pkill -f "${model_bin} serve" 2>/dev/null || true
+
+        # ---- scaling stage ------------------------------------------------
+        # One axis at a time from a base cell (see the defaults block for why
+        # not a factorial), once PER BACKEND when --mlx-python is given, so
+        # the JSON can be plotted as us-vs-mlx-lm along every dimension. The
+        # same cells and the same per-cell seeds run against both servers —
+        # same prompts ⇒ fair curves — the rule bench_serve_compare.sh bakes
+        # in. The warm-stage server is torn down first and this stage owns
+        # its own servers (solo, serial, reaped), instead of trying to reuse
+        # one server across two engines.
+        scaling_json="${RAW}/scaling-${stem}.json"
+        rm -f "${scaling_json}"
+        if (( SCALING && ready )); then
+            # Warm stage's server must not outlive this branch of the loop.
+            kill -INT "${sp}" 2>/dev/null || true
+            for _ in $(seq 1 30); do kill -0 "${sp}" 2>/dev/null || break; sleep 1; done
+            kill -KILL "${sp}" 2>/dev/null || true
+            wait "${sp}" 2>/dev/null || true
+            pkill -f "${model_bin} serve" 2>/dev/null || true
+
+            model_idx=0
+            for m in "${MODELS[@]}"; do [[ "${m}" == "${entry}" ]] && break || model_idx=$((model_idx+1)); done
+
+            # Version provenance: a curve without the version that produced it
+            # is unreproducible. scratchy as a git tag/commit; mlx-lm as the
+            # installed package version (resolved inside the stage's python,
+            # which knows how to ask the interpreter --mlx-python names).
+            scratchy_ver="$(git -C "${ROOT}" describe --tags --always --dirty 2>/dev/null \
+                || git -C "${ROOT}" rev-parse HEAD)"
+
+            echo "--- scaling sweeps (${CONCURRENCIES} | ${INPUT_LENS} | ${OUTPUT_LENS} @ ${BASE_INPUT}x${BASE_OUTPUT} c${BASE_CONCURRENCY})"
+            backends=("${model_bin} serve ${id} --port ${PORT} scratchy")
+            [[ -n "${MLX_PYTHON}" ]] && backends+=("${MLX_PYTHON} -m mlx_lm.server --model ${id} --port ${PORT} mlx-lm")
+            for spec in "${backends[@]}"; do
+                # spec = "<server command> <backend name>" — split off the name.
+                backend="${spec##* }"; serve_line="${spec% *}"
+                serve_log="${RAW}/scaling-${stem}-${backend}.serve.log"
+                echo "    backend: ${backend}"
+                # shellcheck disable=SC2086 # serve_line is a command line by construction
+                ${serve_line} >"${serve_log}" 2>&1 &
+                ssp=$!
+                ok=0
+                deadline=$(( $(date +%s) + 1800 ))
+                while (( $(date +%s) < deadline )); do
+                    curl -fsS -m 2 "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 && { ok=1; break; }
+                    kill -0 "${ssp}" 2>/dev/null || break
+                    sleep 1
+                done
+                if (( ok )); then
+                    python3 - "${model_bin}" "${scaling_json}" "${id}" "${model_idx}" \
+                             "${CONCURRENCIES}" "${INPUT_LENS}" "${OUTPUT_LENS}" \
+                             "${BASE_INPUT}" "${BASE_OUTPUT}" "${BASE_CONCURRENCY}" \
+                             "${NUM_PROMPTS_SCALING}" "${WARMUPS}" "${PORT}" \
+                             "${SEED_BASE}" "${backend}" \
+                             "${scratchy_ver}" "${MLX_PYTHON}" <<'PY'
+import json, os, subprocess, sys, time
+(model_bin, out_path, mid, model_idx, concs, in_lens, out_lens,
+ base_in, base_out, base_conc, num_prompts, warmups, port,
+ seed_base, backend, scratchy_ver, mlx_python) = sys.argv[1:18]
+concs  = [int(x) for x in concs.split(",") if x]
+in_lens  = [int(x) for x in in_lens.split(",") if x]
+out_lens = [int(x) for x in out_lens.split(",") if x]
+base_in, base_out, base_conc = int(base_in), int(base_out), int(base_conc)
+num_prompts, warmups, port, seed_base = int(num_prompts), int(warmups), int(port), int(seed_base)
+model_idx = int(model_idx)
+
+# Cell list: (axis, rung, input_len, output_len, concurrency). The base rung
+# of each axis is the same physical cell; dedup by (input, output, conc) so it
+# is measured once (identical seed ⇒ identical prompts anyway).
+cells = []
+for c in concs:
+    cells.append(("concurrency", c, base_in, base_out, c))
+for il in in_lens:
+    cells.append(("input_len", il, il, base_out, base_conc))
+for ol in out_lens:
+    cells.append(("output_len", ol, base_in, ol, base_conc))
+
+d = json.load(open(out_path)) if os.path.exists(out_path) else {"stage": "scaling", "backends": {}}
+rows = d["backends"].get(backend, [])
+seen = {(r["input_len"], r["output_len"], r["concurrency"]) for r in rows
+        if "output_throughput" in r}
+
+# Per-backend version provenance, recorded once in the backend's block.
+# mlx-lm's version is asked of the same interpreter --mlx-python names, so the
+# version recorded is the version that served the cells.
+d["backends"][backend] = rows
+d.setdefault("versions", {})
+if backend == "scratchy":
+    d["versions"][backend] = {"version": scratchy_ver}
+else:
+    ver = None
+    if mlx_python:
+        try:
+            r = subprocess.run([mlx_python, "-c",
+                                "import importlib.metadata as m; print(m.version('mlx-lm'))"],
+                               capture_output=True, text=True, timeout=60)
+            ver = r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            ver = None
+    d["versions"][backend] = {"version": ver or "unknown"}
+
+for axis, rung, il, ol, c in cells:
+    if (il, ol, c) in seen:
+        # Same physical cell already measured under another axis — reference
+        # it rather than re-running it.
+        rows.append({"axis": axis, "rung": rung, "input_len": il, "output_len": ol,
+                     "concurrency": c,
+                     "dedup_of": {"input_len": il, "output_len": ol, "concurrency": c}})
+        continue
+    n = num_prompts if num_prompts else max(24, 3 * c)
+    seed = seed_base + model_idx * 100000 + il * 131 + ol * 17 + c
+    cell_out = f"{out_path}.{backend}.cell-{il}x{ol}x{c}.json"
+    cmd = [model_bin, "bench", "serve", "--base-url", f"http://127.0.0.1:{port}",
+           "--model", mid, "--num-prompts", str(n), "--input-len", str(il),
+           "--output-len", str(ol), "--max-concurrency", str(c),
+           "--temperature", "0", "--seed", str(seed),
+           "--num-warmups", str(warmups),
+           "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,99",
+           "--output-json", cell_out, "--disable-tqdm"]
+    t0 = time.time()
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"    cell {axis}={rung} FAILED (rc={r.returncode}); "
+              f"{r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'no stderr'}",
+              file=sys.stderr)
+        continue
+    # bench serve writes its JSON to --output-json; stdout is the human summary.
+    try:
+        cell_json = json.load(open(cell_out))
+    except Exception:
+        print(f"    cell {axis}={rung}: no parsable JSON at {cell_out}", file=sys.stderr)
+        continue
+    keep = ["median_ttft_ms", "p99_ttft_ms", "median_tpot_ms", "p99_tpot_ms",
+            "median_itl_ms", "p99_itl_ms", "median_e2el_ms",
+            "output_throughput", "request_throughput", "completed",
+            "total_output_tokens", "duration", "num_prompts"]
+    rows.append({"axis": axis, "rung": rung, "input_len": il, "output_len": ol,
+                 "concurrency": c, "seed": seed,
+                 **{k: cell_json[k] for k in keep if k in cell_json}})
+    seen.add((il, ol, c))
+    print(f"    {axis}={rung:>5} · {n:>3} req · tok/s {cell_json.get('output_throughput', float('nan')):>7.1f}"
+          f" · TPOT {cell_json.get('median_tpot_ms', float('nan')):>6.1f} ms"
+          f" · TTFT {cell_json.get('median_ttft_ms', float('nan')):>7.1f} ms  [{time.time()-t0:.0f}s]")
+d["backends"][backend] = rows
+d["note"] = ("concurrency is OFFERED (max-concurrency); the effective decode "
+             "batch is the scheduler's decision and is not recorded here. "
+             "One axis swept at a time, others pinned at base; identical cells "
+             "and seeds across backends so the curves plot us vs them directly; "
+             "dedup_of marks a cell identical to one already measured under "
+             "another axis.")
+json.dump(d, open(out_path, "w"), indent=2)
+PY
+                else
+                    echo "    ${backend} server never became ready — ${serve_log}" >&2
+                fi
+                # Solo rule: this server is reaped before the next backend.
+                kill -INT "${ssp}" 2>/dev/null || true
+                for _ in $(seq 1 30); do kill -0 "${ssp}" 2>/dev/null || break; sleep 1; done
+                kill -KILL "${ssp}" 2>/dev/null || true
+                wait "${ssp}" 2>/dev/null || true
+            done
+        fi
     fi
 
     python3 - "${JSON}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
-              "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" <<'PY'
+              "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" \
+              "${RAW}/scaling-${stem}.json" <<'PY'
 import json, os, sys
-js, stem, mid, quant, feats, built, secs, size, exec_json, serve_json, exec_mlx_json = sys.argv[1:12]
+(js, stem, mid, quant, feats, built, secs, size,
+ exec_json, serve_json, exec_mlx_json, scaling_json) = sys.argv[1:13]
 def num(x):
     for cast in (int, float):
         try: return cast(x)
@@ -317,6 +535,7 @@ d["models"].append({
     "cache_ladder": load(exec_json),
     "cache_ladder_mlx_lm": load(exec_mlx_json),
     "warm_serving": warm,
+    "scaling": load(scaling_json),
 })
 json.dump(d, open(js, "w"), indent=2)
 PY
@@ -348,7 +567,36 @@ for e in d["models"]:
         print("    BUILD FAILED — see the build log in this machine's raw/ directory")
     elif ladder is None:
         print("    cache ladder unavailable")
+
+# ---- scaling curves ---------------------------------------------------------
+# Per model, per backend, one line per axis rung: the marginal curves the
+# scaling stage exists for, plotted us vs mlx-lm when both ran. tok/s should
+# rise with concurrency then flatten (the gap to linear is per-batch
+# overhead); TPOT ~flat means batched decode is not charging requests for
+# being batched; TTFT vs input is prefill scaling.
+axes = ["concurrency", "input_len", "output_len"]
+for e in d["models"]:
+    sc = e.get("scaling") or {}
+    bks = sc.get("backends") or {}
+    if not bks:
+        continue
+    print(f"\n  {e['stem']} — scaling")
+    for bk in sorted(bks):
+        ver = (sc.get("versions") or {}).get(bk, {}).get("version", "?")
+        rows = sorted((r for r in bks[bk] if "output_throughput" in r),
+                      key=lambda r: (axes.index(r["axis"]) if r["axis"] in axes else 99, r["rung"]))
+        if not rows:
+            continue
+        print(f"    [{bk} {ver}]")
+        print(f"    {'axis':12}{'rung':>7}{'tok/s':>9}{'req/s':>8}{'TPOT':>9}{'TTFT':>9}")
+        for r in rows:
+            print(f"    {r['axis']:12}{r['rung']:>7}"
+                  f"{fmt(r.get('output_throughput'), 1):>9}"
+                  f"{fmt(r.get('request_throughput'), 2):>8}"
+                  f"{fmt(r.get('median_tpot_ms'), 1):>9}"
+                  f"{fmt(r.get('median_ttft_ms')):>9}")
 print(f"\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
+print(f"scaling: concurrency is OFFERED (max-concurrency); TPOT ~flat across it is the goal")
 print(f"json -> {sys.argv[1]}")
 print("paste this file into issue #91; fill the table in #95 from it")
 PY
