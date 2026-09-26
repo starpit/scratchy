@@ -26,7 +26,8 @@
 #   t_ready, ttft_from_send, tpot      scr bench startup --exec
 #   peak RSS, major faults             scr bench startup --exec  (per child, wait4)
 #   TTFT/TPOT/ITL p50+p99, tok/s       scr bench serve
-#   scaling curves: tok/s, TPOT, TTFT  scr bench serve   (per-axis sweeps, see below)
+#   scaling curves: tok/s, TPOT, TTFT  scr bench serve   (served axes, see below)
+#   offline batch scaling: tok/s, lat  scr bench latency + mlx-lm BatchGenerator
 #
 # The cache ladder, the eviction proof, the priming launch, per-child resource
 # attribution and the validity gates all live in `--exec`. See
@@ -106,6 +107,16 @@ WARMUPS=1
 # Seeds are stable across models (model index salts the space) so a re-run of
 # one model reproduces its own cells.
 SEED_BASE=1000
+# ---- offline batch axis ------------------------------------------------------
+# The served concurrency axis measures scheduler + kernels together (the
+# batch is OFFERED, the scheduler decides). This one COMMANDS the width: no
+# server, `scr bench latency -b <rungs>` on our side and mlx-lm's
+# BatchGenerator with completion_batch_size pinned on theirs — so the two
+# curves differ in exactly one thing: the batching kernels.
+BATCH_SIZES="1,2,4,8,16,32"
+NUM_ITERS=10
+NUM_ITERS_WARMUP=3
+BATCH_AXIS=1
 # `--exec` picks purge on macOS and fadvise on Linux by itself
 EVICT=""
 EVICT_PATH=()
@@ -148,6 +159,10 @@ while [[ $# -gt 0 ]]; do
         --num-prompts-scaling) NUM_PROMPTS_SCALING="$2"; shift 2 ;;
         --warmups)        WARMUPS="$2"; shift 2 ;;
         --seed-base)      SEED_BASE="$2"; shift 2 ;;
+        --batch-sizes)    BATCH_SIZES="$2"; shift 2 ;;
+        --num-iters)      NUM_ITERS="$2"; shift 2 ;;
+        --num-iters-warmup) NUM_ITERS_WARMUP="$2"; shift 2 ;;
+        --no-batch-axis)  BATCH_AXIS=0; shift ;;
         -h|--help)        grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -162,7 +177,8 @@ done
 # assignment exports nothing.
 SM_CONC="${CONCURRENCIES}"; SM_INPUT_LENS="${INPUT_LENS}"; SM_OUTPUT_LENS="${OUTPUT_LENS}"
 SM_BASE_IN="${BASE_INPUT}"; SM_BASE_OUT="${BASE_OUTPUT}"; SM_BASE_CONC="${BASE_CONCURRENCY}"
-export SM_CONC SM_INPUT_LENS SM_OUTPUT_LENS SM_BASE_IN SM_BASE_OUT SM_BASE_CONC
+SM_BATCH="${BATCH_SIZES}"
+export SM_CONC SM_INPUT_LENS SM_OUTPUT_LENS SM_BASE_IN SM_BASE_OUT SM_BASE_CONC SM_BATCH
 
 BIN="${ROOT}/target/release/scr"
 chip="$(sysctl -n machdep.cpu.brand_string)"
@@ -229,14 +245,17 @@ json.dump({
              "scaling": {"rungs": {
                 "concurrency": [int(x) for x in os.environ["SM_CONC"].split(",") if x],
                 "input_len":   [int(x) for x in os.environ["SM_INPUT_LENS"].split(",") if x],
-                "output_len":  [int(x) for x in os.environ["SM_OUTPUT_LENS"].split(",") if x]},
+                "output_len":  [int(x) for x in os.environ["SM_OUTPUT_LENS"].split(",") if x],
+                "batch":       [int(x) for x in os.environ["SM_BATCH"].split(",") if x]},
                 "base": {"input_len": int(os.environ["SM_BASE_IN"]),
                          "output_len": int(os.environ["SM_BASE_OUT"]),
                          "concurrency": int(os.environ["SM_BASE_CONC"])},
                 "note": "one axis swept at a time, others pinned at base; "
                         "concurrency is OFFERED (max-concurrency), the effective "
                         "decode batch is the scheduler's decision and is not "
-                        "recorded here"}},
+                        "recorded here; the batch axis is OFFLINE and COMMANDED "
+                        "(scr bench latency -b / mlx-lm completion_batch_size) "
+                        "so it isolates the batching kernels from the scheduler"}},
   "methodology": "docs/BENCHMARKING.md — rung definitions, fairness rules and disclosed asymmetries live there, not here",
   "models": [],
 }, open(out, "w"), indent=2)
@@ -365,6 +384,16 @@ for entry in "${MODELS[@]}"; do
         # one server across two engines.
         scaling_json="${RAW}/scaling-${stem}.json"
         rm -f "${scaling_json}"
+
+        # Version provenance: a curve without the version that produced it
+        # is unreproducible. scratchy as a git tag/commit; mlx-lm as the
+        # installed package version (resolved inside the stage's python,
+        # which knows how to ask the interpreter --mlx-python names).
+        # Computed for the whole per-model block: both the scaling and the
+        # offline batch stages record it.
+        scratchy_ver="$(git -C "${ROOT}" describe --tags --always --dirty 2>/dev/null \
+            || git -C "${ROOT}" rev-parse HEAD)"
+
         if (( SCALING && ready )); then
             # Warm stage's server must not outlive this branch of the loop.
             kill -INT "${sp}" 2>/dev/null || true
@@ -375,13 +404,6 @@ for entry in "${MODELS[@]}"; do
 
             model_idx=0
             for m in "${MODELS[@]}"; do [[ "${m}" == "${entry}" ]] && break || model_idx=$((model_idx+1)); done
-
-            # Version provenance: a curve without the version that produced it
-            # is unreproducible. scratchy as a git tag/commit; mlx-lm as the
-            # installed package version (resolved inside the stage's python,
-            # which knows how to ask the interpreter --mlx-python names).
-            scratchy_ver="$(git -C "${ROOT}" describe --tags --always --dirty 2>/dev/null \
-                || git -C "${ROOT}" rev-parse HEAD)"
 
             echo "--- scaling sweeps (${CONCURRENCIES} | ${INPUT_LENS} | ${OUTPUT_LENS} @ ${BASE_INPUT}x${BASE_OUTPUT} c${BASE_CONCURRENCY})"
             backends=("${model_bin} serve ${id} --port ${PORT} scratchy")
@@ -515,14 +537,160 @@ PY
                 wait "${ssp}" 2>/dev/null || true
             done
         fi
+
+        # ---- offline batch axis ---------------------------------------------
+        # The COMMANDED counterpart of the concurrency axis above: no server,
+        # width set by the caller, so the curve isolates the batching kernels
+        # from the online scheduler. scratchy: `scr bench latency -b <rungs>`
+        # (one model load sweeps the ladder natively). mlx-lm: the same
+        # BatchGenerator the library exposes, completion_batch_size pinned to
+        # the rung, fed the SAME deterministic token ids the latency bench
+        # feeds itself — (i*997 + j*31 + 42) % 10000, from latency.rs — so
+        # both sides prefill byte-identical prompts. Both sides: greedy,
+        # ignore_eos (StopSequences(None) on the mlx-lm side), prefix caching
+        # OFF so every timed iteration pays its own prefill.
+        if (( BATCH_AXIS )); then
+            batch_json="${RAW}/batch-${stem}.json"
+            rm -f "${batch_json}"
+            echo "--- offline batch sweep (-b ${BATCH_SIZES} @ ${BASE_INPUT}x${BASE_OUTPUT}, ${NUM_ITERS} iters)"
+
+            # scratchy: one process, whole ladder. Wrapped JSON: {"results":
+            # [{model, batch_size, avg_latency, percentiles, latencies}]}.
+            "${model_bin}" bench latency "${id}" \
+                --device metal -b "${BATCH_SIZES}" \
+                --input-len "${BASE_INPUT}" --output-len "${BASE_OUTPUT}" \
+                --num-iters "${NUM_ITERS}" --num-iters-warmup "${NUM_ITERS_WARMUP}" \
+                --no-prefix-caching --temperature 0 \
+                --output-json "${batch_json}.scratchy" \
+                2>&1 | tail -4 | sed 's/^/    /' \
+                || echo "    bench latency (scratchy) failed" >&2
+
+            if [[ -n "${MLX_PYTHON}" ]]; then
+                "${MLX_PYTHON}" - "${batch_json}.mlx-lm" "${id}" \
+                    "${BATCH_SIZES}" "${BASE_INPUT}" "${BASE_OUTPUT}" \
+                    "${NUM_ITERS}" "${NUM_ITERS_WARMUP}" "${scratchy_ver}" <<'PYLX'
+import json, sys, time
+
+# Offline mlx-lm batch sweep mirroring `scr bench latency -b`:
+#   - same rung list, same input/output lens, warmup + timed iters
+#   - same deterministic prompts: the latency bench feeds itself
+#     (i*997 + j*31 + 42) % 10000 token ids (crates/benches/src/latency.rs)
+#   - EOS cannot stop generation: StopSequences(None) is an empty automaton
+#     (ignore_eos parity)
+#   - width COMMANDED: completion_batch_size pinned to the rung, so like the
+#     latency bench every sequence decodes inside one batch of exactly `bs`
+import mlx.core as mx
+from mlx_lm import load
+from mlx_lm.generate import BatchGenerator, StopSequences
+
+(out_path, model_id, bss, il, ol, num_iters, num_warmups, scratchy_ver) = sys.argv[1:9]
+bss = [int(x) for x in bss.split(",") if x]
+il, ol, num_iters, num_warmups = int(il), int(ol), int(num_iters), int(num_warmups)
+
+model, tokenizer = load(model_id)
+
+def prompts(bs):
+    # latency.rs's formula, verbatim: token ids (i*997 + j*31 + 42) % 10000.
+    return [[((i * 997 + j * 31 + 42) % 10000) for j in range(il)]
+            for i in range(bs)]
+
+results = []
+for bs in bss:
+    p = prompts(bs)
+    gen_kw = dict(completion_batch_size=bs, prefill_batch_size=min(bs, 8))
+    # Warmup: untimed, same width.
+    for _ in range(num_warmups):
+        gen = BatchGenerator(model, stop_tokens=None,
+                             max_tokens=ol, **gen_kw)
+        gen.insert(p, [ol] * bs,
+                   stop_sequences=[StopSequences(None)] * bs)
+        while gen.next_generated():
+            pass
+        gen.close()
+    # Timed.
+    latencies = []
+    for _ in range(num_iters):
+        t0 = time.perf_counter()
+        gen = BatchGenerator(model, stop_tokens=None,
+                             max_tokens=ol, **gen_kw)
+        gen.insert(p, [ol] * bs,
+                   stop_sequences=[StopSequences(None)] * bs)
+        while gen.next_generated():
+            pass
+        gen.close()
+        latencies.append(time.perf_counter() - t0)
+    results.append({
+        "model": model_id, "batch_size": bs,
+        "avg_latency": sum(latencies) / len(latencies),
+        "latencies": latencies,
+    })
+    print(f"    bs={bs:>3} · avg {results[-1]['avg_latency']:.3f} s "
+          f"· tok/s {bs * ol / results[-1]['avg_latency']:.1f}")
+
+json.dump({"results": results,
+           "note": "offline, COMMANDED width (completion_batch_size); prompts "
+                   "and seeds identical to scr bench latency by formula "
+                   "(latency.rs); StopSequences(None) = ignore_eos"},
+          open(out_path, "w"), indent=2)
+PYLX
+            fi
+
+            # Merge the per-backend sweeps into the recorded block:
+            # {config, backends: {scratchy: ..., "mlx-lm": ...}} — the same
+            # shape the served scaling block uses, so downstream consumers
+            # treat the two stages alike.
+            python3 - "${batch_json}" "${batch_json}.scratchy" "${batch_json}.mlx-lm" \
+                     "${BASE_INPUT}" "${BASE_OUTPUT}" "${NUM_ITERS}" "${NUM_ITERS_WARMUP}" \
+                     "${BATCH_SIZES}" "${scratchy_ver}" "${MLX_PYTHON}" <<'PY'
+import json, os, subprocess, sys
+(out, sk_p, lx_p, il, ol, iters, warmups, bss, sk_ver, mlx_python) = sys.argv[1:11]
+def load(p):
+    return json.load(open(p)) if p and os.path.exists(p) else None
+d = {"config": {"input_len": int(il), "output_len": int(ol),
+                "num_iters": int(iters), "num_iters_warmup": int(warmups),
+                "batch_sizes": [int(x) for x in bss.split(",") if x]},
+     "backends": {}}
+sk, lx = load(sk_p), load(lx_p)
+if sk:
+    d["backends"]["scratchy"] = sk
+if lx:
+    d["backends"]["mlx-lm"] = lx
+# Same version provenance rule as the served scaling block: mlx-lm's version
+# is asked of the same interpreter --mlx-python names, so the recorded
+# version is the version that ran the sweep.
+versions = {}
+if sk:
+    versions["scratchy"] = {"version": sk_ver}
+if lx:
+    ver = None
+    if mlx_python:
+        try:
+            r = subprocess.run([mlx_python, "-c",
+                                "import importlib.metadata as m; print(m.version('mlx-lm'))"],
+                               capture_output=True, text=True, timeout=60)
+            ver = r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            ver = None
+    versions["mlx-lm"] = {"version": ver or "unknown"}
+if versions:
+    d["versions"] = versions
+d["note"] = ("offline, COMMANDED batch width — no server, no scheduler; the "
+             "served concurrency axis measures scheduler+kernels, this one "
+             "isolates the kernels. Same rungs, same deterministic prompts "
+             "(latency.rs formula), greedy, EOS cannot stop generation, "
+             "prefix caching off on both sides")
+if d["backends"]:
+    json.dump(d, open(out, "w"), indent=2)
+PY
+        fi
     fi
 
     python3 - "${JSON}" "${stem}" "${id}" "${quant}" "${feats}" "${built}" \
               "${build_secs}" "${bytes}" "${exec_json}" "${serve_json}" "${exec_mlx_json}" \
-              "${RAW}/scaling-${stem}.json" <<'PY'
+              "${RAW}/scaling-${stem}.json" "${RAW}/batch-${stem}.json" <<'PY'
 import json, os, sys
 (js, stem, mid, quant, feats, built, secs, size,
- exec_json, serve_json, exec_mlx_json, scaling_json) = sys.argv[1:13]
+ exec_json, serve_json, exec_mlx_json, scaling_json, batch_json) = sys.argv[1:14]
 def num(x):
     for cast in (int, float):
         try: return cast(x)
@@ -548,6 +716,7 @@ d["models"].append({
     "cache_ladder_mlx_lm": load(exec_mlx_json),
     "warm_serving": warm,
     "scaling": load(scaling_json),
+    "offline_batch": load(batch_json),
 })
 json.dump(d, open(js, "w"), indent=2)
 PY
@@ -607,6 +776,30 @@ for e in d["models"]:
                   f"{fmt(r.get('request_throughput'), 2):>8}"
                   f"{fmt(r.get('median_tpot_ms'), 1):>9}"
                   f"{fmt(r.get('median_ttft_ms')):>9}")
+
+# ---- offline batch curves ---------------------------------------------------
+# The COMMANDED-width counterpart of the concurrency axis: same rungs, no
+# scheduler. tok/s at bs should track linear with bs minus per-batch
+# overhead; the gap between this curve and the served one is the scheduler's
+# share. Both backends' rows share one config (input/output lens, iters).
+for e in d["models"]:
+    ob = e.get("offline_batch") or {}
+    cfg = ob.get("config") or {}
+    ol = cfg.get("output_len")
+    backends = ob.get("backends") or {}
+    if not backends:
+        continue
+    print(f"\n  {e['stem']} — offline batch (COMMANDED width, no scheduler)")
+    for bk in sorted(backends):
+        rows = backends[bk].get("results", [])
+        if not rows:
+            continue
+        print(f"    [{bk}]")
+        print(f"    {'bs':>5}{'avg s':>9}{'tok/s':>9}")
+        for r in rows:
+            bs, lat = r["batch_size"], r["avg_latency"]
+            tps = bs * ol / lat if (ol and lat) else None
+            print(f"    {bs:>5}{fmt(lat, 3):>9}{fmt(tps, 1):>9}")
 print(f"\nfrozen/cold are ttft_exec seconds (exec -> first token); TTFT/TPOT are warm ms.")
 print(f"scaling: concurrency is OFFERED (max-concurrency); TPOT ~flat across it is the goal")
 print(f"json -> {sys.argv[1]}")

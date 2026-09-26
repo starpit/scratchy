@@ -24,7 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-AXES = ["concurrency", "input_len", "output_len"]
+AXES = ["concurrency", "input_len", "output_len", "batch"]
 # metric key in a row -> (label, ylabel). tok/s is the headline; TPOT flat
 # across concurrency is the goal; TTFT vs input_len is prefill scaling.
 METRICS = {
@@ -38,9 +38,11 @@ AXIS_LABELS = {
     "concurrency": "offered concurrency (max-concurrency)",
     "input_len": "input length (tokens)",
     "output_len": "output length (tokens)",
+    "batch": "commanded batch width (offline, no scheduler)",
 }
 # Log-x axes where rungs span orders of magnitude (128..8192).
-LOG_X = {"input_len": True, "output_len": True, "concurrency": False}
+LOG_X = {"input_len": True, "output_len": True, "concurrency": False,
+         "batch": False}
 
 
 def main():
@@ -60,13 +62,42 @@ def main():
         sys.exit(f"unknown metrics: {bad}; choose from {list(METRICS)}")
 
     os.makedirs(args.out_dir, exist_ok=True)
-    models = [e for e in d.get("models", []) if e.get("scaling")]
+    models = [e for e in d.get("models", [])
+              if e.get("scaling") or e.get("offline_batch")]
     if not models:
-        sys.exit("no model in this JSON has a scaling block")
+        sys.exit("no model in this JSON has a scaling or offline_batch block")
 
     n_files = 0
     for e in models:
         sc = e["scaling"]
+        # The offline batch block (offline_batch.backends.{scratchy,mlx-lm})
+        # is a different row shape (batch_size/avg_latency, no per-request
+        # metrics) — normalize it into scaling-shaped rows under axis="batch"
+        # so the same plotting loop handles both. tok/s is bs*output_len /
+        # avg_latency; TPOT is avg_latency/output_len. These are derived,
+        # not measured per-request, which is why the offline axis only ever
+        # plots tok_s and tpot.
+        ob = e.get("offline_batch") or {}
+        ob_cfg = ob.get("config") or {}
+        ol = ob_cfg.get("output_len")
+        sc = e.get("scaling") or {"backends": {}, "versions": {}}
+        if ol and ob.get("backends"):
+            for bk, blk in ob["backends"].items():
+                sc.setdefault("backends", {}).setdefault(bk, [])
+                for r in blk.get("results", []):
+                    lat = r.get("avg_latency")
+                    if not lat:
+                        continue
+                    sc["backends"][bk].append({
+                        "axis": "batch", "rung": r["batch_size"],
+                        "input_len": ob_cfg.get("input_len"),
+                        "output_len": ol, "concurrency": r["batch_size"],
+                        "output_throughput": r["batch_size"] * ol / lat,
+                        "median_tpot_ms": lat / ol * 1000.0,
+                    })
+            # versions from the offline block too (same shape as scaling's)
+            for bk, v in (ob.get("versions") or {}).items():
+                sc.setdefault("versions", {}).setdefault(bk, v)
         backends = sc.get("backends") or {}
         versions = sc.get("versions") or {}
         want = args.backends.split(",") if args.backends else sorted(backends)
