@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = ["numpy", "safetensors", "torch"]
+# ///
 """UNIVERSAL carrier-as-Python oracle: runs ANY `dsl/<arch>.py` under torch
 against synthetic weights and dumps the logits scratchy must reproduce.
 
@@ -28,7 +31,7 @@ packed-split rules) so the Rust gate can load the SAME weights through
 the macro-emitted `load`.
 
 Usage:
-    python tests/golden_gen_carrier.py --arch qwen3 --stem qwen3-0.6b \
+    uv run tests/golden_gen_carrier.py --arch qwen3 --stem qwen3-0.6b \
         [--tiny] [--num-tokens 8] [--out goldens/<arch>-<stem>]
 """
 

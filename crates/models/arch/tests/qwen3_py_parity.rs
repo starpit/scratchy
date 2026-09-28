@@ -14,8 +14,8 @@
 //! a lower value is a real divergence between carrier text and compiled
 //! tape).
 //!
-//! Regenerate goldens (torch venv):
-//!   python tests/golden_gen_qwen3_py.py \
+//! Regenerate goldens (deps are inline in the script, so uv resolves them):
+//!   uv run tests/golden_gen_qwen3_py.py \
 //!     --checkpoint ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<sha>
 //!
 //! Run:
@@ -83,6 +83,8 @@ fn qwen3_py_carrier_parity() {
         eprintln!("skipping: no Metal device");
         return;
     };
+    // Goldens are local-only (gitignored *.bin), so a fresh clone has none:
+    // absent fixtures mean "regenerate", not "fail" — same as carrier_parity.
     for name in [
         "input_ids",
         "positions",
@@ -90,11 +92,13 @@ fn qwen3_py_carrier_parity() {
         "block_table",
         "slot_mapping",
     ] {
-        assert!(
-            std::path::Path::new(&format!("{GOLDEN}/{name}.bin")).exists(),
-            "missing golden {GOLDEN}/{name}.bin — regenerate with \
-             tests/golden_gen_qwen3_py.py (see this file's header)"
-        );
+        if !std::path::Path::new(&format!("{GOLDEN}/{name}.bin")).exists() {
+            eprintln!(
+                "skipping: missing golden {GOLDEN}/{name}.bin — regenerate with \
+                 tests/golden_gen_qwen3_py.py (see this file's header)"
+            );
+            return;
+        }
     }
     if !std::path::Path::new(SNAPSHOT).exists() {
         eprintln!("skipping: checkpoint snapshot not found at {SNAPSHOT}");
@@ -156,26 +160,24 @@ fn qwen3_py_carrier_parity() {
             128,        // BLOCKS_PER_CHUNK (metal target const)
             usize::MAX, // eager: allocate all chunks now
             |bytes| {
-                use objc2_metal::{MTLDevice as _, MTLResourceOptions};
-                let buf = device_arc
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .expect("kv chunk alloc");
                 // The interpreter's command buffers attach the allocator's
                 // residency set — every buffer the forward reads MUST be
-                // inserted before the first forward's lazy commit (the
-                // worker inserts each chunk exactly this way, gpu_worker.rs
-                // "residency.insert(&buffer)"). A non-resident chunk reads
+                // pinned in it before the first forward's lazy commit (the
+                // worker allocates each chunk exactly this way, gpu_worker.rs
+                // "MetalMem::new_pinned"). A non-resident chunk reads
                 // structured garbage through the chunk-address table.
-                allocator.residency().insert(&buf);
-                Ok(scratchy_target_metal::MetalMem::from_buffer(buf))
+                Ok(scratchy_target_metal::MetalMem::new_pinned(
+                    &device_arc,
+                    allocator.residency(),
+                    bytes,
+                ))
             },
             |bytes| {
-                use objc2_metal::{MTLDevice as _, MTLResourceOptions};
-                let buf = device_arc
-                    .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                    .expect("kv table alloc");
-                allocator.residency().insert(&buf);
-                Ok(scratchy_target_metal::MetalMem::from_buffer(buf))
+                Ok(scratchy_target_metal::MetalMem::new_pinned(
+                    &device_arc,
+                    allocator.residency(),
+                    bytes,
+                ))
             },
         )
         .expect("KvCachePool::new_metal_chunked")

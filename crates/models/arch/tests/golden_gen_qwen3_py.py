@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# /// script
+# dependencies = ["numpy", "safetensors", "torch"]
+# ///
 """E2E parity oracle for the Python-as-DSL flip: runs `dsl/qwen3.py` AS
 PYTHON under torch and dumps the logits scratchy must reproduce.
 
@@ -30,8 +33,8 @@ crates/targets/metal/src/paged_kv_layout.rs:
   cache[physical_block, kv_head, slot_in_block, dim]
   slot = block_id * block_size + offset  (global slot id)
 
-Run (torch venv with numpy + safetensors):
-    python golden_gen_qwen3_py.py --checkpoint <snapshot-dir> --out goldens/
+Run (deps are declared inline above, so uv resolves them):
+    uv run golden_gen_qwen3_py.py --checkpoint <snapshot-dir> --out goldens/
 
 Outputs (under --out, each .bin raw little-endian + an entry in
 goldens.json with shape/dtype):
