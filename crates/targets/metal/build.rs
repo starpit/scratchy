@@ -33,6 +33,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// The `xcrun` arguments every shader compiles with — shared with the megakernel bake.
+include!("src/msl_offline.rs");
+
 /// HEAD_DIMs (BD template arg of `attention_paged<...>` in
 /// `mlx_steel_attn/steel_attention_paged_kernel.h`) instantiated in
 /// `attention_steel_paged.metal`. Must cover every `head_dim`
@@ -186,7 +189,7 @@ fn compile_metallib(shader: &Path, stem: &str, shader_dir: &Path, out_dir: &Path
     // Without `-mmacosx-version-min=26.2` the embedded
     // `affine_qmm_t_nax_*` metallib is ~95% wrong.
     let mut cmd = Command::new("xcrun");
-    cmd.args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat"]);
+    cmd.args(MSL_TO_AIR);
     // Only compile the sampler's telemetry-spill params/entropy when the
     // `sampler-telemetry` feature is on, so a plain engine kernel is
     // byte-identical to before (see #ifdef in sampling.metal).
@@ -218,7 +221,7 @@ fn compile_metallib(shader: &Path, stem: &str, shader_dir: &Path, out_dir: &Path
 
     // AIR → metallib.
     let status = Command::new("xcrun")
-        .args(["-sdk", "macosx", "metallib"])
+        .args(AIR_TO_METALLIB)
         .arg(&air)
         .arg("-o")
         .arg(&metallib)
