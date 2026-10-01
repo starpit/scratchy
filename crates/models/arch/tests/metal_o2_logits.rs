@@ -922,6 +922,198 @@ mod perf {
         )*};
     }
 
+    /// PROBE (branch `mk-probe`): per-dispatch GPU time of the decode, dispatch vs segmented, on
+    /// the SAME greedy sequence. Prints, per segment kernel, the dispatch path's time for the
+    /// commands one launch plays (summed) against the launch's time, per instance; and per
+    /// command, the dispatch time.
+    fn run_probe(
+        case: PerfCase,
+        buckets: &'static [scratchy_target_metal::interpreter::metal::MetalBucketSpec],
+    ) {
+        use scratchy_target_metal::interpreter::metal::probe;
+        use scratchy_target_metal::tape::lowered::{GateCtx, GenClass};
+        let mut l = load(case.repo, BUCKET_CAP);
+        let prompt = tokenize(&l, case.prompt);
+        let steps = WARMUP + DECODE;
+        let blocks = sequence_blocks(l.num_groups, &block_sizes(&l), prompt.len() + steps);
+        let device = detect_device().expect("metal");
+        let class = GenClass::of(device.profile.generation);
+        let decode = buckets.iter().find(|b| b.bucket_m == 1).expect("decode bucket");
+        let classed = decode
+            .tapes
+            .iter()
+            .find(|t| t.gen_class == class && !t.chunked)
+            .expect("this device's tape");
+        let [mk] = classed.megakernel else {
+            panic!("one megakernel")
+        };
+        let commands = classed.tape.commands_expanded();
+        let origins = classed.tape.expanded_origins();
+        let ctx = GateCtx::decode_one(false);
+        let admitted = |i: usize| commands[i].gate.is_none_or(|g| g.admits(ctx));
+        // Segment instances in expanded order, each with the admitted commands it plays.
+        let opener: std::collections::HashMap<u32, usize> = mk
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(k, s)| (s.opens, k))
+            .collect();
+        let mut instances: Vec<(usize, Vec<usize>)> = Vec::new();
+        for i in 0..commands.len() {
+            if let Some(&k) = opener.get(&(origins[i].baked as u32)) {
+                instances.push((k, Vec::new()));
+            }
+            if admitted(i) {
+                instances.last_mut().expect("an admitted command before the first segment").1.push(i);
+            }
+        }
+        probe::arm(&device.device, 4096);
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let mut per_path: Vec<(&str, Vec<f64>, f64)> = Vec::new();
+        for &path in ExecPath::DECODER {
+            let mut wall = Vec::new();
+            greedy(&mut l, path, &prompt, &blocks, steps, |s, forward| {
+                if s.index == WARMUP {
+                    probe::take();
+                }
+                if s.index > WARMUP {
+                    wall.push(forward.as_secs_f64() * 1e3);
+                }
+            });
+            let forwards = probe::take();
+            let n = forwards.iter().map(|f| f.len()).max().unwrap_or(0);
+            let width = forwards
+                .iter()
+                .flat_map(|f| f.iter().map(|(i, _)| *i as usize + 1))
+                .max()
+                .unwrap_or(0);
+            let mut cols: Vec<Vec<f64>> = vec![Vec::new(); width];
+            for f in &forwards {
+                for &(i, ns) in f {
+                    cols[i as usize].push(ns);
+                }
+            }
+            let med: Vec<f64> = cols
+                .iter_mut()
+                .map(|c| if c.is_empty() { 0.0 } else { median(c) })
+                .collect();
+            let wall_med = median(&mut wall);
+            println!(
+                "PROBEPATH {} path={} forwards={} dispatches={n} gpu_sum_ms={:.4} wall_med_ms={:.4}",
+                case.name,
+                path.name,
+                forwards.len(),
+                med.iter().sum::<f64>() / 1e6,
+                wall_med
+            );
+            per_path.push((path.name, med, wall_med));
+        }
+        probe::disarm();
+        let disp = &per_path.iter().find(|p| p.0 == "dispatch").expect("dispatch").1;
+        let seg = &per_path.iter().find(|p| p.0 == "segmented").expect("segmented").1;
+        assert_eq!(seg.len(), instances.len(), "one launch per segment instance");
+        // Per segment kernel: the median over its instances (the probe stalls ~0.35 ms every ~80
+        // timestamps, at fixed positions: an instance's median is free of them).
+        let mut per_k: Vec<(Vec<f64>, Vec<f64>, usize)> =
+            vec![(Vec::new(), Vec::new(), 0); mk.segments.len()];
+        for (j, (k, cmds)) in instances.iter().enumerate() {
+            per_k[*k].0.push(cmds.iter().map(|&i| disp[i]).sum());
+            per_k[*k].1.push(seg[j]);
+            per_k[*k].2 = cmds.len();
+        }
+        let (mut tot_d, mut tot_s) = (0.0, 0.0);
+        for (k, (d, sv, c)) in per_k.iter_mut().enumerate() {
+            let n = d.len() as f64;
+            let (dm, sm) = (median(d), median(sv));
+            tot_d += dm * n;
+            tot_s += sm * n;
+            let funcs: Vec<&str> = mk
+                .steps
+                .iter()
+                .filter(|st| st.segment as usize == k)
+                .map(|st| st.function)
+                .collect();
+            println!(
+                "PROBESEG {} k={k} instances={n} cmds={c} disp_us={:.2} seg_us={:.2} delta_us={:.2} funcs={}",
+                case.name,
+                dm / 1e3,
+                sm / 1e3,
+                (sm - dm) / 1e3,
+                funcs.join(",")
+            );
+        }
+        println!(
+            "PROBETOTAL {} disp_ms={:.4} seg_ms={:.4} delta_ms={:.4}",
+            case.name,
+            tot_d / 1e6,
+            tot_s / 1e6,
+            (tot_s - tot_d) / 1e6
+        );
+        for (j, (k, cmds)) in instances.iter().enumerate() {
+            let d: f64 = cmds.iter().map(|&i| disp[i]).sum();
+            println!(
+                "PROBELAUNCH {} j={j} k={k} first_cmd={} disp_us={:.2} seg_us={:.2}",
+                case.name,
+                cmds[0],
+                d / 1e3,
+                seg[j] / 1e3
+            );
+        }
+        for (i, d) in disp.iter().enumerate() {
+            if !admitted(i) || i >= commands.len() {
+                continue;
+            }
+            let c = &commands[i].command;
+            println!(
+                "PROBECMD {} i={i} fn={} tg={:?} tpt={:?} disp_us={:.2}",
+                case.name,
+                c.function,
+                c.dispatch.threadgroups,
+                c.dispatch.threads_per_threadgroup,
+                d / 1e3
+            );
+        }
+    }
+
+    #[cfg(feature = "llama-3.2-3b")]
+    #[test]
+    #[ignore = "needs a Metal 4 GPU, the checkpoint in the local Hub cache, and no other GPU work"]
+    fn probe_llama_3_2_3b_mlx() {
+        run_probe(
+            PerfCase {
+                name: "probe_llama_3_2_3b_mlx",
+                repo: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+                prompt: concat!(
+                    "<|start_header_id|>user<|end_header_id|>\n\n",
+                    request!(),
+                    "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                ),
+                bos: "<|begin_of_text|>",
+                markup: &["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+            },
+            scratchy_models::llama::llama_3_2_3b_mlx_affine_b4_g64::METAL_BUCKETS,
+        );
+    }
+
+    #[cfg(feature = "gemma-4-26b-a4b-it")]
+    #[test]
+    #[ignore = "needs a Metal 4 GPU, the checkpoint in the local Hub cache, and no other GPU work"]
+    fn probe_gemma_4_26b_a4b_mlx() {
+        run_probe(
+            PerfCase {
+                name: "probe_gemma_4_26b_a4b_mlx",
+                repo: "mlx-community/gemma-4-26b-a4b-it-4bit",
+                prompt: concat!("<bos><|turn>user\n", request!(), "<turn|>\n<|turn>model\n"),
+                bos: "<bos>",
+                markup: &["<|turn>", "<turn|>"],
+            },
+            scratchy_models::gemma4_moe::gemma_4_26b_a4b_it_mlx_affine_b4_g64::METAL_BUCKETS,
+        );
+    }
+
     // The perf targets, each under the mlx-affine-b4-g64 preset.
     perf_cases! {
         "llama-3.2-3b" => perf_llama_3_2_3b_mlx {

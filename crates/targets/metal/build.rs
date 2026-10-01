@@ -131,6 +131,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=MK_PROBE_STREAM_WIDTH");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=tests");
 
@@ -376,7 +377,11 @@ fn parse_mk_markers(text: &str) -> Vec<MkMarker> {
             library: library.to_string(),
             function: function.to_string(),
             tg_bytes: int(tg_bytes),
-            item_threads: int(item_threads),
+            // PROBE ONLY (branch `mk-probe`): every streaming adapter's width from the env.
+            item_threads: match std::env::var("MK_PROBE_STREAM_WIDTH") {
+                Ok(w) if int(item_threads) < 1024 => int(&w),
+                _ => int(item_threads),
+            },
             writes: int(writes),
             tail: int(tail) != 0,
             short_rows: (int(short) != 0).then(|| (int(short), int(row), int(below))),

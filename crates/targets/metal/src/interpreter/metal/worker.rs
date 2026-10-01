@@ -663,6 +663,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         } else {
             Vec::new()
         };
+        let probing = super::probe::armed();
+        if probing {
+            super::probe::begin(enc);
+        }
+        let mut flat = 0u32;
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -673,6 +678,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(step.m_scaling.iter())
                 .zip(step.runtime_gate.iter())
             {
+                let this = flat;
+                flat += 1;
                 if !gate.is_none_or(|g| g.admits(ctx)) {
                     // Skipped: e.g. the lm_head slice's gather/qmv/scatter
                     // (`OnlyIfNoSpec`) on a spec-decode verify step, or
@@ -781,6 +788,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                if probing {
+                    super::probe::after(enc, this);
+                }
                 // A segment kernel fuses the commands it plays.
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {

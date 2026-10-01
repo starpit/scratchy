@@ -852,6 +852,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
         completed.map_err(ForwardError::GpuCommandFailed)?;
+        super::probe::resolve();
         Ok((
             encoded,
             Submitted {
