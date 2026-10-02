@@ -141,24 +141,24 @@ fn emit_regions(
 
     let out = match node.program {
         Program::RmsNorm => {
-            emit::lower_ktir_to_superdsc::rmsnorm(name, node, &regions, &mut sym, layout)
+            emit::lower_ktir_to_superdsc::rmsnorm(name, node, regions, &mut sym, layout)
         }
         Program::ScalarMul => {
-            emit::lower_ktir_to_superdsc::scalarmul(name, node, &regions, &mut sym, layout)
+            emit::lower_ktir_to_superdsc::scalarmul(name, node, regions, &mut sym, layout)
         }
         Program::Elementwise(kind) => {
             // NO BROADCAST FLAGS: this per-NODE door takes regions the caller already resolved and
             // has no program to prove a broadcast chain from. The whole-function walk is what
             // recognises `m[:, None]` and states the axes; here an empty slice says "every operand is
             // dense", which is what a `Program::Elementwise` node with resolved regions is.
-            emit::lower_ktir_to_superdsc::elementwise(name, kind, &regions, &[], &mut sym, layout)
+            emit::lower_ktir_to_superdsc::elementwise(name, kind, regions, &[], &mut sym, layout)
         }
         Program::SiluMul => {
-            emit::lower_ktir_to_superdsc::silumul(name, &regions, &mut sym, layout)
+            emit::lower_ktir_to_superdsc::silumul(name, regions, &mut sym, layout)
         }
-        Program::LmLast => emit::lower_ktir_to_superdsc::lmlast(name, node, &regions, &mut sym, layout),
+        Program::LmLast => emit::lower_ktir_to_superdsc::lmlast(name, node, regions, &mut sym, layout),
         Program::Transpose => {
-            emit::lower_ktir_to_superdsc::transpose(name, &regions, &mut sym, layout)
+            emit::lower_ktir_to_superdsc::transpose(name, regions, &mut sym, layout)
         }
         // `matmul` threads a per-BUNDLE fp8 activation-quantize dedup set. One node at a time
         // here, so a fresh set per call is correct; a real bundle walk threads one across nodes.
@@ -201,7 +201,7 @@ fn emit_regions(
             let mut quantized = std::collections::HashSet::new();
             emit::lower_ktir_to_superdsc::matmul_oriented(
                 name,
-                &regions,
+                regions,
                 &mut sym,
                 layout,
                 &mut quantized,

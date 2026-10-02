@@ -750,11 +750,7 @@ impl Parser {
             Some(body[a + 2..].trim().to_string())
         } else if let Some(t) = trimmed.strip_prefix(':') {
             Some(t.trim().to_string())
-        } else if let Some(c) = body.rfind(" : ") {
-            Some(body[c + 3..].trim().to_string())
-        } else {
-            None
-        };
+        } else { body.rfind(" : ").map(|c| body[c + 3..].trim().to_string()) };
         if let Some(t) = type_tail {
             let mut t = t.trim_end_matches('{').trim().to_string();
             // `arith.extf %x : tensor<..xf16> to tensor<..xf32>` states the OPERAND

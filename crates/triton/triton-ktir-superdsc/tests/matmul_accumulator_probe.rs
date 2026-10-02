@@ -306,10 +306,10 @@ fn the_comparison_is_sensitive_to_an_operand_the_door_does_read() {
                 matches!((key, v), (AttrKey::Shape, Attr::IntList(s)) if *s == [64, 128])
             });
             if wide {
-                o.clone()
+                (*o)
                     .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![64, 64])))
             } else {
-                o.clone()
+                *o
             }
         })
         .collect();

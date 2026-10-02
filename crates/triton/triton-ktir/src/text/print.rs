@@ -676,9 +676,9 @@ mod tests {
 
     #[test]
     fn mlir_float_spelling_round_trips_the_flash_constants() {
-        assert_eq!(print_float(FloatBits::f16_from_f32(0.127517432)), "1.275630e-01");
+        assert_eq!(print_float(FloatBits::f16_from_f32(0.127_517_43)), "1.275630e-01");
         // And the f32 the ttir carries, before the re-round.
-        assert_eq!(print_float(FloatBits::f32(0.127517432)), "1.275170e-01");
+        assert_eq!(print_float(FloatBits::f32(0.127_517_43)), "1.275170e-01");
         assert_eq!(print_float(FloatBits::f16_from_f32(0.0)), "0.000000e+00");
         assert_eq!(print_float(FloatBits::f16_from_f32(1.0)), "1.000000e+00");
         assert_eq!(print_float(FloatBits { bits: 0xFC00, width: 16 }), "0xFC00");

@@ -52,20 +52,20 @@ use triton_ktir::text;
 
 fn root() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../..")
+        .join("..")
         .canonicalize()
-        .expect("the repo root")
+        .expect("crates/triton, the re-hosted ladder's root")
 }
 
 fn fixture(name: &str) -> String {
-    let p = root().join("third_party/spyre/test/fixtures").join(format!("{name}.py"));
+    let p = root().join("test-fixtures").join(format!("{name}.py"));
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
 /// The C++ chain's KTIR for a configuration, as the sibling checked it in.
 fn golden(name: &str) -> Option<String> {
     let p = root()
-        .join("third_party/spyre/test/experiment1/ktir")
+        .join("test-experiment1/ktir")
         .join(format!("{name}.ktir.mlir"));
     std::fs::read_to_string(p).ok()
 }

@@ -802,14 +802,14 @@ impl IrType {
 
     pub fn num_elements(&self) -> Option<i64> {
         let d = self.dims()?;
-        if d.iter().any(|x| *x == DYNAMIC) {
+        if d.contains(&DYNAMIC) {
             return None;
         }
         Some(d.iter().product())
     }
 
     pub fn has_static_shape(&self) -> bool {
-        self.dims().map(|d| !d.iter().any(|x| *x == DYNAMIC)).unwrap_or(true)
+        self.dims().map(|d| !d.contains(&DYNAMIC)).unwrap_or(true)
     }
 
     /// Is this a COMPUTE-DOMAIN f32 -- an f32 scalar or an f32-elemented tensor?
@@ -1179,7 +1179,7 @@ mod tests {
         // sm_scale = 1/sqrt(128). ttir has it as f32 `0.127517432`; the C++ KTIR
         // prints the f16 as `1.275630e-01`. If our re-round differs by one ULP the
         // golden diff fails on a constant, which is the bug this pins.
-        let f32v = 0.127517432_f32;
+        let f32v = 0.127_517_43_f32;
         let h = FloatBits::f32(f32v).to_f16();
         assert_eq!(h.width, 16);
         // The nearest f16 is 0.1275634765625: exponent -3 (biased 12) with mantissa

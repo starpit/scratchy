@@ -725,7 +725,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut joined = Vec::with_capacity(rest.len() + tail.len());
     joined.extend_from_slice(rest);
     joined.extend_from_slice(&tail);
-    for chunk in joined.chunks_exact(64) {
+    for chunk in joined.as_chunks::<64>().0 {
         block.copy_from_slice(chunk);
         sha256_block(&block, &mut h, &K);
     }
@@ -821,7 +821,7 @@ pub fn decode_f64(bytes: &[u8], n: usize, dtype: DType) -> Result<Vec<f64>> {
             Ok(f32s.into_iter().map(|v| v as f64).collect())
         }
         DType::I32 => Ok(bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
             .collect()),
         other => Err(refuse(

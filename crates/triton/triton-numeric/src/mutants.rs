@@ -406,7 +406,7 @@ pub mod rmsnorm {
         assert_eq!(x.len(), m * d_model, "rmsnorm: x is not [m, d_model]");
         assert_eq!(w.len(), d_model, "rmsnorm: w is not [d_model]");
         if drop.is_some() {
-            assert!(lanes > 0 && d_model % lanes == 0, "rmsnorm: d_model must be a whole number of {lanes}-wide sticks");
+            assert!(lanes > 0 && d_model.is_multiple_of(lanes), "rmsnorm: d_model must be a whole number of {lanes}-wide sticks");
         }
         let mut out = vec![0.0f64; x.len()];
         for r in 0..m {

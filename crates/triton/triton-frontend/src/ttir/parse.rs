@@ -676,7 +676,7 @@ fn parse_op_line(p: &mut Parser, no: usize, t: &str) -> Result<Option<Op>, Parse
                 }
             } else {
                 let end = rest
-                    .find(|c: char| c == '(' || c == ' ')
+                    .find(['(', ' '])
                     .unwrap_or(rest.len());
                 rest[..end].to_string()
             };

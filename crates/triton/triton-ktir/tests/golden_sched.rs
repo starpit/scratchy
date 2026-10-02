@@ -135,7 +135,8 @@ fn the_triton_op_conversions_match_the_cpp_census() {
             "attention_flash_causal" => (3usize, 9usize),
             _ => (4usize, 12usize),
         };
-        for (name, baseline) in [("tensor.expand_shape", expand_baseline)] {
+        {
+            let (name, baseline) = ("tensor.expand_shape", expand_baseline);
             let ov = count(&o, name);
             if ov as i64 != baseline as i64 * n {
                 failures.push(format!(

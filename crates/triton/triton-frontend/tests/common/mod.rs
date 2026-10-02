@@ -13,7 +13,7 @@ pub fn crate_dir() -> PathBuf {
 
 pub fn fixture_path(name: &str) -> PathBuf {
     crate_dir()
-        .join("../../test-fixtures")
+        .join("../test-fixtures")
         .join(format!("{name}.py"))
 }
 
@@ -261,7 +261,7 @@ fn decoder_constexprs() -> Vec<(&'static str, Val)> {
         ("HALF", Val::Int(64)),
         ("EPS", Val::Float(1e-05)),
         ("INV_D", Val::Float(1.0 / 128.0)),
-        ("QK_SCALE", Val::Float(0.0078125 * 1.44269504)),
+        ("QK_SCALE", Val::Float(0.011271055)), // 0.0078125 * 1.44269504, folded; see the comment above
         ("RM", Val::Float(0.22)),
     ]
 }

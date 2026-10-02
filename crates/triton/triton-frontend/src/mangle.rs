@@ -185,7 +185,7 @@ pub fn mangle_arg(v: &Val, ty_of: &dyn Fn(&Val) -> Option<Type>) -> Option<Strin
 pub fn mangle_fn(full_name: &str, arg_mangles: &[String]) -> String {
     let joined = arg_mangles.join("_");
     // `code_generator.py:35-37`: quotes and brackets are not legal in an LLVM identifier.
-    let joined = joined.replace('\'', "_sq_").replace('[', "_").replace(']', "_");
+    let joined = joined.replace('\'', "_sq_").replace(['[', ']'], "_");
     format!("{full_name}__{joined}")
 }
 

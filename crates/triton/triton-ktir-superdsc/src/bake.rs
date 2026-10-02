@@ -274,9 +274,9 @@ pub fn write_placements(
     }
     s.push_str("],\n  \"places\": [\n");
     for (i, (tid, p)) in layout.placements.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             s,
-            "    {{\"tid\": {}, \"role\": \"{:?}\", \"segment\": {}, \"bank\": {}, \"offset\": {}, \"size\": {}}}{}\n",
+            "    {{\"tid\": {}, \"role\": \"{:?}\", \"segment\": {}, \"bank\": {}, \"offset\": {}, \"size\": {}}}{}",
             tid,
             p.role,
             p.segment,
@@ -288,9 +288,9 @@ pub fn write_placements(
     }
     s.push_str("  ],\n  \"synth\": [\n");
     for (i, (name, off)) in synth.map.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             s,
-            "    {{\"name\": \"{}\", \"segment\": {}, \"offset\": {}, \"size\": {}}}{}\n",
+            "    {{\"name\": \"{}\", \"segment\": {}, \"offset\": {}, \"size\": {}}}{}",
             name,
             intermediate,
             off,
@@ -320,9 +320,9 @@ pub fn write_placements(
     s.push_str("  ],\n  \"scalarmul_scales\": [\n");
     let scales = &layout.scalarmul_scales;
     for (i, v) in scales.iter().enumerate() {
-        let _ = write!(
+        let _ = writeln!(
             s,
-            "    {{\"tid\": {}, \"index\": {}, \"value\": {:?}}}{}\n",
+            "    {{\"tid\": {}, \"index\": {}, \"value\": {:?}}}{}",
             ktir_superdsc::reserved_tids::scalarmul_scale_tid(i),
             i,
             v,
@@ -355,9 +355,9 @@ pub fn write_placements(
             (FP8_INV448_TID, 1.0 / 448.0),
         ];
         for (i, (tid, v)) in rows.iter().enumerate() {
-            let _ = write!(
+            let _ = writeln!(
                 s,
-                "    {{\"tid\": {}, \"value\": {}}}{}\n",
+                "    {{\"tid\": {}, \"value\": {}}}{}",
                 tid,
                 v,
                 if i + 1 == rows.len() { "" } else { "," }

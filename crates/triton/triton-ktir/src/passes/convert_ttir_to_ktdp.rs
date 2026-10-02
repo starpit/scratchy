@@ -127,7 +127,7 @@ fn build_base_memory_view(module: &mut Module, desc: &Op, elem: DType) -> Result
     let mut shape = Vec::new();
     let mut strides = Vec::new();
     // The operand layout is base, then rank shape values, then rank stride values.
-    let have = desc.operands.len() >= 1 + 2 * rank;
+    let have = desc.operands.len() > 2 * rank;
     if have {
         for i in 0..rank {
             shape.push(

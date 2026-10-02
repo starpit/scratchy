@@ -172,7 +172,7 @@ pub const SILU_REL_GAIN: f64 = 2.0;
 /// `0.0078125 * 1.44269504` (`gen_numeric_data.py:166`). Needed because the score error enters the
 /// softmax as an ABSOLUTE exponent perturbation, and this constant is what converts a score-scale
 /// error into one. Config, not a fit.
-pub const DECODER_QK_SCALE: f64 = 0.0078125 * 1.44269504;
+pub const DECODER_QK_SCALE: f64 = 0.011271055; // 0.0078125 * 1.44269504, folded — Python's literal, bit-identical; NOT std's LOG2_E product spelling
 
 /// `decoder_block.py`'s residual multiplier, the `RM` constexpr = 0.22 (`gen_numeric_data.py:167`).
 /// The residual adds `o * RM` to `x`, so it is what weights the branch error against the skip.
@@ -365,7 +365,7 @@ pub fn fold_depth(n: usize) -> u32 {
         return 0;
     }
     // ceil(log2(n)) without floats.
-    (usize::BITS - (n - 1).leading_zeros()) as u32
+    usize::BITS - (n - 1).leading_zeros()
 }
 
 /// The classic f32 forward-error coefficient for summing `n` terms in ANY order:
@@ -1055,7 +1055,7 @@ mod tests {
         // the shipped coefficient to be the outward-ceiled version of it. This is the guard against
         // a coefficient drifting away from the comment that justifies it.
         let d = 4096usize;
-        let d_mean = 1 + fold_depth(d) + 0 + 1;
+        let d_mean = (1 + fold_depth(d)) + 1;
         assert_eq!(d_mean, 14);
         let eps_rsqrt = 2.0 * U_F32;
         let eps_const = 0.5 * const_rel_error(1e-5);

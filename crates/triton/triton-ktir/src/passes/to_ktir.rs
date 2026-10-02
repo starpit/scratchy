@@ -1653,7 +1653,7 @@ fn unroll_grid_positions(module: &mut Module) -> Result<()> {
             terminator = Some(op);
             continue;
         }
-        if reads(&[op.clone()], &depends) {
+        if reads(std::slice::from_ref(&op), &depends) {
             depends.extend(op.results.iter().copied());
             per_copy.push(op);
         } else {
@@ -1888,7 +1888,7 @@ fn feeds_matmul_input(module: &Module, ops: &[Op], v: Ssa) -> bool {
         for o in ops {
             // A matmul input, directly or through one intervening conversion op.
             if o.kind == OpKind::LinalgMatmul {
-                let mut work: Vec<Ssa> = o.operands.iter().copied().collect();
+                let mut work: Vec<Ssa> = o.operands.to_vec();
                 // Unwrap one layer of cast/broadcast/expand/collapse per step, so a
                 // load two hops from the matmul still counts.
                 for _ in 0..2 {
@@ -1971,10 +1971,8 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
         let Some(res) = mm.results.first().copied() else { continue };
         let res_ty = mm.result_types.first().cloned();
         let Some(res_ty) = res_ty else {
-            return Err(refuse(format!(
-                "a `linalg.matmul` with an accumulator states no result type, so the zero \
-                 splat that replaces the accumulator cannot be shaped"
-            )));
+            return Err(refuse("a `linalg.matmul` with an accumulator states no result type, so the zero \
+                 splat that replaces the accumulator cannot be shaped".to_string()));
         };
         let elem = match &res_ty {
             IrType::Tensor { elem, .. } => *elem,

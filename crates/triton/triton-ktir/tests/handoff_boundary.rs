@@ -133,7 +133,7 @@ fn windows_under_work_loop(f: &IRFunction<'_>) -> usize {
 /// still hides windows from every reader there. Mirrored here so a failure names the pass that
 /// buried them instead of naming their reader.
 fn window_counts(f: &IRFunction<'_>) -> Vec<(usize, usize)> {
-    fn views_over<'o>(ops: &[&'o ktir_core::ir::Operation<'_>], ptr: Ssa) -> Vec<Ssa> {
+    fn views_over(ops: &[&ktir_core::ir::Operation<'_>], ptr: Ssa) -> Vec<Ssa> {
         ops.iter()
             .filter(|o| {
                 o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr)

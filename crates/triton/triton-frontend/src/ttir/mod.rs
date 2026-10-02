@@ -371,7 +371,9 @@ pub enum Attr {
 /// compares it. What the diff does NOT compare is the `#locN` numbering or the SSA
 /// suffixes MLIR appends to disambiguate -- those are printer bookkeeping.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Default)]
 pub enum Loc {
+    #[default]
     Unknown,
     File {
         file: Rc<str>,
@@ -530,11 +532,6 @@ pub struct Module {
     pub loc: Loc,
 }
 
-impl Default for Loc {
-    fn default() -> Self {
-        Loc::Unknown
-    }
-}
 
 impl Module {
     pub fn ty(&self, v: ValueId) -> &Type {

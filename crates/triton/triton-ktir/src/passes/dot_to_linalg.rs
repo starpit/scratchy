@@ -1176,10 +1176,8 @@ fn verify_canonical_paged_matmul_kernel(
         .result_type()
         .ok_or_else(|| refuse("the ids load defines no type"))?;
     if ids_ty.elem() != Some(DType::I32) {
-        return Err(refuse(format!(
-            "paged matmul: the ids load's element is not i32 (the indirect tile indexes \
-             by a 32-bit row number)",
-        )));
+        return Err(refuse("paged matmul: the ids load's element is not i32 (the indirect tile indexes \
+             by a 32-bit row number)".to_string()));
     }
     let ids_dims = ids_ty
         .dims()

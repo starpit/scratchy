@@ -397,7 +397,7 @@ fn recover_tile_sticks(loopp: &Op) -> Option<i64> {
             continue;
         }
         let Some(dims) = op.result_type().and_then(|t| t.dims()) else { continue };
-        if dims.is_empty() || dims.iter().any(|d| *d == DYNAMIC) {
+        if dims.is_empty() || dims.contains(&DYNAMIC) {
             continue;
         }
         let stick_dim = *dims.last().unwrap();
@@ -421,7 +421,7 @@ fn recover_matmul_n(loopp: &Op) -> Option<i64> {
             continue;
         }
         let Some(dims) = op.result_type().and_then(|t| t.dims()) else { continue };
-        if dims.is_empty() || dims.iter().any(|d| *d == DYNAMIC) {
+        if dims.is_empty() || dims.contains(&DYNAMIC) {
             continue;
         }
         let n = *dims.last().unwrap();
@@ -481,7 +481,7 @@ fn recover_matmul_shape(module: &Module, loopp: &Op) -> Option<[i64; 3]> {
             .def_of(at.operands.first().copied()?)
             .filter(|o| o.kind == OpKind::KtdpConstructMemoryView)?;
         let s = mv.attr(&AttrKey::Shape)?.as_int_list()?;
-        if s.len() != 2 || s.iter().any(|x| *x == DYNAMIC) {
+        if s.len() != 2 || s.contains(&DYNAMIC) {
             return None;
         }
         Some((s[0], s[1]))

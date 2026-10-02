@@ -2787,7 +2787,7 @@ fn fold_binary(op: BinOpKind, l: &Val, r: &Val) -> Option<Val> {
                 BinOpKind::RShift => Some(Val::Int(a >> b)),
                 // Python's `/` on two ints is a float.
                 BinOpKind::Div if b != 0 => Some(Val::Float(a as f64 / b as f64)),
-                BinOpKind::Pow if b >= 0 && b < 64 => Some(Val::Int(a.pow(b as u32))),
+                BinOpKind::Pow if (0..64).contains(&b) => Some(Val::Int(a.pow(b as u32))),
                 _ => None,
             };
         }

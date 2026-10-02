@@ -236,7 +236,7 @@ fn affine_result<'a>(
 ///
 /// which is `0 <= dN <= bound` per dimension. Their `ConstraintKind::GreaterEq` is `expr
 /// >= 0`, the same convention, so each clause maps one-to-one. Anything else -- an
-/// equality, a symbol, a product -- is refused by name.
+/// > equality, a symbol, a product -- is refused by name.
 pub fn affine_set<'a>(text: &str, a: &'a Arena) -> Result<KSet<'a>> {
     let body = text
         .trim()

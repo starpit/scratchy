@@ -289,7 +289,7 @@ fn the_measured_laws_hold_in_the_ports_output() {
             let dynamic = op
                 .attr(&AttrKey::Shape)
                 .and_then(|a| a.as_int_list())
-                .map(|s| s.iter().any(|x| *x == DYNAMIC))
+                .map(|s| s.contains(&DYNAMIC))
                 .unwrap_or(false);
             let set = match op.attr(&AttrKey::CoordinateSet) {
                 Some(Attr::AffineSet(s)) => s.clone(),

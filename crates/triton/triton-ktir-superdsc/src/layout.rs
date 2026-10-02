@@ -694,7 +694,7 @@ fn scales_for_program_shape(
         message: e.message,
     })?;
     let mut out: Vec<f32> = Vec::new();
-    let mut push = |v: f32, out: &mut Vec<f32>| {
+    let push = |v: f32, out: &mut Vec<f32>| {
         if !out.iter().any(|x| x.to_bits() == v.to_bits()) {
             out.push(v);
         }
