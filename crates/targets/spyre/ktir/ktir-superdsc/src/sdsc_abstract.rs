@@ -909,6 +909,11 @@ impl MatM {
     pub const fn single_row() -> MatM {
         MatM(1)
     }
+    /// One kv head's GQA group of query heads, as ROWS — the gathered fold's legs, whose batch axis
+    /// carries the requests, so the heads sharing that kv head's K/V are the op's rows.
+    pub const fn of_gqa_group(gqa: crate::addr::Gqa) -> MatM {
+        MatM(gqa.get())
+    }
     /// A whole head-major buffer's rows (`heads * mq`) — the collapsed RoPE form sweeps them all in
     /// one op.
     pub const fn of_head_major_rows(rows: u32) -> MatM {

@@ -29,7 +29,7 @@ pub use assemble::{
 };
 pub use dims::set_split_mb_forbidden;
 pub use opspec::{
-    matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
+    BatchOrder, matmul_opspec, matmul_opspec_batched, matmul_opspec_batched_off, matmul_opspec_off,
     matmul_opspec_off_operands, matmul_opspec_off_operands_phys,
     matmul_opspec_off_operands_phys_gathered, matmul_opspec_split,
 };

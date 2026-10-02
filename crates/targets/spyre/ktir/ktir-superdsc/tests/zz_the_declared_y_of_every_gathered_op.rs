@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! ⭐⭐⭐⭐⭐ WHAT THE GATHERED DECODE BUNDLE **DECLARES**, OP BY OP, AT THREE WIDTHS — the emitter half
-//! of the `job_bin_ptr + numCoresUsed_*128` launch refusal, obtained on a Mac in under a second, and now
-//! the gate on the form that replaced the refused one.
+//! of the `job_bin_ptr + numCoresUsed_*128` launch refusal, obtained on a Mac in under a second, and the
+//! gate on the gathered fold's request-batched legs.
 //!
 //! ## The card refusal this file localized
 //! ```text
@@ -102,61 +102,56 @@
 //! without the gather index — and reports only what DIFFERS. A shape present in both is, by
 //! construction, a shape the card runs today.
 //!
-//! ## ⛔⛔⛔ THE FORM THAT FAULTED, AND HOW THIS FILE CONVICTED IT
+//! ## ⛔⛔⛔ THE FORM THAT FAULTED
 //! The first collapsed fold carried the REQUESTS on `y`, which needs a per-batch 3-D `[y,in,out]` KERNEL.
 //! Projected here, that op declared `y_=mq`, `mb_=1`, `numWkSlicesPerDim_ {y:mq, mb:1}` and
 //! `numCoresUsed_ == mq` (`mb` is 1 and `out` is 64, which `work::matmul_cost_split`'s stick clause
 //! forbids splitting, so `y` was the only splittable dim) — and its kernel showed **`mq` DISTINCT
 //! per-core starts** where every shipped kernel shows ONE.
 //!
-//! So `job_bin_ptr + mq*128` was read as `job_bin_ptr + numCoresUsed_*128`: one flit per CORE, at index
-//! `cores`, one past the last one the program holds (`init_binary.bin = 1920 + 128*cores`; see
-//! `one-block-per-core-is-an-11x-oversized-init` — dxp's 1-op/32-core group is 1 header + 8 base + 31
-//! patches). ⛔ THAT WHOLE PARAGRAPH IS REFUTED by the per-fault `[segaddr]` above — `bootstrap == 0` and
-//! the fault flit is inside the binary — and `numCoresUsed_` was refuted separately on card. It is kept
-//! because the *declarations* it records are still what this file gates. **RUNG 4 closed it**: at mq=4 that op is `{mb:1, y:4}` on FOUR cores, which is
-//! `matmul/dims.rs`'s on-hardware-proven solo-decode split, and it faulted at `+0x200` exactly like 2 at
-//! `+0x100` and 8 at `+0x400` — syndrome `0xc00`, locator `0x2`, cases `[PrepZeroFlitCnt,PrepSwVer]`
-//! bit-identical, only the index moving. ⇒ The `y`-split VALUE is exonerated and the KERNEL RANK is what
-//! the address is made of.
+//! It faulted at `job_bin_ptr + mq*128` at rungs 2, 4 and 8 — syndrome `0xc00`, locator `0x2`, cases
+//! `[PrepZeroFlitCnt,PrepSwVer]` bit-identical, only the index moving. At mq=4 that op is `{mb:1, y:4}` on
+//! FOUR cores, `matmul/dims.rs`'s on-hardware-proven solo-decode split, so the `y`-split VALUE is
+//! exonerated. The reading "one flit per core, one past the program's per-core patch table" is refuted by
+//! the per-fault `[segaddr]` above (`bootstrap == 0`, the fault flit inside the binary). ⛔ **THE CAUSE IS
+//! NOT ESTABLISHED.** The unapplied `ComputeOnHost` correction above produces exactly this syndrome; the
+//! request-batched legs' dxp plan for granite-3.1-2b fp8 carries NO `ComputeOnHost` (measured 2026-10-01
+//! with a local `dxp_standalone`: `ComputeOnDevice`, `Allocate`, `InitTransfer` only).
 //!
-//! ## ⭐⭐⭐⭐⭐ WHAT THE FIX DECLARES INSTEAD, AND IT IS THE SHIPPED OP AT ONE ROW
-//! The gather is what makes the per-`y` kernel DIM unnecessary: the scratch destination is contiguous and
-//! request-MINOR, so request `r`'s block is reached by a baked OFFSET
-//! (`GatherScratch::kernel_row_off`) exactly as a GQA group's shared kv head is reached by `kt_off_fn`'s.
-//! So the collapsed fold emits `mq` copies of the SHIPPED op, one per request, in ONE pass:
+//! ## ⭐⭐⭐⭐⭐ WHAT THIS FILE GATES: THE REQUESTS ON `y`, ONE OP PER (QUERY HEAD, SLAB)
+//! Emitting one leg op per kv head AND request — the request a baked offset — grew a gathered fold group
+//! as `66 * width + 44` ops: 2,156 at width 32, in ONE dxp program the trip cap cannot cut, 128 s of dxp
+//! alone; at hd=128 the 8b build spent ~40 minutes on it. The legs now carry the requests on `y`:
 //!
 //! | | shipped (`gather=false`) | gathered (`gather=true`) |
 //! |---|---|---|
-//! | prefix score/value op | `attn_pNsc_g{0..7}` — one per **kv head** | `attn_pNsc_g{0..7}r{0..mq-1}` — one per **(kv head, request)** |
-//! | `N_` | `y=4` (the GQA group), `mb=mq` | `y=4`, **`mb=1`** |
-//! | `numWkSlicesPerDim_` | `{y:4, mb:mq}` | `{y:4, mb:1}` |
-//! | `numCoresUsed_` | 32 at mq=8, 8 at mq=2 | **4 at every rung** |
-//! | kernel operand | `[in,out]`, **1** distinct per-core start | `[in,out]`, **1** distinct per-core start |
-//! | every operand's `layoutDimOrder_`/`maxDimSizes_` | — | **IDENTICAL to the shipped op's** |
-//! | fused epilogue | YES — 4 operands, actively `y`/`mb`-addressed | yes — 4 operands |
+//! | prefix score/value op | `attn_pNsc_g{0..7}` — one per **kv head** | `attn_pNsc_q{0..31}` — one per **query head** |
+//! | `N_` | `y=4` (the GQA group), `mb=mq` | **`y=mq`**, `mb=1` |
+//! | `numWkSlicesPerDim_` | `{y:4, mb:mq}` | `{y:mq, mb:1}` |
+//! | `numCoresUsed_` | 32 at mq=8, 8 at mq=2 | `mq` |
+//! | kernel operand | `[in,out]`, **1** distinct per-core start | `[y,in,out]`, **`mq`** starts — each request's own page |
+//! | fused epilogue | YES — 4 operands, actively `y`/`mb`-addressed | yes — per request, cloned from the output |
 //!
-//! ⭐ [`the_collapsed_op_is_the_shipped_op_at_one_row`] is the sharp version: the ONLY declared
-//! quantities that differ from the shipped fold leg are the swept `mb_`, the `mb` split it forbids, and
-//! the core count that follows. At `mq == 1` the two are the same op — the one running at 41 tok/s.
-//!
-//! ⭐ AND THE OP COUNT IS THE TRADE TO WANT, not a regression: `nkvh*mq` ops in ONE pass against `nkvh`
-//! ops in each of `mq` passes — the same op count over the step, `mq`× fewer launches — and each op now
-//! computes ONE row where the shipped one computes `mq` and masks `mq-1` away. Measured: 1.42 µs per op
-//! against ~28 µs per fold pass.
+//! ⭐ [`the_gathered_kernel_starts_are_each_requests_own_page`] is the oracle: every kernel start is
+//! `PageScratch::coord_off` of that request — the pool's own address law — so a wrong `y` step fails it at
+//! every rung, and the activation and output must step exactly one row per request.
 //!
 //! ⛔ AND THIS IS NOT THE PAIRING `attn.rs` FORBIDS. Its note says *"DO NOT PAIR `(gqa, request)` ONTO
 //! ONE `y`"* — GARBAGE on the 8b at hd=128, 10/10 runs. That is a PACKED PAIR on a single axis
-//! (`y = gqa*mq`) whose two components share one differenced step. Here `y` carries the group ALONE,
-//! exactly as it ships, and the request is not on an axis at all.
+//! (`y = gqa*mq`) whose two components share one differenced step. Here `y` carries the requests ALONE;
+//! the GQA group is not on an axis — one op per query head.
 //!
-//! ⛔ WHAT IS STILL UNMEASURED: a LAUNCH of this form, and hd=128. Every verdict in this file is the
-//! emitter's own declaration read locally. The card gate is `scr batch` against a bs=1 solo oracle per
-//! row (the model's own answers, never the textbook ones — an expected-answer detector reports ~9 phantom
-//! failures at bs=1).
+//! ⛔ WHAT IS STILL UNMEASURED: a LAUNCH of this form. Every verdict in this file is the emitter's own
+//! declaration read locally. The card gate is `scr batch` against a bs=1 solo oracle per row (the model's
+//! own answers, never the textbook ones — an expected-answer detector reports ~9 phantom failures at
+//! bs=1).
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, FeatIdx, KvCoord, KvHead, KvPlane, POOL_STICK, PageScratch, PagedKvPool,
+    QueryRowCount, SlotCount, SlotWindow, attn_bundle_rows,
+};
+use ktir_superdsc::superdsc_opspec::{DataFormat, Fp16};
 
 /// granite-3.1-2b — the model every card number is from.
 const NQH: u32 = 32;
@@ -177,6 +172,8 @@ struct OpPicture {
     cores: i64,
     /// Per-operand `(layoutDimOrder_, maxDimSizes_, start-map entries, DISTINCT starts)`.
     operands: Vec<(Vec<String>, Vec<i64>, usize, usize)>,
+    /// Per-operand DISTINCT per-core start addresses, ascending — the values the count above counts.
+    starts: Vec<Vec<i64>>,
     /// `(label, factor)` of the fold attributes on operand 0 (core / corelet / time).
     fold: Vec<(String, i64)>,
 }
@@ -304,26 +301,17 @@ fn emit_at(mq: u32, gather: bool) -> Vec<OpPicture> {
                                 .as_array()
                                 .map(|a| a.iter().map(|d| d.as_i64().unwrap_or(0)).collect())
                                 .unwrap_or_default();
-                            // ⛔ THE START VALUES ARE STRINGS (`{"[0, 0, 0]": "0"}`). Reading them with
-                            // `as_i64` alone reports ZERO distinct starts for every operand — a broken
-                            // extractor reading as a finding, paid for once already in
-                            // `zz_diff_the_rung_descriptors`.
-                            let m = n["startAddressCoreCorelet_"]["data_"].as_object();
-                            let tot = m.map_or(0, |m| m.len());
-                            let dis = m.map_or(0, |m| {
-                                m.values()
-                                    .filter_map(|x| {
-                                        x.as_str()
-                                            .and_then(|s| s.trim().parse::<i64>().ok())
-                                            .or_else(|| x.as_i64())
-                                    })
-                                    .collect::<std::collections::BTreeSet<_>>()
-                                    .len()
-                            });
-                            (layout, maxd, tot, dis)
+                            let tot = n["startAddressCoreCorelet_"]["data_"]
+                                .as_object()
+                                .map_or(0, |m| m.len());
+                            (layout, maxd, tot, distinct_starts(n).len())
                         })
                         .collect()
                 })
+                .unwrap_or_default();
+            let starts = body["scheduleTree_"]
+                .as_array()
+                .map(|nodes| nodes.iter().map(distinct_starts).collect())
                 .unwrap_or_default();
             let fold = body["scheduleTree_"][0]["startAddressCoreCorelet_"]["dim_prop_attr"]
                 .as_array()
@@ -346,10 +334,33 @@ fn emit_at(mq: u32, gather: bool) -> Vec<OpPicture> {
                 split: sorted_map(&v["numWkSlicesPerDim_"]),
                 cores: v["numCoresUsed_"].as_i64().unwrap_or(-1),
                 operands,
+                starts,
                 fold,
             }
         })
         .collect()
+}
+
+/// One `scheduleTree_` operand's DISTINCT per-core start addresses, ascending.
+///
+/// ⛔ THE START VALUES ARE STRINGS (`{"[0, 0, 0]": "0"}`). Reading them with `as_i64` alone reports ZERO
+/// distinct starts for every operand — a broken extractor reading as a finding, paid for once already in
+/// `zz_diff_the_rung_descriptors`.
+fn distinct_starts(node: &serde_json::Value) -> Vec<i64> {
+    node["startAddressCoreCorelet_"]["data_"]
+        .as_object()
+        .map(|m| {
+            m.values()
+                .filter_map(|x| {
+                    x.as_str()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .or_else(|| x.as_i64())
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The ops whose (stem, shape) pair appears in the gathered emission and NOT in the shipped one — what
@@ -394,26 +405,50 @@ fn what_the_gather_changes() {
     }
 }
 
-/// ⭐ FACT 1 — THE DECLARED `y` IS THE **GQA GROUP**, AT EVERY RUNG, AND NEVER THE RUNG WIDTH.
+const GQA: u32 = NQH / NKVH;
+
+/// A collapsed-fold prefix leg: one op per (query head, slab), named `attn_p{window}{sc|ov}_q{qh}…`.
+fn is_gathered_leg(o: &OpPicture) -> bool {
+    o.name.contains("sc_q") || o.name.contains("ov_q")
+}
+
+/// `N_`'s swept `mb_`.
+fn mb(o: &OpPicture) -> Option<i64> {
+    o.iter.iter().find(|(k, _)| k == "mb_").map(|(_, v)| *v)
+}
+
+/// How many slices `numWkSlicesPerDim_` cuts `dim` into — 1 when the dim is not split.
+fn split_of(o: &OpPicture, dim: &str) -> i64 {
+    o.split
+        .iter()
+        .find(|(k, _)| k == dim)
+        .map_or(1, |(_, v)| *v)
+}
+
+/// ⭐ FACT 1 — EVERY GATHERED SCORE/VALUE LEG CARRIES THE BATCH'S REQUESTS ON `y`, AT ONE ROW.
 ///
-/// This is the assertion that inverts. The refused form declared `y_ == mq` (2 at rung 2, 8 at rung 8);
-/// the collapsed fold declares `y_ == gqa` — the SAME batch axis the shipped bundle carries — with the
-/// requests on no axis at all. A `y` that tracks the rung width again means the per-batch kernel is back,
-/// and with it `numCoresUsed_ == mq` and the fault address.
-///
-/// Compared against the SHIPPED emission rather than against 1, because `attn_newkt*` legitimately
-/// carries a width-invariant `y_=64` that has nothing to do with the batch.
+/// The gather lays every request's page into a scratch of one page plane per request, and every other
+/// operand of the two legs is request-MINOR, so the requests are a uniform batch axis: `y_ == mq` and
+/// `mb_ == 1` at every rung. A leg whose `y_` is the GQA group is the per-request emission, whose fold
+/// group grows as `66 * width + 44` ops — 2,156 at width 32, in ONE dxp program.
 #[test]
-fn every_y_the_gather_introduces_is_the_gqa_group_and_never_the_rung_width() {
-    const GQA: i64 = (NQH / NKVH) as i64;
+fn every_gathered_leg_carries_the_requests_on_y_at_one_row() {
     for mq in [2u32, 4, 8] {
-        for o in only_gathered(mq) {
-            let y = o.y();
-            assert!(
-                y <= 1 || y == GQA,
-                "mq={mq}: {} declares y_={y}, which is neither 1 nor the GQA group ({GQA}). If it is the \
-                 rung width the requests are back on `y`, which needs the per-batch 3-D kernel the card \
-                 REFUSED at every rung — N_{:?}",
+        let legs: Vec<OpPicture> = emit_at(mq, true)
+            .into_iter()
+            .filter(is_gathered_leg)
+            .collect();
+        assert!(
+            !legs.is_empty(),
+            "mq={mq}: the gathered emission has no collapsed-fold leg — the filter is broken, not the \
+             emission"
+        );
+        for o in &legs {
+            assert_eq!(
+                (o.y(), mb(o)),
+                (i64::from(mq), Some(1)),
+                "mq={mq}: {} declares N_{:?} — a collapsed-fold leg sweeps ONE row per request with the \
+                 {mq} requests on `y`",
                 o.name,
                 o.iter,
             );
@@ -421,48 +456,31 @@ fn every_y_the_gather_introduces_is_the_gqa_group_and_never_the_rung_width() {
     }
 }
 
-/// ⭐⭐⭐ FACT 2 — `numCoresUsed_` IS **OFF THE RUNG WIDTH**: it is the GQA group, 4, at every rung.
+/// ⭐ FACT 2 — THE GATHERED LEGS SPLIT ONLY THE REQUEST AXIS.
 ///
-/// The core count is the number the fault address WAS made of — `job_bin_ptr + cores*128`, one flit per
-/// core, read at index `cores`, one past the last one the program holds. The refused form's collapsed
-/// onto `mq` (2, 4 and 8, all three faulting at `cores*128`); this one cannot, because `y` is the group
-/// and the `mb` split is forbidden for a decode batch. **4 is also the value
-/// `matmul/dims.rs`'s own doc records as on-hardware-proven** (`{mb:1, y:4}` on 4 cores, the solo-decode
-/// split), so this is not a new number on the card at all.
-///
-/// ⛔ THE SWEEP OVER THREE RUNGS IS WHAT MAKES THIS SHARP, not a `!= mq` clause. At rung 4 the group and
-/// the width are the SAME NUMBER — which is exactly why rung 4 was the card's discriminator — so no
-/// single-width assertion can tell "cores is the group" from "cores is the width". Checked at 2, 4 and 8
-/// together, the constant 4 can only be the group.
+/// `mb` is one row and `out` one stick, which `work::matmul_cost_split`'s stick clause forbids splitting,
+/// so `y` is the only split and each request lands on its own core: `numCoresUsed_ == mq`. The shipped
+/// prefix score leg is checked alongside — `4 * mq` cores, the GQA group times the `mq` rows it sweeps —
+/// so a change to the shared cost split shows up here as well as in the gathered form.
 #[test]
-fn the_gathers_core_count_is_the_gqa_group_at_every_rung_and_never_the_width() {
-    const GQA: i64 = (NQH / NKVH) as i64;
+fn the_gathered_legs_split_only_the_request_axis() {
     for (mq, shipped) in [(2u32, 8i64), (4, 16), (8, 32)] {
-        let gathered = only_gathered(mq);
-        let legs: Vec<&OpPicture> = gathered
-            .iter()
-            .filter(|o| o.name.contains("sc_g") || o.name.contains("ov_g"))
-            .collect();
+        let gathered = emit_at(mq, true);
+        let legs: Vec<&OpPicture> = gathered.iter().filter(|o| is_gathered_leg(o)).collect();
         assert!(
             !legs.is_empty(),
-            "mq={mq}: the gathered emission introduced no per-request score/value leg at all — the diff \
-             is broken, not the emission"
+            "mq={mq}: no collapsed-fold leg in the gathered emission"
         );
         for o in &legs {
             assert_eq!(
-                (o.cores, o.y()),
-                (GQA, GQA),
-                "mq={mq}: {} declares numCoresUsed_={} at y_={} — the collapsed fold's legs must land on \
-                 the GQA group ({GQA}) at EVERY rung. A core count that tracks the width is the number \
-                 `job_bin_ptr + cores*128` indexed. wk={:?}",
+                (o.cores, split_of(o, "y"), split_of(o, "mb")),
+                (i64::from(mq), i64::from(mq), 1),
+                "mq={mq}: {} declares numCoresUsed_={} with wk={:?} — expected one request per core",
                 o.name,
                 o.cores,
-                o.y(),
                 o.split,
             );
         }
-        // The shipped prefix score leg, for the contrast: same rung, `4 * mq` cores because it sweeps
-        // `mq` rows to keep one.
         let ship = emit_at(mq, false);
         let g0 = ship
             .iter()
@@ -526,172 +544,184 @@ fn the_fused_epilogue_on_a_y_batched_matmul_already_ships() {
     }
 }
 
-/// ⭐⭐⭐⭐⭐ FACT 4 — **NO OP IN EITHER BUNDLE DECLARES A PER-BATCH 3-D `[y,in,out]` KERNEL, AND EVERY
-/// KERNEL HAS EXACTLY ONE DISTINCT PER-CORE START.** This is the assertion the fix exists to satisfy.
+/// A per-core start is TAGGED `operand slot << 34 | byte offset` — the convention `attn.rs`'s
+/// `per_core_blocks` masks off — so the BYTE offset is the low 34 bits.
+const START_TAG_SHIFT: u32 = 34;
+
+/// One operand's distinct per-core starts as BYTE offsets, the slot tag masked off.
+fn byte_starts(starts: &[i64]) -> Vec<i64> {
+    starts
+        .iter()
+        .map(|s| s & ((1i64 << START_TAG_SHIFT) - 1))
+        .collect()
+}
+
+/// Bytes per fp16 element — the attention operands' own format.
+const ELEM_BYTES: i64 = <Fp16 as DataFormat>::WORD_LENGTH as i64;
+
+/// The kernel's expected per-core starts, in BYTES, for one gathered leg: request `r`'s copy of the page
+/// in the scratch, at this leg's (plane, kv head, window, slab) — [`PageScratch::coord_off`], the pool's
+/// own address law plus a request row. The test does not pick the stride; the law does.
+fn expected_kernel_starts(mq: u32, plane: KvPlane, kvh: KvHead, window: SlotWindow) -> Vec<i64> {
+    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
+        .unwrap_or_else(|| panic!("mq={mq}: the pool admits no page scratch"));
+    let coord = KvCoord::block(plane, kvh)
+        .at_slot(window.first_slot())
+        .at_feat(FeatIdx::of_slab(0));
+    (0..mq)
+        .map(|r| {
+            let off = scratch
+                .coord_off(r, &pool, coord)
+                .unwrap_or_else(|| panic!("mq={mq}: request {r} has no scratch row"));
+            i64::try_from(off).expect("a scratch offset fits i64") * ELEM_BYTES
+        })
+        .collect()
+}
+
+/// ⭐⭐⭐⭐⭐ FACT 4 — ONLY THE GATHERED LEGS DECLARE A PER-BATCH 3-D `[y,in,out]` KERNEL, AND ITS PER-CORE
+/// STARTS ARE EACH REQUEST'S OWN PAGE.
 ///
-/// The refused form's kernel was the one operand in the bundle whose per-core start count went from ONE
-/// distinct address (all cores read the shared weight from one place) to `mq` — one weight start per core,
-/// against a fault at index `cores` of a `cores`-long 128-byte table. The gather makes the rank
-/// unnecessary: the scratch is request-minor and contiguous, so request `r`'s block is a baked OFFSET
-/// (`GatherScratch::kernel_row_off`) and the kernel stays the bare shared 2-D weight the card runs.
-///
-/// ⛔ IT ASSERTS ON THE EMITTED DESCRIPTOR, NOT ON THE BUILDER. A builder that no longer has a 3-D door
-/// is not evidence: the rank is a property of `layoutDimOrder_`, and that is what this reads.
+/// The oracle is [`PageScratch::coord_off`], not a stride chosen here: on its `mq` cores the kernel of
+/// query head `qh`'s window-`w` score leg must start at exactly `{ coord_off(r, Kᵗ of kv head qh/gqa,
+/// window w, slab 0) : r < mq }`, and its value leg at the same set on the V plane. A wrong `in` device
+/// extent moves every start but request 0's, so a set compare catches it at every rung. The activation and
+/// output, request-minor, must step exactly ONE ROW (one 64-element stick) per request. And no op of the
+/// SHIPPED bundle may declare a 3-D kernel at all.
 #[test]
-fn no_op_declares_a_per_batch_3d_kernel_and_every_kernel_has_one_start() {
+fn the_gathered_kernel_starts_are_each_requests_own_page() {
+    let nkvh = std::num::NonZeroU32::new(NKVH).expect("granite has kv heads");
     for mq in [2u32, 4, 8] {
-        for gather in [false, true] {
-            for o in emit_at(mq, gather) {
-                for (l, d, _, dis) in &o.operands {
-                    assert!(
-                        !(l.len() == 3 && l[0] == "y" && l[1] == "in" && l[2] == "out"),
-                        "mq={mq} gather={gather}: {} declares a per-batch 3-D kernel {l:?}{d:?} with \
-                         {dis} distinct start(s). That form is REFUTED ON CARD — it faulted at \
-                         `job_bin_ptr + numCoresUsed_*128` at rungs 2, 4 and 8 alike.",
-                        o.name,
-                    );
+        for o in emit_at(mq, false) {
+            for (l, d, _, dis) in &o.operands {
+                assert!(
+                    !(l.len() == 3 && l[0] == "y" && l[1] == "in" && l[2] == "out"),
+                    "mq={mq}: the SHIPPED {} declares a per-batch 3-D kernel {l:?}{d:?} ({dis} \
+                     start(s)) — only the gathered fold's legs carry one",
+                    o.name,
+                );
+            }
+        }
+        let gathered = emit_at(mq, true);
+        let windows: Vec<SlotWindow> = SlotWindow::sweep(SlotCount::new(ACTIVE_CAP)).collect();
+        for (wi, window) in windows.iter().enumerate() {
+            for kvh in KvHead::all(nkvh) {
+                for g in 0..GQA {
+                    let qh = kvh.get() * GQA + g;
+                    for (leg, plane) in [("sc", KvPlane::Kt), ("ov", KvPlane::V)] {
+                        let name = format!("attn_p{wi}{leg}_q{qh}_o");
+                        let o = gathered
+                            .iter()
+                            .find(|o| o.name.starts_with(&name))
+                            .unwrap_or_else(|| panic!("mq={mq}: no op named {name}*"));
+                        // Operand order is `[a, w, o, epi?]`, so the kernel is operand 1.
+                        let (layout, _, _, _) = &o.operands[1];
+                        assert_eq!(
+                            layout.join(","),
+                            "y,in,out",
+                            "mq={mq}: {}'s kernel must be the per-request 3-D `[y,in,out]`",
+                            o.name
+                        );
+                        assert_eq!(
+                            byte_starts(&o.starts[1]),
+                            expected_kernel_starts(mq, plane, kvh, *window),
+                            "mq={mq}: {}'s kernel starts are not each request's own page in the \
+                             gathered scratch — a request reading another request's keys",
+                            o.name
+                        );
+                        for (i, what) in [(0usize, "activation"), (2, "output")] {
+                            let s = byte_starts(&o.starts[i]);
+                            let rows: Vec<i64> = s.iter().map(|v| v - s[0]).collect();
+                            let one_row_each: Vec<i64> = (0..i64::from(mq))
+                                .map(|r| r * i64::from(POOL_STICK) * ELEM_BYTES)
+                                .collect();
+                            assert_eq!(
+                                rows, one_row_each,
+                                "mq={mq}: {}'s {what} must step ONE ROW per request (it is \
+                                 request-minor); starts {s:?}",
+                                o.name
+                            );
+                        }
+                    }
                 }
             }
         }
-        // ⭐ AND POSITIVELY: every collapsed-fold leg's KERNEL is `[in,out]` read from ONE address.
-        // Operand order is `[a, w, o, epi?]`, so the kernel is operand 1.
-        let legs: Vec<OpPicture> = only_gathered(mq)
-            .into_iter()
-            .filter(|o| o.name.contains("sc_g") || o.name.contains("ov_g"))
-            .collect();
-        assert!(
-            !legs.is_empty(),
-            "mq={mq}: no collapsed-fold leg in the gathered emission — the diff is broken"
-        );
-        for o in &legs {
-            let k = &o.operands[1];
-            assert_eq!(
-                (k.0.join(","), k.3),
-                ("in,out".to_string(), 1),
-                "mq={mq}: {}'s kernel declares {:?} with {} distinct per-core start(s). The whole fix is \
-                 that this operand is `[in,out]` with ONE start — core-invariant, exactly as every \
-                 shipped attention kernel is — with the request supplied as a baked offset instead.",
-                o.name,
-                k.0,
-                k.3,
-            );
-        }
     }
 }
 
-/// ⭐⭐⭐⭐⭐ FACT 4b — **THE COLLAPSED OP *IS* THE SHIPPED FOLD OP AT ONE ROW.** The sharpest statement of
-/// the fix, and the reason it is worth a card run: every operand's `layoutDimOrder_`, every
-/// `maxDimSizes_`, the contraction, the output width and the fused epilogue are IDENTICAL to the shipped
-/// prefix leg's. The only declared quantities that move are the swept `mb_` (1 instead of `mq`), the
-/// `mb` split that follows it, and `numCoresUsed_`.
+/// ⭐ FACT 5 — A GATHERED LEG CONTRACTS EXACTLY WHAT THE SHIPPED LEG CONTRACTS.
 ///
-/// So the shape is not new on the card — it is the `mq == 1` solo-decode leg, which runs at 41 tok/s,
-/// emitted `mq` times with three different base offsets.
+/// The collapse changes which rows an op computes and where its kernel comes from — never the matmul
+/// itself. So every gathered leg's `in_`/`out_` equal the shipped pass-0 leg's of the same kind: the score
+/// leg contracts one head-dim stick into one 64-slot window, the value leg one window into one stick.
 #[test]
-fn the_collapsed_op_is_the_shipped_op_at_one_row() {
+fn a_gathered_leg_contracts_what_the_shipped_leg_contracts() {
+    let in_out = |o: &OpPicture| -> Vec<(String, i64)> {
+        o.iter
+            .iter()
+            .filter(|(k, _)| k == "in_" || k == "out_")
+            .cloned()
+            .collect()
+    };
     for mq in [2u32, 4, 8] {
         let (ship, gath) = (emit_at(mq, false), emit_at(mq, true));
-        for (ship_stem, gath_stem) in [
-            ("attn_p0sc_g0_o", "attn_p0sc_g0_r0_o"),
-            ("attn_p0ov_g0_o", "attn_p0ov_g0_r0_o"),
-        ] {
-            let find = |v: &[OpPicture], stem: &str| {
-                v.iter()
-                    .find(|o| o.name.starts_with(stem))
-                    .unwrap_or_else(|| panic!("mq={mq}: no op named {stem}*"))
-                    .clone()
-            };
-            let (s, g) = (find(&ship, ship_stem), find(&gath, gath_stem));
-            // Operand DECLARATIONS: layout order and maxDimSizes, per operand. The per-core start COUNT
-            // legitimately differs (it is the core count), so it is compared separately below.
-            let decl = |o: &OpPicture| -> Vec<(Vec<String>, Vec<i64>)> {
-                o.operands
-                    .iter()
-                    .map(|(l, d, _, _)| (l.clone(), d.clone()))
-                    .collect()
-            };
-            assert_eq!(
-                decl(&s),
-                decl(&g),
-                "mq={mq}: {gath_stem}'s operand declarations differ from the shipped {ship_stem}'s. The \
-                 collapse is supposed to change only WHICH ROW an op computes, so any difference here is \
-                 a new shape on the card and needs its own justification."
-            );
-            // `N_`: identical except `mb_`, which is the ONE row instead of the batch's `mq`.
-            let iter_but_mb = |o: &OpPicture| -> Vec<(String, i64)> {
-                o.iter.iter().filter(|(k, _)| k != "mb_").cloned().collect()
-            };
-            assert_eq!(
-                iter_but_mb(&s),
-                iter_but_mb(&g),
-                "mq={mq}: {gath_stem} and {ship_stem} must agree on every iteration extent but `mb_`"
-            );
-            let mb = |o: &OpPicture| o.iter.iter().find(|(k, _)| k == "mb_").map(|(_, v)| *v);
-            assert_eq!(
-                (mb(&s), mb(&g)),
-                (Some(i64::from(mq)), Some(1)),
-                "mq={mq}: the shipped leg should sweep `mq` rows and the collapsed one exactly ONE — that \
-                 difference IS the redundant arithmetic the collapse removes ({ship_stem} vs {gath_stem})"
-            );
-        }
-    }
-}
-
-/// ⭐⭐⭐ FACT 6 — **EVERY `y` SPLIT IN EVERY ATTENTION OP, GATHERED OR NOT, IS 4 (THE GQA GROUP) OR 1.**
-///
-/// This was the assertion that convicted the refused form: its ops split `y` by the rung width — 2, 4 and
-/// 8 — and with `mb` pinned to 1 and a one-stick `out` that split IS `numCoresUsed_`, which IS the fault's
-/// flit index. Nothing that has ever launched splits `y` by anything but the group or 1.
-///
-/// It now covers BOTH emissions, which is the strongest form of the pin: the collapsed fold does not
-/// merely avoid the refused number, it lands on the same `y` split the shipped bundle has always carried.
-///
-/// ⛔ AND `be3ca5355`'s CONTROL STILL DOES NOT REACH, which is why the number is asserted rather than
-/// argued. That commit inferred the rank was harmless because "the `mq`-entry one-flit table is in the
-/// program of BOTH kernel ranks, and the 2-D one is what ships and runs today". Its premise is the
-/// ISOLATION bundle — `/work/iso-gate/superdsc_gate/sweep_bmm2d_y8/group_0/sdsc_0.json` carries
-/// `numCoresUsed_:8, numWkSlicesPerDim_:{in:1,mb:1,out:1,y:8}`, measured — and the shipped 2-D form is
-/// `{y:4, mb:mq}` on 32 cores, so `{mb:1, y:8}` had never run on card in either rank.
-#[test]
-fn every_y_split_in_every_attention_op_is_the_gqa_group_or_one() {
-    const GQA: i64 = (NQH / NKVH) as i64;
-    for mq in [2u32, 4, 8] {
-        for gather in [false, true] {
-            for o in emit_at(mq, gather) {
-                let ys = o
-                    .split
-                    .iter()
-                    .find(|(k, _)| k == "y")
-                    .map_or(1, |(_, v)| *v);
-                assert!(
-                    ys == 1 || ys == GQA,
-                    "mq={mq} gather={gather}: {} splits `y` {ys} ways. Every attention op that has ever \
-                     launched splits `y` by 1 or the GQA group ({GQA}); a split at the rung width with \
-                     `mb` pinned to 1 IS `numCoresUsed_`, which IS the flit index the refused form \
-                     faulted at. wk={:?} cores={}",
+        for leg in ["sc", "ov"] {
+            let shipped = ship
+                .iter()
+                .find(|o| o.name.starts_with(&format!("attn_p0{leg}_g0_o")))
+                .unwrap_or_else(|| panic!("mq={mq}: the shipped bundle has no attn_p0{leg}_g0"));
+            let legs: Vec<&OpPicture> = gath
+                .iter()
+                .filter(|o| is_gathered_leg(o) && o.name.contains(&format!("{leg}_q")))
+                .collect();
+            assert!(!legs.is_empty(), "mq={mq}: no gathered {leg} leg");
+            for o in legs {
+                assert_eq!(
+                    in_out(o),
+                    in_out(shipped),
+                    "mq={mq}: {} contracts {:?} where the shipped {} contracts {:?}",
                     o.name,
-                    o.split,
-                    o.cores,
+                    in_out(o),
+                    shipped.name,
+                    in_out(shipped),
                 );
             }
         }
     }
 }
 
-/// ⭐ FACT 5 — THE GATHER EMITS `mq`× THE PREFIX-LEG OPS **PER PASS**, WHICH IS THE SAME OP COUNT PER
-/// STEP, BECAUSE THE SHIPPED FOLD RUNS `mq` PASSES.
+/// ⭐ FACT 6 — EVERY `y` SPLIT IS THE GQA GROUP OR ONE, EXCEPT THE GATHERED LEGS', WHICH IS THE WIDTH.
 ///
-/// One op per (kv head, request) against the shipped one per kv head — and the shipped one relaunches the
-/// whole group once per (page, REQUEST) while the collapsed one relaunches once per page. So the trade
-/// bought is `mq`× fewer launches at an unchanged op count, plus `mq`× less arithmetic per op (`mb_=1`
-/// against `mb_=mq`, see [`the_collapsed_op_is_the_shipped_op_at_one_row`]).
-///
-/// ⛔ IT IS NOT `nqh` OPS. That was the refused form's count (one op per QUERY head, `y` carrying the
-/// requests), priced from the card at 1.42 µs/op. `nkvh*mq` is 2× that at rung 8 and 1/2× at rung 2, and
-/// both are far below the ~28 µs of a fold pass it removes — but the number belongs measured, not
-/// remembered.
+/// Every shipped attention op splits `y` by 1 or the GQA group. The gathered legs split it by the
+/// request count (FACT 2); nothing else in the gathered bundle may.
 #[test]
-fn the_gathered_prefix_legs_are_one_op_per_kv_head_and_request() {
+fn every_y_split_is_the_gqa_group_or_one_but_the_gathered_legs() {
+    for mq in [2u32, 4, 8] {
+        for gather in [false, true] {
+            for o in emit_at(mq, gather) {
+                let ys = split_of(&o, "y");
+                let expected_ok = if gather && is_gathered_leg(&o) {
+                    ys == i64::from(mq)
+                } else {
+                    ys == 1 || ys == i64::from(GQA)
+                };
+                assert!(
+                    expected_ok,
+                    "mq={mq} gather={gather}: {} splits `y` {ys} ways. wk={:?} cores={}",
+                    o.name, o.split, o.cores,
+                );
+            }
+        }
+    }
+}
+
+/// ⭐⭐⭐ FACT 7 — THE GATHERED PREFIX LEGS ARE ONE OP PER QUERY HEAD, AT EVERY WIDTH.
+///
+/// The count that made the fold group grow with the batch: per window, the shipped bundle has `nkvh` legs
+/// of each kind, and the gathered one must have `nqh` — the SAME at every width, because the width rides
+/// on `y`. `nkvh * mq` here is the per-request emission back.
+#[test]
+fn the_gathered_prefix_legs_are_one_op_per_query_head_at_every_width() {
     for mq in [2u32, 4, 8] {
         let count = |gather: bool, needle: &str| {
             emit_at(mq, gather)
@@ -703,10 +733,9 @@ fn the_gathered_prefix_legs_are_one_op_per_kv_head_and_request() {
             let (shipped, gathered) = (count(false, leg), count(true, leg));
             assert_eq!(
                 (shipped, gathered),
-                (NKVH as usize, (NKVH * mq) as usize),
+                (NKVH as usize, NQH as usize),
                 "mq={mq}: prefix-pass-0 {leg} legs — shipped {shipped}, gathered {gathered}. Expected \
-                 `nkvh` and `nkvh*mq`: one op per kv head per request, in ONE pass where the shipped \
-                 form takes `mq`. `nqh` here would mean the refused per-query-head form is back."
+                 `nkvh` and `nqh`: one op per query head serving every request."
             );
         }
     }

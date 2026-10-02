@@ -56,7 +56,7 @@
 //! broadcast), lining up 1:1 with the worker's pre-tiled rows. Not yet verified on real hardware.
 
 use super::matmul::{
-    SharedKernelBmmForm, assemble_matmul_off_maybe_epilogue,
+    SharedKernelBmmForm, assemble_matmul_batched_off, assemble_matmul_off_maybe_epilogue,
     assemble_matmul_off_phys_m_maybe_epilogue, assemble_matmul_off_phys_m_with_epilogue,
     assemble_matmul_off_with_epilogue,
 };
@@ -351,12 +351,16 @@ impl BlockNests {
 /// request 0's values to all of them — fluent, wrong, and it would look like a working collapse in the
 /// launch count. `Some` therefore means "this block's score AND value legs are per-request".
 ///
-/// ⛔ AND IT CARRIES NO STRIDE, WHICH IS THE WHOLE FIX. It used to carry two `RequestAxis`es — the three
-/// `y` steps a per-batch-KERNEL matmul would take. That form is refuted on card (`numCoresUsed_` collapses
-/// onto the request count and the launch faults at `job_bin_ptr + cores*128`), so nothing strides across
-/// requests any more: each request gets its OWN op, whose three bases are the block's nests re-based by
-/// [`BlockNests::at_request`] and whose kernel base is
-/// [`crate::sdsc_abstract::GatherScratch::kernel_row_off`].
+/// ⭐ THE REQUESTS RIDE `y` OF ONE OP PER (QUERY HEAD, SLAB). Every operand's per-request step comes from
+/// a law this type or the block's nests own: one ROW of the request-minor buffers (the `mb * out` a
+/// one-stick block derives — [`Self::request_batch`]) and one PAGE PLANE of the scratch
+/// ([`Self::kernel_in_extent`]); the bases are request 0's ([`BlockNests::at_request`],
+/// [`Self::kernel_off`]). `zz_the_declared_y_of_every_gathered_op` checks every emitted kernel start
+/// against [`crate::sdsc_abstract::PageScratch::coord_off`].
+///
+/// ⚠️ NOT YET RUN ON A CARD. An earlier request-on-`y` form faulted at launch (`PrepZeroFlitCnt`,
+/// `PrepSwVer` at flit `mq` of the program); that test file records the measurements, and its cause was
+/// not established.
 #[derive(Clone, Copy)]
 struct GatheredFold {
     scratch: crate::sdsc_abstract::PageScratch,
@@ -380,6 +384,56 @@ impl GatheredFold {
     /// was staged for.
     fn requests(self) -> u32 {
         self.scratch.mq()
+    }
+    /// ⭐ THE BATCH AXIS BOTH LEGS DECLARE — the requests — and the two conditions it needs.
+    ///
+    /// Every buffer the legs read or write besides the kernel is request-MINOR (`HeadRequestRow`,
+    /// `of_token_stream`), so request `r` is ONE ROW past request 0. A batched matmul steps `y` by
+    /// `mb * out` on its activation and output; at `mb` = one row that is one row only while the block
+    /// is ONE STICK wide. A wider block is refused here, by name, rather than striding into the next
+    /// request's columns.
+    ///
+    /// ⛔ AND THERE MUST BE A BATCH. A single request shares one resident history and is never gathered
+    /// (`rows_are_requests` in the target crate: the solo decode and the prompt chunk emit no gather), and
+    /// `matmul_dims` drops a one-element `y` entirely, so a one-request "batch" would name an axis the
+    /// op does not have. Refused by name rather than emitted as some other op.
+    fn request_batch(self, width: BlockCols) -> Result<MatY, SuperDscError> {
+        if self.requests() < 2 {
+            return Err(SuperDscError(format!(
+                "the gathered fold batches a decode batch's requests on `y`, and this pass has {} — a \
+                 single request shares one resident history and is never gathered",
+                self.requests(),
+            )));
+        }
+        if width != BlockCols::of_one_stick(Lanes::FP16) {
+            return Err(SuperDscError(format!(
+                "the gathered fold batches its {} requests on `y`, which steps `mb * out` = {} \
+                 element(s) per request, but a request is ONE ROW (one stick) of every request-minor \
+                 buffer it reads — the block must be one stick wide",
+                self.requests(),
+                width.get(),
+            )));
+        }
+        Ok(MatY::of_requests(self.requests()))
+    }
+    /// ⭐ THE KERNEL'S PHYSICAL `in` EXTENT, which makes its `y` step exactly ONE PAGE PLANE.
+    ///
+    /// The batched kernel walks `[y, in, out]` with `out` one stick, so `y` steps `in_phys * stick`.
+    /// Request `r`'s page sits [`crate::sdsc_abstract::PageScratch::cols`] elements past request 0's, so
+    /// `in_phys` is the plane's sub-row count. Each op sweeps ONE `out` stick — a window on the score
+    /// leg, a head-dim slab on the value leg — so `in_phys` sets no other stride: the kv head, window
+    /// and slab are all in the request-0 base, [`Self::kernel_off`].
+    fn kernel_in_extent(self) -> Result<(&'static str, u32), SuperDscError> {
+        use super::matmul::walk::WalkAxis as _;
+        let sub_rows = self.scratch.plane().sub_rows();
+        u32::try_from(sub_rows)
+            .map(|r| (super::matmul::walk::InAxis::NAME, r))
+            .map_err(|_| {
+                SuperDscError(format!(
+                    "the gathered page plane is {sub_rows} sub-rows, which does not fit the \
+                     descriptor's extent width"
+                ))
+            })
     }
     /// ⭐⭐⭐⭐⭐ THE KERNEL BASE for (this window, kv head `kvh`, request `r`) — **the POOL'S OWN ADDRESS
     /// plus request `r`'s row**, with no arithmetic spelled here.
@@ -854,11 +908,8 @@ fn assemble_attn_block(
     // away here — a GQA group shares a kv head's Kᵀ, but the requests inside that head do NOT share a
     // block, and `y` can only carry one of the two. Query-head-major is the one that pays: it trades
     // `nkvh` ops per pass for `nqh`, against `requests`× fewer PASSES, and a trip is ~3.4 µs where a
-    // pass is a ~93 µs launch (measured: 8 ops × 8 passes → 32 ops × 1).
-    //
-    // `device_extent("out", PAGE_SLOTS)` because the op sweeps a 64-slot window of a whole-page
-    // kernel; undeclared, `y` steps `in*64` and request 1 reads 64 slots into request 0's keys —
-    // pinned by `fold_request_axis_strides.rs`, off the emitted per-core addresses.
+    // pass is a ~93 µs launch (measured: 8 ops × 8 passes → 32 ops × 1). The kernel's `y` step is one
+    // page plane of the gather scratch — [`GatheredFold::kernel_in_extent`].
     // ⭐ THE STRIDE GUARD BOTH FOLD-COLLAPSE ATTEMPTS NEEDED. A batched matmul lands its `(y, mb)` grid
     // on rows, and whether those are the rows `HeadRequestRow` names is arithmetic nobody was checking:
     // get it wrong and one request's scores are written onto another request's row, which is fluent,
@@ -868,15 +919,6 @@ fn assemble_attn_block(
     // carried by the op's own base offset (one op per head) — which the law accepts unconditionally.
     // The `phys_m` form claims the head on `y` with `mb = 1` swept, and its `y` really steps ONE row
     // where the law needs `mq`; that is why it garbled, and it now cannot be emitted.
-    // ⭐⭐ ONE PLAIN 2-D MATMUL PER (REQUEST, QUERY HEAD) — the simplest form that can express this, and
-    // the one with NOTHING TO DECLARE. `batch = 1` means there is no `y` axis, so there is no y-stride to
-    // get right, no `device_extent` override, and no 3-D per-batch kernel: every address is a base
-    // offset, and the pool composes the request term. The four mechanisms that broke the previous two
-    // attempts are not guarded here, they are ABSENT.
-    //
-    // AND IT COSTS NOTHING. Today the fold runs `nkvh` ops in each of `requests` launches; this runs
-    // `nqh * requests` ops in ONE. At nb=1, nkvh=8, nqh=32, mq=8 that is 512 op-executions either way —
-    // the same work, no longer split across launches, and a launch is ~93 us against a trip's ~3.4.
     // The mask add FUSES directly into the score matmul's own launch in BOTH cases now:
     //  - `mask_bcast=false` (cmask): THE ONE ROW LAW comment above establishes cmask shares `sc`'s
     //    own row addressing 1:1, so `nests.score_rows(h, width)` — the SAME call `sc`'s own per-head
@@ -916,136 +958,69 @@ fn assemble_attn_block(
     } else {
         &[]
     };
-    // ⭐⭐⭐⭐⭐ THE COLLAPSED-FOLD ARM — **`mq` COPIES OF THE SHIPPED OP, ONE PER REQUEST, IN ONE PASS.**
+    // ⭐⭐⭐⭐⭐ THE COLLAPSED-FOLD ARM — ONE OP PER (KV HEAD, SLAB) FOR THE WHOLE BATCH: `y` = the requests,
+    // `mb` = the kv head's GQA query heads.
     //
-    // ⛔⛔⛔ THE `y = REQUEST` FORM IS REFUTED ON CARD AND MUST NOT COME BACK. Carrying the requests on
-    // `y` needs a per-batch 3-D `[y,in,out]` KERNEL — the one operand in the bundle whose per-core start
-    // count goes from ONE to `mq` — and with `mb` pinned to 1 and a one-stick `out` that `y` split IS
-    // `numCoresUsed_`. Every rung faulted at `job_bin_ptr + numCoresUsed_*128`, one flit past the
-    // program's per-core patch table (`init_binary.bin = 1920 + 128*cores`): rung 2 at +0x100, rung 4 at
-    // +0x200, rung 8 at +0x400, syndrome `0xc00` / locator `0x2` / cases `[PrepZeroFlitCnt,PrepSwVer]`
-    // bit-identical, only the index moving. Rung 4 is the discriminator that closed it: `{mb:1, y:4}` is
-    // `matmul/dims.rs`'s on-hardware-proven solo-decode split, so the `y`-split VALUE is exonerated and
-    // the 3-D kernel is what the address is made of.
-    //
-    // ⭐⭐⭐ AND THE GATHER IS WHAT MAKES THE DIM UNNECESSARY, which is the whole reason the scratch
-    // exists. The scratch destination is CONTIGUOUS and request-MINOR: the index already put request
-    // `r`'s KV block where `r` needs it, so `r`'s kernel is reached by a baked OFFSET — exactly as a GQA
-    // group's shared kv head is reached by `kt_off_fn`'s. So this arm emits the SHIPPED shape: `y` back on
-    // the GQA group with a bare 2-D `[in,out]` kernel (`MatY::of_gqa_group` +
-    // `assemble_matmul_off_phys_m_with_epilogue`), `mb` = ONE ROW, and the request supplied as a
-    // coordinate of all four laws (`BlockNests::at_request`). At `mq == 1` that is BYTE-FOR-BYTE the solo
-    // decode op that runs at 41 tok/s today; at `mq > 1` it is that op `mq` times, and `numCoresUsed_` is
-    // `{y:4, mb:1}` = 4 at EVERY rung.
-    //
-    // ⭐ THE OP COUNT IS THE TRADE, AND IT IS THE ONE TO WANT. `nkvh*mq` ops in ONE pass against the
-    // shipped `nkvh` ops in each of `mq` passes — the SAME op count, `mq`× fewer launches — and each op
-    // now computes ONE row where the shipped one computes `mq` and masks `mq-1` of them away. Measured:
-    // 1.42 µs per op against ~28 µs per fold pass.
-    //
-    // ⛔ AND THIS IS NOT THE PAIRING `attn.rs` FORBIDS. That one PACKS `(gqa, request)` onto a single `y`
-    // whose two components share one differenced step — garbage on the 8b at hd=128, 10/10 runs. Here `y`
-    // carries the group ALONE, exactly as it ships, and the request is not on an axis at all.
+    // The gather copied every request's page into one scratch whose per-request pitch this compiler
+    // chose — one page plane per request — so the requests ARE a uniform batch axis with a per-request
+    // kernel ([`GatheredFold::kernel_in_extent`]). The query heads sharing the kv head's keys are the
+    // op's rows: in the head-major, request-minor token stream and score buffer (`HeadRequestRow`) a
+    // request is ONE ROW and a head a whole `mq`-row block, which is exactly the `[mb, y, ·]` walk
+    // (`BatchOrder::RequestsInner`). So the op count is the shipped fold's — `nkvh * nslab` per window —
+    // at every batch width, and the gathered fold group is the shipped one plus its gather copies.
     if let Some(gf) = request_axis {
-        // THE KV HEADS FROM THE SCRATCH ITSELF — the same count the index table was staged for, so the
-        // kernel row an op reads and the entry the host filled cannot come from two numbers.
         let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
             .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
-        // ⭐⭐⭐⭐⭐ THE CONTRACTION IS SPLIT BY SLAB — `nslab` ops of ONE STICK each, accumulating in `sc`.
-        //
-        // ⛔⛔⛔ IT WAS `MatK::of_head_dim(hd)` IN ONE OP, JUSTIFIED BY A COMMENT THAT SAID "the gather's
-        // own precondition is `hd <= POOL_STICK`, so there is exactly one slab and no partial sums to
-        // accumulate". The precondition was `PageScratch::of_pass`'s `slabs() != 1` refusal, so the prose
-        // was true only while the door was shut — and the whole point of the door coming off is that at
-        // hd=128 there ARE two slabs. An UNSPLIT `y`-batched contraction of two sticks is the shape
-        // `ScoreArm::choose` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
-        // FASTER ITL, which is the tell: less work, done wrong"), and it is what the 8b's
-        // wrong-from-the-first-token runs were emitting.
-        //
-        // ⭐ AND `OneStickContraction::by_slab_split` IS THE WITNESS, which is why it takes no arguments:
-        // a slab IS one stick at every head dim, so the split satisfies the precondition by construction
-        // rather than by a head-dim test. The batched form's two stride relations hold because each
-        // operand declares its OWN pitch (`BatchStrides::{a_pitch,o_pitch}`).
-        //
-        // ⛔⛔⛔ AND THE KERNEL **VIEW** IS NOT WHAT WAS WRONG, WHICH IS WHY READING THE TEMPLATE WOULD
-        // NOT HAVE FOUND THIS. The fp16 score kernel's slice layout is ONE-DIM ON `%out`
-        // (`deeptools/share/ddc/ddl_templates/bmm.ddl:23`:
-        // `%slice_layout_kernel_16bit = ddl.layout(%out) {is_order_fixed=true}`), i.e. sticked on SLOTS,
-        // so `hd` is a non-stick reduction extent and a two-stick contraction is perfectly expressible in
-        // the view. It is nonetheless incoherent on the CARD under a `y`-batch — measured twice, and the
-        // template cannot say so. The lesson is the one this file keeps relearning: the declaration being
-        // legal is not the machine agreeing.
+        let gqa = crate::addr::Gqa::new(nqh / nkvh_nz.get());
+        let requests = gf.request_batch(width)?;
+        let kernel_in = gf.kernel_in_extent()?;
+        // ⭐ THE CONTRACTION IS ONE SLAB PER OP — a batched contraction must be ONE STICK
+        // (`OneStickContraction::by_slab_split`); the slabs accumulate in `sc` through the epilogue.
         let (k, n) = (
             MatK::of_head_slab(FeatIdx::SLAB_FEATS),
             MatN::of_kv_window(width),
         );
-        for r in 0..gf.requests() {
-            let rn = nests.at_request(r);
-            for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
-                let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
-                let h0 = qh0.get();
-                // The mask under a collapsed pass is `MaskBlockForm::PerPage` and read PER ROW: this
-                // op's row block is the same `score_rows` slice `sc` itself writes, so the validity it
-                // adds is request `r`'s own. `mask_bcast` cannot be true here — a broadcast row would
-                // give every request row 0's validity — so there is no arm for it.
-                let row_mask_off = mask_off + rn.score_rows(h0, width).off();
-                for s in 0..nslab {
-                    // ⭐ THE MASK IS ADDED ON SLAB 0 ONLY — `sc = sum_s (Q_s . Kt_s) + mask`. Adding it
-                    // per slab adds it `nslab` times, which is INERT at hd=64 and wrong above it: the
-                    // same shape as every other defect this file records. Later slabs fuse `sc` itself
-                    // at this group's own offset, so the op computes `sc += Q_s . Kt_s` (the DDL epilogue
-                    // is SFP-resident with one store, so the read of the prior partial precedes it).
-                    let (epi_h, epi_off): (&Stk<FlatTag>, crate::addr::DevOff) = if s == 0 {
-                        (&mask_h, row_mask_off)
-                    } else {
-                        (&sc_h, rn.score_rows(h0, width).off())
-                    };
-                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
-                    let name = if nslab == 1 {
-                        format!("attn_{tag}sc_g{}_r{r}_o{t}", kvh.get())
-                    } else {
-                        format!("attn_{tag}sc_g{}s{s}_r{r}_o{t}", kvh.get())
-                    };
-                    ops.push(assemble_matmul_off_phys_m_with_epilogue(
-                        // THE KV HEAD AND THE REQUEST AS SEPARATE NAME SEGMENTS, so the descriptor
-                        // projections that collapse `g{n}` / `r{n}` to one reported row keep working.
-                        &name,
-                        // ⛔ ONE ROW OF WORK. This op computes request `r`'s single score row for each
-                        // head of the group; declaring `mq` rows is what makes a pass compute `mq` rows
-                        // to keep one, which is the arithmetic the collapse is removing.
-                        MatM::single_row(),
-                        n,
-                        k,
-                        MatY::of_gqa_group(
-                            gqa,
-                            // ⛔ THE BY-SLAB STREAM PLACEMENT, NOT THE PLAIN ONE. A one-stick `in`
-                            // derives its head step as `pitch * in`, so the stream's own `mq` pitch
-                            // would stride 64 where the heads are `mq*hd` apart. Same law the
-                            // ungathered slab-split arm takes.
-                            rn.token_stream_by_slab(h0, s),
-                            rn.score_rows(h0, width),
-                        ),
-                        score_form,
-                        &rb(qs, mq_n, hd),
-                        rn.token_stream_by_slab(h0, s),
-                        // ⭐ THE GATHERED SCRATCH AS THE KERNEL, AT ITS FULL DECLARED `hd` ROWS with the
-                        // slab selected purely by OFFSET — the same discipline the ungathered arm uses.
-                        // Declaring `stick` rows instead would re-derive the stick-GROUP stride as
-                        // `stick*stk` where the tensor's is `hd*stk`.
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
-                        gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
-                        &rb(sc, rows_n, width_n),
-                        rn.score_rows(h0, width).off(),
-                        epi_h,
-                        epi_off,
-                        crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                        &[],
-                        false,
-                        sym_id_base,
-                        layout,
-                    ));
-                }
+        let rn = nests.at_request(0);
+        for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
+            let h0 = kvh.group_first_query(gqa).get();
+            for s in 0..nslab {
+                // ⭐ THE MASK IS ADDED ON SLAB 0 ONLY — `sc = sum_s (Q_s . Kt_s) + mask`. Later slabs fuse
+                // `sc` itself at this group's offset, so the op computes `sc += Q_s . Kt_s`. The mask is per
+                // ROW (`MaskBlockForm::PerPage`), framed like `sc`, so each request adds its own validity.
+                let (epi_h, epi_off): (&Stk<FlatTag>, crate::addr::DevOff) = if s == 0 {
+                    (&mask_h, mask_off + rn.score_rows(h0, width).off())
+                } else {
+                    (&sc_h, rn.score_rows(h0, width).off())
+                };
+                // nslab == 1 keeps the shipped fold leg's NAME.
+                let name = if nslab == 1 {
+                    format!("attn_{tag}sc_g{}_o{t}", kvh.get())
+                } else {
+                    format!("attn_{tag}sc_g{}s{s}_o{t}", kvh.get())
+                };
+                let a = rn.token_stream_by_slab(h0, s);
+                ops.push(assemble_matmul_batched_off(
+                    &name,
+                    MatM::of_gqa_group(gqa),
+                    n,
+                    k,
+                    requests,
+                    // The by-slab stream's heads are `nslab * mq` rows apart — its own pitch.
+                    super::matmul::BatchOrder::RequestsInner {
+                        a_head_pitch: Some(a.head_pitch().get()),
+                    },
+                    &rb(qs, mq_n, hd),
+                    a.off(),
+                    &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                    gf.kernel_off(kvh, 0, crate::sdsc_abstract::KvPlane::Kt, s)?,
+                    Some(kernel_in),
+                    &rb(sc, rows_n, width_n),
+                    rn.score_rows(h0, width).off(),
+                    Some((epi_h, epi_off)),
+                    crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                    sym_id_base,
+                    layout,
+                ));
             }
         }
     }
@@ -1414,86 +1389,57 @@ fn assemble_attn_block(
         // `request_stride` — "bytes between two requests' KV inside a page" — which no longer exists: a
         // page holds slots and a request is reached by its PAGE. There is nothing left to disagree.
     }
-    // ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S VALUE LEG — the score leg's mirror: `mq` copies of the SHIPPED
-    // per-kv-head op, one per request, `y` on the GQA group, the V scratch row reached by a baked OFFSET.
-    // See the score arm above for why the per-`y` kernel DIM is refuted and what the gather buys instead.
+    // ⭐⭐⭐⭐⭐ THE COLLAPSED FOLD'S VALUE LEG — the score leg's mirror: one op per (kv head, slab) for the
+    // whole batch, `y` = the requests, `mb` = the kv head's query heads, the V kernel stepping one page
+    // plane per request.
+    //
+    // `out` is ONE STICK — one head-dim slab per op — so the accumulator's head step, `y·out`, is the
+    // head-major `mq` rows of one slab plane; the slab is selected by the output's own offset
+    // (`head_major(.., s)`) and the kernel's (`kernel_off(.., s)`).
     if let Some(gf) = request_axis {
         let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
             .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
-        // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
-        // the ungathered batched arm below already makes, for the same reason.
-        //
-        // ⛔⛔⛔ THIS LEG HAD `n = MatN::of_head_slab(SLAB_FEATS)` — ONE STICK — AND **NO SLAB LOOP**,
-        // under a comment saying "ONE slab, because the gather's own precondition is `hd <= POOL_STICK`".
-        // At hd=64 one stick IS the whole head dim, so the absence was invisible. At hd=128 it means the
-        // gathered fold wrote only feature slab 0 of `run_o`: the upper 64 features of EVERY head's
-        // attention output received no prefix contribution at all, keeping only the new-token block's
-        // seed. Clean bake, no fault, every row wrong from its first generated token — which is exactly
-        // what `PageScratch::of_pass`'s refused hd=128 measurement recorded.
-        //
-        // ⛔ AND `out` MUST STAY ONE STICK, which is why the fix is a LOOP and not a wider `n`. A batched
-        // matmul reaches head `h` by striding `y` and derives that stride as `mb*out`; the accumulators
-        // are head-major `[rows, hd]` whose real pitch is `mq*stick`, so `out = hd` derives `mq*hd` and
-        // agrees only at one stick. The slab is selected by the output's own OFFSET
-        // (`of_head_major_accum(.., s)`) and the kernel's (`at_feat`), never by a fourth walk axis.
+        let gqa = crate::addr::Gqa::new(nqh / nkvh_nz.get());
+        let requests = gf.request_batch(width)?;
+        let kernel_in = gf.kernel_in_extent()?;
         let (k, n) = (
             MatK::of_kv_window(width),
             MatN::of_head_slab(FeatIdx::SLAB_FEATS),
         );
-        for r in 0..gf.requests() {
-            let rn = nests.at_request(r);
-            for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
-                let qh0 = kvh.group_first_query(crate::addr::Gqa::new(gqa));
-                let h0 = qh0.get();
-                for s in 0..nests.slabs() {
-                    // nslab == 1 keeps the op's NAME, so granite-3.1-2b's emission does not move.
-                    let name = if nests.slabs() == 1 {
-                        format!("attn_{tag}ov_g{}_r{r}_o{t}", kvh.get())
-                    } else {
-                        format!("attn_{tag}ov_g{}s{s}_r{r}_o{t}", kvh.get())
-                    };
-                    ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
-                        &name,
-                        MatM::single_row(),
-                        n,
-                        k,
-                        // The same two laws the shipped batched value arm declares — a head-major
-                        // probability buffer read and a head-major accumulator written, both `mq*stick`
-                        // apart — asked at THIS request's row and THIS slab.
-                        MatY::of_gqa_group(
-                            gqa,
-                            rn.score_rows(h0, width),
-                            crate::sdsc_abstract::OperandPlacement::of_head_major_accum(
-                                rows.swept(),
-                                hd,
-                                mq,
-                                h0,
-                                r,
-                                s,
-                            ),
-                        ),
-                        bmm_form,
-                        &rb(expb, rows_n, width_n),
-                        rn.score_rows(h0, width),
-                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS NOW THE PAGE — the scratch
-                        // row is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
-                        // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE
-                        // WINDOW, which is what made the gathered geometry differ from the pool's at all.
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
-                        gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
-                        &rb(run_o, rows_n, hd),
-                        rn.head_major(h0, s),
-                        // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
-                        // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
-                        fold_addend.as_ref().map(|a| (a, rn.head_major(h0, s))),
-                        crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
-                        &[],
-                        false,
-                        sym_id_base,
-                        layout,
-                    ));
-                }
+        let rn = nests.at_request(0);
+        for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
+            let h0 = kvh.group_first_query(gqa).get();
+            for s in 0..nests.slabs() {
+                // nslab == 1 keeps the shipped fold leg's NAME.
+                let name = if nests.slabs() == 1 {
+                    format!("attn_{tag}ov_g{}_o{t}", kvh.get())
+                } else {
+                    format!("attn_{tag}ov_g{}s{s}_o{t}", kvh.get())
+                };
+                let a = rn.score_rows(h0, width);
+                ops.push(assemble_matmul_batched_off(
+                    &name,
+                    MatM::of_gqa_group(gqa),
+                    n,
+                    k,
+                    requests,
+                    super::matmul::BatchOrder::RequestsInner {
+                        a_head_pitch: Some(a.head_pitch().get()),
+                    },
+                    &rb(expb, rows_n, width_n),
+                    a.off(),
+                    &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                    gf.kernel_off(kvh, 0, crate::sdsc_abstract::KvPlane::V, s)?,
+                    Some(kernel_in),
+                    &rb(run_o, rows_n, hd),
+                    rn.head_major(h0, s),
+                    // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
+                    // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
+                    fold_addend.as_ref().map(|a| (a, rn.head_major(h0, s))),
+                    crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
+                    sym_id_base,
+                    layout,
+                ));
             }
         }
     }

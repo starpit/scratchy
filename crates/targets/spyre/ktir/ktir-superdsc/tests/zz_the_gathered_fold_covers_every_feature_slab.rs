@@ -24,9 +24,9 @@
 //! The DESCRIPTORS, not the call site. For each head dim it emits the whole attention body with the
 //! gather on and asserts, from the emitted JSON:
 //! 1. the gathered score leg contracts **one stick** (`N_["in_"] == POOL_STICK`) at every head dim, and
-//!    there are `nslab` of them per (kv head, request);
+//!    there are `nslab` of them per query head;
 //! 2. the gathered value leg's output is **one stick wide** (`N_["out_"] == POOL_STICK`) and there are
-//!    `nslab` of them per (kv head, request), whose descriptors are DISTINCT — a second slab that
+//!    `nslab` of them per query head, whose descriptors are DISTINCT — a second slab that
 //!    emitted the same bytes would be the missing loop with a name;
 //! 3. at hd=64 the op names are byte-for-byte what shipped (no `s` segment), so granite-3.1-2b's
 //!    emission does not move.
@@ -53,6 +53,11 @@ struct Op {
 
 /// The whole attention body at one head dim and width, gather ON.
 fn emit_at<const HD: u32>(mq: u32) -> Vec<Op> {
+    try_emit_at::<HD>(mq).unwrap_or_else(|e| panic!("hd={HD} mq={mq}: assemble_attn refused: {e}"))
+}
+
+/// [`emit_at`], with `assemble_attn`'s refusal returned rather than panicked on.
+fn try_emit_at<const HD: u32>(mq: u32) -> Result<Vec<Op>, String> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let bundle_rows =
         attn_bundle_rows(geom, mq, true).unwrap_or_else(|| panic!("mq={mq} is not a baked rung"));
@@ -79,30 +84,32 @@ fn emit_at<const HD: u32>(mq: u32) -> Vec<Op> {
         &mut sym,
         None,
     )
-    .unwrap_or_else(|e| panic!("hd={HD} mq={mq}: assemble_attn refused: {}", e.0))
-    .iter()
-    .map(|e| {
-        let v = serde_json::to_value(&e.op).expect("serializes");
-        let (name, body) = v["dscs_"][0]
-            .as_object()
-            .and_then(|m| m.iter().next())
-            .map(|(k, b)| (k.clone(), b.clone()))
-            .expect("one named dsc per emitted op");
-        let n = body["N_"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, x)| x.as_i64().map(|i| (k.clone(), i)))
-                    .collect()
+    .map_err(|e| e.0)
+    .map(|ops| {
+        ops.iter()
+            .map(|e| {
+                let v = serde_json::to_value(&e.op).expect("serializes");
+                let (name, body) = v["dscs_"][0]
+                    .as_object()
+                    .and_then(|m| m.iter().next())
+                    .map(|(k, b)| (k.clone(), b.clone()))
+                    .expect("one named dsc per emitted op");
+                let n = body["N_"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, x)| x.as_i64().map(|i| (k.clone(), i)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Op {
+                    name,
+                    n,
+                    body: serde_json::to_string(&body).expect("serializes"),
+                }
             })
-            .unwrap_or_default();
-        Op {
-            name,
-            n,
-            body: serde_json::to_string(&body).expect("serializes"),
-        }
+            .collect()
     })
-    .collect()
 }
 
 /// The PREFIX fold's gathered ops of one leg, keyed by their name. `p{b}` is a fold pass; `nsc`/`nov` are
@@ -137,8 +144,8 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
             let nb = CAP / POOL_STICK;
             assert_eq!(
                 leg.len() as u32,
-                nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the gathered value leg must emit nb*nkvh*mq*nslab ops. Got {}: {:?}",
+                nb * NQH * nslab,
+                "hd={hd} mq={mq}: the gathered value leg must emit nb*nqh*nslab ops, at every width. Got {}: {:?}",
                 leg.len(),
                 leg.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
             );
@@ -159,10 +166,10 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
             }
             // ⭐ AND THE SLAB IS IN THE NAME AT hd=128 AND ABSENT AT hd=64 — the 2b's emission does not
             // move, which is the safety property for an address-moving change.
-            let with_slab = leg.iter().filter(|o| o.name.contains("s1_r")).count();
+            let with_slab = leg.iter().filter(|o| o.name.contains("s1_o")).count();
             assert_eq!(
                 with_slab as u32,
-                if nslab == 1 { 0 } else { nb * NKVH * mq },
+                if nslab == 1 { 0 } else { nb * NQH },
                 "hd={hd} mq={mq}: slab 1's ops are named `s1` — at one slab there must be none, so the \
                  shipped 2b descriptor names are byte-identical"
             );
@@ -171,15 +178,15 @@ fn the_gathered_value_leg_emits_one_op_per_feature_slab() {
             if nslab > 1 {
                 let s0 = leg
                     .iter()
-                    .find(|o| o.name.contains("ov_g0s0_r0"))
-                    .expect("slab 0 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("ov_q0s0_o"))
+                    .expect("slab 0 of query head 0");
                 let s1 = leg
                     .iter()
-                    .find(|o| o.name.contains("ov_g0s1_r0"))
-                    .expect("slab 1 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("ov_q0s1_o"))
+                    .expect("slab 1 of query head 0");
                 assert_ne!(
                     s0.body, s1.body,
-                    "hd={hd} mq={mq}: the two slabs of (kv head 0, request 0) emit IDENTICAL \
+                    "hd={hd} mq={mq}: the two slabs of query head 0 emit IDENTICAL \
                      descriptors, so slab 1 writes slab 0's bytes and the upper half of every head's \
                      output is never produced"
                 );
@@ -207,8 +214,8 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
             let nb = CAP / POOL_STICK;
             assert_eq!(
                 leg.len() as u32,
-                nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the gathered score leg must emit nb*nkvh*mq*nslab ops. Got {}: {:?}",
+                nb * NQH * nslab,
+                "hd={hd} mq={mq}: the gathered score leg must emit nb*nqh*nslab ops, at every width. Got {}: {:?}",
                 leg.len(),
                 leg.iter().map(|o| o.name.as_str()).collect::<Vec<_>>()
             );
@@ -231,12 +238,12 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
             if nslab > 1 {
                 let s0 = leg
                     .iter()
-                    .find(|o| o.name.contains("sc_g0s0_r0"))
-                    .expect("slab 0 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("sc_q0s0_o"))
+                    .expect("slab 0 of query head 0");
                 let s1 = leg
                     .iter()
-                    .find(|o| o.name.contains("sc_g0s1_r0"))
-                    .expect("slab 1 of (kv head 0, request 0)");
+                    .find(|o| o.name.contains("sc_q0s1_o"))
+                    .expect("slab 1 of query head 0");
                 assert_ne!(
                     s0.body, s1.body,
                     "hd={hd} mq={mq}: the two slab partials of one score row emit IDENTICAL \
@@ -252,22 +259,20 @@ fn the_gathered_score_leg_contracts_exactly_one_stick_per_op() {
 /// whole run). So the slab split doubles a number that is already the largest group in the bundle, and
 /// that number is the BAKE COST.
 ///
-/// ⛔ MEASURED, and it is the practical price of hd=128: the granite-3.1-8b fp8 build spent **2470 s**,
-/// of which ~40 minutes was ONE `dxp_standalone` on the fold group — against 334 s for a whole cold
-/// granite-3.1-2b fp8 build whose fold group is half the size. It does bake, which is the thing that had
-/// to be established; it is also superlinear, so a further doubling (hd=256, or a wider rung) needs this
-/// number looked at before it is attempted rather than after.
+/// ⛔ MEASURED on the per-request form (one leg op per kv head AND request, so the run carried the
+/// width): the granite-3.1-8b fp8 build spent **2470 s**, ~40 minutes of it ONE `dxp_standalone` on
+/// the fold group, and granite-3.1-2b fp8's width-32 group was 2,156 ops — 128 s in dxp alone. With the
+/// requests on `y` the legs are `nb * nqh * nslab` each at every width, and that 2b group is 364 ops,
+/// 38 s alone.
 ///
-/// ⭐ ASSERTED AS A COMPOSITION, NOT A CEILING. `GroupSize::CEILING` (512, the largest CHUNKED group
-/// observed to bake) is already exceeded by the 2b's own exempt fold run (588), so a ceiling assertion
-/// here would either fail on shipped code or pin the wrong bound. What is checkable is that the count is
-/// exactly the two legs plus the per-block fixed cost plus the copies — so an accidental extra factor
-/// (a slab loop nested inside a slab loop, say) shows up here as a number and not as a slow build.
+/// ⭐ ASSERTED AS A COMPOSITION, NOT A CEILING: the count is exactly the two legs plus the copies, so an
+/// accidental extra factor — the width coming back, a slab loop nested inside a slab loop — shows up
+/// here as a number and not as a slow build.
 #[test]
 fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
     let nb = CAP / POOL_STICK;
     for (hd, nslab) in [(HD_2B, 1u32), (HD_8B, 2)] {
-        for mq in [1u32, 2, 8] {
+        for mq in [2u32, 8] {
             let ops = if hd == HD_2B {
                 emit_at::<HD_2B>(mq)
             } else {
@@ -280,8 +285,8 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
                 .count() as u32;
             assert_eq!(
                 legs,
-                2 * nb * NKVH * mq * nslab,
-                "hd={hd} mq={mq}: the two gathered legs are nb*nkvh*mq*nslab ops each"
+                2 * nb * NQH * nslab,
+                "hd={hd} mq={mq}: the two gathered legs are nb*nqh*nslab ops each, at every width"
             );
             // TWO PLANES, one copy op per (request, entry cut) each — `ops_per_row` is 1 here.
             assert_eq!(
@@ -294,5 +299,27 @@ fn the_gathered_fold_runs_group_size_is_the_two_legs_plus_its_fixed_cost() {
                 ops.len()
             );
         }
+    }
+}
+
+/// ⭐ A GATHERED FOLD OF ONE REQUEST IS REFUSED BY NAME, AT EVERY HEAD DIM.
+///
+/// The fold's legs carry the requests on `y`, and `matmul_dims` drops a one-element `y`, so a single
+/// request has no batch axis to declare. Production never asks — a solo decode shares one resident
+/// history and emits no gather (`rows_are_requests`) — so the emitter refuses rather than emitting some
+/// other op under the gathered name.
+#[test]
+fn a_gathered_fold_of_one_request_is_refused() {
+    for (hd, refused) in [
+        (HD_2B, try_emit_at::<HD_2B>(1).err()),
+        (HD_8B, try_emit_at::<HD_8B>(1).err()),
+    ] {
+        let e = refused.unwrap_or_else(|| {
+            panic!("hd={hd}: a one-request gathered fold was emitted instead of refused")
+        });
+        assert!(
+            e.contains("never gathered"),
+            "hd={hd}: refused for the wrong reason: {e}"
+        );
     }
 }

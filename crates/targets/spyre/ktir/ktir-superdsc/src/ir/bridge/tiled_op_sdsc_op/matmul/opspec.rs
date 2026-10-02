@@ -4,7 +4,7 @@
 use super::dims::{matmul_dims, matmul_split_map, matmul_split_map_for};
 use super::walk::{
     InAxis, MatmulWrapperSite, MbAxis, OutAxis, RungRegime, SharedKernelBmmForm,
-    SharedKernelBmmRegime, Walk2, Walk3, WalkAxis,
+    SharedKernelBmmRegime, Walk2, Walk3, WalkAxis, YAxis,
 };
 use crate::ir::island::tile_op::TileOp;
 use crate::sdsc_abstract::{MatK, MatM, MatN, MatY, PhysM};
@@ -706,6 +706,7 @@ pub fn matmul_opspec_batched(
         MatN::of_out_features(n),
         MatK::of_in_features(k),
         MatY::of_heads(batch),
+        BatchOrder::HeadsOutermost,
         a_name,
         w_name,
         o_name,
@@ -714,6 +715,19 @@ pub fn matmul_opspec_batched(
         0,
         None,
     )
+}
+
+/// WHICH WALK ORDER A PER-BATCH (3-D-kernel) BMM DECLARES FOR ITS ACTIVATION AND OUTPUT — the kernel is
+/// `[y, in, out]` either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchOrder {
+    /// `[y, mb, ·]` — `y` carries attention HEADS, each one head plane (`mb·stick`) apart.
+    HeadsOutermost,
+    /// `[mb, y, ·]` — `y` carries a decode batch's REQUESTS, one ROW apart, and `mb` one kv head's GQA
+    /// query heads, `y·stick` apart: the head-major, request-minor layout of every gathered-fold buffer.
+    /// `a_head_pitch` is the activation's head step in rows when it exceeds the batch (the by-slab token
+    /// stream, whose heads are `nslab·mq` rows apart), declared as its `y` device extent.
+    RequestsInner { a_head_pitch: Option<u32> },
 }
 
 /// [`matmul_opspec_batched`] with per-operand ELEMENT start-offsets and an optional KERNEL
@@ -741,6 +755,7 @@ pub fn matmul_opspec_batched_off(
     n: MatN,
     k: MatK,
     batch: MatY,
+    order: BatchOrder,
     a_name: &str,
     w_name: &str,
     o_name: &str,
@@ -749,13 +764,11 @@ pub fn matmul_opspec_batched_off(
     o_off: u32,
     kernel_device_extent: Option<(&'static str, u32)>,
 ) -> Result<OpSpec, String> {
-    // ⛔⛔⛔ THIS FORM IS NOT FOR REQUESTS, AND THAT IS A CARD MEASUREMENT. A `RequestAxis` parameter here
-    // once carried the three `y` steps a request-batched fold leg would take, checked against the walk
-    // this function declares. The form it guarded — a per-batch 3-D `[y,in,out]` KERNEL, one distinct
-    // weight start per core — faulted at `job_bin_ptr + numCoresUsed_*128` at every rung, one flit past
-    // the program's per-core patch table, and rung 4's `{mb:1, y:4}` (the proven solo-decode split)
-    // faulted identically, so the kernel RANK is the fault and not the split. The collapsed fold now
-    // emits the shared-2-D-kernel form per request; see `attn.rs`'s collapsed-fold arm.
+    // The gathered fold's legs (`attn.rs`, `MatY::of_requests`, `BatchOrder::RequestsInner`) carry the
+    // batch's requests here, with the kernel's `in` device extent making its `y` step one page plane of
+    // the gather scratch.
+    // ⚠️ That use is not yet run on a card: an earlier request-on-`y` form faulted at launch, cause not
+    // established — see `zz_the_declared_y_of_every_gathered_op`.
     //
     // The floor of the typed run for the batched form: raw extents from here down.
     let (m, n, k, batch) = (m.get(), n.get(), k.get(), batch.get());
@@ -773,20 +786,26 @@ pub fn matmul_opspec_batched_off(
         .tile(MaxCores::<MAX_CORES>, matmul_split_map, OutAxis::NAME)
         .map_err(|e| e.0)?;
     let (plan, time_tile) = (tiled.plan, tiled.time_tile);
-    // INPUT [y,mb,in] stick=in (batch-outermost; reduction = OMIT `in` from OUTPUT).
-    let input_walk = Walk3::input_head_outermost();
-    let input = TensorArg::<3>::new(
-        true,
-        a_name.to_string(),
-        Role::Input,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(input_walk.order()),
-        input_walk.order(),
-        input_walk.stick(),
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
+    // INPUT, stick=in (reduction = OMIT `in` from OUTPUT), in the order the batch axis needs.
+    let input = match order {
+        BatchOrder::HeadsOutermost => {
+            batched_input_arg(a_name, Walk3::input_head_outermost(), &plan)?
+        }
+        BatchOrder::RequestsInner { .. } => {
+            batched_input_arg(a_name, Walk3::input_requests_inner(), &plan)?
+        }
+    }
     .with_offset(a_off);
+    // `[mb, y, in]` gives `mb` (the heads) a `y_dev·in` step, so heads further apart than the batch are
+    // declared through `y`'s device extent.
+    let input = match order {
+        BatchOrder::RequestsInner {
+            a_head_pitch: Some(pitch),
+        } if pitch > plan.extent(YAxis::NAME) => input
+            .with_device_extent(YAxis::NAME, pitch)
+            .map_err(|e| e.0)?,
+        _ => input,
+    };
     // KERNEL [y,in,out] stick=out — the 3-D PER-BATCH weight (`y` carries the head),
     // NOT the 2-D shared kernel. This is the entire difference from `matmul_opspec`.
     let kernel_walk = Walk3::kernel_per_head();
@@ -823,18 +842,14 @@ pub fn matmul_opspec_batched_off(
         }
         None => kernel,
     };
-    let output_walk = Walk3::output_head_outermost();
-    let output = TensorArg::<3>::new(
-        false,
-        o_name.to_string(),
-        Role::Output,
-        [Scale::Active, Scale::Active, Scale::Active],
-        plan.iter_syms(output_walk.order()),
-        output_walk.order(),
-        output_walk.stick(),
-        Allocation::Hbm,
-    )
-    .map_err(|e| e.0)?
+    let output = match order {
+        BatchOrder::HeadsOutermost => {
+            batched_output_arg(o_name, Walk3::output_head_outermost(), &plan)?
+        }
+        BatchOrder::RequestsInner { .. } => {
+            batched_output_arg(o_name, Walk3::output_requests_inner(), &plan)?
+        }
+    }
     .with_offset(o_off);
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     let args = vec![

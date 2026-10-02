@@ -755,10 +755,6 @@ pub const MAX_STAGED_BYTES: usize = 512 * 1024 * 1024;
 /// width, and this constant, untouched. Measured on a 20-CPU-quota pod: width 8 still failed.
 pub const COMPILE_WIDTH: usize = 32;
 
-/// Kept as the queue's const-generic parameter — the channel depth, which only has to exceed the
-/// compile width so a finished worker never waits for the producer.
-pub const IN_FLIGHT: usize = COMPILE_WIDTH * 2;
-
 /// ⭐ A BYTE BUDGET FOR STAGED JSON, with the blocking on `reserve`.
 ///
 /// `reserve` waits until the request fits under [`MAX_STAGED_BYTES`]; `release` wakes a waiter. The
@@ -832,12 +828,6 @@ impl Latch {
         }
     }
 
-    /// Undo an `enter` whose work never reached a worker, so a failed send cannot strand the latch
-    /// above zero forever.
-    fn cancel(&self) {
-        self.leave();
-    }
-
     fn leave(&self) {
         if let Ok(mut n) = self.outstanding.lock() {
             *n = n.saturating_sub(1);
@@ -862,9 +852,87 @@ impl Latch {
     }
 }
 
-/// The queue as the emitter names it — the const is bound here so the emitter does not become generic
-/// over it.
-pub type Bake = BakeQueue<IN_FLIGHT>;
+/// ⭐ THE GROUPS WAITING FOR A COMPILER, LARGEST FIRST.
+///
+/// A bake's wall time is set by its slowest compiles, and dxp's time grows with a group's size: the
+/// largest group, started last, runs alone after everything else has finished. So a free compiler takes
+/// the largest group waiting. Size is the staged json bytes the emitter reserved for the group — the one
+/// size this queue is told exactly. Ties go to the group submitted first, so equal groups keep the
+/// emitter's order.
+///
+/// ⛔ NOT BOUNDED BY A COUNT. What a waiting group costs is its staged bytes, and those are already
+/// bounded by [`StageBudget`]: the emitter reserves before it writes, so [`Self::push`] never blocks. A
+/// count bound would only shrink the set the largest is chosen from — at a depth of 64, a bake that
+/// emits its widest bundles last starts their groups last.
+#[derive(Debug, Default)]
+pub struct GroupQueue {
+    waiting: Mutex<Waiting>,
+    arrived: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Waiting {
+    heap: std::collections::BinaryHeap<Queued>,
+    /// Groups pushed so far — each one's submission number, for the tie-break.
+    pushed: u64,
+}
+
+/// A waiting group with its submission number, ordered largest first, then earliest.
+#[derive(Debug)]
+struct Queued {
+    group: SealedGroup,
+    seq: u64,
+}
+
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.group
+            .staged_bytes
+            .cmp(&other.group.staged_bytes)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Queued {}
+
+impl GroupQueue {
+    /// Add a group. Never blocks — see the type's doc for the bound.
+    pub fn push(&self, group: SealedGroup) {
+        if let Ok(mut w) = self.waiting.lock() {
+            let seq = w.pushed;
+            w.pushed += 1;
+            w.heap.push(Queued { group, seq });
+            self.arrived.notify_one();
+        }
+    }
+
+    /// Take the largest waiting group, blocking until there is one. `None` only if the lock is poisoned,
+    /// which means a worker panicked holding it.
+    pub fn pop(&self) -> Option<SealedGroup> {
+        let mut w = self.waiting.lock().ok()?;
+        loop {
+            if let Some(q) = w.heap.pop() {
+                return Some(q.group);
+            }
+            w = self.arrived.wait(w).ok()?;
+        }
+    }
+}
+
+/// The queue as the emitter names it.
+pub type Bake = BakeQueue;
 
 /// Where the per-op json is STAGED for dxp.
 ///
@@ -1151,13 +1219,13 @@ enum MemoState {
     Failed,
 }
 
-/// A BOUNDED builder work queue: `IN_FLIGHT` groups may be outstanding, `IN_FLIGHT` workers drain
-/// them, and the first dxp failure stops the build.
+/// A BOUNDED builder work queue: [`COMPILE_WIDTH`] workers compile the largest waiting group first
+/// ([`GroupQueue`]), and the first dxp failure stops the build.
 ///
 /// The bound is the point. An unbounded queue would let the emitter run ahead and materialise the
-/// whole ladder again — which is the problem this exists to solve — so `submit` blocks rather than
-/// buffering.
-pub struct BakeQueue<const N: usize> {
+/// whole ladder again — which is the problem this exists to solve — so the emitter's
+/// [`Self::reserve`] blocks until the group's staged json fits [`MAX_STAGED_BYTES`].
+pub struct BakeQueue {
     stage: StageRoot,
     /// The DISK bound. Shared with the workers, which release a group's bytes when its staging dir
     /// is deleted — that release is what unblocks the emitter's next `reserve`.
@@ -1169,9 +1237,8 @@ pub struct BakeQueue<const N: usize> {
     memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)>,
     /// dxp runs actually skipped, for the build log.
     memo_hits: Arc<AtomicUsize>,
-    /// `Mutex<Option<..>>` rather than `Option<..>` because ONE queue serves the whole emit from a
-    /// `static` (see [`global`]), so closing it happens through a shared reference.
-    tx: Mutex<Option<std::sync::mpsc::SyncSender<SealedGroup>>>,
+    /// The groups submitted and not yet taken by a worker, largest first.
+    queue: Arc<GroupQueue>,
     /// The pool's threads. RETAINED, not read: the pool is process-lived now that [`Self::finish`] is a
     /// barrier rather than a shutdown, and these are what own it. Dropping the handles would only detach
     /// the threads; keeping them is what leaves a real shutdown available if one is ever wanted.
@@ -1190,20 +1257,12 @@ pub struct BakeQueue<const N: usize> {
     inflight: Arc<Latch>,
 }
 
-impl<const N: usize> BakeQueue<N> {
-    const _BOUNDED: () = assert!(
-        N > 0,
-        "a bounded queue with no slots cannot make progress — the emitter would block forever"
-    );
-
+impl BakeQueue {
     /// Start the workers. `None` when this build has no dxp (cardless): the caller then writes json
     /// and leaves it for `build.rs`, exactly as before.
     pub fn start() -> Option<Bake> {
-        let () = Self::_BOUNDED;
         let tool = DxpTool::resolve()?;
-        // A SyncSender IS the bound: `send` blocks while `N` items are unclaimed.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<SealedGroup>(N);
-        let rx = Arc::new(Mutex::new(rx));
+        let queue = Arc::new(GroupQueue::default());
         let reaper: Arc<Reaper> = Arc::new(Reaper::default());
         // Arm both teardowns before the first child can exist: the emit's own panics unwind only the
         // main thread, and a `^C` unwinds nothing at all, so these hooks are the only things that reap a
@@ -1217,12 +1276,10 @@ impl<const N: usize> BakeQueue<N> {
         let memo: Arc<(Mutex<std::collections::HashMap<u64, MemoState>>, Condvar)> =
             Arc::new((Mutex::new(std::collections::HashMap::new()), Condvar::new()));
         let memo_hits = Arc::new(AtomicUsize::new(0));
-        // COMPILE_WIDTH workers, not N: N is only the channel depth. Conflating them is what made
-        // the disk bound and the compile width the same number.
         let inflight: Arc<Latch> = Arc::new(Latch::default());
         let mut workers = Vec::with_capacity(COMPILE_WIDTH);
         for _ in 0..COMPILE_WIDTH {
-            let (rx, reaper, tool) = (Arc::clone(&rx), Arc::clone(&reaper), tool.clone());
+            let (queue, reaper, tool) = (Arc::clone(&queue), Arc::clone(&reaper), tool.clone());
             let (compiled, device_bytes) = (Arc::clone(&compiled), Arc::clone(&device_bytes));
             let results = Arc::clone(&results);
             let budget = Arc::clone(&budget);
@@ -1230,13 +1287,9 @@ impl<const N: usize> BakeQueue<N> {
             let inflight = Arc::clone(&inflight);
             workers.push(std::thread::spawn(move || {
                 loop {
-                    // Hold the receiver lock only for the recv, never across the compile — otherwise
-                    // the `N` workers would serialise into one.
-                    let job = match rx.lock() {
-                        Ok(g) => g.recv(),
-                        Err(_) => return,
-                    };
-                    let Ok(job) = job else { return };
+                    // `pop` holds the queue's lock only to take a group, never across the compile —
+                    // otherwise the workers would serialise into one.
+                    let Some(job) = queue.pop() else { return };
                     // Already failed? Drain without working, so the emitter's `submit` error is the
                     // one that surfaces rather than a pile of consequences.
                     if reaper.has_failed() {
@@ -1338,7 +1391,7 @@ impl<const N: usize> BakeQueue<N> {
             budget,
             memo,
             memo_hits,
-            tx: Mutex::new(Some(tx)),
+            queue,
             workers: Mutex::new(workers),
             reaper,
             compiled,
@@ -1365,39 +1418,24 @@ impl<const N: usize> BakeQueue<N> {
         self.budget.peak_bytes()
     }
 
-    /// Hand one finished group to the compilers. BLOCKS while `N` are outstanding — that block is
-    /// the disk bound. `Err` as soon as any group has failed, so the emitter stops instead of
-    /// writing the rest of a ladder that cannot compile.
+    /// Hand one finished group to the compilers, which take the largest waiting group first. Does not
+    /// block — the disk bound is [`Self::reserve`], taken before the group's json was written. `Err` as
+    /// soon as any group has failed, so the emitter stops instead of writing the rest of a ladder that
+    /// cannot compile.
     pub fn submit(&self, group: SealedGroup) -> Result<(), String> {
         if let Some(e) = self.reaper.first_error() {
             return Err(e);
         }
-        // Clone the sender out from under the lock: `send` BLOCKS when the queue is full, and
-        // holding the lock across it would serialise every producer behind one blocked send.
-        let tx = match self.tx.lock() {
-            Ok(g) => g.clone(),
-            Err(_) => None,
-        };
-        match tx {
-            // A closed channel means every worker is gone; the stored error explains why.
-            None => Err("bake queue already finished".to_string()),
-            Some(tx) => {
-                // Entered BEFORE the send: a job must be outstanding before any worker can account for
-                // it, or `finish` could return through a gap and read an incomplete `results`.
-                self.inflight.enter();
-                tx.send(group).map_err(|_| {
-                    self.inflight.cancel();
-                    self.reaper
-                        .first_error()
-                        .unwrap_or_else(|| "bake workers exited".to_string())
-                })
-            }
-        }
+        // Entered BEFORE the push: a job must be outstanding before any worker can account for it, or
+        // `finish` could return through a gap and read an incomplete `results`.
+        self.inflight.enter();
+        self.queue.push(group);
+        Ok(())
     }
 
     /// ⛔⛔⛔ A BARRIER, NOT A SHUTDOWN — AND THAT DISTINCTION WAS A BUILD FAILURE.
     ///
-    /// Waits until nothing is outstanding ([`Latch`]), then reports the first failure. The channel stays
+    /// Waits until nothing is outstanding ([`Latch`]), then reports the first failure. The queue stays
     /// open and the workers stay alive.
     ///
     /// 🛑 IT USED TO DROP THE SENDER AND JOIN THE WORKERS, on the reasoning that it is "called ONCE per

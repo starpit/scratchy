@@ -4,7 +4,7 @@
 //! alone — an inline test would silently never run.
 
 use scratchy_target_spyre::superdsc_bake::{
-    Bake, COMPILE_WIDTH, DxpTool, IN_FLIGHT, MAX_STAGED_BYTES, StageRoot,
+    Bake, COMPILE_WIDTH, DxpTool, GroupId, GroupQueue, MAX_STAGED_BYTES, SealedGroup, StageRoot,
 };
 
 /// ⭐ THE DISK BOUND AND THE COMPILE WIDTH ARE SEPARATE NUMBERS.
@@ -31,11 +31,58 @@ fn the_disk_bound_is_not_the_compile_width() {
         COMPILE_WIDTH <= 128,
         "one dxp process per group; do not fork hundreds"
     );
-    // The channel only has to outrun the workers so a finished one never waits on the producer.
-    assert!(
-        IN_FLIGHT >= COMPILE_WIDTH,
-        "channel shallower than the worker pool starves it"
+}
+
+/// Where test group `group` claims to be staged — how a popped group is told apart.
+fn stage_of(group: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/nonexistent/group_{group}"))
+}
+
+/// A group of `bytes` staged json, named by `group` — the queue reads nothing else.
+fn sealed(group: u32, bytes: usize) -> SealedGroup {
+    SealedGroup::sealed(
+        stage_of(group),
+        GroupId {
+            fp: "queue-order".to_string(),
+            group,
+        },
+        bytes,
+        u64::from(group),
+    )
+}
+
+/// ⭐ A FREE COMPILER TAKES THE LARGEST WAITING GROUP, AND EQUAL GROUPS KEEP THE EMITTER'S ORDER.
+///
+/// The bake's wall time is its slowest compiles, and the largest group started last runs alone after
+/// everything else. Pushed in emission order — small, LARGE, mid, LARGE, tiny — the groups must come out
+/// largest first, with the two equal ones in the order they were submitted.
+#[test]
+fn the_largest_waiting_group_is_compiled_first() {
+    let q = GroupQueue::default();
+    for (group, bytes) in [(0u32, 10usize), (1, 300), (2, 50), (3, 300), (4, 1)] {
+        q.push(sealed(group, bytes));
+    }
+    let order: Vec<std::path::PathBuf> = (0..5)
+        .map(|_| q.pop().expect("a group is waiting").path().to_path_buf())
+        .collect();
+    assert_eq!(
+        order,
+        [1, 3, 2, 0, 4].map(stage_of).to_vec(),
+        "largest first, ties in submission order"
     );
+}
+
+/// ⭐ `pop` WAITS FOR A GROUP RATHER THAN RETURNING EMPTY — a worker that finds nothing queued must still
+/// be there when the emitter submits the next one.
+#[test]
+fn a_free_compiler_waits_for_the_next_group() {
+    let q = std::sync::Arc::new(GroupQueue::default());
+    let worker = {
+        let q = std::sync::Arc::clone(&q);
+        std::thread::spawn(move || q.pop().map(|g| g.path().to_path_buf()))
+    };
+    q.push(sealed(7, 64));
+    assert_eq!(worker.join().expect("worker panicked"), Some(stage_of(7)));
 }
 
 /// ⭐ THE STAGING ROOT IS LOCAL AND OVERRIDABLE, AND IT IS NOT A CACHE.

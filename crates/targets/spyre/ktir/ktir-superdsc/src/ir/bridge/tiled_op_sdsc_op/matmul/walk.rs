@@ -407,6 +407,17 @@ impl Walk3<MbAxis, YAxis, InAxis> {
             _order: PhantomData,
         }
     }
+
+    /// The REQUEST-batched INPUT walk `[mb, y, in]`: a decode batch's requests on `y`, one ROW apart,
+    /// and one kv head's GQA query heads on `mb`, one `y·in` block apart — the head-major,
+    /// request-minor layout every gathered-fold buffer has (`HeadRequestRow`). The stride assignment
+    /// [`Self::input_batch_inner_mq1_proven`] gets wrong at `mb > 1` is exactly right here, because
+    /// here `mb` carries the HEADS and `y` the rows.
+    pub(crate) fn input_requests_inner() -> Self {
+        Walk3 {
+            _order: PhantomData,
+        }
+    }
 }
 
 impl Walk3<MbAxis, YAxis, OutAxis> {
@@ -416,6 +427,14 @@ impl Walk3<MbAxis, YAxis, OutAxis> {
     /// `out` and head stride `mb·out`. Coincides with the physical layout only at `mb == 1`,
     /// and is private for the same reason as its input twin.
     fn output_batch_inner_mq1_proven() -> Self {
+        Walk3 {
+            _order: PhantomData,
+        }
+    }
+
+    /// The REQUEST-batched OUTPUT walk `[mb, y, out]` — [`Walk3::input_requests_inner`] on the N stick:
+    /// `y` (requests) one row, `mb` (a kv head's query heads) one `y·out` block.
+    pub(crate) fn output_requests_inner() -> Self {
         Walk3 {
             _order: PhantomData,
         }

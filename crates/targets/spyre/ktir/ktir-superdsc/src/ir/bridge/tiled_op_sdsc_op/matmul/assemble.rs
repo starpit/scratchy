@@ -874,26 +874,36 @@ pub fn assemble_matmul_off_phys_m_with_epilogue_gathered<
     )
 }
 
-/// [`assemble_matmul_off`] for the TRUE PER-BATCH (3-D-kernel) batchmatmul: ONE op covering
-/// `batch` kv-heads instead of `batch · gqa` per-head ops. See [`matmul_opspec_batched_off`] for
-/// the offset / `kernel_device_extent` contract.
+/// [`assemble_matmul_off`] for the TRUE PER-BATCH (3-D-kernel) batchmatmul: ONE op covering `batch`
+/// kernels instead of one op per kernel, with an OPTIONAL fused pointwise epilogue (see
+/// [`assemble_from_opspec_maybe_epilogue`]). See [`matmul_opspec_batched_off`] for the offset /
+/// `kernel_device_extent` contract.
 ///
 /// Same typed-operand discipline as [`assemble_matmul_off`] — activation is `RowBlocked`, the
 /// K/V cache is a `Kernel`, so addressing the cache as a non-Kernel does not type-check.
+///
+/// The epilogue operand is cloned from this op's own per-batch output, so it is never a broadcast:
+/// every batch element adds its own slice.
 #[allow(clippy::too_many_arguments)]
-pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
+pub fn assemble_matmul_batched_off<
+    O: crate::sdsc_abstract::KindTag,
+    E: crate::sdsc_abstract::KindTag,
+>(
     op_name: &str,
     m: MatM,
     n: MatN,
     k: MatK,
     batch: MatY,
+    order: super::opspec::BatchOrder,
     a: &Stk<crate::sdsc_abstract::RowBlockedTag>,
-    a_off: u32,
+    a_off: crate::addr::DevOff,
     w: &Stk<crate::sdsc_abstract::KernelTag>,
-    w_off: u32,
+    w_off: crate::addr::DevOff,
     kernel_device_extent: Option<(&'static str, u32)>,
     o: &Stk<O>,
-    o_off: u32,
+    o_off: crate::addr::DevOff,
+    epi: Option<(&Stk<E>, crate::addr::DevOff)>,
+    epi_op_func: crate::superdsc_opspec::EpilogueOpFunc,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
@@ -903,18 +913,26 @@ pub fn assemble_matmul_batched_off<O: crate::sdsc_abstract::KindTag>(
         n,
         k,
         batch,
+        order,
         a_name,
         w_name,
         o_name,
-        a_off,
-        w_off,
-        o_off,
+        a_off.into_raw_elems(),
+        w_off.into_raw_elems(),
+        o_off.into_raw_elems(),
         kernel_device_extent,
     )
     .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"));
-    let folds = SdscFoldSet::new(op.iter.cores_used());
-    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
-        .unwrap_or_else(|e| panic!("assemble_matmul_batched_off {op_name}: {e}"))
+    assemble_from_opspec_maybe_epilogue(
+        op_name,
+        op,
+        epi,
+        epi_op_func,
+        &[],
+        false,
+        sym_id_base,
+        layout,
+    )
 }
 
 /// THE CONTROL SET FOR [`out_width_the_weight_holds`], and the reason it is not vacuous.
