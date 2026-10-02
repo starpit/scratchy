@@ -19,6 +19,7 @@ pub mod forward;
 pub mod megakernel;
 pub mod mtl4;
 pub mod pool;
+pub mod probe;
 pub mod runtime;
 pub mod split;
 pub mod worker;

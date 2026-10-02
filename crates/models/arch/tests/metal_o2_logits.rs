@@ -907,6 +907,106 @@ mod perf {
         println!("PERFTEXT {} {text:?}", case.name);
     }
 
+    /// TEMPORARY PROBE: per-dispatch GPU time of the decode on each path (median over steps).
+    /// `PROBEFN`: the dispatch path summed per kernel function; `PROBEL`: each segmented launch.
+    fn run_probe(
+        case: PerfCase,
+        buckets: &'static [scratchy_target_metal::interpreter::metal::MetalBucketSpec],
+    ) {
+        use scratchy_target_metal::interpreter::metal::probe;
+        use scratchy_target_metal::tape::lowered::GenClass;
+        let mut l = load(case.repo, BUCKET_CAP);
+        let prompt = tokenize(&l, case.prompt);
+        let steps = WARMUP + DECODE;
+        let blocks = sequence_blocks(l.num_groups, &block_sizes(&l), prompt.len() + steps);
+        let device = detect_device().expect("metal");
+        probe::arm(&device.device, 4096);
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for &path in ExecPath::DECODER {
+            greedy(&mut l, path, &prompt, &blocks, steps, |s, _| {
+                if s.index == WARMUP {
+                    probe::take();
+                }
+            });
+            let forwards = probe::take();
+            let width = (forwards.iter())
+                .flat_map(|f| f.iter().map(|(i, _)| *i as usize + 1))
+                .max()
+                .unwrap_or(0);
+            let mut cols: Vec<Vec<f64>> = vec![Vec::new(); width];
+            for f in &forwards {
+                for &(i, ns) in f {
+                    cols[i as usize].push(ns);
+                }
+            }
+            let med: Vec<f64> = (cols.iter_mut())
+                .map(|c| if c.is_empty() { 0.0 } else { median(c) })
+                .collect();
+            println!(
+                "PROBEPATH {} path={} forwards={} launches={} gpu_sum_ms={:.4}",
+                case.name,
+                path.name,
+                forwards.len(),
+                med.iter().filter(|x| **x > 0.0).count(),
+                med.iter().sum::<f64>() / 1e6
+            );
+            // Every launch's median, in order, on one line.
+            let us: Vec<String> = med.iter().map(|ns| format!("{:.1}", ns / 1e3)).collect();
+            println!(
+                "PROBEL {} path={} us={}",
+                case.name,
+                path.name,
+                us.join(",")
+            );
+            if path.name == "dispatch" {
+                let class = GenClass::of(device.profile.generation);
+                let decode = buckets
+                    .iter()
+                    .find(|b| b.bucket_m == 1)
+                    .expect("decode bucket");
+                let classed = (decode.tapes.iter())
+                    .find(|t| t.gen_class == class && !t.chunked)
+                    .expect("this device's tape");
+                let commands = classed.tape.commands_expanded();
+                let mut by: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+                for (i, ns) in med.iter().enumerate() {
+                    if let Some(c) = commands.get(i) {
+                        let e = by.entry(c.command.function).or_default();
+                        e.0 += usize::from(*ns > 0.0);
+                        e.1 += ns;
+                    }
+                }
+                for (f, (n, ns)) in by {
+                    println!(
+                        "PROBEFN {} n={n} total_us={:.1} fn={f}",
+                        case.name,
+                        ns / 1e3
+                    );
+                }
+            }
+        }
+        probe::disarm();
+    }
+
+    #[cfg(feature = "gemma-4-26b-a4b-it")]
+    #[test]
+    #[ignore = "TEMPORARY probe"]
+    fn probe_gemma_4_26b_a4b_mlx() {
+        run_probe(
+            PerfCase {
+                name: "probe_gemma_4_26b_a4b_mlx",
+                repo: "mlx-community/gemma-4-26b-a4b-it-4bit",
+                prompt: concat!("<bos><|turn>user\n", request!(), "<turn|>\n<|turn>model\n"),
+                bos: "<bos>",
+                markup: &["<|turn>", "<turn|>"],
+            },
+            scratchy_models::gemma4_moe::gemma_4_26b_a4b_it_mlx_affine_b4_g64::METAL_BUCKETS,
+        );
+    }
+
     macro_rules! perf_cases {
         ($( $feat:literal => $case:ident {
             repo: $repo:literal, prompt: $prompt:expr, bos: $bos:literal, markup: $markup:expr $(,)?
