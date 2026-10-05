@@ -66,6 +66,12 @@ SCRATCHY_CONSTANT_OPTIONAL(bool, QMV_BIASED_FC, 11);
 SCRATCHY_CONSTANT_OPTIONAL(float, QMV_SCALE, 12);
 constant constexpr bool QMV_BIASED = QMV_BIASED_FC_SET && QMV_BIASED_FC;
 constant constexpr bool QMV_SCALED = QMV_SCALE_SET;
+// PROBE BRANCH ONLY: 18 / 19 set qmv_fast's simdgroups per threadgroup and rows per simdgroup
+// (2 and 4 unset, as MLX). Each row's math is unchanged.
+SCRATCHY_CONSTANT_OPTIONAL(int, QMV_SG_FC, 18);
+SCRATCHY_CONSTANT_OPTIONAL(int, QMV_RPS_FC, 19);
+constant int QMV_SG = QMV_SG_FC_SET ? QMV_SG_FC : 2;
+constant int QMV_RPS = QMV_RPS_FC_SET ? QMV_RPS_FC : 4;
 
 // A lane's `count` input values as a normalizing matvec dots them: x ⊙ (gain + offset) into `xg`,
 // the squares of the first `valid` into `sum_sq`.
@@ -694,8 +700,8 @@ METAL_FUNC void qmv_fast_impl(
     const device T_scale* gain = nullptr,
     const device T_act* bias = nullptr) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
-  constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  const int num_simdgroups = QMV_SG;
+  const int results_per_simdgroup = QMV_RPS;
   constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
   constexpr int values_per_thread = pack_factor * packs_per_thread;
@@ -707,7 +713,7 @@ METAL_FUNC void qmv_fast_impl(
   typedef float U;
 
   thread U x_thread[values_per_thread];
-  thread U result[results_per_simdgroup] = {0};
+  thread U result[8] = {0};
 
   // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
