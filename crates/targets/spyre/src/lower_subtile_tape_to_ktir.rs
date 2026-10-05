@@ -399,9 +399,9 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         | SubOp::ScalarWeightMul
         | SubOp::GateSplit { .. }
         | SubOp::GateApply
+        | SubOp::Concat { .. }
         | SubOp::GateScale
-        | SubOp::LoadPixels { .. }
-        | SubOp::LoadPosEmbeds { .. }
+        | SubOp::LoadRows { .. }
         | SubOp::EmbeddingGather { .. }
         | SubOp::VisionRope
         | SubOp::VarlenAttention { .. }
