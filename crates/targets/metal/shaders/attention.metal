@@ -308,7 +308,9 @@ constant constexpr uint ATTN_MERGE_SLICES = 4u;
 // butterfly per local bit plus a `simd_shuffle_xor` butterfly per lane bit is
 // H·x for either layout. MUST be called simdgroup-uniformly.
 inline void tq_wht(thread float* x, uint qk_per_thread, uint simd_lid) {
+    _Pragma("clang loop unroll(full)")
     for (uint h = 1; h < qk_per_thread; h <<= 1) {
+        _Pragma("clang loop unroll(full)")
         for (uint j = 0; j < qk_per_thread; ++j) {
             if ((j & h) == 0u) {
                 const float a = x[j];
@@ -318,7 +320,9 @@ inline void tq_wht(thread float* x, uint qk_per_thread, uint simd_lid) {
             }
         }
     }
+    _Pragma("clang loop unroll(full)")
     for (ushort m = 1; m < 32; m <<= 1) {
+        _Pragma("clang loop unroll(full)")
         for (uint j = 0; j < qk_per_thread; ++j) {
             const float o = simd_shuffle_xor(x[j], m);
             x[j] = (simd_lid & m) ? (o - x[j]) : (x[j] + o);
@@ -811,20 +815,24 @@ template <typename T>
     // codebook domain is laid out contiguously — lane `l` owns elements
     // `l*qk_per_thread + j` (`tq_e`) whatever the q/K layout, as H·D mixes
     // every element anyway — so a lane's codes sit in adjacent packed words.
-    // Every simdgroup owns the same slices and rotates its own copy in
-    // registers. The codebook (<= 16 centroids) is staged once.
+    // Simdgroup `h` rotates head `h` once, through the merge's scratch (free
+    // until the merge, past a barrier every simdgroup reaches after reading
+    // it), and every simdgroup loads its slices. The codebook (<= 16
+    // centroids) is staged with it.
+    static_assert(ATTN_TQ == 0u || ATTN_TQ_HEADS * ATTN_HEAD_DIM <= ATTN_MERGE_SLICES * 32u * 32u,
+                  "the rotated queries fit the merge's scratch");
     const uint tq_e = simd_lid * qk_per_thread;
     thread U qt_reg[32];
     threadgroup U tq_lut[16];
     if (ATTN_TQ != 0u) {
-        for (uint h = 0; h < heads; ++h) {
-            thread U* qt = qt_reg + h * qk_per_thread;
+        if (simd_gid < heads) {
+            U qt[16];
             for (uint j = 0; j < qk_per_thread; ++j) {
-                qt[j] = U(scale) * U(q_row[h * head_dim + tq_e + j]) * tq_signs[tq_e + j];
+                qt[j] = U(scale) * U(q_row[simd_gid * head_dim + tq_e + j]) * tq_signs[tq_e + j];
             }
             tq_wht(qt, qk_per_thread, simd_lid);
             for (uint j = 0; j < qk_per_thread; ++j) {
-                qt[j] /= U(head_dim);
+                tg_outputs[simd_gid * head_dim + tq_e + j] = qt[j] / U(head_dim);
             }
         }
         const uint tid = simd_gid * uint(BD) + simd_lid;
@@ -832,6 +840,11 @@ template <typename T>
             tq_lut[tid] = tq_centroids[tid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint h = 0; h < heads; ++h) {
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                qt_reg[h * qk_per_thread + j] = tg_outputs[h * head_dim + tq_e + j];
+            }
+        }
     }
     const uint tq_pdim = (ATTN_TQ == 0u) ? 0u : (head_dim + 32u / ATTN_TQ - 1u) / (32u / ATTN_TQ);
 
