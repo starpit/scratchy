@@ -777,6 +777,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     // doesn't run with stale per-dispatch state.
                     continue;
                 }
+                // PROBE BRANCH ONLY: a decode step runs without its rope + KV append (dispatch and
+                // barrier) — wrong output, the most folding that step away could save.
+                if facts.num_tokens == facts.num_seqs
+                    && matches!(
+                        step.kernel,
+                        super::lowered::KernelId::RopeAppend
+                            | super::lowered::KernelId::RopeAppendNormed
+                    )
+                {
+                    continue;
+                }
                 if need_barrier {
                     // Default to `None` visibility — measured -30 ms
                     // TTFT @ 1024-tok / -89 ms @ 2048-tok on M4
