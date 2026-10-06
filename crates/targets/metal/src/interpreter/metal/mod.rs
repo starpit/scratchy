@@ -17,6 +17,7 @@ pub mod pipelines;
 pub mod forward;
 pub mod mtl4;
 pub mod pool;
+pub mod probe; // PROBE
 pub mod runtime;
 pub mod worker;
 

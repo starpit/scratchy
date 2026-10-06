@@ -737,6 +737,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .unrotated_blocks
                 .load(std::sync::atomic::Ordering::Relaxed),
         };
+        if range.is_none() {
+            super::probe::begin(enc); // PROBE
+        }
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -881,6 +884,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 };
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                if range.is_none() {
+                    super::probe::mark(enc, step.kernel, tg_scaled, *tpt, need_barrier); // PROBE
+                }
                 #[cfg(feature = "forward-telemetry")]
                 if tape_enabled {
                     tape.push(TapeEntry {

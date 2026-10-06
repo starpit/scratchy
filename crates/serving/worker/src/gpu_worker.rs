@@ -3805,7 +3805,7 @@ impl Worker for MetalWorker {
         // A step that reads the newest one's tokens on the device leaves that
         // one in flight; any other step — and an idle batch, whose KV may
         // shrink — needs every token on the host first.
-        let deferrable = self.deferrable(scheduler_output);
+        let deferrable = self.deferrable(scheduler_output) && std::env::var_os("SCRATCHY_PROBE").is_none(); // PROBE
         while self.in_flight.len() > usize::from(deferrable) {
             self.resolve_oldest()?;
         }

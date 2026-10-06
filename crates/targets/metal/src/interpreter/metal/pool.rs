@@ -974,6 +974,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             return Ok(());
         }
         let ((), took) = self.submit(Some(writes), encode)?;
+        super::probe::report(num_tokens as usize); // PROBE
         if trace {
             let dispatches = worker.count_dispatches(bucket_idx);
             eprintln!(
