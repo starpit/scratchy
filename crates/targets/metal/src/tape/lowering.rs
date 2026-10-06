@@ -4733,6 +4733,7 @@ fn lower_one(
                     ConstantValue::uint(2, hk),
                     ConstantValue::uint(3, hv),
                     ConstantValue::float(4, scale),
+                    ConstantValue::uint(5, p.spec_drafts),
                 ]
             };
             // head_k a multiple of 32: lanes split it (`gdn_scan_simd`, `gdn_decode`).
@@ -4812,6 +4813,7 @@ fn lower_one(
                 constants: baked(vec![
                     ConstantValue::uint(0, conv_dim),
                     ConstantValue::uint(1, kernel),
+                    ConstantValue::uint(2, p.spec_drafts),
                 ]),
                 dispatch: {
                     let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);

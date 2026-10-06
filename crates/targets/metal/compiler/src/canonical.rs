@@ -283,6 +283,7 @@ pub fn lower_canonical(
         fold_projections,
         matvec_ends: m <= u64::from(scratchy_target_metal::tape::quantized::QMV_MATVEC_BAND_ROWS),
         row_programs: m == 1,
+        hidden_out: consts.spec_drafts > 0,
     };
     // Metal's barriers drain everything in flight: independent branches run between the same ones.
     // A fused command reads what its fold absorbed and writes its epilogues, so the folds the tape
