@@ -49,7 +49,7 @@ run() { # tag model legs...
       "$W/scr-$t-$tag" chat -m "$m" --device metal -q "$P" --bench --max-tokens 400 --temperature 0 \
         > "$W/out-$t.raw" 2>&1
       grep -o 'ITL p10/p50/p90 : [0-9. /]*ms' "$W/out-$t.raw"
-      grep -v '^\[\|INFO\|WARN\|Using model\|ITL\|TTFT\|tok/s\|decode\|prefill' "$W/out-$t.raw" > "$W/out-$t.txt"
+      sed '/^--- bench ---/,$d' "$W/out-$t.raw" | grep -v '^\[\|INFO\|WARN\|Using model' > "$W/out-$t.txt"
     done
   done
   for t in "${legs[@]}"; do
