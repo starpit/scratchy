@@ -809,6 +809,24 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         MTL4VisibilityOptions::None,
                     );
                 }
+                { // DIAGSKIP
+                    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new(); // DIAGSKIP
+                    let skip = SKIP.get_or_init(|| { // DIAGSKIP
+                        std::env::var("SCRATCHY_DIAG_SKIP").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default() // DIAGSKIP
+                    }); // DIAGSKIP
+                    let name = format!("{:?}", step.kernel); // DIAGSKIP
+                    let at = format!("{name}@{}x{}x{}", tg.width, tg.height, tg.depth); // DIAGSKIP
+                    { // DIAGSKIP
+                        static LISTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0); // DIAGSKIP
+                        if num_tokens == 1 && std::env::var_os("SCRATCHY_DIAG_LIST").is_some() // DIAGSKIP
+                            && LISTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000 { // DIAGSKIP
+                            eprintln!("[diaglist] {at}"); // DIAGSKIP
+                        } // DIAGSKIP
+                    } // DIAGSKIP
+                    if skip.iter().any(|k| *k == name || *k == at) { // DIAGSKIP
+                        continue; // DIAGSKIP
+                    } // DIAGSKIP
+                } // DIAGSKIP
                 let tg_scaled = scale_tg_for_num_tokens(
                     *tg,
                     *scaling,
