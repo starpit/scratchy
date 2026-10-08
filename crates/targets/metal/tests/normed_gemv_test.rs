@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A one-row dense GEMM with its pre-norm folded in (`gemv_normed_*`: a router's logits, its own
-//! pre-norm or the RMSNorm whose rows it reads) against the commands it replaces: the RMSNorm, then
-//! the plain GEMV over its row.
+//! A few-row dense GEMM with its pre-norm folded in (`gemv_normed_*`: a router's logits, its own
+//! pre-norm or the RMSNorm whose rows it reads — a decode step's row, a verify step's) against the
+//! commands it replaces: the RMSNorm, then the plain GEMV over its rows.
 //!
 //! Normalizing on load dots `x ⊙ gain` and scales each row by `1 / rms(x)`, so it skips the normed
 //! row's rounding: its output must be as close to the exact `W · rmsnorm(x, gain)` as the unfused
@@ -64,12 +64,13 @@ impl Dtype {
     }
 }
 
-/// `n` logits of a `k`-wide row; activations and weights in `act`, the gain in `gain`, which the
-/// norm offsets by `offset` (`rmsnorm(x, gain + offset)`).
+/// `n` logits of each of `rows` `k`-wide rows; activations and weights in `act`, the gain in
+/// `gain`, which the norm offsets by `offset` (`rmsnorm(x, gain + offset)`).
 #[derive(Clone, Copy, Debug)]
 struct Case {
     act: Dtype,
     gain: Dtype,
+    rows: usize,
     k: usize,
     n: usize,
     offset: f32,
@@ -137,6 +138,7 @@ fn rig(c: &Case) -> Option<Rig> {
         baked_build(&cache, &PipelineKey::new(library, name, constants)).expect(name)
     };
     let normed = NormedGemvConstants {
+        rows: BucketM(c.rows as u32),
         n: NDim(c.n as u32),
         k: KDim(c.k as u32),
         eps: Eps(EPS),
@@ -148,13 +150,13 @@ fn rig(c: &Case) -> Option<Rig> {
         normed.into(),
     );
     let dims = vec![
-        ConstantValue::uint(0, 1),
+        ConstantValue::uint(0, c.rows as u32),
         ConstantValue::uint(1, c.n as u32),
         ConstantValue::uint(2, c.k as u32),
     ];
     let plain = build("gemm", leak(format!("gemv_{act}_specialized")), dims);
     let norm = RmsNormConstants {
-        bucket_m: BucketM(1),
+        bucket_m: BucketM(c.rows as u32),
         q_size: QSize(c.k as u32),
         rms_norm_eps: RmsNormEps(EPS),
         weight_offset: c.offset,
@@ -173,7 +175,7 @@ fn rig(c: &Case) -> Option<Rig> {
     })
 }
 
-/// The weights `[n][k]`, the row and the gain, as stored.
+/// The weights `[n][k]`, the rows `[rows][k]` and the gain, as stored.
 struct Inputs {
     w: Vec<u16>,
     x: Vec<u16>,
@@ -184,28 +186,34 @@ fn inputs(c: &Case, rng: &mut Lcg) -> Inputs {
     let w = (0..c.n * c.k)
         .map(|_| c.act.bits(0.05 * rng.unit()))
         .collect();
-    let x = (0..c.k).map(|_| c.act.bits(6.0 * rng.unit())).collect();
+    let x = (0..c.rows * c.k).map(|_| c.act.bits(6.0 * rng.unit())).collect();
     let gain = (0..c.k)
         .map(|_| c.gain.bits(0.5 + rng.unit().abs()))
         .collect();
     Inputs { w, x, gain }
 }
 
-/// `W · rmsnorm(x, gain)` in f64, each row with the bound on its error: the output's rounding,
-/// plus twice what rounding each normed input to the activation type can move its dot.
+/// `W · rmsnorm(x, gain)` in f64 for each row `x`, each logit with the bound on its error: the
+/// output's rounding, plus twice what rounding each normed input to the activation type can move
+/// its dot.
 fn exact(c: &Case, i: &Inputs) -> Vec<(f64, f64)> {
     let u = c.act.roundoff();
-    let x: Vec<f64> = i.x.iter().map(|&b| c.act.value(b)).collect();
-    let rms = (x.iter().map(|v| v * v).sum::<f64>() / c.k as f64 + f64::from(EPS)).sqrt();
-    let xn: Vec<f64> = (x.iter().zip(&i.gain))
-        .map(|(v, &g)| v / rms * (c.gain.value(g) + f64::from(c.offset)))
-        .collect();
-    (0..c.n)
-        .map(|r| {
-            let row = &i.w[r * c.k..(r + 1) * c.k];
-            let terms = row.iter().zip(&xn).map(|(&w, x)| c.act.value(w) * x);
-            let (dot, scale) = terms.fold((0.0, 0.0), |(d, m), t| (d + t, m + f64::abs(t)));
-            (dot, u * dot.abs() + 2.0 * u * scale)
+    i.x.chunks(c.k)
+        .flat_map(|x| {
+            let x: Vec<f64> = x.iter().map(|&b| c.act.value(b)).collect();
+            let rms = (x.iter().map(|v| v * v).sum::<f64>() / c.k as f64 + f64::from(EPS)).sqrt();
+            let xn: Vec<f64> = (x.iter().zip(&i.gain))
+                .map(|(v, &g)| v / rms * (c.gain.value(g) + f64::from(c.offset)))
+                .collect();
+            (0..c.n)
+                .map(|r| {
+                    let row = &i.w[r * c.k..(r + 1) * c.k];
+                    let terms = row.iter().zip(&xn).map(|(&w, x)| c.act.value(w) * x);
+                    let (dot, scale) =
+                        terms.fold((0.0, 0.0), |(d, m), t| (d + t, m + f64::abs(t)));
+                    (dot, u * dot.abs() + 2.0 * u * scale)
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }
@@ -220,7 +228,7 @@ enum How {
 fn run(r: &Rig, c: &Case, i: &Inputs, how: How) -> Vec<u16> {
     let buf = |d: &[u16]| shared(&r.device, d);
     let (w, x, g) = (buf(&i.w), buf(&i.x), buf(&i.gain));
-    let (y, normed_row) = (buf(&vec![0u16; c.n]), buf(&vec![0u16; c.k]));
+    let (y, normed_row) = (buf(&vec![0u16; c.rows * c.n]), buf(&vec![0u16; c.rows * c.k]));
     let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
     let (groups, threads) = (size((c.n.div_ceil(4), 1, 1)), size((256, 1, 1)));
     match how {
@@ -234,16 +242,16 @@ fn run(r: &Rig, c: &Case, i: &Inputs, how: How) -> Vec<u16> {
         }
         How::NormThenPlain => {
             let binds = [(&normed_row, 0), (&x, 1), (&g, 2)];
-            let one = size((1, 1, 1));
+            let each_row = size((c.rows, 1, 1));
             let norm_threads = size((NORM_THREADS as usize, 1, 1));
-            batch.encode(&r.norm, &binds, &[], &[], &[], one, norm_threads);
+            batch.encode(&r.norm, &binds, &[], &[], &[], each_row, norm_threads);
             batch.barrier();
             let binds = [(&y, 0), (&normed_row, 1), (&w, 2)];
             batch.encode(&r.plain, &binds, &[], &[], &[], groups, threads);
         }
     }
     batch.commit(true);
-    read(&y, c.n)
+    read(&y, c.rows * c.n)
 }
 
 /// Whether every row of `got` is within its bound of the exact; the first that is not.
@@ -262,6 +270,7 @@ fn cases() -> Vec<Case> {
     let gemma4 = Case {
         act: Dtype::Bf16,
         gain: Dtype::Bf16,
+        rows: 1,
         k: 2816,
         n: 128,
         offset: 0.0,
@@ -280,12 +289,20 @@ fn cases() -> Vec<Case> {
         Case {
             act: Dtype::F16,
             gain: Dtype::F16,
+            rows: 1,
             k: 2048,
             n: 64,
             offset: 0.0,
         },
         // Qwen3.6-35B-A3B's router over its MoE block's input norm: 256 experts, a 2048-wide row.
         Case {
+            k: 2048,
+            n: 256,
+            ..gemma4
+        },
+        // The same over a verify step's three rows, each normalized by its own rms.
+        Case {
+            rows: 3,
             k: 2048,
             n: 256,
             ..gemma4

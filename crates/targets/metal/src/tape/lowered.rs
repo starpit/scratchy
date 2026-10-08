@@ -1915,10 +1915,14 @@ pub enum LoweringError {
     /// A KV codec step reached the lowering of a model whose KV codec is dense: the codec pass
     /// runs only on a TurboQuant model.
     CodecStepOnDenseModel,
-    /// A one-row fold — a gated matvec, a matvec's ends, a router's pre-norm, a decode attention
-    /// running its KV writer — in a bucket of `bucket_m` rows: its kernel computes one row, and
-    /// the fold applies to that bucket only.
+    /// A one-row fold — a gated matvec, a decode attention running its KV writer — in a bucket of
+    /// `bucket_m` rows: its kernel computes one row, and the fold applies to that bucket only.
     OneRowFold { bucket_m: u32 },
+    /// A router's pre-norm folded into its gemv in a bucket of `bucket_m` rows, more than the
+    /// gemv computes (`GEMV_MAX_ROWS`).
+    GemvRows { bucket_m: u32 },
+    /// A matvec's ends in a bucket of `bucket_m` rows, where it runs as a matmul, which takes none.
+    MatmulEnds { bucket_m: u32 },
     /// A decode attention running its KV writer whose writer or attention lowered to other than
     /// one command, or whose writer binds a buffer the fused command has no place for.
     RopedAttentionShape { index: usize },
@@ -1997,6 +2001,12 @@ impl std::fmt::Display for LoweringError {
             ),
             Self::OneRowFold { bucket_m } => {
                 write!(f, "lowering: a one-row fold in the {bucket_m}-row bucket")
+            }
+            Self::GemvRows { bucket_m } => {
+                write!(f, "lowering: a normed router gemv in the {bucket_m}-row bucket")
+            }
+            Self::MatmulEnds { bucket_m } => {
+                write!(f, "lowering: a matvec's ends on a matmul in the {bucket_m}-row bucket")
             }
             Self::RopedAttentionShape { index } => write!(
                 f,

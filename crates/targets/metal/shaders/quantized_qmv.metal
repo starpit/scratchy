@@ -1192,7 +1192,9 @@ inline void dequantize(const device uint8_t* w, U scale, U bias, W w_local) {
 // traffic is M-independent where the plain qmv re-streams the whole
 // matrix per row. `k_lanes` lanes reduce K per output row;
 // 32/k_lanes rows per simdgroup; the partials fold with a shuffle
-// ladder (simd_sum would mix the rows a simdgroup spans).
+// ladder (simd_sum would mix the rows a simdgroup spans). Its ends as
+// `qmv_fast_impl`'s: each vector normalized as it loads (its sum of
+// squares folded with its dot) and its rows stored through `qmv_store`.
 // ─────────────────────────────────────────────────────────────────
 
 template <typename T_act, typename T_scale, int group_size, int bits, int vecs_per_tg, int k_lanes>
@@ -1205,7 +1207,9 @@ METAL_FUNC void qmv_wide_impl(
     int M,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    const device T_scale* gain,
+    const device T_act* bias) {
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
   constexpr int sub = 8; // values per sub-chunk (== bits bytes, byte-aligned)
@@ -1235,6 +1239,7 @@ METAL_FUNC void qmv_wide_impl(
   }
 
   U result[vecs_per_tg] = {0};
+  U sum_sq[vecs_per_tg] = {0};
 
   // Each lane reduces a strided subset of the row's groups: decode the group
   // in 8-value sub-chunks and reuse each chunk across the streamed vectors.
@@ -1247,13 +1252,25 @@ METAL_FUNC void qmv_wide_impl(
       const device uint8_t* wc = wrow + k0 * bits / 8;
       U w_dq[sub];
       dequantize<U, sub, bits>(wc, scale, bias, w_dq);
+      U gk[sub];
+      if (QMV_NORMED) {
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+          gk[i] = U(gain[k0 + i]) + QMV_GAIN_OFFSET;
+        }
+      }
 #pragma unroll
       for (int v = 0; v < vecs_per_tg; v++) {
         const device T_act* xc = xv[v] + k0;
         U acc = 0;
 #pragma unroll
         for (int i = 0; i < sub; i++) {
-          acc += static_cast<U>(xc[i]) * w_dq[i];
+          U xi = static_cast<U>(xc[i]);
+          if (QMV_NORMED) {
+            sum_sq[v] += xi * xi;
+            xi *= gk[i];
+          }
+          acc += xi * w_dq[i];
         }
         result[v] += acc;
       }
@@ -1263,27 +1280,19 @@ METAL_FUNC void qmv_wide_impl(
   // Reduce each vector's partial over its k_lanes with a shuffle ladder:
   // simd_sum would mix the results_per_simdgroup rows a simdgroup spans.
   for (int v = 0; v < vecs_per_tg; v++) {
-    if constexpr (k_lanes >= 32) {
-      result[v] += simd_shuffle_down(result[v], 16);
-    }
-    if constexpr (k_lanes >= 16) {
-      result[v] += simd_shuffle_down(result[v], 8);
-    }
-    if constexpr (k_lanes >= 8) {
-      result[v] += simd_shuffle_down(result[v], 4);
-    }
-    if constexpr (k_lanes >= 4) {
-      result[v] += simd_shuffle_down(result[v], 2);
-    }
-    if constexpr (k_lanes >= 2) {
-      result[v] += simd_shuffle_down(result[v], 1);
+    for (ushort d = k_lanes / 2; d >= 1; d >>= 1) {
+      result[v] += simd_shuffle_down(result[v], d);
+      if (QMV_NORMED) {
+        sum_sq[v] += simd_shuffle_down(sum_sq[v], d);
+      }
     }
   }
 
   if (k_lane == 0 && out_row < OUT_VEC_SIZE) {
     for (int v = 0; v < vecs_per_tg; v++) {
       if (vec0 + v < M) {
-        y[(vec0 + v) * OUT_VEC_SIZE + out_row] = static_cast<T_act>(result[v]);
+        const U s = qmv_row_scale(sum_sq[v], IN_VEC_SIZE);
+        qmv_store<T_act>(y + (vec0 + v) * OUT_VEC_SIZE + out_row, result[v] * s, bias, out_row);
       }
     }
   }
@@ -1310,6 +1319,8 @@ template <
     const device T_scale* biases [[buffer(2)]],
     const device T_act* x [[buffer(3)]],
     device T_act* y [[buffer(4)]],
+    const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -1322,7 +1333,9 @@ template <
       QMV_WIDE_M,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      gain,
+      bias);
 }
 
 // ─────────────────────────────────────────────────────────────────

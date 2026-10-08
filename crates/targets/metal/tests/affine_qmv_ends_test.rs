@@ -570,3 +570,93 @@ fn a_normalizing_gated_matvec_is_as_close_as_the_norm_then_gated_matvec() {
     within(&c, &run(&plain, false), &want).expect("the norm then gated matvec");
     within(&c, &run(&normed, true), &want).expect("the normalizing gated matvec");
 }
+
+/// The small-M band's matvec (`affine_qmv_wide`, a verify step's rows) takes each row's ends: every
+/// row normalized as it loads is as close to its exact normed product as the one-row bound
+/// allows — which the raw rows fail — and every row's epilogue is its plain row biased, scaled
+/// and added into its own residual.
+#[test]
+fn a_wide_matvec_takes_each_row_s_ends() {
+    use scratchy_target_metal::tape::ids::MDimI32;
+    use scratchy_target_metal::tape::kernel_constants::AffineQmvWideConstants;
+    const M: usize = 3;
+    let c = cases()[0];
+    let Some(r) = rig(&c) else { return };
+    let kernel = QmvKernel::Wide { nv: M as u32 };
+    let name = qmv_kernel_static_name(kernel, c.dtype.dequant(), c.dtype.scale(), 4, 64);
+    let wide = |e: QmvEnds| {
+        let mut v: Vec<ConstantValue> = AffineQmvWideConstants {
+            k: KDimI32(c.k as i32),
+            n: NDimI32(c.n as i32),
+            m: MDimI32(M as i32),
+            codes: AffineCodes::AsWritten,
+        }
+        .into();
+        v.extend(Vec::<ConstantValue>::from(e));
+        let cache = SpecializedPipelineCache::new(r.device.clone(), &[]).expect("shaders");
+        baked_build(&cache, &PipelineKey::new("quantized_qmv", name, v)).expect(name)
+    };
+    let mut rng = Lcg(31);
+    let w = Weights::new(&r.device, &c, &mut rng);
+    let rows: Vec<(Vec<u16>, Vec<u16>)> = (0..M).map(|_| inputs(&c, &mut rng)).collect();
+    // One gain for every row (a norm's weight), each row its own x.
+    let gain = rows[0].1.clone();
+    let x: Vec<u16> = rows.iter().flat_map(|(x, _)| x.clone()).collect();
+    let bits = |n: usize, scale: f32, rng: &mut Lcg| -> Vec<u16> {
+        (0..n).map(|_| c.dtype.bits(scale * rng.unit())).collect()
+    };
+    let (residual, bias) = (bits(M * c.n, 8.0, &mut rng), bits(c.n, 0.5, &mut rng));
+    let (xb, gb, bb) = (
+        shared(&r.device, &x),
+        shared(&r.device, &gain),
+        shared(&r.device, &bias),
+    );
+    let (grid, threads) = qmv_dispatch_shape(kernel, M as u32, c.n as u32, 1);
+    let run = |ends: QmvEnds, y0: &[u16]| {
+        let pso = wide(ends);
+        let y = shared(&r.device, y0);
+        let mut batch = Mtl4DispatchBatch::begin(&r.device).expect("mtl4");
+        let binds = [
+            (&w.w, 0),
+            (&w.scales, 1),
+            (&w.biases, 2),
+            (&xb, 3),
+            (&y, 4),
+            (&gb, 15),
+            (&bb, 16),
+        ];
+        batch.encode(&pso, &binds, &[], &[], &[], size(grid), size(threads));
+        batch.commit(true);
+        read_u16(&y, M * c.n)
+    };
+    let zero = vec![0u16; M * c.n];
+    let (plain, normed_rows) = (run(QmvEnds::default(), &zero), run(normed(&c), &zero));
+    for (i, (x, _)) in rows.iter().enumerate() {
+        let want = exact(&c, &w, x, &gain);
+        let row = |v: &[u16]| v[i * c.n..(i + 1) * c.n].to_vec();
+        within(&c, &row(&normed_rows), &want)
+            .unwrap_or_else(|e| panic!("row {i} of the normalizing wide matvec: {e}"));
+        assert!(
+            within(&c, &row(&plain), &want).is_err(),
+            "row {i}: the bound accepts the raw wide matvec — it cannot see a missing norm"
+        );
+    }
+    let ended = run(ending(true), &residual);
+    let ulp = match c.dtype {
+        Dtype::Bf16 => 2f32.powi(-8),
+        Dtype::F16 => 2f32.powi(-11),
+    };
+    let value = |b: u16| c.dtype.value(b);
+    for i in 0..M * c.n {
+        let p = value(plain[i]);
+        let scaled = (p + value(bias[i % c.n])) * SCALE;
+        let want = value(residual[i]) + scaled;
+        let got = value(ended[i]);
+        // The plain row's own rounding, scaled, where the fused one never rounds it; then the sum's.
+        assert!(
+            (got - want).abs() <= ulp * (p.abs() * SCALE + want.abs()),
+            "ended element {i} (row {}): {got} vs {want}",
+            i / c.n
+        );
+    }
+}

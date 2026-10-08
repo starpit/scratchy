@@ -764,6 +764,7 @@ impl From<crate::tape::step::QmvEnds> for Vec<ConstantValue> {
 /// `KernelId::NormedGemv` (`gemv_normed_<T>_s_<G>`, `gemm.metal`): the GEMM's one row (slots 0 /
 /// 1 / 2: M, N, K) and its folded norm's epsilon (5) and gain offset (6).
 pub struct NormedGemvConstants {
+    pub rows: BucketM,
     pub n: NDim,
     pub k: KDim,
     pub eps: crate::tape::step::Eps,
@@ -773,7 +774,7 @@ pub struct NormedGemvConstants {
 impl From<NormedGemvConstants> for Vec<ConstantValue> {
     fn from(c: NormedGemvConstants) -> Self {
         vec![
-            ConstantValue::uint(ConstSlot(0), 1),
+            ConstantValue::uint(ConstSlot(0), c.rows.get()),
             ConstantValue::uint(ConstSlot(1), c.n.get()),
             ConstantValue::uint(ConstSlot(2), c.k.get()),
             ConstantValue::float(ConstSlot(5), c.eps.0),

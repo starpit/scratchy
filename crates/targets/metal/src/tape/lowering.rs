@@ -2370,9 +2370,6 @@ fn lower_one(
                 // `is_nax_capable` boundary is gen 17 (M5). Same family of gate, ours stricter.
                 let wide_ok =
                     profile.is_some_and(|pr| crate::targets::is_nax_capable(pr.generation));
-                if g.ends != QmvEnds::default() && bucket_m != 1 {
-                    return Err(LoweringError::OneRowFold { bucket_m });
-                }
                 affine_qmv_command(
                     p,
                     g,
@@ -2385,7 +2382,7 @@ fn lower_one(
                     qmv_end_weights(g, w, layer_offset)?,
                 )
             } else if g.ends != QmvEnds::default() {
-                return Err(LoweringError::OneRowFold { bucket_m });
+                return Err(LoweringError::MatmulEnds { bucket_m });
             } else {
                 // Matmul branch (prefill-shape). `pick_qmm_t_kernel`
                 // mirrors MLX `quantized.cpp:1411-1424 + :788-805`:
@@ -6974,11 +6971,12 @@ fn lower_moe_step(
             ]),
             gemm_dims: None,
         }],
-        // One row, a norm folded in: its own pre-norm, the router scale binding as the norm's
-        // gain, or the RMSNorm whose rows it reads, that norm's gain (its row's `RmsNorm` weight).
+        // Up to the gemv's rows, a norm folded in: its own pre-norm, the router scale binding as
+        // the norm's gain, or the RMSNorm whose rows it reads, that norm's gain (its row's
+        // `RmsNorm` weight).
         S::RouterLogits(rows, l, norm) if norm.is_some() || matches!(rows, MoeRows::Normed(..)) => {
-            if bucket_m != 1 {
-                return Err(LoweringError::OneRowFold { bucket_m });
+            if bucket_m > crate::interpreter::metal::pipelines::GEMV_MAX_ROWS {
+                return Err(LoweringError::GemvRows { bucket_m });
             }
             let (x, eps, offset, gain) = match (rows, norm) {
                 (MoeRows::Normed(Slot(slot), n), None) => {
@@ -6996,6 +6994,7 @@ fn lower_moe_step(
                 library: "gemm",
                 function: normed_gemv_kernel_static_name(p, scale_dtype),
                 constants: super::kernel_constants::NormedGemvConstants {
+                    rows: super::ids::BucketM(bucket_m),
                     n: super::ids::NDim(e),
                     k: super::ids::KDim(hidden),
                     eps,

@@ -283,10 +283,13 @@ pub fn lower_canonical(
     // Whether the gate/up projections fold is this model's fact: a dense preset has the fused
     // projection kernel, and an affine one the fused one-row matvec, for its one-row bucket.
     let fold_projections = facts.mlp == MlpForm::Packed || m == 1;
-    // The one-row bucket's affine matvecs normalize their input and add into the residual.
+    // A bucket every affine matmul of which runs as a matvec — the one-row bucket and the
+    // verify-sized ones below every generation's matvec limit — normalizes the matvecs' input
+    // and adds their rows into the residual.
+    let matvec_bucket = m < u64::from(scratchy_target_metal::tape::quantized::QMV_BATCH_LIMIT_FLOOR);
     let model = ModelFoldFacts {
         fold_projections,
-        matvec_ends: m == 1,
+        matvec_ends: matvec_bucket,
         row_programs: m == 1,
         hidden_out: consts.spec_drafts > 0,
     };

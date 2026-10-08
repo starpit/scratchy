@@ -273,6 +273,10 @@ pub fn qmv_kernel_static_name(
 // branch) and `Instruction::Gemm`-equivalent (matmul branch).
 // ─────────────────────────────────────────────────────────────────
 
+/// The smallest [`get_qmv_batch_limit`] of any shape on any generation: a bucket of fewer rows
+/// runs every MLX-affine matmul as a matvec.
+pub const QMV_BATCH_LIMIT_FLOOR: u32 = 6;
+
 /// Vector-vs-matrix limit for a given `(K, N, arch_gen)`. M < limit
 /// routes to `qmv*`; M >= limit routes to `qmm*` (P4).
 ///
@@ -1412,5 +1416,18 @@ mod tests {
         assert_eq!(get_qmv_batch_limit(2048, 2048, AppleSiliconGen::M1), 14);
         assert_eq!(get_qmv_batch_limit(4096, 4096, AppleSiliconGen::M2), 10);
         assert_eq!(get_qmv_batch_limit(8192, 8192, AppleSiliconGen::M1), 6);
+    }
+
+    /// The floor is the table's least limit: no shape on any generation runs a bucket of fewer
+    /// rows as a matmul.
+    #[test]
+    fn qmv_batch_limit_floor_is_the_least_limit() {
+        use AppleSiliconGen as G;
+        let dims = [1024, 2048, 2049, 4096, 4097, 8192, 65536];
+        let least = [G::M1, G::M2, G::M3, G::M4, G::M5]
+            .into_iter()
+            .flat_map(|g| dims.iter().flat_map(move |&k| dims.map(|n| get_qmv_batch_limit(k, n, g))))
+            .min();
+        assert_eq!(least, Some(QMV_BATCH_LIMIT_FLOOR));
     }
 }
