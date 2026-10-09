@@ -341,7 +341,7 @@ pub const METAL_SORTED_PAIRS_PER_EXPERT: std::ops::Range<f32> = 0.5..1.0;
 /// The bucket rows from which a gathered bake's gate/up command runs the pairs that share an
 /// expert in the expert's first pair (`SharedExperts::InFirstPair`, up to [`METAL_VERIFY_ROWS`]):
 /// one row's picks are distinct experts.
-pub const METAL_SHARED_EXPERTS_FROM: u32 = 2;
+pub const METAL_SHARED_EXPERTS_FROM: u32 = 9;
 
 /// The steps whose commands a bake may drop: a gathered block's sort, the unsort (the combine
 /// reads through it), and an unsliced bake's sampled rows around its matmul.
