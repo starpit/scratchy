@@ -1070,6 +1070,7 @@ mod tests {
     fn make_test_state() -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
@@ -1170,6 +1171,7 @@ mod tests {
 
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
@@ -1445,6 +1447,7 @@ mod tests {
     fn make_test_state_with_metrics() -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
@@ -1634,6 +1637,7 @@ mod tests {
     ) -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
@@ -1818,6 +1822,7 @@ mod tests {
     fn make_pooling_test_state() -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
