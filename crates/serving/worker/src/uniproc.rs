@@ -398,6 +398,7 @@ mod tests {
             is_pooling: false,
             enable_prefix_caching: false,
             hybrid_kv: None,
+            max_decode_window: 1,
         };
 
         let mut engine = EngineCore::new(config, Box::new(exec));

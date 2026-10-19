@@ -1425,7 +1425,7 @@ fn initialize_core(
         }))
     });
 
-    let (mut worker, hf_config, model_dir, model_dtype) =
+    let (mut worker, hf_config, model_dir, model_dtype, worker_max_decode_window) =
         create_worker(config, speculation, model_path, progress)?;
 
     if let Some(arch) = worker.architecture() {
@@ -1483,6 +1483,11 @@ fn initialize_core(
     // And the snapshots of the model's recurrent state it can keep, which decide whether a
     // recurrent-hybrid model may be prefix cached at all.
     let worker_snapshots = worker.snapshot_budget();
+    // The decode-window cap the backend declared (#603 PR3b §1.7): the most positions one
+    // engine step may resolve. Captured here for the same reason as the two above — the
+    // worker is moved into the engine below, and every `EngineCoreConfig` this function
+    // builds clips its window against this cap.
+    let worker_max_decode_window = worker_max_decode_window.max(1);
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
@@ -1678,6 +1683,7 @@ fn initialize_core(
         is_pooling: config.runner == "pooling",
         enable_prefix_caching,
         hybrid_kv: swa_hybrid_kv,
+        max_decode_window: worker_max_decode_window,
     };
 
     let client = InprocClient::new(engine_config, Box::new(executor));
@@ -1983,6 +1989,7 @@ fn initialize_core_tp(config: &VllmConfig, speculation: &Speculation) -> Result<
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
             hybrid_kv: swa_hybrid_kv,
+            max_decode_window: CudaWorker::MAX_DECODE_WINDOW,
         };
 
         let client = InprocClient::new(engine_config, Box::new(executor));
@@ -2530,6 +2537,7 @@ fn initialize_stack_multinode(
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
             hybrid_kv: swa_hybrid_kv,
+            max_decode_window: CudaWorker::MAX_DECODE_WINDOW,
         };
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
@@ -3090,6 +3098,7 @@ fn initialize_stack_tp_pp(
                 is_pooling: config.runner == "pooling",
                 enable_prefix_caching,
                 hybrid_kv: swa_hybrid_kv,
+                max_decode_window: CudaWorker::MAX_DECODE_WINDOW,
             };
 
             let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
@@ -3420,6 +3429,7 @@ fn initialize_stack_tp(
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
             hybrid_kv: swa_hybrid_kv,
+            max_decode_window: CudaWorker::MAX_DECODE_WINDOW,
         };
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =
@@ -3796,6 +3806,7 @@ fn initialize_stack_external(
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
             hybrid_kv: swa_hybrid_kv,
+            max_decode_window: CudaWorker::MAX_DECODE_WINDOW,
         };
 
         let client: Box<dyn scratchy_serving_engine::core_client::EngineCoreClient + Send> =

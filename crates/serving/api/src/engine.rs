@@ -4376,6 +4376,7 @@ mod tests {
     fn make_engine_config() -> EngineCoreConfig {
         EngineCoreConfig {
             hybrid_kv: None,
+            max_decode_window: 1,
             scheduler_config: SchedulerConfig {
                 max_num_batched_tokens: 8192,
                 max_num_seqs: 256,
