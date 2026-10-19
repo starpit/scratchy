@@ -487,6 +487,12 @@ pub use crate::worker_factory::resolve_model_path;
 /// `CudaModel`, which is cuda-only).
 #[cfg(feature = "metal")]
 impl MetalWorker {
+    /// The engine's decode-window cap for this backend (#603 PR3b §1.7): metal resolves one
+    /// position per engine step. A window needs the device to gather its next input row from
+    /// its own argmax — a composite this backend does not mint — so the cap is 1, and at 1
+    /// the engine's window arithmetic degenerates to today's step byte for byte.
+    pub const MAX_DECODE_WINDOW: usize = 1;
+
     /// Build `[3, n_tokens]` u32 MRoPE positions for an image-bearing
     /// batch. Mirrors Python vLLM's
     /// `Qwen2VLForConditionalGeneration.get_input_positions_tensor`:
@@ -8240,7 +8246,14 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
                     .clone();
                 let model_dir = worker.model_dir().map(|p| p.to_path_buf());
                 let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-                Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes))
+                let max_decode_window = MetalWorker::MAX_DECODE_WINDOW;
+                Ok((
+                    Box::new(worker),
+                    hf_config,
+                    model_dir,
+                    dtype_elem_bytes,
+                    max_decode_window,
+                ))
             }
             Err(ExecutorError::ArchNotSupported(arch)) => {
                 Err(anyhow::anyhow!("Unsupported arch `{arch}`"))

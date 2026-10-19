@@ -129,12 +129,20 @@ pub enum Draft {
 
 /// Result of worker creation: the worker plus metadata needed for init.
 ///
-/// The trailing `usize` is the KV cache element size in bytes (e.g. 2 for
-/// F16/BF16, 4 for F32). The extract methods (`hf_config`, `model_dir`,
-/// `resolved_dtype_elem_bytes`) are inherent on the concrete workers (not
-/// on the `Worker` trait), so the factory returns the full tuple rather
-/// than a bare `Box<dyn Worker>`.
-pub type WorkerCreationResult = (Box<dyn Worker>, HfModelConfig, Option<PathBuf>, usize);
+/// The trailing `usize`s are the KV cache element size in bytes (e.g. 2 for
+/// F16/BF16, 4 for F32) and the backend's decode window cap (`MAX_DECODE
+/// WINDOW`, #603 PR3b §1.7: the most positions a backend may resolve per
+/// engine step — 1 = no windowing, spyre = 4). The extract methods
+/// (`hf_config`, `model_dir`, `resolved_dtype_elem_bytes`) are inherent on the
+/// concrete workers (not on the `Worker` trait), so the factory returns the
+/// full tuple rather than a bare `Box<dyn Worker>`.
+pub type WorkerCreationResult = (
+    Box<dyn Worker>,
+    HfModelConfig,
+    Option<PathBuf>,
+    usize,
+    usize,
+);
 
 /// A progress callback the factory may wire into the worker during load.
 pub type ProgressCallback = std::sync::Arc<dyn Fn(&str) + Send + Sync>;

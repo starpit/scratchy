@@ -87,6 +87,12 @@ pub struct EngineCore {
     /// KV cache block size in tokens (for seal-pad block alignment checks).
     block_size: usize,
 
+    /// The backend's decode-window cap (#603 PR3b §1.7), read once from
+    /// `EngineCoreConfig::max_decode_window`. The window scheduler clips this
+    /// per step by page edge and remaining output budget; at 1 (metal, cuda)
+    /// the engine takes today's one-position step exactly.
+    max_decode_window: usize,
+
     /// 🦭 Sealed request IDs that have already generated an EOS/stop token.
     /// Tracked so check_stop_criteria can defer stopping until block-aligned.
     seal_eos_seen: HashSet<String>,
@@ -135,6 +141,17 @@ pub struct EngineCoreConfig {
     /// group over the ONE shared pool of `num_blocks`. `None` keeps the single
     /// uniform full-attention pool (every non-SWA model — unchanged behavior).
     pub hybrid_kv: Option<HybridKvConfig>,
+    /// The decode-window cap the BACKEND declared (#603 PR3b §1.7): the most
+    /// positions one engine step may resolve, threaded from each worker's
+    /// `MAX_DECODE_WINDOW` through `WorkerCreationResult` at creation. 1 = no
+    /// windowing (metal, cuda); spyre declares 4. The engine still clips this
+    /// per step — by page edge (`block_size`), by the request's remaining
+    /// output budget, and by batching/grammar/sample-mode eligibility — so
+    /// the value here is a CAP, not a promise.
+    ///
+    /// ⛔ NOT CONFIGURABLE AT RUNTIME: no env knob, no CLI flag (design §7.6).
+    /// It is a backend capability, and the only writer is worker creation.
+    pub max_decode_window: usize,
 }
 
 /// Hybrid SWA KV config for [`EngineCoreConfig::hybrid_kv`]: the shared-pool
@@ -384,6 +401,7 @@ impl EngineCore {
             eos_token_ids: config.eos_token_ids,
             is_pooling: config.is_pooling,
             block_size: config.block_size,
+            max_decode_window: config.max_decode_window,
             seal_eos_seen: HashSet::new(),
             head_drafts,
             pipelines_speculative: false,
@@ -1366,6 +1384,7 @@ mod tests {
             is_pooling: false,
             enable_prefix_caching: false,
             hybrid_kv: None,
+            max_decode_window: 1,
         }
     }
 
@@ -1901,6 +1920,7 @@ mod tests {
             is_pooling: false,
             enable_prefix_caching: false,
             hybrid_kv: None,
+            max_decode_window: 1,
         }
     }
 

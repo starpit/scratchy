@@ -91,6 +91,18 @@ pub struct SpyreWorker {
 }
 
 impl SpyreWorker {
+    /// The engine's decode-window cap for this backend (#603 PR3b §1.7, §7.6): the most positions
+    /// one engine step may resolve. **k = 4, a compile-time constant** — no env knob, no CLI flag.
+    ///
+    /// It rides [`WorkerCreationResult`](scratchy_serving_engine::worker_factory::WorkerCreationResult)
+    /// into `EngineCoreConfig::max_decode_window`, where the engine clips it by page edge and
+    /// remaining output budget. Backends that cannot window (metal, cuda) declare 1, and at 1 the
+    /// engine's window arithmetic degenerates to today's one-position step byte for byte.
+    ///
+    /// 4, not 8: ITL(k) ≈ B − (1−1/k)·T_serial, so k=4 already banks 86% of k=8's amortization
+    /// (design §3) while keeping the overrun-discard bound (k−1)·D to ~123 ms at 2b fp16.
+    pub const MAX_DECODE_WINDOW: usize = 4;
+
     pub fn new(config: WorkerConfig, model_path: String) -> Self {
         Self {
             config,
@@ -237,7 +249,14 @@ impl scratchy_serving_engine::worker_factory::WorkerFactory for SpyreWorkerFacto
             .clone();
         let model_dir = worker.model_dir().map(|p| p.to_path_buf());
         let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-        Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes))
+        let max_decode_window = SpyreWorker::MAX_DECODE_WINDOW;
+        Ok((
+            Box::new(worker),
+            hf_config,
+            model_dir,
+            dtype_elem_bytes,
+            max_decode_window,
+        ))
     }
 }
 
