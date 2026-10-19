@@ -1568,7 +1568,15 @@ impl Worker for SpyreWorker {
                         scratchy_subtile::sdsc_abstract::SlotCount::new(1),
                     );
                     order.push(id.clone());
-                    sampled.push(Some(tok));
+                    // ⭐ THE BATCHED PATH IS k=1 BY ITS OWN GATE — `solo_step_is_decode`
+                    // admits only `num_scheduled == 1` requests here, and this loop's
+                    // argmax resolves exactly that one token; a decode WINDOW (n=k>1)
+                    // never enters the batched path — it rides `run_request_step`,
+                    // whose return is already the window's whole `Vec<u32>`. So the
+                    // one-token vec is the step's whole answer, not a truncation of a
+                    // window: the commit algebra below reads `first()` for the k=1
+                    // shape and only the `len() > 1` arms see windows.
+                    sampled.push(Some(vec![tok]));
                     batched.insert(id.clone());
                 }
             }
