@@ -22,7 +22,9 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use flex_rs::iommu::PfIommuMapper;
 use flex_rs::memory_region::MemoryType;
+use flex_rs::shared_host_pool::SharedHostPool;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
@@ -268,6 +270,15 @@ impl StepImageCache {
             t.replay_derive_ms += started.elapsed().as_secs_f64() * 1e3;
         }
         self.map.insert(key, image);
+    }
+
+    /// The largest canvas any cached image carries — the window budget's
+    /// early-check number (§4.7): `cbs_per_step` for the keys this session has
+    /// already derived. `None` until the first derivation, which is exactly the
+    /// first window's documented deferral — [`Executor::window_step`]'s running
+    /// counter covers it with the real counts as they land.
+    fn max_canvas_len(&self) -> Option<usize> {
+        self.map.values().map(|i| i.data.canvas.len()).max()
     }
 }
 
@@ -702,6 +713,80 @@ fn refill_sends(keyed: &BTreeMap<bundle::PlaceId, Keyed>, id: &bundle::PlaceId) 
     keyed.get(id).is_none_or(|k| k.fresh)
 }
 
+/// The merged-run half of one dirty segment's upload plan — the sort, the overlap
+/// merge, and the ≥7/8 whole-segment collapse, extracted from the old inline loop of
+/// [`Executor::refill_activations`] as ONE pure function so the plan is pin-testable
+/// without a card (the executor itself cannot be built there). `single_chunk` false —
+/// a multi-chunk region has no addressable sub-window — degenerates to the
+/// whole-segment DMA exactly as the inline code did.
+fn merge_activation_runs(raw: &[(u64, u64)], tot: u64, single_chunk: bool) -> SegUpload {
+    if !single_chunk {
+        return SegUpload::Whole;
+    }
+    let mut r = raw.to_vec();
+    r.sort_unstable();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for (a, b) in r {
+        let b = b.min(tot);
+        if b <= a {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => runs.push((a, b)),
+        }
+    }
+    // If the runs cover essentially everything, one whole-segment DMA is cheaper.
+    let covered: u64 = runs.iter().map(|(a, b)| b - a).sum();
+    if runs.is_empty() || covered * 8 >= tot * 7 {
+        return SegUpload::Whole;
+    }
+    SegUpload::Runs(runs)
+}
+
+/// The response-tag pool's usable size — every submitted CB leases one tag until it
+/// retires, tag 0 is reserved (`TagPool::TAG_OFFSET`), and the pool is sized by
+/// `FLEX_RESPONSE_WORKER_MAX_PENDING_REQUESTS` (default 32768). The window's §4.7
+/// budget is measured against exactly this number.
+fn response_tag_budget() -> usize {
+    flex_rs::flex_config::RuntimeConfig::response_worker_max_pending_requests()
+        .value()
+        .saturating_sub(1) as usize
+}
+
+/// ⭐ §4.7 — THE DECODE WINDOW'S OUTSTANDING-CB BUDGET, one pure function so the
+/// arithmetic is pin-testable without a card. Every CB the window submits holds a
+/// response tag until the window's ONE synchronize retires it (the steps between
+/// begin and finish share no host round trip that could return tags earlier), so
+/// k·(cbs_per_step + dma_cbs_per_step) must fit [`response_tag_budget`] or the
+/// submit thread stalls on tag return mid-window. This check is the EARLY, loud
+/// statement of a bound the scheduler holds anyway: `wait_for_queue_capacity`
+/// bounds every submission against the same pool (stall, never wedge), so what this
+/// refusal buys is a named, fixable wiring error instead of a silent stall in the
+/// field. Returns the budget so the caller can accumulate against the same number.
+fn decode_window_budget_check(
+    k: usize,
+    cbs_per_step: usize,
+    dma_cbs_per_step: usize,
+    budget: usize,
+) -> Result<usize> {
+    let per_step = cbs_per_step + dma_cbs_per_step;
+    // u128: the inputs are usize and the product must not wrap before it can refuse.
+    let needed = (k as u128) * (per_step as u128);
+    if needed > budget as u128 {
+        // per_step > 0 whenever this arm runs: needed = k·per_step exceeded budget ≥ 0.
+        let k_max = budget / per_step;
+        bail!(
+            "decode window: k={k} × {per_step} CBs/step ({cbs_per_step} image \
+             + {dma_cbs_per_step} DMA) = {needed} CBs exceeds the response-tag budget \
+             of {budget} (FLEX_RESPONSE_WORKER_MAX_PENDING_REQUESTS − 1) — k_max for \
+             this bundle is {k_max}. The window REFUSES rather than stall the submit \
+             thread on tag return mid-window"
+        );
+    }
+    Ok(budget)
+}
+
 /// ⛔⛔⛔ EVERY WAY A SOURCE TENSOR'S BYTES CAN GET THERE — THE COMPLETE LIST.
 ///
 /// The device cannot report an unfilled source: it reads whatever the segment happens to hold, or it
@@ -934,6 +1019,21 @@ pub struct Executor {
     /// one; every batched or instrumented step takes the walk instead, so
     /// nothing here is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
+
+    // ── #603 PR3b — the k-step decode window ──
+    /// The LIVE window's state — `Some` only between [`Executor::window_begin`] and
+    /// [`Executor::window_finish`], never across windows (a begin while one is live is
+    /// a wiring bug, and a window abandoned mid-flight is an error path, not a state).
+    decode_window: Option<DecodeWindow>,
+    /// The window's idx-readback slots (#606): one pinned pool of `k` × 256 B slots
+    /// behind one IOMMU map, constructed at the FIRST window and KEPT for the
+    /// session's life — the stable IOVAs are the point (no per-window pin traffic,
+    /// and the per-step D2H stays a replay candidate). A later window needing MORE
+    /// slots than the geometry rebuilds the pool BETWEEN windows (the previous
+    /// finish synchronized, so nothing in flight references the old IOVAs — the
+    /// pool's own drop law). Owned outright, never shared: every use runs through
+    /// `&mut self`/`&self` on the executor alone.
+    idx_pool: Option<SharedHostPool>,
 }
 
 /// Per-session state for the card-side tensordump — see [`Diag::tensordump`].
@@ -1005,6 +1105,75 @@ struct ForwardHalf {
     h2d_note: String,
     h2d_bytes: u64,
 }
+
+/// One dirty segment's upload plan: the merged aligned runs, or the whole-segment
+/// fallback the ≥7/8 coverage rule (or a multi-chunk region, which has no addressable
+/// sub-window) degenerates to. The merge itself is
+/// [`merge_activation_runs`], one pure function so the plan is pin-testable without a
+/// card.
+enum SegUpload {
+    /// One whole-segment DMA — cheaper when the runs cover essentially everything.
+    Whole,
+    /// The merged `[start, end)` runs: 4096-aligned, ascending, non-overlapping.
+    Runs(Vec<(u64, u64)>),
+}
+
+/// One step's staged activation upload plan — the half of
+/// [`Executor::refill_activations`] that runs BEFORE any H2D: the bound tensors
+/// sen-converted into `seg_host` at their placements, and per dirty segment the merged
+/// runs (or whole-segment fallback). Extracted so the decode window's step
+/// ([`Executor::window_step`]) can stage the SAME plan and then upload from its OWN
+/// copy of the bytes — see that method for the race that makes the copy mandatory.
+struct StagedActivations {
+    /// Per segment: `None` = nothing bound there this step (or the segment is aliased,
+    /// whose shadow is never uploaded — the same set the inline loop skipped).
+    segs: [Option<SegUpload>; NUM_SEGMENTS],
+}
+
+/// ⭐⭐⭐⭐⭐ THE k-STEP DECODE WINDOW'S LIVE STATE (#603 PR3b) — present only between
+/// [`Executor::window_begin`] and [`Executor::window_finish`], never across windows.
+///
+/// The window is the loop-closure primitive: k solo greedy decode steps enqueued
+/// back-to-back on the one persistent stream with NO host round trip between them —
+/// the only inter-step data dependency (token N+1's embedding row, written by the
+/// device-side gather that chains off the argmax's idx stick) lives on device, the
+/// its OWN copy, because the next step's binds overwrite `seg_host` long before the
+/// device executes this step's H2D — the DMA reads the host buffer at execution, not
+/// at enqueue, and it is exactly the per-step synchronize of the k=1 path that the
+/// window deletes), and each step's idx stick lands in its own #606-pooled slot so
+/// ONE synchronize retires the whole window. The host reads the k words after that
+/// sync and re-engages once per window (the v1 ruling, §1.6).
+struct DecodeWindow {
+    /// k — the number of steps this window runs (`window_begin`'s argument).
+    k: usize,
+    /// Steps enqueued so far — also the pool slot index the next step's idx D2H
+    /// targets (slot i is step i's, so the words survive until the one sync).
+    next: usize,
+    /// The wiring's idx stick, resolved ONCE at begin from the PlaceId the caller
+    /// states: the placement window the per-step D2H reads, its byte length, and
+    /// the vocab the sentinel is measured against (the minted chain's own V — the
+    /// graph-local logits width, not the model-wide one).
+    idx_win: DevAddr,
+    idx_bytes: u64,
+    idx_vocab: usize,
+    /// Per-step staged preamble — step i's OWN copies of its merged dirty runs,
+    /// `(segment, device offset, bytes)`, uploaded from here and kept alive until
+    /// the window's synchronize retires their H2Ds.
+    staged: Vec<Vec<(SegIdx, u64, Vec<u8>)>>,
+    /// CBs enqueued so far — the running side of the §4.7 outstanding-CB budget.
+    cbs: u64,
+}
+
+/// The one-request rung's [1, ARGMAX_BLOCK] SenUint32 idx stick — 256 B, the
+/// readback pool's slot width. One word per step is read; the width is the stick's
+/// whole placement, the same shape law `window_begin` refuses against.
+const IDX_SLOT_BYTES: usize = 256;
+
+/// The per-step DMA CB count the window's begin-time budget check assumes — the
+/// preamble's merged runs (2–4 at decode shapes) plus the idx D2H, stated
+/// conservatively as 8. The number's point is the ORDER of k·(cbs + dma), not its
+/// exact tail; `window_step` checks with the step's REAL run count.
+const IDX_DMA_CBS_ESTIMATE: usize = 8;
 
 impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1109,6 +1278,8 @@ impl Executor {
             n_weights_staged: 0,
             dump: None,
             step_images: StepImageCache::default(),
+            decode_window: None,
+            idx_pool: None,
         };
 
         // ── RE-ROLLED mode: a re-roll meta ⇒ this bundle is the BODY (one layer); the prefix (embed)
@@ -4420,10 +4591,375 @@ impl Executor {
         Ok(())
     }
 
-    /// Refill per-step ACTIVATIONS into their segment's host staging at the baked offset
-    /// (IEEE→sen), and re-H2D the dirtied segments. Weights (seg1) and KV (seg2) stay RESIDENT —
-    /// never re-uploaded, which is the whole perf point.
-    fn refill_activations(&mut self, d: &Diag) -> Result<(String, u64)> {
+
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+    //  #603 PR3b — the k-step decode window: begin / step / finish
+    // ──────────────────────────────────────────────────────────────────────────────────────────
+
+    /// ⭐⭐⭐⭐⭐ OPEN A k-STEP DECODE WINDOW (#603 PR3b) — resolve once what every step
+    /// shares, refuse once what every step would refuse, and set the live
+    /// [`DecodeWindow`]. Between this and [`Self::window_finish`] the caller drives
+    /// exactly k × [`Self::window_step`]; the window's whole point is that no host
+    /// round trip, no tag return, and no synchronize happens in between.
+    ///
+    /// The refusals mirror the k=1 token step's own, hoisted to once-per-window:
+    /// the idx stick must be placed, and must fit the pool's slot — the window's
+    /// only inter-step dependency is the next token's embedding row, which the
+    /// DEVICE argmax + gather feed writes (the mint's follow-on chain), so the
+    /// caller gates on the wiring's `result_is_index` before opening a window
+    /// and states the stick's [`bundle::PlaceId`] and the vocab HERE — the
+    /// executor holds no wiring fact of its own. The pool: #606's
+    /// [`SharedHostPool`] is built at the FIRST window and kept for
+    /// the session's life; a larger k than its geometry rebuilds it here — safe
+    /// because the previous window's finish synchronized, retiring every transfer
+    /// the old slots served (the pool's own drop law).
+    pub fn window_begin(&mut self, k: usize, stick: bundle::PlaceId, vocab: usize) -> Result<()> {
+        if !self.prepared {
+            bail!("window_begin before prepare");
+        }
+        if k == 0 {
+            bail!("window_begin: a window of zero steps is a wiring bug, not a schedule");
+        }
+        if self.decode_window.is_some() {
+            bail!(
+                "window_begin: a window is already open — begin/step/finish run one at \
+                 a time, never nested"
+            );
+        }
+        let lp = self
+            .places
+            .get(&stick)
+            .cloned()
+            .ok_or_else(|| anyhow!("window_begin: the idx stick {stick} has no placement"))?;
+        // ⛔ THE STICK MUST FIT THE POOL'S SLOT — the one-request rung's minted stick is
+        // `[1, ARGMAX_BLOCK]` i32 (256 B exactly, matching [`IDX_SLOT_BYTES`]); the pooled
+        // D2H transfers the placement's aligned window into one slot, so a stick wider
+        // than the slot is a bundle the window was never meant to serve.
+        let stick_len = crate::lower_subtile_tape_to_superdsc::align128(lp.size);
+        if lp.size == 0 || stick_len > IDX_SLOT_BYTES {
+            bail!(
+                "window_begin: the idx stick {stick} is {} B (aligned {}), which does not \
+                 fit the pool's {IDX_SLOT_BYTES} B slot — the mint's one-request stick is \
+                 `[1, ARGMAX_BLOCK]` i32, and the window serves exactly that shape",
+                lp.size,
+                stick_len
+            );
+        }
+        let seg = SegIdx::checked(lp.segment as i64)
+            .ok_or_else(|| anyhow!("the idx stick's segment {} is out of range", lp.segment))?;
+        let addr = self.seg_addr[seg.get()]
+            .as_ref()
+            .ok_or_else(|| anyhow!("the idx stick's seg{} has no region", lp.segment))?;
+        let tot = addr.total_size().as_u64();
+        let lo = lp.offset;
+        let len = stick_len.min(tot - lo);
+        // The placement's OWN window, never a whole-region fallback: the pool door
+        // transfers `device.total_size()` into a 256 B slot, so a window that cannot
+        // form here is a loud refusal, not a silent region read (the k=1 step could
+        // fall back to the region only because its host buffer was the whole segment).
+        let idx_win = (len < tot)
+            .then(|| addr.window(ByteOffset(lo), ByteSize(len)))
+            .flatten()
+            .ok_or_else(|| {
+                anyhow!(
+                    "window_begin: the idx stick's placement window (seg{} off {lo}, {len} \
+                     B) is unaddressable — the pooled D2H serves exactly the placement's \
+                     own window",
+                    lp.segment
+                )
+            })?;
+        let need_rebuild = match self.idx_pool.as_ref() {
+            None => true,
+            Some(p) => p.slot_count() < k,
+        };
+        if need_rebuild {
+            let mapper = PfIommuMapper::new();
+            self.idx_pool = Some(
+                SharedHostPool::new(k, IDX_SLOT_BYTES, &mapper).map_err(|e| {
+                    anyhow!(
+                        "window_begin: the idx-readback pool ({k} × {IDX_SLOT_BYTES} B) \
+                         refused to pin: {e:?}"
+                    )
+                })?,
+            );
+        }
+        // §4.7's budget, early-checked against the largest canvas this session has
+        // already derived — the steady state (image cached) refuses HERE, before any
+        // doorbell. The FIRST window (cache empty) defers to `window_step`'s running
+        // counter with the real counts, and the scheduler's per-submission
+        // queue-capacity gate holds the line either way.
+        if let Some(cbs) = self.step_images.max_canvas_len() {
+            decode_window_budget_check(k, cbs, IDX_DMA_CBS_ESTIMATE, response_tag_budget())?;
+        }
+        self.decode_window = Some(DecodeWindow {
+            k,
+            next: 0,
+            idx_win,
+            idx_bytes: len,
+            idx_vocab: vocab,
+            staged: Vec::with_capacity(k),
+            cbs: 0,
+        });
+        Ok(())
+    }
+
+    /// ⭐⭐⭐⭐⭐ ENQUEUE ONE STEP OF THE OPEN WINDOW (#603 PR3b). The caller binds this
+    /// step's inputs exactly as the k=1 step binds its own — EXCEPT the embedding row:
+    /// steps 2..k have no row to bind, because that row's token id does not exist on
+    /// the host until the window's sync reads it. The device-side gather chained
+    /// off the argmax's idx stick is what writes the row; the per-step bind set
+    /// therefore EXCLUDES it for every step of the window, and that exclusion is
+    /// the caller's contract (its guard lands with the worker-side wiring, the
+    /// commit after this one).
+    ///
+    /// The step's chain, all on the one persistent stream with FIFO order doing all
+    /// the work: (1) stage this step's bound activations and snapshot the merged
+    /// dirty runs into the window's OWN storage — the snapshot is mandatory, not an
+    /// optimization: the DMA reads host memory at EXECUTION, and the next step's
+    /// binds overwrite `seg_host` long before the device executes this step's H2D
+    /// (the per-step synchronize of the k=1 path is the only thing that made the
+    /// shared buffer safe, and the window deletes it); (2) upload the runs on the
+    /// compute pipeline (#544's junction — FIFO-ahead of the replay, the barrier
+    /// draining the empty DMA deques); (3) the forward — the SAME replay-or-walk
+    /// decision the k=1 step takes, which is why an instrumented run walks inside
+    /// windows (correct, degraded, and the rbgap legs depend on it); (4) the idx D2H
+    /// into this step's pool slot, compute-pipelined FIFO-behind the gather and
+    /// FIFO-ahead of the next step's replay, which overwrites the stick — the
+    /// queue's order is the only thing that lets one stick serve k steps.
+    ///
+    /// No synchronize, no tag return, no host read. An error here abandons the
+    /// window WITH its in-flight CBs: the state stays in place (the staged
+    /// snapshots must outlive their H2Ds; the teardown drain retires them), the
+    /// error propagates to the request, and §4.8's recovery is the caller's (mark
+    /// errored, discard uncommitted tokens, stop enqueueing) — never a mid-window
+    /// k=1 fallback.
+    pub fn window_step(&mut self, seq_pos: SeqPos) -> Result<()> {
+        let d = Diag::get();
+        // The state is TAKEN for the body — the body needs `&mut self` throughout
+        // (binds, staging, the replay, the pool door) — and goes back on BOTH arms:
+        // an error abandons the window rather than clearing it, so the staged
+        // snapshots stay owned and no later `window_begin` can open over in-flight
+        // window CBs.
+        let mut win = self
+            .decode_window
+            .take()
+            .ok_or_else(|| anyhow!("window_step: no window is open — window_begin opens one"))?;
+        let step = self.window_step_inner(&mut win, seq_pos, d);
+        self.decode_window = Some(win);
+        step
+    }
+
+    fn window_step_inner(
+        &mut self,
+        win: &mut DecodeWindow,
+        seq_pos: SeqPos,
+        d: &Diag,
+    ) -> Result<()> {
+        if win.next >= win.k {
+            bail!(
+                "window_step: the window is full ({} of {} steps enqueued) — \
+                 window_finish retires it",
+                win.next,
+                win.k
+            );
+        }
+        if !self.prepared {
+            bail!("window_step before prepare");
+        }
+        self.require_sources_filled()?;
+        // RB timing: the same per-forward reset the k=1 half does — host-side only (a
+        // ring drain, no device wait), so the window's no-sync shape keeps it. What
+        // rb_time CANNOT have inside a window is per-op attribution (it needs the
+        // step's synchronize to see completed CBs): window_finish's epilogue runs the
+        // attribution over whatever the final drain holds and the existing
+        // sequence-mismatch guard declines it loudly — degraded by construction, never
+        // silently wrong.
+        if d.rb_time {
+            let _ = flex_rs::rb_telemetry::drain();
+        }
+        timers().rb_seq.clear();
+
+        // (1) The shared staging half — the binds sen-converted into `seg_host` at
+        // their placements, and the merged-run plan per dirty segment.
+        let staged = self.stage_bound_activations(d)?;
+
+        // (2) The snapshot + upload, from this step's OWN copies. A whole-segment plan
+        // is REFUSED, not fallen back to: the window's per-step staging is bounded by
+        // the merged runs by design (2–4 at decode shapes), and a ≥7/8-coverage or
+        // multi-chunk degenerate is a bind set the window was never shaped for — the
+        // step belongs at k=1, and refusing beats a silent O(cap) cliff inside a
+        // window whose whole point was deleting the host round trips.
+        let mut runs: Vec<(SegIdx, u64, Vec<u8>)> = Vec::new();
+        for i in 0..NUM_SEGMENTS {
+            let Some(plan) = staged.segs[i].as_ref() else {
+                continue;
+            };
+            let addr = self.seg_addr[i]
+                .as_ref()
+                .expect("a dirty segment has a region");
+            match plan {
+                SegUpload::Whole => bail!(
+                    "window_step: seg{i}'s staged runs cover the whole segment — the \
+                     window's per-step staging is bounded by the merged runs, and a \
+                     whole-segment plan (≥7/8 coverage, or a multi-chunk region) is a \
+                     bind set the window was never shaped for. The step must run at \
+                     k=1; this refusal is a wiring bug, never a schedule decision"
+                ),
+                SegUpload::Runs(rs) => {
+                    for &(a, b) in rs {
+                        let bytes = self.seg_host[i][a as usize..b as usize].to_vec();
+                        let dev = addr.window(ByteOffset(a), ByteSize(b - a)).ok_or_else(|| {
+                            anyhow!(
+                                "window_step: seg{i}'s run [{a}, {b}) has no addressable \
+                                 window — `stage_bound_activations` merged it inside the \
+                                 region, so this is a placement corruption, not a \
+                                 schedule decision"
+                            )
+                        })?;
+                        self.stream_ref()?
+                            .h2d_on_compute(&bytes, &dev)
+                            .map_err(|e| anyhow!("window_step preamble H2D seg{i}: {e}"))?;
+                        runs.push((
+                            SegIdx::checked(i as i64).expect("in range by construction"),
+                            a,
+                            bytes,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // §4.7 with this step's REAL DMA count (the runs above + the idx D2H below):
+        // the product form k×(cbs + dma) must fit, with `cbs` from the largest cached
+        // canvas when one exists. The first window's first derivation has no cached
+        // canvas yet — the running check below and the scheduler's per-submission
+        // queue-capacity gate hold that case, and the next window's begin-check sees
+        // the derived number.
+        if let Some(cbs) = self.step_images.max_canvas_len() {
+            decode_window_budget_check(win.k, cbs, runs.len() + 1, response_tag_budget())?;
+        }
+        if win.cbs as usize > response_tag_budget() {
+            bail!(
+                "decode window: {} CBs enqueued exceed the response-tag budget — the \
+                 running side of §4.7; the product check above should have refused \
+                 first, so reaching this is a wiring bug",
+                win.cbs
+            );
+        }
+
+        // (3) The forward — the same replay-or-walk decision the k=1 step takes. A
+        // window step is one token by definition (the engine's k positions arrive as
+        // k one-token steps), so the replay gate is exactly forward_half's own.
+        let cbs_this = match self.try_replay_forward(seq_pos)? {
+            Some(n) => n,
+            None => {
+                self.launch_forward(seq_pos)?;
+                0 // the walk's CBs are the canvas's own shape; the scheduler's
+                // queue-capacity gate bounds them per submission
+            }
+        };
+
+        // (4) The idx D2H into this step's pool slot, on the compute pipeline —
+        // #544's junction law once more: FIFO-behind this step's argmax (the slot
+        // gets its word only after the kernel answers), FIFO-ahead of the next
+        // step's replay (which overwrites the stick).
+        let slot = win.next;
+        self.stream_ref()?
+            .pooled_copy_on_compute(
+                self.idx_pool.as_ref().expect("window_begin built the pool"),
+                slot,
+                &win.idx_win,
+                false,
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "window_step (pos {}): idx D2H ({} B) into pool slot {slot}: {e:?}",
+                    seq_pos.0,
+                    win.idx_bytes
+                )
+            })?;
+
+        // The state commit — only now, after every enqueue succeeded.
+        win.cbs += cbs_this as u64 + (runs.len() + 1) as u64;
+        win.staged.push(runs);
+        win.next += 1;
+        Ok(())
+    }
+
+    /// ⭐⭐⭐⭐⭐ RETIRE THE OPEN WINDOW (#603 PR3b) — THE ONE SYNCHRONIZE, the k words,
+    /// and the epilogue. Everything the steps enqueued (the per-step preamble H2Ds
+    /// from their own snapshots, the replays or walks, the idx D2Hs into the pool
+    /// slots) retires here; this single host wait is the window itself — the
+    /// loop-closure primitive's re-engagement point, one per k steps instead of one
+    /// per step.
+    ///
+    /// The words: slot i holds step i's idx stick, little-endian, raw on both sides
+    /// of the DMA door (SenUint32's own law — the same word the k=1 token step's
+    /// pooled read hands the worker). Each is sentinel-checked against the stick's
+    /// own vocab with the token step's
+    /// own refusal, naming the step it died on — a window feeds k tokens to the
+    /// detokenizer at once, so a NaN-born token must not hide among them.
+    ///
+    /// v1 runs EVERY step before finishing — the engine discards a clipped tail at
+    /// COMMIT (outside the executor), so a short window here is a wiring bug, not a
+    /// schedule. The pool STAYS: later windows reuse its IOVAs; only a larger k
+    /// rebuilds it, at the next `window_begin` (between windows, per its drop law).
+    pub fn window_finish(&mut self) -> Result<Vec<u32>> {
+        let d = Diag::get();
+        let (k, next, idx_vocab) = {
+            let Some(win) = self.decode_window.as_ref() else {
+                bail!("window_finish: no window is open");
+            };
+            (win.k, win.next, win.idx_vocab)
+        };
+        if next != k {
+            bail!(
+                "window_finish: {next} of {k} steps enqueued — v1 runs every window step \
+                 before finishing (the engine discards a clipped tail at COMMIT, never \
+                 the executor mid-window); a short window is a wiring bug"
+            );
+        }
+        // ⭐ THE ONE SYNCHRONIZE — the window's only host wait. The staged snapshots'
+        // lifetimes and the pool slots' reads both hang off it.
+        self.stream_ref()?
+            .synchronize()
+            .map_err(|e| anyhow!("window_finish: sync: {e}"))?;
+        let pool = self
+            .idx_pool
+            .as_ref()
+            .expect("window_begin built the pool before any window step ran");
+        let mut ids = Vec::with_capacity(k);
+        for i in 0..k {
+            // Slot i is step i's — `window_step`'s D2H targeted it by construction.
+            let word: [u8; 4] = pool.slot(i).expect("window_begin sized the pool to k")[..4]
+                .try_into()
+                .expect("the slot is IDX_SLOT_BYTES wide");
+            let idx = u32::from_le_bytes(word);
+            if idx as usize >= idx_vocab {
+                bail!(
+                    "window_finish: step {i}'s argmax answer is {idx} against a vocab \
+                     of {idx_vocab} — the sentinel row, which the chain reaches exactly \
+                     when EVERY logit lane was NaN (the same refusal the k=1 token step \
+                     states, named per step here because a window hands k tokens over \
+                     at once)"
+                );
+            }
+            ids.push(idx);
+        }
+        self.step_epilogue(d);
+        // The window state drops — its snapshots' H2Ds retired at the sync above,
+        // which was their whole lifetime law. The POOL stays for the session.
+        self.decode_window = None;
+        Ok(ids)
+    }
+
+    /// Stage per-step ACTIVATIONS into their segment's host staging at the baked offset
+    /// (IEEE→sen) and compute the upload plan — the staging half of
+    /// [`Self::refill_activations`], shared with the decode window's step
+    /// ([`Self::window_step`]). Weights (seg1) and KV (seg2) stay RESIDENT — never
+    /// re-uploaded, which is the whole perf point. No H2D, no stream: pure host work, so
+    /// the window can upload each step's runs from that step's OWN copy of the bytes.
+    fn stage_bound_activations(&mut self, d: &Diag) -> Result<StagedActivations> {
         // ⛔ A WHOLE-SEGMENT H2D IS THE O(cap) DECODE CLIFF. seg3 is 8425 KB and a bs=8 decode step
         // writes a small fraction of it, so nearly every byte uploaded is unchanged — a flat
         // ~1.5 ms no amount of shrinking the mask could reach, because the transfer is sized by the
@@ -4438,8 +4974,6 @@ impl Executor {
         // narrowed nothing. Keep each tensor's own range and merge only what actually overlaps.
         let mut seg_runs: [Vec<(u64, u64)>; NUM_SEGMENTS] = [const { Vec::new() }; NUM_SEGMENTS];
 
-        // Collect first (the borrow of `bound` and the mutation of `seg_host` cannot overlap).
-        let mut writes: Vec<(usize, u64, &[u8])> = Vec::new();
         for (nm, src) in &self.bound {
             if self.weight_ids.contains(nm) {
                 continue; // weight, resident
@@ -4473,7 +5007,6 @@ impl Executor {
             if p.offset as usize + src.len() > self.seg_host[seg.get()].len() {
                 bail!("predict: activation '{nm}' overflows seg{}", p.segment);
             }
-            writes.push((seg.get(), p.offset, src.as_slice()));
             seg_dirty[seg.get()] = true;
             seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
             if d.phase_time {
@@ -4539,8 +5072,7 @@ impl Executor {
             k.fresh = false;
         }
 
-        let mut note = String::new();
-        let mut total = 0u64;
+        let mut segs: [Option<SegUpload>; NUM_SEGMENTS] = [const { None }; NUM_SEGMENTS];
         for i in 0..NUM_SEGMENTS {
             if !seg_dirty[i] {
                 continue; // only re-upload activation segments
@@ -4552,32 +5084,34 @@ impl Executor {
                 continue;
             }
             let addr = self.seg_addr[i].as_ref().unwrap();
+            segs[i] = Some(merge_activation_runs(
+                &seg_runs[i],
+                addr.total_size().as_u64(),
+                addr.is_single_chunk(),
+            ));
+        }
+        Ok(StagedActivations { segs })
+    }
+
+    /// Refill per-step ACTIVATIONS: stage them ([`Self::stage_bound_activations`]) and
+    /// re-H2D the dirtied segments' merged runs straight out of `seg_host` — safe for the
+    /// k=1 path because the per-step synchronize after this step's readback drains the
+    /// H2D before the next step's binds overwrite the staging. The decode window's step
+    /// stages the SAME plan and uploads each step's runs from that step's OWN copy
+    /// instead ([`Self::window_step`] states the race).
+    fn refill_activations(&mut self, d: &Diag) -> Result<(String, u64)> {
+        let staged = self.stage_bound_activations(d)?;
+        let mut note = String::new();
+        let mut total = 0u64;
+        for i in 0..NUM_SEGMENTS {
+            let Some(plan) = staged.segs[i].as_ref() else {
+                continue; // only re-upload activation segments
+            };
+            let addr = self.seg_addr[i].as_ref().unwrap();
             let tot = addr.total_size().as_u64();
-            // THE MERGED ALIGNED RUNS, or the whole segment when they cannot be used.
-            let mut runs: Vec<(u64, u64)> = Vec::new();
-            if addr.is_single_chunk() {
-                let mut r = seg_runs[i].clone();
-                r.sort_unstable();
-                for (a, b) in r {
-                    let b = b.min(tot);
-                    if b <= a {
-                        continue;
-                    }
-                    match runs.last_mut() {
-                        Some(last) if a <= last.1 => last.1 = last.1.max(b),
-                        _ => runs.push((a, b)),
-                    }
-                }
-                // If the runs cover essentially everything, one whole-segment DMA is cheaper.
-                let covered: u64 = runs.iter().map(|(a, b)| b - a).sum();
-                if runs.is_empty() || covered * 8 >= tot * 7 {
-                    runs.clear();
-                }
-            }
-            let sent = if runs.is_empty() {
-                tot
-            } else {
-                runs.iter().map(|(a, b)| b - a).sum()
+            let sent = match plan {
+                SegUpload::Whole => tot,
+                SegUpload::Runs(runs) => runs.iter().map(|(a, b)| b - a).sum(),
             };
             total += sent;
             if d.phase_time {
@@ -4592,18 +5126,21 @@ impl Executor {
             // switch at all, the remaining cross-step barrier drains deques that hold
             // nothing, and the queue's own FIFO orders the preamble CB ahead of the step's
             // compute CBs — the whole step submits with no host-side waits.
-            if runs.is_empty() {
-                stream
-                    .h2d_on_compute(whole_shadow(&self.seg_host[i], addr, i)?, addr)
-                    .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
-            } else {
-                for (a, b) in runs {
-                    let win = addr
-                        .window(ByteOffset(a), ByteSize(b - a))
-                        .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
+            match plan {
+                SegUpload::Whole => {
                     stream
-                        .h2d_on_compute(&self.seg_host[i][a as usize..b as usize], &win)
-                        .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
+                        .h2d_on_compute(whole_shadow(&self.seg_host[i], addr, i)?, addr)
+                        .map_err(|e| anyhow!("preamble H2D seg{i}: {e}"))?;
+                }
+                SegUpload::Runs(runs) => {
+                    for &(a, b) in runs {
+                        let win = addr
+                            .window(ByteOffset(a), ByteSize(b - a))
+                            .ok_or_else(|| anyhow!("seg{i} window {a}..{b} unaddressable"))?;
+                        stream
+                            .h2d_on_compute(&self.seg_host[i][a as usize..b as usize], &win)
+                            .map_err(|e| anyhow!("preamble H2D seg{i} window: {e}"))?;
+                    }
                 }
             }
         }
@@ -4716,7 +5253,11 @@ impl Executor {
     /// off-sample room fits. There is no third path and no toggle: the
     /// production configuration (quiet diag, one request) is the player,
     /// minus one step per page.
-    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<()>> {
+    ///
+    /// `Ok(Some(n))` carries the image's CB count — the per-step number the
+    /// decode window's outstanding-CB budget (#603 PR3b §4.7) is pinned
+    /// against; the k=1 path ignores it.
+    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<usize>> {
         if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
             return Ok(None);
         }
@@ -4837,7 +5378,7 @@ impl Executor {
         if t.replay_steps == 1 || t.replay_steps.is_multiple_of(256) {
             report_replay(&t);
         }
-        Ok(Some(()))
+        Ok(Some(cbs))
     }
 
     /// Derive one step image at its first use — the row sequence is
@@ -6228,5 +6769,75 @@ mod tests {
             rb_class_window(&entries, |e| e.dma == Some(DmaDirection::HostToDevice)).is_none(),
             "an absent class is absent, not zero-bounded"
         );
+    }
+
+    /// #603 PR3b — the window's preamble plan is one pure function, so every merge law
+    /// is pinned cardless: overlap (and adjacency) merge into one run, the ≥7/8
+    /// coverage rule collapses to the whole-segment DMA, a multi-chunk region has no
+    /// addressable sub-window at all, and runs past the region clamp instead of
+    /// reading out of bounds.
+    #[test]
+    fn merge_activation_runs_merges_overlaps_and_pins_the_degenerates() {
+        // Overlap and adjacency merge; the input arrives unsorted.
+        let plan = merge_activation_runs(&[(8192, 12288), (0, 4096), (4096, 8192)], 1 << 20, true);
+        match plan {
+            SegUpload::Runs(runs) => assert_eq!(runs, vec![(0, 12288)]),
+            SegUpload::Whole => panic!("8192 B of 1 MiB is a run plan, not a whole segment"),
+        }
+        // Exactly 7/8 coverage collapses — the rule is ≥, and the boundary is the law.
+        let plan = merge_activation_runs(&[(0, 7168)], 8192, true);
+        assert!(
+            matches!(plan, SegUpload::Whole),
+            "7168 of 8192 is exactly 7/8 coverage — the whole-segment side of the rule"
+        );
+        // Just under 7/8 stays a run plan.
+        let plan = merge_activation_runs(&[(0, 7167)], 8192, true);
+        assert!(matches!(plan, SegUpload::Runs(_)));
+        // A multi-chunk region degenerates to Whole before any merging — there is no
+        // addressable sub-window to send runs to.
+        let plan = merge_activation_runs(&[(0, 4096)], 1 << 20, false);
+        assert!(matches!(plan, SegUpload::Whole));
+        // A run past the region's end clamps to it instead of reading out of bounds,
+        // and one entirely past it is dropped (an empty plan is the whole segment).
+        let plan = merge_activation_runs(&[(9000, 20000), (12000, 20000)], 10000, true);
+        match plan {
+            SegUpload::Runs(runs) => assert_eq!(runs, vec![(9000, 10000)]),
+            SegUpload::Whole => panic!("1000 B of 10000 is a run plan, not a whole segment"),
+        }
+        let plan = merge_activation_runs(&[(12000, 20000)], 10000, true);
+        assert!(
+            matches!(plan, SegUpload::Whole),
+            "every run past the region leaves an empty plan, whose upload is the whole segment"
+        );
+    }
+
+    /// #603 PR3b §4.7 — the outstanding-CB budget's arithmetic, pinned cardless with
+    /// explicit budgets (never the ambient config: the env knob moves it). The
+    /// shipping decode shape is ~122 CBs/step; the product form must refuse with the
+    /// k_max the caller can act on, and the boundary case (product == budget) passes.
+    #[test]
+    fn decode_window_budget_pins_the_product_law() {
+        // The shipping shape: 122 CBs + 8 DMA per step, k=4, the default tag pool.
+        let budget = decode_window_budget_check(4, 122, 8, 32767).expect("520 CBs fit 32767");
+        assert_eq!(
+            budget, 32767,
+            "the check returns the budget it was judged against"
+        );
+        // The boundary: product == budget passes (the refusal is strictly greater).
+        decode_window_budget_check(4, 122, 8, 520).expect("k·per_step == budget is the last fit");
+        // The refusal names k_max: 32767 / 20008 = 1.
+        let err = decode_window_budget_check(4, 20000, 8, 32767).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("k_max for this bundle is 1"),
+            "the refusal carries k_max: {msg}"
+        );
+        assert!(
+            msg.contains("exceeds the response-tag budget"),
+            "the refusal names the pool it judged against: {msg}"
+        );
+        // k=0 carries nothing — the caller's wiring bug is refused at window_begin,
+        // and the budget must not invent a second opinion about it.
+        decode_window_budget_check(0, 20000, 8, 32767).expect("zero steps lease zero tags");
     }
 }
