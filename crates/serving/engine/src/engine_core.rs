@@ -3193,6 +3193,14 @@ mod tests {
     /// A stop mid-window keeps the longest prefix: the window resolves all k positions, the
     /// commit appends token by token and drops everything past the first token that finishes
     /// the request — the same truncation a verify step performs on accepted drafts.
+    ///
+    /// This assert is also #603 PR3b §5's prefix-cache gate, and it is the WHOLE gate:
+    /// `append_output_token_ids` is the one writer of both `output_token_ids` and
+    /// `all_token_ids` — the field every block hash is computed over — so a token
+    /// absent from the ids below cannot reach a hash. (No cache-side test is added for
+    /// this: a lookup by a real continuation can never hash-match a dropped token, so
+    /// hit/miss observables are identical whether or not the discard held. The ids are
+    /// where the law lives.)
     #[test]
     fn a_stop_mid_window_keeps_the_longest_prefix() {
         let mut worker = PositionalExecutor::default();
@@ -3234,6 +3242,12 @@ mod tests {
     /// — must degrade to sequential decode, never stall or corrupt: the commit rewinds the
     /// unfed positions exactly as it does for rejected drafts, and the next window attaches
     /// at the position the request actually reached.
+    ///
+    /// That extent assert is #603 PR3b §5's re-run gate at the engine's grain: the next
+    /// window starts at the same position, and the worker binds each of its steps at
+    /// `start + i` — the same affine position expression the k=1 step uses — so the
+    /// re-run rewrites the same KV slots and overwrites the uncommitted rows rather
+    /// than reading them.
     #[test]
     fn an_all_rejecting_window_degrades_to_sequential_decode() {
         let mut engine = EngineCore::new(window_config(256, 4), Box::new(NoopExecutor::new(1024)));

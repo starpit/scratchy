@@ -2567,12 +2567,15 @@ pub(crate) fn run_request_step(
     if p_last + 1 >= tokens.prompt_len(id) {
         // ⭐⭐⭐⭐⭐ THE WINDOW'S COMMIT (#603 PR3b): all k tokens at once, in step
         // order — the engine's verify algebra reads exactly this shape (k outputs
-        // over k−1 placeholder drafts ⇒ accepted = k−1 ⇒ nothing rewinds; a stop
-        // mid-window keeps the longest prefix by the existing truncation, and the
-        // tokens past it are never appended because they never leave this fn).
-        // The store gets every token so the NEXT step's position `start` reads a
-        // real one; their KV rows landed at affine slots and were recorded once,
-        // with the extent, below the chunk loop.
+        // over k−1 placeholder drafts ⇒ accepted = k−1 ⇒ nothing rewinds). The
+        // store gets every token, and an un-stopped window commits every one; on
+        // a stop mid-window the tokens past it DO leave this fn and DO enter the
+        // store — the ENGINE's commit loop is what drops them, appending token by
+        // token and breaking at the stop, so they never reach the request's
+        // output ids and therefore never reach the response or a block hash
+        // (§5's discard gate; the engine's stop test pins the kept prefix). Their
+        // KV rows landed at affine slots and were recorded once, with the extent,
+        // below the chunk loop.
         if let Some(ids) = window_ids {
             for t in &ids {
                 tokens.push_generated(id, *t);
