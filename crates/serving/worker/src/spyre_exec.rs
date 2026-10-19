@@ -488,7 +488,11 @@ impl Worker for SpyreWorker {
         }
 
         let mut order: Vec<String> = Vec::new();
-        let mut sampled: Vec<Option<u32>> = Vec::new();
+        // ⭐⭐⭐⭐⭐ ONE ENTRY PER REQUEST, AS MANY TOKENS AS THE STEP RESOLVED (#603
+        // PR3b): `None` for an intermediate prefill chunk, one token for every step
+        // the k=1 paths answer, and k tokens for a decode window — the verify shape
+        // the engine's commit algebra already reads.
+        let mut sampled: Vec<Option<Vec<u32>>> = Vec::new();
 
         // New requests = (chunked) prefill: register the prompt + empty KV cache.
         for nr in &scheduler_output.scheduled_new_reqs {
@@ -579,7 +583,8 @@ impl Worker for SpyreWorker {
             sampled.push(s);
         }
 
-        // Cached requests = decode (n=1) or a prefill-continuation chunk.
+        // Cached requests = decode (n=1), a decode WINDOW (n=k, #603 PR3b), or a
+        // prefill-continuation chunk.
         let cr = &scheduler_output.scheduled_cached_reqs;
         // ⭐ INSTALL THE STEP'S BLOCK GRANT FOR EVERY CACHED REQUEST, BEFORE ANY OF THEM FORWARD, and
         // in the scheduler's own indexing — `new_block_ids[i]` belongs to `req_ids[i]`, and a resumed
@@ -1626,12 +1631,25 @@ impl Worker for SpyreWorker {
         // with a positive control (`the_hole_counter_moves_when_the_hosts_blocks_stop_short_of_the_write_page`)
         // before any zero from it was believed.
         // One sampled token per request, in processing order; intermediate
-        // prefill chunks (None) carry no token.
-        let tokens: Vec<u32> = sampled.iter().map(|s| s.unwrap_or(0)).collect();
+        // prefill chunks (None) carry no token. A WINDOW's request carries its k
+        // tokens — the entry is overwritten wholesale below, because
+        // `from_ordered` builds a one-token-per-request shape and the window's
+        // is the per-request Vec the engine's verify algebra reads.
+        let tokens: Vec<u32> = sampled
+            .iter()
+            .map(|s| s.as_ref().and_then(|v| v.first().copied()).unwrap_or(0))
+            .collect();
         let mut out = ModelRunnerOutput::from_ordered(order, tokens);
         for (idx, s) in sampled.iter().enumerate() {
-            if s.is_none() {
-                out.sampled_token_ids[idx].clear();
+            match s {
+                None => out.sampled_token_ids[idx].clear(),
+                // ⭐⭐⭐⭐⭐ THE WINDOW'S k TOKENS (#603 PR3b): the engine counts
+                // `len − 1` accepted over the k−1 placeholder drafts, so nothing
+                // rewinds on a full window and a stop mid-window keeps the longest
+                // prefix by the existing truncation — the commit algebra closes
+                // unchanged because the SHAPE is the verify step's own.
+                Some(v) if v.len() > 1 => out.sampled_token_ids[idx] = v.clone(),
+                _ => {}
             }
         }
         // ⭐ REPORT WHAT THIS STEP DID TO EVERY LIVE REQUEST'S KV — the span its blocks must cover and

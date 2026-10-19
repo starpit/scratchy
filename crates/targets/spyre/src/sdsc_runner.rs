@@ -627,6 +627,44 @@ impl SuperDscSession {
             .predict_token(NewTokens(n_new as i64), SeqPos(seq_pos as i64))
     }
 
+    /// ⭐⭐⭐⭐⭐ OPEN A k-STEP DECODE WINDOW (#603 PR3b) — the runner's door on
+    /// [`Executor::window_begin`]. The caller drives exactly k ×
+    /// [`Self::run_window_step`] then [`Self::run_window_finish`]; between those,
+    /// NOTHING host-side touches the stream.
+    pub fn run_window_begin(&mut self, k: usize) -> Result<()> {
+        self.exec.window_begin(k)
+    }
+
+    /// ⭐⭐⭐⭐⭐ ONE STEP OF THE OPEN WINDOW (#603 PR3b) — [`Self::run_step_token`]'s
+    /// twin: the SAME bind loop over the same three channels, then
+    /// [`Executor::window_step`] instead of `predict_token` — no readback, no
+    /// synchronize, no return value. The token this step produced is read once,
+    /// with all the others, by [`Self::run_window_finish`].
+    ///
+    /// ⛔ THE CALLER'S ROW CONTRACT: an ahead-step binds NO embedding row — the
+    /// composite's device-side gather wrote it (§1.2's chain), and an H2D staged
+    /// from a placeholder id would OVERWRITE the gather's row after it (the queue
+    /// is FIFO). The caller filters the row from the step's binds; the runner does
+    /// not, because the runner cannot tell which activation is the row (the tape
+    /// can, and the tape is the caller's).
+    pub fn run_window_step(
+        &mut self,
+        seq_pos: usize,
+        activations: &[crate::wiring::Bind],
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+    ) -> Result<()> {
+        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.exec.window_step(SeqPos(seq_pos as i64))
+    }
+
+    /// ⭐⭐⭐⭐⭐ RETIRE THE OPEN WINDOW (#603 PR3b) — [`Executor::window_finish`]:
+    /// the ONE synchronize, the k sentinel-checked words, the epilogue. The pool
+    /// stays for the session.
+    pub fn run_window_finish(&mut self) -> Result<Vec<u32>> {
+        self.exec.window_finish()
+    }
+
     /// The bind loop every step runs before its forward — the three channels
     /// (`run_step_inner`'s own, extracted when the token step needed the identical body):
     /// f32 narrowed to f16 at the boundary, already-f16 bytes as-is, and RAW LE int32
