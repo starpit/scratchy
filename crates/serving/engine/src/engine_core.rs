@@ -697,6 +697,98 @@ impl EngineCore {
         req_ids
     }
 
+    /// ⭐ #603 PR3b — attach the decode window's k−1 placeholder positions for the sole running
+    /// request's next step.
+    ///
+    /// The window rides the scheduler's existing speculative-decode channel, which is the whole
+    /// trick: k−1 placeholder spec ids make the next `schedule()` compute
+    /// `num_new_tokens = num_tokens_with_spec + placeholders − num_computed = k`, allocate k
+    /// slots, and hand the worker `scheduled_spec_decode_tokens = k−1` placeholders — the exact
+    /// shape a draft-model verify step has. The worker then resolves all k positions in ONE
+    /// device visit (its composite argmax chain feeding each step's row to the next), and the
+    /// commit algebra in `update_from_output` closes unchanged: a full window returns k tokens,
+    /// `num_accepted = k−1 = num_draft_tokens`, so `num_rejected = 0` and nothing rewinds,
+    /// while the kept-truncation loop already drops tokens past the first one that finishes
+    /// the request. A worker that returns FEWER tokens than positions scheduled (the
+    /// all-reject shape, e.g. an executor without the chain) rewinds exactly as a verify step
+    /// with rejected drafts does — the window degrades to sequential decode, never corrupts.
+    ///
+    /// ⛔ EVERY CONJUNCT IS A DESIGN RULING (§1.6, §4.4–§4.7), NOT A TUNING KNOB:
+    /// * `max_decode_window <= 1` — metal and cuda declare 1, and at 1 no placeholder is ever
+    ///   attached: the step sequence is today's, byte for byte.
+    /// * `proposer.is_none()` — the window IS this engine's speculative decoding for backends
+    ///   without a drafter; a proposer owns the spec channel and the two never compose.
+    /// * exactly one running request, nothing waiting — a batched step may carry the request at
+    ///   k positions, but the worker takes its sequential path for a batch (§4.6), so the
+    ///   window attaches only when the next step is guaranteed solo.
+    /// * `!is_prefill_chunk` — the next step decodes at generated positions; a window never
+    ///   rides a prefill chunk.
+    /// * `sampling_params.is_greedy()` — the device chain feeds each step's argmax to the next
+    ///   step's input row, which is only the sampled token when sampling IS argmax (§4.5).
+    /// * no grammar, no `mm_data` — both need the host between steps (the same on-device
+    ///   conjuncts [`Self::mark_pipeline`] checks for head drafting).
+    ///
+    /// The cap is CLIPPED, never raised, by the two edges the device cannot cross mid-window:
+    /// * PAGE EDGE — the step that opens a KV page (`pos % block_size == 0`) walks a different
+    ///   image (the replay player refuses page boundaries), so the window ENDS BEFORE the next
+    ///   boundary, and a window that would START on one runs that step alone at k=1 (§4.1).
+    /// * OUTPUT BUDGET — the window may not run past `max_tokens`: it clips to the request's
+    ///   remaining outputs, and at one remaining token the step stays k=1 (the near-max_tokens
+    ///   shrink, §1.7).
+    ///
+    /// A preempt between here and the next `schedule()` clears the spec ids (§4.4): the request
+    /// resumes at k=1 — the safe degradation, never a wrong window. In the async loop a
+    /// windowed step is speculative, so nothing pre-schedules behind it: v1's once-per-window
+    /// resolve pacing, by the existing `is_speculative()` gate.
+    fn attach_decode_window(&mut self) {
+        if self.max_decode_window <= 1 || self.proposer.is_some() {
+            return;
+        }
+        let (num_running, num_waiting) = self.scheduler.get_request_counts();
+        if num_running != 1 || num_waiting != 0 {
+            return;
+        }
+        // Counts say one running and nothing waiting, so the unfinished list names it.
+        let Some(req_id) = self
+            .scheduler
+            .get_unfinished_request_ids()
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let Some(request) = self.scheduler.get_request(&req_id) else {
+            return;
+        };
+        if request.status.is_finished()
+            || request.is_prefill_chunk
+            || !request.spec_token_ids.is_empty()
+            || !request.sampling_params.is_greedy()
+            || request.sampling_params.guided_grammar.is_some()
+            || request.mm_data.is_some()
+        {
+            return;
+        }
+        // The window's steps sit at `start .. start + k`: `start` is the row the next step
+        // feeds (`num_computed_tokens`, which lags `num_tokens` by exactly the one generated
+        // token not yet fed — steady decode).
+        let start = request.num_computed_tokens as usize;
+        let remaining =
+            (request.max_tokens as usize).saturating_sub(request.output_token_ids.len());
+        // Page-edge clip: the window holds no position ≡ 0 (mod block_size). A window that
+        // would start on one runs that step alone; otherwise it ends before the next boundary.
+        let into_page = start % self.block_size;
+        let to_page_edge = if into_page == 0 {
+            1
+        } else {
+            self.block_size - into_page
+        };
+        let k = self.max_decode_window.min(remaining).min(to_page_edge);
+        if k > 1 {
+            self.scheduler.set_spec_token_ids(&req_id, vec![0; k - 1]);
+        }
+    }
+
     /// A step done — finalized or failed: the step behind it waits on it no more.
     fn end_lead(&mut self, sched: &SchedulerOutput) {
         if sched.spec_pipeline.leads {
@@ -807,6 +899,11 @@ impl EngineCore {
                 self.scheduler.set_spec_token_ids(&req_id, drafts);
             }
         }
+
+        // 4.5. Attach the decode window's placeholder positions for the next step (#603
+        //     PR3b). Self-guarding: nothing to do at k=1 (every backend but a windowing one)
+        //     or when a proposer owns the spec channel.
+        self.attach_decode_window();
 
         // 5. Compute spec decode metrics.
         let spec_decode_stats = if !scheduler_output.scheduled_spec_decode_tokens.is_empty() {
@@ -2844,5 +2941,384 @@ mod tests {
         let step = engine.schedule_next().unwrap();
         assert!(step.recurrent_state.is_empty());
         assert_eq!(step.num_scheduled_tokens["r1"], 600);
+    }
+
+    // -----------------------------------------------------------------------
+    // #603 PR3b — the decode window
+    // -----------------------------------------------------------------------
+
+    /// A window worker's full-accept shape: a step resolves one token for the position the
+    /// request had already reached (the prefill's last prompt token, or the previous step's
+    /// output) plus one per draft it carries — `1 + scheduled_spec_decode_tokens[req]`, the
+    /// verify-step contract. [`NoopExecutor`] is the other shape (one token per request, all
+    /// drafts rejected); a window engine must stay correct under both. Unscripted positions
+    /// emit sequential token ids; a request's script, when it has one, is consumed first —
+    /// for stopping mid-window at a chosen token.
+    #[derive(Default)]
+    struct PositionalExecutor {
+        next_id: u32,
+        script: HashMap<String, VecDeque<u32>>,
+    }
+
+    impl PositionalExecutor {
+        /// Emit `token` as this request's next output token.
+        fn says(&mut self, req_id: &str, token: u32) -> &mut Self {
+            self.script
+                .entry(req_id.to_string())
+                .or_default()
+                .push_back(token);
+            self
+        }
+    }
+
+    impl Executor for PositionalExecutor {
+        fn execute_model(
+            &mut self,
+            scheduler_output: &SchedulerOutput,
+        ) -> EngineResult<ModelRunnerOutput> {
+            let n = scheduler_output.num_scheduled_tokens.len();
+            let mut req_ids = Vec::with_capacity(n);
+            let mut req_id_to_index = HashMap::with_capacity(n);
+            let mut sampled_token_ids = Vec::with_capacity(n);
+            for (i, req_id) in scheduler_output.num_scheduled_tokens.keys().enumerate() {
+                req_id_to_index.insert(req_id.clone(), i);
+                req_ids.push(req_id.clone());
+                let drafts = scheduler_output
+                    .scheduled_spec_decode_tokens
+                    .get(req_id)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                let tokens: Vec<u32> = (0..=drafts)
+                    .map(|_| match self.script.get_mut(req_id) {
+                        Some(q) if !q.is_empty() => q.pop_front().unwrap(),
+                        _ => {
+                            self.next_id += 1;
+                            self.next_id - 1
+                        }
+                    })
+                    .collect();
+                sampled_token_ids.push(tokens);
+            }
+            Ok(ModelRunnerOutput {
+                req_ids,
+                req_id_to_index,
+                sampled_token_ids,
+                ..ModelRunnerOutput::empty()
+            })
+        }
+        fn initialize_cache(&mut self, _: usize, _: usize) -> EngineResult<()> {
+            Ok(())
+        }
+        fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
+            Ok(vec![8 << 30])
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    fn window_config(block_size: usize, max_decode_window: usize) -> EngineCoreConfig {
+        EngineCoreConfig {
+            block_size,
+            max_decode_window,
+            ..make_test_config()
+        }
+    }
+
+    fn greedy_request(id: &str, prompt_len: usize, max_tokens: u32) -> Request {
+        Request::new(
+            id.to_string(),
+            (0..prompt_len as u32).collect(),
+            SamplingParams {
+                max_tokens: Some(max_tokens),
+                temperature: 0.0,
+                ..Default::default()
+            },
+            0.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    /// At a declared window of 1 — metal's and cuda's — the step sequence is today's: no
+    /// placeholder is ever attached, every decode step schedules exactly one position, and
+    /// none of the window machinery so much as runs. §1.7's byte-for-byte guarantee.
+    #[test]
+    fn a_window_of_one_is_today_s_step() {
+        let mut engine = EngineCore::new(
+            window_config(16, 1),
+            Box::new(PositionalExecutor::default()),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        for _ in 0..10 {
+            let step = engine.schedule_next().unwrap();
+            assert_eq!(step.num_scheduled_tokens["a"], 1, "one position per step");
+            assert!(
+                step.scheduled_spec_decode_tokens.is_empty(),
+                "no placeholder ever rides"
+            );
+            let out = executor.execute_model(&step).unwrap();
+            engine.finalize_step(&step, &out);
+            assert!(
+                engine
+                    .scheduler
+                    .get_request("a")
+                    .unwrap()
+                    .spec_token_ids
+                    .is_empty(),
+                "nothing left attached"
+            );
+        }
+    }
+
+    /// A greedy, sole, decoding request on a windowing backend takes k positions in one
+    /// step: the prefill's finalize attaches k−1 placeholders, the next schedule computes
+    /// k, the worker resolves all k, and the commit keeps every one — accepted = drafts,
+    /// so nothing rewinds and the request's history grows by the full window.
+    #[test]
+    fn a_sole_greedy_decode_step_attaches_the_window() {
+        let mut engine = EngineCore::new(
+            window_config(256, 4),
+            Box::new(PositionalExecutor::default()),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        assert_eq!(prefill.num_scheduled_tokens["a"], 5);
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+
+        let window = engine.schedule_next().unwrap();
+        assert_eq!(
+            window.num_scheduled_tokens["a"], 4,
+            "k positions in one step"
+        );
+        assert_eq!(
+            window.scheduled_spec_decode_tokens["a"],
+            [0, 0, 0],
+            "k−1 placeholder drafts"
+        );
+        let out = executor.execute_model(&window).unwrap();
+        assert_eq!(out.get_tokens("a").unwrap().len(), 4);
+        engine.finalize_step(&window, &out);
+
+        // Steady state: one prefill token plus the window's four, computed lags tokens by
+        // exactly the one generated token not yet fed, and the next window attaches again.
+        let r = engine.scheduler.get_request("a").unwrap();
+        assert_eq!(r.output_token_ids.len(), 5);
+        assert_eq!(r.num_computed_tokens as usize, r.num_tokens() - 1);
+        let next = engine.schedule_next().unwrap();
+        assert_eq!(next.num_scheduled_tokens["a"], 4);
+    }
+
+    /// The window ends before the page edge: positions are clipped so none opens a KV page
+    /// (a page-opening step walks a different image and runs alone at k=1), and the window
+    /// is full again inside the next page.
+    #[test]
+    fn the_window_ends_before_the_page_edge_and_walks_alone() {
+        let mut engine =
+            EngineCore::new(window_config(8, 4), Box::new(PositionalExecutor::default()));
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        // Next start is 5; the page edge at 8 clips the window to positions 5..7.
+        let clipped = engine.schedule_next().unwrap();
+        assert_eq!(
+            clipped.num_scheduled_tokens["a"], 3,
+            "clipped at the page edge"
+        );
+        let out = executor.execute_model(&clipped).unwrap();
+        engine.finalize_step(&clipped, &out);
+        // Next start is 8 — the page-opening step runs alone.
+        let boundary = engine.schedule_next().unwrap();
+        assert_eq!(boundary.num_scheduled_tokens["a"], 1, "the walk runs alone");
+        assert!(boundary.scheduled_spec_decode_tokens.is_empty());
+        let out = executor.execute_model(&boundary).unwrap();
+        engine.finalize_step(&boundary, &out);
+        // Next start is 9, seven inside the page: the full window returns.
+        let full = engine.schedule_next().unwrap();
+        assert_eq!(full.num_scheduled_tokens["a"], 4);
+    }
+
+    /// The window never runs past `max_tokens`: it clips to the request's remaining output
+    /// budget, and the step that takes the last token is k=1 — the request then finishes at
+    /// exactly its budget, by length.
+    #[test]
+    fn the_window_shrinks_to_the_remaining_output_budget() {
+        let mut engine = EngineCore::new(
+            window_config(256, 4),
+            Box::new(PositionalExecutor::default()),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 6));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        // One prefill token out; five remain, so the first window is the full 4.
+        let window = engine.schedule_next().unwrap();
+        assert_eq!(window.num_scheduled_tokens["a"], 4);
+        let out = executor.execute_model(&window).unwrap();
+        engine.finalize_step(&window, &out);
+        // Five tokens out, one remains: k=1, no placeholders.
+        let last = engine.schedule_next().unwrap();
+        assert_eq!(
+            last.num_scheduled_tokens["a"], 1,
+            "one token of budget left"
+        );
+        assert!(last.scheduled_spec_decode_tokens.is_empty());
+        let out = executor.execute_model(&last).unwrap();
+        engine.finalize_step(&last, &out);
+        let r = engine
+            .scheduler
+            .get_request("a")
+            .expect("cleared on the next schedule");
+        assert_eq!(r.output_token_ids.len(), 6, "exactly the budget");
+        assert!(
+            r.status.is_finished(),
+            "the request finished with its budget"
+        );
+        assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    /// A second schedule member collapses the window: with two requests running, no
+    /// placeholder is attached and the batched step decodes both at one position each.
+    #[test]
+    fn a_second_request_collapses_the_window() {
+        let mut engine = EngineCore::new(
+            window_config(256, 4),
+            Box::new(PositionalExecutor::default()),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        engine.add_request(greedy_request("b", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        assert_eq!(prefill.num_scheduled_tokens.len(), 2);
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        for _ in 0..5 {
+            let step = engine.schedule_next().unwrap();
+            assert_eq!(
+                step.num_scheduled_tokens["a"], 1,
+                "a batched step takes no window"
+            );
+            assert_eq!(step.num_scheduled_tokens["b"], 1);
+            assert!(step.scheduled_spec_decode_tokens.is_empty());
+            let out = executor.execute_model(&step).unwrap();
+            engine.finalize_step(&step, &out);
+        }
+    }
+
+    /// A request whose sampling is not argmax never windows: the device chain feeds each
+    /// step's argmax to the next step's input row, which is only the sampled token when
+    /// sampling IS argmax (§4.5).
+    #[test]
+    fn a_sampled_request_never_windows() {
+        let mut engine = EngineCore::new(
+            window_config(256, 4),
+            Box::new(PositionalExecutor::default()),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(Request::new(
+            "a".to_string(),
+            vec![0, 1, 2, 3, 4],
+            SamplingParams {
+                max_tokens: Some(50),
+                temperature: 1.0,
+                ..Default::default()
+            },
+            0.0,
+            0,
+            0,
+            None,
+        ));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        for _ in 0..5 {
+            let step = engine.schedule_next().unwrap();
+            assert_eq!(step.num_scheduled_tokens["a"], 1);
+            assert!(step.scheduled_spec_decode_tokens.is_empty());
+            let out = executor.execute_model(&step).unwrap();
+            engine.finalize_step(&step, &out);
+        }
+    }
+
+    /// A stop mid-window keeps the longest prefix: the window resolves all k positions, the
+    /// commit appends token by token and drops everything past the first token that finishes
+    /// the request — the same truncation a verify step performs on accepted drafts.
+    #[test]
+    fn a_stop_mid_window_keeps_the_longest_prefix() {
+        let mut worker = PositionalExecutor::default();
+        worker.says("a", 100); // the prefill's token
+        worker.says("a", 42); // the window's first token: the EOS
+        worker.says("a", 7); // past the stop — must be dropped
+        worker.says("a", 8);
+        worker.says("a", 9);
+        let mut engine = EngineCore::new(
+            EngineCoreConfig {
+                eos_token_ids: vec![42],
+                ..window_config(256, 4)
+            },
+            Box::new(worker),
+        );
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        let window = engine.schedule_next().unwrap();
+        assert_eq!(window.num_scheduled_tokens["a"], 4);
+        let out = executor.execute_model(&window).unwrap();
+        engine.finalize_step(&window, &out);
+        let r = engine
+            .scheduler
+            .get_request("a")
+            .expect("cleared on the next schedule");
+        assert_eq!(
+            r.output_token_ids,
+            [100, 42],
+            "the kept prefix, nothing past the stop"
+        );
+        assert!(r.status.is_finished(), "the request stopped");
+        assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    /// A worker that resolves fewer tokens than the window scheduled — the all-reject shape
+    /// — must degrade to sequential decode, never stall or corrupt: the commit rewinds the
+    /// unfed positions exactly as it does for rejected drafts, and the next window attaches
+    /// at the position the request actually reached.
+    #[test]
+    fn an_all_rejecting_window_degrades_to_sequential_decode() {
+        let mut engine = EngineCore::new(window_config(256, 4), Box::new(NoopExecutor::new(1024)));
+        let mut executor = engine.take_executor().unwrap();
+        engine.add_request(greedy_request("a", 5, 50));
+        let prefill = engine.schedule_next().unwrap();
+        let out = executor.execute_model(&prefill).unwrap();
+        engine.finalize_step(&prefill, &out);
+        for step_no in 0..5 {
+            let step = engine.schedule_next().unwrap();
+            assert_eq!(
+                step.num_scheduled_tokens["a"], 4,
+                "the window attaches every step"
+            );
+            let out = executor.execute_model(&step).unwrap();
+            engine.finalize_step(&step, &out);
+            let r = engine.scheduler.get_request("a").unwrap();
+            assert_eq!(
+                r.output_token_ids.len(),
+                2 + step_no,
+                "exactly one token per rejecting step"
+            );
+            assert_eq!(
+                r.num_computed_tokens as usize,
+                r.num_tokens() - 1,
+                "no stall: the request stays caught up"
+            );
+        }
     }
 }
