@@ -24,8 +24,6 @@
 
 use std::path::PathBuf;
 
-use ktir_superdsc::ktir_node::Program;
-use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
 use triton_frontend::{codegen, opt};
 
@@ -99,68 +97,12 @@ fn main() {
         println!("{}", triton_ktir_superdsc::dump(&node));
     }
 
-    // THE MODEL-GEOMETRY CONST DOOR. `emit_node` refuses `Program::{Rope, Attn}` ON PURPOSE: their
-    // bodies are monomorphised on the head geometry (`rope_at::<HD>`, `attn_at::<NQH, NKVH, HD>`),
-    // which is a CONST parameter, so no runtime `Program` can reach them and defaulting the geometry
-    // would make a wrong head count a silently wrong grouping. `drive_rope` takes it explicitly.
-    //
-    // The values come from the fixture's OWN `tl.constexpr`s -- the same numbers the kernel was
-    // compiled against on the leg above, not a second statement of them that could drift.
-    if program == Program::Rope {
-        let ce = |k: &str| match kspec.constexprs.get(k) {
-            Some(Val::Int(v)) => u32::try_from(*v)
-                .map_err(|_| format!("`{k}` = {v} does not fit the geometry's u32")),
-            _ => Err(format!(
-                "`{k}` is not an integer tl.constexpr of this configuration"
-            )),
-        };
-        let (hd, h, n_tok) = match (ce("HEAD_DIM"), ce("H"), ce("N_TOK")) {
-            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => refused!("constexpr", e),
-        };
-        // ⛔⛔⛔ THE ROW ORDER IS STATED, NOT INFERRED, AND IT CANNOT BE INFERRED. A roped plane is
-        // `[mq·heads, hd]` under BOTH orders -- same shape, same element count, same footprint -- so
-        // no shape check, no arrangement check and no footprint guard separates them, and the wrong
-        // one places every (row, head) block at another block's address and reports success. See
-        // `RopeRows`, which carries the five lines of `KtirFunc::rope` that settle it.
-        //
-        // TOKEN-major is what `rope_at` addresses. `KTIR_ROPE_ROWS=head-major` states the other one,
-        // so "would the wrong order have been caught?" stays a question THIS binary answers rather
-        // than a claim about a guard nobody fired.
-        let rows = match std::env::var("KTIR_ROPE_ROWS").as_deref() {
-            Ok("head-major") => triton_ktir_superdsc::RopeRows::HeadMajor,
-            _ => triton_ktir_superdsc::RopeRows::TokenMajor,
-        };
-        let layout = match triton_ktir_superdsc::layout::for_node(&node) {
-            Ok(l) => l,
-            Err(e) => refused!(e.stage, e.message),
-        };
-        // `rows_are_requests` is false: these are prefill token rows, not one row per decode request.
-        match triton_ktir_superdsc::drive_rope(&node, hd, n_tok, h * hd, rows, false, Some(&layout))
-        {
-            Err(e) => refused!(e.stage, e.message),
-            Ok(ops) => match triton_ktir_superdsc::bake::write_dir(&out_dir, &ops) {
-                Err(e) => refused!("bake", e),
-                Ok(w) => {
-                    // ⛔ THE LAUNCH MAP TOO, or this bake cannot be run. The other two arms write it
-                    // and this one did not, so a rope baked 35 descriptors and then had no
-                    // `placements.json` for the launcher to bind against — the bake looked like a
-                    // success and was unrunnable. Same call, same reason as the whole-function arm.
-                    if let Err(e) = triton_ktir_superdsc::bake::write_placements(&out_dir, &layout)
-                    {
-                        refused!("bake", e);
-                    }
-                    println!(
-                        "BAKED    {config:24} {:<12} drive_rope: ops={} files={}",
-                        "",
-                        ops.len(),
-                        w.len()
-                    );
-                    return;
-                }
-            },
-        }
-    }
+    // ⛔ ROPE HAS NO MODEL-GEOMETRY ARM HERE, ON PURPOSE — the same ruling attention already
+    // carries below. `drive_rope`/`rope_at::<HD>` (the monomorphised, hand-written rope body
+    // keyed on the fixture's constexpr geometry) is deleted: rope's compiled ops lower through
+    // the WHOLE-FUNCTION door (`KTIR_WHOLE=1`) like every other kernel, one op at a time, with
+    // the band lift resolving the per-core uniform corners and the pointwise emission carrying
+    // the rotate-half pairs' unequal per-operand column windows. Do not re-add a geometry arm.
 
     // ⛔ ATTENTION HAS NO MODEL-GEOMETRY ARM HERE, ON PURPOSE. There used to be a `KTIR_ATTN=1`
     // door that recognised `Program::Attn` and slotted in `attn_at::<NQH, NKVH, HD>`'s fragment

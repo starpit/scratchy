@@ -11,10 +11,9 @@
 //! ⛔ THAT ARM SET IS THE CONSUMER'S MODEL INVENTORY, SO A LEAF CRATE MUST NOT OWN IT. It cannot be
 //! received as data either — the whole point is that the values become `const` parameters, i.e. a
 //! MONOMORPHISATION site. So the crate exposes
-//! [`attn_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::attn_at)`::<NQH, NKVH, HD>` and
-//! [`rope_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::rope_at)`::<HD>` as public generic entry
-//! points and THE CALLER CROSSES THE DOOR. A third-party KTIR producer instantiates them from its
-//! own configs; every build-time refusal here (a geometry with no arm is a loud bake error citing
+//! [`attn_at`](ktir_superdsc::emit::lower_ktir_to_superdsc::attn_at)`::<NQH, NKVH, HD>` as a public
+//! generic entry point and THE CALLER CROSSES THE DOOR. A third-party KTIR producer instantiates it
+//! from its own configs; every build-time refusal here (a geometry with no arm is a loud bake error citing
 //! `geometry_sources()`) is unchanged.
 //!
 //! ⭐⭐ AND THAT IS ALSO WHY THE MODEL'S AND THE BUNDLE'S OWN FACTS LIVE HERE. [`BundleAttnParams`] is
@@ -25,16 +24,16 @@
 //! attention; the leaf crate now reads the six operand identities and the resident capacity out of the
 //! program itself (`attn_operands`) and takes these four from whoever crossed the door.
 //!
-//! ⛔ THE TWO NEWTYPES BELOW ARE THE ORPHAN RULE, NOT A DESIGN. `OnAttnGeometry`/`OnHeadDim` are
-//! `scratchy-subtile`'s traits and `AttnAt`/`RopeAt` are `ktir-superdsc`'s structs — neither is
-//! local, so the impls need a type of THIS crate's own to hang on. They carry no logic: each wraps
-//! the crate's argument pack and hands it straight to the generic entry point.
+//! ⛔ THE NEWTYPE BELOW IS THE ORPHAN RULE, NOT A DESIGN. `OnAttnGeometry` is
+//! `scratchy-subtile`'s trait and `AttnAt` is `ktir-superdsc`'s struct — neither is
+//! local, so the impl needs a type of THIS crate's own to hang on. It carries no logic: it wraps
+//! the crate's argument pack and hands it straight to the generic entry point. (There was a second
+//! one, for rope's `OnHeadDim`; it is deleted with the rope geometry arm — see the `Program::Rope`
+//! dispatch.)
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{
-    Error, Region, attn_at, err, regions, rope_at, split_out,
-};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, attn_at, regions, split_out};
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -71,8 +70,8 @@ pub struct BundleAttnParams {
     /// one graph carries TWO and no per-bundle value can describe both. The program's own views state
     /// the geometry of the attention they compute (`q`'s view is `[mq, nqh·hd]`, a kv stream's is
     /// `[·, nkvh·hd]`, and its first access tile on `q` is `hd` wide), so the door MINTS the geometry
-    /// there — the same reading rope already does for its head dim, and the same direction the scale,
-    /// `mq` and the swept extent all took: facts the program states are read from the program, and a
+    /// there — the same direction the scale, `mq` and the swept extent all took: facts the program
+    /// states are read from the program, and a
     /// fact only the caller knows stays a caller's argument. The row KIND is the one that stays: no
     /// program states it, for the reason its own comment gives.
     pub rows_are_requests: bool,
@@ -159,8 +158,8 @@ pub struct BundleAttnParams {
 /// parameter nothing reads is a lie about behavior, and the follow-up that threads the dedup
 /// adds it where it is consumed.
 ///
-/// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the two bodies whose
-/// device laws need a fact no program states.
+/// `attn_params` is [`BundleAttnParams`] — main's own remaining parameters, for the attention
+/// body's device laws, which need a fact no program states.
 pub fn lower(
     k: &KtirNode,
     sym_id_base: &mut i64,
@@ -208,8 +207,8 @@ pub fn lower(
             k,
             layout,
             sym_id_base,
-            // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the rope/attn
-            // arms read: the o matmul's weight tid, named per bundle by the dataflow walk. Every
+            // ⭐ THE HEAD-MAJOR SWAP'S DOOR FACT, from the same `BundleAttnParams` the attn arm
+            // reads: the o matmul's weight tid, named per bundle by the dataflow walk. Every
             // other matmul of the bundle (q/k/v, mlp, lm_head) carries a tid the fact does not
             // name, so it keeps its own staged weight — the swap is keyed on the operand's
             // identity, never a shape. ⛔ A handoff without an `oproj_wtid` is a malformed bundle
@@ -233,10 +232,18 @@ pub fn lower(
         // arm keys on the stated `Program` and refuses a copy that grew a compute op rather than
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
-        Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
+        // ⛔ ROPE HAS NO MODEL-GEOMETRY DOOR, ON PURPOSE — the same ruling attention's whole-door
+        // cases already carry. The hand-rolled `rope_at::<HD>` body (the monomorphised rotate-half
+        // matmul over the reserved P table, keyed on the fixture's constexpr geometry) is deleted:
+        // rope's compiled ops lower through the whole-function door like every other kernel — the
+        // band lift resolves the per-core uniform corners and the pointwise emission carries the
+        // rotate-half pairs' unequal per-operand column windows. The layout's rotate-matrix
+        // placement went with it: no op of the compiled body names `ROPE_P_TID`. Do not re-add a
+        // geometry arm.
+        Program::Rope => lower_function(k, layout, sym_id_base, None),
         Program::Attn => attn(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
-        // program states and by nothing about the model, so the arm is the body — unlike `rope`/`attn`
+        // program states and by nothing about the model, so the arm is the body — unlike `attn`
         // above, whose head geometry has to become const generics on this side.
         Program::Transpose => lk::transpose(name, &r, sym_id_base, layout),
     }
@@ -386,206 +393,6 @@ fn attn(
              the head dim parameterise the device layout (GQA grouping, slabs, head strides), so \
              they must be consts, not values. The instantiations are read from the model configs in \
              scope ({}); this geometry belongs to none of them.",
-            scratchy_subtile::model_geometry::geometry_sources(),
-        ),
-    })?
-}
-
-/// The orphan-rule carrier for [`lk::RopeAt`] — see the module header.
-struct RopeAt<'a>(lk::RopeAt<'a>);
-
-impl scratchy_subtile::model_geometry::OnHeadDim for RopeAt<'_> {
-    type Out = Result<Vec<EmittedOp>, Error>;
-    fn on_head_dim<const HD: u32>(self) -> Self::Out {
-        rope_at::<HD>(self.0)
-    }
-}
-
-/// ⭐ THE DOOR. main's `lower_rope_node` read `mq`/`total` off a `TileOp` built from the node and its
-/// operand names off `ds_name`. `total` is the node's declared output width and `mq` its row count —
-/// both carried on [`KtirNode::out_shape`], because the program states only their product with
-/// `heads` (see that field). The head dim is the `x` view's own column extent, and it becomes the
-/// const generic through the SAME door main crossed.
-fn rope(
-    name: &str,
-    r: &[Region],
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let (ins, out) = split_out(name, r, layout, 3)?;
-    // ⛔ THE WHOLE-TENSOR ROW WINDOW, THE 2a LAW — for BOTH forms below. `rope.py`'s per-row form states a
-    // row window (`R_START` baked into every access tile's corner) — the producer's per-position
-    // decomposition mints one rope node per tail row, and the splice compiles each one. But
-    // `RopeAt` addresses the buffers at their BASES, so a window whose corner is not the
-    // tensor's first row would lower to ops that read and write every position shifted by
-    // the corner — a silently wrong answer, not a loud one. Refusing here names the gap at
-    // the door itself; the row-base extension (an `R_START`-scaled base per buffer) is the
-    // 2b worklist item. A whole-region rope states `R_START = 0` and passes untouched.
-    for (x, role) in [(&ins[0], "the `x` view"), (&out, "the `out` view")] {
-        if x.r_cover != (0, x.v_rows) {
-            return err(format!(
-                "{name}: {role} covers rows [{}, {}) of {} — a per-row rope window. `RopeAt` \
-                 addresses the buffer base, so lowering a windowed rope would shift every \
-                 position by the window's corner. The row-base extension is the 2b worklist \
-                 item; until it lands, only whole-tensor ropes lower through this door",
-                x.r_cover.0, x.r_cover.1, x.v_rows,
-            ));
-        }
-    }
-    // ⭐ TWO FORMS, TOLD APART BY THE VIEW'S WIDTH, and the access tile is a half-head either way.
-    // A rope whose positions outnumber its heads loops over the HEADS (`rope.py`'s `_rope_per_head`):
-    // it views `x` as the plane it is, `[mq, heads·hd]`, one `[mq, hd/2]` tile per head half, so its
-    // program stops growing with the chunk. Every other rope loops over the POSITIONS and views `x`
-    // tall, `[rows·heads, hd]` — the arm below. A tall view is one head dim wide, i.e. exactly twice
-    // its tile; a plane view of two or more heads is wider than that.
-    if ins[0].c_len > 0 && ins[0].v_cols > 2 * ins[0].c_len {
-        let hd = 2 * ins[0].c_len;
-        if !ins[0].v_cols.is_multiple_of(hd) || ins[0].r_len != ins[0].v_rows {
-            return err(format!(
-                "{name}: the `x` view states `[{}, {}]` and its first tile `[{}, {}]` — a per-head \
-                 rope tiles every row of a plane a whole number of heads wide, half a head at a time",
-                ins[0].v_rows, ins[0].v_cols, ins[0].r_len, ins[0].c_len,
-            ));
-        }
-        return rope_at_geometry(
-            name,
-            &ins,
-            &out,
-            RopePlane {
-                hd,
-                mq: ins[0].v_rows,
-                total: ins[0].v_cols,
-            },
-            sym_id_base,
-            layout,
-            attn_params,
-        );
-    }
-    // The rope program views `x` as `[rows·heads, hd]`, so the view's COLUMN extent is the head dim.
-    let hd = ins[0].v_cols;
-    // ⭐⭐⭐ ROWS AND WIDTH, BOTH READ OFF THE PROGRAM — AND THE READING IS THE TILE, NOT A VIEW.
-    // The rope program views `x` as `[rows·heads, hd]` and takes one access tile
-    // `(ri·heads, 0, heads, half)` per position, so the ACCESS TILE's row extent IS `heads` — the
-    // fact the two
-    // view extents multiply together and neither states alone. `regions()` already records it as
-    // `Region::r_len`. With `heads` known the view's own row count divides into the positions, and the
-    // node's real width is `heads · hd`.
-    //
-    // ⛔ NOT THE COS VIEW. It looked like the answer — cos is one row per position — but `rope` binds
-    // it through `load_1d(cos_t, rows·tbl_cols, ri·tbl_cols, half)`, i.e. ONE-DIMENSIONAL, so its view
-    // is `(1, rows·tbl_cols)` and its row extent is 1 for every model. Reading it as the position
-    // count made granite-3.1-8b's `[2, 4096]` rope output into `[1, 8192]`, which the arrangement
-    // authority caught as a same-tensor layout conflict on t729. The half-width is `c_len` here, so
-    // `hd == 2 · c_len` is checked below rather than assumed.
-    let heads = ins[0].r_len;
-    if heads == 0 || hd == 0 {
-        return err(format!(
-            "{name}: the `x` view states `[{}, {hd}]` and its access tile {heads} row(s) — a rope \
-             needs a nonzero head dim and at least one head",
-            ins[0].v_rows,
-        ));
-    }
-    if ins[0].v_rows % heads != 0 {
-        return err(format!(
-            "{name}: the `x` view states {} row(s) over an access tile of {heads} head(s), which does \
-             not divide — the rope program views `x` as `rows·heads` by `hd`, so the head count must \
-             tile its rows exactly",
-            ins[0].v_rows,
-        ));
-    }
-    if ins[0].c_len * 2 != hd {
-        return err(format!(
-            "{name}: the `x` access tile takes {} column(s) of a {hd}-wide view — a rope rotates \
-             half-width slices, so the window must be exactly `hd / 2`",
-            ins[0].c_len,
-        ));
-    }
-    let mq = ins[0].v_rows / heads;
-    let total = heads * hd;
-    rope_at_geometry(
-        name,
-        &ins,
-        &out,
-        RopePlane { hd, mq, total },
-        sym_id_base,
-        layout,
-        attn_params,
-    )
-}
-
-/// What a rope program states about its plane, whichever form stated it: the head dim, and the
-/// `[mq, total]` plane's rows and width. Both forms describe the same bytes, so the device program is
-/// one function of these three numbers.
-#[derive(Clone, Copy)]
-struct RopePlane {
-    hd: u32,
-    mq: u32,
-    total: u32,
-}
-
-/// The rope's lowering once its [`RopePlane`] is read.
-fn rope_at_geometry(
-    name: &str,
-    ins: &[Region],
-    out: &Region,
-    plane: RopePlane,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-    attn_params: Option<BundleAttnParams>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let RopePlane { hd, mq, total } = plane;
-    // ⛔ THE ROW KIND, AS A PARAMETER — main's `LowerRope::rows_are_requests`, which main also took as
-    // a parameter and for the reason its own comment gives. It decides whether the head-major collapse
-    // may span the query rows, which is a DEVICE law: the rope program never receives the fact and
-    // emits the same ops either way, so no program can state it. A rope in a bundle with no attention
-    // node has no requests to have rows of, which is main's own `false` at that call site.
-    let rows_are_requests = attn_params.is_some_and(|p| p.rows_are_requests);
-    // ⭐⭐ THE ONE PLACE THE HEAD DIM STOPS BEING A VALUE, the same door `lower_one_node` crossed for
-    // the SubtileIR path: the arms are every head dim the workspace's model configs declare, and a
-    // head dim with no arm is a loud bake error answered by a `config.json`.
-    if hd == 0 {
-        return err(format!("{name}: the `x` view states a zero head dim"));
-    }
-    // ⭐ THE ROPE-P CLASS TID — which `[hd,hd]` P table this rope's `matmul(x, P)` names. The class
-    // set is the bake's OWN registry (`BundleLayout::rope_class_hds`, the same registry mechanism
-    // `scalarmul_scales` established), so the emitter, the placement pass and the worker's load-time
-    // bind all resolve class↔tid through ONE list. A rope arriving with no registry, or a head dim
-    // the registry does not hold, is a desync — refuse it rather than guessing class 0.
-    let p_tid = layout
-        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == hd))
-        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
-        .ok_or_else(|| Error {
-            message: format!(
-                "{name}: rope head_dim {hd} absent from BundleLayout.rope_class_hds {:?} (registry \
-                 desync — the placement pass and this lowering disagree about the tape's rope \
-                 classes, so which P table this rope reads is not a fact either of them states)",
-                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
-            ),
-        })?;
-    scratchy_subtile::model_geometry::with_config_head_dim(
-        scratchy_subtile::model_geometry::HeadDim::new(hd),
-        RopeAt(lk::RopeAt {
-            name,
-            x: ins[0].name(),
-            cos: ins[1].name(),
-            sin: ins[2].name(),
-            out: out.name(),
-            t: out.tid,
-            mq,
-            total,
-            p_tid,
-            sym_id_base,
-            layout,
-            rows_are_requests,
-        }),
-    )
-    .ok_or_else(|| Error {
-        message: format!(
-            "{name}: head_dim {hd} has no const-generic instantiation. The head dim parameterises \
-             the device layout (slabs = head_dim/lanes, and the head-major collapse is valid only at \
-             head_dim == lanes), so it must be a const, not a value. The instantiations are read \
-             from the model configs in scope ({}); this head dim belongs to none of them.",
             scratchy_subtile::model_geometry::geometry_sources(),
         ),
     })?

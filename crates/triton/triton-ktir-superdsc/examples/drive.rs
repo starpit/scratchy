@@ -9,13 +9,10 @@
 //! `<program>` is stated, not inferred — see the crate docs on why the node kind is an argument
 //! during bring-up. Accepted: `rmsnorm`, `matmul`, `silumul`, `scalarmul`, `lmlast`, `transpose`,
 //! `ew:add|mul|sub|silu|gelu|exp|rsqrt|sqrt|abs|reciprocal|sigmoid|tanh|mish|realdiv|maximum|minimum`,
-//! and the two that cross the model-geometry const door, `rope` and `attn`.
-//!
-//! `rope` and `attn` need `HEAD_DIM` / `H` / `GQA` / `N_TOK`, and this driver READS them out of
-//! `test/experiment1/index.json`'s `constexprs` for the named configuration — the fixture's own
-//! `tl.constexpr` values, recorded there by `run_experiment1.py` from each fixture's `constexprs()`.
-//! A missing key is a REFUSAL naming the config and the key: a defaulted head count is a wrong GQA
-//! grouping with nothing downstream to catch it.
+//! and `rope`/`attn`, both of which now REFUSE here by name: their hand-rolled geometry doors are
+//! deleted, and each lowers from its compiled ops through the whole-function door instead —
+//! `examples/bake_py` with `KTIR_WHOLE=1` is that path. Staying accepted keeps the refusal honest
+//! (a named answer, not `no case for rope`).
 //!
 //! Environment:
 //! * `KTIR_DUMP=1` — the handed-off `IRFunction`, one op per line.
@@ -23,16 +20,10 @@
 //! * `KTIR_ADDR_DUMP=1` — each emitted descriptor's per-core HBM start addresses.
 //! * `KTIR_NO_LAYOUT=1` — drive with `layout: None`, `ktir-superdsc`'s unit-test addressing. The
 //!   CONTROL for "did the layout change this verdict?".
-//! * `KTIR_ROPE_ROWS=token-major` — state that the roped plane is token-major. See
-//!   [`triton_ktir_superdsc::RopeRows`]: the fixtures are HEAD-major and the two are
-//!   indistinguishable by shape, so `rope` refuses by default and this override exists only to
-//!   measure the door BEHIND that refusal. It is a lie about our fixtures; a result obtained under
-//!   it is not a bake.
 
 use std::path::PathBuf;
 
 use ktir_superdsc::ktir_node::{Elementwise, Program};
-use triton_ktir_superdsc::RopeRows;
 
 fn program_from(s: &str) -> Option<Program> {
     Some(match s {
@@ -165,47 +156,14 @@ fn main() {
             }
         }
     }
-    // THE GEOMETRY DOOR. `rope` cannot be dispatched from a runtime `Program`, so it gets its own
-    // entry point and the geometry is READ from the fixture's recorded constexprs. Note
-    // `rows_are_requests: false`, and it is a reading, not a default: the fixtures sweep
-    // `N_TOK` CONSECUTIVE POSITIONS of one sequence (`rope.py`'s `offs_m = off_h * N_TOK +
-    // start_m * BLOCK_M`), never one row per request.
-    //
-    // ⛔ ATTENTION HAS NO ARM HERE, ON PURPOSE. The old `Program::Attn` arm routed through
-    // `drive_attn` → `attn_at::<NQH, NKVH, HD>`, scratchy's prebuilt fragment-assembly lowering
-    // selected by constexpr-geometry match — pattern matching instead of lowering the given
-    // code. Removed; attention is `emit_node_with`'s problem like every other program (the
-    // whole-function door in `bake_py` is the from-source path that runs on card).
-    let geometry_driven = match program {
-        Program::Rope => {
-            let g = |k: &str| match constexpr_int(config, k) {
-                Ok(v) => Ok(v),
-                Err(e) => Err(e),
-            };
-            let (hd, h, n_tok) = match (g("HEAD_DIM"), g("H"), g("N_TOK")) {
-                (Ok(a), Ok(b), Ok(c)) => (a, b, c),
-                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => refused!("constexpr", e),
-            };
-            let rows = match std::env::var("KTIR_ROPE_ROWS").as_deref() {
-                Ok("token-major") => RopeRows::TokenMajor,
-                // The fixture's own layout. `rope.py` builds `x` as `[H * N_TOK, HEAD_DIM]` and
-                // indexes row `off_h * N_TOK + start_m * BLOCK_M` — head outermost.
-                _ => RopeRows::HeadMajor,
-            };
-            Some(triton_ktir_superdsc::drive_rope(
-                &node,
-                hd,
-                n_tok,
-                h * hd,
-                rows,
-                false,
-                layout.as_ref(),
-            ))
-        }
-        _ => None,
-    };
-    let emitted = geometry_driven
-        .unwrap_or_else(|| triton_ktir_superdsc::emit_node_with(&node, layout.as_ref()));
+    // ⛔ NO GEOMETRY DOOR HERE, ON PURPOSE. The old `Program::Attn` arm routed through
+    // `drive_attn` → `attn_at::<NQH, NKVH, HD>`, and the `Program::Rope` arm through
+    // `drive_rope` → `rope_at::<HD>` — scratchy's prebuilt fragment-assembly lowerings
+    // selected by constexpr-geometry match, pattern matching instead of lowering the given
+    // code. Both removed; both programs refuse by name in `emit_node_with` and lower from
+    // their compiled ops through the whole-function door (`bake_py` with `KTIR_WHOLE=1`
+    // is the from-source path that runs on card).
+    let emitted = triton_ktir_superdsc::emit_node_with(&node, layout.as_ref());
     match emitted {
         Err(e) => refused!(e.stage, e.message),
         Ok(ops) => {
@@ -242,79 +200,4 @@ fn main() {
             )
         }
     }
-}
-
-/// ONE INTEGER `tl.constexpr` OF ONE CONFIGURATION, read out of `test/experiment1/index.json`.
-///
-/// ⛔ THIS IS A READING, NOT A TABLE. The alternative was a `match config { "rope_kv8" => 128, .. }`
-/// in this driver, which would be a second statement of the head geometry, free to drift from the
-/// kernel that is compiled with it. `run_experiment1.py` writes `constexprs` straight from each
-/// fixture's own `constexprs()` (`cases()`, `constexprs=ce`; serialized at
-/// `"constexprs": {k: repr(v) if float else v}`), so this file IS the fixture's constexpr set.
-///
-/// ⛔ AND IT IS A LINE SCAN BECAUSE `serde_json` IS NOT A DEPENDENCY OF THIS CRATE, and its
-/// `Cargo.toml` was outside this change. It is fail-closed rather than lenient: `index.json` is
-/// machine-written with `json.dump(indent=2, sort_keys=True)`, so a configuration's `constexprs`
-/// block always precedes its `"name"` key; this walk collects the most recent block and requires one
-/// to have been seen INSIDE the same entry. A reordering, a reformat, a missing key or a non-integer
-/// value all produce an `Err` naming the config and the key — never a number.
-fn constexpr_int(config: &str, key: &str) -> Result<u32, String> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate sits one level under crates/triton")
-        .join("test-experiment1/index.json");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut in_block = false;
-    // The constexprs of the entry currently being scanned — cleared at each entry boundary so a
-    // block can never be attributed to a later configuration.
-    let mut here: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        let t = line.trim_end();
-        if t == "  {" {
-            here.clear();
-            in_block = false;
-        } else if t == "    \"constexprs\": {" {
-            here.clear();
-            in_block = true;
-        } else if in_block && (t == "    }" || t == "    },") {
-            // WITH OR WITHOUT THE TRAILING COMMA. `constexprs` sorts before `fixture`, so its close
-            // is `    },`; only a last key would close bare. Matching only the bare form left
-            // `in_block` true for the rest of the file and every lookup answered "no configuration
-            // named X" — a refusal, which is why this was a wasted run and not a wrong number.
-            in_block = false;
-        } else if in_block {
-            let s = t.trim().trim_end_matches(',');
-            if let Some((k, v)) = s.split_once("\": ") {
-                here.push((k.trim_start_matches('"').to_string(), v.to_string()));
-            }
-        } else if t == format!("    \"name\": \"{config}\",") {
-            if here.is_empty() {
-                return Err(format!(
-                    "{}: configuration `{config}` states no `constexprs` block before its `name` \
-                     key — this walk relies on `json.dump(sort_keys=True)`'s ordering and will not \
-                     guess. Read the geometry from the fixture directly.",
-                    path.display()
-                ));
-            }
-            let Some((_, v)) = here.iter().find(|(k, _)| k == key) else {
-                return Err(format!(
-                    "{config}: `constexprs` states no `{key}`. It has {:?}. The head geometry is the \
-                     fixture's own `tl.constexpr` and this driver will not default it — a wrong head \
-                     count is a wrong GQA grouping with nothing downstream to catch it.",
-                    here.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
-                ));
-            };
-            return v.parse::<u32>().map_err(|_| {
-                format!(
-                    "{config}: `constexprs.{key}` is `{v}`, not a non-negative integer — the const \
-                     door takes a `u32`, so a float or a string here is a refusal, not a cast"
-                )
-            });
-        }
-    }
-    Err(format!(
-        "{}: no configuration named `{config}`",
-        path.display()
-    ))
 }

@@ -50,7 +50,7 @@ use ktir_superdsc::place::{PlaceId, act_name};
 use ktir_superdsc::placement::{
     BundleLayout, SegRole, SynthAlloc, TensorPlacement, WeightTail, align128, synth_footprint_bytes,
 };
-use ktir_superdsc::reserved_tids::{ROPE_P_TID, scalarmul_scale_tid};
+use ktir_superdsc::reserved_tids::scalarmul_scale_tid;
 use ktir_superdsc::superdsc_opspec::Df;
 use ktir_superdsc::wire::SEGMENT_SIZE;
 
@@ -320,64 +320,12 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         )?;
     }
 
-    // ── THE ROTATE MATRIX P ──────────────────────────────────────────────────────────────────────
-    // `rope_at` opens with `crate::place::act_name(ROPE_P_TID)` and reaches it from BOTH its forms —
-    // the head-major collapse as one `[hd, hd]` kernel matmul, the slab path as a per-slab ±I block
-    // — so a rope driven without this placement is not a wrong address, it is `resolve_seg_base`'s
-    // panic.
-    //
-    // ⭐ AND ITS EXTENT IS READ, NOT INVENTED, WHICH IS WHY THIS ONE RESERVED CONST CAN BE PLACED
-    // HERE AT ALL. P is `[hd, hd]` fp16 — `rope_at` addresses it as
-    // `Stk::<KernelTag>::kernel(hd, hd, &p)` and scratchy places it at `hd * hd * 2` — and `hd` is
-    // stated by the program: `Region`'s own doc says the rope views its plane as `[rows·heads, hd]`,
-    // so the OUTPUT view's column count IS the head dim. Nothing is guessed, so the footprint guard
-    // keeps its teeth for P as well.
-    //
-    // ⛔ IT IS A DEVICE CONSTANT AND NOT A PARAMETER, so it is placed with the per-launch inputs
-    // (`SegRole::Activation`) and not in the output segment: scratchy's own comment at this
-    // placement records the alternative's cost — a seg1/WEIGHT P is H2D'd only at PrepareModel,
-    // where the worker binds only the manifest's model weights, so it "stays ZERO ⇒ rot=matmul(x,0)
-    // ⇒ RoPE collapses to x·cos ⇒ wrong positional encoding".
-    //
-    // ⭐ THE CLASS SET IS REGISTERED WHERE P IS PLACED. `rope_p_class_tid(idx)` keys off
-    // `BundleLayout::rope_class_hds` (one entry per DISTINCT rope head dim, sorted descending,
-    // class 0 = the widest = `ROPE_P_TID`), and the door resolves this rope's `p_tid` off that same
-    // list — so the placement pass and the lowering read ONE registry, never two.
-    let mut rope_class_hds: Vec<u32> = Vec::new();
-    if matches!(node.program, Program::Rope) {
-        let out = r.iter().find(|reg| reg.is_out).ok_or_else(|| Error {
-            stage: "layout",
-            message: format!(
-                "{name}: Rope states no parameter its program stores through, so there is no output \
-                 view to read the head dim off and P's `[hd, hd]` extent cannot be stated. A rope \
-                 that writes nothing is a malformed program, not a placement to invent."
-            ),
-        })?;
-        let hd = out.v_cols;
-        if hd == 0 {
-            return Err(Error {
-                stage: "layout",
-                message: format!(
-                    "{name}: the output t{} states a `[{}, 0]` view, so its head dim is zero and P \
-                     would be a zero-byte placement — which `resolve_seg_base`'s synth arm records \
-                     the device reads as `1 << 27` flits = 16 GiB.",
-                    out.tid, out.v_rows,
-                ),
-            });
-        }
-        // One rope program per single-kernel bundle, so one class — trivially the widest, and its
-        // ops name `ROPE_P_TID` exactly as a uniform model's do (the byte-identity law).
-        rope_class_hds.push(hd);
-        let size = synth_footprint_bytes(&[hd, hd], Df::Fp16);
-        pack(
-            name,
-            ROPE_P_TID,
-            SegRole::Activation,
-            size,
-            &mut placements,
-            &mut segment_bytes,
-        )?;
-    }
+    // ⛔ THE ROTATE MATRIX P IS NOT PLACED, ON PURPOSE. `rope_at` — the hand-rolled geometry body
+    // whose `matmul(x, P)` read it, and the only consumer this placement ever had — is deleted:
+    // rope lowers from its compiled ops through the whole-function door, and no op of that body
+    // names `ROPE_P_TID` (measured: the whole-door rope bakes' descriptors reference no reserved
+    // tid). A placement here would be a dead activation entry every rope bundle allocates, fills
+    // and never reads. Do not re-add it with a geometry arm.
 
     // ── THE fp8 W8A8 CLAMP CONSTS ─────────────────────────────────────────────────────────────────
     // `matmul_fp8_descriptors`'s activation-quantize chain names three reserved consts by name —
@@ -519,10 +467,9 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No head-major o_proj copies: the restructure is minted from a spyre bundle's
         // attention→o_proj dataflow, and one Triton kernel's parameter list is not that graph.
         weight_copies: Vec::new(),
-        // The rope-P class set, filled where P itself is placed (see the Rope arm above). `drive_rope`
-        // resolves this rope's `p_tid` off it — the same registry the consumer ladder's door resolves
-        // through, so the two ladders cannot disagree about which P table a class reads.
-        rope_class_hds,
+        // No rope-P classes: the rotate matrix is not placed (see the marker above) — rope has no
+        // geometry body to resolve a class for, so nothing on this ladder reads the registry.
+        rope_class_hds: Vec::new(),
         // No attention identity classes: `Attn` is refused BY NAME at this crate's doors, so no
         // `AttnDecode` program reaches layout to state a head dim.
         attn_class_hds: Vec::new(),
@@ -568,16 +515,16 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// The reserved device constants a `Program`'s entry point names without them being parameters, or
 /// `None` when it names none.
 ///
-/// ⛔ READ OFF THE BODIES, one by one. `rope_at` opens with `crate::place::act_name(ROPE_P_TID)`
-/// (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
-/// `kct_resident_tid(k_id)`. None of those is a buffer a Triton kernel declares. Every other body
-/// names only its parameters and its own declared synthetics.
+/// ⛔ READ OFF THE BODIES, one by one. `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`,
+/// `IDENTITY_TID` and `kct_resident_tid(k_id)`. None of those is a buffer a Triton kernel
+/// declares. Every other body names only its parameters and its own declared synthetics. (`rope_at`
+/// used to open with `crate::place::act_name(ROPE_P_TID)` — the rotate matrix — but that body is
+/// deleted; rope's whole-function body names no reserved constant at all.)
 ///
-/// ⭐ THE LINE IS NOT "IS IT A PARAMETER", IT IS "DOES THE PROGRAM STATE ITS EXTENT" — and that is
-/// what moved `Rope` off this list. The footprint guard compares an access against `p.size`, so a
-/// placement whose size this module invented converts the one check that catches an over-run into a
-/// rubber stamp; a placement whose size the PROGRAM states keeps it. Rope's P is `[hd, hd]` and `hd`
-/// is the rope output view's own column count (see [`for_regions`]'s P placement), so it is read.
+/// ⭐ THE LINE IS NOT "IS IT A PARAMETER", IT IS "DOES THE PROGRAM STATE ITS EXTENT". The
+/// footprint guard compares an access against `p.size`, so a placement whose size this module
+/// invented converts the one check that catches an over-run into a
+/// rubber stamp; a placement whose size the PROGRAM states keeps it.
 /// Attention's are not, and none of them is close: `ATTN_MASK_TID` is `[nqh·mq, cap]` over a prefix
 /// CAPACITY the worker chooses per step, `ATTN_CAUSAL_TID` the same, `IDENTITY_TID` is `[hd, hd]` at
 /// the head dim of a GQA geometry that reaches `attn_at` as a const generic and not as a view, and
@@ -614,8 +561,8 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
             "IDENTITY_TID",
             "kct_resident_tid(k)",
         ]),
-        // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
-        // from an extent the program states.
+        // `Rope` is HERE and not above: it has no geometry body, so it names no reserved constant —
+        // its compiled ops lower through the whole-function door and read only parameters.
         Program::Rope
         | Program::RmsNorm
         | Program::ScalarMul

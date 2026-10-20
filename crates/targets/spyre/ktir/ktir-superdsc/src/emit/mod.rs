@@ -43,9 +43,9 @@ use std::collections::BTreeMap;
 /// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
 /// facts the KTIR states. See its own header.
 pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The one
+/// that crosses a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`]) is a public
+/// generic entry point the CALLER instantiates.
 pub mod lower_ktir_to_superdsc;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
@@ -843,9 +843,9 @@ pub fn assemble_pointwise_broadcast_hm(
 /// [`assemble_pointwise_broadcast_gather`], carried as a struct.
 ///
 /// A struct rather than nine positional parameters because the sibling assemblers below predate that
-/// convention and each carries an `#[allow(clippy::too_many_arguments)]`; this follows
-/// [`lower_ktir_to_superdsc::rope_at`]'s `RopeAt` instead, which is the newer shape in this crate and
-/// adds no sixteenth `allow`.
+/// convention and each carries an `#[allow(clippy::too_many_arguments)]`; this follows the
+/// argument-pack shape the deleted `lower_ktir_to_superdsc::rope_at` established, which is the newer
+/// shape in this crate and adds no sixteenth `allow`.
 pub struct PointwiseGather<'a, O: KindTag> {
     /// The descriptor's name.
     pub op_name: &'a str,
@@ -1568,7 +1568,8 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
 }
 
 /// The parameter list of [`assemble_pointwise_broadcast_divided`], carried as a struct — the
-/// [`PointwiseGather`] / `RopeAt` shape, which adds no `#[allow(clippy::too_many_arguments)]`. Every field
+/// argument-pack shape ([`PointwiseGather`] and the deleted `RopeAt`), which adds no
+/// `#[allow(clippy::too_many_arguments)]`. Every field
 /// but `division` is [`assemble_pointwise_broadcast_off`]'s, with the same contract.
 pub struct PointwiseDivided<'a, O: KindTag> {
     pub op_name: &'a str,

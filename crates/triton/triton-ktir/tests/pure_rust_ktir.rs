@@ -457,10 +457,11 @@ fn cases() -> Vec<Case> {
         // the HEAD-MAJOR `rope.py` -- `offs_m = off_h * N_TOK + start_m * BLOCK_M`, a
         // `[BLOCK_M, HALF]` block, grid `[4, H]`. `rope.py` delta 7 made the fixture TOKEN-major
         // (row = position * H + head), because that is the order `KtirFunc::rope` -- the producer
-        // the device emitter `rope_at` was written against -- tiles and broadcasts for, and
-        // because a head-major tall view is the reshape of the TRANSPOSED `[mq, heads*hd]` plane
-        // attention reads. The two orders share a shape, so the mismatch was a wrong ANSWER
-        // rather than a build error; see `RopeRows` in `triton-ktir-superdsc/src/lib.rs`.
+        // the (now-deleted) geometry emitter `rope_at` was written against -- tiles and broadcasts
+        // for, and because a head-major tall view is the reshape of the TRANSPOSED `[mq, heads*hd]`
+        // plane attention reads. The two orders share a shape, so the mismatch was a wrong ANSWER
+        // rather than a build error; the row-order law lived in `RopeRows`, deleted with the
+        // geometry arm (see the deletion marker in `triton-ktir-superdsc/src/lib.rs`).
         //
         // So the golden is stale BY CONSTRUCTION and cannot be met without reintroducing the
         // defect. It also cannot be regenerated here: only IBM's C++ chain produces these files.

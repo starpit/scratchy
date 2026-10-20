@@ -78,11 +78,12 @@
 //! remains is whatever the current guards name, which is the honest work list.
 //!
 //! ⭐ ROPE SPLICES — the module-header claim that it could not was OVERSTATED, audited
-//! against the door: `rope_at` derives every fact it needs (`mq`, `total`, `hd`) from the
-//! PROGRAM's own views and access tiles, and the one bundle fact (`rows_are_requests`)
-//! is re-read by the door off `BundleAttnParams` AFTER the splice returns. The kernel
-//! states the builder's own view extents (`[mq·heads, hd]`) and takes one `[heads, half]`
-//! access tile per position, which is what the door's first-tile read needs.
+//! against the door when the door had a geometry arm: it derived every fact it needed
+//! (`mq`, `total`, `hd`) from the PROGRAM's own views and access tiles, and the one bundle
+//! fact (`rows_are_requests`) was re-read off `BundleAttnParams` AFTER the splice returns.
+//! The kernel states the builder's own view extents (`[mq·heads, hd]`) and takes one
+//! `[heads, half]` access tile per position — and the geometry arm is now deleted, so the
+//! whole-function door reads the same body straight off the compiled ops, corners and all.
 //!
 //! fp8 `MatmulTile` — a row after all: the activation-quantize dedup (`quantized`) is
 //! threaded BUNDLE-WIDE by the door's callers, which run DOWNSTREAM of the splice: both

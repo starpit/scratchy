@@ -91,21 +91,11 @@ impl SharedKernelBmmForm {
         }
     }
 
-    /// ⭐⭐⭐ A MATMUL THAT IS **NEWLY** `y`-BATCHED OVER HEADS — always the head-OUTERMOST order, at
-    /// EVERY head dim.
-    ///
-    /// ⛔ DO NOT REUSE [`Self::of_score_leg`] FOR THIS. That door degenerates to the proven batch-inner
-    /// form at one slab, which is correct for a leg that was ALREADY batched there (its emission must
-    /// not move). For an op whose `y` axis is NEW, the batch-inner order cannot express a head stride at
-    /// all: `[mb, y, in]` puts `mb` outside `y`, so `y` strides exactly `in`. At hd=64/mq=7 that is 64
-    /// against a real head stride of `mq*hd` = 448 — the build-time refusal RoPE's rotate matmul hit on
-    /// granite-3.1-2b fp8 the moment it stopped looping heads.
-    ///
-    /// Head-outermost derives `mb_dev * in`, which is `mq*hd` at every head dim once the operand
-    /// declares its own pitch (`mq` with a full-`hd` `in`, `mq*nslab` with a one-stick `in`).
-    pub(crate) fn of_head_batched(_: impl NonAttnBmmSite) -> Self {
-        SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
-    }
+    // ⛔ `of_head_batched` IS DELETED (2026-10-19), with the rope geometry arm that was its only
+    // caller — the hand-rolled rotate matmul's head-outermost walk. The law it recorded survives
+    // in [`Self::of_kv_cache_write`]'s doc below: a `y` axis that is NEW cannot use the batch-inner
+    // order, because `[mb, y, in]` strides `y` by exactly `in` and a head stride needs
+    // `mb_dev * in`. Do not re-add a door for an emitter that no longer exists.
 
     /// ⭐⭐⭐⭐⭐ THE KV CACHE WRITE'S DOOR — the plane walk, head-OUTERMOST at EVERY head dim, and no
     /// witness to charge because there is nothing here for a caller to choose.
@@ -116,9 +106,9 @@ impl SharedKernelBmmForm {
     /// exactly `in` (64) whatever pitch an operand declares. So the batch-inner order is not an
     /// alternative for this site at any width — including `mq == 1`, where every OTHER site's proven
     /// form is the batch-inner one. That asymmetry is why this is its own door rather than a call to
-    /// [`Self::of_score_leg`] (which degenerates at one slab) or [`Self::of_head_batched`] (whose
-    /// witness exists to keep the attention emitter out of the proven form, a question this site does
-    /// not have).
+    /// [`Self::of_score_leg`] (which degenerates at one slab; there was a third door,
+    /// `of_head_batched`, for the deleted rope geometry arm's rotate matmul, whose witness existed to
+    /// keep that emitter out of the proven form — a question this site does not have).
     pub fn of_kv_cache_write() -> Self {
         SharedKernelBmmForm(SharedKernelBmmRegime::Requests(HeadOutermostRequests(())))
     }

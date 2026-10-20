@@ -314,7 +314,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Program)> {
         // nothing downstream compares a grid against the extent a kernel indexes.
         //
         // `H` still separates the two configurations, but now only through the plane width
-        // (`H * HEAD_DIM`), which is exactly what `drive_rope` cross-checks against the output view.
+        // (`H * HEAD_DIM`), which the output view states and the whole-function door reads.
         "rope_q32" => (
             spec("rope", "rope_fwd", ROPE, &rope_ce(32)),
             vec![256],

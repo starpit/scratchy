@@ -253,23 +253,19 @@ fn emit_regions(
                 ),
             });
         }
-        // THE MONOMORPHISATION DOOR. `rope_at::<HD>` is not reachable without the geometry, and
-        // the geometry is a const parameter, so `Program::Rope` is refused here and driven from
-        // `drive_rope` which takes it explicitly. Refused rather than defaulted: a wrong head
-        // count is a silently wrong grouping.
-        //
-        // ⛔ `Program::Attn` IS REFUSED FOR A DIFFERENT REASON NOW: its pattern-matched door
-        // (`drive_attn` → `attn_at::<NQH, NKVH, HD>`, scratchy's prebuilt fragment assembly
-        // selected by geometry match) is REMOVED — attention is lowered from its compiled ops
-        // through the whole-function door, and a per-`Program` dispatch would be a second,
+        // ⛔ `Program::Attn` AND `Program::Rope` ARE REFUSED FOR THE SAME REASON: their
+        // pattern-matched doors (`drive_attn` → `attn_at::<NQH, NKVH, HD>`, `drive_rope` →
+        // `rope_at::<HD>` — scratchy's prebuilt fragment assemblies selected by constexpr
+        // geometry match) are REMOVED. Both lower from their compiled ops through the
+        // whole-function door (`emit_whole`), and a per-`Program` dispatch would be a second,
         // hand-rolled path. Do not re-add one.
         Program::Attn | Program::Rope => {
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} crosses the model-geometry const door (`rope_at::<HD>`), so it cannot \
-                     be dispatched from a runtime `Program`. Call the generic entry with the \
-                     fixture's own tl.constexpr values",
+                    "{:?} has no per-`Program` entry point — its hand-rolled geometry door is \
+                     deleted, and it lowers from its compiled ops through the whole-function \
+                     door (`emit_whole`) instead",
                     node.program
                 ),
             });
@@ -310,204 +306,16 @@ fn emit_regions(
 //  and inverting it is exactly the silent mis-grouping the const door exists to make visible.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// WHICH AXIS IS OUTERMOST in a roped `[·, head_dim]` plane — the fact the view's SHAPE cannot
-/// state, and therefore the one that has to be said out loud.
-///
-/// ⛔⛔⛔ THE TWO ORDERS PRODUCE THE SAME `regions()` SHAPE AND DIFFERENT BYTES. `rope_kv8`'s `x`
-/// view is `[2048, 128]`; so is a token-major `[256, 8·128]` plane reinterpreted as `[rows·heads,
-/// hd]`. Nothing in the program distinguishes them, `declare_arrangement`'s `addr_eq` admits a
-/// same-total contiguous reshape, and the footprint guard sees one buffer of the right size — so a
-/// mismatch here is not caught anywhere and comes out as a wrong answer.
-///
-/// ⭐⭐⭐ AND IT IS NOW SETTLED, BY THE PRODUCER `rope_at` WAS WRITTEN AGAINST. It is
-/// [`TokenMajor`](RopeRows::TokenMajor). `KtirFunc::rope` (scratchy
-/// `lower_subtile_tape_to_ktir.rs:3527`) is the whole argument in five lines:
-///
-/// ```text
-///   let mh = rows * heads;
-///   let x_view = self.view_shaped(x_t, mh, hd);          // the `[rows·heads, hd]` view
-///   for ri in 0..rows {
-///       let rbase = self.idx(ri * heads);                // ← THE ROW BASE OF POSITION ri
-///       let xf_acc = self.tile(x_view, rbase, zero, heads, half);   // heads ROWS TALL
-///       let cos1 = self.load_1d(cos_t, rows * tbl_cols, ri * tbl_cols, half);
-///       let cosb = self.broadcast(cos1, vec![heads, half], 0);      // ONE row, over those heads
-/// ```
-///
-/// Position `ri` occupies rows `ri·heads .. ri·heads + heads`, one row per head, and the SINGLE
-/// cos/sin row of that position is broadcast across exactly those rows. So the row index is
-/// `token·heads + head` — token outermost, head the FAST row axis. Head-outermost rows would make
-/// that same tile `heads` CONSECUTIVE TOKENS of one head, every one of them rotated by position
-/// `ri`'s angle, which is the silent-garbage case this enum exists to name.
-///
-/// ⭐ THE CONSUMER SIDE AGREES INDEPENDENTLY: scratchy's own door
-/// (`ktir_superdsc_door.rs`, the rope arm) derives `heads = ins[0].r_len` — the x ACCESS TILE's row
-/// extent — and then `mq = v_rows / heads`. The tile's rows ARE the head axis, inside one token, or
-/// that derivation reads a token count as a head count.
-///
-/// ⭐ AND IT IS THE SAME BYTES AS THE PLANE ATTENTION READS. Row-major `[mq, heads·hd]` puts
-/// element `(ri, h·hd + d)` at flat `ri·heads·hd + h·hd + d`, which IS row `ri·heads + h`, column `d`
-/// of the tall `[mq·heads, hd]` view — the contiguous reshape `addr_eq` admits. A head-outermost
-/// tall view is instead the reshape of `[heads, mq, hd]`, i.e. the TRANSPOSED plane.
-///
-/// ⛔ DO NOT READ `rope_at`'s COLLAPSE COMMENT AS THE OTHER ANSWER. It says "head `h` row `r` of the
-/// roped `[mq, heads*hd]` tensor sits at `h*mq*hd + r*hd`, and a `[heads*mq, hd]` view indexed
-/// `h*mq + r` gives exactly `(h*mq+r)*hd`" — that is the DEVICE offset of a stick-scattered
-/// `[mq, total]` tensor (`dev_off: [r,c] → (c/64)·(mq·64) + r·64 + c%64`), where the column-stick
-/// scattering has already made head-major contiguous ON CARD. It is a statement about the device
-/// arrangement of the wide plane, not about the row order of the host view, and mistaking the two is
-/// what makes a head-major fixture look plausible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RopeRows {
-    /// Row = token, head in COLUMNS: the `[mq, heads·hd]` plane `rope_at` addresses, whose device
-    /// offset for `(row r, head h)` is the `["row", "head", "feat"]` nest over `[mq, heads, hd]`.
-    TokenMajor,
-    /// Row = `head·n_tok + token`, i.e. head OUTERMOST — what `rope.py` builds
-    /// (`x = torch.randn(h * n_tok, head_dim)`, `offs_m = off_h * N_TOK + start_m * BLOCK_M`).
-    HeadMajor,
-}
-
-/// `Program::Rope` at its const head dim.
-///
-/// `mq`/`total` are the roped plane's TOKEN ROWS and FULL WIDTH (`heads · head_dim`) — the two
-/// numbers `[rows·heads, hd]` cannot separate, since `v_rows = mq · heads` is one equation in two
-/// unknowns. They come from the fixture's `N_TOK` and `H · HEAD_DIM`, and are CROSS-CHECKED against
-/// the output view here so a geometry that does not belong to this program is a refusal, not an
-/// address.
-pub fn drive_rope(
-    node: &KtirNode,
-    head_dim: u32,
-    mq: u32,
-    total: u32,
-    rows: RopeRows,
-    rows_are_requests: bool,
-    layout: Option<&BundleLayout>,
-) -> Result<Vec<EmittedOp>, Error> {
-    let name = node.func.name;
-    let r = emit::lower_ktir_to_superdsc::regions(node).map_err(|e| Error {
-        stage: "regions",
-        message: format!("{e:?}"),
-    })?;
-    // x, cos, sin, out — `KtirFunc::rope`'s parameters, and `RopeAt`'s four names in order.
-    let (ins, out) =
-        emit::lower_ktir_to_superdsc::split_out(name, &r, layout, 3).map_err(|e| Error {
-            stage: "ktir-superdsc",
-            message: format!("{e:?}"),
-        })?;
-    if head_dim == 0 || total == 0 || !total.is_multiple_of(head_dim) {
-        return Err(Error {
-            stage: "geometry",
-            message: format!(
-                "{name}: head_dim {head_dim} does not divide the roped width {total} — the fixture's \
-                 own `HEAD_DIM` and `H · HEAD_DIM` must agree, and `rope_at` derives its head count \
-                 as `total / hd`"
-            ),
-        });
-    }
-    let heads = total / head_dim;
-    // THE CROSS-CHECK. `rope_at` addresses a `[mq, total]` plane through a `[rows·heads, hd]` view,
-    // so the geometry crossed and the program's own view have to reconcile — `v_cols` IS the head
-    // dim (`Region`'s doc: "`KtirFunc::rope` views `x` as `[rows·heads, hd]`, so this states the
-    // HEAD DIM directly") and `v_rows` is `mq · heads`. Without this a wrong `H` would silently
-    // rescale every per-(row, head) offset.
-    if (out.v_rows, out.v_cols) != (mq * heads, head_dim) {
-        return Err(Error {
-            stage: "geometry",
-            message: format!(
-                "{name}: the output t{} states a `[{}, {}]` view, but head_dim {head_dim} with \
-                 {mq} token row(s) and {heads} head(s) makes it `[{}, {head_dim}]` — the geometry \
-                 crossed does not belong to this program",
-                out.tid,
-                out.v_rows,
-                out.v_cols,
-                mq * heads,
-            ),
-        });
-    }
-    // ⛔⛔⛔ AND THE ROW ORDER, WHICH THE SHAPES CANNOT SETTLE AND `KtirFunc::rope` DOES. Token
-    // outermost — see [`RopeRows`] for the five lines of the producer that settle it and for the two
-    // independent confirmations (its consumer door reads `heads` off the x tile's ROW extent; the
-    // token-major tall view is the contiguous reshape of the `[mq, heads·hd]` plane attention reads).
-    // `rope.py` indexes `off_h * N_TOK + start_m * BLOCK_M` over an `[H · N_TOK, HEAD_DIM]` buffer,
-    // i.e. HEAD outermost, so THE KERNEL IS THE SIDE THAT IS WRONG. Same element count, same view
-    // shape, different byte for every (r, h) but (0, 0) — so emitting anyway is the
-    // silent-wrong-answer case, and it is refused BY NAME.
-    if rows != RopeRows::TokenMajor {
-        return Err(Error {
-            stage: "geometry",
-            message: format!(
-                "{name}: this program's roped plane is HEAD-MAJOR in rows (row = head·{mq} + token, \
-                 which is `rope.py`'s `offs_m = off_h * N_TOK + start_m * BLOCK_M` over an \
-                 `[H · N_TOK, HEAD_DIM]` buffer) while the rope this adapter drives is TOKEN-major: \
-                 `KtirFunc::rope` views the plane as `[rows·heads, hd]`, tiles it `heads` rows tall at \
-                 row base `ri·heads` for position `ri`, and broadcasts that position's ONE cos/sin \
-                 row across those rows — so row = token·{heads} + head. Both views are \
-                 `[{}, {head_dim}]`, so no shape check, no arrangement check (`addr_eq` admits a \
-                 same-total contiguous reshape) and no footprint guard distinguishes them: lowering \
-                 this would place every (row, head) block at another block's address and report \
-                 success. THE KERNEL IS THE SIDE THAT CHANGES — a head-major nest in `rope_at` would \
-                 also have to transpose the `[mq, heads·hd]` plane its attention consumer reads.",
-                out.v_rows,
-            ),
-        });
-    }
-    // ⭐ THE ROPE-P CLASS TID, RESOLVED OFF THE SHARED REGISTRY — the same resolution the consumer
-    // ladder's door performs (`scratchy-target-spyre`'s `ktir_superdsc_door`): the class index of
-    // this program's head dim in `BundleLayout::rope_class_hds`, then `rope_p_class_tid(idx)`
-    // (class 0 = the widest = `ROPE_P_TID`, so a uniform model's ops name the sentinel exactly as
-    // before). A head dim the registry does not hold is a registry desync — the placement pass and
-    // this lowering disagree about which P table the rope reads — and it is refused BY NAME rather
-    // than guessed at class 0, because a wrong class is a wrong `[hd, hd]` contraction with nothing
-    // downstream to catch it.
-    let p_tid = layout
-        .and_then(|l| l.rope_class_hds.iter().position(|&h| h == head_dim))
-        .map(ktir_superdsc::reserved_tids::rope_p_class_tid)
-        .ok_or_else(|| Error {
-            stage: "geometry",
-            message: format!(
-                "{name}: rope head_dim {head_dim} absent from BundleLayout.rope_class_hds {:?} \
-                 (registry desync — the layout's class set and this rope's head dim disagree, so \
-                 which P table it reads is not a fact either of them states)",
-                layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
-            ),
-        })?;
-    let mut sym = 0i64;
-    let a = emit::lower_ktir_to_superdsc::RopeAt {
-        name,
-        x: ins[0].name(),
-        cos: ins[1].name(),
-        sin: ins[2].name(),
-        out: out.name(),
-        t: out.tid,
-        mq,
-        total,
-        p_tid,
-        sym_id_base: &mut sym,
-        layout,
-        rows_are_requests,
-    };
-    // THE DOOR. Enumerated, so a head dim outside the set is a refusal naming it rather than a
-    // monomorphisation nobody asked for; 64/128/256 are the head dims this tree's models state
-    // (`rope.py`'s `HEAD_DIM = 128`, and the crate's own slab path exists for hd > 64).
-    let out = match head_dim {
-        64 => emit::lower_ktir_to_superdsc::rope_at::<64>(a),
-        128 => emit::lower_ktir_to_superdsc::rope_at::<128>(a),
-        256 => emit::lower_ktir_to_superdsc::rope_at::<256>(a),
-        other => {
-            return Err(Error {
-                stage: "geometry",
-                message: format!(
-                    "{name}: head_dim {other} has no `rope_at::<HD>` instantiation here (64, 128, \
-                     256). It is a CONST parameter of the device layout, so a new head dim is a new \
-                     arm in this match — never a runtime value threaded past the door."
-                ),
-            });
-        }
-    };
-    out.map_err(|e| Error {
-        stage: "ktir-superdsc",
-        message: format!("{e:?}"),
-    })
-}
+// ⛔ `drive_rope` IS DELETED (2026-10-19). It was the model-geometry door: read `HEAD_DIM`/`H`/
+// `N_TOK` off a `Program::Rope` kernel's constexprs, cross-check them against the output view, and
+// emit `rope_at::<HD>`'s hand-rolled rope body — substituting a prebuilt implementation for the
+// given Triton code, exactly the shape `drive_attn` had. Rope goes through the whole-function door
+// (`bake_py` `KTIR_WHOLE=1`): the compiled fixture's ops, lowered one at a time, the per-core
+// uniform corners resolved as bands and the rotate-half pairs' unequal column windows carried
+// per-operand by the pointwise emission (`rope_q32`/`rope_kv8` bake this way, 48 ops each).
+// `rope_at`/`RopeAt` in the vendored `ktir-superdsc` crate are deleted with it, and so is
+// `RopeRows` — the row order it stated is a fact of the ops the whole door now reads, not a
+// parameter anyone has to name. Do not re-add this door.
 
 // ⛔ `drive_attn` IS DELETED (2026-09-29). It was the pattern-match door: read `H`/`GQA`/
 // `HEAD_DIM` off a `Program::Attn` kernel's constexprs, pick the matching
@@ -766,14 +574,15 @@ module {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-//  THE ROPE PATH, DRIVEN FROM THE FIXTURE — the measurement `examples/bake_py` cannot make.
+//  ROPE THROUGH THE WHOLE DOOR, DRIVEN FROM THE FIXTURE — the contract the geometry arm's
+//  deletion leaves behind.
 //
-//  `bake_py` dispatches on the runtime `Program`, so a rope stops at the model-geometry const door
-//  ([`emit_regions`]) and never reaches [`drive_rope`]. Everything past that door — whether the
-//  layout now serves `rope_at` (its rotate matrix P is placed, so `resolve_seg_base` has a name to
-//  find rather than a panic to raise) and whether the ROW ORDER is the wall that remains — is
-//  therefore only reachable from a test that crosses the door itself, with the fixture's own
-//  `tl.constexpr` values.
+//  Rope used to stop at a model-geometry const door here ([`drive_rope`] over the deleted
+//  `RopeAt`); that door is deleted, and with it the layout's rotate-matrix placement — no op of
+//  the compiled body names `ROPE_P_TID`. What remains to hold: the fixture still compiles to a
+//  `Program::Rope` node, the layout still serves it, and the whole-function door lowers it — the
+//  band lift resolving the per-core uniform corners, the pointwise emission carrying the
+//  rotate-half pairs' unequal per-operand column windows.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod rope_from_the_fixture {
@@ -826,161 +635,30 @@ mod rope_from_the_fixture {
         node_for(&m, Program::Rope).expect("node_for")
     }
 
-    /// ⭐ THE LAYOUT SERVES A ROPE NOW. It used to refuse the program outright for naming
-    /// `ROPE_P_TID`; P's extent is `[hd, hd]` at the head dim the output view states, so it is
-    /// placed, and this is the test that the refusal is gone rather than merely reworded.
+    /// ⭐ THE POST-DELETION CONTRACT, IN ONE TEST.
+    ///
+    /// (1) The layout places NO rotate matrix. `P` existed for `rope_at`'s `matmul(x, P)` and for
+    /// nothing else — no op of the compiled body names `ROPE_P_TID` (measured: the whole-door rope
+    /// bakes' descriptors reference no reserved tid) — so a placement that survives the body's
+    /// deletion is a dead activation entry every rope bundle would allocate, fill and never read.
+    ///
+    /// (2) The whole-function door lowers the compiled body — the fixture's own ops, not a
+    /// hand-rolled geometry — and emits more than nothing. The door's internals (the band lift, the
+    /// per-operand column windows) carry their own tests below; this one pins that rope reaches
+    /// them at all.
     #[test]
-    fn the_layout_places_ropes_rotate_matrix() {
+    fn rope_lowers_whole_and_places_no_rotate_matrix() {
         let node = rope_kv8();
         let l = layout::for_node(&node).expect("the layout must serve a rope");
-        let p = l
-            .placements
-            .get(&ktir_superdsc::reserved_tids::ROPE_P_TID)
-            .expect("P is placed");
-        // `[128, 128]` fp16 — the head dim the fixture's own `HEAD_DIM` states, doubled by the
-        // element size, and NOT a number this module chose.
-        assert_eq!(p.size, 128 * 128 * 2);
-        // Its name is in `ids` too, which is the half `resolve_seg_base` reaches first: a placement
-        // without one is invisible there and takes the build down as an undeclared synthetic.
         assert!(
-            l.id_of(&ktir_superdsc::place::act_name(
-                ktir_superdsc::reserved_tids::ROPE_P_TID
-            ))
-            .is_some(),
-            "a placement without its `ids` entry is the panic this places P to avoid"
+            !l.placements
+                .contains_key(&ktir_superdsc::reserved_tids::ROPE_P_TID),
+            "the rotate matrix is placed, but the geometry body that read it is deleted"
         );
-    }
-
-    /// ⛔ AND THE WALL THAT REMAINS IS THE ROW ORDER — refused, by name, for the reason
-    /// [`RopeRows`] settles: `KtirFunc::rope` is TOKEN-major and `rope.py`'s plane is HEAD-major.
-    ///
-    /// This is the test that a HEAD-major plane cannot reach a descriptor. It is the
-    /// silent-wrong-answer case (same view shape, same footprint, `addr_eq` admits the reshape), so
-    /// the only thing standing between it and a bake that reports success is this refusal.
-    #[test]
-    fn a_head_major_plane_is_refused_by_name() {
-        let node = rope_kv8();
-        let l = layout::for_node(&node).expect("layout");
-        // `EmittedOp` has no `Debug`, so the Ok arm says what it emitted rather than dumping it.
-        let e = match drive_rope(&node, 128, 256, 1024, RopeRows::HeadMajor, false, Some(&l)) {
-            Err(e) => e,
-            Ok(ops) => panic!(
-                "a head-major plane reached {} descriptor(s) instead of being refused",
-                ops.len()
-            ),
-        };
-        assert_eq!(e.stage, "geometry");
-        assert!(e.message.contains("HEAD-MAJOR"), "{}", e.message);
-        assert!(e.message.contains("TOKEN-major"), "{}", e.message);
-    }
-
-    /// ⭐⭐ THE WALL AFTER THE ROW ORDER, MEASURED AND FAILING CLOSED: an angle table bound
-    /// NARROWER than the plane that reads it, caught by the footprint guard in bytes.
-    ///
-    /// Told the plane is token-major (the order [`RopeRows`] settles as the right one), the drive
-    /// crosses the geometry door and `rope_at` reads its angle tables at the roped plane's OWN
-    /// extent — `[mq·heads, hd]`, because the worker "pre-tiles the cos/sin tables to the rope's full
-    /// width" (`KtirFunc::rope`'s own words) and every head's slice of a row is identical. A table
-    /// bound at HALF that width is not a saving, it is an OUT-OF-BOUNDS READ, and the guard states it
-    /// in bytes rather than computing it as garbage:
-    ///
-    /// ```text
-    ///   t1: access offset 0B + 524288B exceeds its placement footprint 32768B (seg3)
-    /// ```
-    ///
-    /// 524288 B is `mq·total·2` (the whole plane, `256·1024·2`) and 32768 B is `N_TOK·HALF·2`
-    /// (`256·64·2`). The same guard was reached at 2097152 B on `rope_q32`, whose 32 heads make the
-    /// plane four times as wide against the same table.
-    ///
-    /// ⛔⛔⛔ THE HALF-WIDTH BINDING IS CONSTRUCTED HERE AND NO LONGER BORROWED FROM THE FIXTURE, AND
-    /// THAT IS THE WHOLE POINT OF THIS EDIT. This test used to get its input by calling
-    /// [`layout::for_node`] on `rope_kv8()` and relying on `test/fixtures/rope.py` binding its tables
-    /// at `[N_TOK, HALF]` — its then-delta 2, "a full-width table would be two identical sticks per
-    /// row … halving it is deleting a duplicate". Commit `bad6820b5` made that fixture TOKEN-MAJOR
-    /// with both tables at `x`'s own extent (`shape=[y_dim, HEAD_DIM]`), which is the CORRECT
-    /// binding — so the fixture stopped being a witness for the defect and this test silently stopped
-    /// testing anything, failing as a `should_panic` that no longer panics.
-    ///
-    /// A test that takes its INPUT from a file whose job is to change was always going to rot that
-    /// way. So the narrow binding is stated here, in the one place that needs it: the regions are read
-    /// from the program and parameters 1 and 2 — `desc_cos` and `desc_sin`, by `rope_fwd`'s own
-    /// parameter order — are re-bound at the extent the fixture used to declare.
-    /// [`layout::for_regions`] sizes a placement from `v_rows × v_cols`, so that is the whole of it;
-    /// the NODE is untouched, so `rope_at` still reads the plane at its real extent. Narrow
-    /// placement, wide reader, which is exactly the defect — and it is now reachable no matter what
-    /// any fixture declares.
-    ///
-    /// ⭐ AND THE PREMISE IS ASSERTED BEFORE THE DRIVE, so this cannot pass on someone else's panic: a
-    /// `should_panic` test whose input is silently well-formed is the failure mode being repaired
-    /// here, and an assert that fires first panics with the wrong message and fails.
-    ///
-    /// ⛔ IT IS A `should_panic` BECAUSE THE VENDOR STILL UNWRAPS THIS GUARD'S `Err` — CHECKED, not
-    /// assumed, because the `Result` form did arrive for the matmul door this session
-    /// (`try_assemble_matmul_seeded`, `aba078748`) and the obvious guess is that this moved with it.
-    /// It did not: rope's pointwise leg goes through `assemble_pointwise_broadcast`, whose two tails
-    /// are still `.unwrap_or_else(|e| panic!(…))` (`vendor/ktir-superdsc/src/emit/mod.rs:752` and
-    /// `:755`), and `vendor/PROVENANCE.md` records under "FOUND AND DELIBERATELY NOT PATCHED" that
-    /// threading a `Result` out of that family reaches ~40 call sites and was left as their call. So
-    /// there is no `Err` for this test to read. If that door ever returns instead, this test is the
-    /// place to notice: drop the attribute and assert the `Err`.
-    #[test]
-    #[should_panic(expected = "exceeds its placement footprint")]
-    fn a_half_width_angle_table_is_caught_in_bytes() {
-        let node = rope_kv8();
-        let mut r = emit::lower_ktir_to_superdsc::regions(&node).expect("regions");
-        // `rope_fwd`'s parameters are `desc_x, desc_cos, desc_sin, desc_o` and `regions()` pairs them
-        // BY POSITION with the bindings, so 1 and 2 are the two angle tables. `[N_TOK, HALF]` =
-        // `[256, 64]` is the extent `rope.py` declared before `bad6820b5` widened it.
-        assert_eq!(
-            r.len(),
-            4,
-            "four parameters, or 1 and 2 are not cos and sin"
-        );
-        r[1].v_rows = 256;
-        r[1].v_cols = 64;
-        r[2].v_rows = 256;
-        r[2].v_cols = 64;
-        let l = layout::for_regions(&node, &r).expect("layout");
-        // THE PREMISE, ASSERTED: the table really is bound at 32768 B, and the plane that reads it
-        // really is wider. Without these the test could pass on any panic at all, which is how it
-        // came to be green against a fixture that no longer produced the defect.
-        let cos = l.placements.get(&1).expect("cos is placed");
-        assert_eq!(
-            cos.size, 32768,
-            "the narrow binding must be N_TOK*HALF*2 = 32768 B, or this test is not the defect"
-        );
-        let x = l.placements.get(&0).expect("the roped plane is placed");
+        let ops = emit_whole(&node, Some(&l)).expect("rope lowers through the whole door");
         assert!(
-            x.size > cos.size,
-            "the plane ({} B) must be wider than its angle table ({} B), or there is no over-read",
-            x.size,
-            cos.size
-        );
-        let _ = drive_rope(&node, 128, 256, 1024, RopeRows::TokenMajor, false, Some(&l));
-    }
-
-    /// THE GEOMETRY CROSS-CHECK, from the other side: a geometry that does not belong to this
-    /// program is a refusal and not an address. `mq` and `total` cannot both be read off a
-    /// `[mq·heads, hd]` view, so they are crossed — and a wrong `H` would silently rescale every
-    /// per-(row, head) offset if this check were not here.
-    #[test]
-    fn a_geometry_that_is_not_this_programs_is_refused() {
-        let node = rope_kv8();
-        let l = layout::for_node(&node).expect("layout");
-        // H=4 instead of 8: `total` says 4 heads, so the view would have to be `[1024, 128]` and it
-        // states `[2048, 128]`.
-        let e = match drive_rope(&node, 128, 256, 512, RopeRows::TokenMajor, false, Some(&l)) {
-            Err(e) => e,
-            Ok(ops) => panic!(
-                "a 4-head geometry over an 8-head program reached {} descriptor(s)",
-                ops.len()
-            ),
-        };
-        assert_eq!(e.stage, "geometry");
-        assert!(
-            e.message.contains("does not belong to this program"),
-            "{}",
-            e.message
+            !ops.is_empty(),
+            "the whole door emitted nothing for a rope the fixture compiles"
         );
     }
 }

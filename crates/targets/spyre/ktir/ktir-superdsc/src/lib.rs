@@ -31,10 +31,11 @@
 //!
 //! ⛔ THE ONE DOOR THE CALLER CROSSES IS MONOMORPHISATION. Head counts and head dim parameterise the
 //! device layout (GQA grouping, slabs, head strides), so they must be `const`, not values:
-//! [`emit::lower_ktir_to_superdsc::attn_at`]`::<NQH, NKVH, HD>` and
-//! [`emit::lower_ktir_to_superdsc::rope_at`]`::<HD>` are generic entry points and the CALLER
-//! instantiates them from its own model configs. That arm set is the consumer's model inventory, so a
-//! leaf crate must not own it, and it cannot be received as data either.
+//! [`emit::lower_ktir_to_superdsc::attn_at`]`::<NQH, NKVH, HD>` is a generic entry point and the
+//! CALLER instantiates it from its own model configs. That arm set is the consumer's model
+//! inventory, so a leaf crate must not own it, and it cannot be received as data either. (Rope had
+//! a second such entry point, `rope_at::<HD>`; it is deleted — rope lowers from its compiled ops
+//! through the whole-function door.)
 //!
 //! ⚠️ NOT YET LEAF-CLEAN: [`emit::EmittedOp`], this crate's own output type, still carries a
 //! consumer's bake plan (`kv_page_fold`, `kv_batched_requests`, `kv_fold_rows`, `kv_page_slots`,
