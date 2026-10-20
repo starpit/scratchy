@@ -89,17 +89,19 @@ const LAYERS: u32 = 2;
 /// The shared fixture's `[1, hd]` row suits the subtile-level tests, but this walk runs
 /// the door, whose `rope_xc` reads `[1, heads·hd]` — so the q site's pair (sources 5, 6)
 /// is widened to `[1, H]`, and the K-side append — a DIFFERENT width, `kv_heads·hd` —
-/// gets its own `[1, KV]` pair (sources 14, 15) the way production memoizes per width.
+/// gets its own `[1, KV]` pair (sources 15, 16, past the base fixture's P at 14) the way
+/// production memoizes per width. P itself needs no widening: `[hd, hd]` is the whole
+/// table at every site.
 fn fp8_oproj_one_layer() -> LoweringInput {
     let mut input = fixtures::one_layer_input_shaped(H, KV, I, HD);
     input.sources[5] = SourceShape { rows: 1, cols: H }; // 5: cos, q-site tiled [1, 32·128]
     input.sources[6] = SourceShape { rows: 1, cols: H }; // 6: sin, q-site tiled
-    input.sources.push(SourceShape { rows: 1, cols: KV }); // 14: cos, k-site tiled [1, 8·128]
-    input.sources.push(SourceShape { rows: 1, cols: KV }); // 15: sin, k-site tiled
+    input.sources.push(SourceShape { rows: 1, cols: KV }); // 15: cos, k-site tiled [1, 8·128]
+    input.sources.push(SourceShape { rows: 1, cols: KV }); // 16: sin, k-site tiled
     // The K-side append (op 5) reads its own-width pair — inputs 1, 2 are its cos, sin.
-    input.ops[5].inputs[1] = InputRef::Ext(14);
-    input.ops[5].inputs[2] = InputRef::Ext(15);
-    input.sources.push(SourceShape { rows: 1, cols: H }); // 16: o_scale [1, n]
+    input.ops[5].inputs[1] = InputRef::Ext(15);
+    input.ops[5].inputs[2] = InputRef::Ext(16);
+    input.sources.push(SourceShape { rows: 1, cols: H }); // 17: o_scale [1, n]
     let o = &mut input.ops[7];
     // Op 7 is the o projection — its first input is op 6, the AttnDecode — and the scale
     // is the arity-3 matmul's THIRD input, after [activation, weight].
@@ -110,7 +112,7 @@ fn fp8_oproj_one_layer() -> LoweringInput {
         n,
         weight: GemmWeight::Fp8Dynamic,
     };
-    o.inputs.push(InputRef::Ext(16));
+    o.inputs.push(InputRef::Ext(17));
     // Restate the base fixture's own `1/√hd` explicitly — the non-f16-exact spelling IS the
     // pin (see `ATTN_SCALE`): the door must resolve it through the f16 image, not by bits.
     for op in &mut input.ops {
@@ -139,33 +141,35 @@ fn fp8_oproj_one_layer() -> LoweringInput {
 /// by 1.0 is exactly what constant folding erases — the splat vanishes, and the walk
 /// refuses ("the program states no single multiplier").
 ///
-/// Shared across layers: x and the four rotary-table sources. Returns the input with
+/// Shared across layers: x and the five rotary-table sources (the four angle tables
+/// plus P — layer-invariant, one `[hd, hd]` per head dim). Returns the input with
 /// the staged-WEIGHT source id set — every per-layer source except the two KV caches
 /// (seg2's own role): the gammas, the seven projections, and the fp8 scale, the
 /// production classification of what the checkpoint ships as a layer weight.
 ///
-/// Source ids: 0=x, 1=cos_q, 2=sin_q, 3=cos_k, 4=sin_k (all five SHARED — the rotary
-/// tables are layer-invariant), then `n` blocks of twelve per-layer sources. Layer 0's
-/// block is `5..=16` (o_w = 11, gate_w = 13, o_scale = 16); layer `L`'s starts at
-/// `5 + L·12` (layer 1: o_w = 23, gate_w = 25, o_scale = 28).
+/// Source ids: 0=x, 1=cos_q, 2=sin_q, 3=cos_k, 4=sin_k, 5=P (all six SHARED — the
+/// rotary tables are layer-invariant), then `n` blocks of twelve per-layer sources.
+/// Layer 0's block is `6..=17` (o_w = 12, gate_w = 14, o_scale = 17); layer `L`'s
+/// starts at `6 + L·12` (layer 1: o_w = 24, gate_w = 26, o_scale = 29).
 fn n_layer_fp8_oproj(n: u32) -> (LoweringInput, HashSet<u32>) {
     let base = fp8_oproj_one_layer();
     let body = base.ops.clone();
     let ops_per_layer = body.len(); // 15
     // Base source ids: 0=x, 1=rms_w0, 2=q_w, 3=k_w, 4=v_w, 5=cos_q, 6=sin_q, 7=prefix_k,
-    // 8=prefix_v, 9=o_w, 10=rms_w1, 11=gate_w, 12=up_w, 13=down_w, 14=cos_k, 15=sin_k,
-    // 16=o_scale. SHARED across layers: 0 (x — global input) and the four rotary-table
-    // ids (5, 6, 14, 15 — layer-invariant). PER-LAYER: the other twelve.
+    // 8=prefix_v, 9=o_w, 10=rms_w1, 11=gate_w, 12=up_w, 13=down_w, 14=P, 15=cos_k,
+    // 16=sin_k, 17=o_scale. SHARED across layers: 0 (x — global input) and the five
+    // rotary-table ids (5, 6, 14, 15, 16 — layer-invariant). PER-LAYER: the other twelve.
     let per_layer_src_ids: Vec<usize> = (1..base.sources.len())
-        .filter(|e| !matches!(e, 5 | 6 | 14 | 15))
+        .filter(|e| !matches!(e, 5 | 6 | 14 | 15 | 16))
         .collect();
     let n_per = per_layer_src_ids.len(); // 12
     let mut sources = vec![
         base.sources[0],
         base.sources[5],
         base.sources[6],
-        base.sources[14],
         base.sources[15],
+        base.sources[16],
+        base.sources[14],
     ];
     for _ in 0..n {
         for &e in &per_layer_src_ids {
@@ -176,10 +180,11 @@ fn n_layer_fp8_oproj(n: u32) -> (LoweringInput, HashSet<u32>) {
         match e {
             5 => 1,  // cos_q (shared)
             6 => 2,  // sin_q (shared)
-            14 => 3, // cos_k (shared)
-            15 => 4, // sin_k (shared)
+            15 => 3, // cos_k (shared)
+            16 => 4, // sin_k (shared)
+            14 => 5, // P (shared — one table per head dim)
             _ => {
-                5 + layer * n_per
+                6 + layer * n_per
                     + per_layer_src_ids
                         .iter()
                         .position(|&x| x == e)
@@ -337,7 +342,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
 
     // ── 1. THE BUNDLE FACT ────────────────────────────────────────────────────────────────────
     // The handoff is minted (not defaulted) and names the o matmul's weight BY DATAFLOW:
-    // layer 0's o_w is source 11. `k == n` here — 4096 × 4096 — so this tid is the only
+    // layer 0's o_w is source 12. `k == n` here — 4096 × 4096 — so this tid is the only
     // thing standing between the o matmul and every other square projection.
     // The one-request rung's OWN value — false. The arg turns true only for batched rungs
     // (two rows and wider); the single-row bake keeps the shipped emission for everything
@@ -349,19 +354,19 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
     );
     assert_eq!(
         params.oproj_wtid,
-        Some(11),
+        Some(12),
         "the o matmul's weight, by dataflow"
     );
 
     // ── 2. THE LAYOUT: both layers' copies, after their companions ────────────────────────────
-    let perm0 = oproj_headmajor_tid(11);
-    let perm1 = oproj_headmajor_tid(23);
+    let perm0 = oproj_headmajor_tid(12);
+    let perm1 = oproj_headmajor_tid(24);
     assert_eq!(
         rolled.layout.weight_copies,
-        vec![(11, perm0), (23, perm1)],
+        vec![(12, perm0), (24, perm1)],
         "one permuted copy per layer's o_proj, in source-tid order"
     );
-    let comp = &rolled.layout.placements[&11];
+    let comp = &rolled.layout.placements[&12];
     let perm = &rolled.layout.placements[&perm0];
     assert_eq!(
         perm.segment, comp.segment,
@@ -437,8 +442,8 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
         "the permuted copies form their own per-layer family"
     );
     assert_eq!(
-        rolled.per_layer.get(&11).map(|v| v.as_slice()),
-        Some(&[11, 23][..]),
+        rolled.per_layer.get(&12).map(|v| v.as_slice()),
+        Some(&[12, 24][..]),
         "the companions form theirs"
     );
     assert!(
@@ -458,7 +463,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
         "the copy family advances by the weight stride"
     );
     assert_eq!(
-        rolled.layout.placements[&23].offset - rolled.layout.placements[&11].offset,
+        rolled.layout.placements[&24].offset - rolled.layout.placements[&12].offset,
         stride,
         "…exactly as the companion family does"
     );
@@ -472,7 +477,7 @@ fn the_headmajor_oproj_handoff_runs_the_whole_walk() {
         .expect("the mint runs for the prefill row kind");
     assert_eq!(
         layout_prefill.weight_copies,
-        vec![(11, perm0), (23, perm1)],
+        vec![(12, perm0), (24, perm1)],
         "the permuted copies are staged for every bundle of the model, read or not"
     );
 
@@ -628,14 +633,14 @@ fn a_handoff_without_an_oproj_weight_is_refused() {
 /// A handoff naming a DENSE projection's weight refuses at exactly that projection — the
 /// width and precision are the handoff's own (minted for the single-row fp8 W8A8 o
 /// matmul), and a swap over an f16 weight reads slab-major bytes against an unpermuted
-/// one. Naming layer 0's gate weight (source 13, dense) must refuse the gate projection
-/// alone; the o matmul (whose weight tid is 11, not 13) and every other projection lower
+/// one. Naming layer 0's gate weight (source 14, dense) must refuse the gate projection
+/// alone; the o matmul (whose weight tid is 12, not 14) and every other projection lower
 /// normally.
 #[test]
 fn the_handoff_refuses_a_dense_projection_named_as_the_o_proj() {
     let (rolled, ..) = walk_at_8b();
     let mut params = rolled.attn_params.expect("the bundle states its facts");
-    params.oproj_wtid = Some(13); // the gate weight — DENSE
+    params.oproj_wtid = Some(14); // the gate weight — DENSE
     let mut refused = Vec::new();
     for e in matmul_body_ops(&rolled) {
         match door_lower_op(&rolled, e, Some(params)) {
@@ -654,7 +659,7 @@ fn the_handoff_refuses_a_dense_projection_named_as_the_o_proj() {
         "the gate projection (fixture op 10, node 11 under the prologue)"
     );
     assert!(
-        err.message.contains("for weight t13,"),
+        err.message.contains("for weight t14,"),
         "the refusal names the bundle's own statement: {}",
         err.message
     );

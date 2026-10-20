@@ -3651,21 +3651,22 @@ mod attn_scale_weight_fold_tests {
         let hd = scratchy_subtile::model_geometry::HeadDim::new(128);
         let shape = |rows: u32, cols: u32| scratchy_subtile::subtile_ir::SourceShape { rows, cols };
         let sources = vec![
-            shape(1, 8),    // 0: x (hidden 8)
-            shape(8, 256),  // 1: W_q — q width 2·128
-            shape(8, 128),  // 2: W_k — kv width 1·128
-            shape(1, 128),  // 3: v
-            shape(32, 128), // 4: prefix_k cache
-            shape(32, 128), // 5: prefix_v cache
-            shape(1, 256),  // 6: cos (q side — one per q head pair)
-            shape(1, 256),  // 7: sin (q side)
-            shape(256, 16), // 8: W_o — fp8, k = 2·128
-            shape(1, 16),   // 9: o_scale
-            shape(1, 128),  // 10: cos (k side — kv width 1·128)
-            shape(1, 128),  // 11: sin (k side)
+            shape(1, 8),     // 0: x (hidden 8)
+            shape(8, 256),   // 1: W_q — q width 2·128
+            shape(8, 128),   // 2: W_k — kv width 1·128
+            shape(1, 128),   // 3: v
+            shape(32, 128),  // 4: prefix_k cache
+            shape(32, 128),  // 5: prefix_v cache
+            shape(1, 256),   // 6: cos (q side — one per q head pair)
+            shape(1, 256),   // 7: sin (q side)
+            shape(256, 16),  // 8: W_o — fp8, k = 2·128
+            shape(1, 16),    // 9: o_scale
+            shape(1, 128),   // 10: cos (k side — kv width 1·128)
+            shape(1, 128),   // 11: sin (k side)
+            shape(128, 128), // 12: P (rotate-half permutation, [hd, hd])
         ];
         let ops = vec![
-            // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin)
+            // 0: q = x · W_q; 1: q_rot = rope_rotate(q, cos, sin, P)
             OpDesc {
                 op: SubOp::MatmulTile {
                     n: 256,
@@ -3677,9 +3678,14 @@ mod attn_scale_weight_fold_tests {
             OpDesc {
                 op: SubOp::rope_rotate(hd),
                 m: 1,
-                inputs: vec![InputRef::Op(0), InputRef::Ext(6), InputRef::Ext(7)],
+                inputs: vec![
+                    InputRef::Op(0),
+                    InputRef::Ext(6),
+                    InputRef::Ext(7),
+                    InputRef::Ext(12),
+                ],
             },
-            // 2: k = x · W_k; 3: k_rot = rope_append(k, cos_k, sin_k, v, caches)
+            // 2: k = x · W_k; 3: k_rot = rope_append(k, cos_k, sin_k, v, caches, P)
             OpDesc {
                 op: SubOp::MatmulTile {
                     n: 128,
@@ -3703,6 +3709,7 @@ mod attn_scale_weight_fold_tests {
                     InputRef::Ext(3),
                     InputRef::Ext(4),
                     InputRef::Ext(5),
+                    InputRef::Ext(12),
                 ],
             },
             // 4: attn = AttnDecode(q_rot, prefix_k, prefix_v, k_rot, v)

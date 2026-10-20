@@ -69,6 +69,10 @@ pub(crate) struct BundleMeta {
     /// width, and a hybrid-attention arch gives classes different tables.
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    /// The rotate-half permutation sources as `(id, head_dim)` — one per distinct rope
+    /// class; the forward stages each as the fixed `[hd, hd]` table the rope kernel's
+    /// `tl.dot(x, P)` reads.
+    pub(crate) p_srcs: Vec<(usize, usize)>,
     pub(crate) result_id: usize,
     /// One per layer, in layer order.
     pub(crate) layers: Vec<LayerWiring>,

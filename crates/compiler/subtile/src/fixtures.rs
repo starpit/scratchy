@@ -33,6 +33,7 @@ use crate::subtile_ir::{
 ///  11: gate_w    [2048, 8192]   ([K, N] = [hidden, intermediate])
 ///  12: up_w      [2048, 8192]   ([K, N] = [hidden, intermediate])
 ///  13: down_w    [8192, 2048]   ([K, N] = [intermediate, hidden])
+///  14: P         [hd, hd]       (rotate-half permutation, one per head dim)
 ///
 /// Weight orientation is the SubtileIR `MatmulTile` convention `[K, N]`
 /// (`eval_node`/`lower_region`: weight rows = K = activation cols,
@@ -86,6 +87,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             SourceShape { rows: h, cols: i },  // 11 gate_w [K=h, N=i]
             SourceShape { rows: h, cols: i },  // 12 up_w   [K=h, N=i]
             SourceShape { rows: i, cols: h },  // 13 down_w [K=i, N=h]
+            SourceShape { rows: hd, cols: hd }, // 14 P      [hd, hd] rotate-half permutation
         ],
         // Production-faithful arity-5 decode layer (matches
         // to_wavefront.rs OpKind::{RopeAppend,Attention}): q/k/v all
@@ -135,9 +137,14 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
             OpDesc {
                 op: SubOp::rope_rotate(head_dim),
                 m: 1,
-                inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
+                inputs: vec![
+                    InputRef::Op(1),
+                    InputRef::Ext(5),
+                    InputRef::Ext(6),
+                    InputRef::Ext(14),
+                ],
             },
-            // 5: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v)
+            // 5: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v, P)
             //    (rotate K + write rotated K / un-roped V to layer 0 cache)
             OpDesc {
                 op: SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
@@ -149,6 +156,7 @@ pub fn one_layer_input_shaped(h: u32, kv: u32, i: u32, hd: u32) -> LoweringInput
                     InputRef::Op(3),
                     InputRef::Ext(7),
                     InputRef::Ext(8),
+                    InputRef::Ext(14),
                 ],
             },
             // 6: attn = AttnDecode(q', prefix_k, prefix_v, new_k, v)
@@ -514,7 +522,7 @@ pub fn silu_mul_only_input() -> LoweringInput {
 
 /// Phase 6 single-op fixture: NeoX RoPE rotate on a single Q row of
 /// `[1, num_heads * head_dim]`. Llama-1B Q-side: 32 heads × 64 head_dim
-/// = 2048 cols. Buffer count: 3 sources (x, cos, sin) + 1 op output = 4.
+/// = 2048 cols. Buffer count: 4 sources (x, cos, sin, P) + 1 op output = 5.
 pub fn rope_rotate_only_input() -> LoweringInput {
     let head_dim = 64u32;
     let num_heads = 32u32;
@@ -531,11 +539,20 @@ pub fn rope_rotate_only_input() -> LoweringInput {
                 rows: 1,
                 cols: head_dim,
             }, // 2  sin
+            SourceShape {
+                rows: head_dim,
+                cols: head_dim,
+            }, // 3  P (rotate-half permutation, [hd, hd])
         ],
         ops: vec![OpDesc {
             op: SubOp::rope_rotate(HeadDim::new(head_dim)),
             m: 1,
-            inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
+            inputs: vec![
+                InputRef::Ext(0),
+                InputRef::Ext(1),
+                InputRef::Ext(2),
+                InputRef::Ext(3),
+            ],
         }],
         result: 0,
     }

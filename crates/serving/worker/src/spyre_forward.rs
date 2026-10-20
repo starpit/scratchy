@@ -1918,6 +1918,15 @@ pub(crate) fn forward_chunk(
                 vec![rows, w as usize],
             ));
         }
+        // ⭐ THE ROTATE-HALF PERMUTATION, one FIXED `[hd, hd]` table per source — the
+        // same `rope_p_entry` values the reserved-tid fill stages, bound here at the
+        // SOURCE the spliced kernel's `desc_p` reads (row-major, the strides the
+        // kernel's own view states). Position-independent, so unlike cos/sin there is
+        // no per-row tiling: the table is the bytes.
+        for &(pid, hd) in b.p_srcs.iter() {
+            let table = scratchy_subtile::sdsc_abstract::rope_p_rowmajor(hd);
+            dynamic.push((pid as u64, table, vec![hd as usize, hd as usize]));
+        }
         dynamic
     };
     let vocab = sh.vocab;

@@ -197,9 +197,10 @@ pub(crate) fn node_to_tile_ops<F: scratchy_subtile::subtile_ir::RopeForm>(
           // any decision about how to batch/split rows or heads for the device, is a SEPARATE concern —
           // either a later IR-to-IR transformation on TileIR, or the TileIR→SdscOp step itself (which is
           // where "translate to a lower level of abstraction" legitimately happens). Lowering only
-          // TRANSLATES; it does not SCHEDULE. `n_operands` = every declared input (RopeRotate: 3;
-          // RopeAppend: 6, including the cache-write operands main's `lower_rope_node` dropped from its
-          // OWN rotation math) + the output — no cherry-picking which inputs "count".
+          // TRANSLATES; it does not SCHEDULE. `n_operands` = every declared input (RopeRotate: 4;
+          // RopeAppend: 7, including the cache-write operands main's `lower_rope_node` dropped from its
+          // OWN rotation math, and the rotate-half permutation P both ropes carry LAST) + the output
+          // — no cherry-picking which inputs "count".
           // AttnDecode: PURE SYNTAX, same convention as every arm above — the node's own [rows,cols]
           // output shape and its own declared input count (Q + alternating (K_seg,V_seg) pairs) + the
           // output. This does NOT characterize attention as "really" softmax(QKᵀ/√d)V internally, nor
@@ -316,7 +317,7 @@ mod tests {
     /// add) at this stage. That decomposition is a SEPARATE concern (an explicit later transformation,
     /// or the TileIR→SdscOp step), never smuggled into the SubtileTape→TileIR translation. Proves
     /// decode (rows=1, this fixture) needs NO special case: it hits the exact same arm any row count
-    /// would, with the SAME `n_operands = 3 inputs + 1 output` any RopeRotate node has.
+    /// would, with the SAME `n_operands = 4 inputs + 1 output` any RopeRotate node has.
     #[test]
     fn rope_lowers_as_one_undecomposed_tile_op() {
         let input = scratchy_subtile::fixtures::rope_rotate_only_input();
@@ -333,8 +334,8 @@ mod tests {
         let ops = &tiled[0].tile_ops;
         assert_eq!(ops.len(), 1, "one node -> one TileOp, undecomposed");
         assert!(
-            matches!(ops[0].kind, TileOpKind::PointwiseOrReduce { n_operands: 4 }),
-            "3 declared inputs (x, cos, sin) + 1 output"
+            matches!(ops[0].kind, TileOpKind::PointwiseOrReduce { n_operands: 5 }),
+            "4 declared inputs (x, cos, sin, P) + 1 output"
         );
         let mb_dim = ops[0].dims.iter().find(|d| d.name == "mb").unwrap();
         assert_eq!(

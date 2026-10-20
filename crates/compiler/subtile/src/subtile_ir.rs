@@ -1122,7 +1122,10 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     },
     /// Rotary embedding over `[rows, heads * head_dim]` in the
     /// `F: RopeForm` pairing. `inputs[0]` = x, `inputs[1]` = cos row,
-    /// `inputs[2]` = sin row.
+    /// `inputs[2]` = sin row, `inputs[3]` = the rotate-half permutation
+    /// `P` `[head_dim, head_dim]` (a synthetic source — targets whose kernels
+    /// spell rotate-half natively still carry the input, unread, because the
+    /// node's arity is every target's contract).
     RopeRotate {
         head_dim: HeadDim,
         #[doc(hidden)]
@@ -1132,7 +1135,9 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     /// **and** write the rotated K + un-rotated V into the paged KV
     /// cache (the cache identity is bound by `layout`). The host eval is
     /// **rotation only** (identical to [`SubOp::RopeRotate`]); V and the
-    /// cache write are GPU-only. `inputs` = `[K, cos, sin, V, K_cache, V_cache]`.
+    /// cache write are GPU-only. `inputs` = `[K, cos, sin, V, K_cache,
+    /// V_cache, P]` — the rotate-half permutation LAST, so every positional
+    /// read of the six inputs this op used to carry keeps its index.
     RopeAppend {
         head_dim: HeadDim,
         layer: u32,
@@ -2321,6 +2326,15 @@ pub fn lower_region(
         }
     };
 
+    // ⭐ THE ROPE'S ROTATE-HALF PERMUTATION P is an ORDINARY SOURCE, stated by
+    // whoever builds the OpDesc list (`to_wavefront`'s `rope_p` memo on the
+    // production path, the fixture builders in tests) and carried LAST on the
+    // lowered node — arity 4 / 7. This lowering TRANSLATES the declared inputs;
+    // it does not mint or append any: a mint here would DOUBLE P on every graph
+    // that already states it (the production path), and validate() would refuse
+    // the node's arity — a refusal that surfaced only in the real model
+    // expansion, whose silent early return left `SUPERDSC_WIRINGS` unemitted.
+
     for desc in &input.ops {
         let m = desc.m;
         // ⛔ OPERAND 0 IS OPTIONAL. The host-staged loads (`LoadRows`) take NO operands — their buffer is delivered by the
@@ -2660,6 +2674,12 @@ pub fn lower_region(
                         }
                     })
                     .collect();
+                // P rides LAST on every rope node (arity 4 / 7) — but it is
+                // DECLARED like any other input (`to_wavefront`'s rope_p memo, the
+                // fixtures), so the generic resolution above already carried it:
+                // WHOLE, because it is neither position- nor head-dependent, so
+                // every rope chunk reads the same `[hd, hd]` table. Nothing to
+                // append here — see the note at the top of this lowering.
                 if let SubOp::AttnDecode {
                     producer,
                     valid_len,
@@ -2910,8 +2930,10 @@ pub fn decompose_rmsnorm<F: RopeForm>(
 ///
 /// Each emitted chunk reads a head-aligned slice of the rope's
 /// activation input and writes the matching slice of the output
-/// tensor. cos/sin and (for RopeAppend) cache tensors stay whole —
-/// every chunk reads the same cos/sin row vec; cache writes are
+/// tensor. cos/sin, the rotate-half permutation P, and (for
+/// RopeAppend) cache tensors stay whole — every chunk reads the
+/// same cos/sin row vec and the same `[head_dim, head_dim]` P;
+/// cache writes are
 /// indexed by `layout.layer × position` not by head, and per-block
 /// region narrowing is handled at the lower_compute layer (audit
 /// finding #18 — Patch 2 territory).
@@ -2955,6 +2977,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 let q_in = node.inputs[0];
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
+                let p_in = node.inputs[3];
                 let total_cols = node.output.region.cols.len;
                 let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
                     .expect("head_tile_rope: head_dim must be non-zero");
@@ -2977,6 +3000,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                             },
                             cos_in,
                             sin_in,
+                            p_in,
                         ],
                         output: TensorRegion {
                             tensor: node.output.tensor,
@@ -2996,15 +3020,16 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                 layout,
                 _form: _,
             } => {
-                // Arity 6: [K, cos, sin, V, K_cache, V_cache]. K and V
-                // are head-tiled; cos/sin and the cache handles stay
-                // whole.
+                // Arity 7: [K, cos, sin, V, K_cache, V_cache, P]. K and V
+                // are head-tiled; cos/sin, the rotate-half permutation P,
+                // and the cache handles stay whole.
                 let k_in = node.inputs[0];
                 let cos_in = node.inputs[1];
                 let sin_in = node.inputs[2];
                 let v_in = node.inputs[3];
                 let kcache_in = node.inputs[4];
                 let vcache_in = node.inputs[5];
+                let p_in = node.inputs[6];
                 let total_cols = node.output.region.cols.len;
                 let head_dim_nz = std::num::NonZeroU32::new(head_dim.get())
                     .expect("head_tile_rope: head_dim must be non-zero");
@@ -3041,6 +3066,7 @@ pub fn head_tile_rope<F: RopeForm>(graph: &SubtileIR<F>, nb: std::num::NonZeroU3
                             },
                             kcache_in,
                             vcache_in,
+                            p_in,
                         ],
                         output: TensorRegion {
                             tensor: node.output.tensor,
@@ -3540,6 +3566,7 @@ mod tests {
                 }, // 1: Wq [h, qdim]
                 SourceShape { rows: 1, cols: hd }, // 2: cos
                 SourceShape { rows: 1, cols: hd }, // 3: sin
+                SourceShape { rows: hd, cols: hd }, // 4: P (rotate-half permutation)
             ],
             ops: vec![
                 OpDesc {
@@ -3553,7 +3580,12 @@ mod tests {
                 OpDesc {
                     op: SubOp::rope_rotate(HeadDim::new(hd)),
                     m,
-                    inputs: vec![InputRef::Op(0), InputRef::Ext(2), InputRef::Ext(3)],
+                    inputs: vec![
+                        InputRef::Op(0),
+                        InputRef::Ext(2),
+                        InputRef::Ext(3),
+                        InputRef::Ext(4),
+                    ],
                 },
             ],
             result: 1,
@@ -3623,6 +3655,7 @@ mod tests {
                     rows: l,
                     cols: kvdim,
                 }, // 6: prefixV
+                SourceShape { rows: hd, cols: hd }, // 7: P (rotate-half permutation)
             ],
             ops: vec![
                 OpDesc {
@@ -3640,6 +3673,7 @@ mod tests {
                         InputRef::Ext(4),
                         InputRef::Ext(5),
                         InputRef::Ext(6),
+                        InputRef::Ext(7),
                     ],
                 },
                 OpDesc {

@@ -97,12 +97,17 @@ macro_rules! for_each_subop {
                 rows = [in0], gemm_w = [none];
             RmsNormApply [SubOp::RmsNormApply { .. }] arity = (|n| n == 3), cols = [in0],
                 rows = [in0], gemm_w = [none];
-            RopeRotate [SubOp::RopeRotate { .. }] arity = (|n| n == 3), cols = [in0], rows = [in0],
+            // [x, cos, sin, P] — the rotate-half permutation is the LAST input: a
+            // target that spells rotate-half natively carries it unread, and every
+            // positional read of the three inputs this op used to carry keeps its
+            // index.
+            RopeRotate [SubOp::RopeRotate { .. }] arity = (|n| n == 4), cols = [in0], rows = [in0],
                 gemm_w = [none];
-            // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
+            // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache, P]
             // — the caches are per-layer PrefixK / PrefixV sources used
-            // as TMA-store destinations for the new decode token's K/V.
-            RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 6), cols = [in0], rows = [in0],
+            // as TMA-store destinations for the new decode token's K/V,
+            // and P (the rotate-half permutation, `[hd, hd]`) rides LAST.
+            RopeAppend [SubOp::RopeAppend { .. }] arity = (|n| n == 7), cols = [in0], rows = [in0],
                 gemm_w = [none];
             // `[K, V, K_cache, V_cache]`: the un-rotated writer.
             KvAppend [SubOp::KvAppend { .. }] arity = (|n| n == 4), cols = [in0], rows = [in0],

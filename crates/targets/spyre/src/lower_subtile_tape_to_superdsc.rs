@@ -2615,6 +2615,29 @@ pub fn rope_table_periods<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::H
         .collect()
 }
 
+/// ⭐ THE ROPE P SOURCES' HEAD DIMS — the rotate-half permutation `[hd, hd]` the
+/// spliced kernel's `tl.dot(x, P)` reads. P is position-INDEPENDENT, so unlike
+/// cos/sin there is no periodic-synth option: the TRUE table (`rope_p_rowmajor`,
+/// the same `rope_p_entry` the worker's reserved-tid fill and the Kani proof
+/// share) is the staging law for BOTH gate legs. Flat synth noise here convicts
+/// the gate's own probe — the emulator's `rotate_half` becomes `x·noise` while
+/// the golden rotates by the reference half-pairing (measured on
+/// granite-3.1-8b: the four rope tensors refusing at local ~0.7, the |sin|
+/// term's own magnitude). Keyed by source tid; the input is the rope node's
+/// LAST input (P rides last on both rope op kinds).
+pub fn rope_p_table_dims<F: RopeForm>(ir: &SubtileIR<F>) -> std::collections::HashMap<u32, usize> {
+    ir.nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+                Some((n, head_dim.get() as usize))
+            }
+            _ => None,
+        })
+        .filter_map(|(n, hd)| n.inputs.last().map(|inp| (inp.tensor.index() as u32, hd)))
+        .collect()
+}
+
 /// The fp8 payload's synth normalizer — see the payload arm of the gate's weights
 /// loop: codes at `synth × C` (e4m3 normals), the magnitude `1/C` riding the
 /// ws row, so the dequant meets the reference product at the grid's own ~3%
@@ -3012,6 +3035,10 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
     // there the tables are one row and the pattern agrees with the run-time
     // staging by construction.
     let rope_table_half = rope_table_periods(ir);
+    // The P sources stage the TRUE permutation on this leg too — the golden's
+    // rope eval spells rotate-half natively and never reads the input, but the
+    // two legs' source bytes stay one law (see [`rope_p_table_dims`]).
+    let rope_p_dims = rope_p_table_dims(ir);
     // ⭐ WEIGHT SOURCES STAY EMPTY — materialized per node from the staged
     // bytes (see `weights`), never held as f32 beyond the node reading them;
     // a source the covering slice does not bind stays empty with its readers
@@ -3027,6 +3054,8 @@ pub(crate) fn eval_golden_buffers<F: RopeForm>(
                 Vec::new()
             } else if let Some(v) = staged_rope.get(&(id as u32)) {
                 v.clone()
+            } else if let Some(&hd) = rope_p_dims.get(&(id as u32)) {
+                ktir_superdsc::sdsc_abstract::rope_p_rowmajor(hd)
             } else {
                 let t = ir.tensors[id];
                 let n = (t.rows as usize) * (t.cols as usize);
@@ -3990,6 +4019,9 @@ pub fn numeric_gate<F: RopeForm>(
     // The rope cos/sin sources stage at their runtime contract — period-`half`,
     // per [`rope_table_periods`] — not as flat noise.
     let rope_table_half = rope_table_periods(ir);
+    // The rope P sources stage at THEIR runtime contract too — the TRUE
+    // permutation (`rope_p_table_dims`), never synth noise.
+    let rope_p_dims = rope_p_table_dims(ir);
     // ⭐ THE PREFILL ROPE ROWS — ONE LAW, BOTH LEGS (`staged_rope_rows`'s doc):
     // this product feeds the emulator's probe binds below AND the golden's
     // source buffers (`eval_golden_buffers`), so a staging defect cannot hide
@@ -4015,6 +4047,10 @@ pub fn numeric_gate<F: RopeForm>(
             vec![1.0; n]
         } else if let Some(v) = staged_rope.get(&tid) {
             v.clone()
+        } else if let Some(&hd) = rope_p_dims.get(&tid) {
+            // The rotate-half permutation, as the row-major `[hd, hd]` f32 the
+            // kernel's `desc_p` states — one law with the worker's fill.
+            ktir_superdsc::sdsc_abstract::rope_p_rowmajor(hd)
         } else if let Some(&half) = rope_table_half.get(&tid) {
             (0..n)
                 .map(|j| dbg_synth_val(tid as usize, j % half))

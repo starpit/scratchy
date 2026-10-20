@@ -40,7 +40,7 @@ fn verify_attn_decode_pure_syntax() {
         // AttnDecode's node id is opaque outside the crate (SubtileId is sealed), so identify it by
         // its TileOp's operand count: AttnDecode's inputs are [q', prefix_k, prefix_v, new_k, v] = 5,
         // +1 output = 6 — distinct from every other node in this layer (RmsNorm=2in+1, Gemm handled
-        // separately as Matmul, RopeRotate/Append=3or6in+1, SiluMul=2in+1, Add=2in+1).
+        // separately as Matmul, RopeRotate/Append=4or7in+1 (P rides LAST), SiluMul=2in+1, Add=2in+1).
         if let [op] = tc.tile_ops.as_slice()
             && matches!(op.kind, TileOpKind::PointwiseOrReduce { n_operands: 6 })
         {

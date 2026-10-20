@@ -279,6 +279,14 @@ pub enum SourceBinding {
     Sin {
         local: bool,
     },
+    /// The rotate-half permutation matrix `P` `[head_dim, head_dim]` the rope
+    /// computes `rot = matmul(x, P)` through — a FIXED table (the Kani-proven
+    /// `rope_p_entry`), one per DISTINCT head dim, staged like cos/sin but
+    /// position-INDEPENDENT. A target whose rope kernel spells rotate-half
+    /// natively carries the source unread.
+    RopeP {
+        head_dim: u32,
+    },
     /// The read-only prefix KV cache for a layer, `[prefix_len, kvdim]`.
     PrefixK {
         layer: u64,

@@ -2741,7 +2741,11 @@ mod tests {
             view(2, 64, 0),
             op(RMS, 1, vec![Op(3), Ext(4)]),
             view(1, 128, 4),
-            op(SubOp::rope_rotate(head_dim), 1, vec![Op(5), Ext(6), Ext(7)]),
+            op(
+                SubOp::rope_rotate(head_dim),
+                1,
+                vec![Op(5), Ext(6), Ext(7), Ext(10)],
+            ),
             view(2, 64, 1),
             op(RMS, 1, vec![Op(7), Ext(5)]),
             view(1, 128, 8),
@@ -2749,7 +2753,7 @@ mod tests {
             op(
                 SubOp::rope_append(head_dim, 0, AttnMask::Causal, RopeFormTag::NeoX),
                 1,
-                vec![Op(9), Ext(6), Ext(7), Op(10), Ext(8), Ext(9)],
+                vec![Op(9), Ext(6), Ext(7), Op(10), Ext(8), Ext(9), Ext(10)],
             ),
             op(ADD, 1, vec![Op(6), Op(11)]),
         ];
@@ -2771,6 +2775,7 @@ mod tests {
             (1, 64),
             (8, 128),
             (8, 128),
+            (64, 64),
         ];
         let mut bindings = weights(6);
         bindings[0] = SourceBinding::EmbeddedHidden;
@@ -2779,6 +2784,7 @@ mod tests {
             SourceBinding::Sin { local: false },
             SourceBinding::PrefixK { layer: 0 },
             SourceBinding::PrefixV { layer: 0 },
+            SourceBinding::RopeP { head_dim: 64 },
         ]);
         fold(&src, bindings, rope_ops(v_read_again), &[], table, SPLIT)
     }

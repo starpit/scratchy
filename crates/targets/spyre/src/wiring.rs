@@ -482,6 +482,7 @@ impl Wiring {
             embed_src: self.embed_src,
             cos_srcs: self.cos_srcs,
             sin_srcs: self.sin_srcs,
+            p_srcs: self.p_srcs,
             prefix_mask: owns_prefix,
             kv_block_index: gathers.get(),
             n_consts,
@@ -788,6 +789,11 @@ pub struct Wiring {
     /// rotary tables, so every source carries its own [`RotaryKind`].
     pub cos_srcs: &'static [(u32, u32, RotaryKind)],
     pub sin_srcs: &'static [(u32, u32, RotaryKind)],
+    /// The rotate-half permutation sources as `(id, head_dim)` — one per DISTINCT rope
+    /// head dim (P is `[hd, hd]` and position-independent, so unlike cos/sin there is no
+    /// width or class to state: the worker builds the table from `rope_p_entry` at the
+    /// head dim alone). The rope kernel dots through it: `out = x·cos + dot(x, P)·sin`.
+    pub p_srcs: &'static [(u32, u32)],
     /// Per-layer AttnDecode wiring, in layer order.
     pub layers: &'static [LayerWiring],
     pub geometry: Geometry,
@@ -1755,6 +1761,7 @@ mod constant_tape_tests {
             embed_src: 0,
             cos_srcs: &[],
             sin_srcs: &[],
+            p_srcs: &[],
             layers: &[],
             geometry: Geometry {
                 hidden: 128,

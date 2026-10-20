@@ -190,6 +190,10 @@ pub(crate) struct Parsed {
     /// per-position rotary row across heads.
     pub(crate) cos_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
     pub(crate) sin_srcs: Vec<(usize, usize, scratchy_target_spyre::wiring::RotaryKind)>,
+    /// The rotate-half permutation sources as `(id, head_dim)` — one per distinct
+    /// rope class; the forward stages each as the fixed `[hd, hd]` table the rope
+    /// kernel's `tl.dot(x, P)` reads.
+    pub(crate) p_srcs: Vec<(usize, usize)>,
     pub(crate) result_id: usize,
     pub(crate) capacity: usize,
     pub(crate) m_cap: usize,
@@ -254,6 +258,14 @@ pub(crate) fn wiring_to_parsed(
         embed_src,
         cos_srcs: triples(w.cos_srcs),
         sin_srcs: triples(w.sin_srcs),
+        // The rotate-half permutation sources — `(id, head_dim)`, one per distinct rope
+        // class; the forward stages each as the fixed `[hd, hd]` table the kernel dots
+        // through.
+        p_srcs: w
+            .p_srcs
+            .iter()
+            .map(|&(i, hd)| (i as usize, hd as usize))
+            .collect(),
         result_id: w.result as usize,
         capacity,
         m_cap: (w.tensor_shapes[embed_src].0 as usize).max(1),
@@ -2724,6 +2736,7 @@ impl SpyreWorker {
                 embed_src: p.embed_src,
                 cos_srcs: p.cos_srcs,
                 sin_srcs: p.sin_srcs,
+                p_srcs: p.p_srcs,
                 result_id: p.result_id,
                 layers: p.layers,
                 #[cfg(not(feature = "spyre-hw"))]

@@ -362,7 +362,8 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
     let hd = 64u32;
 
     // t0 x [m, hidden]; t1 Wq [hidden, qw]; t2 cos [m, qw]; t3 sin [m, qw];
-    // t4 q [m, qw]; t5 roped q [m, qw] (the RESULT — same width as q).
+    // t4 q [m, qw]; t5 roped q [m, qw] (the RESULT — same width as q);
+    // t6 P [hd, hd] — the rotate-half permutation every rope node carries LAST.
     // Sources FIRST (eval_dag's contract: tensors[0..num_sources] are leaves).
     // The cos/sin tables are PER-POSITION `[m, qw]` rows — the rope program views
     // them as `[rows*tbl_cols]` and reads position `ri`'s row at `ri*tbl_cols`.
@@ -375,12 +376,13 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
             rows: hidden,
             cols: qw,
         }, // t1 Wq (source)
-        TensorShape { rows: m, cols: qw }, // t2 cos (source)
-        TensorShape { rows: m, cols: qw }, // t3 sin (source)
-        TensorShape { rows: m, cols: qw }, // t4 q
-        TensorShape { rows: m, cols: qw }, // t5 roped (result)
+        TensorShape { rows: m, cols: qw },  // t2 cos (source)
+        TensorShape { rows: m, cols: qw },  // t3 sin (source)
+        TensorShape { rows: m, cols: qw },  // t4 q
+        TensorShape { rows: m, cols: qw },  // t5 roped (result)
+        TensorShape { rows: hd, cols: hd }, // t6 P (source)
     ];
-    let num_sources = 4u32; // x, Wq, cos, sin
+    let num_sources = 5u32; // x, Wq, cos, sin, P
     let whole = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),
         region: tensors[t].whole(),
@@ -419,7 +421,7 @@ fn the_fold_refuses_a_width_collision_that_feeds_the_result_through_rope() {
                 head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
                 _form: std::marker::PhantomData,
             },
-            vec![row(4, ri), row(2, ri), row(3, ri)],
+            vec![row(4, ri), row(2, ri), row(3, ri), whole(6)],
             row(5, ri),
         ));
     }

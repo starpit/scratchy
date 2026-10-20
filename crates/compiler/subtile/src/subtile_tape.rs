@@ -3526,23 +3526,25 @@ pub(crate) mod tests {
         // Pattern S S G | S S G — layer → class head dim.
         let hd_of = |layer: u32| if layer % 3 == 2 { 512 } else { 256 };
         // sources, contiguous at the front (num_sources covers all of them):
-        // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5.
-        // (The rope's operand list is [k, cos, sin, v, prefix_k, prefix_v] — the cache
-        // tensors are separate sources per layer, like the real KV pool.)
+        // 0 = x; 1..7 = W_0..W_5; 7 = cos; 8 = sin; 9..15 = pk_0..pk_5; 15..21 = pv_0..pv_5;
+        // 21 = P_256; 22 = P_512. (The rope's operand list is
+        // [k, cos, sin, v, prefix_k, prefix_v, P] — the cache tensors are separate sources
+        // per layer, like the real KV pool, and P is one per DISTINCT class head dim.)
         let mut tensors = Vec::new();
-        for _ in 0..21 {
+        for _ in 0..23 {
             tensors.push(TensorShape { rows: 1, cols: 4 });
         }
         let cos = TensorId(7);
         let sin = TensorId(8);
-        // op outputs: 21 = r_0; 22..28 = r_1..r_6; 29 = y; 30..36 = rope intermediates.
+        let p_of = |layer: u32| TensorId(if layer % 3 == 2 { 22 } else { 21 });
+        // op outputs: 23 = r_0; 24..30 = r_1..r_6; 31 = y; 32..38 = rope intermediates.
         for _ in 0..16 {
             tensors.push(TensorShape { rows: 1, cols: 4 });
         }
-        let r0 = TensorId(21);
-        let r_out = |layer: u32| TensorId(22 + layer);
-        let y = TensorId(29);
-        let rope_out = |layer: u32| TensorId(30 + layer);
+        let r0 = TensorId(23);
+        let r_out = |layer: u32| TensorId(24 + layer);
+        let y = TensorId(31);
+        let rope_out = |layer: u32| TensorId(32 + layer);
         let tr = |t: u32| TensorRegion {
             tensor: TensorId(t),
             region: Region {
@@ -3577,6 +3579,7 @@ pub(crate) mod tests {
                     tr(r_in.0),
                     tr(9 + layer),
                     tr(15 + layer),
+                    tr(p_of(layer).0),
                 ],
                 output: tr(rope_out(layer).0),
             });
@@ -3597,7 +3600,7 @@ pub(crate) mod tests {
         ));
         SubtileIR {
             tensors,
-            num_sources: 21,
+            num_sources: 23,
             nodes,
             result: y,
             op_output: Vec::new(),

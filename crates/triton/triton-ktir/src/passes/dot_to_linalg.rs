@@ -210,23 +210,35 @@ pub fn run(module: &mut Module) -> Result<()> {
         // its own parameter -- the f16 verifier's counts would refuse it (it expects 2
         // loads and no epilogue), so the fp8 form is verified by its own function rather
         // than by bending the f16 one. SO DOES THE GATHERED ARM (rung 4): its B is a
-        // transposed gather, which the f16 counts would refuse the same way.
-        let canonical = if single_dot_kernel {
+        // transposed gather, which the f16 counts would refuse the same way. AND SO DOES
+        // THE ROPE ARM: the rotate-half restatement (`out = x*cos + dot(x, P)*sin`,
+        // `kernels/rope.py`) is the tree's one single-dot kernel that is NOT a matmul at
+        // all -- it is door-bound by the splice's own routing, so its dot is lowered and
+        // left UNTAGGED (the paged-attention treatment: the whole-function door walks the
+        // ops; the tag is the standalone-matmul emitter's trust and would be a lie here).
+        let mut canonical = false;
+        if single_dot_kernel {
             if is_fp8_kernel {
                 // The PEELED LOAD, not `dot.operands[1]` -- this runs BEFORE the rewire
                 // below, so the dot's operand is still the extf/trans chain. The peel in
                 // `run` checked the fp8 elem; this function checks everything else.
                 let b_load = fp8_b_load.expect("is_fp8_kernel implies the peeled load");
                 verify_canonical_fp8_matmul_kernel(module, &index, path, b_load)?;
+                canonical = true;
             } else if let Some(g) = gathered_b {
                 verify_canonical_paged_matmul_kernel(module, &index, path, g)?;
+                canonical = true;
+            } else if verify_rope_rotation(module, &index, path)? {
+                // A verified rope rotation: nothing further to check here, and
+                // `canonical` stays false BY DESIGN (see the arm's doc) -- the splice
+                // routes the rope through the whole-function door, which walks the
+                // lowered matmul like attention's four, not through the standalone
+                // matmul emitter the tag vouches for.
             } else {
                 verify_canonical_matmul_kernel(module, &index, path)?;
+                canonical = true;
             }
-            true
-        } else {
-            false
-        };
+        }
 
         // ⭐ A TRANSPOSED B IS SPENT HERE, IN THE INDEXING MAPS -- NOT LEFT FOR THE TILE.
         //
@@ -650,6 +662,312 @@ fn verify_canonical_matmul_kernel(
         }
     }
     Ok(())
+}
+
+/// ⭐⭐⭐ THE ROPE ROTATION ARM — the tree's one single-dot kernel that is NOT a matmul
+/// at all.
+///
+/// `kernels/rope.py` restates NeoX rotate-half full-width as
+/// `out = x*cos + dot(x, P)*sin`, with `P` the worker-staged `[hd, hd]`
+/// rotate-half permutation (a KERNEL PARAMETER, arg 3 of 5: x, cos, sin, P, out).
+/// The splice routes the rope through the whole-function door like every other
+/// spliced kernel, so its dot is lowered here and left UNTAGGED — exactly the
+/// multi-dot treatment attention's four dots get ("lower each dot locally and
+/// leave it UNTAGGED"; the tag vouches for the STANDALONE-MATMUL emitter, and a
+/// rope is not one). The door walks the ops; its own window/stick laws gate the
+/// regions; the numeric golden gates the math. This verifier therefore pins
+/// IDENTITY, not the body census: enough facts that no standalone-matmul shape
+/// can satisfy them and no almost-rope slips through untagged.
+///
+/// The identification ladder is fail-closed in the file's discipline:
+/// * `Ok(false)` — not a rope candidate; the standalone-matmul contract speaks
+///   (its refusals are the right messages for a kernel that was trying to be a
+///   matmul). Five pointer args, B a DIRECT load whose base is arg 3, and A a
+///   direct load are the candidacy facts.
+/// * `Err` — a rope candidate that fails one of its own facts, refused BY NAME:
+///   the P law (square `[hd, hd]`, whole-tensor block, row-major strides, loaded
+///   at the origin OUTSIDE the trip loop — the shared permutation tile), the
+///   cos/sin law (args 1/2, descriptors sharing x's shape -- the same-bytes
+///   head-replicated tables), the census (exactly 4 loads, 2 mulf, 1 addf, 1
+///   store -- one trip's worth, the module still looped here), the store at arg
+///   4, the zero accumulator, and the NeoX epilogue itself
+///   (`addf(mulf(x, tbl), mulf(dot, tbl))` -- the one fact that makes this a
+///   rotation and not a matmul with a stray multiply).
+///
+/// Deliberately NOT checked: the load/store offset arithmetic and the trip
+/// count. The door's window laws own those (they are the laws that refused this
+/// kernel's own sub-stick predecessor), and pinning them here would state the
+/// kernel's body twice -- the two-matchers-for-one-fact defect this file's
+/// `TRANSPOSED_B_MAPS` comment exists to prevent.
+fn verify_rope_rotation(module: &Module, index: &DefIndex, dot_path: &OpPath) -> Result<bool> {
+    let dot = walk::at(module, dot_path).expect("path");
+    let a = dot.operands[0];
+    let b = dot.operands[1];
+    let acc = dot.operands[2];
+    let d = dot
+        .result()
+        .ok_or_else(|| refuse("the dot defines no result"))?;
+
+    // ── Candidacy: everything before the P law is a matmul contract's business ──
+    let func = module.kernel()?;
+    let args: Vec<Ssa> = func.regions[0].args.iter().map(|(v, _)| *v).collect();
+    // The rope states exactly five pointers: x, cos, sin, P, out.
+    if args.len() != 5 {
+        return Ok(false);
+    }
+    // A must be a DIRECT load (x's own trip load); if it is not, the standalone
+    // matmul contract's direct-load refusal is the right message.
+    let Some(a_ld) = index
+        .def_of(a)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad)
+    else {
+        return Ok(false);
+    };
+    // B is the permutation load, DIRECT (P is staged row-major; the kernel spells
+    // no `.T`). A transposed B whose load still reads arg 3 is an almost-rope --
+    // the staged table is row-major, so a transposition is a misspelling of this
+    // arm and is refused here rather than reaching the door as a mystery operand.
+    let b_ld = match index
+        .def_of(b)
+        .filter(|o| o.kind == OpKind::TtDescriptorLoad)
+    {
+        Some(ld) => ld,
+        None => {
+            let transposed_from_arg3 = index
+                .def_of(b)
+                .filter(|o| o.kind == OpKind::TtTrans)
+                .and_then(|t| t.operands.first().copied())
+                .and_then(|src| {
+                    index
+                        .def_of(src)
+                        .filter(|o| o.kind == OpKind::TtDescriptorLoad)
+                })
+                .and_then(|ld| descriptor_of(index, &ld.operands).ok())
+                .is_some_and(|desc| desc.operands.first() == Some(&args[3]));
+            if transposed_from_arg3 {
+                return Err(refuse(
+                    "the rope's permutation P is staged ROW-MAJOR at arg 3 and the kernel \
+                     must dot against it directly -- a transposed P is a misspelling of the \
+                     rotation, not a form this arm lowers",
+                ));
+            }
+            return Ok(false);
+        }
+    };
+    let b_desc = descriptor_of(index, &b_ld.operands)?;
+    // B reads arg 3. A weight that reads any other argument is a matmul's (or a
+    // new kernel's) business, not this arm's.
+    if b_desc.operands.first() != Some(&args[3]) {
+        return Ok(false);
+    }
+
+    // ── Committed: a rope candidate. Every fact below refuses BY NAME ──
+    // THE P LAW: square `[hd, hd]`, whole-tensor block, row-major, at the origin.
+    let (pr, pc) = desc_shape2(index, b_desc)
+        .ok_or_else(|| refuse("the permutation descriptor's shape is not compile-time"))?;
+    if pr != pc {
+        return Err(refuse(format!(
+            "the rope's P input at arg 3 is [{pr}, {pc}] -- the rotate-half permutation is \
+             the SQUARE `[hd, hd]` table"
+        )));
+    }
+    let (ps0, ps1) = desc_strides2(index, b_desc)
+        .ok_or_else(|| refuse("the permutation descriptor's strides are not compile-time"))?;
+    if ps0 != pr || ps1 != 1 {
+        return Err(refuse(format!(
+            "the rope's P strides [{ps0}, {ps1}] are not the row-major [{pr}, 1] the worker \
+             stages"
+        )));
+    }
+    let p_block = b_desc
+        .result_type()
+        .and_then(|t| t.dims().map(|x| x.to_vec()))
+        .ok_or_else(|| refuse("the permutation descriptor is not 2-D"))?;
+    if p_block.len() != 2 || p_block[0] != pr || p_block[1] != pc {
+        return Err(refuse(format!(
+            "the rope's P block {p_block:?} is not the whole `[{pr}, {pc}]` table -- the \
+             permutation is position-independent and loads once, in full"
+        )));
+    }
+    let b_idx = &b_ld.operands[1..];
+    if b_idx.len() != 2
+        || const_int_index(index, b_idx[0]) != Some(0)
+        || const_int_index(index, b_idx[1]) != Some(0)
+    {
+        return Err(refuse(
+            "the rope's P load is not at the origin [0, 0] -- the permutation has no window",
+        ));
+    }
+    // The shared permutation tile: ONE load, at the function top level, outside
+    // the trip loop (identified by the value it defines, per this file's own
+    // `def_of`/`ops_deep` discipline; top level by pointer, per the store checks).
+    let all = func.ops_deep();
+    let p_ld = all
+        .iter()
+        .find(|o| o.kind == OpKind::TtDescriptorLoad && o.result() == Some(b))
+        .expect("B is a load this pass resolved");
+    if !func.regions[0].ops.iter().any(|o| std::ptr::eq(o, *p_ld)) {
+        return Err(refuse(
+            "the rope's P load is nested inside the trip loop -- the permutation tile is \
+             shared by every trip and must load ONCE, outside it",
+        ));
+    }
+
+    // x reads arg 0.
+    let a_desc = descriptor_of(index, &a_ld.operands)?;
+    if a_desc.operands.first() != Some(&args[0]) {
+        return Err(refuse(
+            "the rope's x load does not read arg 0 (x, cos, sin, P, out -- the kernel's own \
+             parameter order)",
+        ));
+    }
+
+    // THE COS/SIN LAW: args 1/2, descriptors sharing x's own shape, strides and
+    // block -- the same-bytes head-replicated tables over the same staging.
+    let a_shape = desc_shape2(index, a_desc)
+        .ok_or_else(|| refuse("the x descriptor's shape is not compile-time"))?;
+    let a_strides = desc_strides2(index, a_desc)
+        .ok_or_else(|| refuse("the x descriptor's strides are not compile-time"))?;
+    let a_block = a_desc
+        .result_type()
+        .and_then(|t| t.dims().map(|x| x.to_vec()))
+        .ok_or_else(|| refuse("the x descriptor is not 2-D"))?;
+    let mut tbl_res = Vec::with_capacity(2);
+    for (arg_ix, role) in [(1usize, "cos"), (2usize, "sin")] {
+        let ld = all
+            .iter()
+            .find(|o| {
+                o.kind == OpKind::TtDescriptorLoad
+                    && o.result() != Some(a)
+                    && o.result() != Some(b)
+                    && descriptor_of(index, &o.operands)
+                        .is_ok_and(|desc| desc.operands.first() == Some(&args[arg_ix]))
+            })
+            .ok_or_else(|| {
+                refuse(format!(
+                    "the rope stages its {role} table at arg {arg_ix} and loads it -- a rope \
+                     kernel that does not is not this arm's form"
+                ))
+            })?;
+        let desc = descriptor_of(index, &ld.operands)?;
+        let shape = desc_shape2(index, desc)
+            .ok_or_else(|| refuse("the cos/sin descriptor's shape is not compile-time"))?;
+        let strides = desc_strides2(index, desc)
+            .ok_or_else(|| refuse("the cos/sin descriptor's strides are not compile-time"))?;
+        let block = desc
+            .result_type()
+            .and_then(|t| t.dims().map(|x| x.to_vec()))
+            .ok_or_else(|| refuse("the cos/sin descriptor is not 2-D"))?;
+        if shape != a_shape || strides != a_strides || block != a_block {
+            return Err(refuse(format!(
+                "the {role} descriptor states shape {shape:?} / strides {strides:?} / block \
+                 {block:?}, but x states {a_shape:?} / {a_strides:?} / {a_block:?} -- the \
+                 head-replicated tables are the SAME-BYTES staging as x and must share its \
+                 view"
+            )));
+        }
+        tbl_res.push(ld.result().expect("a load defines its result"));
+    }
+
+    // THE CENSUS (the module is still looped here -- one trip's worth of ops):
+    // exactly {4 loads (x, cos, sin, P), 2 mulf, 1 addf, 1 store}. A kernel with
+    // more is computing something else and is refused rather than walked as a
+    // rope; the door's own op walk is faithful, so this census pins identity,
+    // not silent-drop risk.
+    let count = |k: OpKind| all.iter().filter(|o| o.kind == k).count();
+    let (n_load, n_mulf, n_addf, n_store) = (
+        count(OpKind::TtDescriptorLoad),
+        count(OpKind::ArithMulf),
+        count(OpKind::ArithAddf),
+        count(OpKind::TtDescriptorStore),
+    );
+    if n_load != 4 || n_mulf != 2 || n_addf != 1 || n_store != 1 {
+        return Err(refuse(format!(
+            "the rope rotation is exactly {{4 loads (x, cos, sin, P), 2 arith.mulf, 1 \
+             arith.addf, 1 store}} per trip (got load={n_load} mulf={n_mulf} addf={n_addf} \
+             store={n_store}); a kernel with any other census is not this arm's form"
+        )));
+    }
+    if !is_zero_const_index(index, acc) {
+        return Err(refuse(
+            "the rope's dot accumulator is not zero (the rotation adds nothing)",
+        ));
+    }
+
+    // THE STORE, at arg 4, of the NeoX line itself: addf(mulf(x, tbl), mulf(dot,
+    // tbl)) with the two tables split across the multiplies -- the epilogue is
+    // what makes this a rotation and not a matmul with a stray multiply, so it is
+    // pinned here, operand orders and all.
+    let store = all
+        .iter()
+        .find(|o| o.kind == OpKind::TtDescriptorStore)
+        .expect("counted one");
+    let c_desc = descriptor_of(index, &store.operands)?;
+    if c_desc.operands.first() != Some(&args[4]) {
+        return Err(refuse(
+            "the rope's store does not read arg 4 (x, cos, sin, P, out -- the kernel's own \
+             parameter order)",
+        ));
+    }
+    let src = store
+        .operands
+        .last()
+        .ok_or_else(|| refuse("the store states no source"))?;
+    let addf = index
+        .def_of(*src)
+        .filter(|o| o.kind == OpKind::ArithAddf)
+        .ok_or_else(|| {
+            refuse(
+                "the rope's stored value is not an arith.addf -- the NeoX line is \
+                 `x*cos + rotate_half(x)*sin`, a sum of two products",
+            )
+        })?;
+    let muls: Vec<&OpHead> = addf
+        .operands
+        .iter()
+        .map(|v| index.def_of(*v).filter(|o| o.kind == OpKind::ArithMulf))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            refuse(
+                "the rope's addf does not add two arith.mulf products -- the NeoX line is \
+                 `x*cos + rotate_half(x)*sin`",
+            )
+        })?;
+    // One product carries the dot's result, the other x's load; the remaining
+    // operands are the two table loads, one each.
+    let (dot_side, x_side) = if muls.iter().any(|m| m.operands.contains(&d)) {
+        let ix = muls
+            .iter()
+            .position(|m| m.operands.contains(&d))
+            .expect("checked");
+        (muls[ix], muls[1 - ix])
+    } else {
+        return Err(refuse(
+            "neither product of the rope's addf carries the dot's result -- the rotation's \
+             second product is `dot(x, P) * sin`",
+        ));
+    };
+    if !x_side.operands.contains(&a) {
+        return Err(refuse(
+            "the rope's other product does not carry x's load -- the rotation's first \
+             product is `x * cos`",
+        ));
+    }
+    let other = |m: &OpHead, of: Ssa| {
+        m.operands
+            .iter()
+            .copied()
+            .find(|v| *v != of)
+            .expect("a binary product has two operands")
+    };
+    let (t_dot, t_x) = (other(dot_side, d), other(x_side, a));
+    if !tbl_res.contains(&t_dot) || !tbl_res.contains(&t_x) || t_dot == t_x {
+        return Err(refuse(
+            "the rope's two products do not multiply by the cos and sin loads -- the NeoX \
+             line pairs each product with its own table",
+        ));
+    }
+    Ok(true)
 }
 
 /// ⭐ THE fp8 W8A8 WHOLE-KERNEL CONTRACT (review P1.0, the fp8 arm).
@@ -1816,6 +2134,240 @@ module {
             e.message
                 .contains("A and B must be direct tt.descriptor_load results"),
             "got {e}"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // THE ROPE ROTATION ARM (`verify_rope_rotation`) — the tree's one single-dot
+    // kernel that is not a matmul at all. The positive asserts the door-bound
+    // treatment (lowered, UNTAGGED); the controls each break ONE load-bearing
+    // fact and assert the refusal that names it.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// The per-head form's own shape, as `make_ttir` prints it (SSA names
+    /// shortened): MQ=8 positions of a 32-head hd-64 plane -- the prefill-rung
+    /// routing -- one trip's worth of the body. Five pointer args in the
+    /// kernel's own order (x, cos, sin, P, out); the permutation loads ONCE at
+    /// the origin; the epilogue is the one NeoX line.
+    const ROPE: &str = "\
+module {
+  tt.func public @rope_fwd(%desc_x: !tt.ptr<f16>, %desc_cos: !tt.ptr<f16>, %desc_sin: !tt.ptr<f16>, %desc_p: !tt.ptr<f16>, %desc_o: !tt.ptr<f16>) attributes {noinline = false} {
+    %cst = arith.constant dense<0.000000e+00> : tensor<8x64xf16>
+    %z = arith.constant 0 : i32
+    %mq = arith.constant 8 : i32
+    %width = arith.constant 2048 : i32
+    %hd = arith.constant 64 : i32
+    %width64 = arith.constant 2048 : i64
+    %hd64 = arith.constant 64 : i64
+    %one = arith.constant 1 : i64
+    %x_desc = tt.make_tensor_descriptor %desc_x, [%mq, %width], [%width64, %one] : <f16>, <8x64xf16>
+    %cos_desc = tt.make_tensor_descriptor %desc_cos, [%mq, %width], [%width64, %one] : <f16>, <8x64xf16>
+    %sin_desc = tt.make_tensor_descriptor %desc_sin, [%mq, %width], [%width64, %one] : <f16>, <8x64xf16>
+    %p_desc = tt.make_tensor_descriptor %desc_p, [%hd, %hd], [%hd64, %one] : <f16>, <64x64xf16>
+    %o_desc = tt.make_tensor_descriptor %desc_o, [%mq, %width], [%width64, %one] : <f16>, <8x64xf16>
+    %p = tt.descriptor_load %p_desc[%z, %z] : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>
+    %x = tt.descriptor_load %x_desc[%z, %z] : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>
+    %c = tt.descriptor_load %cos_desc[%z, %z] : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>
+    %s = tt.descriptor_load %sin_desc[%z, %z] : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>
+    %rot = tt.dot %x, %p, %cst : tensor<8x64xf16>
+    %t0 = arith.mulf %x, %c : tensor<8x64xf16>
+    %t1 = arith.mulf %rot, %s : tensor<8x64xf16>
+    %o = arith.addf %t0, %t1 : tensor<8x64xf16>
+    tt.descriptor_store %o_desc[%z, %z], %o : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>
+    tt.return
+  }
+}
+";
+
+    /// The fixture lowers DOOR-BOUND: the dot becomes `linalg.matmul` with NO maps
+    /// of its own (P is dotted where it lies, never a folded transpose-B) and NO
+    /// CanonicalVerified tag anywhere -- the tag vouches for the standalone-matmul
+    /// emitter, and the splice routes the rope through the whole-function door,
+    /// which walks the lowered matmul like attention's four. That untagged verdict
+    /// is the one fact that separates this arm from every other single-dot arm.
+    #[test]
+    fn the_rope_rotation_fixture_lowers_untagged() {
+        let mut m = parse::parse(ROPE).unwrap();
+        run(&mut m).expect("the rope rotation must lower, not be refused");
+        let c = m.census();
+        let get = |n: &str| c.iter().find(|(k, _)| k == n).map(|(_, v)| *v).unwrap_or(0);
+        assert_eq!(get("linalg.matmul"), 1, "the dot lowered");
+        assert_eq!(get("tt.dot"), 0, "no dot survives");
+        assert_eq!(get("tt.trans"), 0, "no trans -- P is dotted where it lies");
+        assert!(
+            !m.attrs
+                .iter()
+                .any(|(k, _)| *k == AttrKey::CanonicalVerified),
+            "the module carries NO trust tag -- the rope is door-bound, not \
+             standalone-matmul-shaped"
+        );
+        for op in m.ops_deep() {
+            if op.kind == OpKind::LinalgMatmul {
+                assert!(
+                    op.attr(&AttrKey::IndexingMaps).is_none(),
+                    "the matmul states NO maps -- a plain-B rotation, never a folded \
+                     transpose-B"
+                );
+                assert!(
+                    op.attr(&AttrKey::CanonicalVerified).is_none(),
+                    "the lowered matmul is untagged"
+                );
+            }
+        }
+    }
+
+    /// CONTROL — a TRANSPOSED permutation: the dot's B is a `tt.trans` over the
+    /// arg-3 load. The worker stages P row-major and the kernel must dot against
+    /// it directly; a `.T` is a misspelling of the rotation, refused here rather
+    /// than reaching the door as a mystery operand.
+    #[test]
+    fn a_transposed_rope_permutation_is_refused_row_major() {
+        let src = ROPE
+            .replacen(
+                "    %rot = tt.dot %x, %p, %cst : tensor<8x64xf16>",
+                "    %pt = tt.trans %p : tensor<64x64xf16> {order = array<i32: 1, 0>}\n    %rot = tt.dot %x, %pt, %cst : tensor<8x64xf16>",
+                1,
+            );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("ROW-MAJOR"),
+            "the row-major refusal must fire -- got {e}"
+        );
+    }
+
+    /// CONTROL — a NON-SQUARE permutation at arg 3: `[64, 32]` instead of the
+    /// square `[hd, hd]` rotate-half table.
+    #[test]
+    fn a_non_square_rope_permutation_is_refused() {
+        let src = ROPE
+            .replacen(
+                "    %hd64 = arith.constant 64 : i64",
+                "    %half = arith.constant 32 : i32\n    %hd64 = arith.constant 64 : i64",
+                1,
+            )
+            .replacen(
+                "tt.make_tensor_descriptor %desc_p, [%hd, %hd], [%hd64, %one] : <f16>, <64x64xf16>",
+                "tt.make_tensor_descriptor %desc_p, [%hd, %half], [%hd64, %one] : <f16>, <64x64xf16>",
+                1,
+            );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("SQUARE"),
+            "the square-table refusal must fire -- got {e}"
+        );
+    }
+
+    /// CONTROL — a PARTIAL permutation block: the descriptor states the whole
+    /// `[128, 128]` table but blocks `[64, 64]`. The permutation is
+    /// position-independent and loads once, in full.
+    #[test]
+    fn a_partial_rope_permutation_block_is_refused() {
+        let src = ROPE
+            .replacen(
+                "    %hd64 = arith.constant 64 : i64",
+                "    %dbl = arith.constant 128 : i32\n    %dbl64 = arith.constant 128 : i64\n    %hd64 = arith.constant 64 : i64",
+                1,
+            )
+            .replacen(
+                "tt.make_tensor_descriptor %desc_p, [%hd, %hd], [%hd64, %one] : <f16>, <64x64xf16>",
+                "tt.make_tensor_descriptor %desc_p, [%dbl, %dbl], [%dbl64, %one] : <f16>, <64x64xf16>",
+                1,
+            );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("whole"),
+            "the whole-tensor refusal must fire -- got {e}"
+        );
+    }
+
+    /// CONTROL — the permutation load NESTED IN THE TRIP LOOP: the real looped
+    /// form with P (mistakenly) inside the body. The tile is shared by every trip
+    /// and must load ONCE, outside it.
+    #[test]
+    fn a_permutation_load_inside_the_trip_loop_is_refused() {
+        let src = ROPE
+            .replacen(
+                "    %one = arith.constant 1 : i64",
+                "    %one = arith.constant 1 : i64\n    %c1 = arith.constant 1 : i32",
+                1,
+            )
+            .replacen(
+                "    %p = tt.descriptor_load %p_desc[%z, %z] : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>",
+                "    scf.for %i = %z to %mq step %c1 {\n      %p = tt.descriptor_load %p_desc[%z, %z] : !tt.tensordesc<64x64xf16> -> tensor<64x64xf16>",
+                1,
+            )
+            .replacen(
+                "    tt.descriptor_store %o_desc[%z, %z], %o : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>",
+                "      tt.descriptor_store %o_desc[%z, %z], %o : !tt.tensordesc<8x64xf16> -> tensor<8x64xf16>\n    }",
+                1,
+            );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("nested inside the trip loop"),
+            "the shared-tile refusal must fire -- got {e}"
+        );
+    }
+
+    /// CONTROL — a THIRD product: the census is exactly {4 loads, 2 mulf, 1 addf,
+    /// 1 store} per trip; a kernel with any other census is not this arm's form.
+    #[test]
+    fn a_rope_with_a_third_product_is_refused_by_the_census() {
+        let src = ROPE.replacen(
+            "    %o = arith.addf %t0, %t1 : tensor<8x64xf16>",
+            "    %t2 = arith.mulf %t0, %t1 : tensor<8x64xf16>\n    %o = arith.addf %t0, %t2 : tensor<8x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("mulf=3"),
+            "the census refusal must fire and name the count -- got {e}"
+        );
+    }
+
+    /// CONTROL — the epilogue DROPS THE DOT: the addf still adds two products, but
+    /// neither carries the dot's result (the second product multiplies x by sin).
+    /// The NeoX line pairs each product with its own table and one of them IS the
+    /// rotation.
+    #[test]
+    fn a_rope_whose_addf_drops_the_dot_is_refused() {
+        let src = ROPE.replacen(
+            "    %t1 = arith.mulf %rot, %s : tensor<8x64xf16>",
+            "    %t1 = arith.mulf %x, %s : tensor<8x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            e.message.contains("neither product"),
+            "the NeoX-line refusal must fire -- got {e}"
+        );
+    }
+
+    /// CONTROL — NOT A ROPE: the dot's B reads arg 1, not the permutation's arg 3.
+    /// The arm must return `Ok(false)` and let the STANDALONE-MATMUL contract
+    /// speak (its own vocabulary, never a rope refusal) -- this is the candidacy
+    /// boundary: a weight that reads any other argument is a matmul's business.
+    #[test]
+    fn a_b_from_arg1_is_the_matmul_contract_s_business() {
+        let src = ROPE.replacen(
+            "tt.make_tensor_descriptor %desc_p, [%hd, %hd], [%hd64, %one] : <f16>, <64x64xf16>",
+            "tt.make_tensor_descriptor %desc_cos, [%hd, %hd], [%hd64, %one] : <f16>, <64x64xf16>",
+            1,
+        );
+        let mut m = parse::parse(&src).unwrap();
+        let e = run(&mut m).unwrap_err();
+        assert!(
+            !e.message.contains("permutation") && !e.message.contains("rotation"),
+            "no rope-arm refusal may fire for a non-rope B -- got {e}"
+        );
+        assert!(
+            e.message.contains("matmul"),
+            "the standalone-matmul contract speaks -- got {e}"
         );
     }
 }

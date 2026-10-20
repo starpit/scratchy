@@ -2626,6 +2626,23 @@ pub fn rope_p_entry(hd: usize, inn: usize, o: usize) -> i8 {
     }
 }
 
+/// The rotate-half permutation `P` as the ROW-MAJOR `[hd, hd]` f32 bytes the rope
+/// KERNEL's `desc_p` view states (`strides [HEAD_DIM, 1]`) — the staging the spliced
+/// program's `tl.dot(x, P)` reads. Values from the same [`rope_p_entry`] the
+/// reserved-tid fill stages through [`stage_kernel_table`], so the source-bind and the
+/// reserved-bind cannot drift; the LAYOUTS differ on purpose (the kernel's descriptor
+/// states row-major strides, and a stick-blocked kernel table is not expressible as a
+/// 2-D stride pair — at one-stick head dims like 64 the two spellings coincide).
+pub fn rope_p_rowmajor(hd: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; hd * hd];
+    for inn in 0..hd {
+        for o in 0..hd {
+            out[inn * hd + o] = rope_p_entry(hd, inn, o) as f32;
+        }
+    }
+    out
+}
+
 /// THE DECODE PREFIX-MASK EXTENT: at decode position `p` (= the count of cached prefix tokens), the
 /// attention prefix-length mask (`ATTN_MASK_TID`) is VALID (additive 0) exactly on cache columns `[0..p)`
 /// and −∞ on `[p..cap)`. This is the single decision that sets how many prefix slots the softmax attends;

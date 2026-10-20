@@ -937,13 +937,15 @@ mod tests {
                 op(
                     SubOp::rope_rotate(HeadDim::new(64)),
                     1,
-                    vec![Op(3), Ext(3), Ext(4)],
+                    vec![Op(3), Ext(3), Ext(4), Ext(5)],
                 ),
             ]
         };
-        let src = [(1, 128), (128, 128), (1, 64), (1, 64), (1, 64)];
-        let (direct, _) = colour(&src, weights(5), ops(), no_folds).unwrap();
-        let (peeled, _) = colour(&src, weights(5), ops(), |s| FoldFacts {
+        let src = [(1, 128), (128, 128), (1, 64), (1, 64), (1, 64), (64, 64)];
+        let mut bindings = weights(5);
+        bindings.push(SourceBinding::RopeP { head_dim: 64 });
+        let (direct, _) = colour(&src, bindings.clone(), ops(), no_folds).unwrap();
+        let (peeled, _) = colour(&src, bindings, ops(), |s| FoldFacts {
             normed_rope: [s[4]].into(),
             ..FoldFacts::default()
         })

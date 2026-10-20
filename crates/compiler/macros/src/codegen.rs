@@ -9066,6 +9066,22 @@ fn emit_superdsc_wiring(
             model.source_stem
         );
     }
+    // ⭐ THE ROTATE-HALF PERMUTATION SOURCES — one per DISTINCT rope head dim, keyed by
+    // the head dim alone (P is position-independent, so there is no class/width pairing to
+    // state: the worker builds the `[hd, hd]` table from the same `rope_p_entry` the
+    // reserved-tid fill uses). Deduped: every rope of one head dim shares the source
+    // `to_wavefront` minted.
+    let mut p_v: Vec<(u32, u32)> = lwd
+        .bindings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            SourceBinding::RopeP { head_dim } => Some((i as u32, *head_dim)),
+            _ => None,
+        })
+        .collect();
+    p_v.sort_unstable();
+    p_v.dedup();
     let pair_toks = |v: &[(u32, u32, proc_macro2::TokenStream)]| -> Vec<proc_macro2::TokenStream> {
         v.iter()
             .map(|(i, w, k)| {
@@ -9075,6 +9091,13 @@ fn emit_superdsc_wiring(
             .collect()
     };
     let (cos_toks, sin_toks) = (pair_toks(&cos_v), pair_toks(&sin_v));
+    let p_toks = p_v
+        .iter()
+        .map(|&(i, hd)| {
+            let (i, hd) = (u32l(i), u32l(hd));
+            quote! { (#i, #hd) }
+        })
+        .collect::<Vec<_>>();
     let embed_src_lit = u32l(embed_src);
 
     let shapes = gk.tensor_shapes.iter().map(|(r, c)| {
@@ -9193,6 +9216,7 @@ fn emit_superdsc_wiring(
         // ── every caller-filled source is covered by exactly one filler ──
         let cos_ids: std::collections::HashSet<u32> = cos_v.iter().map(|&(i, ..)| i).collect();
         let sin_ids: std::collections::HashSet<u32> = sin_v.iter().map(|&(i, ..)| i).collect();
+        let p_ids: std::collections::HashSet<u32> = p_v.iter().map(|&(i, _)| i).collect();
         let mut embeds = 0usize;
         for id in 0..gk.num_sources {
             let Some(b) = lwd.bindings.get(id as usize) else {
@@ -9222,6 +9246,11 @@ fn emit_superdsc_wiring(
                 SB::Sin { .. } => {
                     if !sin_ids.contains(&id) {
                         fail.push(format!("Sin source t{id} is not in the tape's sin_srcs"));
+                    }
+                }
+                SB::RopeP { .. } => {
+                    if !p_ids.contains(&id) {
+                        fail.push(format!("RopeP source t{id} is not in the tape's p_srcs"));
                     }
                 }
                 // Device-resident, bound per layer through `LayerWiring` — covered by the layer
@@ -9475,6 +9504,7 @@ fn emit_superdsc_wiring(
             embed_src: #embed_src_lit,
             cos_srcs: &[#(#cos_toks),*],
             sin_srcs: &[#(#sin_toks),*],
+            p_srcs: &[#(#p_toks),*],
             layers: &[#(#layer_toks),*],
             geometry: ::scratchy_target_spyre::wiring::Geometry {
                 hidden: #hidden,
@@ -12204,6 +12234,11 @@ fn dump_wavefront_mega(
                             }
                             SourceBinding::Cos { .. } => format!("{{\"id\":{i},\"role\":\"cos\"}}"),
                             SourceBinding::Sin { .. } => format!("{{\"id\":{i},\"role\":\"sin\"}}"),
+                            SourceBinding::RopeP { head_dim } => {
+                                format!(
+                                    "{{\"id\":{i},\"role\":\"rope_p\",\"head_dim\":{head_dim}}}"
+                                )
+                            }
                             SourceBinding::PrefixK { layer } => {
                                 format!("{{\"id\":{i},\"role\":\"prefix_k\",\"layer\":{layer}}}")
                             }

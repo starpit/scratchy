@@ -262,6 +262,22 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 col
             }
         }
+        ForwardKernel::RopeP(i) => {
+            // ⭐ THE SOURCE'S OWN HEAD DIM, not the model's: a hybrid-attention arch gives
+            // its classes different head dims and therefore different permutation tables.
+            // FIXED values — no position row, no per-row loop: the table is one matrix.
+            let &(_, hd) = shape
+                .p_srcs
+                .get(i)
+                .ok_or_else(|| format!("no rope-P source {i}"))?;
+            let hd = hd as usize;
+            let table = ktir_superdsc::sdsc_abstract::rope_p_rowmajor(hd);
+            if inp.stick_major {
+                stick_scatter(hd, hd, &table)
+            } else {
+                table
+            }
+        }
         ForwardKernel::CausalMask => {
             // The key names its own rows; a key for another rung would tile a mask the placement
             // was not sized for.
@@ -446,6 +462,9 @@ pub enum ForwardKernel {
     /// Rotary `cos` / `sin` for this position, tiled to source `i`'s width.
     Cos(usize),
     Sin(usize),
+    /// The rotate-half permutation table for source `i`'s head dim — a FIXED
+    /// `[hd, hd]` matrix (`rope_p_entry`), so this kernel takes no position.
+    RopeP(usize),
     /// Prefix validity: 0 on slots this request holds, fp16-safe -inf elsewhere.
     PrefixMask,
     /// Causal validity for the new token's block.
@@ -496,6 +515,9 @@ pub struct ForwardShape {
     /// duplicated a `&'static` slice the macro put in the binary, once per forward, per token.
     pub cos_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
     pub sin_srcs: &'static [(u32, u32, crate::wiring::RotaryKind)],
+    /// The rotate-half permutation sources `(id, head_dim)` — FIXED tables, so unlike
+    /// cos/sin they carry no rotary class: the head dim alone names the bytes.
+    pub p_srcs: &'static [(u32, u32)],
     /// `false` when the bundle placed no broadcast prefix mask, so nothing reads one.
     pub prefix_mask: bool,
     /// ⭐⭐⭐ THIS BUNDLE READS KV THROUGH AN INDEX, so the tape has a [`ForwardKernel::KvBlockIndex`]
@@ -530,6 +552,12 @@ impl ForwardShape {
         for (i, &(t, ..)) in self.sin_srcs.iter().enumerate() {
             v.push(ForwardStep {
                 kernel: ForwardKernel::Sin(i),
+                tensor: PlaceId::Act(t),
+            });
+        }
+        for (i, &(t, ..)) in self.p_srcs.iter().enumerate() {
+            v.push(ForwardStep {
+                kernel: ForwardKernel::RopeP(i),
                 tensor: PlaceId::Act(t),
             });
         }
@@ -654,6 +682,7 @@ mod tests {
             embed_src: 0,
             cos_srcs: &[(5, 64, KIND), (7, 64, KIND)],
             sin_srcs: &[(6, 64, KIND), (8, 64, KIND)],
+            p_srcs: &[(9, 64)],
             prefix_mask: true,
             // The shipped non-gathering shape, so the ORDER assertion below stays the order every
             // existing bundle plays. The gathering variant is asserted separately.
@@ -839,6 +868,7 @@ mod tests {
                 ForwardKernel::Cos(1),
                 ForwardKernel::Sin(0),
                 ForwardKernel::Sin(1),
+                ForwardKernel::RopeP(0),
                 ForwardKernel::PrefixMask,
                 ForwardKernel::CausalMask,
                 ForwardKernel::Const(0),

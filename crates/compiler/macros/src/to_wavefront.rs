@@ -259,6 +259,11 @@ struct Builder<'a> {
     /// ktir / metal consumers read the first `head_dim` and broadcast, so a
     /// wider source is backward-compatible for them.
     cos_sin: BTreeMap<(u32, bool), (usize, usize)>,
+    /// Shared rotate-half permutation source index, keyed by head dim — `P` is
+    /// `[hd, hd]` and position-INDEPENDENT, so one source serves every rope of
+    /// one head dim (a uniform model's Q and K share it; a hybrid's classes
+    /// each get their own, exactly like the cos/sin classes above).
+    rope_p: BTreeMap<u32, usize>,
     /// Prefix KV-cache source pair `(prefix_k, prefix_v)` per kv-cache
     /// extern index (one per layer).
     prefix: HashMap<(u64, u32), (usize, usize)>,
@@ -510,6 +515,19 @@ impl<'a> Builder<'a> {
         (cos, sin)
     }
 
+    /// The shared rotate-half permutation source `[head_dim, head_dim]`, memoized
+    /// per head dim. The worker fills it from the same `rope_p_entry` table the
+    /// reserved-tid fill builds — a FIXED matrix, so unlike cos/sin it never
+    /// depends on the launch's rows or positions.
+    fn rope_p(&mut self, head_dim: u32) -> usize {
+        if let Some(&p) = self.rope_p.get(&head_dim) {
+            return p;
+        }
+        let p = self.push_source(head_dim, head_dim, SourceBinding::RopeP { head_dim });
+        self.rope_p.insert(head_dim, p);
+        p
+    }
+
     /// The per-layer prefix-KV source pair at the CALLING CLASS's kv width.
     ///
     /// ⭐ THE WIDTH IS AN ARGUMENT, NOT A MODEL FACT. A hybrid model (gemma-4) has TWO attention
@@ -730,6 +748,7 @@ pub fn lower_decode_to_wavefront(
         produced: HashMap::new(),
         weight_src: HashMap::new(),
         cos_sin: BTreeMap::new(),
+        rope_p: BTreeMap::new(),
         prefix: HashMap::new(),
         geom,
         eps,
@@ -1053,6 +1072,9 @@ pub fn lower_decode_to_wavefront(
                 .hd();
                 let (cos_q, sin_q) = bx.cos_sin(q_cols, local_rope);
                 let (cos_k, sin_k) = bx.cos_sin(k_cols, local_rope);
+                // The rotate-half permutation both rotations dot through — ONE
+                // source per head dim, shared by this layer's Q and K ropes.
+                let p = bx.rope_p(head_dim.get());
                 // E.12 — RopeAppend writes rotated K and V into the
                 // paged KV cache. Pull the per-layer PrefixK / PrefixV
                 // source indices via the cached `prefix_for(layer, k_cols)`
@@ -1063,7 +1085,12 @@ pub fn lower_decode_to_wavefront(
                 let (pk, pv) = bx.prefix_for(layer as u64, k_cols);
                 let qi = bx.push_op(
                     SubOp::rope_rotate(head_dim),
-                    vec![q, InputRef::Ext(cos_q), InputRef::Ext(sin_q)],
+                    vec![
+                        q,
+                        InputRef::Ext(cos_q),
+                        InputRef::Ext(sin_q),
+                        InputRef::Ext(p),
+                    ],
                 );
                 let pairing = match node.op {
                     OpKind::RopeAppendInterleaved => RopeFormTag::Interleaved,
@@ -1080,6 +1107,7 @@ pub fn lower_decode_to_wavefront(
                         v,
                         InputRef::Ext(pk),
                         InputRef::Ext(pv),
+                        InputRef::Ext(p),
                     ],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(qi));

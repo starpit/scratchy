@@ -1004,7 +1004,7 @@ fn spliced_rope_executes_the_real_program() {
 fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
     // The op count, and its three commonest kinds — what grew, if anything did. PRODUCTION'S node shape,
     // the wide `[mq, heads·hd]` plane `to_wavefront` builds (the splice derives `H = total / hd` off
-    // it); `rope_ir`'s tall `[mq·heads, hd]` node states ONE head of `mq·heads` positions.
+    // it); a tall `[mq·heads, hd]` node would state ONE head of `mq·heads` positions.
     let ops_at = |mq: u32, heads: u32| {
         let ir = rope_plane_ir(mq, heads, 64);
         let spliced = scratchy_triton_splice::lower(&ir.nodes[0], &ir, false)
@@ -1035,10 +1035,10 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
-    // ⛔ PRODUCTION'S PLANE, NOT THE TALL NODE: `rope_ir` states `[mq·heads, hd]`, which the splice reads
-    // as ONE head of `mq·heads` positions (`H = total / hd = 1`), so a run over it never had more than one
-    // head. `rope_plane_ir` is `to_wavefront`'s `[mq, heads·hd]` — the SAME bytes (element (p, h·hd + d)
-    // is tall row p·heads + h, column d), so the staging below is unchanged.
+    // ⛔ PRODUCTION'S PLANE, NOT THE TALL NODE: a tall `[mq·heads, hd]` node is read by the splice
+    // as ONE head of `mq·heads` positions (`H = total / hd = 1`), so a run over it never had more
+    // than one head. This plane is `to_wavefront`'s `[mq, heads·hd]` — the SAME bytes (element
+    // (p, h·hd + d) is tall row p·heads + h, column d), so the staging below is unchanged.
     let ir = rope_plane_ir(mq, heads, hd);
     let node = &ir.nodes[0];
     let spliced = scratchy_triton_splice::lower(node, &ir, false)
@@ -1077,7 +1077,10 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     // `[mq*heads, hd]` (row = position*heads + head), and cos/sin as `spyre_forward`'s
     // `tile` builds them — `rope_cos_sin(pos, hd, theta)` rows replicated across the
     // heads of each position (granite's theta 1e7). The f32 reference is NeoX
-    // `x*cos + rotate_half(x)*sin` over the same bytes.
+    // `x*cos + rotate_half(x)*sin` over the same bytes. P (the rotate-half
+    // permutation the kernel dots against) is the FIXED `[hd, hd]` table the
+    // worker binds as an ordinary dynamic parameter — row-major
+    // `rope_p_rowmajor`, the same bytes the `ForwardKernel::RopeP` step stages.
     let tall = (mq * heads) as usize;
     let half = (hd / 2) as usize;
     let theta = 1e7f32;
@@ -1118,6 +1121,7 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     let mut session =
         scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
             .expect("build the one-program session");
+    let p = scratchy_subtile::sdsc_abstract::rope_p_rowmajor(hd as usize);
     let out = session
         .run_step(
             0,
@@ -1125,11 +1129,12 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
                 (0, x, vec![tall, hd as usize]),
                 (1, cos, vec![tall, hd as usize]),
                 (2, sin, vec![tall, hd as usize]),
+                (3, p, vec![hd as usize, hd as usize]),
             ],
-            &[(3, 0)],
+            &[(4, 0)],
         )
         .unwrap_or_else(|_| panic!("run the spliced rope program (mq={mq} heads={heads} hd={hd})"));
-    let got = &out[&3];
+    let got = &out[&4];
     assert_eq!(
         got.len(),
         tall * hd as usize,
@@ -1541,8 +1546,15 @@ const ROPE_SHAPES: &[(u32, u32, u32)] = &[
 fn spliced_rope_lowers_through_the_door() {
     for &(mq, heads, hd) in ROPE_SHAPES {
         for rows_are_requests in [false, true] {
-            let ir = rope_ir(mq, heads, hd);
-            let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32].into_iter().collect();
+            // ⛔ PRODUCTION'S PLANE, NOT THE TALL NODE (the execute test's own ruling):
+            // the worker stages `[mq, heads·hd]` and the splice reads `H = total/hd`
+            // heads off it, so every tile sits at row corner 0 — the row the door's
+            // matmul arm can address the rotation's activation at. The tall
+            // `[mq·heads, hd]` node states H = 1 and its per-position trips carry
+            // row corners, which that arm refuses BY NAME (`base_addressed`) — a
+            // form production never states, pinned here by not being the fixture.
+            let ir = rope_plane_ir(mq, heads, hd);
+            let weight_ids: HashSet<u32> = [0u32, 1u32, 2u32, 3u32].into_iter().collect();
 
             // The layout the tape walk computes for this graph.
             let layout = compute_bundle_layout(
@@ -1608,66 +1620,30 @@ fn spliced_rope_lowers_through_the_door() {
     }
 }
 
-/// One rope node as a one-node [`SubtileIR`]: `rotate(x, cos, sin) -> out` over
-/// `[mq, heads*hd]`. The x/cos/sin/out tensors carry the WORKER's staging — x/out as
-/// `[mq*heads, hd]` tall views of the `[mq, heads*hd]` plane (same bytes, the
-/// arrangement `addr_eq` admits), cos/sin as the worker's head-tiled
-/// `[mq*heads, hd]` tables (`spyre_forward.rs`'s `tile` over `rope_cos_sin` rows) —
-/// because that is the binding the spliced kernel and the historical builder program both
-/// address. The node kind is `RopeRotate` (the pure rotation); `RopeAppend`'s extra
-/// inputs are cache destinations that flow through graph edges, and the splice covers
-/// both kinds with the same row.
-/// [`rope_ir`] at PRODUCTION'S node shape: the wide `[mq, heads·hd]` plane `to_wavefront` builds for a
-/// rope (`out_cols` = the rope's full width), so the splice reads `H = heads` and `MQ = mq`.
+/// One rope node as a one-node [`SubtileIR`] at PRODUCTION'S node shape: the wide
+/// `[mq, heads·hd]` plane `to_wavefront` builds for a rope (`out_cols` = the rope's
+/// full width), so the splice reads `H = heads` and `MQ = mq` — the form whose every
+/// access tile sits at row corner 0 (the tall `[mq·heads, hd]` spelling of the same
+/// bytes would state `H = 1` and put row corners on the door's matmul arm, which
+/// refuses them by name). cos/sin are the worker's head-tilled `[mq*heads, hd]`
+/// tables (`spyre_forward.rs`'s `tile` over `rope_cos_sin` rows) — same bytes as the
+/// plane's head-replicated view. The node kind is `RopeRotate` (the pure rotation);
+/// `RopeAppend`'s extra inputs are cache destinations that flow through graph edges,
+/// and the splice covers both kinds with the same row.
 fn rope_plane_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
     let plane = TensorShape {
         rows: mq,
         cols: heads * hd,
     };
-    let tensors = vec![plane, plane, plane, plane];
-    let whole = |t: usize| TensorRegion {
-        tensor: TensorId::from_index(t),
-        region: tensors[t].whole(),
-    };
-    let node = SubtileNode {
-        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
-        op: SubOp::RopeRotate {
-            head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
-            _form: std::marker::PhantomData,
-        },
-        inputs: vec![whole(0), whole(1), whole(2)],
-        output: whole(3),
-    };
-    SubtileIR {
-        tensors,
-        num_sources: 3,
-        nodes: vec![node],
-        result: TensorId::from_index(3),
-        op_output: Vec::new(),
-    }
-}
-
-fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
-    let tall = mq * heads;
-    // t0 = x source (staged [mq*heads, hd], i.e. the [mq, heads*hd] plane reshaped),
-    // t1 = cos source (head-tiled [mq*heads, hd]), t2 = sin, t3 = result.
+    // t3 = the rotate-half permutation `[hd, hd]`, minted INSIDE the source block
+    // (P LAST on the node) exactly where `lower_region`'s mint appends it — after
+    // the front end's own sources, before any output. t4 = the output.
     let tensors = vec![
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
-        TensorShape {
-            rows: tall,
-            cols: hd,
-        },
+        plane,
+        plane,
+        plane,
+        TensorShape { rows: hd, cols: hd },
+        plane,
     ];
     let whole = |t: usize| TensorRegion {
         tensor: TensorId::from_index(t),
@@ -1679,14 +1655,14 @@ fn rope_ir(mq: u32, heads: u32, hd: u32) -> SubtileIR {
             head_dim: scratchy_subtile::model_geometry::HeadDim::new(hd),
             _form: std::marker::PhantomData,
         },
-        inputs: vec![whole(0), whole(1), whole(2)],
-        output: whole(3),
+        inputs: vec![whole(0), whole(1), whole(2), whole(3)],
+        output: whole(4),
     };
     SubtileIR {
         tensors,
-        num_sources: 3,
+        num_sources: 4,
         nodes: vec![node],
-        result: TensorId::from_index(3),
+        result: TensorId::from_index(4),
         op_output: Vec::new(),
     }
 }

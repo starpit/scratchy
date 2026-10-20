@@ -318,10 +318,10 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "scalarmul_fwd",
             program: Program::ScalarMul,
         },
-        // `RopeAppend` carries 6 inputs but only the first three are the rotation (V
-        // and the KV-cache destinations flow through GRAPH edges — the builder's own
-        // `lower_rope_node` reads `inputs[0..3]`), so the kernel consumes x/cos/sin/out
-        // and the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
+        // `RopeAppend` carries 7 inputs but only four are the rotation (V and the
+        // KV-cache destinations flow through GRAPH edges — the kernel consumes
+        // x/cos/sin/P/out, with P the rotate-half permutation LAST on the node), so
+        // the row covers BOTH `RopeAppend` and the standalone `RopeRotate`.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/rope.py"),
             file: "rope.py",
@@ -1111,11 +1111,6 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
 
     // ⛔ THE ARITY IS THE NODE'S OWN CONTRACT, stated once per op kind so the splice and
     // the builder cannot disagree about it. The builder arm's own check is identical.
-    // ⭐ ROPE'S ARITY IS 3, NOT THE NODE'S INPUT COUNT: `lower_rope_node` reads only
-    // `inputs[0..3]` (x, cos, sin) — a `RopeAppend` carries 6 inputs but its V and
-    // KV-cache destinations flow through GRAPH edges, not through the op — so the
-    // splice binds the same first three operands the builder's program does, and the
-    // check below is `>= 3` exactly as the builder's own `inputs.len() < 3` refusal is.
     let arity = match &node.op {
         SubOp::RmsNorm { .. } => 2,
         SubOp::SiluMul => 2,
@@ -1132,7 +1127,16 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::Elementwise(EwKind::Silu | EwKind::Gelu) => 1,
         SubOp::Elementwise(_) => 2,
         SubOp::ScalarMul { .. } => 1,
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
+        // ⭐ ROPE'S KERNEL CONSUMES FOUR POINTER OPERANDS — x, cos, sin and the
+        // rotate-half permutation P — but the NODE's arity is the validator's own
+        // contract: a `RopeRotate` is exactly those four, while a `RopeAppend`
+        // carries 7 `[K, cos, sin, V, K_cache, V_cache, P]` (its V and KV-cache
+        // destinations flow through GRAPH edges, not through the kernel). The
+        // splice binds the kernel's four — indices 0, 1, 2 and P LAST (3 on a
+        // `RopeRotate`, 6 on a `RopeAppend`) — and `default_bindings` is where
+        // that selection lives; this row only pins what the NODE must declare.
+        SubOp::RopeRotate { .. } => 4,
+        SubOp::RopeAppend { .. } => 7,
         // ⭐ SCALAR-WEIGHT MUL IS ARITY-2 (`[act, weight]`, the builder's own
         // binding). The MoE sub-ops have NO arity here any more: the registry
         // refuses them before the splice — the MoE lowers only from
@@ -2143,7 +2147,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 ));
             }
             let heads = total / hd;
-            for p in ["desc_x", "desc_cos", "desc_sin", "desc_o"] {
+            for p in ["desc_x", "desc_cos", "desc_sin", "desc_p", "desc_o"] {
                 signature.insert(
                     p.to_string(),
                     ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
@@ -2204,9 +2208,47 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             ce("H", Val::Int(i128::from(heads)))?;
             ce("MQ", Val::Int(i128::from(mq_rows)))?;
             ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-            ce("HALF", Val::Int(i128::from(hd / 2)))?;
             ce("Y_TOTAL", Val::Int(i128::from(y_total)))?;
             ce("R_START", Val::Int(i128::from(r_start)))?;
+            // ⭐ P'S OWN LAW — A WHOLE-TENSOR REGION, NOT ONE OF THE FOUR ABOVE. The
+            // rotate-half permutation is `[hd, hd]` and position-independent: it shares
+            // NO row window with x/cos/sin/out (the kernel loads it once, at the
+            // origin, outside the trip loop), so its region must be the WHOLE tensor —
+            // anything else is a windowed permutation no kernel states, refused by name.
+            // P is LAST on the node: index 3 on a `RopeRotate`, 6 on a `RopeAppend`.
+            let p_ix = match &node.op {
+                SubOp::RopeRotate { .. } => 3,
+                SubOp::RopeAppend { .. } => 6,
+                _ => unreachable!("the rope arm's own match"),
+            };
+            let p_ref = node.inputs.get(p_ix).ok_or_else(|| {
+                format!(
+                    "triton splice: rope t{} carries no P input at index {p_ix} — the \
+                     rotate-half permutation is the rope's fourth consumed operand",
+                    node.output.tensor.index()
+                )
+            })?;
+            let p_tensor = &ir.tensors[p_ref.tensor.index()];
+            let p_whole = p_ref.region.rows.start == 0
+                && p_ref.region.rows.len == p_tensor.rows
+                && p_ref.region.cols.start == 0
+                && p_ref.region.cols.len == p_tensor.cols;
+            if !p_whole || p_tensor.rows != hd || p_tensor.cols != hd {
+                return Err(format!(
+                    "triton splice: rope t{}: the P input states rows [{}, {}] × cols \
+                     [{}, {}] of a [{}, {}] tensor — the rotate-half permutation is the \
+                     WHOLE `[hd, hd]` table at head dim {hd}, staged once per class and \
+                     shared by every trip (a windowed or mis-sized P is not a shape any \
+                     kernel states)",
+                    node.output.tensor.index(),
+                    p_ref.region.rows.start,
+                    p_ref.region.rows.len,
+                    p_ref.region.cols.start,
+                    p_ref.region.cols.len,
+                    p_tensor.rows,
+                    p_tensor.cols,
+                ));
+            }
         }
         (SubOp::TanhSoftCap { cap }, "tanhsoftcap_fwd") => {
             // The kernel's own parameter spellings: desc_x, desc_o, then the constexprs
@@ -2661,18 +2703,21 @@ fn compile_kernel_uncached(
 }
 
 /// ⛔ THE DEFAULT BINDING LAW — the node's operand prefix, the output LAST. Rope binds
-/// three (a `RopeAppend`'s V and KV-cache destinations flow through GRAPH edges, so the
-/// kernel consumes x, cos, sin only).
+/// four (x, cos, sin and the rotate-half permutation P — a `RopeAppend`'s V and
+/// KV-cache destinations flow through GRAPH edges, and P rides LAST on the node so its
+/// index is named per kind, not a prefix).
 fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
 ) -> Vec<BufferId> {
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    let n_bound = match &node.op {
-        SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => 3,
-        _ => node.inputs.len(),
+    // The consumed operand indices per kind; the output is pushed after them.
+    let consumed: Vec<usize> = match &node.op {
+        SubOp::RopeRotate { .. } => vec![0, 1, 2, 3],
+        SubOp::RopeAppend { .. } => vec![0, 1, 2, 6],
+        _ => (0..node.inputs.len()).collect(),
     };
-    let mut bindings: Vec<BufferId> = node.inputs.iter().take(n_bound).map(&t).collect();
+    let mut bindings: Vec<BufferId> = consumed.iter().map(|&i| t(&node.inputs[i])).collect();
     bindings.push(t(&node.output));
     bindings
 }
