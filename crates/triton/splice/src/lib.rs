@@ -284,14 +284,15 @@ pub fn lmlast_row() -> TritonKernelRow {
     }
 }
 
-/// THE ATTENTION FAMILY — one row, one kernel, every shape: `attn.py`'s own three
-/// constexpr-selected arms (the causal one-pass, decode, prefill continuation) are the
-/// builder's own three arms restated, so the row does not branch on shape at all.
-pub fn attn_row() -> TritonKernelRow {
+/// THE ATTENTION FAMILY — one row, one kernel: `batched_decode.py`'s own batched paged-decode
+/// kernel, the Spyre-native `batched_decode_hm`. The old `attn.py` row (the three
+/// constexpr-selected arms over the flat cache) is deleted, not left beside it; the prefill
+/// shapes it served are the prefill kernel's to serve.
+pub fn attn_decode_row() -> TritonKernelRow {
     TritonKernelRow::Spliced {
-        src: include_str!("../../../targets/spyre/kernels/attn.py"),
-        file: "attn.py",
-        entry: "attn_fwd",
+        src: include_str!("../../../targets/spyre/kernels/batched_decode.py"),
+        file: "batched_decode.py",
+        entry: "batched_decode_hm",
         program: Program::Attn,
     }
 }
@@ -327,14 +328,13 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             entry: "rope_fwd",
             program: Program::Rope,
         },
-        // ATTENTION SPLICES — `lower_attn` is the entry: the kernel states the same
-        // three arms as constexpr-selected cases, and the door (`attn_operands`) reads
-        // every fact — the q/out views, the swept rung, the scale — off the program
+        // ATTENTION SPLICES — `lower_attn` is the entry: the batched paged-decode kernel
+        // states its whole contract as constexprs off the SubOp's own fields, and the door
+        // reads every fact — the q/out views, the pool planes, the scale — off the program
         // itself. This row exists so `row()` stays exhaustive; the walk never routes
-        // attention through `lower_one` (attention needs door-order bindings, the mask
-        // binding, and the dead-prefix view injection that no pure-Triton program can
-        // state).
-        SubOp::AttnDecode { .. } => attn_row(),
+        // attention through `lower_one` (attention needs door-order bindings and the
+        // synthetic id-table and mask bindings that no pure-Triton program can state).
+        SubOp::AttnDecode { .. } => attn_decode_row(),
         // ⛔ THE MoE SUB-OPS ARE NOT SPLICED KINDS ANY MORE — the MoE lowers
         // only from `kernels/moe.py` through KTIR, and
         // `lower_subtile_tape_to_ktir` refuses every MoE SubOp before the
@@ -1294,147 +1294,123 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //  ATTENTION — the one spliced kind whose program is NOT a straight parameter-for-tensor
 //  substitution, which is why it gets its own entry rather than riding `lower_one`:
 //
-//  * the DOOR's parameter order is q, out, then kc, new_k, vc, new_v, then the mask — the
-//    output is SECOND, not last, because `attn_operands` reads `r[0]`/`r[1]` as q/out and
-//    the next four as the segment pairs (`KtirFunc::attn`'s own `arg_for` order);
-//  * the MASK is a bound synthetic tensor beyond the graph (`k.mask`, not a binding slot
-//    the positional mint could name);
-//  * the DEAD PREFIX is a SPLICE-INJECTED VIEW: at `SWEPT == 0` the kernel's `if SWEPT > 0`
-//    guards leave the resident cache parameters addressed nowhere, the ladder DCEs an
-//    unconsumed descriptor, and no Triton program can state "a parameter with a view and no
-//    access tile" — so this entry injects the two `ktdp.construct_memory_view` ops into the
-//    compiled module post-hoc, the same law as `lmlast`'s `node_out_tid` (a stated tape
-//    fact, not an inferred one).
+//  * the KERNEL is `batched_decode.py`'s `batched_decode_hm` — the Spyre-native batched
+//    paged-decode kernel, ONE program for the whole decode batch, the pool swept through
+//    the device-resident page-id table (the old `attn.py` row is deleted; the prefill
+//    shapes it served are the prefill kernel's to serve, refused by name until that row
+//    lands);
+//  * the DOOR's parameter order is q, out, kt, v, ids, mask — the output is SECOND, the
+//    two pool planes are the node's OWN cache-tensor pair (`KvCacheLayout`, the sealed
+//    witness the producing `RopeAppend` writes), and the id table and the mask are bound
+//    synthetic tensors beyond the graph (`k.mask`'s own law), because no graph tensor
+//    names them;
+//  * EVERY CONSTEXPR IS THE NODE'S OWN FACT OR A SHARED LAW — the geometry and scale off
+//    `SubOp::AttnDecode`, the page geometry off `PagedKvPool`/`CopyDims` (the pool's page
+//    width and the id stick's entry count are device laws, not per-model numbers), and
+//    the batching off the request count the walk itself carries. Nothing is hand-typed
+//    per model.
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// THE ATTENTION SPLICE — compile `attn.py` for this node's geometry and swept rung, and
-/// mint the `Program::Attn` `KtirNode` with the door's own parameter order.
+/// THE ATTENTION SPLICE — compile `batched_decode.py` for this node's geometry, and mint the
+/// `Program::Attn` `KtirNode` with the kernel's own parameter order.
 ///
-/// `cap` is the resident cache tensor's row extent (`lower_attn_node`'s own read), and
-/// `active_cap` is the swept rung the bundle was baked for — THE one bundle fact that must
-/// meet the program here, because `attn_at` reads the swept extent back off the program
-/// (`param_read_rows`) and the two must agree by the door's own hard error.
+/// `cap` is the resident pool tensor's row extent (`lower_attn_node`'s own read) — for the
+/// paged pool a row IS a page, so it is the kernel's `PAGES` constexpr. `_active_cap` is the
+/// walk's swept rung, carried for the prefill row and unread here: the batched kernel sweeps
+/// the pool through the id table, not a baked rung. `rows_are_requests` is the ONE routing
+/// bit — the decode rung's rows are requests and this kernel serves them; a token-row shape
+/// is the prefill kernel's and is refused by name until that row is wired.
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     cap: u32,
-    active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    _active_cap: ktir_superdsc::ktir_node::ActiveCap,
+    rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    let row = attn_row();
+    let row = attn_decode_row();
     let (src, attn_program) = match &row {
         TritonKernelRow::Spliced { src, program, .. } => (*src, program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let SubOp::AttnDecode { geom, scale, .. } = &node.op else {
+    let SubOp::AttnDecode {
+        geom,
+        scale,
+        valid_len,
+        ..
+    } = &node.op
+    else {
         return Err(
             "triton splice: lower_attn called on a node that is not an AttnDecode — the \
              entry is AttnDecode's"
                 .to_string(),
         );
     };
-    if node.inputs.len() < 5 {
+    if !rows_are_requests {
         return Err(format!(
-            "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, new_k, \
-             new_v], found {}",
-            node.output.tensor.index(),
-            node.inputs.len()
-        ));
-    }
-    let (nqh, nkvh, hd) = (geom.nqh().get(), geom.nkvh().get(), geom.hd().get());
-    let stick = ktir_superdsc::sdsc_abstract::POOL_STICK; // 64 — the rung alignment law
-    let swept = active_cap.resolve(cap, stick);
-    let mq = node.output.region.rows.len;
-    let gqa = geom.gqa().get();
-    // ⛔ THE PREFIX SEGMENT'S OWN LAW, `KtirSeg`'s and not the rung's: a MASKED prefix
-    // (this forward's own rope-append) is read from row 0 to the SWEPT extent — the
-    // rung, bounded by the cache TENSOR's own rows (`graph.shape(kr.tensor).rows`,
-    // NOT the region's: `lower_region` slices a rope-append prefix's region to
-    // `valid_len - 1` rows while the builder's tile sweeps the rung and lets the
-    // runtime length mask bound it); a PRE-POPULATED one (the emulator's host-threaded
-    // cache) is read at its own region rows and corner. The door reads this extent
-    // back off the program (`param_read_rows`), so the spliced tile must state exactly
-    // the builder's.
-    let mask_prefix = matches!(
-        &node.op,
-        SubOp::AttnDecode {
-            producer: scratchy_subtile::subtile_ir::KvCacheProducer::SameForwardRopeAppend { .. },
-            ..
-        }
-    );
-    // The cache tensor's own row count — the builder's bound (`swept.min` of exactly
-    // this), and the same reading `lower_one_node`'s walk used for `cap`.
-    let cache_rows = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let (prefix_len, kc_row) = if mask_prefix {
-        (swept.min(cache_rows), 0)
-    } else {
-        (
-            node.inputs[1].region.rows.len,
-            node.inputs[1].region.rows.start,
-        )
-    };
-    // `KtirFunc::attn`'s zero-length segment law: a dead prefix (prefix_len == 0) keeps
-    // its VIEW (injected below) and drops its compute, AND CLEARS `mask_prefix` — with no
-    // prefix segment there is nothing the runtime length mask could bound. That clearing
-    // is what makes a no-prefix prompt chunk take the causal ONE-PASS arm.
-    let mask_eff = mask_prefix && prefix_len > 0;
-    let new_len = node.inputs[3].region.rows.len;
-    // The builder's own one-pass arm condition, verbatim: ONE LIVE SEGMENT (the dead
-    // prefix leaves exactly the new block), mq > 1, no runtime length mask, and the new
-    // block spanning the whole chunk (`seq_len == mq`) — the additive `[mq, mq]` causal
-    // triangle can then replace the per-row slice. (A temporary `mq >= 8` floor sat
-    // here to satisfy the front end's since-removed TMA 16-byte check — a GPU law the
-    // Spyre target does not have; with the check gone the builder's own condition
-    // stands again, and the ladder's bottom rung takes the one-pass arm like main.)
-    let one_pass = !mask_eff && prefix_len == 0 && new_len == mq && mq > 1;
-    // Every other multi-row shape is the whole-chunk continuation (`attn.py`'s
-    // `_attn_cont_head`), which states its causality in the mask rather than in per-row
-    // tile extents — so it always binds one.
-    let continuation = mq > 1 && !one_pass;
-    if continuation && (prefix_len == 0 || new_len < mq) {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {mq}-row attention with a {prefix_len}-row prefix and \
-             a {new_len}-row new block — the whole-chunk continuation needs a live prefix and a new \
-             block covering every row, and a dead prefix with a full new block is the one-pass arm",
+            "triton splice: AttnDecode t{} is a token-row shape (a prompt chunk or its \
+             continuation), and the attention row is the batched paged-DECODE kernel — \
+             batched_prefill_hm is the prefill row and is not wired yet",
             node.output.tensor.index()
         ));
     }
-    // THE MASK IS BOUND WHEN A SEGMENT CONSUMES IT — the runtime length mask (decode,
-    // `[1, prefix_len]`), the causal triangle (the one-pass, `[mq, mq]`), or the
-    // continuation's `[mq, prefix_len + mq]` prefix-plus-new-block mask.
-    let has_mask = mask_eff || one_pass || continuation;
-    // The scale, stated as the kernel's own constexpr so the program's `qk * SCALE` mulf
-    // carries exactly the value `program_score_scale` reads back — the door resolves the
-    // registry slot FROM that value, so the program and `scalarmul_scales` cannot disagree.
-    let spec = attn_kernel_spec(
-        node,
-        &AttnFacts {
-            nqh,
-            nkvh,
-            hd,
-            gqa,
-            mq,
-            cap,
-            prefix_len,
-            kc_row,
-            new_len,
-            scale: *scale,
-            has_mask,
-            one_pass,
-        },
-    )?;
-    // ⭐ THE GRID IS THE HEAD COUNT AT mq > 1 — the builder's own structure. `KtirFunc::attn`
-    // runs one head per program instance when `mq > 1` (`KtdpGetComputeTileId`, grid
-    // `(nq, 1)`), and the kernel states the same shape: `tl.program_id(0)` IS the head in
-    // its mq > 1 arms, so the grid folds the head axis and the program carries ONE head's
-    // body — 32x fewer ops per program than a static_range head loop unrolled into one
-    // grid-[1] program (granite: 32 query heads), which is the compile-time law the
-    // builder's form sets. Decode keeps grid [1] and the kernel's own static head loop,
-    // exactly the builder's `mq == 1` arm.
-    let grid: Vec<i64> = if mq > 1 {
-        vec![i64::from(nqh)]
-    } else {
-        vec![1]
-    };
+    let (nkvh, hd) = (geom.nkvh().get(), geom.hd().get());
+    let gqa = geom.gqa().get();
+    // THE REQUEST COUNT IS THE BATCH — the decode rung's rows are one per request, the same
+    // reading the caller threads as `rows_are_requests`.
+    let num_seqs = node.output.region.rows.len;
+    if num_seqs == 0 {
+        return Err(format!(
+            "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
+             kernel's NUM_SEQS is the request count and cannot be 0",
+            node.output.tensor.index()
+        ));
+    }
+    // THE PAGE GEOMETRY IS A SHARED DEVICE LAW, NOT A MODEL NUMBER: the pool's page width
+    // and the id stick's entry count live beside the pool types every other consumer reads.
+    let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    // THE ID TABLE IS ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK` must fill the
+    // SenUint32 stick exactly (the kernel's own contract — one entry per core), so the chunk
+    // depth is the stick divided by the batch, and a batch that does not divide it has no
+    // form under this kernel.
+    if entries % num_seqs != 0 {
+        return Err(format!(
+            "triton splice: AttnDecode t{}: a {num_seqs}-request decode batch does not divide \
+             the {entries}-entry id stick, so no BLOCKS_PER_CHUNK fills it exactly — the \
+             kernel's one-stick contract has no form at this batch width",
+            node.output.tensor.index()
+        ));
+    }
+    let blocks_per_chunk = entries / num_seqs;
+    // THE POOL'S ROWS ARE ITS PAGES — `cap` is the cache tensor's own row extent, and a
+    // paged pool row is one whole page for every KV head.
+    let pages = cap;
+    if pages == 0 {
+        return Err(format!(
+            "triton splice: AttnDecode t{} reads a zero-page pool — PAGES is the cache \
+             tensor's row extent and cannot be 0",
+            node.output.tensor.index()
+        ));
+    }
+    // THE CHUNK COUNT COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's stated
+    // logical length (prefix ++ new), the one sequence-extent fact the node carries. Pages
+    // per sequence, then chunks at this batch's own chunk depth.
+    let pages_per_seq = valid_len.div_ceil(page_slots);
+    let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
+    let spec = batched_decode_spec(&BatchedDecodeFacts {
+        num_seqs,
+        nkvh,
+        gqa,
+        hd,
+        pages,
+        page_slots,
+        blocks_per_chunk,
+        num_chunks,
+        scale: *scale,
+    })?;
+    // ONE PROGRAM FOR THE WHOLE BATCH — grid [1, 1] is the kernel's own contract: every
+    // descriptor corner is a compile-time constant (the chunk loop is `tl.static_range`).
+    let grid: Vec<i64> = vec![1, 1];
     let positional = attn_positional(
         src,
         &spec,
@@ -1443,11 +1419,11 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         AttnPostCompile {
             cap,
             kv_width: nkvh * hd,
-            dead_prefix: prefix_len == 0,
-            has_mask,
+            dead_prefix: false,
+            has_mask: true,
         },
     )?;
-    let k = mint_attn(node, ir, positional, has_mask)?;
+    let k = mint_attn(node, ir, positional)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -1537,57 +1513,55 @@ fn attn_positional(
 /// The facts arrive as ONE struct — the group is the shape's own frame (geometry, widths,
 /// segment extents, arm selectors), minted by `lower_attn` beside the laws that derive
 /// each member, so this mint holds no derivation of its own.
-struct AttnFacts {
-    nqh: u32,
+/// The batched paged-decode kernel's facts — every one the node's own or a shared law,
+/// minted by [`lower_attn`] beside the law that derives each member, so this struct holds
+/// no derivation of its own.
+struct BatchedDecodeFacts {
+    num_seqs: u32,
     nkvh: u32,
-    hd: u32,
     gqa: u32,
-    mq: u32,
-    cap: u32,
-    prefix_len: u32,
-    kc_row: u32,
-    new_len: u32,
+    hd: u32,
+    pages: u32,
+    page_slots: u32,
+    blocks_per_chunk: u32,
+    num_chunks: u32,
     scale: f32,
-    has_mask: bool,
-    one_pass: bool,
 }
 
-fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
-    node: &SubtileNode<F>,
-    f: &AttnFacts,
-) -> Result<KernelSpec, String> {
-    let AttnFacts {
-        nqh,
+/// THE BATCHED DECODE KERNEL'S LAUNCH CONTRACT — the kernel's own parameter order
+/// (`batched_decode_hm`: q, out, the two pool planes, the id table, the mask), plus every
+/// extent as a constexpr: the geometry (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`,
+/// `PAGE_SLOTS`), the batching (`BLOCKS_PER_CHUNK`, `NUM_CHUNKS`), and the scale.
+///
+/// The ids table is `*i32` — the kernel gathers pages through it and the door sizes an
+/// index buffer `SenUint32` by its own gather law. The mask is ALWAYS consumed (the kernel
+/// loads it unconditionally in the chunk loop — the additive -65504 sentinel is what makes
+/// a padded page merge with weight zero), so the parameter is always in the signature.
+fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
+    let BatchedDecodeFacts {
+        num_seqs,
         nkvh,
-        hd,
         gqa,
-        mq,
-        cap,
-        prefix_len,
-        kc_row,
-        new_len,
+        hd,
+        pages,
+        page_slots,
+        blocks_per_chunk,
+        num_chunks,
         scale,
-        has_mask,
-        one_pass,
     } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    // The door's positional order: q, out, kc, kd, vc, vd — the cache's K before the new
-    // block's K, then the same for V — then the mask when a segment reads it.
-    let mut params: Vec<&str> = vec![
-        "desc_q", "desc_o", "desc_kc", "desc_kd", "desc_vc", "desc_vd",
-    ];
-    // ⛔ THE MASK PARAMETER IS ALWAYS IN THE SIGNATURE: the kernel's parameter list is static
-    // Python, so a shape without a mask still declares `desc_mask` — and the trace (every
-    // descriptor and load under `if HAS_MASK:` / `if SWEPT > 0`) never references it, so the
-    // pipeline DCEs the unaddressed parameter and the compiled program carries exactly the
-    // arguments the builder's own arm states (six, for a maskless shape). Same law as the dead
-    // prefix's cache views: the program's parameter set is decided by what the trace addresses.
-    params.push("desc_mask");
-    for p in params {
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_o", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
         signature.insert(
             p.to_string(),
-            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
         );
     }
     let mut ce = |k: &str, v: Val| -> Result<(), String> {
@@ -1595,35 +1569,20 @@ fn attn_kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
         constexprs.insert(k.to_string(), v);
         Ok(())
     };
-    // The segment corners, from the node's own regions — the row/col starts the builder's
-    // `KtirSeg` states (`kr.region.rows.start`, `kr.region.cols.start`). The MASKED prefix's
-    // row corner is 0 by the builder's own law (`row_start = 0` at `mask_prefix && i == 0`),
-    // which is why `kc_row` arrives as its own parameter and is not read off the region.
-    let (kc_c, kd_r, kd_c) = (
-        node.inputs[1].region.cols.start,
-        node.inputs[3].region.rows.start,
-        node.inputs[3].region.cols.start,
-    );
-    ce("NQH", Val::Int(i128::from(nqh)))?;
+    ce("NUM_SEQS", Val::Int(i128::from(num_seqs)))?;
     ce("NKVH", Val::Int(i128::from(nkvh)))?;
-    ce("HD", Val::Int(i128::from(hd)))?;
     ce("GQA", Val::Int(i128::from(gqa)))?;
-    ce("MQ", Val::Int(i128::from(mq)))?;
-    ce("CAP", Val::Int(i128::from(cap)))?;
-    ce("SWEPT", Val::Int(i128::from(prefix_len)))?;
-    ce("NEW_LEN", Val::Int(i128::from(new_len)))?;
-    ce("KC_ROW", Val::Int(i128::from(kc_row)))?;
-    ce("KC_COL", Val::Int(i128::from(kc_c)))?;
-    ce("KD_ROW", Val::Int(i128::from(kd_r)))?;
-    ce("KD_COL", Val::Int(i128::from(kd_c)))?;
+    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
+    ce("PAGES", Val::Int(i128::from(pages)))?;
+    ce("BLOCKS_PER_CHUNK", Val::Int(i128::from(blocks_per_chunk)))?;
+    ce("NUM_CHUNKS", Val::Int(i128::from(num_chunks)))?;
     ce("SCALE", Val::Float(f64::from(scale)))?;
-    ce("HAS_MASK", Val::Bool(has_mask))?;
-    ce("ONE_PASS", Val::Bool(one_pass))?;
     Ok(KernelSpec {
-        kernel: "attn_fwd".to_string(),
+        kernel: "batched_decode_hm".to_string(),
         signature,
         constexprs,
-        file: "attn.py".to_string(),
+        file: "batched_decode.py".to_string(),
     })
 }
 
@@ -1747,44 +1706,46 @@ fn truncate_unused_mask_param(module: &mut triton_ktir::ir::Module) -> Result<()
 }
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
-/// attention's own re-state: the bindings in the DOOR's parameter order (q, out, then the
-/// segment pairs, with the output SECOND, not last), the mask as a bound synthetic tensor id
-/// (the graph's next free one — the builder's own `graph.tensors.len()` law for the mask id),
-/// and the builder's `attn_s{id}` name.
+/// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
+/// pool planes, the id table, the mask), the pool planes bound to the node's OWN cache-tensor
+/// pair (the sealed `KvCacheLayout` witness — the same tensors the producing `RopeAppend`
+/// writes), the id table and the mask as bound synthetic tensors beyond the graph (the
+/// builder's own `graph.tensors.len()` law for the mask; the ids table one past it), and the
+/// builder's `attn_s{id}` name.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     positional: KtirNode,
-    mask_bound: bool,
 ) -> Result<KtirNode, String> {
-    // ⛔ THE DOOR'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
-    // kc (inputs[1]), kd (inputs[3]), vc (inputs[2]), vd (inputs[4]) — the order
-    // `KtirFunc::attn`'s `arg_for` mints and `attn_operands` reads back. `regions()` zips
+    let SubOp::AttnDecode { layout, .. } = &node.op else {
+        return Err(
+            "triton splice: mint_attn called on a node that is not an AttnDecode".to_string(),
+        );
+    };
+    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
+    // the K pool plane, the V pool plane, the id table, the mask. `regions()` zips
     // `bindings[i]` against `arguments[i]`, so a swapped binding is a descriptor over the
-    // wrong tensor, and the door's `is_out` check is what catches a transposed q/out.
+    // wrong tensor.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    let mut bindings = vec![
+    // ⭐ THE SYNTHETIC BINDING SLOTS — tensors BEYOND the graph, numbered past the builder's
+    // own mask law (`graph.tensors.len()`): the host stages both per step, no graph tensor
+    // names them, and the door sizes the ids buffer `SenUint32` by its own gather law.
+    let mask_tid = BufferId::new(ir.tensors.len() as u32);
+    let ids_tid = BufferId::new(ir.tensors.len() as u32 + 1);
+    let bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
-        t(&node.inputs[1]),
-        t(&node.inputs[3]),
-        t(&node.inputs[2]),
-        t(&node.inputs[4]),
+        BufferId::new(layout.cache_tensor().index() as u32),
+        BufferId::new(layout.v_cache_tensor().index() as u32),
+        ids_tid,
+        mask_tid,
     ];
-    // ⭐ THE MASK'S BINDING SLOT — the synthetic tensor BEYOND the graph, numbered the way
-    // the builder numbers it (`self.graph.tensors.len()`): the door skips the parameter
-    // by this very tid (`k.mask`), so beyond-the-graph is the only requirement, and the
-    // builder's own law is the graph's extent.
-    let mask_tid = mask_bound.then(|| BufferId::new(ir.tensors.len() as u32));
-    if let Some(m) = mask_tid {
-        bindings.push(m);
-    }
     let name = Arena::global().str(format!("attn_s{}", node.id.index()));
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
         return Err(format!(
-            "triton splice: {} compiled to {} parameters but the door's order states {} \
+            "triton splice: {} compiled to {} parameters but the kernel's order states {} \
              bindings — the kernel's parameter list diverged from the row's contract",
             func.name,
             func.arguments.len(),
@@ -1795,7 +1756,7 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         func: ktir_core::ir::IRFunction { name, ..func },
         program,
         bindings,
-        mask: mask_tid,
+        mask: Some(mask_tid),
         node_out_tid: None,
         minted: Default::default(),
     })

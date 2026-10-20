@@ -1045,7 +1045,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap) {
+            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
                 Err(reason) => Unhandled(reason),
             }
