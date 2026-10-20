@@ -1664,7 +1664,7 @@ impl Worker for SpyreWorker {
                                 .collect();
                             let mut hasher = DefaultHasher::new();
                             for v in &vals {
-                                hasher.write_u64(v.to_bits());
+                                hasher.write_u64(u64::from(v.to_bits()));
                             }
                             eprint!(
                                 "{}",
