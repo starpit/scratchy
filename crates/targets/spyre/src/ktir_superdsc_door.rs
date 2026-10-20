@@ -33,7 +33,7 @@
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, attn_at, regions, split_out};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, attn_at, regions};
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
