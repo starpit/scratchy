@@ -1737,6 +1737,171 @@ fn presented_flat(r: &Region, axis: BcastAxis) -> Result<Region, String> {
     Ok(f)
 }
 
+/// One reshape's FLAT-PRESENTATION verdict — the #741 re-row law
+/// ([`crate::sdsc_abstract::RegionFrame::reframe`], the door
+/// [`crate::sdsc_abstract::Access::reframe`] states for a reshape over a minted access) run at
+/// the forward, from the source's own type to the reshape target's flat presentation.
+#[derive(Clone, Debug)]
+enum ReshapeFlat {
+    /// The target's flat `[rows', cols']` is byte-faithful over the source's frame (the
+    /// identity, or a pad-up inside one stick): every consumer that reads the value flat or at
+    /// the source's own framing reads the bytes the source holds. Every reshape of the batched
+    /// paged-decode kernel's flat values is this — `[1024, 64] -> [256, 4, 64]` is flat
+    /// `[1024, 64]`, the identity.
+    Admitted,
+    /// The re-row law REFUSES the flat presentation — the target's framing moves bytes the
+    /// source's frame does not (`[32, 131072] -> [256, 64, 256]` is flat `[16384, 256]`, and the
+    /// inter-stick stride is the ROW count, so the re-row moves every element past the first
+    /// stick column). The value is still FORWARDED — the bytes are the source's, and the ONE
+    /// consumer that states its own affine access over the source may lawfully read it (the
+    /// gathered matmul's B, the `Access::gathered` mint) — but a consumer that reads it at the
+    /// target's framing without stating that access is refused at the resolution site, naming
+    /// the law's own clause.
+    Refused(String),
+}
+
+/// The stick law's element format — the [`crate::superdsc_opspec::Df`] whose `elems_per_stick`
+/// is the frame's lane count, from the value's own element type. `None` for the formats with no
+/// stick geometry in this dialect (bool, i64): a reshape over those states no frame law this
+/// door can check, which the verdict refuses by name.
+fn df_of_dtype(elem: ktir_core::dtypes::DType) -> Option<crate::superdsc_opspec::Df> {
+    use ktir_core::dtypes::DType;
+    Some(match elem {
+        DType::F16 => crate::superdsc_opspec::Df::Fp16,
+        DType::F32 => crate::superdsc_opspec::Df::Fp32,
+        DType::Fp8E4m3 => crate::superdsc_opspec::Df::Fp8,
+        DType::I32 => crate::superdsc_opspec::Df::SenUint32,
+        DType::Bool | DType::I64 => return None,
+    })
+}
+
+/// A value's own type — the argument list's entry, or the defining operation's `result_type`.
+/// Every SSA in a TTIR function carries one; `None` says the program did not state it.
+fn type_of<'f>(f: &IRFunction<'f>, v: Ssa) -> Option<ktir_core::irtype::IrType<'f>> {
+    if let Some(&(_, t)) = f.arguments.iter().find(|&&(s, _)| s == v) {
+        return Some(t);
+    }
+    f.ops_deep()
+        .into_iter()
+        .find(|o| o.result == Some(v))
+        .and_then(|o| o.result_type)
+}
+
+/// A shape's FLAT `[rows, cols]` presentation — the leading product over the last dim, the
+/// frame a whole-value flat read addresses. `None` for an empty or negative shape.
+fn flat_of(dims: &[i64]) -> Option<(usize, usize)> {
+    let (&last, lead) = dims.split_last()?;
+    if last < 0 || lead.iter().any(|&d| d < 0) {
+        return None;
+    }
+    let mut rows: u64 = 1;
+    for &d in lead {
+        rows = rows.checked_mul(d as u64)?;
+    }
+    usize::try_from(rows).ok().map(|r| (r, last as usize))
+}
+
+/// The re-row law for ONE reshape — the target's flat presentation against the source's own
+/// frame, both stated from the program's own types (the source's defining type, the reshape's
+/// `result_type`). A reshape whose flat law cannot be stated (either side unshaped, an element
+/// format with no stick law, a target that changes the element type) is the REFUSED verdict's
+/// sibling: this walk does not forward a lens it cannot vouch for, so the consumer-side check
+/// refuses it by name rather than passing it blind.
+fn reshape_flat_law(f: &IRFunction<'_>, op: &Operation<'_>, src: Ssa) -> ReshapeFlat {
+    let refuse = |what: &str| {
+        ReshapeFlat::Refused(format!(
+            "the reshape of t{} states {what}, so its flat presentation's byte law cannot be \
+             stated — the #741 re-row law this forward checks needs both frames",
+            src.0
+        ))
+    };
+    let Some(tt) = op.result_type else {
+        return refuse("no result type");
+    };
+    let Some(target) = tt.dims().and_then(flat_of) else {
+        return refuse("a result shape the flat presentation cannot read");
+    };
+    let Some(st) = type_of(f, src) else {
+        return refuse("no type on the value it reshapes");
+    };
+    let Some(source) = st.dims().and_then(flat_of) else {
+        return refuse("a source shape the flat presentation cannot read");
+    };
+    let Some(df) = st.elem().and_then(df_of_dtype) else {
+        return refuse("an element format with no stick law");
+    };
+    if tt.elem().is_some_and(|e| Some(e) != st.elem()) {
+        return refuse("a different element type than the value it reshapes");
+    }
+    match crate::sdsc_abstract::RegionFrame::stick_blocked(source.0, source.1, df)
+        .reframe(target.0, target.1)
+    {
+        Ok(_) => ReshapeFlat::Admitted,
+        Err(msg) => ReshapeFlat::Refused(msg),
+    }
+}
+
+/// ⭐⭐⭐ THE `tensor.reshape` FORWARDS — every reshape result maps to the value it reshapes, and
+/// every consumer of a reshape reads THROUGH it to that value.
+///
+/// `tl.reshape` is numpy semantics: the result preserves the source's flat C-order index exactly
+/// (element at flat index `i` stays at flat index `i`), never permuting. So a reshape moves no
+/// byte and states no computation — it is a LENS the consumer reads the same bytes through. The
+/// walk therefore treats the op as plumbing (no descriptor, nothing minted) and resolves every
+/// value a consumer names through the chain to the value underneath: a load (the region is the
+/// parameter's), a gathered load (the identity join finds its tile), a compute op's result (the
+/// minted intermediate). Reshape-of-reshape resolves transitively — the map records the
+/// ULTIMATE source, built in definition order so a later reshape reads the earlier one's entry.
+///
+/// ⭐⭐⭐ AND THE LENS IS LAW-CHECKED AT THE REFRAME — [`reshape_flat_law`] runs the #741 re-row
+/// law at the forward itself, the same law [`crate::sdsc_abstract::Access::reframe`] states for
+/// a reshape over a minted access: the target's flat presentation is admitted only when every
+/// element addresses the byte it did (`rows' == rows`, the stick-column count unchanged). A
+/// refused reshape does not stop the forward — the bytes are the source's either way — but it
+/// marks the value CARRIED: only the consumer that states its own affine access over the source
+/// (the gathered matmul's B, the `Access::gathered` mint) may read that framing, and the
+/// consumer-side check refuses every other reader by name. Without that check a `[1024, 64]`
+/// value reshaped `[64, 1024]` and consumed by a row-framed op would read the source's frame at
+/// the target's extents — a clean bake of wrong bytes, exactly what the re-row law exists to
+/// refuse.
+///
+/// The reshape forwards' maps: (result → ultimate source), (result → the reshape's own input,
+/// for the per-hop law walk), each result's law verdict, and the set of every reshape result
+/// (the plumbing the walk's op loop skips).
+type ReshapeForwards = (
+    std::collections::HashMap<Ssa, Ssa>,
+    std::collections::HashMap<Ssa, Ssa>,
+    std::collections::HashMap<Ssa, ReshapeFlat>,
+    std::collections::HashSet<Ssa>,
+);
+
+/// Returns the forwards map (result → ultimate source), the immediate-source map (result → the
+/// reshape's own input, for the per-hop law walk), each result's law verdict, and the set of
+/// every reshape result — the values the walk's op loop skips as plumbing.
+fn reshape_forwards(f: &IRFunction<'_>) -> ReshapeForwards {
+    let mut forwards = std::collections::HashMap::new();
+    let mut hops = std::collections::HashMap::new();
+    let mut verdicts = std::collections::HashMap::new();
+    let mut consumed = std::collections::HashSet::new();
+    for op in f.ops_deep() {
+        if op.op_type != OpKind::TensorReshape {
+            continue;
+        }
+        let Some(res) = op.result else { continue };
+        let Some(src) = op.operands.first().copied() else {
+            continue;
+        };
+        // The ultimate source: a reshape of a reshape reads the earlier entry, so the map is
+        // transitively closed by construction (definitions precede uses in straight-line SSA).
+        let ultimate = forwards.get(&src).copied().unwrap_or(src);
+        forwards.insert(res, ultimate);
+        hops.insert(res, src);
+        verdicts.insert(res, reshape_flat_law(f, op, src));
+        consumed.insert(res);
+    }
+    (forwards, hops, verdicts, consumed)
+}
+
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
 ///
 /// `ktdp.load <- ktdp.construct_access_tile <- ktdp.construct_memory_view <- parameter`, and the
@@ -2579,6 +2744,14 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    // ⭐⭐⭐ THE RESHAPE FORWARDS, read before the walk for the same reason the broadcast plumbing
+    // is: a `tensor.reshape` moves no byte (numpy semantics — the flat C-order index is
+    // preserved), so the op lowers to NOTHING and every consumer reads through it to the value
+    // underneath. See [`reshape_forwards`] for the law: the re-row verdict at the forward and
+    // the consumer-side check below together are the `Access::reframe` instance — a refused
+    // lens is readable only by the consumer that states its own affine access.
+    let (reshapes, reshape_hops, reshape_verdicts, reshape_consumed) = reshape_forwards(f);
+    let through = |v: Ssa| reshapes.get(&v).copied().unwrap_or(v);
     // ⭐⭐⭐ THE GATHERS THE PROGRAM STATES, read ONCE and from [`gathers_of`] — the same joins the
     // per-`Program` door's `gather_of` makes, so the two doors cannot disagree about which parameter
     // is the table or which is the index. A program with ONE indirect tile reads identically to
@@ -2625,6 +2798,9 @@ pub fn lower_function(
                 || rmsnorms.iter().any(|c| c.consumed.contains(&r))
                 // The expand/collapse/broadcast chain itself: no descriptor, the consumer states it.
                 || bcast_consumed.contains(&r)
+                // A `tensor.reshape` result: no descriptor, no minted buffer — the consumer
+                // reads through it to the value underneath ([`reshape_forwards`]).
+                || reshape_consumed.contains(&r)
                 // An fp8 dot's absorbed scale mulf: it rode into the dot's emission above.
                 || fp8_epilogue.contains(&r)
                 // A row-folded family's non-leader block: the leader's one whole-view descriptor
@@ -2776,6 +2952,47 @@ pub fn lower_function(
             .iter()
             .map(|v| bcasts.get(v).map_or(*v, |b| b.src))
             .collect();
+        // ⭐⭐⭐ AND THROUGH THE RESHAPES — the last rewrite before any consumer-side lookup, so
+        // every join downstream (the region loop, the `inter` mint lookup, the gather identity
+        // join, the row fold) names the value UNDERNEATH the lens and not the lens. A reshape
+        // result is never a load, never a minted intermediate, and never a gathered load's
+        // identity — without this rewrite every one of those lookups fails on it; with it, the
+        // region/gather/mint of the SOURCE answers, and the consumer's own extent guards are
+        // what say whether the split it reads through is one its math can use.
+        let pre_through: Vec<Ssa> = in_values.clone();
+        let in_values: Vec<Ssa> = in_values.iter().map(|v| through(*v)).collect();
+        // ⭐⭐⭐ AND THE LENS IS LAW-CHECKED AT THE CONSUMER — every hop the consumer's own
+        // operand spelling reads through must be flat-ADMITTED (the #741 re-row law the forward
+        // ran), unless this op is the ONE consumer that states its own affine access over the
+        // source: a matmul whose B is the gathered load, whose presentation is the
+        // `Access::gathered` mint over the ultimate source — a DIFFERENT set of byte laws (the
+        // total bound, the gather's own), stated where that access is minted. Anything else
+        // reading a refused reshape takes the target's framing on the source's bytes — the
+        // clean-bake wrong-byte class the re-row law exists to refuse, so it is a build error
+        // here, naming the law's own clause.
+        let states_own_access =
+            matches!(op.op_type, OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul)
+                && gathers
+                    .iter()
+                    .any(|g| Some(g.load) == in_values.get(1).copied());
+        for (i, v) in pre_through.iter().enumerate() {
+            let mut cur = *v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                if let Some(ReshapeFlat::Refused(msg)) = reshape_verdicts.get(&cur)
+                    && !(states_own_access && i == 1)
+                {
+                    return err(format!(
+                        "{}: operand {i} reads t{} through a reshape whose flat presentation \
+                         the re-row law refuses — {msg}. A consumer may take that framing only \
+                         by stating its own affine access over the source (the gathered \
+                         matmul's B does); this op does not, so it would read the source's \
+                         bytes at a framing that moves them",
+                        f.name, cur.0
+                    ));
+                }
+                cur = next;
+            }
+        }
 
         // ⭐⭐⭐⭐⭐ THE ROW-TILED FAMILY FOLD'S CANDIDACY GATE. Only the foldable pointwise kinds
         // (the same `program` this loop just derived — never re-derived here, so the gate cannot
@@ -3096,11 +3313,43 @@ pub fn lower_function(
             transposed_b_is_placeable(f.name, b, b_from_parameter)?;
         }
 
-        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result.
-        let mut stored = f
-            .operations
-            .iter()
-            .find(|s| s.op_type == OpKind::KtdpStore && s.operands.first().copied() == op.result);
+        // THIS OP'S OUTPUT: the parameter a `ktdp.store` writes from this op's result. ⭐⭐⭐ THE
+        // STORE'S VALUE READS THROUGH RESHAPES — the producer's own spelling ends
+        // `o_desc.store([0, 0], tl.reshape(o, [rows, cols]))`, so the store's operand is the
+        // LENS, not the value: the find resolves it through [`reshape_forwards`] to the op's
+        // result, exactly as the input-side rewrites above do, and a store whose value no
+        // through-reshape resolution matches keeps the not-stored arm below (mint + named
+        // refusal if nothing consumes it) rather than a silent unwritten output.
+        let mut stored = f.operations.iter().find(|s| {
+            s.op_type == OpKind::KtdpStore
+                && s.operands
+                    .first()
+                    .copied()
+                    .is_some_and(|v| Some(through(v)) == op.result)
+        });
+        // ⭐⭐⭐ AND THE STORE IS A FLAT CONSUMER OF THE SAME LAW — it writes the value's whole
+        // flat content at its window, so the chain it reads through must be flat-ADMITTED like
+        // every other consumer's: a store whose value arrives through a REFUSED reshape would
+        // take the target's framing on the source's bytes, and the window's rows are the
+        // producer's own statement. There is no store-side exemption — the one access-stating
+        // consumer is the gathered matmul's B.
+        if let Some(s) = stored
+            && let Some(v) = s.operands.first().copied()
+        {
+            let mut cur = v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                if let Some(ReshapeFlat::Refused(msg)) = reshape_verdicts.get(&cur) {
+                    return err(format!(
+                        "{}: the `ktdp.store` of t{} reads t{} through a reshape whose flat \
+                         presentation the re-row law refuses — {msg}. The store writes the \
+                         value's whole flat content at its window, so a framing that moves \
+                         bytes is not one it can write",
+                        f.name, v.0, cur.0
+                    ));
+                }
+                cur = next;
+            }
+        }
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
         // the dot's result is never stored directly: without this arm the walk would mint it an
@@ -4404,6 +4653,189 @@ mod presented_flat_tests {
     fn the_row_split_mode_presents_nothing() {
         let p = presented_flat(&reg(64, 4), BcastAxis::Y(4)).expect("the identity");
         assert_eq!((p.v_rows, p.v_cols), (64, 4));
+    }
+}
+
+#[cfg(test)]
+/// ⭐⭐⭐ THE RESHAPE FORWARDS' LAW, at the batched paged-decode kernel's own geometry — the
+/// verdicts the consumer-side check reads, pinned so the #741 re-row law's application to
+/// `tensor.reshape` (the `Access::reframe` instance) cannot drift silently.
+mod reshape_forward_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::dtypes::DType;
+    use ktir_core::irtype::IrType;
+
+    /// One straight-line function: the argument `Ssa(0)` of type `src_dims` reshaped to
+    /// `target_dims`, the result `Ssa(1)`.
+    fn reshaped(src_dims: &[i64], target_dims: &[i64]) -> &'static IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let f16 = |dims: &[i64]| IrType::Tensor {
+            dims: a.ints(dims.to_vec()),
+            elem: DType::F16,
+        };
+        let op = Operation {
+            result: Some(Ssa(1)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: Some(f16(target_dims)),
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(Ssa(0), f16(src_dims))]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        Box::leak(Box::new(f))
+    }
+
+    /// ⭐ EVERY FLAT RESHAPE OF THE KERNEL IS THE IDENTITY at its flat presentation — q's
+    /// `[1024, 64] -> [256, 4, 64]`, the mask's, the merge section's and the final store's —
+    /// so the forward admits them and every consumer reads the bytes the source holds.
+    #[test]
+    fn the_kernels_flat_reshapes_are_admitted() {
+        for (src, target) in [
+            // q, pre-repeated in entry order, restated per [batch, gqa, hd].
+            (&[1024, 64][..], &[256, 4, 64][..]),
+            // the additive mask, staged at the score tile's own rows.
+            (&[1024, 256][..], &[256, 4, 256][..]),
+            // the merge section: the running max, l and acc restated [j, b·nkvh, gqa(, hd)].
+            (&[256, 4][..], &[4, 64, 4][..]),
+            (&[1024, 64][..], &[4, 64, 4, 64][..]),
+            // the final store's [b·nkvh·gqa, hd].
+            (&[64, 4, 64][..], &[256, 64][..]),
+        ] {
+            let (forwards, _hops, verdicts, consumed) = reshape_forwards(reshaped(src, target));
+            assert_eq!(
+                forwards.get(&Ssa(1)),
+                Some(&Ssa(0)),
+                "forwards to the source"
+            );
+            assert!(
+                consumed.contains(&Ssa(1)),
+                "the reshape result is plumbing the walk skips"
+            );
+            assert!(
+                matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)),
+                "{src:?} -> {target:?} is the identity at the flat presentation"
+            );
+        }
+    }
+
+    /// ⭐⭐⭐ THE GATHERED OPERANDS' RESHAPES ARE CARRIED, NOT FLAT — kt's
+    /// `[32, 131072] -> [256, 64, 256]` and v's `[32, 131072] -> [256, 256, 64]` are flat
+    /// `[16384, 256]` / `[65536, 64]` against a 32-row source, and the inter-stick stride is
+    /// the ROW count, so the re-row law refuses them: only the gathered matmul's B (the
+    /// `Access::gathered` mint) may read that framing. The refusal names the law's own clause.
+    #[test]
+    fn the_gathered_reshapes_are_carried_not_flat() {
+        for (src, target) in [
+            (&[32, 131072][..], &[256, 64, 256][..]),
+            (&[32, 131072][..], &[256, 256, 64][..]),
+        ] {
+            let (forwards, hops, verdicts, _) = reshape_forwards(reshaped(src, target));
+            assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)), "still forwards");
+            assert_eq!(hops.get(&Ssa(1)), Some(&Ssa(0)), "one hop to the source");
+            let Some(ReshapeFlat::Refused(msg)) = verdicts.get(&Ssa(1)) else {
+                panic!("{src:?} -> {target:?} must be refused as a flat presentation");
+            };
+            assert!(
+                msg.contains("stride BETWEEN stick columns"),
+                "names the re-row law's own clause: {msg}"
+            );
+        }
+    }
+
+    /// ⛔ A FLAT FRAMING THAT MOVES BYTES — `[1024, 64] -> [64, 1024]`: same numel, but the
+    /// rows (the inter-stick stride) and the stick-column count both change, so a row-framed
+    /// consumer would read the source's frame at the target's extents. This is the clean-bake
+    /// wrong-byte class the consumer-side check refuses.
+    #[test]
+    fn a_row_swapped_flat_target_is_refused() {
+        let (_, _, verdicts, _) = reshape_forwards(reshaped(&[1024, 64], &[64, 1024]));
+        assert!(
+            matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Refused(_))),
+            "a row swap is not a re-row"
+        );
+    }
+
+    /// ⛔ AND A RESHAPE THAT STATES NO LAW IS NOT FORWARDED BLIND — no result type means the
+    /// flat presentation cannot be stated, and the verdict refuses by name so the
+    /// consumer-side check fails closed.
+    #[test]
+    fn an_untyped_reshape_is_refused_not_forwarded() {
+        let a: &'static Arena = Arena::global();
+        let op = Operation {
+            result: Some(Ssa(1)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: None,
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(
+                Ssa(0),
+                IrType::Tensor {
+                    dims: a.ints(vec![1024, 64]),
+                    elem: DType::F16,
+                },
+            )]),
+            operations: a.ops(vec![op]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let (_, _, verdicts, _) = reshape_forwards(f);
+        let Some(ReshapeFlat::Refused(msg)) = verdicts.get(&Ssa(1)) else {
+            panic!("an untyped reshape must be refused, not forwarded blind");
+        };
+        assert!(msg.contains("no result type"), "names the cause: {msg}");
+    }
+
+    /// ⭐ A CHAIN RESOLVES TRANSITIVELY — reshape of reshape reads the earlier entry, so the
+    /// forwards map names the ULTIMATE source while the hops stay per-reshape for the law walk.
+    #[test]
+    fn a_reshape_chain_resolves_to_the_ultimate_source() {
+        let a: &'static Arena = Arena::global();
+        let f16 = |dims: Vec<i64>| IrType::Tensor {
+            dims: a.ints(dims),
+            elem: DType::F16,
+        };
+        let one = Operation {
+            result: Some(Ssa(1)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(0)]),
+            attributes: &[],
+            result_type: Some(f16(vec![256, 4, 64])),
+            regions: &[],
+        };
+        let two = Operation {
+            result: Some(Ssa(2)),
+            op_type: OpKind::TensorReshape,
+            operands: a.ssa(vec![Ssa(1)]),
+            attributes: &[],
+            result_type: Some(f16(vec![1024, 64])),
+            regions: &[],
+        };
+        let f = IRFunction {
+            name: "reshape_probe",
+            arguments: a.args(vec![(Ssa(0), f16(vec![1024, 64]))]),
+            operations: a.ops(vec![one, two]),
+            grid: (1, 1, 1),
+            return_type: None,
+        };
+        let f: &'static IRFunction<'static> = Box::leak(Box::new(f));
+        let (forwards, hops, verdicts, _) = reshape_forwards(f);
+        assert_eq!(forwards.get(&Ssa(1)), Some(&Ssa(0)));
+        assert_eq!(forwards.get(&Ssa(2)), Some(&Ssa(0)), "the ultimate source");
+        assert_eq!(hops.get(&Ssa(2)), Some(&Ssa(1)), "hops stay per-reshape");
+        assert!(matches!(verdicts.get(&Ssa(1)), Some(ReshapeFlat::Admitted)));
+        assert!(matches!(verdicts.get(&Ssa(2)), Some(ReshapeFlat::Admitted)));
     }
 }
 
