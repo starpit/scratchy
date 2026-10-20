@@ -1836,12 +1836,19 @@ fn row_tiled_family(
         if p != out_ptr {
             continue;
         }
+        // ⭐ A STORE WHOSE ROW WINDOW IS NOT CONSTEXPR IS NOT A ROW-BLOCK MEMBER — it is the
+        // per-core UNIFORM spelling (a corner riding the launch position; the rope fixture's
+        // `pos * H`), and that corner is the BAND LIFT's domain, not the fold's: the fold's
+        // tiling arithmetic sorts and abuts constexpr windows, and a uniform one is neither, so
+        // the store cannot be classified into a family the fold could ever merge. BAIL rather
+        // than refuse — the bail lowers every member per-op, exactly as the walk did before the
+        // fold existed, and the band lift resolves the uniform corner there. The raw compiled
+        // program (pre-splice — the form the fixture tests drive through the whole door to
+        // exercise the band lift) states its corners that way, so refusing here would refuse a
+        // working program; a store whose window is neither constexpr nor uniform still refuses,
+        // at its own op, by the band lift's own law.
         let Some((rs, rl)) = store_rows(f, s, &consts) else {
-            return err(format!(
-                "{}: a `ktdp.store` to the row-folded output states no constant row window \
-                 (tile corner/shape), so the fold cannot prove the family tiles the view",
-                f.name
-            ));
+            return Ok(None);
         };
         members.push((s, rs, rl));
     }
