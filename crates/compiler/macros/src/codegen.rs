@@ -10888,14 +10888,29 @@ fn dump_wavefront_mega(
                 // record of "this prefill bundle actually baked", set at the only two
                 // sites that stamp a prefill fp and read at the wiring stamp below — a
                 // skipped rung leaves the wiring unstamped, `pparsed` parses nothing,
-                // and the worker falls to its sequential per-token prefill (slower,
-                // never wrong: the rung contract's own fallback).
+                // and the rung contract covers a single skipped rung (a narrower rung
+                // still chunks the width); a bake that skipped EVERY prefill rung is
+                // refused AT SERVE TIME ("no-prefill-bundle", `spyre_forward.rs` — the
+                // sequential mq=1 prefill path is REMOVED): loud and never wrong, but
+                // NOT the silent slower fallback an older comment here claimed.
                 let mut prefill_fp_stamped = false;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
-                    eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
-                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
+                    // ⛔ GARBAGE ⇒ THE BAKE REFUSES. This used to be an eprintln + an
+                    // empty return — build-script stderr nobody reads without `cargo -vv`
+                    // — whose silent empty `BakeEffects` left the wiring unstamped, so
+                    // `SUPERDSC_WIRINGS` was never emitted and the rejection surfaced as
+                    // an unrelated E0425 in the generated model module (the double-mint
+                    // RopeRotate arity refusal hid here exactly that way). The reroll's
+                    // own twin check below already panics for the same reason.
+                    panic!(
+                        "[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?} \
+                         (previously swallowed by an eprintln on build-script stderr, \
+                         leaving the wiring unstamped so SUPERDSC_WIRINGS never emitted \
+                         and the rejection surfaced as an unrelated E0425 in the \
+                         generated module)"
+                    );
                 }
                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
