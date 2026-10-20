@@ -297,6 +297,19 @@ pub fn attn_decode_row() -> TritonKernelRow {
     }
 }
 
+/// THE ATTENTION FAMILY'S PREFILL ROW — `batched_prefill.py`'s own chunked-prefill kernel,
+/// the Spyre-native `batched_prefill_hm`: the token-row shapes (the prompt chunk and its
+/// continuations), torch's `page_attn_head_major_prefill` algorithm over the same pool and
+/// id-stick laws as the decode row.
+pub fn attn_prefill_row() -> TritonKernelRow {
+    TritonKernelRow::Spliced {
+        src: include_str!("../../../targets/spyre/kernels/batched_prefill.py"),
+        file: "batched_prefill.py",
+        entry: "batched_prefill_hm",
+        program: Program::Attn,
+    }
+}
+
 /// THE ROW FOR A NODE — the family functions composed. Every `SubOp` that can reach the
 /// splice has a family below (attention rides its own `lower_attn` entry); the ops the
 /// spyre target has no kernel FOR (the 2b expansion kinds, the host-routed pairs, …)
@@ -1315,11 +1328,11 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// `Program::Attn` `KtirNode` with the kernel's own parameter order.
 ///
 /// `cap` is the resident pool tensor's row extent (`lower_attn_node`'s own read) — for the
-/// paged pool a row IS a page, so it is the kernel's `PAGES` constexpr. `_active_cap` is the
-/// walk's swept rung, carried for the prefill row and unread here: the batched kernel sweeps
-/// the pool through the id table, not a baked rung. `rows_are_requests` is the ONE routing
-/// bit — the decode rung's rows are requests and this kernel serves them; a token-row shape
-/// is the prefill kernel's and is refused by name until that row is wired.
+/// paged pool a row IS a page, so it is the decode kernel's `PAGES` constexpr. `_active_cap`
+/// is the walk's swept rung, carried for the caller's contract and unread here: both batched
+/// kernels sweep the pool through the id table, not a baked rung. `rows_are_requests` is the
+/// ONE routing bit — the decode rung's rows are requests and `batched_decode_hm` serves
+/// them; a token-row shape is a chunk and `batched_prefill_hm` serves it.
 pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1327,7 +1340,11 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     _active_cap: ktir_superdsc::ktir_node::ActiveCap,
     rows_are_requests: bool,
 ) -> Result<EmittedOp, String> {
-    let row = attn_decode_row();
+    let row = if rows_are_requests {
+        attn_decode_row()
+    } else {
+        attn_prefill_row()
+    };
     let (src, attn_program) = match &row {
         TritonKernelRow::Spliced { src, program, .. } => (*src, program),
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
@@ -1345,71 +1362,107 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 .to_string(),
         );
     };
-    if !rows_are_requests {
-        return Err(format!(
-            "triton splice: AttnDecode t{} is a token-row shape (a prompt chunk or its \
-             continuation), and the attention row is the batched paged-DECODE kernel — \
-             batched_prefill_hm is the prefill row and is not wired yet",
-            node.output.tensor.index()
-        ));
-    }
     let (nkvh, hd) = (geom.nkvh().get(), geom.hd().get());
     let gqa = geom.gqa().get();
-    // THE REQUEST COUNT IS THE BATCH — the decode rung's rows are one per request, the same
-    // reading the caller threads as `rows_are_requests`.
-    let num_seqs = node.output.region.rows.len;
-    if num_seqs == 0 {
-        return Err(format!(
-            "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
-             kernel's NUM_SEQS is the request count and cannot be 0",
-            node.output.tensor.index()
-        ));
-    }
     // THE PAGE GEOMETRY IS A SHARED DEVICE LAW, NOT A MODEL NUMBER: the pool's page width
     // and the id stick's entry count live beside the pool types every other consumer reads.
     let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-    // THE ID TABLE IS ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK` must fill the
-    // SenUint32 stick exactly (the kernel's own contract — one entry per core), so the chunk
-    // depth is the stick divided by the batch, and a batch that does not divide it has no
-    // form under this kernel.
-    if entries % num_seqs != 0 {
-        return Err(format!(
-            "triton splice: AttnDecode t{}: a {num_seqs}-request decode batch does not divide \
-             the {entries}-entry id stick, so no BLOCKS_PER_CHUNK fills it exactly — the \
-             kernel's one-stick contract has no form at this batch width",
-            node.output.tensor.index()
-        ));
-    }
-    let blocks_per_chunk = entries / num_seqs;
-    // THE POOL'S ROWS ARE ITS PAGES — `cap` is the cache tensor's own row extent, and a
-    // paged pool row is one whole page for every KV head.
-    let pages = cap;
-    if pages == 0 {
+    // ⛔ THE POOL'S ROWS ARE ITS PAGES — `cap` is the cache tensor's own row extent, and a
+    // paged pool row is one whole page for every KV head. The decode kernel states it as
+    // its `PAGES` constexpr.
+    if cap == 0 {
         return Err(format!(
             "triton splice: AttnDecode t{} reads a zero-page pool — PAGES is the cache \
              tensor's row extent and cannot be 0",
             node.output.tensor.index()
         ));
     }
-    // THE CHUNK COUNT COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's stated
-    // logical length (prefix ++ new), the one sequence-extent fact the node carries. Pages
-    // per sequence, then chunks at this batch's own chunk depth.
-    let pages_per_seq = valid_len.div_ceil(page_slots);
-    let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
-    let spec = batched_decode_spec(&BatchedDecodeFacts {
-        num_seqs,
-        nkvh,
-        gqa,
-        hd,
-        pages,
-        page_slots,
-        blocks_per_chunk,
-        num_chunks,
-        scale: *scale,
-    })?;
-    // ONE PROGRAM FOR THE WHOLE BATCH — grid [1, 1] is the kernel's own contract: every
-    // descriptor corner is a compile-time constant (the chunk loop is `tl.static_range`).
+    let spec = if rows_are_requests {
+        // ── THE DECODE ROW: the request count is the batch. ──
+        let num_seqs = node.output.region.rows.len;
+        if num_seqs == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} states a zero-row decode output — the batched \
+                 kernel's NUM_SEQS is the request count and cannot be 0",
+                node.output.tensor.index()
+            ));
+        }
+        // THE ID TABLE IS ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK` must fill
+        // the SenUint32 stick exactly (the kernel's own contract — one entry per core), so
+        // the chunk depth is the stick divided by the batch, and a batch that does not
+        // divide it has no form under this kernel.
+        let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+        if entries % num_seqs != 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{}: a {num_seqs}-request decode batch does not \
+                 divide the {entries}-entry id stick, so no BLOCKS_PER_CHUNK fills it exactly — \
+                 the kernel's one-stick contract has no form at this batch width",
+                node.output.tensor.index()
+            ));
+        }
+        let blocks_per_chunk = entries / num_seqs;
+        // THE CHUNK COUNT COVERS THE NODE'S OWN VALID LENGTH: `valid_len` is the SubOp's
+        // stated logical length (prefix ++ new), the one sequence-extent fact the node
+        // carries. Pages per sequence, then chunks at this batch's own chunk depth.
+        let pages_per_seq = valid_len.div_ceil(page_slots);
+        let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
+        batched_decode_spec(&BatchedDecodeFacts {
+            num_seqs,
+            nkvh,
+            gqa,
+            hd,
+            pages: cap,
+            page_slots,
+            blocks_per_chunk,
+            num_chunks,
+            scale: *scale,
+        })?
+    } else {
+        // ── THE PREFILL ROW: the chunk's query rows are M. ──
+        if node.inputs.len() < 5 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} expects 5 inputs [q, prefix_k, prefix_v, \
+                 new_k, new_v], found {}",
+                node.output.tensor.index(),
+                node.inputs.len()
+            ));
+        }
+        let mq = node.output.region.rows.len;
+        if mq == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} states a zero-row chunk — the prefill \
+                 kernel's MQ is the chunk's query rows and cannot be 0",
+                node.output.tensor.index()
+            ));
+        }
+        // THE PAGES THE CHUNK ATTENDS: the prefix segment's rows plus the new block's —
+        // the graph's own regions, the same reading the old attn.py splice took — padded
+        // to whole pages. The kernel's own static_assert carries the rest of the contract
+        // (one full id stick per page: `NKVH*GQA == 32`).
+        let prefix_len = node.inputs[1].region.rows.len;
+        let new_len = node.inputs[3].region.rows.len;
+        let pages = (prefix_len + new_len).div_ceil(page_slots);
+        if pages == 0 {
+            return Err(format!(
+                "triton splice: AttnDecode t{} attends zero pages — a {prefix_len}-row \
+                 prefix plus a {new_len}-row new block has no page under PAGE_SLOTS = \
+                 {page_slots}",
+                node.output.tensor.index()
+            ));
+        }
+        batched_prefill_spec(&BatchedPrefillFacts {
+            mq,
+            nkvh,
+            gqa,
+            hd,
+            pages,
+            page_slots,
+            scale: *scale,
+        })?
+    };
+    // ONE PROGRAM FOR THE WHOLE BATCH/CHUNK — grid [1, 1] is both kernels' own contract:
+    // every descriptor corner is a compile-time constant (the page/chunk loop is
+    // `tl.static_range`).
     let grid: Vec<i64> = vec![1, 1];
     let positional = attn_positional(
         src,
@@ -1583,6 +1636,73 @@ fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
         signature,
         constexprs,
         file: "batched_decode.py".to_string(),
+    })
+}
+
+/// The batched prefill kernel's facts — every one the node's own or a shared law, minted by
+/// [`lower_attn`] beside the law that derives each member, so this struct holds no
+/// derivation of its own.
+struct BatchedPrefillFacts {
+    mq: u32,
+    nkvh: u32,
+    gqa: u32,
+    hd: u32,
+    pages: u32,
+    page_slots: u32,
+    scale: f32,
+}
+
+/// THE BATCHED PREFILL KERNEL'S LAUNCH CONTRACT — the same parameter order as the decode
+/// kernel's (`batched_prefill_hm`: q, out, the two pool planes, the id table, the mask),
+/// plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool walk
+/// (`PAGES`, `PAGE_SLOTS`), and the scale.
+///
+/// The ids table is `*i32` and the mask always consumed, under the same laws as the decode
+/// spec — the two kernels share the pool, the id-stick and the mask staging contracts. The
+/// kernel's own `static_assert` carries the one-stick-per-page law (`NKVH*GQA == 32`), so a
+/// model class the form does not cover refuses at compile, in the kernel's own terms.
+fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
+    let BatchedPrefillFacts {
+        mq,
+        nkvh,
+        gqa,
+        hd,
+        pages,
+        page_slots,
+        scale,
+    } = *f;
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for (p, ty) in [
+        ("desc_q", "*fp16"),
+        ("desc_o", "*fp16"),
+        ("desc_kt", "*fp16"),
+        ("desc_v", "*fp16"),
+        ("desc_ids", "*i32"),
+        ("desc_mask", "*fp16"),
+    ] {
+        signature.insert(
+            p.to_string(),
+            ArgSpec::parse(ty).map_err(|e| e.to_string())?,
+        );
+    }
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("MQ", Val::Int(i128::from(mq)))?;
+    ce("NKVH", Val::Int(i128::from(nkvh)))?;
+    ce("GQA", Val::Int(i128::from(gqa)))?;
+    ce("HD", Val::Int(i128::from(hd)))?;
+    ce("PAGE_SLOTS", Val::Int(i128::from(page_slots)))?;
+    ce("PAGES", Val::Int(i128::from(pages)))?;
+    ce("SCALE", Val::Float(f64::from(scale)))?;
+    Ok(KernelSpec {
+        kernel: "batched_prefill_hm".to_string(),
+        signature,
+        constexprs,
+        file: "batched_prefill.py".to_string(),
     })
 }
 
