@@ -993,10 +993,10 @@ enum Lowering {
 ///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
 ///   upstream, so it falls through to be refused by name.
 pub fn splat_scale_of(
-    f: &IRFunction<'static>,
+    facts: &FuncFacts,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Option<(f32, Ssa)> {
-    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    let def_of = |s: Ssa| facts.def(s);
     // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
     // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
     let splat_value = |s: Ssa| -> Option<f64> {
@@ -1050,29 +1050,28 @@ pub struct BoundScale {
 /// of an intermediate has no binding and no launch spelling, so it is left alone rather than
 /// misread as one.
 pub fn bound_scale_of(
-    k: &KtirNode,
+    facts: &FuncFacts,
     op: &ktir_core::ir::Operation<'static>,
 ) -> Result<Option<BoundScale>, Error> {
-    let f = &k.func;
     // The `[1,1]` VIEW a splat-of-load reads, when it reads one: splat → load → tile → view.
-    // Every step is a `find` over the top level, the same walk `region_for_operand` takes.
+    // Every step is a lookup in the facts, the same walk `region_for_operand` takes.
     let splat_view = |s: Ssa| -> Option<ktir_core::ir::Ssa> {
-        let sp = f.operations.iter().find(|o| o.result == Some(s))?;
+        let sp = facts.def(s)?;
         if sp.op_type != OpKind::TensorSplat {
             return None;
         }
         let loaded = *sp.operands.first()?;
-        let ld = f.operations.iter().find(|o| o.result == Some(loaded))?;
+        let ld = facts.def(loaded)?;
         if ld.op_type != OpKind::KtdpLoad {
             return None;
         }
         let tile = *ld.operands.first()?;
-        let tl = f.operations.iter().find(|o| o.result == Some(tile))?;
+        let tl = facts.def(tile)?;
         if tl.op_type != OpKind::KtdpConstructAccessTile {
             return None;
         }
         let view = *tl.operands.first()?;
-        let vw = f.operations.iter().find(|o| o.result == Some(view))?;
+        let vw = facts.def(view)?;
         if vw.op_type != OpKind::KtdpConstructMemoryView {
             return None;
         }
@@ -1091,11 +1090,7 @@ pub fn bound_scale_of(
         _ => return Ok(None),
     };
     // ⛔ THE BOTH-AXES-DEGENERATE TEST: only a `[1,1]` view qualifies.
-    let vw = f
-        .operations
-        .iter()
-        .find(|o| o.result == Some(view))
-        .expect("splat_view found it");
+    let vw = facts.def(view).expect("splat_view found it");
     let shape = super::lower_ktir_to_superdsc::shape_2d(vw);
     if shape != Some((1, 1)) {
         return Ok(None);
@@ -1103,10 +1098,10 @@ pub fn bound_scale_of(
     // ⛔ THE PARAMETER TEST: the view's address operand must be a function argument, and the
     // binding tid is that argument's position.
     let ptr = vw.operands.first().copied();
-    let Some(idx) = f.arguments.iter().position(|(s, _)| Some(*s) == ptr) else {
+    let Some(idx) = facts.f.arguments.iter().position(|(s, _)| Some(*s) == ptr) else {
         return Ok(None);
     };
-    let Some(tid) = k.bindings.get(idx).map(|b| b.get()) else {
+    let Some(tid) = facts.tids.get(idx).copied() else {
         return Ok(None);
     };
     Ok(Some(BoundScale { tid, tensor }))
@@ -1368,6 +1363,73 @@ fn program_broadcast_chains(
     Ok((map, consumed))
 }
 
+/// ⭐⭐⭐⭐⭐ THE FUNCTION'S OWN FACTS, READ ONCE PER WALK. The walk follows chains — a load's tile,
+/// a tile's view, a view's parameter, a store's row window, a corner's constant — and every link
+/// was found by scanning `f.operations` for the op with a given result, with the constant table,
+/// the uniform-corner table and the whole parameter walk ([`regions`]) recomputed per call. A few
+/// hundred ops never noticed. A PER-TRIP program does: rope's `_rope_per_position` at the prefill
+/// rungs unrolls MQ trips of four pointwise ops over `[MQ·H, hd]` views, so the 8b's own rung
+/// states tens of thousands of ops and thousands of stores, the row fold's gate fires once per
+/// foldable op, and the membership scan alone — every store's chain re-walked for every op — is
+/// CUBIC in the trip count (MEASURED: a >10-minute spin at the `(96, 32, 128)` door cell the
+/// moment the extent law admitted per-trip windows; expansion pays this cost for every rope node
+/// of every layer). The facts are per-function invariants, so they are computed ONCE and threaded
+/// as this one value: every find-by-result a lookup, the constant and uniform tables and the
+/// parameter walk read once, the store list an index to iterate.
+pub struct FuncFacts<'a> {
+    /// The function the facts describe.
+    f: &'a IRFunction<'static>,
+    /// Each op by its result — SSA results are unique per function, so this is total over the ops
+    /// that state one.
+    by_result: std::collections::HashMap<Ssa, usize>,
+    /// `index_constants(f)` — the constant table every corner reader reads.
+    consts: std::collections::HashMap<Ssa, i64>,
+    /// `uniform_corners(f, &consts)` — the band lift's per-core corner table.
+    uniform: std::collections::HashMap<Ssa, super::lower_ktir_to_superdsc::Uniform>,
+    /// `regions(k)` — every parameter's `Region`, the walk the operand and store tails share.
+    regions: Vec<Region>,
+    /// The binding tid per argument position — `k.bindings` read once.
+    tids: Vec<u32>,
+    /// Every `ktdp.store`'s index — the row fold's membership scan iterates this, not a filter
+    /// over the whole op list.
+    stores: Vec<usize>,
+}
+
+impl<'a> FuncFacts<'a> {
+    pub fn new(k: &'a KtirNode) -> Result<Self, Error> {
+        let f = &k.func;
+        let consts = super::lower_ktir_to_superdsc::index_constants(f);
+        let uniform = super::lower_ktir_to_superdsc::uniform_corners(f, &consts);
+        let mut by_result = std::collections::HashMap::with_capacity(f.operations.len());
+        let mut stores = Vec::new();
+        for (i, o) in f.operations.iter().enumerate() {
+            if let Some(r) = o.result {
+                by_result.insert(r, i);
+            }
+            if o.op_type == OpKind::KtdpStore {
+                stores.push(i);
+            }
+        }
+        Ok(Self {
+            f,
+            by_result,
+            consts,
+            uniform,
+            regions: super::lower_ktir_to_superdsc::regions(k)?,
+            tids: k.bindings.iter().map(|b| b.get()).collect(),
+            stores,
+        })
+    }
+
+    /// The op that produced `s`, if the function states one. The callers check the KIND
+    /// themselves — a find-by-result-and-kind and a lookup-by-result-plus-kind-check read the
+    /// same op, because an SSA result names exactly one op.
+    fn def(&self, s: Ssa) -> Option<&'a Operation<'static>> {
+        let ops: &'a [Operation<'static>] = self.f.operations;
+        self.by_result.get(&s).map(|&i| &ops[i])
+    }
+}
+
 /// The [`Region`] one OPERAND names, by walking back from the value to the parameter it reads.
 ///
 /// `ktdp.load <- ktdp.construct_access_tile <- ktdp.construct_memory_view <- parameter`, and the
@@ -1404,34 +1466,31 @@ fn program_broadcast_chains(
 /// row count off the OUTPUT, which is the only place it can honestly come from. So the parameter's
 /// own region is exact here, and the one thing that would be wrong on it — a row corner — is what
 /// `base_addressed` refuses downstream.
-pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error> {
+pub fn region_for_operand(facts: &FuncFacts, v: Ssa) -> Result<Option<Region>, Error> {
     // The parameter-rooted walk already computes every field of a `Region` correctly; the only
     // thing wrong for a multi-op function is WHICH parameter and WHICH tile. So find the parameter
     // this value reads and reuse that Region, rather than rebuilding one field by field and
     // risking a different answer from the same IR.
-    let f = &k.func;
-    let load = f
-        .operations
-        .iter()
-        .find(|o| o.result == Some(v) && o.op_type == OpKind::KtdpLoad);
-    let Some(load) = load else { return Ok(None) };
-    let tile_v = load.operands.first().copied();
+    let Some(load) = facts.def(v) else {
+        return Ok(None);
+    };
+    if load.op_type != OpKind::KtdpLoad {
+        return Ok(None);
+    }
+    let Some(tile_v) = load.operands.first().copied() else {
+        return Ok(None);
+    };
     // A GATHERED LOAD. Operand 0 of the indirect tile is the DATA view and operand 1 the INDEX view —
     // [`gather_of`]'s own reading of the same op, so the two walks cannot disagree about which
     // parameter is gathered.
-    if let Some(ind) = f
-        .operations
-        .iter()
-        .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
-    {
-        return region_of_view_operand(k, ind, 0);
+    let tile = facts.def(tile_v);
+    if let Some(ind) = tile.filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile) {
+        return region_of_view_operand(facts, ind, 0);
     }
-    let tile = f
-        .operations
-        .iter()
-        .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructAccessTile);
-    let Some(tile) = tile else { return Ok(None) };
-    let Some(r) = region_of_view_operand(k, tile, 0)? else {
+    let Some(tile) = tile.filter(|o| o.op_type == OpKind::KtdpConstructAccessTile) else {
+        return Ok(None);
+    };
+    let Some(r) = region_of_view_operand(facts, tile, 0)? else {
         return Ok(None);
     };
     // ⭐⭐⭐⭐⭐ THE WINDOW IS THE LOAD'S OWN TILE, NOT THE PARAMETER'S FIRST.
@@ -1454,7 +1513,7 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
     // disagree about one tile. A tile whose corners are NOT constants names a window no descriptor
     // can carry, and is refused by name rather than silently falling back to the parameter's first
     // tile — the same discipline as `regions()`'s in-loop guard.
-    Ok(Some(windowed_region(k, r, tile)?))
+    Ok(Some(windowed_region(facts, r, tile)?))
 }
 
 /// ⭐⭐⭐⭐⭐ ONE ACCESS TILE's WINDOW, RESOLVED ONTO ITS PARAMETER's REGION — the walk the load side
@@ -1505,16 +1564,20 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
 /// (per-core tiles with gaps — the band would hold rows no core computes), a base below zero or a
 /// band past the view's end, a zero position count, or a corner that is not uniform at all is
 /// refused by name below. Everything refused here keeps the clone protocol.
-fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<Region, Error> {
-    let f = &k.func;
-    let consts = super::lower_ktir_to_superdsc::index_constants(f);
+fn windowed_region(
+    facts: &FuncFacts,
+    mut r: Region,
+    tile: &Operation<'_>,
+) -> Result<Region, Error> {
+    let f = facts.f;
+    let consts = &facts.consts;
     let Some((tr, tc)) = super::lower_ktir_to_superdsc::shape_2d(tile) else {
         return err(format!(
             "{}: the access tile states no 2-D `shape`, so its window is unknown",
             f.name
         ));
     };
-    let uniform = super::lower_ktir_to_superdsc::uniform_corners(f, &consts);
+    let uniform = &facts.uniform;
     let (gx, gy, gz) = f.grid;
     let positions = (gx * gy * gz) as i64;
     // ⭐ A RANK-1 TILE STATES ONE CORNER, ITS SINGLE AXIS. A constant is an ordinary window at
@@ -1624,24 +1687,26 @@ fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
 /// read; three separate `position(|(a, _)| Some(*a) == ptr)` walks is three chances to reach a
 /// different row from the same IR.
 fn region_of_view_operand(
-    k: &KtirNode,
+    facts: &FuncFacts,
     tile: &Operation<'_>,
     slot: usize,
 ) -> Result<Option<Region>, Error> {
-    let f = &k.func;
-    let view_v = tile.operands.get(slot).copied();
-    let view = f
-        .operations
-        .iter()
-        .find(|o| o.result == view_v && o.op_type == OpKind::KtdpConstructMemoryView);
-    let Some(view) = view else { return Ok(None) };
+    let f = facts.f;
+    let Some(view_v) = tile.operands.get(slot).copied() else {
+        return Ok(None);
+    };
+    let Some(view) = facts
+        .def(view_v)
+        .filter(|o| o.op_type == OpKind::KtdpConstructMemoryView)
+    else {
+        return Ok(None);
+    };
     let ptr = view.operands.first().copied();
 
     // Which parameter is that, and therefore which `Region` of the parameter-rooted walk.
     let idx = f.arguments.iter().position(|(a, _)| Some(*a) == ptr);
     let Some(idx) = idx else { return Ok(None) };
-    let all = regions(k)?;
-    let Some(r) = all.get(idx).copied() else {
+    let Some(r) = facts.regions.get(idx).copied() else {
         return err(format!(
             "{}: parameter {idx} has no region, though the operand walk reached it",
             f.name
@@ -1676,25 +1741,25 @@ enum RowFoldKind {
     BoundScalarMul,
 }
 
-/// The pre-walk analyses the row fold's helpers read — the recognizers' outputs, threaded as ONE
-/// value so the helpers stay under the argument budget without `#[allow]`. Built once in
-/// [`lower_function`], after the recognizers run and before the op loop.
+/// The pre-walk analyses the row fold's helpers read — the recognizers' outputs and the
+/// function's own facts, threaded as ONE value so the helpers stay under the argument budget
+/// without `#[allow]`. Built once in [`lower_function`], after the recognizers run and before
+/// the op loop.
 struct FoldAnalyses<'a> {
     silus: &'a [SiluMulChain],
     rmsnorms: &'a [RmsNormChain],
     gathered_loads: &'a std::collections::HashMap<Ssa, usize>,
+    /// The per-function index — the chain lookups the splat/bound readers and the family walk
+    /// read, so a per-trip program's gate cost is linear in its ops, not cubic (see
+    /// [`FuncFacts`]).
+    facts: &'a FuncFacts<'a>,
 }
 
 /// Classify one terminal op the way [`lower_function`]'s loop does, reduced to the foldable
 /// families. `None` is every kind the fold does not own — an rmsnorm chain's gain multiply (the
 /// reduce inside it changes extent under a merge), a matmul (its trips are the time-tiling
 /// machinery's), a transpose, anything unrouted.
-fn classify_row_fold(
-    k: &KtirNode,
-    op: &Operation<'static>,
-    analyses: &FoldAnalyses<'_>,
-) -> Option<RowFoldKind> {
-    let f = &k.func;
+fn classify_row_fold(op: &Operation<'static>, analyses: &FoldAnalyses<'_>) -> Option<RowFoldKind> {
     let FoldAnalyses {
         silus, rmsnorms, ..
     } = analyses;
@@ -1707,10 +1772,10 @@ fn classify_row_fold(
         if rmsnorms.iter().any(|c| op.result == Some(c.out)) {
             return None;
         }
-        if let Some((v, _)) = splat_scale_of(f, op) {
+        if let Some((v, _)) = splat_scale_of(analyses.facts, op) {
             return Some(RowFoldKind::ScalarMul(v));
         }
-        if let Ok(Some(_)) = bound_scale_of(k, op) {
+        if let Ok(Some(_)) = bound_scale_of(analyses.facts, op) {
             return Some(RowFoldKind::BoundScalarMul);
         }
         return Some(RowFoldKind::Elementwise(OpKind::ArithMulf));
@@ -1734,29 +1799,28 @@ fn classify_row_fold(
 /// The parameter a `ktdp.store` writes — the tile→view→pointer chain the walk's own out path
 /// walks, stated once so the family analysis cannot reach a different parameter than the emission
 /// does.
-fn store_ptr(f: &IRFunction<'static>, store: &Operation<'_>) -> Option<Ssa> {
-    let tile = f.operations.iter().find(|o| {
-        o.op_type == OpKind::KtdpConstructAccessTile && o.result == store.operands.get(1).copied()
-    })?;
-    let view = f.operations.iter().find(|o| {
-        o.op_type == OpKind::KtdpConstructMemoryView && o.result == tile.operands.first().copied()
-    })?;
+fn store_ptr(facts: &FuncFacts, store: &Operation<'_>) -> Option<Ssa> {
+    let tile = facts
+        .def(store.operands.get(1).copied()?)
+        .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)?;
+    let view = facts
+        .def(tile.operands.first().copied()?)
+        .filter(|o| o.op_type == OpKind::KtdpConstructMemoryView)?;
     view.operands.first().copied()
 }
 
 /// A store's own row window — the tile's `Shape` height and its row-corner constant, read with
-/// the same two readers (`shape_2d`, `index_constants`) [`region_for_operand`] reads a load's
+/// the same two readers (`shape_2d`, the constant table) [`region_for_operand`] reads a load's
 /// tile with, so the two walks cannot disagree about one tile.
-fn store_rows(
-    f: &IRFunction<'static>,
-    store: &Operation<'_>,
-    consts: &std::collections::HashMap<Ssa, i64>,
-) -> Option<(u32, u32)> {
-    let tile = f.operations.iter().find(|o| {
-        o.op_type == OpKind::KtdpConstructAccessTile && o.result == store.operands.get(1).copied()
-    })?;
+fn store_rows(facts: &FuncFacts, store: &Operation<'_>) -> Option<(u32, u32)> {
+    let tile = facts
+        .def(store.operands.get(1).copied()?)
+        .filter(|o| o.op_type == OpKind::KtdpConstructAccessTile)?;
     let (r_len, _) = super::lower_ktir_to_superdsc::shape_2d(tile)?;
-    let r_start = tile.operands.get(1).and_then(|s| consts.get(s).copied())? as u32;
+    let r_start = tile
+        .operands
+        .get(1)
+        .and_then(|s| facts.consts.get(s).copied())? as u32;
     Some((r_start, r_len))
 }
 
@@ -1785,31 +1849,33 @@ fn store_rows(
 /// * A family whose stores disagree about kind or parameters is not a family — the key does not
 ///   match, nothing merges, and the members lower (and refuse, loudly) as today.
 fn row_tiled_family(
-    k: &KtirNode,
     leader: &Operation<'static>,
     leader_kind: RowFoldKind,
     leader_in: &[Ssa],
     leader_n_in: usize,
     analyses: &FoldAnalyses<'_>,
 ) -> Result<Option<std::collections::HashSet<Ssa>>, Error> {
-    let f = &k.func;
     let FoldAnalyses {
         silus,
         rmsnorms: _,
         gathered_loads,
+        facts,
     } = analyses;
-    let consts = super::lower_ktir_to_superdsc::index_constants(f);
+    let f = facts.f;
     // The leader's own store — a family is keyed on the parameter its result is stored to. An
     // unstored terminal is an intermediate chain, not a row-block family.
     let Some(leader_res) = leader.result else {
         return Ok(None);
     };
-    let Some(leader_store) = f.operations.iter().find(|s| {
-        s.op_type == OpKind::KtdpStore && s.operands.first().copied() == Some(leader_res)
-    }) else {
+    let Some(leader_store) = facts
+        .stores
+        .iter()
+        .map(|&i| &f.operations[i])
+        .find(|s| s.operands.first().copied() == Some(leader_res))
+    else {
         return Ok(None);
     };
-    let Some(out_ptr) = store_ptr(f, leader_store) else {
+    let Some(out_ptr) = store_ptr(facts, leader_store) else {
         return Ok(None);
     };
     // EVERY store to that parameter, with its own row window — the family's full membership. ⛔
@@ -1817,14 +1883,12 @@ fn row_tiled_family(
     // cannot be classified as in or out of the family, and a membership that might be incomplete
     // is a partial merge waiting to happen — so it refuses by name rather than guessing. Every
     // producer's stores resolve (the walk's own out path reads the same chain for every op it
-    // lowers), so this names a producer form, not a working program.
+    // lowers), so this names a producer form, not a working program. The iteration is the facts'
+    // own store index — the scan runs once per gate call and a per-trip program states thousands
+    // of them (see [`FuncFacts`]).
     let mut members: Vec<(&Operation<'static>, u32, u32)> = Vec::new();
-    for s in f
-        .operations
-        .iter()
-        .filter(|s| s.op_type == OpKind::KtdpStore)
-    {
-        let Some(p) = store_ptr(f, s) else {
+    for s in facts.stores.iter().map(|&i| &f.operations[i]) {
+        let Some(p) = store_ptr(facts, s) else {
             return err(format!(
                 "{}: a `ktdp.store` states no tile→view→parameter chain, so the row-fold cannot \
                  tell whether it writes the folded output — and a membership that might be \
@@ -1847,7 +1911,7 @@ fn row_tiled_family(
         // exercise the band lift) states its corners that way, so refusing here would refuse a
         // working program; a store whose window is neither constexpr nor uniform still refuses,
         // at its own op, by the band lift's own law.
-        let Some((rs, rl)) = store_rows(f, s, &consts) else {
+        let Some((rs, rl)) = store_rows(facts, s) else {
             return Ok(None);
         };
         members.push((s, rs, rl));
@@ -1874,7 +1938,7 @@ fn row_tiled_family(
     // exactly as it did before the fold existed — so this is a BAIL, not a refusal.
     let mut leader_regions: Vec<Region> = Vec::with_capacity(leader_in.len());
     for v in leader_in {
-        let Some(r) = region_for_operand(k, *v)? else {
+        let Some(r) = region_for_operand(facts, *v)? else {
             return Ok(None);
         };
         leader_regions.push(r);
@@ -1889,13 +1953,13 @@ fn row_tiled_family(
                 f.name
             ));
         };
-        let Some(term) = f.operations.iter().find(|o| o.result == Some(v)) else {
+        let Some(term) = facts.def(v) else {
             return err(format!(
                 "{}: the value a `ktdp.store` writes is produced by no top-level op",
                 f.name
             ));
         };
-        let Some(kind) = classify_row_fold(k, term, analyses) else {
+        let Some(kind) = classify_row_fold(term, analyses) else {
             return err(format!(
                 "{}: t{}'s row-blocked family mixes kinds — the walk folds ONE pointwise op \
                  whose blocks tile the view, and a store to the same parameter from a different \
@@ -1940,7 +2004,7 @@ fn row_tiled_family(
                 term.operands.iter().copied().take(leader_n_in).collect()
             }
             RowFoldKind::ScalarMul(_) => {
-                let Some((_, t)) = splat_scale_of(f, term) else {
+                let Some((_, t)) = splat_scale_of(facts, term) else {
                     return err(format!(
                         "{}: a scalar-multiply family member whose multiplier is not a splat",
                         f.name
@@ -1949,7 +2013,7 @@ fn row_tiled_family(
                 vec![t]
             }
             RowFoldKind::BoundScalarMul => {
-                let Ok(Some(b)) = bound_scale_of(k, term) else {
+                let Ok(Some(b)) = bound_scale_of(facts, term) else {
                     return err(format!(
                         "{}: a bound-scale family member with no bound scale",
                         f.name
@@ -2019,7 +2083,7 @@ fn row_tiled_family(
                     f.name, term.op_type
                 ));
             };
-            let Some(r) = region_for_operand(k, v)? else {
+            let Some(r) = region_for_operand(facts, v)? else {
                 return err(format!(
                     "{}: a row-block family member's input {:?} resolves to no parameter — the \
                      fold merges one op over the SAME parameters, never a mix of loads and \
@@ -2066,8 +2130,7 @@ fn row_tiled_family(
                 f.name
             ));
         };
-        let all = regions(k)?;
-        let Some(r) = all.get(out_idx) else {
+        let Some(r) = facts.regions.get(out_idx) else {
             return err(format!(
                 "{}: the row-folded output parameter has no region, though its store reached it",
                 f.name
@@ -2204,12 +2267,17 @@ pub fn lower_function(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The function's own facts — the op index, the constant and uniform tables, the parameter
+    // walk — read ONCE here so the per-op loop and the row fold's gate pay per-OP costs, not
+    // per-op-scan ones (see [`FuncFacts`]).
+    let facts = FuncFacts::new(k)?;
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
         silus: &silus,
         rmsnorms: &rmsnorms,
         gathered_loads: &gathered_loads,
+        facts: &facts,
     };
 
     for op in f.operations.iter() {
@@ -2251,7 +2319,7 @@ pub fn lower_function(
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
         // `Elementwise(Mul)` and then fail on the splat operand having no `Region`.
         let scalar = (op.op_type == OpKind::ArithMulf)
-            .then(|| splat_scale_of(f, op))
+            .then(|| splat_scale_of(&facts, op))
             .flatten();
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
         // multiplier bound at launch rather than baked. `to_ktir`'s `expand_splat_of_scalar_argument`
@@ -2261,7 +2329,7 @@ pub fn lower_function(
         // BEFORE the 1:1 map, which would otherwise route the op to `Elementwise(Mul)` — the
         // mb-broadcast defect shape, a `[1,1]` region against a full tile.
         let bound_scale = if op.op_type == OpKind::ArithMulf && scalar.is_none() {
-            bound_scale_of(k, op)?
+            bound_scale_of(&facts, op)?
         } else {
             None
         };
@@ -2373,6 +2441,11 @@ pub fn lower_function(
         // broadcast family's blocks do not tile the view the same way and the broadcast arms
         // address operands at their own extent). The analysis itself bails on everything that is
         // not a row-blocked family, so a single-window or column-chunked program never enters it.
+        // ⭐ `folded` records that THIS op is the leader of a family the fold merged, so the store
+        // arm below can lift its regions to the family's hull before `emit_one` reads them. The
+        // basis functions no longer consult the cover (an unrolled trip's cover is the whole view
+        // too), so the lift is what tells the leader it is one descriptor for many blocks.
+        let mut folded = false;
         if bcast_axes.iter().all(Option::is_none)
             && matches!(
                 program,
@@ -2381,10 +2454,11 @@ pub fn lower_function(
                     | Lowering::BoundScalarMul(_)
                     | Lowering::Node(Program::Elementwise(_))
             )
-            && let Some(kind) = classify_row_fold(k, op, &analyses)
-            && let Some(members) = row_tiled_family(k, op, kind, &in_values, n_in, &analyses)?
+            && let Some(kind) = classify_row_fold(op, &analyses)
+            && let Some(members) = row_tiled_family(op, kind, &in_values, n_in, &analyses)?
         {
             row_fold_skip.extend(members);
+            folded = true;
         }
 
         let mut per_op: Vec<Region> = Vec::with_capacity(n_in + 1);
@@ -2396,7 +2470,7 @@ pub fn lower_function(
         // re-derived from a footprint that is identical either way.
         let mut from_parameter: Vec<bool> = Vec::with_capacity(n_in + 1);
         for (i, v) in in_values.iter().enumerate() {
-            match region_for_operand(k, *v)? {
+            match region_for_operand(&facts, *v)? {
                 Some(mut r) => {
                     r.is_out = false;
                     per_op.push(r);
@@ -2747,7 +2821,7 @@ pub fn lower_function(
                     }
                 }
             };
-            let Some(mut ws_r) = region_for_operand(k, ws_src)? else {
+            let Some(mut ws_r) = region_for_operand(&facts, ws_src)? else {
                 return err(format!(
                     "{}: the fp8 dot's scale row resolves to no bound parameter — the ws is a \
                      tensor the launch stages, and a scale computed inside this function is a \
@@ -2943,15 +3017,34 @@ pub fn lower_function(
                 f.name, op.op_type
             ));
         };
-        let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+        let Some(mut o) = region_of_view_operand(&facts, tile, 0)? else {
             return err(format!(
                 "{}: `{:?}`'s store names no parameter",
                 f.name, op.op_type
             ));
         };
-        o = windowed_region(k, o, tile)?;
+        o = windowed_region(&facts, o, tile)?;
         o.is_out = true;
         per_op.push(o);
+
+        // ⭐⭐⭐⭐⭐ THE FOLD LIFTS THE LEADER TO THE FAMILY'S HULL. The fold proved this op's family
+        // tiles the view exactly — the members' loads per operand position and their stores both
+        // partition `0..v_rows` — so the ONE folded descriptor stands for all of them, and the
+        // leader's regions must SAY so: lifted from the leader's own `[block, cols]` window to the
+        // hull (`r_start 0, r_len v_rows`) the partition proof already established. Without the
+        // lift, `pointwise_rows` would read the leader's own window as its sweep and emit `block`
+        // rows — computing 1/MQ of the view and leaving the rest unwritten — and the COVER cannot
+        // be consulted to tell the two apart, because an UNROLLED TRIP program has the same cover
+        // and the opposite intent: its ops compute one trip each. The fold's engagement is the
+        // only discriminator, so the lift lives here, where the engagement is known. A fold
+        // leader has no gathered operand (the fold's gather exclusion bailed), so every region in
+        // `per_op` is one of the family's own operands — lifted with it.
+        if folded {
+            for r in per_op.iter_mut() {
+                r.r_start = 0;
+                r.r_len = r.v_rows;
+            }
+        }
 
         let mut emitted = emit_one(
             f.name,

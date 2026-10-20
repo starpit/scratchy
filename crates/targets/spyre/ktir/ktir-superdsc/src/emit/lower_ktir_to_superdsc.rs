@@ -506,38 +506,28 @@ fn node_rows(name: &str, out: &Region) -> Result<u32, Error> {
     Ok(out.v_rows)
 }
 
-/// ⭐⭐⭐ THE ROW BASIS AN ELEMENTWISE OP SWEEPS — the matmul windowing arm's law, stated once for the
-/// pointwise arms.
+/// ⭐⭐⭐ THE DISCRIMINATOR IS THE OP'S OWN WINDOW, NOT THE PARAMETER'S COVER. A WHOLE-VIEW op is
+/// one whose window IS its view (`r_start == 0 && r_len == v_rows`) — the seeded family's shape,
+/// and the fold leader's once the walk lifts it to the family's hull — and it takes
+/// [`node_rows`], the only shape a whole-view sweep can serve. EVERYTHING ELSE sweeps its OWN
+/// window (`r_len`), the way `matmul_oriented` already does (`m = out.r_len`): a GRID program's
+/// one window at a corner this instance owns, a BANDED program's per-core window, a minted
+/// intermediate at the window's own height — and one UNROLLED TRIP of a per-position program
+/// (rope's `_rope_per_position`, every prefill rung), whose `[H, HALF]` window is one tile of a
+/// view whose COVER — the hull over every trip's loads and stores — is the whole view, because
+/// the trips tile it. Routing on the cover reads that hull as this op's sweep and states a
+/// descriptor `MQ·H` rows tall for an op that computes `H`; routing on the window reads the
+/// trip. The two bases agree on every whole-view and banded program — the window IS the view,
+/// or the window IS the cover's single span — so the unrolled trip is the only verdict that
+/// changes, from a refusal to the trip it always was.
 ///
-/// [`node_rows`] folds a ROW-BLOCKED program: its store windows tile `0..v_rows` and one descriptor
-/// spans all of them, which is the only shape a whole-view sweep can serve. A GRID program states the
-/// opposite — ONE window, at a corner this program instance owns — and its inputs are INTERMEDIATES
-/// at the window's own height (an unrolled flash block's `p·V` is `[64, 128]` against a `[1024, 128]`
-/// output view). Sweeping the view there would read 960 rows nobody wrote and write 960 rows nobody
-/// stores; sweeping the WINDOW is exactly what `matmul_oriented` already does (`m = out.r_len`).
-///
-/// The corner itself is still [`base_addressed`]'s business — `split_out` refuses a nonzero row
-/// corner on every operand, so a windowed op here is always at row 0 of its view (the grid's block 0
-/// or an unrolled trip whose corner the fold pass carried away). A program whose window sits at a
-/// nonzero row is the 16-tile grid-corner case, and it is refused by that guard rather than here.
+/// The corner itself is still [`base_addressed`]'s business for the arms that cannot carry one
+/// (`split_out` refuses a nonzero row corner there), but the DENSE arm below places row corners
+/// per-operand through [`band_corner`], so an unrolled trip at a nonzero row corner reaches it.
 fn pointwise_rows(name: &str, out: &Region) -> Result<u32, Error> {
-    if out.r_cover == (0, out.v_rows) {
+    if out.r_start == 0 && out.r_len == out.v_rows {
         node_rows(name, out)
     } else {
-        // The window basis is only honest if the op's rows ARE the window's: the caller's extent
-        // checks compare every operand against this number, and `r_len` is the window one tile
-        // states. A cover that is neither the whole view nor a single window (two disjoint
-        // windows, say) is a program shape this basis does not describe, and is refused by name
-        // rather than folded.
-        if out.r_cover.1 - out.r_cover.0 != out.r_len {
-            return err(format!(
-                "{name}: the output t{}'s store windows cover rows {}..{} in blocks of {} row(s) — \
-                 neither a row-blocked program one descriptor can fold (windows tiling the view) nor \
-                 a grid program's single window. The pointwise arms sweep one rectangle; this \
-                 program states several disjoint ones.",
-                out.tid, out.r_cover.0, out.r_cover.1, out.r_len,
-            ));
-        }
         Ok(out.r_len)
     }
 }
@@ -1060,13 +1050,17 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// [`pointwise_rows`] reads off the OUTPUT), and the basis an operand holds it in is the
 /// operand's own.
 ///
-/// A WHOLE-VIEW operand holds the sweep by BEING it (`v_rows == rows`, at row 0) — the seeded
+/// A WHOLE-VIEW operand holds the sweep by BEING it (`r_len == v_rows`, at row 0) — the seeded
 /// family's shape, and the only shape the old law here described (it compared `v_rows` against
-/// the output's `v_rows`). A WINDOWED operand — a banded program's per-core window, or a minted
-/// intermediate consumed by a banded op — holds the sweep as its WINDOW (`r_len == rows`, fitting
-/// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
-/// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
-/// equality is unchanged — the op's width is one number every operand shares.
+/// the output's `v_rows`). A WINDOWED operand — a banded program's per-core window, a minted
+/// intermediate consumed by a banded op, or one UNROLLED TRIP of a per-position program — holds
+/// the sweep as its WINDOW (`r_len == rows`, fitting its view), and comparing its `v_rows`
+/// instead would refuse exactly the programs the band lift and the per-trip path admit: a
+/// banded or trip-tiled output's whole view is every core's bands, not this op's sweep. The arm
+/// is chosen by the operand's OWN window, never by its parameter's cover — an unrolled trip's
+/// cover is the whole view because the trips tile it, and reading the cover would demand the
+/// trip be the view. The c_len equality is unchanged — the op's width is one number every
+/// operand shares.
 fn pointwise_extents_agree(
     name: &str,
     kind: Elementwise,
@@ -1075,13 +1069,14 @@ fn pointwise_extents_agree(
     rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        let row_ok = if x.r_cover == (0, x.v_rows) {
-            x.r_start == 0 && x.v_rows == rows
+        let whole = x.r_start == 0 && x.r_len == x.v_rows;
+        let row_ok = if whole {
+            x.v_rows == rows
         } else {
             x.r_len == rows && x.r_start + x.r_len <= x.v_rows
         };
         if !row_ok || x.c_len != out.c_len {
-            if x.r_cover == (0, x.v_rows) {
+            if whole {
                 return err(format!(
                     "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
                      cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \

@@ -122,7 +122,7 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         });
     }
 
-    let scalarmul_scales = scales_for_program_shape(node.program, &node.func)?;
+    let scalarmul_scales = scales_for_program_shape(node.program, node)?;
 
     // WHICH PARAMETER IS THE GATHER'S INDEX VECTOR, read off the program by the SAME function family
     // the lowering body reads it with — so the placement and the descriptor cannot disagree about
@@ -708,8 +708,9 @@ fn overlaps_none(
 /// That is the whole reason the chain has to be recognised before the registry can be filled, and it
 /// is why this function calls THE SAME recogniser the emitter dispatches on — agreement is not
 /// something to maintain, it is the same call.
-fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f32>, crate::Error> {
+fn scales_for_program_shape(p: Program, node: &KtirNode) -> Result<Vec<f32>, crate::Error> {
     use ktir_superdsc::emit::whole_function as W;
+    let f = &node.func;
 
     if is_per_program_node(f) {
         return Ok(scales_for(p, f));
@@ -735,6 +736,13 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         .iter()
         .flat_map(|c| c.consumed.iter().copied())
         .collect();
+    // The facts the splat reader reads, built ONCE for the whole mulf loop — the same index the
+    // emitter's own walk reads, so the registry and the emission cannot disagree about which
+    // multipliers exist (and a per-trip program's loop is linear, not a rescan per op).
+    let facts = W::FuncFacts::new(node).map_err(|e| crate::Error {
+        stage: "layout",
+        message: e.message,
+    })?;
     for op in f.operations.iter() {
         if op.op_type != ktir_core::opkind::OpKind::ArithMulf {
             continue;
@@ -742,7 +750,7 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         if op.result.is_some_and(|r| interior.contains(&r)) {
             continue;
         }
-        if let Some((v, _)) = W::splat_scale_of(f, op) {
+        if let Some((v, _)) = W::splat_scale_of(&facts, op) {
             push(v, &mut out);
         }
     }

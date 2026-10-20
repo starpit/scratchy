@@ -29,7 +29,7 @@ use ktir_core::dtypes::DType;
 use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::irtype::IrType;
 use ktir_core::opkind::OpKind;
-use ktir_superdsc::emit::whole_function::{bound_scale_of, lower_function};
+use ktir_superdsc::emit::whole_function::{FuncFacts, bound_scale_of, lower_function};
 use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
 use ktir_superdsc::place::act_name;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
@@ -244,7 +244,7 @@ fn a_degenerate_splat_of_a_loaded_parameter_is_a_bound_scale() {
         .iter()
         .find(|o| o.op_type == OpKind::ArithMulf)
         .expect("the program states its mulf");
-    let b = bound_scale_of(&k, mulf)
+    let b = bound_scale_of(&FuncFacts::new(&k).expect("the facts read"), mulf)
         .expect("the discriminator decides")
         .expect("a [1,1] splat over a parameter load IS a bound scale");
     assert_eq!(
@@ -272,7 +272,8 @@ fn a_row_view_is_not_a_bound_scale_and_the_walk_refuses_it() {
         .iter()
         .find(|o| o.op_type == OpKind::ArithMulf)
         .expect("the program states its mulf");
-    let b = bound_scale_of(&k, mulf).expect("the discriminator decides");
+    let b = bound_scale_of(&FuncFacts::new(&k).expect("the facts read"), mulf)
+        .expect("the discriminator decides");
     assert!(
         b.is_none(),
         "a [1,64] row view is the mb-broadcast defect shape — emitting a scalarmul for it would          address one value where the program means a row"
