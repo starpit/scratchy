@@ -404,6 +404,14 @@ impl SuperDscSession {
         )
     }
 
+    /// Bytes per physical page — the executor's own `kv_page_stride_bytes`, handed to
+    /// callers that compute pool byte offsets beside `gather_entries_per_page` (the kcache
+    /// probe's per-page readback windows). One door, so the probe's page base and the
+    /// gather's entry factor cannot be two derivations of the stride.
+    pub fn kv_page_stride_bytes(&self) -> u64 {
+        self.exec.kv_page_stride_bytes()
+    }
+
     // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE
     // count for the pin that the card refuses (`PagePlaneExtent::entry_elems`); the page-granular gather
     // pins one stick block like every other gather and reads the accessor above. Two accessors over one
@@ -743,6 +751,16 @@ impl SuperDscSession {
         let s =
             SegIdx::checked(seg).ok_or_else(|| anyhow!("read_seg: segment {seg} out of range"))?;
         self.exec.read_seg(s)
+    }
+
+    /// D2H an explicit byte window of a tensor segment, raw sen-fp16 bytes — the paged-pool
+    /// readback [`read_seg`](Self::read_seg) cannot express (the pool has no host shadow, so a
+    /// whole-segment read stops at the baked one-page placement). See
+    /// [`Executor::read_seg_window`].
+    pub fn read_seg_window(&mut self, seg: i64, off: u64, len: u64) -> Result<Vec<u8>> {
+        let s = SegIdx::checked(seg)
+            .ok_or_else(|| anyhow!("read_seg_window: segment {seg} out of range"))?;
+        self.exec.read_seg_window(s, off, len)
     }
 
     /// Overwrite the FIRST `bytes.len()` bytes of a tensor segment + H2D exactly that window — the

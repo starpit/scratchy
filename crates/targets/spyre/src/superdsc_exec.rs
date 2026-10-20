@@ -5224,6 +5224,31 @@ impl Executor {
         Ok(self.seg_host[seg.get()][..got.min(self.seg_host[seg.get()].len())].to_vec())
     }
 
+    /// D2H an EXPLICIT byte window of a segment's device region (raw sen-fp16 bytes, NO
+    /// conversion) — the readback `read_seg` cannot express on the paged KV pool, which has NO
+    /// host shadow to clamp to, so whole-segment reads stop at the baked one-page placement
+    /// while the pool spans hundreds of pages. The transfer rides the session's own stream
+    /// (FIFO behind everything already submitted) and synchronizes, exactly as `read_seg` does.
+    /// Refuses — rather than reading elsewhere — when the window does not address the region.
+    pub fn read_seg_window(&mut self, seg: SegIdx, off: u64, len: u64) -> Result<Vec<u8>> {
+        let i = seg.get();
+        let addr = self.seg_addr[i]
+            .as_ref()
+            .ok_or_else(|| anyhow!("seg{i} has no region"))?;
+        let win = addr
+            .window(ByteOffset(off), ByteSize(len))
+            .ok_or_else(|| anyhow!("seg{i} window {off}..{} unaddressable", off + len))?;
+        let mut buf = vec![0u8; len as usize];
+        let stream = self.stream_ref()?;
+        stream
+            .d2h(&mut buf, &win)
+            .map_err(|e| anyhow!("seg{i} window D2H: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| anyhow!("seg{i} window D2H sync: {e}"))?;
+        Ok(buf)
+    }
+
     /// Overwrite the FIRST `data.len()` bytes of a tensor segment and H2D exactly that window.
     ///
     /// ⛔ WHY NOT [`Executor::write_seg`]: that one is a WHOLE-segment copy, and the thing this

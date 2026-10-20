@@ -1489,18 +1489,231 @@ impl Worker for SpyreWorker {
                 )?;
                 let logits = rows
                     .ok_or_else(|| werr("decode batch: the rung produced no logits".to_string()))?;
-                // ── KCACHE PROBE (SCRATCHY_KCACHE_PROBE), BATCHED STEP ── the batched counterpart of the
-                // solo `[kcache]` probe: after the fold's forward (cache write included), read back the
-                // layer-0 resident Kᵀ plane and print, per live request row, its launch slot, its pool
-                // row, its block table and the actual key columns its prefix mask marks valid — so "the
-                // keys under this request's mask are ANOTHER request's" is a fact the log states rather
-                // than a hypothesis. Same `read_tensor` readback the solo probe uses, through the OWNER
-                // decode session: every rung aliases its seg2 onto `sb.decode`'s pool region, so the
-                // owner's placement names the very pool this forward just wrote, and the owner is the one
-                // session whose seg2 host shadow spans a whole page on the paged path. `read_tensor`
-                // converts exactly the baked placement, which covers PHYSICAL PAGE 0 of the pool — pages
-                // past it are named in the output as unreadable rather than silently skipped, so a run
-                // states what it could not see. Costs one whole-segment D2H per step; env-gated off.
+                // ── KCACHE PROBE, BATCHED STEP (branch `kcache-probe-12b`: THROWAWAY, NEVER MERGED) ──
+                // the 12b/12c nondeterminism discriminator, replacing the vaporware comment this
+                // block used to be. After the fold's forward — cache write and Kᵀ re-transpose
+                // included, and with the logits already D2H'd and synchronized inside the forward,
+                // so the stream is drained and what follows reads the settled end-of-step state —
+                // D2H layer 0's resident Kᵀ AND natural-K planes of every physical page any live
+                // row's block table names, and print per live row its launch slot, its physical
+                // page ids, the history runs its mask marked valid, a per-(kv-head, 64-slot block)
+                // hash of both planes, and the decoded values at the shared write slot itself.
+                //
+                // WHY THOSE TWO PLANES: the cachewr writes natural K, the kctpost re-transposes it
+                // into Kᵀ, and the next step's score reads Kᵀ. Stale bytes at the write slot in
+                // BOTH planes ⇒ the cachewr never landed; fresh Knat under stale Kᵀ ⇒ the cachewr
+                // landed and the re-transpose did not; both fresh while the output still flipped ⇒
+                // the leak is the read side (the next step's gather or an intra-step ordering race
+                // the settled readback cannot see). That trichotomy is the whole point of the
+                // instrument.
+                //
+                // UNCONDITIONAL in this build — the no-env-toggle law holds even for probes — so
+                // this branch prints on every batched decode step and is never merged. Reads go
+                // through THIS rung's own seg2 descriptor (aliased onto the decode session's pool
+                // region at load, so it names the very bytes this forward just wrote), at offsets
+                // from the pool's own address law: page base `phys * kv_page_stride_bytes` (the
+                // same product `fold_plan::page_base_bytes` computes), plane base
+                // `kt_plane_base`/0, and LAYER 0, whose launch `kv_off` is zero by construction
+                // (the launch table's shift is each layer's delta off layer 0's own placement).
+                // Element positions inside a plane come from `PagedKvPool::addr` itself, so the
+                // probe holds no second opinion about the layout; the step line prints the
+                // pool-derived page stride beside the bake's own so a disagreement is a stated
+                // fact rather than silently hashed wrong bytes.
+                {
+                    use scratchy_subtile::sdsc_abstract::{
+                        FeatIdx, KvCoord, KvHead, KvPlane, KvSlot,
+                    };
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::Hasher;
+                    use std::num::NonZeroU32;
+
+                    let page_stride = sess.kv_page_stride_bytes();
+                    let plane_bytes = pool.plane_stride() as u64 * 2;
+                    let layer_bytes = pool.layer_stride() as u64 * 2;
+                    let implied_layers = page_stride as f64 / layer_bytes as f64;
+                    let stick = pool.stick_block_elems(); // elems in one 64-slot block
+                    let blocks_per_head = pool.plane_block_elems() / stick;
+                    let nkvh_nz = NonZeroU32::new(u32::try_from(pool.nkvh).unwrap_or(1))
+                        .unwrap_or(NonZeroU32::MIN);
+                    // The card's own index table, when this body gathers — what the next step's
+                    // gather will actually read, printed beside the host's page maps.
+                    let gather_line = match kv_blocks.as_deref() {
+                        Some(t) => t
+                            .iter()
+                            .map(|e| e.as_i32().to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        None => "none".to_string(),
+                    };
+                    eprint!(
+                        "{}",
+                        format_args!(
+                            "[kcache] step={} rung={} live={} write_slot={} gathers={} \
+                             page_stride={page_stride}B plane={plane_bytes}B layer={layer_bytes}B \
+                             implied_layers={implied_layers:.4} gather=[{gather_line}]\n",
+                            launch_pos,
+                            seqs.get(),
+                            slots.live(),
+                            write_slot.get(),
+                            gathers_kv.get(),
+                        )
+                    );
+                    // Gather one (plane, kv-head, stick-block) out of a plane's raw bytes by the
+                    // pool's own address law, then hash it. Slot-major order, `addr` per element —
+                    // the probe re-derives no stride.
+                    let slots_per_block = stick / pool.hd;
+                    let mut cell = Vec::with_capacity(stick * 2);
+                    let mut block_hash =
+                        |bytes: &[u8], plane: KvPlane, kvh: KvHead, block: usize| -> String {
+                            let mut hasher = DefaultHasher::new();
+                            let base = block * slots_per_block;
+                            for s in base..(base + slots_per_block) {
+                                for f in 0..pool.hd {
+                                    let c = KvCoord {
+                                        plane,
+                                        kvh,
+                                        slot: KvSlot::new(s as u32),
+                                        feat: FeatIdx::new(f as u32),
+                                    };
+                                    let off = pool.addr(c) as usize * 2;
+                                    cell.extend_from_slice(&bytes[off..off + 2]);
+                                }
+                            }
+                            hasher.write(&cell);
+                            cell.clear();
+                            format!("{:016x}", hasher.finish())
+                        };
+                    // One (plane, head, feat) column at an absolute slot — the write-slot readout.
+                    // Returns sen bytes converted to f32 (head-major: [head][feat]).
+                    let mut column_f32 = |bytes: &[u8], plane: KvPlane, slot: u32| -> Vec<f32> {
+                        let mut raw = Vec::with_capacity(pool.nkvh * pool.hd * 2);
+                        for h in 0..pool.nkvh {
+                            let kvh = KvHead::new(h as u32, nkvh_nz).unwrap_or(KvHead::default());
+                            for f in 0..pool.hd {
+                                let c = KvCoord {
+                                    plane,
+                                    kvh,
+                                    slot: KvSlot::new(slot % PagedKvPool::PAGE_SLOTS as u32),
+                                    feat: FeatIdx::new(f as u32),
+                                };
+                                let off = pool.addr(c) as usize * 2;
+                                raw.extend_from_slice(&bytes[off..off + 2]);
+                            }
+                        }
+                        let mut ieee = vec![0u8; raw.len()];
+                        scratchy_target_spyre::sen_convert::sen_to_ieee_bytes(&raw, &mut ieee);
+                        ieee.chunks_exact(2)
+                            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                            .collect()
+                    };
+                    // Per live row: the addressing facts (slot, pages, mask-valid history) and the
+                    // write slot's own bytes, hashed over every head and spelled out for head 0.
+                    let mut done_pages: Vec<i64> = Vec::new();
+                    for (di, (id, start)) in decode_ids.iter().enumerate() {
+                        let slot = slots.slot_of(di).map(|s| s.index()).ok_or_else(|| {
+                            werr(format!(
+                                "kcache: request {id} has no launch slot at step {launch_pos}"
+                            ))
+                        })?;
+                        let map = page_maps.get(slot).map(|m| m.as_slice()).unwrap_or(&[]);
+                        let hist = requests
+                            .get(id)
+                            .map(|r| {
+                                r.kv_hist
+                                    .runs()
+                                    .iter()
+                                    .map(|run| {
+                                        format!("{}..{}", run.start().get(), run.end().get())
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let wslot_page = map
+                            .get((write_slot.get() as usize) / PagedKvPool::PAGE_SLOTS)
+                            .copied()
+                            .unwrap_or(-1);
+                        eprint!(
+                            "{}",
+                            format_args!(
+                                "[kcache] row di={di} slot={slot} id={id} start={start} \
+                                 pages={map:?} hist=[{hist}] wslot_page={wslot_page}\n"
+                            )
+                        );
+                        // The write slot's own Kᵀ and natural-K columns, on the page the row's map
+                        // assigns the slot to — the one cell the next step's score reads.
+                        let kv_seg = scratchy_target_spyre::superdsc_exec::SEG_KV.get() as i64;
+                        let wbase = (wslot_page as u64).wrapping_mul(page_stride);
+                        for (kind, plane, plane_off) in [
+                            ("kt", KvPlane::Kt, pool.kt_plane_base() as u64 * 2),
+                            ("kn", KvPlane::Knat, 0u64),
+                        ] {
+                            let bytes = sess
+                                .read_seg_window(kv_seg, wbase + plane_off, plane_bytes)
+                                .map_err(|e| {
+                                    werr(format!(
+                                        "kcache: write-slot {kind} read p{wslot_page} off {} \
+                                         len {plane_bytes}: {e}",
+                                        wbase + plane_off
+                                    ))
+                                })?;
+                            let vals = column_f32(&bytes, plane, write_slot.get());
+                            let head0: Vec<String> = vals[..pool.hd.min(8)]
+                                .iter()
+                                .map(|v| format!("{v:.4}"))
+                                .collect();
+                            let mut hasher = DefaultHasher::new();
+                            for v in &vals {
+                                hasher.write_u64(v.to_bits());
+                            }
+                            eprint!(
+                                "{}",
+                                format_args!(
+                                    "[kcache] wslot {kind} p{wslot_page} col={} \
+                                     all_heads={:016x} head0=[{}]\n",
+                                    write_slot.get() % PagedKvPool::PAGE_SLOTS as u32,
+                                    hasher.finish(),
+                                    head0.join(","),
+                                )
+                            );
+                        }
+                        // Every DISTINCT physical page this row's table names: both planes,
+                        // per-(head, block) hashes. Deduped across rows — padding slots replicate
+                        // live 0's map and the pool cell is shared, so the same page twice is the
+                        // same bytes twice.
+                        for &phys in map {
+                            if phys < 0 || done_pages.contains(&phys) {
+                                continue;
+                            }
+                            done_pages.push(phys);
+                            let base = (phys as u64).wrapping_mul(page_stride);
+                            for (kind, plane, plane_off) in [
+                                ("kt", KvPlane::Kt, pool.kt_plane_base() as u64 * 2),
+                                ("kn", KvPlane::Knat, 0u64),
+                            ] {
+                                let bytes = sess
+                                    .read_seg_window(kv_seg, base + plane_off, plane_bytes)
+                                    .map_err(|e| {
+                                        werr(format!(
+                                            "kcache: {kind} read p{phys} off {} len \
+                                             {plane_bytes}: {e}",
+                                            base + plane_off
+                                        ))
+                                    })?;
+                                let mut hashes = String::new();
+                                for h in 0..pool.nkvh {
+                                    let kvh =
+                                        KvHead::new(h as u32, nkvh_nz).unwrap_or(KvHead::default());
+                                    for b in 0..blocks_per_head {
+                                        hashes.push_str(&block_hash(&bytes, plane, kvh, b));
+                                        hashes.push(' ');
+                                    }
+                                }
+                                eprint!("{}", format_args!("[kcache] {kind} p{phys} {hashes}\n"));
+                            }
+                        }
+                    }
+                }
                 let vocab = model.vocab;
                 // A REQUEST'S LOGITS COME BACK IN THE SLOT THE LAUNCH PUT IT IN. Ask the same `SlotMap`
                 // that bound the page maps rather than recomputing the position here — one value decides
