@@ -3,134 +3,180 @@
 
 torch-spyre's `batched_decode_head_major` algorithm (`spyre_inference/v1/
 attention/ops/batched_decode_head_major.py`), stated in Triton over the access
-forms this ladder lowers: descriptor windows and index-table page gathers.
+forms this ladder lowers: descriptor windows and index-table block gathers.
 NO masked pointer loads anywhere.
 
 The contract (the module doc of `attn.py` states the shared laws; this file
 follows them):
 
   * ONE program, grid `[1, 1]` — every sequence in one kernel. All descriptor
-    corners are compile-time constants (the chunk loop is `tl.static_range`,
-    unrolled), so nothing materializes per grid position.
-  * PAGES are gathered WHOLE: one K gather + one V gather per chunk, the index
-    vector `[ENTRIES]` loaded from the memory-resident id table (ids are never
-    computed in-register). ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK = 32 — ONE
-    whole `SenUint32` stick, one entry per core, stick-aligned by
-    construction.
+    corners are compile-time constants (the chunk and window loops are
+    `tl.static_range`, unrolled), so nothing materializes per grid position.
+  * THE POOL IS GATHERED ONE STICK BLOCK PER INDEX ENTRY. A block is the
+    pool's own unit — `HD * 64` elements: the K^T block `[HD, 64]` (64 slots,
+    every feature) and the V block `[64, HD]` (64 slots, every feature). The
+    index values are the host's `GatherEntry` bytes — page-relative stick-block
+    numbers composed on the host through the pool's ONE door — so this kernel
+    never spells a page stride, a block-in-page offset, or a layer term: the
+    descriptor's base is the plane's own placement, and every (page, kv head,
+    window) fact rides the index VALUE the host staged.
+  * ONE WINDOW PER TRIP: the walk is a chunk loop over a window loop, and
+    each (chunk, window) trip gathers its OWN id stick of `ENTRIES*NKVH`
+    block-ids, dots it against q at the batch the pool's own rows state, and
+    folds the trip into the running softmax IMMEDIATELY — the online merge is
+    associative, so a window needs no state axis of its own and no spray of q
+    over one. Every operand of every dot is then a load or a gather result at
+    its natural shape: no permute, no relayout, no broadcast anywhere in the
+    kernel.
   * Entry order is torch's own: entry `j*B + s` is block slot `j` of sequence
     `s`, so a sequence's J chunk-slots keep SEPARATE running softmax state and
     merge once at the end (`_entry_local_update` / `_merge_entry_local`).
-  * The two dots carry their batch dims explicitly: operands are rank-3
-    `[batch, M, K]` x `[batch, K, N]` with batch = ENTRIES*NKVH — the KV heads
-    and the GQA group ride the dot's batch and M axes, never new descriptors.
   * The scale rides log2(e) as an immediate multiply on the dot's result, so
     the softmax is `exp2` end to end (the flash fixtures' own law).
   * The mask is staged at the SCORE TILE'S OWN ROWS — pre-replicated xGQA on
-    the host (attn.py's own law) — so the add is a pure flat reshape and an
-    elementwise add. No in-kernel broadcast.
+    the host (attn.py's own law), one row per (entry, kv head, gqa) group of
+    64 lanes per window trip — so the add is a pure flat reshape and an
+    elementwise add. No broadcast.
 
 Staged by the host, per step:
 
-  * `desc_q`    — Q PRE-REPEATED in entry order (torch's `rep_row_ids`
-                  `index_select`): rows `(j*B + s)*NKVH*GQA + kvh*GQA + g`.
-  * `desc_kt`   — K TRANSPOSED units, row = one WHOLE page for ALL KV heads:
-                  `[PAGES_TOTAL, NKVH*HD*PAGE_SLOTS]`, each page's content
-                  row-major `[NKVH, HD, PAGE_SLOTS]` (K^T per head).
-  * `desc_v`    — V units, row = one whole page: content row-major
-                  `[NKVH, PAGE_SLOTS, HD]`.
-  * `desc_ids`  — the page-id table, `[NUM_CHUNKS*ENTRIES]` i32, chunk-major.
-                  Pad ids name a WRITTEN page and are masked (never read
-                  unwritten bytes).
-  * `desc_mask` — additive fp16 mask `[NUM_CHUNKS*ENTRIES*NKVH*GQA,
-                  PAGE_SLOTS]`, pre-replicated xGQA to the score tile's own
-                  rows: 0 where the slot is valid, -65504 where it is past
-                  the sequence's length or a padded page. The finite sentinel
-                  is torch's own clamp trick: a slot masked in every chunk
-                  still merges with weight exp2(-65504 - m) == 0, never NaN.
-  * `desc_o`    — output, head-major `[NUM_SEQS*NQH, HD]`.
+  * `desc_q`       — Q PRE-REPEATED in entry order (torch's `rep_row_ids`
+                     `index_select`): rows `(j*B + s)*NKVH*GQA + kvh*GQA + g`.
+  * `desc_kt`      — the resident K^T plane; this kernel reads it as
+                     `[PAGES*NKVH*W4, HD*64]` — one stick block a row.
+  * `desc_v`       — the resident V plane; read as `[PAGES*NKVH*W4, 64*HD]`.
+  * `desc_ids_kt`  — the K^T plane's block-entry table, `[NUM_CHUNKS *
+                     W4*ENTRIES*NKVH]` i32, chunk-major, window-major within
+                     a chunk, entry-major within a window (entry, then kv
+                     head). Every value is a `GatherEntry` the host minted for
+                     the K^T plane's own block numbering. Pad entries name a
+                     WRITTEN block and are masked (never read unwritten
+                     bytes).
+  * `desc_ids_v`   — the V plane's own block-entry table, same shape and
+                     order, the V plane's own block numbering.
+  * `desc_mask`    — additive fp16 mask `[NUM_CHUNKS * W4*ENTRIES*NKVH*GQA,
+                     64]`, pre-replicated xGQA to the score tile's own rows
+                     in the trip's own (entry, kv head, gqa) order: 0 where
+                     the slot is valid, -65504 where it is past the sequence's
+                     length or a padded window. The finite sentinel is torch's
+                     own clamp trick: a slot masked in every chunk still
+                     merges with weight exp2(-65504 - m) == 0, never NaN.
+  * `desc_o`       — output, head-major `[NUM_SEQS*NQH, HD]`.
 """
 
 
 @triton.jit
 def batched_decode_hm(desc_q, desc_o,  #
-                      desc_kt, desc_v, desc_ids, desc_mask,  #
+                      desc_kt, desc_v, desc_ids_kt, desc_ids_v, desc_mask,  #
                       NUM_SEQS: tl.constexpr, NKVH: tl.constexpr,  #
                       GQA: tl.constexpr, HD: tl.constexpr,  #
                       PAGE_SLOTS: tl.constexpr, PAGES: tl.constexpr,  #
                       BLOCKS_PER_CHUNK: tl.constexpr,  #
                       NUM_CHUNKS: tl.constexpr, SCALE: tl.constexpr):
-    """One decode step for every sequence: chunked whole-page gathers, an
-    online softmax carried per entry-slot, one merge, one store."""
+    """One decode step for every sequence: per-(chunk, window) block gathers
+    through the pool's own index unit, an online softmax folded per trip, one
+    J-slot merge, one store."""
     # torch's chunking law at this batch: blocks_per_chunk = 32 // num_seqs,
-    # so the chunk's entries fill the 32-entry index stick exactly.
+    # so the chunk's entry slots fill the 32-entry stick exactly.
     ENTRIES: tl.constexpr = NUM_SEQS * BLOCKS_PER_CHUNK
     BATCH: tl.constexpr = ENTRIES * NKVH
+    # 64-slot windows per kv head's page — the pool's own stick geometry.
+    W4: tl.constexpr = PAGE_SLOTS // 64
     LOG2E: tl.constexpr = 1.44269504
 
+    # ⛔ THE V BLOCK IS ONE CONTIGUOUS STICK BLOCK ONLY AT HD == 64. The V
+    # plane lays a head out slab-major in 64-feature sticks, so a wider head's
+    # [64, HD] window is several runs apart and the V side must gather per
+    # (window, slab) — a form this kernel does not state yet. Refused HERE,
+    # loudly, by the kernel's own contract — never silently misaddressed.
+    tl.static_assert(HD == 64, "batched_decode_hm: the V plane's [64, HD] block is one contiguous stick block only at HD 64; a wider head needs the per-(window, slab) V gather this kernel does not state yet")
+    tl.static_assert(PAGE_SLOTS % 64 == 0, "batched_decode_hm: a page must be a whole number of 64-slot windows")
+
     # Q, pre-repeated in entry order by the host: [BATCH, GQA, HD] as one
-    # window at base.
+    # window at base — the dot's own A operand, at its natural shape.
     q_desc = tl.make_tensor_descriptor(desc_q, shape=[BATCH * GQA, HD],
                                        strides=[HD, 1],
                                        block_shape=[BATCH * GQA, HD])
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[NUM_SEQS * NKVH * GQA, HD],
                                        strides=[HD, 1],
                                        block_shape=[NUM_SEQS * NKVH * GQA, HD])
-    # The whole-page K^T and V units: ONE row per page, the row the gather's
-    # index names. Block [1, C] is the "gather, don't tile" form.
-    kt_desc = tl.make_tensor_descriptor(
-        desc_kt, shape=[PAGES, NKVH * HD * PAGE_SLOTS],
-        strides=[NKVH * HD * PAGE_SLOTS, 1],
-        block_shape=[1, NKVH * HD * PAGE_SLOTS])
-    v_desc = tl.make_tensor_descriptor(
-        desc_v, shape=[PAGES, NKVH * PAGE_SLOTS * HD],
-        strides=[NKVH * PAGE_SLOTS * HD, 1],
-        block_shape=[1, NKVH * PAGE_SLOTS * HD])
-    # The memory-resident page-id table and the pre-replicated additive mask,
-    # both chunk-major.
-    ids_desc = tl.make_tensor_descriptor(
-        desc_ids, shape=[NUM_CHUNKS * ENTRIES], strides=[1],
-        block_shape=[ENTRIES])
+    # The pool planes at BLOCK granularity: ONE row = ONE stick block
+    # (`HD * 64` elements), the row an index entry names. The row count is the
+    # plane's own block space (every page of the baked extent, every head,
+    # every window); the runtime re-bases the plane per launch, and the pool
+    # a value can reach is bounded where the value is BORN (the host's
+    # GatherEntry door), never re-derived here.
+    kt_blk_desc = tl.make_tensor_descriptor(
+        desc_kt, shape=[PAGES * NKVH * W4, HD * 64],
+        strides=[HD * 64, 1], block_shape=[1, HD * 64])
+    v_blk_desc = tl.make_tensor_descriptor(
+        desc_v, shape=[PAGES * NKVH * W4, 64 * HD],
+        strides=[64 * HD, 1], block_shape=[1, 64 * HD])
+    # The memory-resident block-entry tables (the host's GatherEntry bytes),
+    # one whole stick of ids per (chunk, window) trip, and the
+    # pre-replicated additive mask at the score tile's own rows.
+    KTB: tl.constexpr = ENTRIES * NKVH
+    kt_ids_desc = tl.make_tensor_descriptor(
+        desc_ids_kt, shape=[NUM_CHUNKS * W4 * KTB], strides=[1],
+        block_shape=[KTB])
+    v_ids_desc = tl.make_tensor_descriptor(
+        desc_ids_v, shape=[NUM_CHUNKS * W4 * KTB], strides=[1],
+        block_shape=[KTB])
     mask_desc = tl.make_tensor_descriptor(
-        desc_mask, shape=[NUM_CHUNKS * BATCH * GQA, PAGE_SLOTS],
-        strides=[PAGE_SLOTS, 1], block_shape=[BATCH * GQA, PAGE_SLOTS])
+        desc_mask, shape=[NUM_CHUNKS * W4 * BATCH * GQA, 64],
+        strides=[64, 1], block_shape=[BATCH * GQA, 64])
 
-    # The running softmax, per entry-slot: torch's `_entry_local_update` carry.
+    # The running softmax, per (entry-slot, kv head, gqa): torch's
+    # `_entry_local_update` carry, folded once per (chunk, window) trip.
     q = tl.reshape(q_desc.load([0, 0]), [BATCH, GQA, HD])
     m = tl.full([BATCH, GQA], -65504.0, tl.float32)
     l = tl.zeros([BATCH, GQA], tl.float16)
     acc = tl.zeros([BATCH, GQA, HD], tl.float16)
 
     for c in tl.static_range(NUM_CHUNKS):
-        ids = ids_desc.load([c * ENTRIES])                      # [ENTRIES] i32
-        # ONE K gather + ONE V gather per chunk, whole pages, one stick.
-        kt = tl.reshape(kt_desc.gather(ids, 0), [BATCH, HD, PAGE_SLOTS])
-        v = tl.reshape(v_desc.gather(ids, 0), [BATCH, PAGE_SLOTS, HD])
-        # The score dot, heads and GQA as the batch and M axes.
-        qk = tl.dot(q, kt, out_dtype=tl.float16)                # [BATCH, GQA, PS]
-        qk = qk * (SCALE * LOG2E)
-        # The mask, staged at the score tile's own rows: a pure flat reshape,
-        # an elementwise add. No broadcast.
-        qk = qk + tl.reshape(mask_desc.load([c * BATCH * GQA, 0]),
-                             [BATCH, GQA, PAGE_SLOTS])
-        # The online update: running max, rescaled sum, rescaled accumulator.
-        m_new = tl.maximum(m, tl.max(qk, 2))                    # [BATCH, GQA] f32
-        rescale = tl.math.exp2(m - m_new).to(tl.float16)        # [BATCH, GQA]
-        p = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
-        l = l * rescale + tl.sum(p, 2)
-        acc = acc * rescale[:, :, None] + tl.dot(p, v, out_dtype=tl.float16)
-        m = m_new
+        for w in tl.static_range(W4):
+            # The block gathers: one stick block per index entry, both
+            # planes, this trip's own id stick, the ids loaded from the
+            # memory-resident tables (never computed in-register).
+            kt_ids = kt_ids_desc.load([(c * W4 + w) * KTB])  # [KTB] i32
+            v_ids = v_ids_desc.load([(c * W4 + w) * KTB])    # [KTB] i32
+            kt_blk = tl.reshape(kt_blk_desc.gather(kt_ids, 0),
+                                [BATCH, HD, 64])
+            v_blk = tl.reshape(v_blk_desc.gather(v_ids, 0),
+                               [BATCH, 64, HD])
+            # The score dot at the pool's own rows: q natural on the A side,
+            # the gathered blocks on the B side, GQA the dot's M axis —
+            # never a new descriptor, never a permute, never a spray.
+            qk = tl.dot(q, kt_blk, out_dtype=tl.float16)     # [B, GQA, 64]
+            qk = qk * (SCALE * LOG2E)
+            # The mask, staged at the score tile's own rows: a pure flat
+            # reshape, an elementwise add. No broadcast.
+            qk = qk + tl.reshape(
+                mask_desc.load([(c * W4 + w) * BATCH * GQA, 0]),
+                [BATCH, GQA, 64])
+            # The online update, folded per trip: running max over the 64
+            # score lanes (a LAST-axis reduction), rescaled sum, rescaled
+            # accumulator — the max spray over the lanes is a per-row scalar,
+            # the one broadcast mode a pointwise kernel states natively.
+            m_new = tl.maximum(m, tl.max(qk, 2))             # [B, GQA] f32
+            rescale = tl.math.exp2(m - m_new).to(tl.float16)
+            p = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
+            l = l * rescale + tl.sum(p, 2)
+            pv = tl.dot(p, v_blk, out_dtype=tl.float16)      # [B, GQA, HD]
+            acc = acc * rescale[:, :, None] + pv
+            m = m_new
 
     # The slot merge, torch's `_merge_entry_local`: entry order is j*B + s, so
-    # the batch axis reshapes [J, B*NKVH] and the J slots of one sequence merge
-    # against their common maximum, then normalize once. The merged max's
-    # spray along the leading J axis is a stride-0 leading-axis broadcast the
-    # door reads as a broadcast operand mode.
+    # the state reshapes [J, B*NKVH] and the J slots of one sequence merge
+    # against their common maximum, then normalize once. The merged maximum's
+    # spray along the leading J axis is the row-split broadcast the door
+    # admits (`[J, B*NKVH, GQA]`, the source's own rows as the merged axis).
     mm = tl.reshape(m, [BLOCKS_PER_CHUNK, NUM_SEQS * NKVH, GQA])
     lm = tl.reshape(l, [BLOCKS_PER_CHUNK, NUM_SEQS * NKVH, GQA])
     am = tl.reshape(acc, [BLOCKS_PER_CHUNK, NUM_SEQS * NKVH, GQA, HD])
-    merged = tl.max(mm, 0)                                      # [B*NKVH, GQA]
-    w = tl.math.exp2(mm - tl.reshape(merged, [1, NUM_SEQS * NKVH, GQA])).to(tl.float16)
+    merged = tl.max(mm, 0)                                  # [B*NKVH, GQA]
+    w = tl.math.exp2(mm - merged[None, :, :]).to(tl.float16)
     l = tl.sum(w * lm, 0)
-    acc = tl.sum(w[:, :, :, None] * am, 0)                      # [B*NKVH, GQA, HD]
+    acc = tl.sum(w[:, :, :, None] * am, 0)                  # [B*NKVH, GQA, HD]
     o = acc / l[:, :, None]
     o_desc.store([0, 0], tl.reshape(o, [NUM_SEQS * NKVH * GQA, HD]))

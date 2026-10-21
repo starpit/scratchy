@@ -1387,10 +1387,12 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 node.output.tensor.index()
             ));
         }
-        // THE ID TABLE IS ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK` must fill
-        // the SenUint32 stick exactly (the kernel's own contract — one entry per core), so
-        // the chunk depth is the stick divided by the batch, and a batch that does not
-        // divide it has no form under this kernel.
+        // THE CHUNK'S ENTRY SLOTS FILL ONE WHOLE STICK: `ENTRIES = NUM_SEQS * BLOCKS_PER_CHUNK`
+        // must fill the SenUint32 stick exactly (torch's own chunking law — one entry slot per
+        // core), so the chunk depth is the stick divided by the batch, and a batch that does
+        // not divide it has no form under this kernel. The BLOCK-ENTRY tables the gathers
+        // read are wider (`ENTRIES * NKVH * windows` a chunk); the stick law governs the
+        // CHUNKING, which is what feeds the softmax merge shape.
         let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
         if !entries.is_multiple_of(num_seqs) {
             return Err(format!(
@@ -1438,7 +1440,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         // THE PAGES THE CHUNK ATTENDS: the prefix segment's rows plus the new block's —
         // the graph's own regions, the same reading the old attn.py splice took — padded
         // to whole pages. The kernel's own static_assert carries the rest of the contract
-        // (one full id stick per page: `NKVH*GQA == 32`).
+        // (one full id stick per page-window trip: `NKVH*GQA == 32`).
         let prefix_len = node.inputs[1].region.rows.len;
         let new_len = node.inputs[3].region.rows.len;
         let pages = (prefix_len + new_len).div_ceil(page_slots);
@@ -1542,12 +1544,17 @@ fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
     } = *f;
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
+    // THE BLOCK-ENTRY CONTRACT: the decode kernel gathers the pool ONE STICK BLOCK per
+    // index entry, through TWO tables — each plane's own block numbering — whose values
+    // are the host's `GatherEntry` bytes. No page stride or block offset is a constexpr
+    // here: those live in the values, composed at the pool's one door on the host.
     for (p, ty) in [
         ("desc_q", "*fp16"),
         ("desc_o", "*fp16"),
         ("desc_kt", "*fp16"),
         ("desc_v", "*fp16"),
-        ("desc_ids", "*i32"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
         ("desc_mask", "*fp16"),
     ] {
         signature.insert(
@@ -1591,14 +1598,17 @@ struct BatchedPrefillFacts {
 }
 
 /// THE BATCHED PREFILL KERNEL'S LAUNCH CONTRACT — the same parameter order as the decode
-/// kernel's (`batched_prefill_hm`: q, out, the two pool planes, the id table, the mask),
-/// plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool walk
-/// (`PAGES`, `PAGE_SLOTS`), and the scale.
+/// kernel's (`batched_prefill_hm`: q, out, the two pool planes, the TWO block-entry tables,
+/// the mask), plus every extent as a constexpr: the geometry (`MQ/NKVH/GQA/HD`), the pool
+/// walk (`PAGES`, `PAGE_SLOTS`), and the scale.
 ///
-/// The ids table is `*i32` and the mask always consumed, under the same laws as the decode
-/// spec — the two kernels share the pool, the id-stick and the mask staging contracts. The
-/// kernel's own `static_assert` carries the one-stick-per-page law (`NKVH*GQA == 32`), so a
-/// model class the form does not cover refuses at compile, in the kernel's own terms.
+/// THE BLOCK-ENTRY CONTRACT, under the same laws as the decode spec: the kernel gathers the
+/// pool ONE STICK BLOCK per index entry, through TWO tables — each plane's own block
+/// numbering — whose values are the host's `GatherEntry` bytes. No page stride or block
+/// offset is a constexpr here: those live in the values, composed at the pool's one door on
+/// the host. The ids table is `*i32` and the mask always consumed. The kernel's own
+/// `static_assert` carries the one-stick-per-trip law (`NKVH*GQA == 32`), so
+/// a model class the form does not cover refuses at compile, in the kernel's own terms.
 fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
     let BatchedPrefillFacts {
         mq,
@@ -1616,7 +1626,8 @@ fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
         ("desc_o", "*fp16"),
         ("desc_kt", "*fp16"),
         ("desc_v", "*fp16"),
-        ("desc_ids", "*i32"),
+        ("desc_ids_kt", "*i32"),
+        ("desc_ids_v", "*i32"),
         ("desc_mask", "*fp16"),
     ] {
         signature.insert(
@@ -1646,12 +1657,12 @@ fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
 /// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
-/// pool planes, the id table, the mask), the pool planes bound to the node's OWN cache-tensor
-/// pair (the sealed `KvCacheLayout` witness — the same tensors the producing `RopeAppend`
-/// writes), the id table and the mask as host-staged step inputs past the graph (numbered
-/// through the one shared `step_input_tid` law and STATED on the node, so the producer's
-/// placement pass places exactly those tids and the runtime discovers them by placement), and
-/// the builder's `attn_s{id}` name.
+/// pool planes, the two block-entry tables, the mask), the pool planes bound to the node's
+/// OWN cache-tensor pair (the sealed `KvCacheLayout` witness — the same tensors the producing
+/// `RopeAppend` writes), the two block-entry tables and the mask as host-staged step inputs
+/// past the graph (numbered through the one shared `step_input_tid` law and STATED on the
+/// node, so the producer's placement pass places exactly those tids and the runtime
+/// discovers them by placement), and the builder's `attn_s{id}` name.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1677,19 +1688,24 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     mod attn_step_slots {
         /// The additive validity mask at the score tile's own rows.
         pub const MASK: u32 = 0;
-        /// The paged-pool page-id table the whole-row gathers read.
-        pub const PAGE_IDS: u32 = 1;
+        /// The Kᵀ plane's block-entry table — one `GatherEntry` per stick block the
+        /// score gather reads, in the Kᵀ plane's own block numbering.
+        pub const KT_BLOCK_IDS: u32 = 1;
+        /// The V plane's block-entry table — the V plane's own block numbering.
+        pub const V_BLOCK_IDS: u32 = 2;
     }
     let n_tensors = ir.tensors.len() as u32;
     let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
     let mask_tid = law(attn_step_slots::MASK);
-    let ids_tid = law(attn_step_slots::PAGE_IDS);
+    let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
+    let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
     let bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
         BufferId::new(layout.cache_tensor().index() as u32),
         BufferId::new(layout.v_cache_tensor().index() as u32),
-        ids_tid,
+        kt_ids_tid,
+        v_ids_tid,
         mask_tid,
     ];
     let name = Arena::global().str(format!("attn_s{}", node.id.index()));
@@ -1710,8 +1726,12 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         mask: Some(mask_tid),
         step_inputs: vec![
             ktir_superdsc::ktir_node::StepInput {
-                buffer: ids_tid,
-                slot: attn_step_slots::PAGE_IDS,
+                buffer: kt_ids_tid,
+                slot: attn_step_slots::KT_BLOCK_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: v_ids_tid,
+                slot: attn_step_slots::V_BLOCK_IDS,
             },
             ktir_superdsc::ktir_node::StepInput {
                 buffer: mask_tid,
