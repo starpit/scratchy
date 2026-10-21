@@ -6388,7 +6388,7 @@ mod elementwise_tests {
     #[test]
     fn an_mb_source_at_a_whole_stick_column_corner_moves_the_operands_address() {
         let rows = 32u32;
-        let mut layout = BundleLayout::default();
+        let layout = BundleLayout::default();
         layout.synth(PlaceId::Act(5), &[rows, 64]);
         layout.synth(PlaceId::Act(6), &[1, 256]);
         layout.synth(PlaceId::Act(7), &[rows, 64]);
