@@ -563,6 +563,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // kernel's parameter list places its tables whole, so there is no slice/pool split to
         // state and the gather door bounds every run by the placement itself.
         gather_reach: Default::default(),
+        // No host-staged step inputs: this layout serves ONE kernel minted through `node_for`,
+        // which is positional and states none. A node that states per-step inputs is placed by
+        // the consumer ladder's producer (`place_step_inputs`), whose layout this is not.
+        step_inputs: Default::default(),
     })
 }
 
@@ -1037,6 +1041,7 @@ mod tests {
                 BufferId::new(404),
             ],
             mask: None,
+            step_inputs: Vec::new(),
             node_out_tid: None,
             minted: Default::default(),
         };

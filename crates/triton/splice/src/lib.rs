@@ -1648,9 +1648,10 @@ fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
 /// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
 /// pool planes, the id table, the mask), the pool planes bound to the node's OWN cache-tensor
 /// pair (the sealed `KvCacheLayout` witness — the same tensors the producing `RopeAppend`
-/// writes), the id table and the mask as bound synthetic tensors beyond the graph (the
-/// builder's own `graph.tensors.len()` law for the mask; the ids table one past it), and the
-/// builder's `attn_s{id}` name.
+/// writes), the id table and the mask as host-staged step inputs past the graph (numbered
+/// through the one shared `step_input_tid` law and STATED on the node, so the producer's
+/// placement pass places exactly those tids and the runtime discovers them by placement), and
+/// the builder's `attn_s{id}` name.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
@@ -1667,11 +1668,22 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // wrong tensor.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    // ⭐ THE SYNTHETIC BINDING SLOTS — tensors BEYOND the graph, numbered past the builder's
-    // own mask law (`graph.tensors.len()`): the host stages both per step, no graph tensor
-    // names them, and the door sizes the ids buffer `SenUint32` by its own gather law.
-    let mask_tid = BufferId::new(ir.tensors.len() as u32);
-    let ids_tid = BufferId::new(ir.tensors.len() as u32 + 1);
+    // ⭐ THE SYNTHETIC BINDING SLOTS — the two host-staged inputs past the graph's own tensors,
+    // numbered through the ONE shared law (`step_input_tid`) so the producer's placement pass
+    // places exactly these tids and refuses any disagreement. The slot table is THIS crate's own
+    // (the splice is the layer that knows which staging law each slot names; the ladder sees only
+    // the numbering). Slot 0 keeps the mask on the tid the wiring's own one-past-the-graph law
+    // already assigns it, so nothing pre-existing moves.
+    mod attn_step_slots {
+        /// The additive validity mask at the score tile's own rows.
+        pub const MASK: u32 = 0;
+        /// The paged-pool page-id table the whole-row gathers read.
+        pub const PAGE_IDS: u32 = 1;
+    }
+    let n_tensors = ir.tensors.len() as u32;
+    let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
+    let mask_tid = law(attn_step_slots::MASK);
+    let ids_tid = law(attn_step_slots::PAGE_IDS);
     let bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
@@ -1696,6 +1708,16 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: Some(mask_tid),
+        step_inputs: vec![
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: ids_tid,
+                slot: attn_step_slots::PAGE_IDS,
+            },
+            ktir_superdsc::ktir_node::StepInput {
+                buffer: mask_tid,
+                slot: attn_step_slots::MASK,
+            },
+        ],
         node_out_tid: None,
         minted: Default::default(),
     })
@@ -2616,6 +2638,7 @@ fn mint<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     })

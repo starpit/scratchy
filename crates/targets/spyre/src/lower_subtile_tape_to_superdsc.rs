@@ -58,7 +58,7 @@ pub use scratchy_spyre_bundle as bundle;
 // path after the SubtileIR → KTIR construction moved to its own file.
 pub use crate::lower_subtile_tape_to_ktir::{
     BundleWiring, NodeArgs, graph_wiring, lower_graph_to_ktir, lower_graph_to_superdsc,
-    lower_subtile_tape_to_ktir,
+    lower_subtile_tape_to_ktir, place_step_inputs,
 };
 // ⭐⭐⭐ THE REQUEST TYPE LIVES IN `ktir_superdsc::ktir_node` — `KtirNode` and the decode ladder rung
 // `ActiveCap`. Not a device fact and not the caller's own plan: what a KTIR producer hands in.
@@ -2012,6 +2012,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // ONE source of truth for all three. Empty for a tape with no rope/attention nodes.
         rope_class_hds,
         attn_class_hds,
+        // ⭐ THE HOST-STAGED STEP INPUTS — empty here (the layout walk places graph tensors and
+        // pools only); `place_step_inputs` fills it after the splices state their bindings.
+        step_inputs: std::collections::BTreeMap::new(),
     })
 }
 
@@ -6035,6 +6038,12 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // it — the slot map is this layout's, gone when the bake returns.
         lx,
         kv_request_stride_bytes,
+        // EMIT-ONLY FOR NOW: the host-staged step-input map is the placement pass's own record of
+        // WHICH tids are per-step inputs and the SLOT each took — the discovery table the runtime's
+        // fill half will stage through (never `tensors.len()+k`). The fill half bakes it beside its
+        // staging law (the `weight_copies`/`scalarmul_scales` channel); until that lands there is no
+        // runtime reader, and the PLACEMENTS the map's tids carry above are already baked.
+        step_inputs: _,
         // EMIT-ONLY: the gather reach is the gather door's compile-time bound — the pool a pooled
         // table's entry run is refused past at build. The runtime's own pool budget and the host's
         // `GatherEntry` composition are the value-side authorities; the baked artifact carries the
@@ -9360,6 +9369,7 @@ mod tests {
             program: Program::Elementwise(Elementwise::Mul),
             bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
             mask: None,
+            step_inputs: Vec::new(),
             node_out_tid: None,
             minted: Default::default(),
         }

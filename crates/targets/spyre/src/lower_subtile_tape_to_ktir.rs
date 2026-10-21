@@ -1156,6 +1156,10 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
 ) -> Result<(Vec<EmittedOp>, BundleLayout), SuperDscError> {
     let (programs, mut bundle_layout) =
         lower_graph_to_ktir(ir, weight_ids, active_cap, rows_are_requests)?;
+    // ⭐⭐⭐ THE PER-STEP INPUT PLACEMENTS, before the door pass below can ask for them — the
+    // re-rolled walk places them ahead of its declare pass for the same reason (see
+    // [`place_step_inputs`]).
+    place_step_inputs(&mut bundle_layout, &[&programs], ir.tensors.len() as u32)?;
     // The four facts no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     //
@@ -1498,6 +1502,167 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
+}
+
+/// ⭐⭐⭐⭐⭐ THE PER-STEP INPUT PLACEMENT PASS — one generic law, stated once, consumed by every
+/// program of the bundle.
+///
+/// A spliced program can bind a parameter no graph tensor names — a buffer the runtime stages
+/// every step (an index table, a validity mask). The whole-function door refuses such a binding
+/// until something PLACES it, and that is this pass: for every [`StepInput`] every program of the
+/// bundle states, mint a seg-ACTIVATION placement sized from the program's OWN view
+/// (`construct_memory_view` extent, element format from the view's own dtype) — never from a
+/// re-derivation here, which is how a placement and the bytes a kernel reads drift apart.
+///
+/// ⛔ THE LAW IS CHECKED, NOT TRUSTED. Each stated binding must be numbered exactly as
+/// [`step_input_tid`](ktir_superdsc::ktir_node::step_input_tid)`(n_graph_tensors, slot)` says — the
+/// producer that stated it numbered it through that same law, and a binding numbered any other way
+/// is refused by name, because a hand-picked tid is one collision away from silently aliasing a
+/// graph tensor's placement. Same shape as `gather_entry_ceiling`: both halves mint through one
+/// door, disagreement is refused, never repaired.
+///
+/// ⛔⛔ ZERO KERNEL VOCABULARY HERE, AND THAT IS THE DESIGN CONSTRAINT, NOT A LUCK. This pass asks
+/// three questions of a program — WHICH bindings are host-staged (the producer stated it), WHAT the
+/// kernel's own view says (extent + dtype), and WHICH slot each took (the numbering law) — and none
+/// of the three can mention what the input IS. A second kernel family stating per-step inputs
+/// flows through this pass unchanged; that is not a hope but the acceptance test
+/// (`a_non_attention_program_with_step_inputs_places_them`). WHAT the runtime writes into a placed
+/// buffer is the staging law, which never enters this crate: it travels as data beside the
+/// discovery table this pass records ([`BundleLayout::step_inputs`]), the same channel
+/// `weight_copies` and `scalarmul_scales` established.
+///
+/// ⛔ IDEMPOTENT AND CONFLICT-REFUSING ACROSS PROGRAMS. Every layer of a graph states the same
+/// inputs, so a tid already placed is checked for agreement — same segment, same role, same size —
+/// and a second program stating a DIFFERENT view for one tid is refused by name, because the two
+/// would share one buffer while disagreeing about its extent. A stated slot that disagrees with a
+/// recorded one is the same refusal.
+pub fn place_step_inputs(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+    n_graph_tensors: u32,
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::ktir_node::step_input_tid;
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            if k.step_inputs.is_empty() {
+                continue;
+            }
+            // The program's own parameter rows — one `regions` walk per program that states
+            // anything, not per entry.
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for s in &k.step_inputs {
+                let tid = s.buffer.get();
+                // ⛔ THE LAW CHECK. The stating producer numbered this binding through
+                // `step_input_tid`; anything else is a hand-picked tid.
+                let expected = step_input_tid(n_graph_tensors, s.slot);
+                if tid != expected {
+                    return Err(SuperDscError(format!(
+                        "{}: the host-staged input bound as t{tid} took slot {}, which the \
+                         numbering law states as t{expected} for a {}-tensor graph — a binding \
+                         numbered any other way can collide with a placement it did not state",
+                        e.op_name, s.slot, n_graph_tensors
+                    )));
+                }
+                if ktir_superdsc::reserved_tids::is_reserved(tid) {
+                    return Err(SuperDscError(format!(
+                        "{}: the host-staged input t{tid} landed on a reserved tid — the numbering \
+                         law's slot space walked into the reserved regions, which no real graph's \
+                         tensor count reaches",
+                        e.op_name
+                    )));
+                }
+                // The program's own view of this binding: extent and element format, stated by the
+                // kernel itself.
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the host-staged input t{tid} is stated but not among this \
+                             program's bindings — the producer declared an input its own program \
+                             never takes",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs
+                    .iter()
+                    .find(|r| r.tid == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the host-staged input t{tid} states no view — nothing says how \
+                             wide the buffer it addresses is",
+                            e.op_name
+                        ))
+                    })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the host-staged input t{tid}'s view states a dtype with no stick \
+                             geometry, so this ladder cannot size the buffer the program reads",
+                            e.op_name
+                        ))
+                    })?;
+                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                let seg = SegRole::Activation.segment();
+                match layout.placements.get(&tid) {
+                    // Every layer states the same input: the second sighting must AGREE.
+                    Some(p) => {
+                        if p.role != SegRole::Activation || p.segment != seg || p.size != size {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a host-staged input of {} B, but the \
+                                 bundle already places it as {} B in segment {} — two programs \
+                                 disagree about one buffer's extent",
+                                e.op_name,
+                                size,
+                                p.size,
+                                p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        let off = layout.segment_bytes[seg];
+                        layout.placements.insert(
+                            tid,
+                            TensorPlacement {
+                                tid,
+                                bank: 0,
+                                role: SegRole::Activation,
+                                segment: seg,
+                                offset: off,
+                                size,
+                            },
+                        );
+                        layout.segment_bytes[seg] = align128(off + size);
+                        // THE IDENTITY ROW, the same one `compute_bundle_layout` writes for every
+                        // tensor it places: a placement without it is INVISIBLE to
+                        // `resolve_seg_base`, which would then treat the program's own parameter as
+                        // an undeclared synthetic. The numbering law already put this tid above
+                        // every graph tensor's, so the name is this buffer's alone.
+                        layout.ids.borrow_mut().insert(
+                            ktir_superdsc::place::act_name(tid),
+                            ktir_superdsc::place::PlaceId::Act(tid),
+                        );
+                    }
+                }
+                match layout.step_inputs.get(&tid) {
+                    Some(&prev_slot) if prev_slot != s.slot => {
+                        return Err(SuperDscError(format!(
+                            "{}: t{tid} took slot {} here but slot {} earlier — one buffer cannot \
+                             answer to two slots",
+                            e.op_name, s.slot, prev_slot
+                        )));
+                    }
+                    _ => {
+                        layout.step_inputs.insert(tid, s.slot);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
@@ -2073,9 +2238,19 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // The SAME four facts the real consumer pass is handed — read once here, off the graph's own
     // `AttnDecode` nodes and this walk's own parameters. See [`attn_bundle_params`].
     let attn_params = attn_bundle_params(ir, rows_are_requests, one_request_decode, chunk_pages)?;
+    // ⭐⭐⭐ THE PER-STEP INPUT PLACEMENTS, MINTED BEFORE ANY PASS CAN ASK FOR THEM. The declare pass
+    // below lowers prefix → body → suffix through the door, and the door REFUSES a bound parameter
+    // with no placement — which is exactly what a host-staged input is until this pass places it.
+    // The pass runs after the bodies are lowered (it sizes from the programs' own views) and before
+    // the shared plan is completed (so every bundle's snapshot carries the placements): the one
+    // window in this walk where both halves are in hand.
+    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
+    let mut step_input_lists: Vec<&[EmittedOp]> = vec![&prefix];
+    step_input_lists.extend(body_op_lists.iter().map(|v| v.as_slice()));
+    step_input_lists.push(&suffix);
+    place_step_inputs(&mut bundle_layout, &step_input_lists, ir.tensors.len() as u32)?;
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
-    let body_op_lists: Vec<&Vec<EmittedOp>> = bodies.iter().map(|b| &b.ops).collect();
     for ops in std::iter::once(&prefix)
         .chain(body_op_lists.iter().copied())
         .chain(std::iter::once(&suffix))

@@ -287,6 +287,19 @@ pub struct BundleLayout {
     /// the wide class's upper lanes (dump-proven on gemma-4 tiny-allglobal).
     #[serde(default)]
     pub attn_class_hds: Vec<u32>,
+    /// ⭐⭐⭐ THE HOST-STAGED PER-STEP INPUTS — tid → the SLOT it took (see
+    /// [`step_input_tid`](crate::ktir_node::step_input_tid)).
+    ///
+    /// This is the WORKER'S DISCOVERY TABLE, and it is DATA, exactly like [`Self::weight_copies`]
+    /// and [`Self::scalarmul_scales`]: a per-step input is placed like any other Activation (its
+    /// placement is in [`Self::placements`], sized from the program's own view), and this field is
+    /// how the runtime tells a staged buffer apart from an intermediate WITHOUT recomputing the
+    /// producer's numbering — the runtime reads the tid and the slot off the artifact and never
+    /// re-derives `graph.tensors.len() + k`. What the runtime WRITES into each slot's buffer is the
+    /// staging law, which travels beside this through the wiring as data; this crate serializes
+    /// both and branches on neither.
+    #[serde(default)]
+    pub step_inputs: std::collections::BTreeMap<u32, u32>,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in

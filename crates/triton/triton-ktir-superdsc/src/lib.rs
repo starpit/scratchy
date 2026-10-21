@@ -99,6 +99,10 @@ pub fn node_for(m: &triton_ktir::ir::Module, program: Program) -> Result<KtirNod
         program,
         bindings,
         mask: None,
+        // The adapter is POSITIONAL — it knows the module's parameters and nothing about
+        // the tape that will re-bind them, so it states no host-staged inputs. A node
+        // with per-step inputs states them in its own re-state (the splice's `mint`s).
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     })

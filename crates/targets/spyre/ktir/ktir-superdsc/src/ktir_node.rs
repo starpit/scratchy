@@ -399,6 +399,47 @@ impl ActiveCap {
     }
 }
 
+/// One host-staged per-step input a program binds: the binding, and the SLOT it took.
+///
+/// See [`KtirNode::step_inputs`] for why this carries bindings and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInput {
+    pub buffer: BufferId,
+    /// The index the numbering law maps to this input's tid. Small, dense from 0, and assigned by
+    /// the producer that states the binding — a splice keeps one slot table so two programs of one
+    /// graph that share a slot share the buffer, and the placement pass refuses two programs that
+    /// state different views for one slot's tid.
+    pub slot: u32,
+}
+
+/// ⭐⭐⭐ THE ONE NUMBERING LAW for host-staged per-step inputs — the tid of `slot` in a graph with
+/// `n_graph_tensors` of its own tensors: `n_graph_tensors + slot`.
+///
+/// BOTH HALVES OF THE MECHANISM CALL THIS, AND THE CONSUMER REFUSES DISAGREEMENT. The producer that
+/// states a step input numbers its binding through this law; the placement pass recomputes the law
+/// for the stated slot and refuses a binding numbered any other way — so the two can never drift
+/// apart, and a hand-picked tid is a build failure naming the op, never a silently-aliased buffer.
+/// This is the same shape as `gather_entry_ceiling`: one door both halves mint through, and
+/// disagreement is refused, never repaired.
+///
+/// ⛔ PURE NUMBERING, NOTHING ELSE. The law knows a graph's tensor count and a slot index; it has no
+/// vocabulary for what any input IS. Which slot a meaning takes is the stating producer's own table,
+/// and what the runtime writes into a placed tid travels as data in the bundle artifact — never as a
+/// branch in this crate.
+///
+/// Slots count up from the graph's own tensor count, so a step input can never collide with a graph
+/// tensor's tid (graph tids are `0..n_graph_tensors` by construction — a graph tensor's tid IS its
+/// index into the producer's tensor list). Two programs of one graph numbering the same slot agree
+/// on the tid by construction; the placement pass is what refuses them disagreeing about the view.
+pub const fn step_input_tid(n_graph_tensors: u32, slot: u32) -> u32 {
+    // ⛔ THE LAW IS UNCHECKED ADD, AND THE PLACEMENT PASS GUARDS THE CORNER. A graph whose tensor
+    // count reached `u32::MAX - slot` would wrap the slot onto a tid the graph already owns, and no
+    // real graph is within six orders of magnitude of that; the pass still refuses a wrapped tid
+    // (it would fail the law check or the reserved check), so the corner is loud if it is ever
+    // reachable at all.
+    n_graph_tensors + slot
+}
+
 /// One node's KTIR: the function, and which tensor each of its parameters carries.
 pub struct KtirNode {
     pub func: ktir_core::ir::IRFunction<'static>,
@@ -425,6 +466,23 @@ pub struct KtirNode {
     /// was never absent from the IR anyway: the mask parameter's own view states `[1, capacity]`, so a
     /// caller that wants it reads it from [`regions`](crate::emit::lower_ktir_to_superdsc::regions).
     pub mask: Option<BufferId>,
+    /// ⭐ THE HOST-STAGED PER-STEP INPUTS this program binds — buffers no graph tensor names, staged
+    /// by the runtime every step.
+    ///
+    /// ⛔ A LIST OF BINDINGS, LIKE [`Self::bindings`] AND [`Self::mask`], AND FOR THE SAME REASON: a
+    /// per-step input is SYNTHETIC — no graph tensor names it, so the producer numbers it itself and
+    /// no reading of the IR recovers which parameter it is. Each entry pairs the binding with its
+    /// SLOT — the index the ONE numbering law ([`step_input_tid`]) maps to a tid — so the placement
+    /// pass can CHECK that the producer numbered the binding through the law rather than hand-picking
+    /// a tid, and refuse the disagreement instead of trusting it.
+    ///
+    /// ⛔ ZERO SEMANTICS HERE, BY LAW. This field says THAT a parameter is host-staged and WHICH slot
+    /// it took; it says nothing about WHAT the runtime writes into it. The staging law travels as
+    /// DATA through the bundle artifact (the `weight_copies`/`scalarmul_scales` channel), because it
+    /// is a runtime fact, and this crate never branches on it — a placement mint that needed to know
+    /// a buffer's meaning would be a recognizer, and the whole point of the slot indirection is that
+    /// it does not.
+    pub step_inputs: Vec<StepInput>,
     /// The output tensor of the NODE this program is HALF OF, when that is not the program's own
     /// output. `None` for every program that writes its node's output itself, which is all but one.
     ///
@@ -480,6 +538,7 @@ impl Clone for KtirNode {
             program: self.program,
             bindings: self.bindings.clone(),
             mask: self.mask,
+            step_inputs: self.step_inputs.clone(),
             node_out_tid: self.node_out_tid,
             minted: std::sync::Mutex::new(
                 self.minted

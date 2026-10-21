@@ -832,8 +832,25 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
     Ok(out)
 }
 
-/// Every view a `ktdp.store` writes through — the program's OUTPUT buffers. A store's second operand
-/// is the access tile it writes, and that tile's first operand is the view.
+/// The element format of binding `i`'s own view — the `Df` its `ktdp.construct_memory_view` states,
+/// for a caller that must size a buffer the way the program itself describes it.
+///
+/// ⭐ THE PLACEMENT MINT'S SIZING HALF. A host-staged per-step input ([`KtirNode::step_inputs`])
+/// has no graph tensor, so no placement census ever stated its footprint; the ONE honest source for
+/// the extent is the program's own view — the same op [`regions`] reads — and this hands a caller
+/// the element format beside it. `None` says the view states a dtype with no stick geometry (bool,
+/// i64), which no buffer this ladder sizes can be, and the caller refuses by name.
+pub fn param_df(k: &KtirNode, i: usize) -> Option<crate::superdsc_opspec::Df> {
+    let (ptr, _) = k.func.arguments.get(i)?;
+    let view = k.func.operations.iter().find(|o| {
+        o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr)
+    })?;
+    let dtype = view.attributes.iter().find_map(|(key, v)| match (key, v) {
+        (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
+        _ => None,
+    })?;
+    super::whole_function::df_of_dtype(dtype)
+}
 fn store_views(f: &IRFunction<'static>) -> std::collections::HashSet<Ssa> {
     let tile_view: std::collections::HashMap<Ssa, Ssa> = f
         .operations

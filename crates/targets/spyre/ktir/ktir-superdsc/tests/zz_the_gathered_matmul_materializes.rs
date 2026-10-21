@@ -310,6 +310,7 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             BufferId::new(204),
         ],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }

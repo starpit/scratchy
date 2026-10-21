@@ -2066,8 +2066,11 @@ fn spliced_attn_lowers_through_the_door() {
             // activation or a KV cache (the layout walk re-places the caches into seg2 itself).
             let weight_ids: HashSet<u32> = HashSet::new();
 
-            // The layout the tape walk computes for this graph.
-            let layout = compute_bundle_layout(
+            // The layout the tape walk computes for this graph — MUTABLE here because the
+            // producer's placement pass extends it: the host-staged inputs the spliced
+            // program states are placed after the splice, before the door, exactly where
+            // the re-rolled walk runs the pass.
+            let mut layout = compute_bundle_layout(
                 &ir,
                 &weight_ids,
                 rows_are_requests,
@@ -2126,6 +2129,23 @@ fn spliced_attn_lowers_through_the_door() {
                     s.geom, s.mq
                 );
             }
+
+            // The producer's own placement pass, run at its own site in the walk (after the
+            // splice has stated its bindings, before the door): every host-staged input the
+            // spliced program states takes a seg-ACTIVATION placement minted from the
+            // program's own view, checked against the numbering law — the pass the door's
+            // unplaced-parameter refusal waits for.
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_step_inputs(
+                &mut layout,
+                &[std::slice::from_ref(&spliced)],
+                ir.tensors.len() as u32,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "step inputs placed (geom={:?} mq={} rung={} r_ar={rows_are_requests}): {}",
+                    s.geom, s.mq, s.rung, e
+                )
+            });
 
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states

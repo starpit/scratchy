@@ -250,6 +250,7 @@ fn two_pair_program() -> KtirNode {
             BufferId::new(305),
         ],
         mask: None,
+        step_inputs: Vec::new(),
         node_out_tid: None,
         minted: Default::default(),
     }

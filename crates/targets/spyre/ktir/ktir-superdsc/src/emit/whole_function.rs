@@ -1764,7 +1764,7 @@ enum ReshapeFlat {
 /// is the frame's lane count, from the value's own element type. `None` for the formats with no
 /// stick geometry in this dialect (bool, i64): a reshape over those states no frame law this
 /// door can check, which the verdict refuses by name.
-fn df_of_dtype(elem: ktir_core::dtypes::DType) -> Option<crate::superdsc_opspec::Df> {
+pub(crate) fn df_of_dtype(elem: ktir_core::dtypes::DType) -> Option<crate::superdsc_opspec::Df> {
     use ktir_core::dtypes::DType;
     Some(match elem {
         DType::F16 => crate::superdsc_opspec::Df::Fp16,
