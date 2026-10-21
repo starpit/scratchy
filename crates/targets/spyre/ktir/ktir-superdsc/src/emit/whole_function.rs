@@ -2713,21 +2713,26 @@ pub fn lower_function(
         .filter(|t| !crate::reserved_tids::is_reserved(*t))
         .max()
         .map_or(0, |m| m + 1);
-    // ⭐ A BOUND PARAMETER THE BUNDLE DOES NOT PLACE IS DECLARED AT ITS OWN VIEW — the program's
-    // `ktdp.construct_memory_view` states its full extent and element type, which is the whole
-    // footprint. A producer-numbered per-step input past the graph's tensors (an attention
-    // kernel's index tables and mask) has no graph placement, and this is the one place its
-    // extent is stated. Idempotent: a placed or already-declared tid is left as it is.
+    // ⛔ A BOUND PARAMETER THE BUNDLE DOES NOT PLACE IS REFUSED HERE, BY NAME. A placement is
+    // a promise the WORKER fills: the program's `ktdp.construct_memory_view` states the
+    // extent, but nothing states who writes the bytes. A per-step input (an index table, a
+    // mask) synth-declared into the Intermediate segment would bake a buffer no runtime step
+    // ever writes, and the bundle would read garbage on card — so the walk declares nothing
+    // itself. The two honest fixes live at the producer: a graph tensor is placed by the tape
+    // walk, and a per-step input needs an Activation placement plus a forward-tape fill step.
     if let Some(l) = layout {
-        for (i, r) in regions(k)?.iter().enumerate() {
+        for r in regions(k)?.iter() {
             if l.placements.contains_key(&r.tid) || crate::reserved_tids::is_reserved(r.tid) {
                 continue;
             }
-            let df = match param_view_dtype(f, i) {
-                Some(ktir_core::dtypes::DType::I32) => crate::superdsc_opspec::Df::SenUint32,
-                _ => crate::superdsc_opspec::Df::Fp16,
-            };
-            l.synth_df(crate::place::PlaceId::Act(r.tid), &[r.v_rows, r.v_cols], df);
+            return err(format!(
+                "{}: the bound parameter t{} (its view states [{}, {}]) has no placement in \
+                 this bundle — no step is promised to fill it. A graph tensor is placed by the \
+                 tape walk; a per-step input needs an Activation placement plus a forward-tape \
+                 fill step at its producer. The walk declares nothing itself: a walk-side synth \
+                 would bake a buffer nothing writes.",
+                f.name, r.tid, r.v_rows, r.v_cols
+            ));
         }
     }
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
@@ -3754,19 +3759,6 @@ pub fn lower_function(
         }
     }
     Ok(out)
-}
-
-/// The element type parameter `i`'s `ktdp.construct_memory_view` states.
-fn param_view_dtype(f: &IRFunction<'static>, i: usize) -> Option<ktir_core::dtypes::DType> {
-    let (ptr, _) = f.arguments.get(i)?;
-    let view = f
-        .operations
-        .iter()
-        .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))?;
-    view.attributes.iter().find_map(|(k, v)| match (k, v) {
-        (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
-        _ => None,
-    })
 }
 
 /// ⭐ ONE INDEXED WRITE — [`super::assemble_indexed_write`] over the scatter's own facts. The
