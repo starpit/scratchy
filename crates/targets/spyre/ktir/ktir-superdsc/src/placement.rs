@@ -328,23 +328,26 @@ pub struct BundleLayout {
     /// [`PagedKvPool::request_stride`]: crate::sdsc_abstract::PagedKvPool::request_stride
     #[serde(default)]
     pub kv_request_stride_bytes: u64,
-    /// ⭐ THE GATHER REACH — source tid → the extent, in ELEMENTS of that tensor's own format,
-    /// that a GATHERED read of it may name through its index.
+    /// ⭐ THE GATHER REACH — source tid → the bound on the index VALUES a GATHERED read of that
+    /// tensor may hold, as the typed pair ([`crate::sdsc_abstract::GatherReach`]): the entry
+    /// ceiling and the entry unit those values address at.
     ///
     /// Declared by the producer for a POOLED tensor only. A pooled tensor's placement covers
     /// ONE slice of a pool (the paged KV cache's per-layer plane: one page, one layer, one
-    /// plane), while a gathered read's index names stick-blocks across the WHOLE pool — every
-    /// layer, every plane, every page ([`crate::sdsc_abstract::GatherEntry::of_page_block`]) —
-    /// which the runtime re-bases per launch. So the placement footprint, the bound every
-    /// plain window runs against, is the WRONG bound for the indexed read, and this number is
-    /// the right one: the gather door (`crate::emit::assemble_pointwise_broadcast_gather`)
-    /// bounds the entry RUN against it and re-states the gathered operand's window at ONE
-    /// entry's coverage against the slice. Nothing else widens — a plain sweep or a producer's
-    /// write of the same tid is still bounded by the placement alone, so the reach is a fact
-    /// about the INDEXED read, never about the tensor. Empty for every bundle with no pooled
-    /// tensor, keeping those byte-identical.
+    /// plane), while a gathered read's index names stick-blocks across the WHOLE pool the
+    /// runtime re-bases per launch — RELATIVE TO THE PLANE'S OWN BASE, which is why one reach
+    /// serves every plane. So the placement footprint, the bound every plain window runs
+    /// against, is the WRONG bound for the indexed read, and this pair is the right one: the
+    /// gather door (`crate::emit::assemble_pointwise_broadcast_gather`) checks the descriptor's
+    /// own entry stride against it — the unit the host's `GatherEntry` composition counts in —
+    /// and the host-side composition mints through the SAME ceiling
+    /// ([`crate::sdsc_abstract::gather_entry_ceiling`]), so a value above the pool's bound is
+    /// unconstructible at both halves and the two cannot disagree. Nothing else widens — a
+    /// plain sweep or a producer's write of the same tid is still bounded by the placement
+    /// alone, so the reach is a fact about the INDEXED read, never about the tensor. Empty for
+    /// every bundle with no pooled tensor, keeping those byte-identical.
     #[serde(default)]
-    pub gather_reach: std::collections::BTreeMap<u32, u64>,
+    pub gather_reach: std::collections::BTreeMap<u32, crate::sdsc_abstract::GatherReach>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate

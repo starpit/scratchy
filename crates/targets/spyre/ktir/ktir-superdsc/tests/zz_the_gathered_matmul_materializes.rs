@@ -28,14 +28,23 @@
 //! * CONTROL (the wrong-rows trap): the copy declares the INDEX operand and points its value
 //!   operand at the TABLE's tid — the two facts whose absence is the silent direct read the guard
 //!   exists to refuse, and the matmul does not name the table at all;
-//! * CONTROL (fail-closed survival): a gather whose table is the matmul's **A** still refuses,
-//!   with the original guard message — the exception did not swallow the fail-closed rule;
+//! * THE A SLOT (restated for the walk the WIP left behind): a gathered read materializes for
+//!   ANY consumer — the copy is the gather, and what reads its result reads an ordinary
+//!   activation — so a gather feeding the matmul's **A** materializes exactly as the B-slot one
+//!   does, on a shape-valid fixture (every extent square at K), and the matmul reads the copy.
+//!   The old control pinned the dead law (a ScalarMul-only refusal for the A slot) and is
+//!   replaced, not weakened: the fail-closed rule survives as its own case below — a gathered
+//!   load with TWO consumers is refused by name, because the materialized copy stands for
+//!   exactly one;
 //! * THE POOLED TABLE (b1): a gathered source whose layout declares a `gather_reach` is a POOL
-//!   SLICE — its placement covers one entry while its index names rows across the whole pool —
-//!   so the door bounds the entry RUN against the reach (refused by name past it) and the mint
-//!   checks ONE entry's coverage against the slice. The one-entry placement that the swept-window
-//!   law refuses is admitted under a reach, and the same placement with NO reach still refuses:
-//!   the reach widens the indexed read and nothing else.
+//!   SLICE — its placement covers one entry while its index names values across the whole pool.
+//!   The door checks the read's ENTRY UNIT against the reach's own (the unit the host's
+//!   `GatherEntry` composition counts in — a descriptor striding at any other width reads every
+//!   entry at the wrong address), and the VALUES' bound is the ceiling the stage-side
+//!   composition makes unconstructible (pinned in `zz_the_gather_index_reproduces_the_host_page_
+//!   address`). The one-entry placement the swept-window law refuses is admitted under a reach,
+//!   a reach whose entry unit DISAGREES with the read is refused by name, and the same placement
+//!   with NO reach still refuses: the reach widens the indexed read and nothing else.
 
 use ktir_core::affine::{AffineExpr, AffineMap};
 use ktir_core::arena::Arena;
@@ -58,13 +67,15 @@ const K: i64 = 64;
 const V: i64 = 128;
 const HEAD: i64 = 64;
 
-/// Which matmul slot the gathered load feeds — the swap for the fail-closed control.
+/// Which matmul slot the gathered load feeds.
 #[derive(Clone, Copy)]
 enum GatheredSlot {
-    /// The fixture's own shape: the gathered load is the matmul's B (operand 1).
+    /// The fixture's own shape: the gathered load is the matmul's B (operand 1), `o = matmul(p,
+    /// gather(v, ids))` with P `[8, 64]`.
     B,
-    /// The gathered load feeds the matmul's **A** (operand 0), with B a plain load of the table —
-    /// a gather this arm must NOT materialize. The walk's fail-closed refusal owns it.
+    /// The gathered load feeds the matmul's **A** (operand 0) with the plain operand `[64, 64]`
+    /// and the result `[64, 64]` — every extent square at K, so the fixture is SHAPE-VALID in
+    /// this arrangement and the test pins the materialization itself, not a shape refusal.
     A,
 }
 
@@ -99,9 +110,21 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
     // The output view/tile, the zero outs, and the matmul result.
     let (v_o, t_o, outs, matmul) = (Ssa(16), Ssa(17), Ssa(18), Ssa(19));
 
-    // Which matmul slot consumes the gathered load — the control's one variable. Both slots are
-    // `[64, 64]` here (K = HEAD_DIM = 64, attention's own square), so the swap changes NO extent
-    // and no tid: only the POSITION of the gathered value.
+    // Which matmul slot consumes the gathered load — the one variable. The B case is the
+    // fixture's own `[8, 64] · [64, 64] -> [8, 64]`; the A case keeps every extent square at K
+    // (`[64, 64] · [64, 64] -> [64, 64]`), because the gathered load `[K, HEAD]` is the
+    // contraction's A there and the plain operand must carry K = 64 as its own K extent — the
+    // first draft left P at `[8, 64]` and the control died at the matmul's own K-extent check,
+    // which pins nothing about the gather.
+    let (p_rows, p_cols, out_rows, out_cols) = match slot {
+        GatheredSlot::B => (M, K, M, HEAD),
+        GatheredSlot::A => (K, K, K, K),
+    };
+
+    // The swap itself: same table, same ids, only the POSITION of the gathered value changes.
+    // That is also exactly the shape a TID-comparing guard would have mis-lowered (both operands
+    // resolve to the same tids), which is why the emission checks VALUE IDENTITY
+    // (`in_values[gi] == g.load`) and not tids.
     let (a_operand, b_operand) = match slot {
         GatheredSlot::B => (val_a, prod),
         GatheredSlot::A => (prod, val_a),
@@ -120,11 +143,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             AttrKey::Value,
             Attr::Int(0),
         ),
-        // P: [8, 64]
+        // P: the plain operand — [8, 64] as the B case's A, [64, 64] as the A case's B.
         shape(
             Operation::new(a, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_p]),
-            M,
-            K,
+            p_rows,
+            p_cols,
         ),
         shape(
             Operation::new(
@@ -133,13 +156,13 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 OpKind::KtdpConstructAccessTile,
                 &[v_a, zero, zero],
             ),
-            M,
-            K,
+            p_rows,
+            p_cols,
         ),
         shape(
             Operation::new(a, Some(val_a), OpKind::KtdpLoad, &[t_a]),
-            M,
-            K,
+            p_rows,
+            p_cols,
         ),
         // V: [128, 64] — the table.
         shape(
@@ -230,11 +253,11 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
             K,
             HEAD,
         ),
-        // OUT: [8, 64]
+        // OUT: [8, 64] in the B case, [64, 64] in the A case.
         shape(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
-            M,
-            HEAD,
+            out_rows,
+            out_cols,
         ),
         shape(
             Operation::new(
@@ -243,14 +266,14 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 OpKind::KtdpConstructAccessTile,
                 &[v_o, zero, zero],
             ),
-            M,
-            HEAD,
+            out_rows,
+            out_cols,
         ),
         // The zero outs.
         shape(
             Operation::new(a, Some(outs), OpKind::TensorEmpty, &[]),
-            M,
-            HEAD,
+            out_rows,
+            out_cols,
         ),
         // THE CONTRACTION — plain-B, NO indexing maps: the gathered rows contracted where they lie.
         shape(
@@ -260,8 +283,8 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 OpKind::LinalgMatmul,
                 &[a_operand, b_operand, outs],
             ),
-            M,
-            HEAD,
+            out_rows,
+            out_cols,
         ),
         Operation::new(a, None, OpKind::KtdpStore, &[matmul, t_o]),
     ];
@@ -299,17 +322,22 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
 /// device address (`SEGMENT_OFFSETS[3] + 0x8000`) is shared by no other operand in the test, and
 /// an assertion on that number is an assertion on WHICH buffer an op reads, not on a coincidence
 /// of two zero offsets.
-fn layout_for(k: &KtirNode) -> BundleLayout {
+fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
     let mut l = BundleLayout::default();
     for (i, b) in k.bindings.iter().enumerate() {
         let tid = b.get();
         l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
-        // Bytes per parameter: P [8,64] f16, V [128,64] f16, ids [64] i32, OUT [8,64] f16.
-        let bytes: u64 = match i {
-            0 => (M as u64) * (K as u64) * 2,
-            1 => (V as u64) * (HEAD as u64) * 2,
-            2 => (K as u64) * 4,
-            _ => (M as u64) * (HEAD as u64) * 2,
+        // Bytes per parameter: P (the plain operand, slot-shaped), V [128,64] f16, ids [64] i32,
+        // OUT (the result, slot-shaped).
+        let bytes: u64 = match (slot, i) {
+            (_, 1) => (V as u64) * (HEAD as u64) * 2,
+            (_, 2) => (K as u64) * 4,
+            // P: [8, 64] in the B case, [64, 64] in the A case.
+            (GatheredSlot::B, 0) => (M as u64) * (K as u64) * 2,
+            (GatheredSlot::A, 0) => (K as u64) * (K as u64) * 2,
+            // OUT: [8, 64] in the B case, [64, 64] in the A case.
+            (GatheredSlot::B, _) => (M as u64) * (HEAD as u64) * 2,
+            (GatheredSlot::A, _) => (K as u64) * (K as u64) * 2,
         };
         l.placements.insert(
             tid,
@@ -330,8 +358,11 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
 /// The emitted ops, descriptors and all — asserted on the TYPED structs rather than re-parsed
 /// JSON, so the assertions name the fields the card acts on (`labeledDs_`, `scheduleTree_`) with
 /// no second parser to disagree with the first.
-fn emitted(k: &KtirNode) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
-    let layout = layout_for(k);
+fn emitted(
+    k: &KtirNode,
+    slot: GatheredSlot,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+    let layout = layout_for(k, slot);
     let mut sid = 0i64;
     lower_function(k, Some(&layout), &mut sid, None).map_err(|e| e.message)
 }
@@ -386,7 +417,7 @@ const TABLE_ADDR: u64 = 0xC_0000_0000 + 0x10000;
 /// operand is not at `TABLE_ADDR`" is exactly "the matmul does not read the table".
 #[test]
 fn the_gathered_matmul_emits_the_copy_then_the_matmul() {
-    let ops = emitted(&paged_program(GatheredSlot::B))
+    let ops = emitted(&paged_program(GatheredSlot::B), GatheredSlot::B)
         .expect("the rung-4 program lowers through the whole-function door");
     // 64 entries / 32 per op = 2 copy legs, then the contraction.
     assert_eq!(
@@ -467,26 +498,153 @@ fn the_gathered_matmul_emits_the_copy_then_the_matmul() {
     );
 }
 
-/// ⛔ CONTROL — A GATHER THAT FEEDS THE MATMUL'S **A** STILL REFUSES, with the fail-closed guard's
-/// own message. The exception must not have swallowed the rule.
+/// ⭐⭐⭐ THE A SLOT, RESTATED FOR THE LAW THE WALK NOW RUNS: a gathered read materializes for ANY
+/// consumer — the copy is the gather, and what reads its result reads an ordinary activation —
+/// so a gather feeding the matmul's **A** emits the same two copy legs and a contraction whose
+/// A is the minted intermediate, NOT the table.
 ///
-/// ⭐ THE CONTROL'S OWN TRAP, WHICH THE FIRST DRAFT FELL INTO: the first control swapped the
-/// TABLE the gather reads while leaving the gathered load in the matmul's B slot — which is a
-/// DIFFERENT (and perfectly lowerable) program, `p @ gather(p, ids)`, and the door materialized
-/// it correctly. The control that isolates the guard swaps the SLOT: same table, same ids, same
-/// extents, the gathered value at operand 0 and a plain load at operand 1. That is also exactly
-/// the shape a TID-comparing guard would have mis-lowered (both operands are `[64, 64]` at
-/// K=64=HEAD_DIM, attention's own square), which is why the emission checks VALUE IDENTITY
-/// (`in_values[1] == gathered_result`) and not tids.
+/// ⛔ THE OLD CONTROL PINNED A DEAD LAW, AND THIS IS ITS REPLACEMENT, NOT A WEAKENING. The old
+/// test expected the walk's ScalarMul-only refusal to fire for the A slot; the walk it inherited
+/// (38b5c73c9) materializes every gathered read instead, so the refusal never fires and the
+/// fixture died at the matmul's own K-extent check — P was left `[8, 64]`, which is not a valid
+/// B against a `[64, 64]` A. This fixture is SHAPE-VALID in the A arrangement (every extent
+/// square at K), so what it pins is the materialization itself. The fail-closed rule survives
+/// as its own case in the test below this one.
+///
+/// The A operand is proven by ADDRESS, the same discriminator the B-slot positive uses: the
+/// table sits at `TABLE_ADDR` (seg3 + 0x10000) and the intermediate in the synth segment, so
+/// "the matmul's INPUT operand is not at `TABLE_ADDR`" is exactly "the matmul does not read the
+/// table".
 #[test]
-fn a_gather_over_the_matmuls_a_is_still_refused_by_the_guard() {
-    let e = match emitted(&paged_program(GatheredSlot::A)) {
-        Err(e) => e,
-        Ok(_) => panic!("a gather over A is not the matmul's B -- the door must refuse it"),
+fn an_a_side_gathered_operand_materializes_and_the_matmul_reads_the_copy() {
+    let ops = emitted(&paged_program(GatheredSlot::A), GatheredSlot::A)
+        .expect("an A-side gathered operand materializes like any other gathered read");
+    assert_eq!(
+        ops.len(),
+        3,
+        "the A-slot gather emits the same two materialized copy legs and the contraction -- got \
+         {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    let (copy0, _copy1, mm) = (&ops[0], &ops[1], &ops[2]);
+    // The copy legs are the gather itself — the same identity-with-index shape as the B case.
+    let dsc = copy0
+        .dsc()
+        .dscs_
+        .first()
+        .and_then(|m| m.values().next())
+        .expect("each copy leg has a descriptor");
+    assert!(
+        dsc.computeOp_
+            .iter()
+            .any(|c| c.opFuncName == "identity" && !c.indirectAccessIndexLabeledDs.is_empty()),
+        "the A-slot copy leg is an `identity` carrying the indirect-access index: {:?}",
+        copy0.op_name
+    );
+    assert_eq!(
+        value_tensor_address(copy0),
+        Some(TABLE_ADDR),
+        "the A-slot copy leg gathers from the table at {TABLE_ADDR:#x}: {:?}",
+        copy0.op_name
+    );
+    // ⭐ THE MATMUL READS THE INTERMEDIATE IN ITS **A** SLOT, NOT THE TABLE — by address. A
+    // direct-read descriptor (the trap the guard exists to refuse) would put the INPUT operand
+    // at `TABLE_ADDR`.
+    let mm_dsc = mm
+        .dsc()
+        .dscs_
+        .first()
+        .and_then(|m| m.values().next())
+        .expect("the matmul has a descriptor");
+    assert!(
+        mm_dsc.computeOp_
+            .iter()
+            .any(|c| c.opFuncName == "batchmatmul"),
+        "the last op is the contraction: {:?}",
+        mm.op_name
+    );
+    let a_addr = alloc_address(mm, "INPUT");
+    assert!(
+        a_addr.is_some(),
+        "the matmul declares an INPUT (A) operand: {:?}",
+        mm.op_name
+    );
+    assert_ne!(
+        a_addr,
+        Some(TABLE_ADDR),
+        "the matmul's A is at {a_addr:#?}, NOT the table's {TABLE_ADDR:#x} -- an A at the table's \
+         address is the direct-read trap (right shape, wrong rows): {:?}",
+        mm.op_name
+    );
+}
+
+/// ⛔ THE FAIL-CLOSED RULE SURVIVES THE MATERIALIZE-ANY-GATHERED-READ LAW, AS ITS OWN CASE: a
+/// gathered load with **TWO** consumers is refused by name, because the materialized copy this
+/// door emits stands for exactly one — a second consumer needs its own node, and silently
+/// sharing the copy would read the first consumer's rows. This is the refusal half the old
+/// A-slot control stood for, restated for the law that replaced it.
+#[test]
+fn a_gathered_load_with_two_consumers_is_refused_by_name() {
+    // The B fixture with ONE extra op: the gathered load `prod` feeds BOTH the matmul and a
+    // second store of its own — two consumers of one gathered read.
+    let mut k = paged_program(GatheredSlot::B);
+    let a: &'static Arena = Arena::global();
+    let zero = Ssa(4);
+    // A second output parameter for the gathered rows themselves.
+    let (p_g, v_g, t_g) = (Ssa(20), Ssa(21), Ssa(22));
+    let store_g = Ssa(23);
+    k.func.arguments = a.args(vec![
+        (Ssa(0), IrType::Index),
+        (Ssa(1), IrType::Index),
+        (Ssa(2), IrType::Index),
+        (Ssa(3), IrType::Index),
+        (p_g, IrType::Index),
+    ]);
+    k.bindings.push(BufferId::new(205));
+    let shape = |op: Operation<'static>, r: i64, c: i64| {
+        op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
+            .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
+    };
+    // `prod` (Ssa 15) is the gathered load; store it raw beside the contraction.
+    let extra = vec![
+        shape(
+            Operation::new(a, Some(v_g), OpKind::KtdpConstructMemoryView, &[p_g]),
+            K,
+            HEAD,
+        ),
+        shape(
+            Operation::new(a, Some(t_g), OpKind::KtdpConstructAccessTile, &[v_g, zero, zero]),
+            K,
+            HEAD,
+        ),
+        Operation::new(a, Some(store_g), OpKind::KtdpStore, &[Ssa(15), t_g]),
+    ];
+    let mut ops = k.func.operations.to_vec();
+    ops.extend(extra);
+    k.func.operations = a.ops(ops);
+    let mut l = layout_for(&k, GatheredSlot::B);
+    let tid = 205;
+    l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+    l.placements.insert(
+        tid,
+        TensorPlacement {
+            tid,
+            role: SegRole::Activation,
+            segment: 3,
+            bank: 0,
+            offset: 4 * 0x10000,
+            size: (K as u64) * (HEAD as u64) * 2,
+        },
+    );
+    let mut sid = 0i64;
+    let e = match lower_function(&k, Some(&l), &mut sid, None) {
+        Err(e) => e.message,
+        Ok(_) => panic!("a gathered load with two consumers must refuse, not share one copy"),
     };
     assert!(
-        e.contains("declares an index operand only for `Program::ScalarMul`"),
-        "the ORIGINAL fail-closed refusal must fire -- got {e}"
+        e.contains("2 consumer(s)"),
+        "the refusal names the consumer count and the law (one copy stands for exactly one \
+         consumer) -- got {e}"
     );
 }
 
@@ -494,19 +652,34 @@ fn a_gather_over_the_matmuls_a_is_still_refused_by_the_guard() {
 //
 // The fixture is `paged_program(GatheredSlot::B)` unchanged; only the LAYOUT changes. The table
 // (t202) is placed at ONE ENTRY's footprint (`[1, HEAD]` = 128 B) instead of the whole
-// `[V, HEAD]`, and the bundle declares the table's `gather_reach` in elements. The node gathers
-// `rows = 64` entries at `head = 64` elements per row, so:
+// `[V, HEAD]`, and the bundle declares the table's `gather_reach` as the TYPED pair — the entry
+// ceiling and the entry unit — minted through the pool's own door:
 //
 //   * the SWEPT window is 64 × 64 = 4096 elements = 8192 B — 64× the one-entry placement, which
 //     the swept-window law (the placement footprint) refuses;
-//   * the RUN bound is (0 + 64) × 64 = 4096 elements, which a reach of `V × HEAD = 8192` admits
-//     and a reach one element short refuses.
+//   * the reach's entry unit must be the width the read itself strides at (HEAD = 64), which a
+//     pool at hd=1 states (a stick block is `hd · 64`) and a pool at hd=2 does not — that
+//     disagreement is the door's refusal, and the test that pins it FAILS WITHOUT the check.
+
+/// The pool the fixture's table models, at head dim `hd`: one reach minted through the pool's
+/// own door (`GatherReach::of_plane`), with a 4-page budget over a 128-entry page (four whole
+/// planes — a page smaller than one of its own planes is not a pool, and the door refuses it).
+/// At `hd = 1` the pool's stick block IS the fixture's HEAD (64 elements); at `hd = 2` it is
+/// twice that, which is exactly the disagreement the door must refuse.
+fn fixture_reach(hd: usize) -> Option<ktir_superdsc::sdsc_abstract::GatherReach> {
+    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(8, hd);
+    let page_stride = 128 * pool.stick_block_bytes();
+    ktir_superdsc::sdsc_abstract::GatherReach::of_plane(4, page_stride, pool)
+}
 
 /// [`layout_for`] with the table (t202) placed at ONE ENTRY's footprint and a declared
-/// `gather_reach` of `reach` elements — the pooled-table statement: a slice placement plus the
-/// pool its index names.
-fn pooled_layout_for(k: &KtirNode, reach: u64) -> BundleLayout {
-    let mut l = layout_for(k);
+/// `gather_reach` — the pooled-table statement: a slice placement plus the typed bound on the
+/// index values that address the pool behind it.
+fn pooled_layout_for(
+    k: &KtirNode,
+    reach: ktir_superdsc::sdsc_abstract::GatherReach,
+) -> BundleLayout {
+    let mut l = layout_for(k, GatheredSlot::B);
     let tid = k.bindings[1].get();
     l.placements.get_mut(&tid).expect("the table is placed").size = HEAD as u64 * 2;
     l.gather_reach.insert(tid, reach);
@@ -521,14 +694,20 @@ fn emitted_with(k: &KtirNode, layout: &BundleLayout) -> Result<Vec<ktir_superdsc
 }
 
 /// ⭐ THE POSITIVE: a one-entry placement the swept-window law refuses is ADMITTED under a
-/// declared reach — the door bounds the run (4096 ≤ 8192) and the mint checks one entry's
-/// coverage against the slice (64 × 2 B = 128 B ≤ 128 B). The emission is the rung-4 shape
-/// itself: two copy legs and the contraction, the legs still gathering FROM the table's own
-/// address (the slice placement's base — the pool's base).
+/// declared reach — the door checks the read's entry unit against the reach's own (64 = 64) and
+/// the mint checks ONE entry's coverage against the slice (64 × 2 B = 128 B ≤ 128 B). The
+/// emission is the rung-4 shape itself: two copy legs and the contraction, the legs still
+/// gathering FROM the table's own address (the slice placement's base — the pool's base).
 #[test]
 fn a_pooled_table_gathers_past_its_one_slice_placement() {
     let k = paged_program(GatheredSlot::B);
-    let ops = emitted_with(&k, &pooled_layout_for(&k, V as u64 * HEAD as u64))
+    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
+    assert_eq!(
+        reach.entry_elems(),
+        HEAD as u64,
+        "the hd=1 pool's stick block is the fixture's HEAD — the unit the read strides at"
+    );
+    let ops = emitted_with(&k, &pooled_layout_for(&k, reach))
         .expect("a pooled table's gather is bounded by its reach, not its slice placement");
     assert_eq!(
         ops.len(),
@@ -546,26 +725,39 @@ fn a_pooled_table_gathers_past_its_one_slice_placement() {
     }
 }
 
-/// ⛔ THE REFUSAL THE AUDITOR ASKED TO SEE NAMED: an entry run past the declared reach. The run
-/// names rows [0, 64) at 64 elements per row — 4096 elements — against a reach of 4095, one
-/// element short. The refusal names the op, the table, the span and the reach, and states the
-/// law: a run past the declared reach gathers past the pool.
+/// ⛔ THE REFUSAL, ON THE FACT THE DOOR ALONE CAN SEE: the read's ENTRY UNIT. This node gathers
+/// 64-element rows, but the declared pool's entries are 128-element stick blocks (an hd=2 pool)
+/// — two units for one address. dxp turns a value into an address as `idx * skip_addr + base`,
+/// and the host composes those values in the pool's own unit, so a descriptor striding at 64
+/// reads every entry at half its address — from a clean bake. The refusal names the op, the
+/// table, both widths and the ceiling.
+///
+/// ⭐ THIS IS THE TEST THAT FAILS WITHOUT THE CHECK: with no unit law (the state this commit
+/// fixes), the hd=2 reach is admitted and the emission succeeds — the very defect the audit
+/// named, a bound that looks like a law and pins nothing.
 #[test]
-fn an_entry_run_past_the_declared_gather_reach_is_refused_by_name() {
+fn a_pooled_gather_whose_entry_unit_disagrees_with_the_pool_is_refused_by_name() {
     let k = paged_program(GatheredSlot::B);
-    // (run start 0 + 64 rows) × 64 cols = 4096 elements; the reach is one element short.
-    let reach = 64 * 64 - 1;
+    let reach = fixture_reach(2).expect("hd=2 states a wider entry unit");
+    assert_eq!(
+        reach.entry_elems(),
+        2 * HEAD as u64,
+        "the hd=2 pool's stick block is twice the fixture's HEAD -- the disagreement under test"
+    );
     let e = match emitted_with(&k, &pooled_layout_for(&k, reach)) {
         Err(e) => e,
-        Ok(_) => panic!("a run of 4096 elements past a reach of {reach} must refuse"),
+        Ok(_) => panic!(
+            "a read striding 64-element entries over a pool of 128-element stick blocks must \
+             refuse -- two units for one address"
+        ),
     };
     assert!(
-        e.contains("gather reach"),
-        "the refusal names the law it enforces -- got {e}"
+        e.contains("strides one index entry at 64"),
+        "the refusal names the read's own unit -- got {e}"
     );
     assert!(
-        e.contains("rows [0, 64)") && e.contains("4096") && e.contains(&reach.to_string()),
-        "the refusal names the run, the span and the reach it exceeded -- got {e}"
+        e.contains("128-element stick blocks"),
+        "the refusal names the pool's own unit -- got {e}"
     );
 }
 
@@ -575,7 +767,8 @@ fn an_entry_run_past_the_declared_gather_reach_is_refused_by_name() {
 #[test]
 fn a_one_slice_table_without_a_reach_still_refuses_at_the_placement() {
     let k = paged_program(GatheredSlot::B);
-    let mut l = pooled_layout_for(&k, V as u64 * HEAD as u64);
+    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
+    let mut l = pooled_layout_for(&k, reach);
     let tid = k.bindings[1].get();
     l.gather_reach.remove(&tid);
     let e = match emitted_with(&k, &l) {

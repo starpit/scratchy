@@ -519,13 +519,15 @@ pub struct EwOperand<'a> {
     /// The [`crate::addr::ColWindow`] `col_offset` came from — set only by [`In::col_window`], so a
     /// stick-major presentation of a column window is admitted by type, never by testing the integer.
     col_window: Option<crate::addr::ColWindow>,
-    /// ⭐ THE POOLED MARK — set only by the gather door ([`mark_pooled`]) on the gathered operand
-    /// of a table whose layout declares a `BundleLayout::gather_reach` for it. A pooled table's
-    /// placement is ONE slice of a pool its index re-bases, so the operand's window law at the
-    /// family mint is ONE ENTRY's coverage against the slice (the run's bound is the door's,
-    /// which is the only party that sees the reach). Nothing else about the operand — bytes,
-    /// scales, offsets — changes; the mark selects a bound, never a descriptor.
-    pooled: bool,
+    /// ⭐ THE POOLED MARK — the reach the gather door admitted this operand under, set only by
+    /// [`mark_pooled`] on the gathered operand of a table whose layout declares a
+    /// `BundleLayout::gather_reach` for it. A pooled table's placement is ONE slice of a pool its
+    /// index re-bases, so the operand's window law at the family mint is ONE ENTRY's coverage
+    /// against the slice — ONE ENTRY being the reach's own `entry_elems`, which is why the mark
+    /// CARRIES the value rather than a bool: the window the mint selects and the bound the door
+    /// admitted under are one value, not two facts that could disagree. Nothing else about the
+    /// operand — bytes, scales, offsets — changes; the mark selects a bound, never a descriptor.
+    pooled: Option<crate::sdsc_abstract::GatherReach>,
 }
 impl<'a> EwOperand<'a> {
     pub(crate) fn scale(&self) -> [Scale; 3] {
@@ -583,18 +585,19 @@ impl<'a> EwOperand<'a> {
     pub(crate) fn is_stick_major_window_for(&self, rows: u32) -> bool {
         self.col_window.is_some_and(|w| w.is_stick_major_for(rows))
     }
-    /// ⭐ THE POOLED MARK — the same operand under the gather door's pooled-table law. Set only
-    /// by [`assemble_pointwise_broadcast_gather`] for the gathered operand of a table whose
-    /// layout declares a `BundleLayout::gather_reach`; see the field's own doc for why the
-    /// mark selects a bound and never a descriptor.
-    pub(crate) fn mark_pooled(&self) -> Self {
+    /// ⭐ THE POOLED MARK — the same operand under the gather door's pooled-table law, carrying
+    /// the reach it was admitted under. Set only by [`assemble_pointwise_broadcast_gather`] for
+    /// the gathered operand of a table whose layout declares a `BundleLayout::gather_reach`; see
+    /// the field's own doc for why the mark selects a bound and never a descriptor.
+    pub(crate) fn mark_pooled(&self, reach: crate::sdsc_abstract::GatherReach) -> Self {
         Self {
-            pooled: true,
+            pooled: Some(reach),
             ..*self
         }
     }
-    /// Whether this operand carries the pooled mark (see [`mark_pooled`]).
-    pub(crate) fn is_pooled(&self) -> bool {
+    /// The reach this operand was admitted under, if the gather door pooled it (see
+    /// [`mark_pooled`]).
+    pub(crate) fn pooled(&self) -> Option<crate::sdsc_abstract::GatherReach> {
         self.pooled
     }
     /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
@@ -709,16 +712,20 @@ pub(crate) fn mint_ew_operands(
                 // `sw_rows × sw_cols` is not this operand's access model (its rows are
                 // index-named, never contiguous) and the slice placement is not its bound. What
                 // this mint bounds instead is the DIRECT window: the bytes at the base before
-                // the index moves it, which is ONE entry's `[1, cols]` against the slice — and
-                // the RUN's bound is the door's alone, because only it sees the reach.
-                if i.is_pooled() {
+                // the index moves it, which is ONE entry — and an entry is the reach's own
+                // `entry_elems` (the mark CARRIES the value, so the window selected here and the
+                // bound the door admitted under are one number, never two facts that could
+                // disagree). The VALUES' bound is not here at all: it is the ceiling the
+                // host-side `GatherEntry` composition mints through, unconstructible past it.
+                if let Some(reach) = i.pooled() {
                     let d = i.declared();
+                    let entry = reach.entry_elems() as usize;
                     l.check_window(
                         i.name(),
-                        StickLayout::row_blocked_df(1, d.cols, d.df),
+                        StickLayout::row_blocked_df(1, entry, d.df),
                         off as u64,
                         1,
-                        d.cols as u32,
+                        entry as u32,
                         &what,
                     )?
                 } else {
@@ -1267,51 +1274,59 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     }
     // ⭐⭐⭐⭐⭐ THE POOLED TABLE — DESCRIBED AS IT REALLY LIVES. A gathered source whose layout
     // declares a `BundleLayout::gather_reach` is a POOL SLICE, not a table: its placement covers
-    // one slice (the paged KV cache's per-layer plane) while its index names stick-blocks across
-    // the WHOLE pool the runtime re-bases per launch, so the swept-rectangle-vs-placement law the
-    // legs' mint runs for every other operand is the WRONG pair of facts for it — the rectangle
-    // `rows × cols` is not contiguous and the placement is not the pool. Two checks replace it,
-    // both stated here, the one party that sees the run AND the reach:
+    // one slice (the paged KV cache's per-layer plane) while its index names stick-blocks
+    // RELATIVE TO THE PLANE'S OWN BASE across the whole pool the runtime re-bases per launch,
+    // so the swept-rectangle-vs-placement law the legs' mint runs for every other operand is
+    // the WRONG pair of facts for it — the rectangle `rows × cols` is not contiguous and the
+    // placement is not the pool. What replaces it is ONE check, on the one fact this door
+    // uniquely sees:
     //
-    // 1. THE RUN'S BOUND — the rows this node names, `[run.start, run.start + rows)`, at `cols`
-    //    elements per row, must land inside the declared reach. The index VALUES are runtime data
-    //    no compile can read; the run is the compile-time span they are drawn from, and the
-    //    producer's reach is the pool those values address. A run past it gathers past the pool
-    //    into whatever is placed after it, from a clean bake — refused here, by name.
-    // 2. THE OPERAND'S WINDOW — one entry's coverage against the slice placement, which is the
-    //    mint's pooled arm (selected by the mark this branch puts on the operand): the direct
-    //    bytes at the base are one block, and every other address comes from the index.
+    // THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`,
+    // and this descriptor strides one entry at `cols` elements — while the reach's entries are
+    // `entry_elems`-element stick blocks, the unit the host's `GatherEntry::of_page_block`
+    // composes its runtime values in. Two units for one address is two authorities for the
+    // same bytes: a descriptor striding at any other width reads every entry at the wrong
+    // address, from a clean bake — refused here, by name, with both numbers.
     //
-    // A table with NO declared reach takes neither: its gather keeps the swept-window law exactly
-    // as the embedding's card-proven emission runs it, byte for byte.
+    // ⛔ AND THE VALUES' BOUND IS NOT A CHECK HERE, BECAUSE IT CANNOT BE ONE. The values are
+    // runtime data (the host's index table); `run.start()` is a POSITION in the index buffer,
+    // not a value, so any run-shaped inequality against the reach compares two different
+    // tensors' coordinates and is vacuous on every real bundle. The honest bound on the
+    // VALUES is the ceiling the reach carries — `(page_ceiling − 1) · per_page + plane_blocks`
+    // — and it is enforced where a value is BORN: the host-side composition
+    // (`gather_entry_ceiling` → `GatherEntry::of_page_block`) refuses every value at or above
+    // it, and the same door minted the reach the producer declared, so the bake-time and
+    // stage-time halves are one number by construction. The extent law — the descriptor's
+    // `skip_addr` times the ceiling stays inside the reach — holds by TYPE: the reach's
+    // element extent IS `ceiling · entry_elems` ([`GatherReach::reach_elems`], derived, never
+    // stored), so a `skip_addr` equal to `entry_elems` satisfies it exactly and any other
+    // `skip_addr` is the refusal below.
+    //
+    // A table with NO declared reach takes none of this: its gather keeps the swept-window law
+    // exactly as the embedding's card-proven emission runs it, byte for byte.
     let mut pooled_inputs;
     let inputs = if let Some(l) = layout
         && let Some(crate::place::PlaceId::Act(tid)) = l.id_of(inputs[gathered_input].name())
         && let Some(&reach) = l.gather_reach.get(&tid)
     {
-        let first = run.start().entries() as u64;
-        let last = first + rows as u64;
-        let span = last.checked_mul(cols as u64).ok_or_else(|| {
-            SuperDscError(format!(
-                "{op_name}: this gathered read names rows [{first}, {last}) of '{}' (t{tid}) at \
-                 {cols} elements per row, and that span overflows the element count — no pool a \
-                 bundle can declare holds it",
-                inputs[gathered_input].name(),
-            ))
-        })?;
-        if span > reach {
+        if cols as u64 != reach.entry_elems() {
             return Err(SuperDscError(format!(
-                "{op_name}: this gathered read names rows [{first}, {last}) of '{}' (t{tid}) — a \
-                 span of {span} elements at {cols} per row — but the bundle declares that tensor's \
-                 gather reach as {reach} elements. A pooled table's placement covers ONE slice of \
-                 the pool its index names, and a run past the declared reach gathers past the pool \
-                 into whatever is placed after it, from a clean bake. State a smaller run, or \
-                 declare the pool the runtime really budgets (`BundleLayout::gather_reach`).",
+                "{op_name}: this gathered read of '{}' (t{tid}) strides one index entry at {cols} \
+                 elements, but the bundle declares that pool's entries as {}-element stick blocks \
+                 (a ceiling of {} entry values, {} elements of reach). dxp turns a value into an \
+                 address as `idx * skip_addr + base`, and the host composes those values in the \
+                 pool's own unit (`GatherEntry::of_page_block`), so a descriptor striding at any \
+                 other width reads every entry at the wrong address — from a clean bake. State the \
+                 read at the pool's entry width, or declare the reach for the pool this read \
+                 really strides (`BundleLayout::gather_reach`).",
                 inputs[gathered_input].name(),
+                reach.entry_elems(),
+                reach.max_entry().get(),
+                reach.reach_elems(),
             )));
         }
         pooled_inputs = inputs.to_vec();
-        pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled();
+        pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled(reach);
         &pooled_inputs[..]
     } else {
         inputs
@@ -1796,7 +1811,7 @@ pub fn assemble_indexed_write(
         )));
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    Ok(emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)?)
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
 }
 
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
@@ -4546,7 +4561,7 @@ impl<'a, K: KindTag> In<'a, K> {
             y_broadcast: self.y_broadcast,
             col_offset: self.col_offset,
             col_window: self.col_window,
-            pooled: false,
+            pooled: None,
         }
     }
 }

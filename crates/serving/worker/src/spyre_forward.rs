@@ -881,7 +881,7 @@ fn chunk_index_table(
             scratchy_subtile::sdsc_abstract::ChunkScratch::PAGES_MAX
         )));
     }
-    let per_page = session.gather_entries_per_page(pool).ok_or_else(|| {
+    let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
         werr(format!(
             "{what}: this bundle emits a GATHERED KV read, but a physical page is not a whole number \
              of STICK BLOCKS — no integer index can name a page boundary"
@@ -908,7 +908,7 @@ fn chunk_index_table(
         scratch,
         rows,
         &map.as_i64(),
-        per_page,
+        ceiling,
         // The body's own baked op-local pin budget — the same term the bake's `lx_form` witness
         // read off the layout, so the host refuses exactly the chunks the bake refused.
         step.lx_op_local_bytes(),

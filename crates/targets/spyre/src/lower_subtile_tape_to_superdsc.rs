@@ -1372,8 +1372,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     let mut kv_block_index_bytes: Option<u64> = None;
     // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
     // placements below (the pool those planes' gathers name), consumed by the gather door's
-    // entry-run bound.
-    let mut gather_reach = std::collections::BTreeMap::<u32, u64>::new();
+    // entry-unit check.
+    let mut gather_reach =
+        std::collections::BTreeMap::<u32, ktir_superdsc::sdsc_abstract::GatherReach>::new();
     // ⭐ THE LAYER COUNT A PAGE SPANS — hoisted above the node loop because TWO consumers read
     // it: the gather reach stated at every attention node's plane placements, and the page
     // ceiling the mask's pass grid derives inside the first node's block. ONE derivation, both
@@ -1493,18 +1494,35 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // ⭐⭐⭐⭐⭐ THE GATHER REACH — the POOL a gathered read of these planes names, stated
             // where the slice is placed so the two are ONE fact at one site. The placement above
             // covers this layer's slice of ONE page; a gathered read's index names stick-blocks
-            // across the WHOLE pool — every layer, every plane, every page, the uniform
-            // `hd · 64`-element block grid `GatherEntry::of_page_block` counts in — so the
-            // gather door bounds the entry run against THIS number instead of the slice
-            // footprint. The ceiling is the SAME page ceiling the mask's pass grid derives in
-            // the first node's block below (one flex region, `bundle::MAX_SEGMENT_BYTES`, over
-            // this bundle's own page bytes), so the reach and the pass grid cannot disagree
-            // about how many pages a row may hold. Nothing else widens: a plain sweep of these
-            // tids is still bounded by the placement alone.
+            // RELATIVE TO THE PLANE'S OWN BASE across the whole pool — every page, in the
+            // uniform `hd · 64`-element block grid `GatherEntry::of_page_block` counts in — so
+            // the gather door checks the read's entry stride against THIS reach instead of the
+            // slice footprint. The reach is the TYPED pair
+            // (`GatherReach::of_plane` — the entry ceiling and the entry unit), minted from the
+            // SAME page ceiling the mask's pass grid derives in the first node's block below
+            // (one flex region, `bundle::MAX_SEGMENT_BYTES`, over this bundle's own page bytes)
+            // and the pool's own geometry, and the host-side index composition mints through
+            // the SAME door (`gather_entry_ceiling`), so a value above the ceiling is
+            // unconstructible at both halves and the two cannot disagree. Nothing else widens:
+            // a plain sweep of these tids is still bounded by the placement alone.
             let page_elems = pool.layer_stride() as u64 * kv_layers;
-            let max_pages = (bundle::MAX_SEGMENT_BYTES / (page_elems * 2)).max(1);
+            let page_bytes = page_elems * 2;
+            let page_ceiling = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+            let reach = ktir_superdsc::sdsc_abstract::GatherReach::of_plane(
+                page_ceiling,
+                page_bytes,
+                pool,
+            )
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "attn t{k_id}: the paged KV pool's own geometry admits no gather reach — a \
+                     page ({page_bytes} B over {kv_layers} layer(s)) is not a whole number of the \
+                     pool's stick blocks, so no integer index can name a page boundary and the \
+                     gathered read this bundle emits cannot address the pool"
+                ))
+            })?;
             for tid in [k_id, v_id, kct_resident_tid(k_id)] {
-                gather_reach.insert(tid, max_pages * page_elems);
+                gather_reach.insert(tid, reach);
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
             // no alignment padding creeping in between layers (hd and page_slots are 64-multiples,

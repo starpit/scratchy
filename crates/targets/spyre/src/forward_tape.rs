@@ -770,11 +770,17 @@ mod tests {
         let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(8, 64);
         let plane = scratchy_subtile::sdsc_abstract::PagePlaneExtent::of_pool(pool)
             .expect("a stick head dim");
-        let per_page =
-            scratchy_subtile::sdsc_abstract::gather_entries_per_page(40 * 3 * plane.bytes(), pool)
-                .expect("a page that is a whole number of stick blocks");
+        // A page ceiling past every page the mint below names — the ceiling bounds the VALUE, so
+        // the pool's own budget must admit page 100 for this test to stage it at all.
+        let ceiling = scratchy_subtile::sdsc_abstract::gather_entry_ceiling(
+            512,
+            40 * 3 * plane.bytes(),
+            pool,
+        )
+        .expect("a page that is a whole number of stick blocks");
+        let per_page = ceiling.per_page();
         let mint = |phys: i64| {
-            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(per_page, phys, 0)
+            scratchy_subtile::sdsc_abstract::GatherEntry::of_page_block(ceiling, phys, 0)
                 .expect("an in-range entry")
         };
         let blocks = [mint(0), mint(1), mint(2), mint(100)];

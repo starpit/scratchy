@@ -394,14 +394,42 @@ impl SuperDscSession {
     /// session knows.
     ///
     /// [`gather_entries_per_page`]: scratchy_subtile::sdsc_abstract::gather_entries_per_page
-    pub fn gather_entries_per_page(
+    /// ⭐⭐⭐⭐⭐ THE GATHER'S ENTRY CEILING FOR THIS SESSION — the page factor (`phys → entry`) and the
+    /// page budget (the most pages one region of KV holds) in ONE type, minted from the session's own
+    /// `page_stride_bytes` and the device's own `MAX_SEGMENT_BYTES`, the same two numbers the bake's
+    /// prefix-mask block count and `BundleLayout::gather_reach` derive from. Every index table the
+    /// host stages composes its entries through it, so a value above the pool's bound is
+    /// UNCONSTRUCTIBLE here rather than checked after the fact — and because the bake states the same
+    /// reach through the same door, the stage-time bound and the bake-time bound are one number, not
+    /// two derivations kept in agreement.
+    ///
+    /// ⛔ DERIVED FROM THE SESSION'S OWN `page_stride_bytes`, WHICH IS THE NUMBER `page_base_bytes`
+    /// MULTIPLIES. That is the whole point: the host's page address is `phys * page_stride_bytes` and
+    /// the card's is `idx * skip_addr + base`, so `idx = phys * (page_stride_bytes / skip_addr_bytes)` is an
+    /// identity between two quantities read off the same session — not two derivations that must be kept
+    /// in agreement. `zz_the_gather_index_reproduces_the_host_page_address` pins it.
+    ///
+    /// `None` when the bundle is unpaged, or when a page is not a whole number of entries — in which case
+    /// no integer index can name a page boundary and the caller must refuse rather than round.
+    ///
+    /// The arithmetic itself is [`gather_entry_ceiling`]; this hands it the ONE number only the
+    /// session knows.
+    ///
+    /// [`gather_entry_ceiling`]: scratchy_subtile::sdsc_abstract::gather_entry_ceiling
+    pub fn gather_entry_ceiling(
         &self,
         pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
-    ) -> Option<scratchy_subtile::sdsc_abstract::EntriesPerPage> {
-        scratchy_subtile::sdsc_abstract::gather_entries_per_page(
-            self.exec.kv_page_stride_bytes(),
-            pool,
-        )
+    ) -> Option<scratchy_subtile::sdsc_abstract::GatherEntryCeiling> {
+        let page_bytes = self.exec.kv_page_stride_bytes();
+        // The DEVICE page ceiling — the most pages one flex region of KV holds, the same ceiling
+        // the bake's prefix mask reserves blocks for. A page stride of 0 is an unpaged bundle;
+        // the 0 page ceiling hands it to the door, which refuses it.
+        let page_ceiling = if page_bytes == 0 {
+            0
+        } else {
+            scratchy_spyre_bundle::MAX_SEGMENT_BYTES / page_bytes
+        };
+        scratchy_subtile::sdsc_abstract::gather_entry_ceiling(page_ceiling, page_bytes, pool)
     }
 
     // ⛔ THERE IS NO SECOND FACTOR HERE ANY MORE. `gather_planes_per_page` returned a page-per-PLANE

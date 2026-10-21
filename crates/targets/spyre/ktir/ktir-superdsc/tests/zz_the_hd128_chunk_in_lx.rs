@@ -540,7 +540,10 @@ fn every_hd128_lx_copy_and_its_consumer_meet_at_one_pin() {
 /// head, page, block) exactly once, and each copy reads its own stick of the table.
 #[test]
 fn the_hd128_lx_table_is_each_legs_part_major_run() {
-    let per_page = ktir_superdsc::sdsc_abstract::gather_entries_per_page(
+    // The pool's own ceiling — 64 pages of budget, the ladder's own top (PAGES_MAX), so every
+    // rung below names only pages it holds.
+    let ceiling = ktir_superdsc::sdsc_abstract::gather_entry_ceiling(
+        64,
         32 * pool().stick_block_bytes(),
         pool(),
     )
@@ -617,7 +620,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
             chunk,
             ChunkRowKind::OneRequest,
             &pages,
-            per_page,
+            ceiling,
             0,
             0,
         )
@@ -625,7 +628,7 @@ fn the_hd128_lx_table_is_each_legs_part_major_run() {
         assert_eq!(table.len() as u32, 2 * n, "{j} page(s)");
         let word = |(kvh, page, block): (u32, u32, u32)| {
             ktir_superdsc::sdsc_abstract::GatherEntry::of_page_block(
-                per_page,
+                ceiling,
                 i64::from(page),
                 chunk.source_block(kvh, block).unwrap(),
             )

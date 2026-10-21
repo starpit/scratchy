@@ -1320,7 +1320,7 @@ impl Worker for SpyreWorker {
                 // row 0's keys — fluent and wrong, which is the corruption this path exists to remove.
                 let kv_blocks: Option<Vec<scratchy_subtile::sdsc_abstract::GatherEntry>> =
                     if bake_gathers_kv && batch_chunk.is_none() {
-                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
                         werr(
                             "decode batch: this bundle emits a GATHERED KV read, but a physical page \
                              is not a whole number of STICK BLOCKS — no integer index can name a page \
@@ -1370,7 +1370,7 @@ impl Worker for SpyreWorker {
                             scratch,
                             &page_maps,
                             max_pages,
-                            per_page,
+                            ceiling,
                             pass_stride,
                         )
                         .ok_or_else(|| {
@@ -1435,7 +1435,7 @@ impl Worker for SpyreWorker {
                 // session's, exactly as for the fold's table above.
                 let kv_blocks = match batch_chunk {
                     Some(bc) => {
-                        let per_page = sess.gather_entries_per_page(pool).ok_or_else(|| {
+                        let ceiling = sess.gather_entry_ceiling(pool).ok_or_else(|| {
                             werr(
                                 "decode batch: this body gathers its chunk, but a physical page is not \
                                  a whole number of STICK BLOCKS — no integer index can name a page \
@@ -1445,7 +1445,7 @@ impl Worker for SpyreWorker {
                         })?;
                         Some(
                             scratchy_subtile::sdsc_abstract::batch_chunk_index_table(
-                                bc, &page_maps, per_page, step.lx_op_local_bytes(),
+                                bc, &page_maps, ceiling, step.lx_op_local_bytes(),
                                 step.lx_prob_pin_bytes(),
                             )
                             .ok_or_else(|| {

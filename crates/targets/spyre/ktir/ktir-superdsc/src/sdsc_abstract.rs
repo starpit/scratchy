@@ -6592,7 +6592,7 @@ pub fn gather_entries_per_page(
 /// 4096-element block" is implicitly hd=64, which is exactly the hand-spelled constant this type
 /// makes unspellable. The only constructor divides the SESSION's own `page_stride_bytes` by the
 /// POOL's own `stick_block_bytes()`, so both halves of the identity come from the artifact.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, serde::Serialize)]
 pub struct EntriesPerPage(i64);
 
 impl EntriesPerPage {
@@ -6620,19 +6620,172 @@ impl EntriesPerPage {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct GatherEntry(i32);
 
+/// ⭐⭐⭐⭐⭐ THE ENTRY CEILING — the EXCLUSIVE upper bound on index values a gathered read of ONE
+/// pooled plane may hold, and the bound is on the **VALUE**, not the run: the values are runtime
+/// data (the host's `GatherEntry` composition), so no compile can read them — what a compile CAN
+/// do is make every value above the ceiling UNCONSTRUCTIBLE, which is this type's whole job.
+///
+/// ## The arithmetic, and why it is exact for EVERY plane
+/// An entry is composed RELATIVE TO THE PLANE it reads (`of_page_block`'s `phys * per_page +
+/// block_in_page`, where `block_in_page` is a block of THAT plane — the layer and plane offsets
+/// cancel because the base the descriptor adds is the plane's own placement). So the largest
+/// legal value names the LAST block of the LAST page the pool budget admits, inside the plane's
+/// own extent:
+///
+/// ```text
+/// ceiling = (page_ceiling − 1) · EntriesPerPage + (entries one plane spans)
+/// ```
+///
+/// — the same number for every plane of the pool, which is why one `GatherReach` serves all
+/// three. `page_ceiling` is the DEVICE-derived page budget (`MAX_SEGMENT_BYTES / page_bytes`,
+/// the same ceiling the prefix mask's block count reserves), and "entries one plane spans" is
+/// `plane_stride / stick_block_elems` — `nkvh * 4`, never a hand-written 32.
+///
+/// ⛔⛔⛔ NOT A RAW `u64` OF ELEMENTS. A reach stated as an element count invites the wrong
+/// comparison — an index-buffer POSITION times a row width, say — which type-checks, passes a
+/// fixture whose ids happen to make position equal value, and is vacuous on every real bundle.
+/// The ceiling is a bound on ENTRY VALUES, and the element extent it implies
+/// ([`GatherReach::reach_elems`]) is DERIVED from it, never stored beside it, so the two halves
+/// of the law cannot disagree.
+///
+/// ⛔ NO `From`, NO `Default`: the only constructor is [`Self::of_pool`], and the only public
+/// mint is [`gather_entry_ceiling`], which derives all three inputs from the pool and the page
+/// stride so no caller can spell a sibling arithmetic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct GatherEntryCeiling {
+    per_page: EntriesPerPage,
+    /// EXCLUSIVE: the first value an index may NOT hold.
+    limit: i64,
+}
+
+impl GatherEntryCeiling {
+    /// ONE door — the pool's page ceiling, the page's entry count, and the plane's block count.
+    /// `None` on a zero page ceiling (an unpaged pool has no pages to name), a plane wider than
+    /// its own page, or a product that leaves `i64`.
+    pub(crate) fn of_pool(
+        page_ceiling: u64,
+        per_page: EntriesPerPage,
+        plane_blocks: u64,
+    ) -> Option<Self> {
+        let per = per_page.get();
+        if page_ceiling == 0 || per <= 0 || plane_blocks > per as u64 {
+            return None;
+        }
+        let limit = (page_ceiling - 1)
+            .checked_mul(per as u64)?
+            .checked_add(plane_blocks)?;
+        let limit = i64::try_from(limit).ok()?;
+        if limit <= 0 {
+            return None;
+        }
+        Some(GatherEntryCeiling { per_page, limit })
+    }
+
+    /// The page factor this ceiling composes with — [`GatherEntry::of_page_block`]'s own input,
+    /// read back rather than re-derived, so the bound and the composition share one number.
+    pub const fn per_page(self) -> EntriesPerPage {
+        self.per_page
+    }
+
+    /// The EXCLUSIVE bound on entry values: the first value an index may not hold.
+    pub const fn get(self) -> i64 {
+        self.limit
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE ENTRY CEILING'S ONE PUBLIC MINT — page ceiling, page stride and pool, the same
+/// three numbers [`gather_entries_per_page`] and the prefix mask's block count come from, so the
+/// ceiling cannot disagree with either.
+///
+/// `None` for exactly the reasons [`gather_entries_per_page`] refuses (an unpaged bundle, a page
+/// that is not a whole number of stick blocks), plus a plane that is not itself a whole number of
+/// stick blocks — which no legal pool is, but a ceiling minted from one would be a lie, so the
+/// door refuses rather than rounds.
+pub fn gather_entry_ceiling(
+    page_ceiling: u64,
+    page_stride_bytes: u64,
+    pool: PagedKvPool,
+) -> Option<GatherEntryCeiling> {
+    let per_page = gather_entries_per_page(page_stride_bytes, pool)?;
+    let entry = pool.stick_block_elems();
+    let plane_blocks = pool.plane_stride().checked_div(entry)?;
+    GatherEntryCeiling::of_pool(page_ceiling, per_page, plane_blocks as u64)
+}
+
+/// ⭐⭐⭐⭐⭐ THE GATHER REACH OF ONE POOLED PLANE — the ceiling on its index values and the entry
+/// unit those values address at, as ONE value. The producer states it per pooled source tid in
+/// `BundleLayout::gather_reach`; the gather door checks the descriptor's own entry stride
+/// against it; the host's index composition mints through the same ceiling — so the bake-time
+/// bound and the stage-time composition cannot disagree, because both are this type.
+///
+/// ## The element extent is DERIVED, never stored
+/// `reach_elems() = ceiling · entry_elems` — `(page_ceiling − 1) · page_elems + plane_stride`,
+/// the extent from the plane's OWN placement base that legal entries address. It is a reading of
+/// the pair, not a second field: a reach stored as a raw element count beside a ceiling is two
+/// authorities for one bound, and the disagreement would be exactly the silent kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+pub struct GatherReach {
+    max_entry: GatherEntryCeiling,
+    entry_elems: u64,
+}
+
+impl GatherReach {
+    /// ONE door — the same three numbers [`gather_entry_ceiling`] takes, plus the pool's own
+    /// entry width. `None` for the same reasons.
+    pub fn of_plane(
+        page_ceiling: u64,
+        page_stride_bytes: u64,
+        pool: PagedKvPool,
+    ) -> Option<Self> {
+        Some(GatherReach {
+            max_entry: gather_entry_ceiling(page_ceiling, page_stride_bytes, pool)?,
+            entry_elems: pool.stick_block_elems() as u64,
+        })
+    }
+
+    /// The ceiling on entry values this reach admits (see [`GatherEntryCeiling`]).
+    pub const fn max_entry(self) -> GatherEntryCeiling {
+        self.max_entry
+    }
+
+    /// The entry unit the host's index values address at — the pool's stick block, `hd · 64`
+    /// elements, the width [`GatherEntry::of_page_block`] counts in and the descriptor's
+    /// `skip_addr` must equal.
+    pub const fn entry_elems(self) -> u64 {
+        self.entry_elems
+    }
+
+    /// The extent, in elements, from the plane's OWN placement base that legal entries address:
+    /// `ceiling · entry_elems` = `(page_ceiling − 1) · page_elems + plane_stride`. Derived, never
+    /// stored — see the type's doc.
+    pub fn reach_elems(self) -> u64 {
+        self.max_entry.get() as u64 * self.entry_elems
+    }
+}
+
 impl GatherEntry {
     /// THE ONE COMPOSITION: physical page `phys`, times this bundle's entries-per-page, plus the
     /// block that `(kv head, slot window)` occupies inside a page ([`GatherScratch::block_in_page`]).
     ///
-    /// `None` on a negative page, or when the product or sum leaves `i32` — the width the descriptor
-    /// declares (`SENUINT32`). A wrapped entry is an address, so it cannot be allowed to round.
-    pub fn of_page_block(per_page: EntriesPerPage, phys: i64, block_in_page: u32) -> Option<Self> {
+    /// `None` on a negative page, when the product or sum leaves `i32` — the width the descriptor
+    /// declares (`SENUINT32`) — or when the composed value is AT OR ABOVE the pool's ceiling: the
+    /// values are runtime data, and the ceiling is the one bound on them a compile can make
+    /// unconstructible rather than check after the fact. A wrapped entry is an address, so it
+    /// cannot be allowed to round.
+    pub fn of_page_block(
+        ceiling: GatherEntryCeiling,
+        phys: i64,
+        block_in_page: u32,
+    ) -> Option<Self> {
         if phys < 0 {
             return None;
         }
         let e = phys
-            .checked_mul(per_page.get())?
+            .checked_mul(ceiling.per_page().get())?
             .checked_add(i64::from(block_in_page))?;
+        if e >= ceiling.get() {
+            return None;
+        }
         i32::try_from(e).ok().map(GatherEntry)
     }
 
@@ -6700,15 +6853,17 @@ pub fn gather_index_table(
     block_tables: &[Vec<i64>],
     // Fold passes this step walks — the PAGES, since a gathered fold's pass IS a page.
     pages: usize,
-    // [`gather_entries_per_page`], off the same session `fold_plan::page_base_bytes` reads. It is an
-    // [`EntriesPerPage`] and not an `i64` so that the hd-carrying factor cannot be hand-written here.
-    entries_per_page: EntriesPerPage,
+    // [`gather_entry_ceiling`] — the pool's own ceiling (the hd-carrying page factor and the page
+    // budget in ONE type), so the entries composed here are bounded by the same law the bake
+    // stated and no factor can be hand-written at this call site.
+    ceiling: GatherEntryCeiling,
     // The MASK's own per-pass shift ([`PrefixMaskShape::pass_stride`]) — a [`PassStride`] rather than a
     // `usize` because the index rides that shift and one shift cannot have two pitches.
     pass_stride: PassStride,
 ) -> Option<Vec<GatherEntry>> {
     let rows = scratch.rows() as usize;
     let stride = pass_stride.get();
+    let entries_per_page = ceiling.per_page();
     if block_tables.is_empty()
         || pages == 0
         || entries_per_page.get() <= 0
@@ -6725,7 +6880,7 @@ pub fn gather_index_table(
     // entry this loop does not reach will gather. It is sound only because the gather-copy op reads
     // `rows` of them and the mask invalidates the rest; it is NOT a safe default for a missing row,
     // which is why every failure above refuses instead of leaving one here.
-    let pad = GatherEntry::of_page_block(entries_per_page, 0, 0)?;
+    let pad = GatherEntry::of_page_block(ceiling, 0, 0)?;
     let mut out = vec![pad; pages * stride];
     for p in 0..pages {
         for r in 0..scratch.mq() {
@@ -6741,10 +6896,11 @@ pub fn gather_index_table(
                 for b in 0..scratch.windows() {
                     // ⭐ ONE COMPOSITION, INSIDE THE TYPE. The `phys * per_page + block` arithmetic that
                     // used to be spelled here — and whose three terms all have plausible wrong siblings
-                    // — is now [`GatherEntry::of_page_block`]'s and nothing else's.
+                    // — is now [`GatherEntry::of_page_block`]'s and nothing else's, and the ceiling it
+                    // takes is the pool's own bound on the value.
                     out[p * stride + scratch.row_of(kvh, b, r)? as usize] =
                         GatherEntry::of_page_block(
-                            entries_per_page,
+                            ceiling,
                             phys,
                             scratch.block_in_page(kvh, b)?,
                         )?;
@@ -6779,8 +6935,8 @@ pub fn page_gather_index_table(
     block_tables: &[Vec<i64>],
     // Fold passes this step walks — the PAGES, since a gathered fold's pass IS a page.
     pages: usize,
-    // [`gather_entries_per_page`], off the same session `fold_plan::page_base_bytes` reads.
-    planes: EntriesPerPage,
+    // [`gather_entry_ceiling`] — the pool's own page factor and page budget in one type.
+    ceiling: GatherEntryCeiling,
     // The MASK's own per-pass shift ([`PrefixMaskShape::pass_stride`]).
     pass_stride: PassStride,
 ) -> Option<Vec<GatherEntry>> {
@@ -6794,6 +6950,7 @@ pub fn page_gather_index_table(
         scratch.entries_per_op() as usize,
         scratch.ops_per_row() as usize,
     );
+    let planes = ceiling.per_page();
     if block_tables.is_empty()
         || pages == 0
         || planes.get() <= 0
@@ -6812,7 +6969,7 @@ pub fn page_gather_index_table(
     // ⛔ THE PAD IS PAGE 0's FIRST PLANE AND THAT IS A REAL ADDRESS — stated, because it is what any entry
     // this loop does not reach would gather. Sound only because the copy reads `rows` of them and the mask
     // invalidates the rest; NOT a safe default for a missing row, which is why the checks above refuse.
-    let pad = GatherEntry::of_page_block(planes, 0, 0)?;
+    let pad = GatherEntry::of_page_block(ceiling, 0, 0)?;
     let mut out = vec![pad; pages * stride];
     for p in 0..pages {
         for r in 0..scratch.mq() {
@@ -6838,7 +6995,7 @@ pub fn page_gather_index_table(
                 let first = j * cut;
                 for i in 0..(per_row - first).min(cut) {
                     *out.get_mut(base + i)? =
-                        GatherEntry::of_page_block(planes, phys, u32::try_from(first + i).ok()?)?;
+                        GatherEntry::of_page_block(ceiling, phys, u32::try_from(first + i).ok()?)?;
                 }
             }
         }
@@ -8679,14 +8836,14 @@ pub fn chunk_gather_index_table(
     scratch: ChunkScratch,
     rows: ChunkRowKind,
     pages: &[i64],
-    per_page: EntriesPerPage,
+    ceiling: GatherEntryCeiling,
     op_local_bytes: u64,
     prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
     let last = *pages.last()?;
     let entry = |(kvh, page, q): (u32, u32, u32)| {
         let phys = *pages.get(page as usize).unwrap_or(&last);
-        GatherEntry::of_page_block(per_page, phys, scratch.source_block(kvh, q)?)
+        GatherEntry::of_page_block(ceiling, phys, scratch.source_block(kvh, q)?)
     };
     if let Some(lx) = scratch.lx_form(rows, op_local_bytes, prob_pin_bytes) {
         let values = (0..scratch.entries()).map(|e| entry(lx.entry_coord(e)));
@@ -8977,7 +9134,7 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
 pub fn batch_chunk_index_table(
     bc: BatchChunk,
     maps: &[Vec<i64>],
-    per_page: EntriesPerPage,
+    ceiling: GatherEntryCeiling,
     op_local_bytes: u64,
     prob_pin_bytes: u64,
 ) -> Option<Vec<GatherEntry>> {
@@ -8985,7 +9142,7 @@ pub fn batch_chunk_index_table(
         bc.chunk(),
         ChunkRowKind::Batch,
         &bc.page_list(maps)?,
-        per_page,
+        ceiling,
         op_local_bytes,
         prob_pin_bytes,
     )

@@ -347,6 +347,70 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
     );
 }
 
+/// ⛔⛔⛔ AN ENTRY AT OR ABOVE THE POOL'S CEILING IS **UNCONSTRUCTIBLE** — the value-side bound,
+/// proven where the value is BORN.
+///
+/// The index VALUES are runtime data (the host's `GatherEntry` composition), so no compile-time
+/// inequality can bound them — a run-shaped check compares an index-buffer POSITION against a
+/// pool extent, which is vacuous on every real bundle. The bound that holds is the one the
+/// ceiling type makes structural: `of_page_block` refuses every value at or above
+/// `(page_ceiling − 1) · per_page + (entries one plane spans)`, and this test FAILS WITHOUT IT —
+/// the same compositions returned entries before the ceiling existed.
+///
+/// The last legal entry is checked as an ADDRESS, not just a `Some`: it must land exactly on the
+/// pool's last legal byte, `(page_ceiling − 1) · page_stride + (plane's last block)`, so the
+/// ceiling is proven TIGHT — one block lower would refuse a legal address, one block higher
+/// would admit the first page the pool does not hold.
+#[test]
+fn an_entry_at_or_above_the_pools_ceiling_is_unconstructible() {
+    use scratchy_subtile::sdsc_abstract::{
+        GatherEntry, PagedKvPool, gather_entry_ceiling, gather_entries_per_page,
+    };
+    let pool = PagedKvPool::new(8, 64);
+    let page_ceiling = 4u64;
+    // A page must span whole planes of its own pool (a plane here is 32 blocks), which the
+    // ceiling's door itself refuses otherwise.
+    let page_stride = 128 * pool.stick_block_bytes();
+    let ceiling = gather_entry_ceiling(page_ceiling, page_stride, pool)
+        .expect("a page that is a whole number of stick blocks");
+    let plane_blocks = (pool.plane_stride() / pool.stick_block_elems()) as u32;
+
+    // THE LAST LEGAL ENTRY — page 3 (the ceiling's last), the plane's last block — and its
+    // address is exactly the pool's last legal byte from the base.
+    let last = GatherEntry::of_page_block(ceiling, (page_ceiling - 1) as i64, plane_blocks - 1)
+        .expect("the ceiling's own last page and the plane's own last block are legal");
+    assert_eq!(
+        last.as_i32() as u64 * pool.stick_block_bytes(),
+        (page_ceiling - 1) * page_stride + (plane_blocks as u64 - 1) * pool.stick_block_bytes(),
+        "the last legal entry must land on the pool's last legal byte — the ceiling is tight"
+    );
+    // THE FIRST ILLEGAL ONES, both boundaries of the same exclusive bound: the first page the
+    // pool does not hold, and the block one past the plane inside the last page.
+    assert_eq!(
+        GatherEntry::of_page_block(ceiling, page_ceiling as i64, 0),
+        None,
+        "a page the pool's budget does not hold must be unconstructible, not merely unlikely"
+    );
+    assert_eq!(
+        GatherEntry::of_page_block(
+            ceiling,
+            (page_ceiling - 1) as i64,
+            plane_blocks
+        ),
+        None,
+        "the block one past the plane's own extent is the ceiling itself — the FIRST illegal value"
+    );
+    // AND THE CEILING'S DOOR REFUSES WHAT THE FACTOR'S DOOR REFUSES: a page that is not a whole
+    // number of entries, an unpaged stride, and a zero page budget all answer `None`.
+    assert!(
+        gather_entry_ceiling(page_ceiling, pool.stick_block_bytes() + 1, pool).is_none()
+            && gather_entry_ceiling(page_ceiling, 0, pool).is_none()
+            && gather_entry_ceiling(0, page_stride, pool).is_none()
+            && gather_entries_per_page(pool.stick_block_bytes() + 1, pool).is_none(),
+        "the ceiling inherits the factor's refusals and adds the zero page budget"
+    );
+}
+
 /// ⛔⛔⛔ THE TABLE IS A **FLAT ARRAY OVER THE COPY'S OWN `mb` ROWS**, ONE PASS-BLOCK PER FOLD PASS —
 /// and the row order is `GatherScratch::row_of`'s, request-MINOR.
 ///
@@ -371,7 +435,7 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
     use scratchy_subtile::sdsc_abstract::{
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
-        SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
+        SlotCount, SlotWindow, gather_entry_ceiling, gather_index_table,
     };
     // Two kv heads and one 64-slot window keeps the arithmetic readable; the request axis is what the
     // order is about, so it is the axis with two values.
@@ -386,13 +450,13 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
 
     // Row 0 holds two pages, row 1 holds one — the ragged batch that is the ordinary case.
     let tables = vec![vec![17i64, 3], vec![4]];
-    // ⭐ BOTH FACTORS THROUGH THEIR ONE DOOR. `per_page` was `10i64` and `pass_stride` was `8usize`
-    // — hand-written numbers for quantities that are now [`EntriesPerPage`] (only
-    // `gather_entries_per_page` mints one, from the pool's own entry size) and [`PassStride`] (only
-    // the prefix mask mints one, because the index rides the mask's shift). Ten pages' worth of
-    // stick blocks is a real page stride for this pool; the mask's own block gives the pitch.
-    let per_page = gather_entries_per_page(10 * pool.stick_block_bytes(), pool)
+    // ⭐ BOTH FACTORS THROUGH THEIR ONE DOOR. The page factor and the page budget are now ONE
+    // type ([`GatherEntryCeiling`], only `gather_entry_ceiling` mints one — 32 pages of budget
+    // over ten pages' worth of stick blocks, a real page stride for this pool) and `pass_stride`
+    // is still the mask's own block ([`PassStride`], because the index rides the mask's shift).
+    let ceiling = gather_entry_ceiling(32, 10 * pool.stick_block_bytes(), pool)
         .expect("a page that is a whole number of stick blocks");
+    let per_page = ceiling.per_page();
     let pass_stride = PrefixMaskShape::<POOL_STICK, PAGE_MASK_COLS>::new(
         1,
         scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(2).expect("2 is a baked rung"),
@@ -405,7 +469,7 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
         pass_stride.get(),
         scratch.rows()
     );
-    let t = gather_index_table(scratch, &tables, 2, per_page, pass_stride).expect("a table");
+    let t = gather_index_table(scratch, &tables, 2, ceiling, pass_stride).expect("a table");
     assert_eq!(
         t.len(),
         2 * pass_stride.get(),
@@ -458,11 +522,11 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
     // the pool's entry size, so the quotient is at least 1. A runtime assertion for a state the type
     // system now excludes is a test of dead code, so it is deleted rather than reworded.
     assert!(
-        gather_index_table(scratch, &[vec![17], vec![]], 2, per_page, pass_stride).is_none(),
+        gather_index_table(scratch, &[vec![17], vec![]], 2, ceiling, pass_stride).is_none(),
         "a launch row with no pages cannot be given one"
     );
     assert!(
-        gather_index_table(scratch, &tables[..1], 2, per_page, pass_stride).is_none(),
+        gather_index_table(scratch, &tables[..1], 2, ceiling, pass_stride).is_none(),
         "fewer installed page maps than the scratch's requests is a bind for rows nobody installed"
     );
 }
@@ -491,7 +555,7 @@ fn the_index_is_flat_over_the_scratch_rows_one_block_per_pass() {
 fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds() {
     use scratchy_subtile::sdsc_abstract::{
         GatherScratch, PAGE_MASK_COLS, POOL_STICK, PagedKvPool, PrefixMaskShape, QueryRowCount,
-        SlotCount, SlotWindow, gather_entries_per_page, gather_index_table,
+        SlotCount, SlotWindow, gather_entry_ceiling, gather_index_table,
     };
     let pool = PagedKvPool::new(8, 64);
     let mq = QueryRowCount::of_mq(2);
@@ -537,15 +601,18 @@ fn the_row_of_a_coordinate_does_not_depend_on_how_many_windows_the_scratch_holds
         // ⭐ AND THE TABLE ITSELF, read the way the body's ops read it. The host builds it once, at the
         // ceiling; every entry the narrow body gathers must be the block that body's coordinate names.
         let tables = vec![vec![17i64, 3], vec![4i64, 9]];
-        let per_page = gather_entries_per_page(10 * pool.stick_block_bytes(), pool)
+        // `entry_ceiling` — the pool's own bound (32 pages of budget over ten pages' worth of
+        // stick blocks); the scratch above keeps the name `ceiling` for the sweep rung.
+        let entry_ceiling = gather_entry_ceiling(32, 128 * pool.stick_block_bytes(), pool)
             .expect("a page that is a whole number of stick blocks");
+        let per_page = entry_ceiling.per_page();
         let pass_stride = PrefixMaskShape::<POOL_STICK, PAGE_MASK_COLS>::new(
             32,
             scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(2).expect("a baked rung"),
         )
         .expect("a shape")
         .pass_stride();
-        let t = gather_index_table(ceiling, &tables, 2, per_page, pass_stride)
+        let t = gather_index_table(ceiling, &tables, 2, entry_ceiling, pass_stride)
             .expect("the host's table, built at the ceiling");
         for p in 0..2usize {
             for r in 0..body.mq() {

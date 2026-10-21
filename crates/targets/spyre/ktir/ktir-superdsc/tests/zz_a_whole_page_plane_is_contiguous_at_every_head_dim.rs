@@ -46,6 +46,7 @@
 use ktir_superdsc::sdsc_abstract::{
     CopyDims, FeatIdx, GatherEntry, GatherScratch, KvCoord, KvHead, KvPlane, KvSlot, POOL_STICK,
     PagePlaneExtent, PageScratch, PagedKvPool, QueryRowCount, gather_entries_per_page,
+    gather_entry_ceiling,
 };
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
@@ -557,8 +558,10 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
         let page_stride = LAYERS * PLANES * plane.bytes();
         let block_bytes = pool.stick_block_bytes();
 
-        let per_page =
-            gather_entries_per_page(page_stride, pool).expect("a whole number of stick blocks");
+        // The pool's own ceiling — 256 pages of budget, past every page the sweep below names.
+        let ceiling =
+            gather_entry_ceiling(256, page_stride, pool).expect("a whole number of stick blocks");
+        let per_page = ceiling.per_page();
         assert_eq!(
             per_page.get() as u64,
             page_stride / block_bytes,
@@ -567,7 +570,7 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
 
         for phys in [0i64, 1, 7, 128] {
             for i in [0u32, 1, 31] {
-                let e = GatherEntry::of_page_block(per_page, phys, i).expect("in range");
+                let e = GatherEntry::of_page_block(ceiling, phys, i).expect("in range");
                 assert_eq!(
                     e.as_i32() as u64 * block_bytes,
                     phys as u64 * page_stride + i as u64 * block_bytes,
@@ -576,9 +579,14 @@ fn the_page_entry_reproduces_the_hosts_page_address() {
             }
         }
         assert_eq!(
-            GatherEntry::of_page_block(per_page, -1, 0),
+            GatherEntry::of_page_block(ceiling, -1, 0),
             None,
             "hd={hd}: a negative page must refuse"
+        );
+        assert_eq!(
+            GatherEntry::of_page_block(ceiling, 256, 0),
+            None,
+            "hd={hd}: a page the pool's budget does not hold must be unconstructible"
         );
         assert_eq!(
             gather_entries_per_page(block_bytes + 1, pool),

@@ -865,8 +865,10 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
         // And the host's table is that run (after Kᵗ's own when Kᵗ is in HBM): the prompt chunk's
         // same entries, part-major.
         let pages: Vec<i64> = (0..j as i64).collect();
-        // A one-layer pool's page is `nkvh * PAGE_SLOTS / POOL_STICK` stick blocks.
-        let per_page = ktir_superdsc::sdsc_abstract::gather_entries_per_page(
+        // A one-layer pool's page is `nkvh * PAGE_SLOTS / POOL_STICK` stick blocks; the ceiling
+        // carries the ladder's own top (PAGES_MAX = 64) as the page budget.
+        let ceiling = ktir_superdsc::sdsc_abstract::gather_entry_ceiling(
+            64,
             32 * pool.stick_block_bytes(),
             pool,
         )
@@ -875,7 +877,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             chunk,
             ChunkRowKind::OneRequest,
             &pages,
-            per_page,
+            ceiling,
             0,
             0,
         )
@@ -884,7 +886,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
             chunk,
             ChunkRowKind::Prompt,
             &pages,
-            per_page,
+            ceiling,
             0,
             0,
         )
