@@ -825,8 +825,8 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
         if op.result.is_some_and(|r| interior.contains(&r)) {
             continue;
         }
-        if let Some((v, _)) = W::splat_scale_of(f, op) {
-            push(v, &mut out);
+        if let Some(sf) = W::splat_scale_of(f, op) {
+            push(sf.value, &mut out);
         }
     }
     Ok(out)

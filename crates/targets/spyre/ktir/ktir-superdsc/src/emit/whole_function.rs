@@ -964,6 +964,13 @@ enum Lowering {
     /// clamp against a stated bound). See [`splat_scale_of`] for the discriminator and
     /// `scalarextremum_at` for the body it lowers through.
     ScalarExtremum { value: f32, max: bool },
+    /// `tile − C` / `C − tile` with `C` a splatted constant — the non-commutative member of the
+    /// constant-operand pointwise class. The ORDER is the program's own statement and is carried
+    /// here (`const_first`: the splat is the op's first input), because subtraction is the one op
+    /// of the class whose two orders are DIFFERENT functions: the emission derives its operand
+    /// layout from this fact (see [`SplatFact`]) rather than assuming one. The online softmax's
+    /// running-max rescale at trip 0 — `m − m_new` against the `tl.full` initial — is the shape.
+    ScalarSub { value: f32, const_first: bool },
     /// `tile * <splatted runtime scalar>` — rung 3 of the address-provenance ladder: the multiplier
     /// is a `[1,1]` PARAMETER the launch binds (`const:t<id>`), so the emission names its binding by
     /// tid rather than looking a value up in the registry. See [`bound_scale_of`] for the
@@ -992,16 +999,32 @@ enum Lowering {
 /// multipliers). The whole-function reader returns `None` there by construction, so the scale has to
 /// be read from the op that uses it.
 ///
-/// Returns `(scale, the tensor operand)`. `None` when this is not a scalar multiply at all:
+/// Returns the constant-operand pointwise's stated shape: the constant's VALUE, the TENSOR
+/// operand, and WHICH INPUT the constant occupies — the ORDER fact. `None` when this op does
+/// not state exactly one splatted-constant operand:
 ///
-/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise(Mul)`, which the 1:1 map handles.
+/// * NEITHER operand is a splat — an ordinary two-tensor `Elementwise` op, which the 1:1 map handles.
 /// * BOTH are splats — a multiply of two compile-time constants. That is not a scalarmul (there is no
 ///   tensor to scale) and emitting one would invent an operand; it belongs to constant folding
 ///   upstream, so it falls through to be refused by name.
+///
+/// ⛔ THE ORDER IS STRUCTURAL, NOT COSMETIC. For a COMMUTATIVE op (`multiply`, `maximum`,
+/// `minimum`) the two orders lower to the same function and the emission may swap operands for
+/// its own placement laws. For a NON-commutative one (`subtract`) the two orders are DIFFERENT
+/// functions — `C − tile` is not `tile − C` — so the emission derives its operand layout from
+/// this fact and never assumes one.
+#[derive(Clone, Copy, Debug)]
+pub struct SplatFact {
+    pub value: f32,
+    pub tensor: Ssa,
+    /// The splatted constant is the op's FIRST input (`C ∘ tile`); `false` means `tile ∘ C`.
+    pub const_first: bool,
+}
+
 pub fn splat_scale_of(
     f: &IRFunction<'static>,
     op: &ktir_core::ir::Operation<'static>,
-) -> Option<(f32, Ssa)> {
+) -> Option<SplatFact> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     // A splatted compile-time FLOAT. `arith.constant` → `tensor.splat` is the only spelling this
     // crate's producers use, and it is the one `program_scalarmul_scale` already reads.
@@ -1021,8 +1044,16 @@ pub fn splat_scale_of(
     };
     let [a, b] = op.operands[..] else { return None };
     match (splat_value(a), splat_value(b)) {
-        (Some(v), None) => Some((v as f32, b)),
-        (None, Some(v)) => Some((v as f32, a)),
+        (Some(v), None) => Some(SplatFact {
+            value: v as f32,
+            tensor: b,
+            const_first: true,
+        }),
+        (None, Some(v)) => Some(SplatFact {
+            value: v as f32,
+            tensor: a,
+            const_first: false,
+        }),
         // Both or neither: not a scalar multiply. See the doc above.
         _ => None,
     }
@@ -2217,6 +2248,11 @@ enum RowFoldKind {
     /// multiplier is part of [`RowFoldKind::ScalarMul`]: a family whose blocks clamped at
     /// different bounds (or in different directions) computes different functions per block.
     ScalarExtremum { value: f32, max: bool },
+    /// `tile − C` / `C − tile` with `C` a splatted constant — the subtraction's own scalar form. The
+    /// bound AND the ORDER are part of the kind, for the same reason the multiplier is part of
+    /// [`RowFoldKind::ScalarMul`]: subtraction is not commutative, so a family whose blocks stated
+    /// different orders computes different functions per block.
+    ScalarSub { value: f32, const_first: bool },
     /// `tile · loaded [1,1] parameter` — the same launch-bound multiplier.
     BoundScalarMul,
 }
@@ -2252,8 +2288,8 @@ fn classify_row_fold(
         if rmsnorms.iter().any(|c| op.result == Some(c.out)) {
             return None;
         }
-        if let Some((v, _)) = splat_scale_of(f, op) {
-            return Some(RowFoldKind::ScalarMul(v));
+        if let Some(sf) = splat_scale_of(f, op) {
+            return Some(RowFoldKind::ScalarMul(sf.value));
         }
         if let Ok(Some(_)) = bound_scale_of(k, op) {
             return Some(RowFoldKind::BoundScalarMul);
@@ -2274,11 +2310,20 @@ fn classify_row_fold(
     // which would otherwise call a clamp-with-constant `Elementwise(Maximum/Minimum)` and address
     // the splat as a second input.
     if matches!(op.op_type, OpKind::ArithMaxnumf | OpKind::ArithMinnumf)
-        && let Some((v, _)) = splat_scale_of(f, op)
+        && let Some(sf) = splat_scale_of(f, op)
     {
         return Some(RowFoldKind::ScalarExtremum {
-            value: v,
+            value: sf.value,
             max: op.op_type == OpKind::ArithMaxnumf,
+        });
+    }
+    // The subtraction's scalar tiebreak, the same precedence and for the same reason — and the
+    // ORDER rides the kind, because `C − tile` and `tile − C` are different functions a merge
+    // must not average over.
+    if op.op_type == OpKind::ArithSubf && let Some(sf) = splat_scale_of(f, op) {
+        return Some(RowFoldKind::ScalarSub {
+            value: sf.value,
+            const_first: sf.const_first,
         });
     }
     match program_of(op.op_type) {
@@ -2489,22 +2534,31 @@ fn row_tiled_family(
                 term.operands.iter().copied().take(leader_n_in).collect()
             }
             RowFoldKind::ScalarMul(_) => {
-                let Some((_, t)) = splat_scale_of(f, term) else {
+                let Some(sf) = splat_scale_of(f, term) else {
                     return err(format!(
                         "{}: a scalar-multiply family member whose multiplier is not a splat",
                         f.name
                     ));
                 };
-                vec![t]
+                vec![sf.tensor]
             }
             RowFoldKind::ScalarExtremum { .. } => {
-                let Some((_, t)) = splat_scale_of(f, term) else {
+                let Some(sf) = splat_scale_of(f, term) else {
                     return err(format!(
                         "{}: an extremum family member whose bound is not a splat",
                         f.name
                     ));
                 };
-                vec![t]
+                vec![sf.tensor]
+            }
+            RowFoldKind::ScalarSub { .. } => {
+                let Some(sf) = splat_scale_of(f, term) else {
+                    return err(format!(
+                        "{}: a scalar-subtract family member whose subtrahend is not a splat",
+                        f.name
+                    ));
+                };
+                vec![sf.tensor]
             }
             RowFoldKind::BoundScalarMul => {
                 let Ok(Some(b)) = bound_scale_of(k, term) else {
@@ -2906,6 +2960,14 @@ pub fn lower_function(
         let extremum = matches!(op.op_type, OpKind::ArithMaxnumf | OpKind::ArithMinnumf)
             .then(|| splat_scale_of(f, op))
             .flatten();
+        // ⭐ THE NON-COMMUTATIVE MEMBER of the same class: `arith.subf` against a splatted
+        // constant. Same discriminator, and the fact the others could drop is the one this op
+        // cannot: WHICH input the constant occupies, since `C − tile` and `tile − C` are
+        // different functions. Checked before the 1:1 map for the same reason as the others —
+        // `Elementwise(Sub)` would refuse the splat at the input collection.
+        let scalar_sub = (op.op_type == OpKind::ArithSubf)
+            .then(|| splat_scale_of(f, op))
+            .flatten();
         // ⭐ RUNG 3: a mulf by a splat of a LOADED `[1,1]` PARAMETER is the SAME tiebreak with the
         // multiplier bound at launch rather than baked. `to_ktir`'s `expand_splat_of_scalar_argument`
         // emits the `[1,1]` view/tile/load chain for a scalar argument and re-points its splat at the
@@ -2935,10 +2997,14 @@ pub fn lower_function(
             })
             .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
             .or(reduce.map(Lowering::Reduce))
-            .or(scalar.map(|(v, _)| Lowering::ScalarMul(v)))
-            .or(extremum.map(|(v, _)| Lowering::ScalarExtremum {
-                value: v,
+            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
+            .or(extremum.map(|sf| Lowering::ScalarExtremum {
+                value: sf.value,
                 max: op.op_type == OpKind::ArithMaxnumf,
+            }))
+            .or(scalar_sub.map(|sf| Lowering::ScalarSub {
+                value: sf.value,
+                const_first: sf.const_first,
             }))
             .or(bound_scale.map(Lowering::BoundScalarMul))
             .or_else(|| program_of(op.op_type).map(Lowering::Node))
@@ -2973,9 +3039,12 @@ pub fn lower_function(
             Lowering::Reduce(_) => 1,
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
             // const — so a scalar multiply reads ONE tensor. The extremum's scalar form is the
-            // same: the clamp's bound rides the op, the tile is the one operand.
+            // same: the clamp's bound rides the op, the tile is the one operand. And so is the
+            // subtraction's: whichever SIDE the constant was stated on, the tile is the one
+            // tensor the descriptor reads.
             Lowering::ScalarMul(_)
             | Lowering::ScalarExtremum { .. }
+            | Lowering::ScalarSub { .. }
             | Lowering::BoundScalarMul(_) => 1,
             // x and gamma; the epsilon, `1/cols` and the oneplus offset are the fused body's own.
             Lowering::RmsNorm(..) => 2,
@@ -2991,14 +3060,14 @@ pub fn lower_function(
         };
 
         // A fused chain's inputs are the ones the RECOGNISER proved, not the terminal op's operands.
-        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, extremum) {
+        let in_values: Vec<Ssa> = match (terminal, scalar, bound_scale, extremum, scalar_sub) {
             // The two tensors the rmsnorm recogniser proved, walked back through the rank plumbing to
             // values a `Region` exists for.
             _ if rms.is_some() => {
                 let c = rms.expect("just matched");
                 vec![c.x, c.gamma]
             }
-            (Some(c), _, _, _) => match c.up {
+            (Some(c), _, _, _, _) => match c.up {
                 Some(up) => vec![c.gate, up],
                 // The bare form's one input is the gate; the divide's other operand is the
                 // chain-interior `1 + e^-x`, which the fused op never materialises.
@@ -3006,14 +3075,17 @@ pub fn lower_function(
             },
             // The TENSOR operand the recogniser proved, not operand 0 — the splat sits on either side
             // (`ms * INV_D` has it second, and nothing obliges a producer to put it there).
-            (None, Some((_, tensor)), _, _) => vec![tensor],
+            (None, Some(sf), _, _, _) => vec![sf.tensor],
             // RUNG 3: same rule, the splat's other side. The bound scale is a `[1,1]` parameter, not
             // an operand of the descriptor.
-            (None, None, Some(b), _) => vec![b.tensor],
+            (None, None, Some(b), _, _) => vec![b.tensor],
             // The extremum's scalar form: the TENSOR operand, the clamp's other side — the same
             // rule the mulf arm states.
-            (None, None, None, Some((_, tensor))) => vec![tensor],
-            (None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
+            (None, None, None, Some(sf), _) => vec![sf.tensor],
+            // The subtraction's: same rule again — the constant rides the op whatever side it was
+            // stated on, and the tile is the one operand.
+            (None, None, None, None, Some(sf)) => vec![sf.tensor],
+            (None, None, None, None, None) => op.operands.iter().copied().take(n_in).collect(),
         };
 
         // A BROADCAST OPERAND READS ITS SOURCE. The chain minted no buffer (it emitted no op), so the
@@ -3093,6 +3165,7 @@ pub fn lower_function(
                 Lowering::Silu
                     | Lowering::ScalarMul(_)
                     | Lowering::ScalarExtremum { .. }
+                    | Lowering::ScalarSub { .. }
                     | Lowering::BoundScalarMul(_)
                     | Lowering::Node(Program::Elementwise(_))
             )
@@ -3283,6 +3356,7 @@ pub fn lower_function(
                 program,
                 Lowering::ScalarMul(_)
                     | Lowering::ScalarExtremum { .. }
+                    | Lowering::ScalarSub { .. }
                     | Lowering::BoundScalarMul(_)
             )
         {
@@ -3317,17 +3391,19 @@ pub fn lower_function(
                 program,
                 Lowering::ScalarMul(_)
                     | Lowering::ScalarExtremum { .. }
+                    | Lowering::ScalarSub { .. }
                     | Lowering::BoundScalarMul(_)
             )
         {
             return err(format!(
                 "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` (t{} gathered through \
                  t{}), and this door declares an index operand only for the constant-operand \
-                 pointwise bodies (`Program::ScalarMul` and the extremum's own scalar form) — \
-                 `scalarmul_scaled` is the one body that carries a `Gather`. Every other assembler \
-                 here would emit a descriptor reading the table DIRECTLY at its base, which is the \
-                 right shape and the wrong rows, from a clean bake. Give the gathered operand its \
-                 own `ScalarMul` node, or add the index to the assembler this op needs.",
+                 pointwise bodies (`Program::ScalarMul`, the extremum's and the subtraction's own \
+                 scalar forms) — `scalarmul_scaled` is the one body that carries a `Gather`. Every \
+                 other assembler here would emit a descriptor reading the table DIRECTLY at its \
+                 base, which is the right shape and the wrong rows, from a clean bake. Give the \
+                 gathered operand its own `ScalarMul` node, or add the index to the assembler this \
+                 op needs.",
                 f.name,
                 op.op_type,
                 op_gather.map_or(0, |(g, _, _)| g.value_tid),
@@ -3993,6 +4069,15 @@ fn emit_one(
         Lowering::ScalarExtremum { value, max } => {
             return super::lower_ktir_to_superdsc::scalarextremum_at(
                 name, value, max, gather, per_op, sym_id_base, layout,
+            );
+        }
+        // `tile − C` / `C − tile` — the non-commutative member, through the same ONE shared body,
+        // with the ORDER the program stated. The body derives its operand layout from that fact
+        // (and refuses the one gathered shape no order can serve), so the two sides of a
+        // subtraction are distinguishable all the way into the descriptor.
+        Lowering::ScalarSub { value, const_first } => {
+            return super::lower_ktir_to_superdsc::scalarsub_at(
+                name, value, const_first, gather, per_op, sym_id_base, layout,
             );
         }
         // RUNG 3: the same body, with the multiplier's ADDRESS named by binding rather than looked

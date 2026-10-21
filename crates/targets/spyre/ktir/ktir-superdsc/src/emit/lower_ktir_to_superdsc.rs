@@ -2972,7 +2972,9 @@ fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
 /// whole-function walk, which classifies an `arith.mulf` with exactly one splatted constant as a
 /// `ScalarMul` whose multiplier [`scalarmul_at`] resolves by value — and, the same tiebreak, an
 /// `arith.maxnumf`/`arith.minnumf` with exactly one splatted constant as the extremum's own scalar
-/// form, whose bound [`scalarextremum_at`] resolves by value — so the per-op reader is
+/// form, whose bound [`scalarextremum_at`] resolves by value — and, the same tiebreak again, an
+/// `arith.subf` with exactly one splatted constant as the subtraction's own scalar form, whose
+/// constant [`scalarsub_at`] resolves by value — so the per-op reader is
 /// [`super::whole_function::splat_scale_of`], the same one that walk calls for both tiebreaks. A
 /// one-node program is lowered by the per-`Program` door, whose rmsnorm arm resolves its epsilon
 /// ([`program_rmsnorm_eps`]) and its `(1+w)` offset ([`program_gain_offset`]) through the same
@@ -2984,10 +2986,13 @@ pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
     for op in f.operations.iter() {
         if matches!(
             op.op_type,
-            OpKind::ArithMulf | OpKind::ArithMaxnumf | OpKind::ArithMinnumf
-        ) && let Some((v, _)) = super::whole_function::splat_scale_of(f, op)
+            OpKind::ArithMulf
+                | OpKind::ArithMaxnumf
+                | OpKind::ArithMinnumf
+                | OpKind::ArithSubf
+        ) && let Some(sf) = super::whole_function::splat_scale_of(f, op)
         {
-            stated.push(v);
+            stated.push(sf.value);
         }
     }
     if let Some(eps) = program_rmsnorm_eps(f) {
@@ -3227,6 +3232,80 @@ mod scale_completion_tests {
                 v
             },
             "the appended half is bits-sorted, not walk-ordered"
+        );
+    }
+
+    /// `x − C` / `C − x` — the subtraction's own scalar form, the non-commutative member of the
+    /// constant-operand class. Both STATED ORDERS are built: the online softmax's trip-0 rescale
+    /// reads the `tl.full` initial (−65504) on the subtract's FIRST side, and nothing obliges a
+    /// producer to put it there — the collector must state the value for either order, and only
+    /// the value (the order is the emission's fact, not the registry's).
+    fn subtracted(constant: f64, const_first: bool) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, sub) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let operands = if const_first { &[sp, x] } else { &[x, sp] };
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(constant),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]),
+            Operation::new(a, Some(sub), OpKind::ArithSubf, operands),
+        ];
+        IRFunction {
+            name: "subtract_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// THE SUBTRACTION'S OWN WALL-3 HALF. A subtract's stated constant is looked up by value
+    /// exactly like a multiplier, from EITHER stated order, and the f16-floor initial is a
+    /// constant no payload names — both orders state it, both get exactly one appended slot.
+    #[test]
+    fn a_subtraction_constant_the_census_never_saw_gets_one_appended_slot() {
+        for const_first in [true, false] {
+            let mut scales = vec![0.5f32];
+            let stated = program_stated_scales(&subtracted(-65504.0, const_first));
+            assert_eq!(
+                stated,
+                vec![-65504.0f32],
+                "the {} order states its constant",
+                if const_first { "C − tile" } else { "tile − C" }
+            );
+            complete_scale_registry(&mut scales, stated);
+            assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
+            assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
+            assert_eq!(
+                scale_slot_in(&scales, -65504.0),
+                Some(1),
+                "the door's own lookup now resolves the constant"
+            );
+        }
+    }
+
+    /// A subtract whose constant the registry lacks is REFUSED as the desync it is — and the
+    /// refusal names the subtraction and the value, the same law `scalarmul_at`'s desync states.
+    #[test]
+    fn an_unregistered_subtraction_constant_is_refused_by_name() {
+        let Err(e) = scalarsub_at("s0", -65504.0, true, None, &[], &mut 0, None) else {
+            panic!("no registry means no slot: the subtraction must refuse")
+        };
+        assert!(
+            e.message.contains("Subtraction s0") && e.message.contains("-65504"),
+            "names the op and the constant: {}",
+            e.message
+        );
+        let Err(e) = scalarsub_at("s0", 448.0, false, None, &[], &mut 0, None) else {
+            panic!("no registry means no slot: the subtraction must refuse")
+        };
+        assert!(
+            e.message.contains("Subtraction s0") && e.message.contains("448"),
+            "names the op and the constant, whichever side it was stated on: {}",
+            e.message
         );
     }
 
@@ -7049,7 +7128,7 @@ mod elementwise_tests {
                 let ops = scalarmul_scaled(
                     "scalarmul_s1",
                     &ScaleSource::Bound { tid: 99 },
-                    "multiply",
+                    ScalarOp::Multiply,
                     None,
                     &r,
                     &mut sym,
@@ -7111,7 +7190,7 @@ mod elementwise_tests {
         let mut ops = scalarmul_scaled(
             "scalarmul_s1",
             &ScaleSource::Bound { tid: 99 },
-            "multiply",
+            ScalarOp::Multiply,
             None,
             &logits,
             &mut sym,
@@ -7135,6 +7214,56 @@ mod elementwise_tests {
             "names the tensor and its window: {}",
             e.message
         );
+    }
+
+    /// ⛔⛔⛔ THE TWO SIDES OF A SUBTRACTION ARE DIFFERENT OPERAND ORDERS IN THE DESCRIPTOR —
+    /// `C − tile` and `tile − C` are different functions, so the emission must carry the
+    /// program's stated order into the operand layout, and this pins that it does: the multiply
+    /// (commutative, the card-proven tile-first layout) anchors which base is the tile's and
+    /// which the scale's, and the two subtraction orders must come out as exact swaps of that
+    /// pair with the output LAST. A body that assumed one order — the doc-comment defect this
+    /// wall deleted — would emit one of these two rows wrong and fail here.
+    #[test]
+    fn the_two_sides_of_a_subtraction_emit_different_operand_orders() {
+        let c = -65504.0f32;
+        let rows = 4u32;
+        let r = vec![
+            chunked(5, rows, 0, 64, 64, false),
+            chunked(7, rows, 0, 64, 64, true),
+        ];
+        let mut layout = BundleLayout::default();
+        layout.scalarmul_scales.push(c);
+        // The operands are graph tensors, so the layout knows them the way the bake does: an
+        // Activation placement each (the `graph_layout` law the placement-pass tests state).
+        layout.synth(PlaceId::Act(5), &[rows, 64]);
+        layout.synth(PlaceId::Act(7), &[rows, 64]);
+        // The registry's slot 0 is a device tid like any other — the bake declares its `[1,1]`
+        // placement (`scalarmul_scale_tid(i)`), and so does this layout.
+        layout.synth(PlaceId::Act(scalarmul_scale_tid(0)), &[1, 1]);
+        let mut sym = 0i64;
+        let mul = operand_bases(
+            &scalarmul_at("mul_o", c, None, &r, &mut sym, Some(&layout))
+                .unwrap_or_else(|e| panic!("{}", e.message)),
+        );
+        let c_first = operand_bases(
+            &scalarsub_at("sub_c", c, true, None, &r, &mut sym, Some(&layout))
+                .unwrap_or_else(|e| panic!("{}", e.message)),
+        );
+        let t_first = operand_bases(
+            &scalarsub_at("sub_t", c, false, None, &r, &mut sym, Some(&layout))
+                .unwrap_or_else(|e| panic!("{}", e.message)),
+        );
+        let [m0, m1, m2] = mul[..] else {
+            panic!("the multiply emits [tile, scale, out], got {mul:?}")
+        };
+        assert_ne!(
+            m0, m1,
+            "the tile and the scale must not share a base — the swap would be invisible"
+        );
+        // `tile − C`: the tile stays first, exactly the multiply's layout.
+        assert_eq!(&t_first, &[m0, m1, m2], "tile − C keeps the tile-first order");
+        // `C − tile`: the scalar and the tile SWAP; the output stays last.
+        assert_eq!(c_first, [m1, m0, m2], "C − tile puts the scalar first");
     }
 
     /// ⭐ THE CONTROL: chunk 0 — corner 0 on every operand — still takes the SEEDED emission,
@@ -7976,7 +8105,63 @@ pub fn scalarmul_at(
         &ScaleSource::Registry {
             slot: scalarmul_scale_tid(idx),
         },
-        "multiply",
+        // A multiply is commutative, so the stated order cannot change what it computes; the
+        // body keeps the card-proven layout either way.
+        ScalarOp::Multiply,
+        gather,
+        r,
+        sym_id_base,
+        layout,
+    )
+}
+
+/// ⭐⭐⭐ THE SUBTRACTION'S OWN SCALAR FORM — `tile − C` / `C − tile` with `C` a constant the
+/// program states as a splat, the non-commutative member of the constant-operand pointwise
+/// class, the same tiebreak [`scalarmul_at`] states for multiply and [`scalarextremum_at`] for
+/// the extrema.
+///
+/// The 1:1 map lowers a two-tensor `arith.subf` as `Elementwise(Sub)`; what that arm cannot
+/// take is a splat operand (no `Region`, the same refusal every splat meets). But a subtract
+/// against a STATED CONSTANT is not a two-tensor op — it is the subtraction's scalar form, and
+/// the online softmax's running-max rescale is exactly that shape: trip 0's `m − m_new` reads
+/// the `tl.full` initial (−65504, the f16 floor) on one side of a subtract.
+///
+/// ⛔ AND THE ORDER IS THE FUNCTION. `C − tile` and `tile − C` differ by more than sign, so
+/// the program's stated order (`const_first`, read by [`super::whole_function::splat_scale_of`])
+/// travels INTO the emission: the ungathered body lays its operands out as stated, and the
+/// gathered body refuses the one shape no order can serve (see [`scalarmul_scaled`]'s
+/// gathered-arm law). The two sides of a subtraction are distinguishable all the way into the
+/// descriptor.
+///
+/// The constant is resolved through the SAME value lookup ([`scale_slot`]: exact bits, then the
+/// f16 image), so the registry's completion pass — the program-stated half, which collects
+/// `arith.subf` exactly like the mulf and the extrema — must carry it, and a program whose
+/// constant the registry lacks is refused as the desync it is.
+pub fn scalarsub_at(
+    name: &str,
+    value: f32,
+    const_first: bool,
+    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
+    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
+    // node gathers.
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let idx = scale_slot(layout, value).ok_or_else(|| Error {
+        message: format!(
+            "Subtraction {name}: constant {value}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor reads a bound `[1,1]` const, so the \
+             value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    scalarmul_scaled(
+        name,
+        &ScaleSource::Registry {
+            slot: scalarmul_scale_tid(idx),
+        },
+        ScalarOp::Subtract { const_first },
         gather,
         r,
         sym_id_base,
@@ -8032,7 +8217,12 @@ pub fn scalarextremum_at(
         &ScaleSource::Registry {
             slot: scalarmul_scale_tid(idx),
         },
-        if max { "maximum" } else { "minimum" },
+        // Both extrema are commutative, so the stated order cannot change what they compute.
+        if max {
+            ScalarOp::Maximum
+        } else {
+            ScalarOp::Minimum
+        },
         gather,
         r,
         sym_id_base,
@@ -8073,7 +8263,8 @@ pub fn scalarmul_bound(
     scalarmul_scaled(
         name,
         &ScaleSource::Bound { tid: bound.tid },
-        "multiply",
+        // A multiply is commutative, so the stated order cannot change what it computes.
+        ScalarOp::Multiply,
         gather,
         r,
         sym_id_base,
@@ -8094,25 +8285,60 @@ enum ScaleSource {
     Bound { tid: u32 },
 }
 
-/// ⭐ THE OP'S DDL `opFuncName`, CARRIED AS THE ONE DIFFERENCE between the constant-operand bodies:
-/// `"multiply"` for the scale bodies, `"maximum"`/`"minimum"` for the extremum's own scalar form
-/// ([`scalarextremum_at`]). The descriptor shape is the same for all three — one tile input, one
-/// `In::scalar` over the bound `[1,1]` const — which is why this is one body and not three copies
+/// ⭐ THE OP'S DDL `opFuncName` AND ITS COMMUTATIVITY, CARRIED AS THE ONE DIFFERENCE between the
+/// constant-operand bodies: `"multiply"` for the scale bodies, `"maximum"`/`"minimum"` for the
+/// extremum's own scalar form ([`scalarextremum_at`]), `"subtract"` for the subtraction's own
+/// ([`scalarsub_at`]). The descriptor shape is the same for all four — one tile input, one
+/// `In::scalar` over the bound `[1,1]` const — which is why this is one body and not copies
 /// that could drift (the drift class [`scalarmul_at`]'s own doc records).
 ///
-/// ⛔ ONLY COMMUTATIVE OPS MAY TAKE THE GATHERED SWAP BELOW, and the parameter's every value is
-/// one: `multiply`, `maximum`, `minimum` all compute the same function with their operands
-/// exchanged. A non-commutative op_func here is a caller bug the swap would silently
-/// mis-operand — the caller that names a new one owes the commutativity argument.
+/// ⛔ AND THE COMMUTATIVITY IS A DERIVED FACT THE BODY READS, NOT A DOC-COMMENT ASSUMPTION. Every
+/// operand-layout decision below — which input the scalar occupies ungathered, whether the
+/// gathered arm may swap — is a `match` over `op` itself, whose [`ScalarOp::Subtract`] variant
+/// carries the program's stated order and whose [`ScalarOp::commutative`] answers the swap
+/// question. `subtract` is the one member whose two operand orders are DIFFERENT functions, so
+/// it takes its layout from the stated order and refuses the one gathered shape no order can
+/// serve; the other three swap freely because `commutative()` says so, not because a comment
+/// promised it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ScalarOp {
+    Multiply,
+    Maximum,
+    Minimum,
+    /// `tile − C` / `C − tile` — NOT commutative: the two operand orders are different
+    /// functions, so the program's stated order rides the discriminant itself
+    /// (`const_first`: the splatted constant is the op's first input, `C − tile`).
+    Subtract { const_first: bool },
+}
+
+impl ScalarOp {
+    fn op_func(self) -> &'static str {
+        match self {
+            ScalarOp::Multiply => "multiply",
+            ScalarOp::Maximum => "maximum",
+            ScalarOp::Minimum => "minimum",
+            ScalarOp::Subtract { .. } => "subtract",
+        }
+    }
+
+    /// The one fact every operand-layout decision below reads: whether exchanging the two
+    /// inputs computes the same function. `true` for `multiply`/`maximum`/`minimum`; `false`
+    /// for `subtract` — `C − tile` and `tile − C` differ by more than sign.
+    fn commutative(self) -> bool {
+        !matches!(self, ScalarOp::Subtract { .. })
+    }
+}
+
 fn scalarmul_scaled(
     name: &str,
     scale: &ScaleSource,
-    op_func: &'static str,
+    op: ScalarOp,
     gather: Option<Gather>,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
+    let op_func = op.op_func();
     // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
     // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
     // than by relaxing the count. See [`split_out_excluding`]. A BOUND scale joins the skip list for
@@ -8176,7 +8402,24 @@ fn scalarmul_scaled(
     // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
     // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
     // tiling block) emits the bytes it always did.
-    let inputs = [In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew()];
+    //
+    // ⭐ AND THE ORDER IS DERIVED FROM THE FACTS, NOT ASSUMED. A COMMUTATIVE op keeps the
+    // card-proven tile-first layout — exchanging the operands computes the same function, which
+    // is `commutative()`'s answer, not a comment's promise — so every multiply/extremum
+    // emission is byte-identical to what it always was. The SUBTRACTION takes the program's
+    // STATED order, because its two orders are different functions: the descriptor's
+    // `subtract` computes input 0 − input 1 (the old attention path's `corrsub`:
+    // `[run_m, newm]` → `run_m − newm`, card-proven), so `C − tile` puts the scalar first and
+    // `tile − C` the tile first, exactly as stated.
+    let (tile_in, scalar_in) = (
+        In::col_window(&x_h, corner).ew(),
+        In::scalar(&scale_h).ew(),
+    );
+    let inputs = if op.commutative() || matches!(op, ScalarOp::Subtract { const_first: false }) {
+        [tile_in, scalar_in]
+    } else {
+        [scalar_in, tile_in]
+    };
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
     let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
@@ -8254,7 +8497,8 @@ fn scalarmul_scaled(
                 g.index_tid, idx_r.v_rows, idx_r.v_cols,
             ));
         }
-        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
+        // ⛔⛔⛔ THE TABLE GOES **LAST** — THE GATHERED LAYOUT IS FORCED, AND ITS CORRECTNESS IS
+        // DERIVED FROM THE ORDER FACT.
         //
         // Two placement laws have to hold at once and they coincide at exactly one position. The index
         // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
@@ -8264,16 +8508,17 @@ fn scalarmul_scaled(
         // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
         // when the gathered tensor is the LAST input.
         //
-        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
-        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
-        // `[scalar, table, idx, out]`: adjacent AND output-last.
-        //
-        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS COMMUTATIVE — `multiply`, `maximum`, `minimum`
-        // all compute the same function with their operands exchanged: the SAME two
-        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
-        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
-        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
-        // behalf.
+        // The ungathered commutative order above is `[table, scalar]`, which would emit
+        // `[table, scalar, idx, out]` — index at 2, table at 0, non-adjacent. Swapping to
+        // `[scalar, table]` emits `[scalar, table, idx, out]`: adjacent AND output-last. That
+        // swap is what the forced layout IS, and whether it computes this op's function is a
+        // DERIVED predicate, never a doc-comment promise: a commutative op computes the same
+        // function with its operands exchanged (`commutative()`'s own answer); a `subtract`
+        // computes `C − tile` in this layout, which is the program's subtraction exactly when
+        // the program stated the constant FIRST. The one shape left over — `tile − C` gathered
+        // — satisfies no order at all (the placement laws force the table last while the stated
+        // subtraction needs it first) and is refused below, by name, rather than emitted as the
+        // silently different `C − tile`.
         //
         // ⛔⛔⛔ AND THIS ARM HELD `inputs` / `gathered_input: 0` UNTIL THE WHOLE-FUNCTION DOOR REACHED
         // IT. `scalarmul_at`'s header said "everything below is unchanged and shared, so the two doors
@@ -8284,6 +8529,16 @@ fn scalarmul_scaled(
         // gathered operand ... those are the same slot only for the LAST input". MEASURED, the moment
         // that refusal was lifted: `KTIR_WHOLE=1 bake_py embedding_granite`. `scalarmul` now DELEGATES
         // here, so there is one body and the drift class is gone rather than repaired.
+        if let ScalarOp::Subtract { const_first: false } = op {
+            return err(format!(
+                "{name}: a gathered `subtract` whose constant is the SECOND operand (`tile − C`) — \
+                 the gather's placement laws force the table LAST with the index beside it \
+                 (`[scalar, table, idx, out]`, the dbo dominance law), and that layout computes \
+                 `C − tile`. No operand order satisfies both the index-adjacency law and the stated \
+                 subtraction, so this is a refusal rather than a descriptor computing a different \
+                 function than the program. State the constant first, or lower this op ungathered."
+            ));
+        }
         let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
         // ⭐ THE RUN, BUILT WHERE THE NODE'S ROWS ARE KNOWN — the program's stick-checked anchor
         // plus the whole sticks this node's entries span ([`StickRun::covering`]). The constructor
