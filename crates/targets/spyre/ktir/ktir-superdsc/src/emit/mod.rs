@@ -54,6 +54,17 @@ pub mod lower_ktir_to_superdsc;
 /// function is refused by arity, correctly, and there is nothing else to state.
 pub mod whole_function;
 
+/// A per-`layout`-dim field in the order dxp reads it: as stated, or REVERSED for a view that
+/// states [`crate::superdsc_opspec::TensorArg::with_dxp_innermost_first`]. Every serialization of a
+/// view's dim order — `layoutDimOrder_` on the alloc node and on `primaryDsInfo_`, `scale_` — goes
+/// through here, so the three cannot disagree about which end of `layout` dxp reads first.
+fn wire_order<T>(v: &ArgView<'_>, mut xs: Vec<T>) -> Vec<T> {
+    if v.dxp_innermost_first {
+        xs.reverse();
+    }
+    xs
+}
+
 /// REAL per-core HBM start addresses for one tensor's allocate node (task #50 —
 /// replaces the former same-base-for-all-cores stub). Each core `c` gets:
 ///
@@ -1946,6 +1957,7 @@ fn core_local_reads_agree(
             df: v.df,
             row_blocked: v.row_blocked,
             device_extent: v.device_extent,
+            dxp_innermost_first: v.dxp_innermost_first,
         };
         let dims: Vec<&'static str> = plan.dims().iter().map(|d| d.name).collect();
         let corners = per_core_addr(
@@ -3472,7 +3484,7 @@ pub fn emit_sdsc(
             ldsIdx_: i as u32,
             dsName_: format!("Tensor{i}"),
             dsType_: v.role.ds_type(),
-            scale_: v.scale.iter().map(|s| s.to_i64()).collect(),
+            scale_: wire_order(v, v.scale.iter().map(|s| s.to_i64()).collect()),
             wordLength: v.df.word_length(),
             // Per-tensor dtype from the arg's typed `Df` (`v.df`, the SINGLE source of truth) — NOT a name
             // suffix. `Df::Fp32` → IEEE_FP32 (4-byte, the KSPLIT fp32-SFP-merge partials); `Df::Fp8` →
@@ -3523,19 +3535,19 @@ pub fn emit_sdsc(
         primary.entry(v.role.ds_type()).or_insert_with(|| {
             if is_transpose_out {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec!["out", "mb"],
                     stickSize_: vec![8, 8],
                 }
             } else if is_fp8_kernel {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec!["in", "out"],
                     stickSize_: vec![2, 64],
                 }
             } else {
                 LayoutInfo {
-                    layoutDimOrder_: v.layout.to_vec(),
+                    layoutDimOrder_: wire_order(v, v.layout.to_vec()),
                     stickDimOrder_: vec![v.stick],
                     stickSize_: vec![v.df.elems_per_stick()], // fp16/bf16: 64; fp32: 32; fp8/int8: 128
                 }
@@ -3968,7 +3980,7 @@ pub fn emit_sdsc(
             // stick-major tensor — dxp applies `get_generic_stick_layout` INTERNALLY when it reconstructs
             // the stick-blocked `device_size` from `-1`, so the mb-outermost label + `-1` already yields the
             // stick-major walk (`element_torchspyre_parity`). Reordering here DIVERGES from the golden.
-            layoutDimOrder_: v.layout.to_vec(),
+            layoutDimOrder_: wire_order(v, v.layout.to_vec()),
             // ── The ON-CARD WALK, DERIVED from the SAME `sl` the per-core START uses (`StickLayout::
             // max_dim_sizes`) so the two cannot disagree. Stick-blocked (`RowBlocked`/`Kernel`) ⇒ `-1` per
             // dim (dxp reconstructs the RowBlocked device_size from N_/layoutDimOrder_/stickSize_ and
@@ -4022,7 +4034,17 @@ pub fn emit_sdsc(
                 );
                 // Paged only on the gathered value side. Every pin was resolved against this operand's
                 // own layout above, so `paged_at` cannot be the thing that drops one.
-                if paged_dims.is_empty() {
+                //
+                // ⭐ A dxp-INNERMOST-FIRST VIEW IS RECONSTRUCTED, NOT PINNED: dxp builds its walk from
+                // the REVERSED `layoutDimOrder_` plus the view's back gaps, and a pinned extents array
+                // would be read at the opposite end first — the same strides it derives from the labels,
+                // restated in an order the labels do not carry. `-1` per dim hands the reconstruction to
+                // the labels (the same spelling every stick-blocked view above takes). Ungathered only:
+                // a paged axis keeps its pin, which is what `paged_at` states.
+                if v.dxp_innermost_first && paged_dims.is_empty() {
+                    crate::sdsc_abstract::StickLayout::kernel(1, 1)
+                        .device_walk(&vec![1i64; v.layout.len()])
+                } else if paged_dims.is_empty() {
                     walk
                 } else {
                     walk.clone().paged_at(&paged_dims).unwrap_or(walk)
@@ -4083,7 +4105,34 @@ pub fn emit_sdsc(
                 None | Some(IndirectRole::Value { .. }) => None,
             },
             startAddressCoreCorelet_: addr,
-            backGapCore_: None,
+            // HBM back gaps, `-1`-keyed for all cores — torch-spyre's own spelling (`compute_ops.py`'s
+            // `backGapCore_`). Absent unless a dim states one, and the ONE thing that states one on
+            // this crate is a dxp-innermost-first view's declared `device_extent` wider than its sweep
+            // (`phys − swept`): the only spelling of a physical extent dxp honours as a stride
+            // (`sizesWithGaps_`, dsc2.cpp:2899 — a pinned `maxDimSizes_` entry is not one). Every
+            // existing view declares no extent or serializes as stated, so this stays `None` for every
+            // bundle the crate emitted before the flag existed.
+            backGapCore_: {
+                let gaps: serde_json::Map<String, serde_json::Value> = v
+                    .layout
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(li, d)| {
+                        let gap = if v.dxp_innermost_first {
+                            v.device_extent
+                                .get(li)
+                                .copied()
+                                .flatten()
+                                .map_or(0, |p| p.saturating_sub(iter.extent(d)))
+                        } else {
+                            0
+                        };
+                        (gap > 0)
+                            .then(|| (d.to_string(), serde_json::json!({ "-1": gap.to_string() })))
+                    })
+                    .collect();
+                (!gaps.is_empty()).then_some(serde_json::Value::Object(gaps))
+            },
             coordinates_: coordinates,
         });
     }

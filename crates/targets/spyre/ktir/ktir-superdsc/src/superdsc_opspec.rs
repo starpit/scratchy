@@ -1992,7 +1992,15 @@ pub struct TensorArg<const D: usize> {
     /// torch-spyre's `dev_dim_size > it_dim_size` case — so address/stride derivation for that dim must use
     /// `phys`, not the op's logical extent, mirroring torch-spyre's `strides[dim] = strides[dim] //
     /// dev_dim_size * it_dim_size` rescale exactly. Set via [`TensorArg::with_device_extent`].
+    /// Per-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
+    /// "physical extent == this op's own iteration extent for that dim". See
+    /// [`ArgView::dxp_innermost_first`] for the wire-order flag's law.
     device_extent: [Option<u32>; D],
+    /// ⭐ SERIALIZE THIS VIEW'S DIM ORDER INNERMOST-FIRST — see [`ArgView::dxp_innermost_first`]
+    /// for the law (dxp reads `layoutDimOrder_` idx 0 as innermost and honours a wider physical
+    /// extent only as a `backGapCore_` gap). Set only by [`TensorArg::with_dxp_innermost_first`],
+    /// read only by the wire serialization; the address model never sees it.
+    dxp_innermost_first: bool,
 }
 
 impl<const D: usize> TensorArg<D> {
@@ -2040,6 +2048,7 @@ impl<const D: usize> TensorArg<D> {
             df: Df::Fp16,
             row_blocked: false,
             device_extent: [None; D],
+            dxp_innermost_first: false,
         })
     }
 
@@ -2084,6 +2093,13 @@ impl<const D: usize> TensorArg<D> {
         self.device_extent[idx] = Some(phys_extent);
         Ok(self)
     }
+
+    /// Serialize this view's dim order innermost-first — see [`ArgView::dxp_innermost_first`]
+    /// for the law. Chains off [`TensorArg::new`]; the address model is untouched.
+    pub fn with_dxp_innermost_first(mut self) -> TensorArg<D> {
+        self.dxp_innermost_first = true;
+        self
+    }
 }
 
 /// Rank-erased tensor arg (ranks ≤ 4 in practice), so `OpSpec.args` can hold a
@@ -2123,6 +2139,20 @@ pub struct ArgView<'a> {
     /// Per-`layout`-dim physical device extent override (torch-spyre `arg.device_size`) — `None` means
     /// "physical extent == this op's own iteration extent for that dim" (see [`TensorArg::device_extent`]).
     pub device_extent: &'a [Option<u32>],
+    /// ⭐ SERIALIZE THIS VIEW'S DIM ORDER THE WAY DXP READS IT — INNERMOST FIRST. `layout` is
+    /// this crate's address model, OUTERMOST-first row-major over the device extents
+    /// ([`crate::sdsc_abstract::StickLayout::for_view_df`] → `Flat`, `off_view`), and every
+    /// address this crate computes (`per_core_addr`, the byte gates) reads it in that order,
+    /// flag or no flag. But dxp reads `layoutDimOrder_` INNERMOST-first — stated on the field
+    /// itself (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`: "idx 0 means innermost") —
+    /// and honours a physical extent wider than the sweep ONLY as a back gap
+    /// (`backGapCore_`, `sizesWithGaps_` at `dsc2.cpp:2899`; a pinned `maxDimSizes_` entry is
+    /// not a stride). A view carrying this flag is serialized with its per-dim wire fields
+    /// REVERSED (`layoutDimOrder_`, `scale_`, `maxDimSizes_`) and each declared `device_extent`
+    /// becomes a back gap of `phys − swept` on its dim; the address model reads `layout`
+    /// unchanged, so the two orders are one fact stated at each end. `false` — every view
+    /// built before this flag — serializes exactly as before, byte for byte.
+    pub dxp_innermost_first: bool,
 }
 
 impl AnyTensorArg {
@@ -2217,6 +2247,18 @@ impl AnyTensorArg {
             AnyTensorArg::R2(t) => set(t, dim, phys_extent),
             AnyTensorArg::R3(t) => set(t, dim, phys_extent),
             AnyTensorArg::R4(t) => set(t, dim, phys_extent),
+        }
+    }
+
+    /// Rank-erased [`TensorArg::with_dxp_innermost_first`] setter — flips the wire-order flag on
+    /// an arg a builder already assembled. Only the batched gathered dot's operands carry it;
+    /// every other builder's args serialize in the stated order, byte for byte.
+    pub fn set_dxp_innermost_first(&mut self) {
+        match self {
+            AnyTensorArg::R1(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R2(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R3(t) => t.dxp_innermost_first = true,
+            AnyTensorArg::R4(t) => t.dxp_innermost_first = true,
         }
     }
 
@@ -2322,6 +2364,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R2(t) => ArgView {
                 is_input: t.is_input,
@@ -2336,6 +2379,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R3(t) => ArgView {
                 is_input: t.is_input,
@@ -2350,6 +2394,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
             AnyTensorArg::R4(t) => ArgView {
                 is_input: t.is_input,
@@ -2364,6 +2409,7 @@ impl AnyTensorArg {
                 df: t.df,
                 row_blocked: t.row_blocked,
                 device_extent: &t.device_extent,
+                dxp_innermost_first: t.dxp_innermost_first,
             },
         }
     }
