@@ -184,6 +184,35 @@ pub struct RetileDescriptor {
     pub word_length: u32,
 }
 
+/// One row of the step-input discovery table ([`BundleLayout::step_inputs`]): the SLOT the one
+/// numbering law ([`step_input_tid`](crate::ktir_node::step_input_tid)) gave the tid, and the
+/// ELEMENT FORMAT the program's own view states for that buffer.
+///
+/// ⛔ BOTH FACTS ARE THE PROGRAM'S OWN STATEMENTS, recorded by the placement pass at the same
+/// statements it sizes the placement from — the slot is what the producer numbered the binding
+/// through, and the element format is the dtype of the buffer's own `construct_memory_view`. The
+/// slot is what the runtime ADDRESSES the input by; the element format is what the bake maps to
+/// the staging law. Neither is given a meaning here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepInputRow {
+    pub slot: u32,
+    pub df: Df,
+}
+
+// `Df`'s own doc law is that the typed core does NOT derive `Serialize` (the wire structs do), so
+// the row serializes its format as the dataspace's own `dataFormat_` string — the same spelling
+// the emitted descriptors carry, which is what a runtime diagnostic reading `bundle_layout.json`
+// can actually compare against.
+impl serde::Serialize for StepInputRow {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("StepInputRow", 2)?;
+        st.serialize_field("slot", &self.slot)?;
+        st.serialize_field("df", self.df.dataformat())?;
+        st.end()
+    }
+}
+
 /// The whole-bundle memory plan: every tensor → (segment, offset, size, role),
 /// plus each segment's total packed bytes. Exported as `bundle_layout.json` for
 /// the resident executor (which allocates one region per occupied segment).
@@ -287,19 +316,19 @@ pub struct BundleLayout {
     /// the wide class's upper lanes (dump-proven on gemma-4 tiny-allglobal).
     #[serde(default)]
     pub attn_class_hds: Vec<u32>,
-    /// ⭐⭐⭐ THE HOST-STAGED PER-STEP INPUTS — tid → the SLOT it took (see
-    /// [`step_input_tid`](crate::ktir_node::step_input_tid)).
+    /// ⭐⭐⭐ THE HOST-STAGED PER-STEP INPUTS — tid → its [`StepInputRow`].
     ///
     /// This is the WORKER'S DISCOVERY TABLE, and it is DATA, exactly like [`Self::weight_copies`]
     /// and [`Self::scalarmul_scales`]: a per-step input is placed like any other Activation (its
     /// placement is in [`Self::placements`], sized from the program's own view), and this field is
     /// how the runtime tells a staged buffer apart from an intermediate WITHOUT recomputing the
-    /// producer's numbering — the runtime reads the tid and the slot off the artifact and never
-    /// re-derives `graph.tensors.len() + k`. What the runtime WRITES into each slot's buffer is the
-    /// staging law, which travels beside this through the wiring as data; this crate serializes
-    /// both and branches on neither.
+    /// producer's numbering — the runtime reads the tid, the slot and the element format off the
+    /// artifact and never re-derives `graph.tensors.len() + k`. The element format is the
+    /// program's own view statement, recorded at the same statement the placement was sized from,
+    /// and it is what the bake maps to the staging law (which runtime channel narrows the host's
+    /// bytes); this crate serializes all of it and branches on none of it.
     #[serde(default)]
-    pub step_inputs: std::collections::BTreeMap<u32, u32>,
+    pub step_inputs: std::collections::BTreeMap<u32, StepInputRow>,
     /// SYNTHETIC intermediates created during lowering (silu's `{out}_silu`,
     /// rmsnorm's `{out}_sq/mean/meps/inv/tmp/eps`) are NOT SubtileIR tensors, so
     /// they have no `t{id}` placement. They are lazily assigned a STABLE offset in

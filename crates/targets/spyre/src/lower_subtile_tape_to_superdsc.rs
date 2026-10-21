@@ -6038,12 +6038,13 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // it — the slot map is this layout's, gone when the bake returns.
         lx,
         kv_request_stride_bytes,
-        // EMIT-ONLY FOR NOW: the host-staged step-input map is the placement pass's own record of
-        // WHICH tids are per-step inputs and the SLOT each took — the discovery table the runtime's
-        // fill half will stage through (never `tensors.len()+k`). The fill half bakes it beside its
-        // staging law (the `weight_copies`/`scalarmul_scales` channel); until that lands there is no
-        // runtime reader, and the PLACEMENTS the map's tids carry above are already baked.
-        step_inputs: _,
+        // ⭐ THE HOST-STAGED STEP INPUTS' DISCOVERY TABLE + STAGING LAW, BAKED. The placement pass
+        // recorded each stated input's slot and the element format its program's own view states;
+        // here that format becomes the staging channel — WHICH runtime narrowing the host's bytes
+        // take — and a format with no channel is a `cargo build` panic (this runs at bake), not a
+        // launch-time guess. The runtime resolves slots through the baked table and never
+        // recomputes the producer's `tensors.len()+k` numbering.
+        step_inputs,
         // EMIT-ONLY: the gather reach is the gather door's compile-time bound — the pool a pooled
         // table's entry run is refused past at build. The runtime's own pool budget and the host's
         // `GatherEntry` composition are the value-side authorities; the baked artifact carries the
@@ -6187,6 +6188,33 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // `chunk_gather_index_table` read passes it beside `lx_op_local_bytes`, so it refuses
         // exactly what the bake refused.
         lx_prob_pin_bytes: lx.borrow().prob_pin_bytes,
+        // The discovery table + staging law, tid-sorted (the placement pass kept a BTreeMap): one
+        // row per stated input, its element format mapped to the runtime channel that narrows it.
+        // ⛔ A FORMAT WITH NO CHANNEL IS A BUILD PANIC, not a silent default: this runs at bake, so
+        // a program stating a step input the launch could not stage fails `cargo build` naming the
+        // tid — the same fail-closed shape as every other bake-time guard here.
+        step_inputs: std::borrow::Cow::Owned(
+            step_inputs
+                .iter()
+                .map(|(&tid, row)| {
+                    let stage = match row.df {
+                        Df::Fp16 => bundle::StepInputStage::IeeeF16,
+                        Df::SenUint32 => bundle::StepInputStage::RawU32,
+                        other => panic!(
+                            "t{tid}: a host-staged step input whose program states {other:?} has \
+                             no staging channel — the runtime narrows IEEE f16 to SEN169 or copies \
+                             raw u32 entries, and nothing else. REFUSING to bake a buffer the \
+                             launch could not stage."
+                        ),
+                    };
+                    bundle::StepInput {
+                        tid,
+                        slot: row.slot,
+                        stage,
+                    }
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -9510,6 +9538,75 @@ mod tests {
             "t{victim} must be a real placement for the collision to be the card's shape"
         );
         layout.synth(ktir_superdsc::place::PlaceId::Act(victim), &[1, 64]);
+        let _ = bake_layout(&layout);
+    }
+
+    /// ⭐⭐⭐ THE FILL HALF'S BAKE: the discovery table crosses into the runtime artifact, each
+    /// row's element format mapped to the staging channel that narrows its bytes. The two formats
+    /// today's programs state — an fp16 buffer (the SEN169 narrowing) and a u32 index table (the
+    /// raw copy) — bake to their channels, tid-sorted (the placement pass kept a `BTreeMap`, so
+    /// the artifact's byte order cannot depend on the walk's program order).
+    #[test]
+    fn the_bake_maps_each_step_inputs_format_to_its_staging_channel() {
+        let mut layout = two_node_layout();
+        layout.step_inputs.insert(
+            5,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 0,
+                df: Df::Fp16,
+            },
+        );
+        layout.step_inputs.insert(
+            2,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 1,
+                df: Df::SenUint32,
+            },
+        );
+        let baked = bake_layout(&layout);
+        assert_eq!(
+            baked.step_inputs.iter().copied().collect::<Vec<_>>(),
+            vec![
+                bundle::StepInput {
+                    tid: 2,
+                    slot: 1,
+                    stage: bundle::StepInputStage::RawU32,
+                },
+                bundle::StepInput {
+                    tid: 5,
+                    slot: 0,
+                    stage: bundle::StepInputStage::IeeeF16,
+                },
+            ],
+            "tid-sorted, each row's format mapped to its channel"
+        );
+        // And the fill answers through the baked table: slot 1 is t2 at its own placement extent.
+        assert_eq!(
+            baked.step_input_fill(1, 8 * 64 * 2),
+            Ok(bundle::StepInputFill {
+                place: bundle::PlaceId::Act(2),
+                size: 8 * 64 * 2,
+                stage: bundle::StepInputStage::RawU32,
+            }),
+            "the baked table answers the fill's own question end to end"
+        );
+    }
+
+    /// ⛔ A FORMAT WITH NO STAGING CHANNEL IS A BUILD PANIC, NOT A SILENT DEFAULT. This runs at
+    /// bake, so a program stating a step input the launch could not stage fails `cargo build`
+    /// naming the tid — fail-closed, exactly like every other bake-time guard here. A new format
+    /// gains a channel and a variant in the same commit, never a fallback.
+    #[test]
+    #[should_panic(expected = "no staging channel")]
+    fn the_bake_refuses_a_step_input_format_with_no_channel() {
+        let mut layout = two_node_layout();
+        layout.step_inputs.insert(
+            5,
+            ktir_superdsc::placement::StepInputRow {
+                slot: 0,
+                df: Df::Fp8,
+            },
+        );
         let _ = bake_layout(&layout);
     }
 }

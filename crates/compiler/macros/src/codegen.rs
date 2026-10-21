@@ -9911,6 +9911,7 @@ fn layout_tokens(
         kv_request_stride_bytes,
         lx_op_local_bytes,
         lx_prob_pin_bytes,
+        step_inputs,
     } = l;
     let segs = segment_bytes
         .iter()
@@ -9945,6 +9946,29 @@ fn layout_tokens(
     // budget, summed beside the gathers at the bake's `lx_form` admission. 0 for a bundle whose
     // chunk form mints none.
     let lxpp = proc_macro2::Literal::u64_unsuffixed(*lx_prob_pin_bytes);
+    // The host-staged step inputs' discovery table — which tid each slot took, and which staging
+    // channel narrows its bytes. The stage match has NO wildcard on purpose: a new channel is a
+    // new variant, and this match failing to compile is what forces the emission to learn it in
+    // the same commit (the same law the exhaustive destructure above enforces for fields).
+    let sis = step_inputs.iter().map(|si| {
+        let tid = proc_macro2::Literal::u32_unsuffixed(si.tid);
+        let slot = proc_macro2::Literal::u32_unsuffixed(si.slot);
+        let stage = match si.stage {
+            scratchy_target_spyre::bundle_code::StepInputStage::IeeeF16 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StepInputStage::IeeeF16 }
+            }
+            scratchy_target_spyre::bundle_code::StepInputStage::RawU32 => {
+                quote! { ::scratchy_target_spyre::bundle_code::StepInputStage::RawU32 }
+            }
+        };
+        quote! {
+            ::scratchy_target_spyre::bundle_code::StepInput {
+                tid: #tid,
+                slot: #slot,
+                stage: #stage,
+            }
+        }
+    });
     // The segment budget's verdict, as a variant: every reader matches on it.
     let tail = match weight_tail {
         scratchy_target_spyre::bundle_code::WeightTail::InPlace => {
@@ -9974,6 +9998,7 @@ fn layout_tokens(
             kv_request_stride_bytes: #krs,
             lx_op_local_bytes: #lxol,
             lx_prob_pin_bytes: #lxpp,
+            step_inputs: ::std::borrow::Cow::Borrowed(&[#(#sis),*]),
         }
     }
 }

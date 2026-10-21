@@ -267,11 +267,16 @@ fn a_non_attention_program_with_step_inputs_places_them() {
     assert_eq!(p.segment, SegRole::Activation.segment());
     assert_eq!(p.size, 8 * 64 * 2, "the extent and dtype are the view's own");
     assert_eq!(p.offset, u64::from(n) * 0x10000, "packed at the segment end");
-    // The discovery row: tid → slot, the data the runtime's fill half will stage through.
+    // The discovery row: tid → (slot, element format) — the slot the runtime addresses the input
+    // by, and the format the bake maps to the staging channel. Both are the program's own
+    // statements; neither says what the input IS.
     assert_eq!(
         layout.step_inputs.get(&6),
-        Some(&0),
-        "the discovery table records the slot the binding took"
+        Some(&ktir_superdsc::placement::StepInputRow {
+            slot: 0,
+            df: ktir_superdsc::superdsc_opspec::Df::Fp16,
+        }),
+        "the discovery table records the slot and the view's own element format"
     );
     // The identity row: without it `resolve_seg_base` treats the parameter as an undeclared
     // synthetic.
@@ -316,6 +321,40 @@ fn the_placement_sizes_from_the_views_own_dtype() {
         p.size, 128,
         "1×32 i32 at SenUint32's 4 B word is 128 B — an fp16 default here would under-reserve \
          the buffer the program reads"
+    );
+    // And the discovery row carries the SAME element format — the bake maps it to the raw-u32
+    // staging channel, so a row that said fp16 would stage an index table through the f16
+    // narrowing and corrupt every entry.
+    assert_eq!(
+        layout.step_inputs.get(&2),
+        Some(&ktir_superdsc::placement::StepInputRow {
+            slot: 0,
+            df: ktir_superdsc::superdsc_opspec::Df::SenUint32,
+        }),
+        "the discovery row states the view's own element format"
+    );
+}
+
+/// ⛔ TWO PROGRAMS DISAGREEING ABOUT ONE BUFFER'S ELEMENT FORMAT ARE REFUSED — same slot, same
+/// extent, different dtype. The two would share one buffer while the bake maps them to
+/// DIFFERENT staging channels, so the f16 narrowing would rewrite an index table's entries.
+/// Same refusal family as the extent disagreement: stated twice, both statements must agree.
+#[test]
+fn two_programs_disagreeing_about_one_buffers_format_are_refused() {
+    let n = 6u32;
+    // Both state slot 0 (t6) at the SAME byte extent (8×64 fp16 = 8×32 i32 = 1024 B); only the
+    // element format differs.
+    let first = step_program("mul_s6", 0, 5, 6, Some(0), DType::F16, 8, 64);
+    let second = step_program("mul_s7", 1, 4, 6, Some(0), DType::I32, 8, 32);
+    let ops = [carrying(first), carrying(second)];
+    let lists: Vec<&[EmittedOp]> = ops.iter().map(|v| v.as_slice()).collect();
+    let mut layout = graph_layout(n);
+    let err = place_step_inputs(&mut layout, &lists, n)
+        .expect_err("two element formats for one buffer is a refusal, not a repair");
+    assert!(
+        err.0.contains("two element formats"),
+        "the refusal names the disagreement: {}",
+        err.0
     );
 }
 

@@ -436,6 +436,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         lx_op_local_bytes: 0,
         // No chunk form either, so no probability-part pins beside absent gathers.
         lx_prob_pin_bytes: 0,
+        // No host-staged step inputs: this runner's layouts come from `layout::for_regions`, which
+        // serves one kernel minted positionally and states none. A stated input's discovery table
+        // is baked by `bake_layout` on the consumer ladder, whose bundles these are not.
+        step_inputs: std::borrow::Cow::Owned(Vec::new()),
     };
 
     println!("  parsed segment_bytes {:?}", segment_bytes);

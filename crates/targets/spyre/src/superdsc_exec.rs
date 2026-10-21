@@ -1748,6 +1748,58 @@ impl Executor {
         self.bound.insert(b.id, b.bytes);
     }
 
+    /// ⭐⭐⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT — the runtime's staging half of the per-step
+    /// inputs a spliced program binds past the graph.
+    ///
+    /// The SLOT is the caller's whole handle. This resolves it through the bundle's own baked
+    /// discovery table (data — the runtime never recomputes the producer's `tensors.len()+k`
+    /// numbering), measures the bytes against the placement's extent (the program's own
+    /// `construct_memory_view` statement, sized by the placement pass from that same view), and
+    /// routes them through the channel the bake's staging law states — the f16 narrowing or the
+    /// raw copy, both of which are the guarded channels above. Every disagreement refuses naming
+    /// the slot and the tid (see [`bundle::BundleLayout::step_input_fill`], where the law lives).
+    ///
+    /// ⛔ ZERO KERNEL VOCABULARY, AND THAT IS THE WHOLE DESIGN: this asks WHICH slot, HOW MANY
+    /// bytes, and WHICH channel — nothing about what the input IS. The caller that knows the
+    /// content (a page table, a validity mask) computes it and hands over bytes; a second kernel
+    /// family stating per-step inputs flows through here unchanged.
+    ///
+    /// ⛔ REFUSED BEFORE `prepare`, unlike the channels it routes to: a bind that arrives before
+    /// prepare is latched as a RESIDENT weight and never re-sent, and a per-step input that stops
+    /// being re-sent is every later launch reading the first launch's bytes — silently, fluently
+    /// wrong. The refusal is the cheapest place that cannot happen.
+    pub fn fill_step_input(&mut self, slot: u32, bytes: Vec<u8>) -> Result<()> {
+        if !self.prepared {
+            bail!(
+                "fill_step_input(slot {slot}): session NOT YET PREPARED — a bind before prepare is \
+                 latched as a resident weight and never re-sent, so a per-step input staged now \
+                 would freeze the first launch's bytes into every later one"
+            );
+        }
+        let fill = self
+            .code
+            .layout
+            .step_input_fill(slot, bytes.len())
+            .map_err(|e| anyhow!("{e} (bundle {})", self.code.fp))?;
+        match fill.stage {
+            bundle::StepInputStage::IeeeF16 => self.bind_input(fill.place, bytes),
+            bundle::StepInputStage::RawU32 => {
+                // `place_raw` is the ONLY constructor of the value `bind_input_raw` accepts; its
+                // own guards (whole u32 entries, no over-bind) are subsumed by the fill's `==`
+                // law but re-deriving nothing — it re-measures against the same placement.
+                let rb = self.place_raw(fill.place, bytes).ok_or_else(|| {
+                    anyhow!(
+                        "fill_step_input(slot {slot}): the bytes passed the fill's extent law but \
+                         not the raw channel's own entry law — a u32 staging whose length is not a \
+                         whole number of entries"
+                    )
+                })?;
+                self.bind_input_raw(rb);
+            }
+        }
+        Ok(())
+    }
+
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
     /// The composite argmax's descending ramp and scalar-V stick (#603 PR3a), and nothing else
     /// today.

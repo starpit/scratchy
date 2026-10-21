@@ -1625,9 +1625,10 @@ pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedO
 /// of the three can mention what the input IS. A second kernel family stating per-step inputs
 /// flows through this pass unchanged; that is not a hope but the acceptance test
 /// (`a_non_attention_program_with_step_inputs_places_them`). WHAT the runtime writes into a placed
-/// buffer is the staging law, which never enters this crate: it travels as data beside the
-/// discovery table this pass records ([`BundleLayout::step_inputs`]), the same channel
-/// `weight_copies` and `scalarmul_scales` established.
+/// buffer is the caller's; HOW its bytes become the device's is the staging law, which never
+/// enters this crate: the discovery row this pass records carries the program's own element
+/// format, and the bake maps that format to the staging channel — data beside data, the same
+/// channel `weight_copies` and `scalarmul_scales` established.
 ///
 /// ⛔ IDEMPOTENT AND CONFLICT-REFUSING ACROSS PROGRAMS. Every layer of a graph states the same
 /// inputs, so a tid already placed is checked for agreement — same segment, same role, same size —
@@ -1704,6 +1705,11 @@ pub fn place_step_inputs(
                         ))
                     })?;
                 let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                // The row the discovery table bakes: the slot (the numbering law's own answer,
+                // checked above) and the element format the program's own view states — the fact
+                // the bake maps to the staging law, recorded HERE because this is the one
+                // statement that already resolved the view's dtype.
+                let row = ktir_superdsc::placement::StepInputRow { slot: s.slot, df };
                 let seg = SegRole::Activation.segment();
                 match layout.placements.get(&tid) {
                     // Every layer states the same input: the second sighting must AGREE.
@@ -1746,15 +1752,20 @@ pub fn place_step_inputs(
                     }
                 }
                 match layout.step_inputs.get(&tid) {
-                    Some(&prev_slot) if prev_slot != s.slot => {
+                    Some(prev) if *prev != row => {
                         return Err(SuperDscError(format!(
-                            "{}: t{tid} took slot {} here but slot {} earlier — one buffer cannot \
-                             answer to two slots",
-                            e.op_name, s.slot, prev_slot
+                            "{}: t{tid} is stated as (slot {}, {:?}) here but (slot {}, {:?}) \
+                             earlier — one buffer cannot answer to two slots, nor to two element \
+                             formats",
+                            e.op_name,
+                            row.slot,
+                            row.df,
+                            prev.slot,
+                            prev.df
                         )));
                     }
                     _ => {
-                        layout.step_inputs.insert(tid, s.slot);
+                        layout.step_inputs.insert(tid, row);
                     }
                 }
             }

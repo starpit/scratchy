@@ -485,6 +485,17 @@ impl SuperDscSession {
             })
     }
 
+    /// ⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT by its SLOT — the session's forward of the executor's
+    /// own door ([`Executor::fill_step_input`]). The slot is the caller's whole handle: the
+    /// discovery, the extent law and the staging channel are the bundle's own baked answers, and
+    /// every disagreement refuses naming the slot. See the executor's doc for why the refusal set
+    /// is what it is (absent slot, unplaced tid, partial bytes, pre-prepare bind).
+    ///
+    /// [`Executor::fill_step_input`]: crate::superdsc_exec::Executor::fill_step_input
+    pub fn fill_step_input(&mut self, slot: u32, bytes: Vec<u8>) -> Result<()> {
+        self.exec.fill_step_input(slot, bytes)
+    }
+
     /// Run ONE INCREMENTAL forward over `n_new` NEW positions at `[seq_pos..seq_pos+n_new)`.
     /// `activations[i] = (name, f32 data)` are this step's NEW-token sources bound by NAME
     /// (`t{id}` embed + cos/sin), narrowed to f16 at the boundary. The resident pool holds
