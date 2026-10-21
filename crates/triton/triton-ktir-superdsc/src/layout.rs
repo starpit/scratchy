@@ -558,6 +558,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // No paged KV in a single Triton kernel's parameter list; 0 is the documented "no paged KV"
         // value, not a placeholder.
         kv_request_stride_bytes: 0,
+        // No pooled tables: a gather reach is declared by the consumer ladder's producer for a
+        // POOLED tensor — a placement covering one slice of a pool its index re-bases. One Triton
+        // kernel's parameter list places its tables whole, so there is no slice/pool split to
+        // state and the gather door bounds every run by the placement itself.
+        gather_reach: Default::default(),
     })
 }
 

@@ -29,7 +29,13 @@
 //!   operand at the TABLE's tid — the two facts whose absence is the silent direct read the guard
 //!   exists to refuse, and the matmul does not name the table at all;
 //! * CONTROL (fail-closed survival): a gather whose table is the matmul's **A** still refuses,
-//!   with the original guard message — the exception did not swallow the fail-closed rule.
+//!   with the original guard message — the exception did not swallow the fail-closed rule;
+//! * THE POOLED TABLE (b1): a gathered source whose layout declares a `gather_reach` is a POOL
+//!   SLICE — its placement covers one entry while its index names rows across the whole pool —
+//!   so the door bounds the entry RUN against the reach (refused by name past it) and the mint
+//!   checks ONE entry's coverage against the slice. The one-entry placement that the swept-window
+//!   law refuses is admitted under a reach, and the same placement with NO reach still refuses:
+//!   the reach widens the indexed read and nothing else.
 
 use ktir_core::affine::{AffineExpr, AffineMap};
 use ktir_core::arena::Arena;
@@ -481,5 +487,103 @@ fn a_gather_over_the_matmuls_a_is_still_refused_by_the_guard() {
     assert!(
         e.contains("declares an index operand only for `Program::ScalarMul`"),
         "the ORIGINAL fail-closed refusal must fire -- got {e}"
+    );
+}
+
+// ── THE POOLED TABLE (b1) ──────────────────────────────────────────────────────────────────
+//
+// The fixture is `paged_program(GatheredSlot::B)` unchanged; only the LAYOUT changes. The table
+// (t202) is placed at ONE ENTRY's footprint (`[1, HEAD]` = 128 B) instead of the whole
+// `[V, HEAD]`, and the bundle declares the table's `gather_reach` in elements. The node gathers
+// `rows = 64` entries at `head = 64` elements per row, so:
+//
+//   * the SWEPT window is 64 × 64 = 4096 elements = 8192 B — 64× the one-entry placement, which
+//     the swept-window law (the placement footprint) refuses;
+//   * the RUN bound is (0 + 64) × 64 = 4096 elements, which a reach of `V × HEAD = 8192` admits
+//     and a reach one element short refuses.
+
+/// [`layout_for`] with the table (t202) placed at ONE ENTRY's footprint and a declared
+/// `gather_reach` of `reach` elements — the pooled-table statement: a slice placement plus the
+/// pool its index names.
+fn pooled_layout_for(k: &KtirNode, reach: u64) -> BundleLayout {
+    let mut l = layout_for(k);
+    let tid = k.bindings[1].get();
+    l.placements.get_mut(&tid).expect("the table is placed").size = HEAD as u64 * 2;
+    l.gather_reach.insert(tid, reach);
+    l
+}
+
+/// [`emitted`] under a caller-built layout — the pooled cases' door, so the reach and the
+/// placement it bounds are stated by the test and not re-derived.
+fn emitted_with(k: &KtirNode, layout: &BundleLayout) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+    let mut sid = 0i64;
+    lower_function(k, Some(layout), &mut sid, None).map_err(|e| e.message)
+}
+
+/// ⭐ THE POSITIVE: a one-entry placement the swept-window law refuses is ADMITTED under a
+/// declared reach — the door bounds the run (4096 ≤ 8192) and the mint checks one entry's
+/// coverage against the slice (64 × 2 B = 128 B ≤ 128 B). The emission is the rung-4 shape
+/// itself: two copy legs and the contraction, the legs still gathering FROM the table's own
+/// address (the slice placement's base — the pool's base).
+#[test]
+fn a_pooled_table_gathers_past_its_one_slice_placement() {
+    let k = paged_program(GatheredSlot::B);
+    let ops = emitted_with(&k, &pooled_layout_for(&k, V as u64 * HEAD as u64))
+        .expect("a pooled table's gather is bounded by its reach, not its slice placement");
+    assert_eq!(
+        ops.len(),
+        3,
+        "the pooled gather emits the same two copy legs and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    for copy in &ops[..2] {
+        assert_eq!(
+            value_tensor_address(copy),
+            Some(TABLE_ADDR),
+            "each copy leg gathers from the table's own (slice) placement base: {:?}",
+            copy.op_name
+        );
+    }
+}
+
+/// ⛔ THE REFUSAL THE AUDITOR ASKED TO SEE NAMED: an entry run past the declared reach. The run
+/// names rows [0, 64) at 64 elements per row — 4096 elements — against a reach of 4095, one
+/// element short. The refusal names the op, the table, the span and the reach, and states the
+/// law: a run past the declared reach gathers past the pool.
+#[test]
+fn an_entry_run_past_the_declared_gather_reach_is_refused_by_name() {
+    let k = paged_program(GatheredSlot::B);
+    // (run start 0 + 64 rows) × 64 cols = 4096 elements; the reach is one element short.
+    let reach = 64 * 64 - 1;
+    let e = match emitted_with(&k, &pooled_layout_for(&k, reach)) {
+        Err(e) => e,
+        Ok(_) => panic!("a run of 4096 elements past a reach of {reach} must refuse"),
+    };
+    assert!(
+        e.contains("gather reach"),
+        "the refusal names the law it enforces -- got {e}"
+    );
+    assert!(
+        e.contains("rows [0, 64)") && e.contains("4096") && e.contains(&reach.to_string()),
+        "the refusal names the run, the span and the reach it exceeded -- got {e}"
+    );
+}
+
+/// ⛔ CONTROL — THE REACH WIDENS THE INDEXED READ AND NOTHING ELSE: the SAME one-entry
+/// placement with NO declared reach still refuses at the placement footprint. Without this, the
+/// positive above proves nothing — a door that stopped checking placements would pass it too.
+#[test]
+fn a_one_slice_table_without_a_reach_still_refuses_at_the_placement() {
+    let k = paged_program(GatheredSlot::B);
+    let mut l = pooled_layout_for(&k, V as u64 * HEAD as u64);
+    let tid = k.bindings[1].get();
+    l.gather_reach.remove(&tid);
+    let e = match emitted_with(&k, &l) {
+        Err(e) => e,
+        Ok(_) => panic!("a swept window of 8192B past a 128B placement must refuse"),
+    };
+    assert!(
+        e.contains("exceeds its placement footprint"),
+        "the un-reached table keeps the swept-window law -- got {e}"
     );
 }

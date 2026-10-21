@@ -1370,6 +1370,37 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // grid it shares, PLACED after every other activation (see the placement after the scale
     // registry).
     let mut kv_block_index_bytes: Option<u64> = None;
+    // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
+    // placements below (the pool those planes' gathers name), consumed by the gather door's
+    // entry-run bound.
+    let mut gather_reach = std::collections::BTreeMap::<u32, u64>::new();
+    // ⭐ THE LAYER COUNT A PAGE SPANS — hoisted above the node loop because TWO consumers read
+    // it: the gather reach stated at every attention node's plane placements, and the page
+    // ceiling the mask's pass grid derives inside the first node's block. ONE derivation, both
+    // consumers — the reach and the pass grid cannot disagree about how many layers a page spans.
+    //
+    // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
+    // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
+    // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
+    // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
+    // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
+    // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
+    // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
+    // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
+    // derived ceiling here met the per-class slice type and kept `.len()` silently —
+    // it type-checks against both the single-map and per-class shapes.)
+    let kv_layers = if per_layer_ext.is_empty() {
+        ir.nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
+            .count()
+    } else {
+        per_layer_ext
+            .iter()
+            .map(|class| class.values().next().map_or(0, Vec::len))
+            .sum::<usize>()
+    }
+    .max(1) as u64;
     for node in &ir.nodes {
         if let SubOp::AttnDecode {
             geom, layout: kv, ..
@@ -1458,6 +1489,22 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         size: plane_bytes,
                     },
                 );
+            }
+            // ⭐⭐⭐⭐⭐ THE GATHER REACH — the POOL a gathered read of these planes names, stated
+            // where the slice is placed so the two are ONE fact at one site. The placement above
+            // covers this layer's slice of ONE page; a gathered read's index names stick-blocks
+            // across the WHOLE pool — every layer, every plane, every page, the uniform
+            // `hd · 64`-element block grid `GatherEntry::of_page_block` counts in — so the
+            // gather door bounds the entry run against THIS number instead of the slice
+            // footprint. The ceiling is the SAME page ceiling the mask's pass grid derives in
+            // the first node's block below (one flex region, `bundle::MAX_SEGMENT_BYTES`, over
+            // this bundle's own page bytes), so the reach and the pass grid cannot disagree
+            // about how many pages a row may hold. Nothing else widens: a plain sweep of these
+            // tids is still bounded by the placement alone.
+            let page_elems = pool.layer_stride() as u64 * kv_layers;
+            let max_pages = (bundle::MAX_SEGMENT_BYTES / (page_elems * 2)).max(1);
+            for tid in [k_id, v_id, kct_resident_tid(k_id)] {
+                gather_reach.insert(tid, max_pages * page_elems);
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
             // no alignment padding creeping in between layers (hd and page_slots are 64-multiples,
@@ -1561,28 +1608,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
                 // per layer.
                 //
-                // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
-                // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
-                // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
-                // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
-                // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
-                // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
-                // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
-                // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
-                // derived ceiling here met the per-class slice type and kept `.len()` silently —
-                // it type-checks against both the single-map and per-class shapes.)
-                let layers = if per_layer_ext.is_empty() {
-                    ir.nodes
-                        .iter()
-                        .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-                        .count()
-                } else {
-                    per_layer_ext
-                        .iter()
-                        .map(|class| class.values().next().map_or(0, Vec::len))
-                        .sum::<usize>()
-                }
-                .max(1) as u64;
+                // ⭐ THE TRIP COUNT IS `kv_layers`, hoisted above the node loop — the gather
+                // reach stated at every node's plane placements and this page ceiling read ONE
+                // derivation of the layer count (the trip-count law lives at the hoist).
+                let layers = kv_layers;
                 let page_bytes = pool.layer_stride() as u64 * 2 * layers;
                 let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
@@ -1956,6 +1985,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
         lx: Default::default(),
         arrangements: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         kv_request_stride_bytes,
+        // ⭐ THE GATHER REACH — filled beside each attention node's KV plane placements above.
+        // Empty for every bundle with no paged KV, keeping those byte-identical.
+        gather_reach,
         // ⛔ THE CLASS REGISTRIES, filled where their tables are placed above — the door resolves
         // a rope/attention program's class off these lists and the worker's load-time bind builds
         // each class's table from the same lists the macro bakes into the wiring, so this is the
@@ -5985,6 +6017,11 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // it — the slot map is this layout's, gone when the bake returns.
         lx,
         kv_request_stride_bytes,
+        // EMIT-ONLY: the gather reach is the gather door's compile-time bound — the pool a pooled
+        // table's entry run is refused past at build. The runtime's own pool budget and the host's
+        // `GatherEntry` composition are the value-side authorities; the baked artifact carries the
+        // placements those entries address, not the bound that checked them.
+        gather_reach: _,
         // EMIT-ONLY too: the class registries are build-time facts the door and the load-time bind
         // resolve through; the baked artifact carries each class's PLACEMENT (in `places` above),
         // which is all the runtime needs.
