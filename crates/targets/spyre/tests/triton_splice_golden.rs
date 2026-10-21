@@ -2147,6 +2147,16 @@ fn spliced_attn_lowers_through_the_door() {
                 )
             });
 
+            // The walk's own scale-registry completion, run at its own site (beside the
+            // placement pass, before the door): the spliced program states its exp2-restated
+            // constant as a front-end FOLD of two config constants (`SCALE * LOG2E`), which no
+            // graph payload names, so the registry's program-stated half is what the door's
+            // by-bits lookup resolves it through.
+            scratchy_target_spyre::lower_subtile_tape_to_ktir::complete_program_scales(
+                &mut layout,
+                &[std::slice::from_ref(&spliced)],
+            );
+
             // The program lowers through the production door under the walk's own
             // layout, with the bundle facts stated exactly as the tape walk states
             // them (`attn_at` reads the swept extent, the scale, the span guard and

@@ -2929,29 +2929,233 @@ pub fn program_scalarmul_scale(f: &IRFunction<'static>) -> Option<f32> {
 /// for its multiplier. The program states the constant and the descriptor reads a bound `[1,1]` const,
 /// so the slot is the one thing that has to be looked up rather than read.
 fn scale_slot(layout: Option<&BundleLayout>, value: f32) -> Option<usize> {
-    layout.and_then(|l| {
-        // ⭐ EXACT BITS FIRST, THEN THE f16 IMAGE — and the fallback is not a tolerance.
-        //
-        // `compute_bundle_layout` registers the tape's f32 constant, and the worker binds ONE
-        // fp16 per slot (`SCALE_BYTES = 2`), so the value the descriptor reads is the f16 image
-        // of the registry entry either way. A Triton producer's program states its epsilon as
-        // the f16 image directly: `LegalizeTypes::step_2b_island_constants` ROUNDS the splat
-        // value (`f.to_f16()`) when it feeds an op with an f16 operand — MEASURED, the
-        // triton-spyre layout docs record `1e-5` arriving as `0.00001001358`. Matching that
-        // against the f32 registry by bits alone refused the CORRECT descriptor, so the f16
-        // image is the second query — exact equality of the bound value, not an approximation.
-        // The builder path's program keeps its f32 constant, so it still matches on the first
-        // query and this changes nothing for it.
-        l.scalarmul_scales
-            .iter()
-            .position(|s| s.to_bits() == value.to_bits())
-            .or_else(|| {
-                let v16 = half::f16::from_f32(value);
-                l.scalarmul_scales
-                    .iter()
-                    .position(|s| half::f16::from_f32(*s) == v16)
-            })
-    })
+    layout.and_then(|l| scale_slot_in(&l.scalarmul_scales, value))
+}
+
+/// [`scale_slot`]'s two queries over the registry list itself, so the completion pass below
+/// resolves absence with the DOOR'S OWN LOOKUP rather than a second rule free to disagree.
+fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
+    // ⭐ EXACT BITS FIRST, THEN THE f16 IMAGE — and the fallback is not a tolerance.
+    //
+    // `compute_bundle_layout` registers the tape's f32 constant, and the worker binds ONE
+    // fp16 per slot (`SCALE_BYTES = 2`), so the value the descriptor reads is the f16 image
+    // of the registry entry either way. A Triton producer's program states its epsilon as
+    // the f16 image directly: `LegalizeTypes::step_2b_island_constants` ROUNDS the splat
+    // value (`f.to_f16()`) when it feeds an op with an f16 operand — MEASURED, the
+    // triton-spyre layout docs record `1e-5` arriving as `0.00001001358`. Matching that
+    // against the f32 registry by bits alone refused the CORRECT descriptor, so the f16
+    // image is the second query — exact equality of the bound value, not an approximation.
+    // The builder path's program keeps its f32 constant, so it still matches on the first
+    // query and this changes nothing for it.
+    scales
+        .iter()
+        .position(|s| s.to_bits() == value.to_bits())
+        .or_else(|| {
+            let v16 = half::f16::from_f32(value);
+            scales.iter().position(|s| half::f16::from_f32(*s) == v16)
+        })
+}
+
+/// ⭐⭐⭐ THE PROGRAM-STATED HALF OF THE SCALE REGISTRY — the values THIS program's ops will be
+/// looked up BY VALUE in `BundleLayout::scalarmul_scales`, read with the door's own readers so the
+/// collector cannot drift from the door.
+///
+/// The census that fills the registry (`scalar_registry` in `scratchy-target-spyre`) is a pure walk
+/// of the graph's node payloads: it sees every config-derived scalar a PAYLOAD names. A program can
+/// state a constant no payload names — a front-end FOLD of two config constants into one (the exp2
+/// restatement's `qk * (SCALE * LOG2E)`, where `LOG2E` is a kernel-local constexpr), which arrives
+/// as one splat the census never saw. The door still resolves the value through [`scale_slot`] and
+/// refuses without a slot ("registry desync"), so the registry has to be COMPLETED from the
+/// programs — at the seam where they are built, never inside the door.
+///
+/// ⛔ THE READERS ARE THE DOOR'S OWN, ONE PER DOOR. A whole-kernel program is lowered per-op by the
+/// whole-function walk, which classifies an `arith.mulf` with exactly one splatted constant as a
+/// `ScalarMul` whose multiplier [`scalarmul_at`] resolves by value — so the per-op reader is
+/// [`super::whole_function::splat_scale_of`], the same one that walk calls. A one-node program is
+/// lowered by the per-`Program` door, whose rmsnorm arm resolves its epsilon
+/// ([`program_rmsnorm_eps`]) and its `(1+w)` offset ([`program_gain_offset`]) through the same
+/// [`scale_slot`] — so those readers are here too. A constant no door looks up (an
+/// `Elementwise(Mul)` with no splat operand, a fused body's internal `1/cols`) is never collected:
+/// the collector enumerates LOOKUPS, not constants.
+pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
+    let mut stated = Vec::new();
+    for op in f.operations.iter() {
+        if op.op_type == OpKind::ArithMulf
+            && let Some((v, _)) = super::whole_function::splat_scale_of(f, op)
+        {
+            stated.push(v);
+        }
+    }
+    if let Some(eps) = program_rmsnorm_eps(f) {
+        stated.push(eps);
+    }
+    if let Some(off) = program_gain_offset(f) {
+        stated.push(off);
+    }
+    stated
+}
+
+/// ⭐⭐⭐ THE COMPLETION — append every stated value the registry lacks, in an order NO WALK
+/// CHOOSES. The registry's index IS the device tid (`SCALARMUL_SCALE_BASE - i`), and TWO walks
+/// build it: the bake's layout (`compute_bundle_layout`) and the wiring's registries
+/// (`graph_wiring`) — the worker binds one `[1,1]` const per slot, so a value the two disagreed
+/// about would resolve to a slot nobody bound. The payload half is one shared census; the
+/// program-stated half is completed per walk, so its ORDER is the hazard: the bake walks
+/// prefix → bodies → suffix and the wiring walks nodes, and two folded constants appearing in a
+/// different walk order would take different slots. Sorting the appended values by BITS makes the
+/// completed registry a function of the SET of stated values alone — every walk order, and every
+/// consumer of the list, computes the identical bytes.
+///
+/// ⛔ APPEND-ONLY. A value the registry already holds — by bits, or by f16 image ([`scale_slot`]'s
+/// two queries, applied through [`scale_slot_in`] so the completion and the door cannot disagree
+/// about what "already held" means) — is dropped, never renumbered: existing slots are addresses
+/// shipped bundles' descriptors already carry. Which is also the no-op law: completing over a
+/// program whose constants the census registered leaves the registry byte-identical — pinned by
+/// test.
+pub fn complete_scale_registry(scales: &mut Vec<f32>, stated: Vec<f32>) {
+    let mut missing: Vec<f32> = Vec::new();
+    for v in stated {
+        if scale_slot_in(scales, v).is_none() && scale_slot_in(&missing, v).is_none() {
+            missing.push(v);
+        }
+    }
+    missing.sort_unstable_by_key(|v| v.to_bits());
+    scales.extend(missing);
+}
+
+#[cfg(test)]
+mod scale_completion_tests {
+    use super::*;
+    use ktir_core::arena::Arena;
+    use ktir_core::ir::Operation;
+    use ktir_core::irtype::IrType;
+
+    /// One `x * <constant>` multiply — the whole-kernel form a front-end fold leaves behind: the
+    /// constant is a PRODUCT of config constants (`SCALE * LOG2E`), so no graph payload names it
+    /// and the payload census never registers it. THE WALL-3 SHAPE ITSELF.
+    fn folded(constant: f64) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, mul) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(constant),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]),
+            Operation::new(a, Some(mul), OpKind::ArithMulf, &[x, sp]),
+        ];
+        IRFunction {
+            name: "folded_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// `x * y` — two tensors, no splat: an `Elementwise(Mul)` the door never resolves by value, so
+    /// the collector must state nothing for it.
+    fn elementwise_mul() -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, y, mul) = (Ssa(0), Ssa(1), Ssa(2));
+        let ops = vec![Operation::new(a, Some(mul), OpKind::ArithMulf, &[x, y])];
+        IRFunction {
+            name: "elementwise_probe",
+            arguments: a.args(vec![(x, IrType::Index), (y, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// THE HEADLINE. A folded constant the census never saw gets exactly one appended slot, and
+    /// every value the registry already held keeps its slot — the index is a device tid, so a
+    /// completion that renumbered existing entries would silently move every shipped constant.
+    #[test]
+    fn a_folded_constant_the_census_never_saw_gets_one_appended_slot() {
+        let mut scales = vec![0.5f32, 0.25];
+        let stated = program_stated_scales(&folded(0.022537231));
+        assert_eq!(stated, vec![0.022537231f32], "the reader states the fold");
+        complete_scale_registry(&mut scales, stated);
+        assert_eq!(scales.len(), 3, "one appended slot, nothing renumbered");
+        assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
+        assert_eq!(scales[1], 0.25, "append-only: slot 1 is untouched");
+        assert_eq!(
+            scale_slot_in(&scales, 0.022537231),
+            Some(2),
+            "the door's own lookup now resolves the folded constant"
+        );
+    }
+
+    /// The no-op law, in its MEASURED form: a Triton producer's program states its epsilon as the
+    /// f16 IMAGE of the config constant (`LegalizeTypes` rounding), and the registry holds the f32.
+    /// The completion must drop it — the door's f16-image query already resolves it — or every
+    /// spliced norm would grow the registry by one unused slot.
+    #[test]
+    fn a_value_the_registry_holds_by_f16_image_is_not_re_registered() {
+        let config: f32 = 1e-5;
+        let image = half::f16::from_f32(config).to_f32();
+        assert_ne!(config.to_bits(), image.to_bits(), "the probe must round");
+        let mut scales = vec![config];
+        complete_scale_registry(&mut scales, program_stated_scales(&folded(image as f64)));
+        assert_eq!(
+            scales.len(),
+            1,
+            "the f16 image resolves against the f32 entry: no append"
+        );
+    }
+
+    /// ⛔ THE TWO-WALK LAW. The bake completes prefix → bodies → suffix and the wiring completes in
+    /// node order; two folded constants met in different orders must still land in the SAME slots,
+    /// or the worker would bind a const at a tid no descriptor reads. Sorting the appended half by
+    /// bits is what makes the registry a function of the set alone.
+    #[test]
+    fn the_appended_order_is_independent_of_the_walk_order() {
+        let (a, b) = (0.75f32, 0.125);
+        let mut bake_order = Vec::new();
+        complete_scale_registry(
+            &mut bake_order,
+            program_stated_scales(&folded(b as f64))
+                .into_iter()
+                .chain(program_stated_scales(&folded(a as f64)))
+                .collect(),
+        );
+        let mut wiring_order = Vec::new();
+        complete_scale_registry(
+            &mut wiring_order,
+            program_stated_scales(&folded(a as f64))
+                .into_iter()
+                .chain(program_stated_scales(&folded(b as f64)))
+                .collect(),
+        );
+        assert_eq!(
+            bake_order, wiring_order,
+            "both walks compute the identical registry"
+        );
+        assert_eq!(
+            bake_order,
+            {
+                let mut v = vec![a, b];
+                v.sort_unstable_by_key(|x| x.to_bits());
+                v
+            },
+            "the appended half is bits-sorted, not walk-ordered"
+        );
+    }
+
+    /// A multiply with no splat operand is not a scalar multiply and no door resolves anything for
+    /// it — the collector enumerates lookups, not constants.
+    #[test]
+    fn a_mulf_with_no_splat_operand_states_no_scale() {
+        assert!(
+            program_stated_scales(&elementwise_mul()).is_empty(),
+            "an Elementwise(Mul) states no value-looked-up constant"
+        );
+        let mut scales = vec![0.5f32];
+        complete_scale_registry(&mut scales, program_stated_scales(&elementwise_mul()));
+        assert_eq!(scales, vec![0.5], "completion over it is the identity");
+    }
 }
 
 /// THE NORM'S GAIN OFFSET — the `(1+w)` convention's `+1`, read off the program's

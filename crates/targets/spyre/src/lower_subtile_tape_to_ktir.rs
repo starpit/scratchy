@@ -1094,7 +1094,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // layer boundary to split the weight segment on. An empty map is what tells the layout that
     // banking is not expressible here, leaving the tail spill as the only lever (`&Default::default()`
     // rather than a bool, so there is one spelling of "the layer structure" and not two).
-    let bundle_layout =
+    let mut bundle_layout =
         compute_bundle_layout(ir, weight_ids, rows_are_requests, rows_are_requests, &[])?;
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(ir.nodes.len());
     // Collect EVERY distinct unhandled op kind (the full worklist) in one pass —
@@ -1135,6 +1135,10 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
             unhandled.into_iter().collect::<Vec<_>>().join(", "),
         )));
     }
+    // ⭐⭐⭐ THE REGISTRY'S PROGRAM-STATED HALF, completed over the programs this walk just built,
+    // before the caller's door pass can resolve a scale — the door looks a folded constant up by
+    // bits and refuses without a slot.
+    complete_program_scales(&mut bundle_layout, &[&ops]);
     Ok((ops, bundle_layout))
 }
 
@@ -1335,7 +1339,8 @@ pub fn graph_wiring<F: RopeForm>(
     // registry added later is a missing field at the literal, not a silent `Default` on the
     // card.
     let _ = weight_ids;
-    let registries = WiringRegistries {
+    // `mut` for the program-stated completion below (the same append the bake's walks run).
+    let mut registries = WiringRegistries {
         scalarmul_scales: scalar_registry(ir),
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
@@ -1371,9 +1376,12 @@ pub fn graph_wiring<F: RopeForm>(
     // UNROLLED graph: on granite-2b it was two thirds of the models build script, serially, for one
     // fact per program — its bindings — and one per mask. The fold below sees the results in node
     // order, so the first error and the mask check read exactly as the serial walk did.
-    // One program's binding order, and the `(mask tid, capacity)` it reads, when it reads one.
     type WiredProgram = (NodeArgs, Option<(u32, u32)>);
-    let per_node: Vec<Result<Vec<WiredProgram>, SuperDscError>> = {
+    // One node's whole contribution: its wired programs plus the scale-registry values its own
+    // ops state — the program-stated half this walk completes below, so the wiring binds every
+    // `[1,1]` const the bake's door resolves.
+    type WiredNode = Result<(Vec<WiredProgram>, Vec<f32>), SuperDscError>;
+    let per_node: Vec<WiredNode> = {
         use rayon::prelude::*;
         ir.nodes
             .par_iter()
@@ -1386,8 +1394,16 @@ pub fn graph_wiring<F: RopeForm>(
                     NodeLowering::Unhandled(why) => return Err(SuperDscError(why)),
                 };
                 let mut out = Vec::with_capacity(ops.len());
+                let mut stated = Vec::new();
                 for e in ops {
                     let Some(k) = e.ktir else { continue };
+                    // ⭐ THE DOOR'S OWN READER, run here so the wiring's registry carries every
+                    // value the door resolves by bits — the same `program_stated_scales` the bake's
+                    // completion pass collects, appended bits-sorted below, so the two walks cannot
+                    // disagree about a slot (the one-census law, extended to the folded half).
+                    stated.extend(
+                        ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func),
+                    );
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
                         // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
@@ -1431,14 +1447,17 @@ pub fn graph_wiring<F: RopeForm>(
                         mask,
                     ));
                 }
-                Ok(out)
+                Ok((out, stated))
             })
             .collect()
     };
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
+    let mut stated_scales = Vec::new();
     for lowered in per_node {
-        for (args, m) in lowered? {
+        let (wired, stated) = lowered?;
+        stated_scales.extend(stated);
+        for (args, m) in wired {
             if let Some(m) = m {
                 if mask.is_some_and(|prev| prev != m) {
                     return Err(SuperDscError(format!(
@@ -1470,6 +1489,14 @@ pub fn graph_wiring<F: RopeForm>(
         }
         None => None,
     };
+    // ⭐⭐⭐ THE WIRING'S COPY OF THE PROGRAM-STATED HALF — the same completion the bake's walks
+    // run, over the same nodes this walk just lowered, so the worker's `[1,1]` const binds and
+    // the door's scale lookups resolve the IDENTICAL slots (bits-sorted appends: node order here
+    // and prefix→bodies→suffix in the bake compute the same list).
+    ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
+        &mut registries.scalarmul_scales,
+        stated_scales,
+    );
     Ok(BundleWiring {
         nodes,
         num_sources: ir.num_sources,
@@ -1502,6 +1529,77 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
+}
+
+/// ⭐⭐⭐⭐⭐ THE SCALE-REGISTRY COMPLETION PASS — the program-stated half of
+/// `BundleLayout::scalarmul_scales`, appended at the seam where the programs exist.
+///
+/// The registry's payload half is the census ([`scalar_registry`]): a pure walk of `ir.nodes`,
+/// run by BOTH the bake's layout and the wiring's registries. But a program minted by the splice
+/// can state a constant no payload names — a front-end FOLD of two config constants into one
+/// (`qk * (SCALE * LOG2E)`, the exp2 restatement) — and the door resolves every such value BY
+/// BITS (`scale_slot`) and refuses without a slot. This pass completes the registry from the
+/// programs the walk just built, using the door's own readers
+/// ([`program_stated_scales`](ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales)),
+/// so the collector cannot drift from the door.
+///
+/// ⛔ RUN AT THE SEAM, BEFORE ANY DOOR PASS. The completion must precede the first lowering that
+/// resolves a scale (the declare pass, the door loop) and run over the SAME programs the bake
+/// lowers — which is why it sits beside [`place_step_inputs`] at every walk site, and why
+/// [`graph_wiring`] completes its own copy over the same nodes. The appended half is bits-sorted
+/// ([`complete_scale_registry`](ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry)),
+/// so the bake's prefix→bodies→suffix order and the wiring's node order compute the IDENTICAL
+/// list — two walks, one registry, the same law `scalarmul_scales`'s one-census rule states.
+///
+/// ⭐ A NO-OP FOR A GRAPH WITH NO FOLDED CONSTANTS: every value the census registered is dropped
+/// by the door's own lookup (bits, then f16 image), so existing registries stay byte-identical —
+/// pinned by test in the door crate. The appended slots take the census loop's own placement law
+/// (a `[1,1]` worker-bound const in seg0), minted at the END of the segment so no existing offset
+/// moves.
+pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedOp]]) {
+    let mut stated = Vec::new();
+    for ops in op_lists {
+        for e in ops.iter() {
+            if let Some(k) = e.ktir.as_ref() {
+                stated.extend(
+                    ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func),
+                );
+            }
+        }
+    }
+    let before = layout.scalarmul_scales.len();
+    ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
+        &mut layout.scalarmul_scales,
+        stated,
+    );
+    // ⭐ THE PLACEMENTS — the census loop's own law, minted for the appended half: one `[1,1]`
+    // worker-bound const per NEW slot in seg0 (ACTIVATION, 2 B), appended at the segment's end
+    // so no existing tensor's offset moves. Without the placement the door's window check
+    // refuses the const's operand ("windowed but never declared"); without the identity row the
+    // placement is invisible to `resolve_seg_base` — the same two rows `place_step_inputs` writes
+    // for its own mints, and the same placement `compute_bundle_layout` mints for the payload
+    // half.
+    for i in before..layout.scalarmul_scales.len() {
+        let tid = ktir_superdsc::reserved_tids::scalarmul_scale_tid(i);
+        let seg = SegRole::Activation.segment();
+        let off = layout.segment_bytes[seg];
+        layout.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size: 2,
+            },
+        );
+        layout.segment_bytes[seg] = align128(off + 2);
+        layout.ids.borrow_mut().insert(
+            ktir_superdsc::place::act_name(tid),
+            ktir_superdsc::place::PlaceId::Act(tid),
+        );
+    }
 }
 
 /// ⭐⭐⭐⭐⭐ THE PER-STEP INPUT PLACEMENT PASS — one generic law, stated once, consumed by every
@@ -2249,6 +2347,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     step_input_lists.extend(body_op_lists.iter().map(|v| v.as_slice()));
     step_input_lists.push(&suffix);
     place_step_inputs(&mut bundle_layout, &step_input_lists, ir.tensors.len() as u32)?;
+    // ⭐⭐⭐ THE SAME COMPLETION, over the SAME program lists the declare pass below lowers —
+    // before that pass, because the door resolves a folded constant by bits. Bits-sorted
+    // appends, so this walk's prefix→bodies→suffix order and `graph_wiring`'s node order
+    // compute the identical registry.
+    complete_program_scales(&mut bundle_layout, &step_input_lists);
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     for ops in std::iter::once(&prefix)
