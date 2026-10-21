@@ -1392,7 +1392,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         // the chunk depth is the stick divided by the batch, and a batch that does not
         // divide it has no form under this kernel.
         let entries = ktir_superdsc::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
-        if entries % num_seqs != 0 {
+        if !entries.is_multiple_of(num_seqs) {
             return Err(format!(
                 "triton splice: AttnDecode t{}: a {num_seqs}-request decode batch does not \
                  divide the {entries}-entry id stick, so no BLOCKS_PER_CHUNK fills it exactly — \
