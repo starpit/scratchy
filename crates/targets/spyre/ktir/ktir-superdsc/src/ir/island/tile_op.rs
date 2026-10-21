@@ -123,7 +123,29 @@ impl TileOp {
 pub fn matmul_lx_resident_generic(plan: &WorkPlan, out_per_time: u32, operand_df: Df) -> u64 {
     let per_core_mb = plan.per_core_extent("mb") as u64;
     let k = plan.per_core_extent("in") as u64;
-    let batch = plan.extent("x").max(plan.extent("y")).max(1) as u64;
+    // ⭐⭐⭐ THE BATCH IS BILLED AT THE PER-CORE EXTENT — the same law
+    // [`pointwise_lx_resident_generic`] states for its own sprays ("a core that took the sprays
+    // as its share of the cores holds one"): the work-division MAY split the batch (`y`) across
+    // cores — the joint cost model's `s.b`, on-hardware-proven at mq==1 (`{mb:1, y:4}` on 4
+    // cores) — and a core holding `y/split` batch planes residents exactly that many, in A, W and
+    // OUT alike (the attention bmm's per-batch KERNEL is `[y,in,out]`, one plane per batch
+    // entry). Billing the FULL extent charged every core the whole batch's planes — MEASURED at
+    // the spliced golden's rows-are-requests score dot (mb=4, out=64, in=64, y=256 split 8):
+    // `(1·64 + 64·64 + 1·64)·256·2 = 2,162,688 B` against the 1,677,721-B budget, a refusal
+    // reading "needs K-time PSUM accumulation (Stage 2)" for a shape whose true per-core
+    // residency is 270,336 B — a sixth of the budget. The same false-refusal class as the fp8
+    // word-length over-charge this formula's own doc records.
+    //
+    // ⭐ MONOTONE IN THE SAFE DIRECTION: `per_core_extent ≤ extent` ALWAYS (it is
+    // `extent / split.max(1)`, floored at 1), so the per-core batch read is ≤ the full-extent
+    // read it replaces — the charge can only DROP, never rise. No plan that fit before can
+    // newly fail; the fix can only un-refuse a shape or shrink a time factor, never mint one.
+    // Where the batch is UNSPLIT (`per_core_extent == extent`, every shipped bmm — the known
+    // 576-KiB fixture's y=16 under an mb/out split), the charge is byte-identical.
+    let batch = plan
+        .per_core_extent("x")
+        .max(plan.per_core_extent("y"))
+        .max(1) as u64;
     let opt = out_per_time as u64;
     let operand_bytes = operand_df.word_length() as u64;
     let a = per_core_mb * k * batch * operand_bytes;
@@ -178,6 +200,73 @@ pub fn seeded_reduce_lx_resident_generic(plan: &WorkPlan, out_per_time: u32, df:
     let opt = out_per_time as u64;
     let word = df.word_length() as u64;
     per_core_mb * opt * word + per_core_mb * df.elems_per_stick() as u64 * word
+}
+
+#[cfg(test)]
+mod matmul_residency_tests {
+    use super::matmul_lx_resident_generic;
+    use crate::superdsc_opspec::{Df, Fp16, MaxCores, StickExtent, WorkPlan, MAX_CORES};
+
+    /// The LIVE plan for a batched matmul — the production dim vocabulary and the joint cost
+    /// model's own splitter, so the split under test is the one the emitter derives, never a
+    /// hand-picked map.
+    fn batched_plan(m: u32, n: u32, k: u32, batch: u32) -> WorkPlan {
+        let n_ext = StickExtent::<Fp16>::new(n).expect("whole-stick N");
+        let k_ext = StickExtent::<Fp16>::new(k).expect("whole-stick K");
+        let dims = crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::matmul_dims::<Fp16>(
+            m, &n_ext, &k_ext, batch,
+        );
+        WorkPlan::divide(
+            &dims,
+            MaxCores::<MAX_CORES>,
+            crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::matmul_split_map,
+        )
+        .expect("the cost model divides every batched shape")
+    }
+
+    /// ⭐⭐⭐ A BATCH SPLIT ACROSS CORES BILLS EACH CORE ITS OWN PLANES — the golden's own
+    /// numbers, verbatim from the refusal that motivated the law. The rows-are-requests score
+    /// dot states `mb=4, out=64, in=64, y=256`; the joint cost model's split is `y=8 × mb=4`
+    /// (32 cores), and a core holding 32 of the 256 batch planes residents exactly those:
+    /// `(1·64 + 64·64 + 1·64) · 32 · 2 = 270,336 B` — a sixth of the budget, one trip. The
+    /// full-extent read this replaces charged `(…) · 256 · 2 = 2,162,688 B` and refused with
+    /// "needs K-time PSUM accumulation (Stage 2)" — the same false-refusal class as the fp8
+    /// word-length over-charge the formula's own doc records.
+    #[test]
+    fn a_batch_split_across_cores_bills_each_core_its_own_planes() {
+        let plan = batched_plan(4, 64, 64, 256);
+        assert_eq!(plan.split_of("y"), 8, "the joint cost model splits the batch");
+        assert_eq!(plan.split_of("mb"), 4, "and the rows — 32 cores in all");
+        assert_eq!(plan.per_core_extent("y"), 32, "each core holds 32 of the 256 planes");
+        assert_eq!(
+            matmul_lx_resident_generic(&plan, 64, Df::Fp16),
+            270_336,
+            "the per-core charge: (1·64 + 64·64 + 1·64) · 32 planes · 2 B"
+        );
+        let tt = plan
+            .time_tile_for_lx(|p, o| matmul_lx_resident_generic(p, o, Df::Fp16), "out")
+            .expect("a sixth of the budget is not a Stage-2 shape");
+        assert!(
+            tt.is_none(),
+            "one trip — no time-tile, no reduction split, no Stage-2"
+        );
+    }
+
+    /// ⭐ THE CONTROL — an UNSPLIT batch bills its full extent, byte-identical to every shipped
+    /// bmm: the known-good fixture's shape (M384 N384 K64 batch16 under an mb16×out2 split)
+    /// keeps its 589,824-B charge, `per_core_extent == extent` where no split divides the
+    /// batch.
+    #[test]
+    fn an_unsplit_batch_bills_its_full_extent() {
+        let plan = batched_plan(384, 384, 64, 16);
+        assert_eq!(plan.split_of("y"), 1, "the fixture's split divides mb and out only");
+        assert_eq!(plan.per_core_extent("mb"), 24);
+        assert_eq!(
+            matmul_lx_resident_generic(&plan, 192, Df::Fp16),
+            589_824,
+            "the known bmm's charge, unchanged: (24·64 + 64·192 + 24·192) · 16 · 2"
+        );
+    }
 }
 
 #[cfg(kani)]
