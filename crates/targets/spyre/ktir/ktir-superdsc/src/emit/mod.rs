@@ -52,6 +52,9 @@ pub mod lower_ktir_to_superdsc;
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
 /// decoder layer's twelve `linalg.matmul`s) has no door otherwise: stating one `Program` for such a
 /// function is refused by arity, correctly, and there is nothing else to state.
+/// A batched gathered contraction — the gather's entry axis as the dot's batch axis. See the
+/// module doc for the frame law and the honesty row.
+pub mod batched_gathered;
 pub mod whole_function;
 
 /// A per-`layout`-dim field in the order dxp reads it: as stated, or REVERSED for a view that
@@ -1160,6 +1163,63 @@ pub struct PointwiseGather<'a, O: KindTag> {
     pub o: &'a Stk<O>,
 }
 
+/// ⭐ THE POOL ADMISSION — ONE LAW, TWO DOORS. A table whose layout declares a
+/// `BundleLayout::gather_reach` is a POOL SLICE, not a table: its placement covers one slice (the
+/// paged KV cache's per-layer plane) while its index names stick-blocks RELATIVE TO THE PLANE'S
+/// OWN BASE across the whole pool the runtime re-bases per launch, so the swept-rectangle law is
+/// the wrong pair of facts for it. What replaces it is ONE check, on the one fact the admitting
+/// door uniquely sees:
+///
+/// THE ENTRY UNIT. dxp turns an entry value into an address as `idx * skip_addr + base`, and a
+/// gathered read of this pool strides one entry at `entry_elems` elements — while the reach's
+/// entries are `entry_elems`-element stick blocks, the unit the host's `GatherEntry::of_page_block`
+/// composes its runtime values in. Two units for one address is two authorities for the same
+/// bytes: a descriptor striding at any other width reads every entry at the wrong address, from a
+/// clean bake — refused here, by name, with both numbers.
+///
+/// ⛔ THE VALUES' BOUND IS NOT A CHECK HERE, because it cannot be one: the values are runtime data
+/// and any run-shaped inequality against the reach compares two different tensors' coordinates.
+/// The honest bound is the ceiling the reach carries, enforced where a value is BORN (the
+/// host-side `gather_entry_ceiling` → `GatherEntry::of_page_block` composition); the extent law
+/// holds by TYPE (`skip_addr` equal to `entry_elems` satisfies the reach's derived element extent
+/// exactly). A table with NO declared reach returns `None` and takes none of this — its gather
+/// keeps the swept-window law byte for byte.
+///
+/// Both doors that admit a gathered read of a pool run THIS function — the pointwise gather door
+/// (which then marks its operand pooled, so the operand mint takes the one-entry window) and the
+/// batched gathered contraction's copy — so the two cannot drift about what a pool's entry unit
+/// is. Returns the reach when the table is pooled (after the entry-unit check), `None` when no
+/// reach is declared for it.
+pub(crate) fn pooled_reach_of(
+    what: &str,
+    layout: Option<&BundleLayout>,
+    table: &str,
+    entry_elems: u32,
+) -> Result<Option<crate::sdsc_abstract::GatherReach>, SuperDscError> {
+    let Some((tid, reach)) = layout.and_then(|l| match l.id_of(table) {
+        Some(crate::place::PlaceId::Act(tid)) => l.gather_reach.get(&tid).map(|&r| (tid, r)),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if entry_elems as u64 != reach.entry_elems() {
+        return Err(SuperDscError(format!(
+            "{what}: this gathered read of '{table}' (t{tid}) strides one index entry at \
+             {entry_elems} elements, but the bundle declares that pool's entries as {}-element \
+             stick blocks (a ceiling of {} entry values, {} elements of reach). dxp turns a value \
+             into an address as `idx * skip_addr + base`, and the host composes those values in \
+             the pool's own unit (`GatherEntry::of_page_block`), so a descriptor striding at any \
+             other width reads every entry at the wrong address — from a clean bake. State the \
+             read at the pool's entry width, or declare the reach for the pool this read really \
+             strides (`BundleLayout::gather_reach`).",
+            reach.entry_elems(),
+            reach.max_entry().get(),
+            reach.reach_elems(),
+        )));
+    }
+    Ok(Some(reach))
+}
+
 /// ⭐⭐⭐ A POINTWISE OP ONE OF WHOSE INPUTS IS **GATHERED** — a row lookup `table[ids[row], :]`.
 ///
 /// ## It is a CALLER of the gather, not a second gather
@@ -1316,26 +1376,9 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     // A table with NO declared reach takes none of this: its gather keeps the swept-window law
     // exactly as the embedding's card-proven emission runs it, byte for byte.
     let mut pooled_inputs;
-    let inputs = if let Some(l) = layout
-        && let Some(crate::place::PlaceId::Act(tid)) = l.id_of(inputs[gathered_input].name())
-        && let Some(&reach) = l.gather_reach.get(&tid)
+    let inputs = if let Some(reach) =
+        pooled_reach_of(op_name, layout, inputs[gathered_input].name(), cols)?
     {
-        if cols as u64 != reach.entry_elems() {
-            return Err(SuperDscError(format!(
-                "{op_name}: this gathered read of '{}' (t{tid}) strides one index entry at {cols} \
-                 elements, but the bundle declares that pool's entries as {}-element stick blocks \
-                 (a ceiling of {} entry values, {} elements of reach). dxp turns a value into an \
-                 address as `idx * skip_addr + base`, and the host composes those values in the \
-                 pool's own unit (`GatherEntry::of_page_block`), so a descriptor striding at any \
-                 other width reads every entry at the wrong address — from a clean bake. State the \
-                 read at the pool's entry width, or declare the reach for the pool this read \
-                 really strides (`BundleLayout::gather_reach`).",
-                inputs[gathered_input].name(),
-                reach.entry_elems(),
-                reach.max_entry().get(),
-                reach.reach_elems(),
-            )));
-        }
         pooled_inputs = inputs.to_vec();
         pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled(reach);
         &pooled_inputs[..]

@@ -3220,7 +3220,12 @@ pub fn lower_function(
         // way and this is it: a KERNEL-less gathered copy writing a minted intermediate, the matmul
         // reading the intermediate as plain-B. See [`gathered_matmul_materializes`], which states the
         // whole argument and does the work.
-        let gathered_b = if let Some((g, _ti, gi)) = op_gather
+        // ⭐⭐⭐⭐⭐ AND THE BATCHED FORM IS ADMITTED AT THE SAME DOOR — a `linalg.batch_matmul`
+        // whose B is the gathered table read through its reshape states its geometry in its OWN
+        // operand types, and the materializer's batch branch writes the C-order copy the
+        // per-batch bmm reads (see [`emit::batched_gathered`]). A rank-2 gathered dot never
+        // enters it: it keeps rung 4's card-proven `[k, n]` path, byte for byte.
+        let gathered_form = if let Some((g, _ti, gi)) = op_gather
             && !matches!(
                 program,
                 Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_)
@@ -3238,9 +3243,18 @@ pub fn lower_function(
                 g,
                 gi,
                 &in_values,
+                GatherConsumer {
+                    op,
+                    pre_through: &pre_through,
+                },
             )?
         } else {
-            false
+            GatheredB::No
+        };
+        let gathered_b = !matches!(gathered_form, GatheredB::No);
+        let batched_geo = match gathered_form {
+            GatheredB::Batched(bg) => Some(bg),
+            _ => None,
         };
         if op_gather.is_some()
             && !gathered_b
@@ -3614,9 +3628,11 @@ pub fn lower_function(
             // producer wrote (weight columns past the window; never read at corner 0) stay
             // numerically inert.
             let dev_dims = match program {
-                // The producer's own rule, with `k` from the A operand's region (the same
-                // `k = a.c_len` the emitter itself reads; A is `per_op`'s first input).
-                Lowering::Node(Program::Matmul) => {
+                // ⛔ NOT THE BATCHED DOT: its per-stick cut addresses the output at the LOGICAL
+                // `n` (one stick column block at a time), so the reservation IS the logical dims
+                // — `for_matmul`'s util-floor bump is the ORIENTED emitter's own law and rides
+                // only the arm that addresses at the bumped width.
+                Lowering::Node(Program::Matmul) if batched_geo.is_none() => {
                     let k = per_op.first().map_or(dims[1], |a| a.c_len);
                     // The SAME `for_matmul` the emitter's `n_dev` takes — one decision for the
                     // buffer this mint reserves and the width the emit writes, so they cannot
@@ -3657,6 +3673,7 @@ pub fn lower_function(
                     b_orient,
                     gather: op_gather.map(|(g, _, _)| g),
                     bcast: &bcast_axes,
+                    batched: batched_geo,
                 },
             )?;
             out.append(&mut emitted);
@@ -3703,6 +3720,7 @@ pub fn lower_function(
                 b_orient,
                 gather: op_gather.map(|(g, _, _)| g),
                 bcast: &bcast_axes,
+                batched: batched_geo,
             },
         )?;
         out.append(&mut emitted);
@@ -3852,6 +3870,11 @@ struct WalkProof<'a> {
     /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
     /// broadcast.
     bcast: &'a [Option<BcastAxis>],
+    /// ⭐ THE BATCHED GATHERED DOT'S GEOMETRY — `Some` for exactly a `linalg.batch_matmul` whose
+    /// B is a gathered table (its B in `per_op` is then the C-order copy the materializer wrote,
+    /// not a `[k, n]` window). `None` everywhere else, and then the matmul arm is byte-identical
+    /// to what it was: a rank-2 gathered dot keeps rung 4's own frame.
+    batched: Option<super::batched_gathered::BatchedGathered>,
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -3872,6 +3895,7 @@ fn emit_one(
         b_orient,
         gather,
         bcast,
+        batched,
     } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
@@ -3934,6 +3958,14 @@ fn emit_one(
         Lowering::Node(p) => p,
     };
     Ok(match program {
+        // ⭐⭐⭐ THE BATCHED GATHERED DOT — the entry axis as the batch axis. Its B in `per_op`
+        // is the C-order copy the materializer wrote, NOT a `[k, n]` window, so the oriented
+        // matmul's own frame (and its B-orientation proof) does not apply: the per-batch bmm
+        // states its own. `None` everywhere else — the arm below is byte-identical to what it
+        // was.
+        Program::Matmul if let Some(bg) = batched => {
+            super::batched_gathered::emit_dot(name, &bg, per_op, sym_id_base, layout)?
+        }
         Program::Matmul => {
             // The fp8 activation-quantize dedup set is per-BUNDLE. One op at a time here, so a
             // fresh set is correct for an fp16 program; an fp8 one needs it threaded across ops and
@@ -4044,6 +4076,24 @@ struct GatherEmit<'a> {
     inter: &'a mut std::collections::HashMap<Ssa, Region>,
 }
 
+/// THE CONSUMER'S OWN ROW IN THE WALK — the two facts the batched form's admission reads that
+/// rung 4's 2-D path ignores: the op itself (its kind names the batched form) and its PRE-LENS
+/// operand spellings (A's and B's stated types, through their reshapes). Carried as one value so
+/// the materializer's parameter list stays the size its siblings' are.
+struct GatherConsumer<'a> {
+    op: &'a Operation<'a>,
+    pre_through: &'a [Ssa],
+}
+
+/// What [`gathered_matmul_materializes`] did for one op: nothing (the walk's fail-closed refusal
+/// owns the op), rung 4's 2-D `[k, n]` materialization, or the batched C-order copy together with
+/// the geometry the program stated for it.
+enum GatheredB {
+    No,
+    TwoD,
+    Batched(super::batched_gathered::BatchedGathered),
+}
+
 fn gathered_matmul_materializes(
     k: &KtirNode,
     layout: Option<&BundleLayout>,
@@ -4051,7 +4101,8 @@ fn gathered_matmul_materializes(
     g: Gather,
     gathered_input: usize,
     in_values: &[Ssa],
-) -> Result<bool, Error> {
+    consumer: GatherConsumer<'_>,
+) -> Result<GatheredB, Error> {
     let GatherEmit {
         sym_id_base,
         out,
@@ -4076,7 +4127,7 @@ fn gathered_matmul_materializes(
     // or a transposed K leg (B through a `tt.trans` — refused at the Triton door with the arch
     // reason), never matches; the walk's own refusal names them.
     let Some(b_value) = in_values.get(gathered_input).copied() else {
-        return Ok(false);
+        return Ok(GatheredB::No);
     };
     // ⭐⭐⭐ THIS TILE, BY IDENTITY — `g.tile` is the tile's own result SSA, read once by the same
     // walk (`gathers_of`) that built the join, so the walk and this materializer cannot disagree
@@ -4092,7 +4143,7 @@ fn gathered_matmul_materializes(
     // ⛔ AND THE MATMUL'S GATHERED INPUT IS THE GATHERED LOAD — the identity check the tid check
     // cannot make. `g.load` is the `ktdp.load` over this tile, found by the walk.
     if b_value != g.load {
-        return Ok(false);
+        return Ok(GatheredB::No);
     }
     let gathered_result = g.load;
     let consumers = f
@@ -4117,6 +4168,119 @@ fn gathered_matmul_materializes(
             f.name
         ));
     };
+    // ⭐⭐⭐⭐⭐ THE BATCHED FORM — the gather's ENTRY AXIS AS THE DOT'S BATCH AXIS. The seals above
+    // (B is the gathered load by identity, one consumer, a layout) are the same ones the 2-D frame
+    // runs; only the intermediate's frame and the copy that writes it differ. See
+    // [`super::batched_gathered`] for the frame law and its byte gate — the entry-size authority
+    // is the gathered load's own row width, checked against the reshape's `[batch, k, n]` by
+    // [`batched_geometry_of`] at one door.
+    let GatherConsumer { op, pre_through } = consumer;
+    if let Some(bg) = batched_geometry_of(f, op, pre_through, gathered_input, g)? {
+        // ── THE POOL ADMISSION FIRST — the b1 door's own law, before any leg is built. A table
+        // whose layout declares a `gather_reach` is a pool slice: the entry-unit check refuses a
+        // read striding at any width but the pool's own, and the SOURCE bound is then ONE ENTRY's
+        // coverage (the pooled window law's own), not the swept rectangle. A table with no reach
+        // keeps the swept-window law byte for byte — the embedding's own form.
+        let table_name = crate::place::act_name(g.value_tid);
+        let index_name = crate::place::act_name(g.index_tid);
+        let what = format!(
+            "{}: the batched gathered dot's copy of '{table_name}'",
+            f.name
+        );
+        let src_window = |rows: u32| {
+            crate::sdsc_abstract::StickLayout::row_blocked_df(
+                rows as usize,
+                bg.entry_elems() as usize,
+                crate::superdsc_opspec::Df::Fp16,
+            )
+        };
+        match super::pooled_reach_of(&what, Some(layout), &table_name, bg.entry_elems())
+            .map_err(Error::from)?
+        {
+            Some(_) => layout
+                .check_window(&table_name, src_window(1), 0, 1, bg.entry_elems(), &what)
+                .map_err(|message| Error { message })?,
+            None => layout
+                .check_window(
+                    &table_name,
+                    src_window(bg.entries),
+                    0,
+                    bg.entries,
+                    bg.entry_elems(),
+                    &what,
+                )
+                .map_err(|message| Error { message })?,
+        }
+        // ── THE C-ORDER SCRATCH, minted the way the walk mints its own unstored results: one
+        // stick wide, `copy_rows` sub-rows — the contiguous `[batch, k, n]` buffer the reshape
+        // names (see the module doc for why the bmm's row-major walk and this buffer are one
+        // fact). NOT rung 4's `[entries, head]`: that frame is stick-major at multi-stick width,
+        // and reading it row-major moves every byte past the first stick column.
+        let rows = bg.copy_rows();
+        let stick = crate::work::FP16_ELEMS_PER_STICK;
+        let tid = mint_inter(k, layout, *floor, gathered_result);
+        layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
+        let r = Region {
+            tid,
+            v_rows: rows,
+            v_cols: stick,
+            r_start: 0,
+            c_start: 0,
+            r_len: rows,
+            c_len: stick,
+            r_cover: (0, rows),
+            c_cover: (0, stick),
+            is_out: true,
+            is_fp8: false,
+        };
+        let inter_name = r.name();
+        let copies = super::batched_gathered::copy_opspecs(
+            &bg,
+            &table_name,
+            &index_name,
+            &inter_name,
+            g.first_entry,
+        )
+        .map_err(|msg| Error {
+            message: format!("{}: {msg}", f.name),
+        })?;
+        for (leg, cop) in copies.into_iter().enumerate() {
+            // THE PLACEMENT HALF of the destination's two-door mint (`gather_copy_opspec` ran
+            // the declared-shape half layout-free): the run's window against the synth this mint
+            // declared. Both numbers read off the BUILT op — the leg's `mb` extent and the
+            // output operand's own base — so the check cannot disagree with the emission about
+            // which window the leg writes.
+            let mut cop = cop;
+            let leg_rows = cop.iter.extent("mb");
+            let dest_base = cop
+                .args
+                .last()
+                .map_or(0, |a| a.view().offset_elems) as u64;
+            super::mint_full_window(
+                &what,
+                &super::rb(&inter_name, rows, stick),
+                dest_base,
+                leg_rows,
+                stick,
+                Some(layout),
+            )
+            .map_err(|message| Error { message })?;
+            super::apply_lx_residency(&mut cop, Some(layout));
+            let folds = crate::superdsc_opspec::SdscFoldSet::new(cop.iter.cores_used());
+            out.push(
+                super::emit_sdsc_tiled(
+                    &format!("{inter_name}_g{leg}"),
+                    &cop,
+                    &folds,
+                    sym_id_base,
+                    Some(layout),
+                )
+                .map_err(Error::from)?,
+            );
+        }
+        inter.insert(gathered_result, r);
+        return Ok(GatheredB::Batched(bg));
+    }
     // ── (2) THE INTERMEDIATE, minted the same way the walk mints its own unstored results.
     //
     // Rows: the indirect tile's own `Shape` — the program's statement of how many rows are
@@ -4189,7 +4353,69 @@ fn gathered_matmul_materializes(
     // so the walk's `inter` lookup hands the matmul the intermediate's region for that operand,
     // and the caller REPLACES `per_op`'s B slot with it before `emit_one` runs.
     inter.insert(gathered_result, r);
-    Ok(true)
+    Ok(GatheredB::TwoD)
+}
+
+/// ⭐ THE BATCHED FORM'S STATED GEOMETRY — read from the program's OWN statements, at one door,
+/// before any copy leg or dot op is built.
+///
+/// The admission is: the consumer is a `linalg.batch_matmul` whose GATHERED operand is its **B**
+/// (input 1 — A-side gathers are not this form, same rule as rung 4), and B's stated type THROUGH
+/// its reshape lens is rank-3. Everything else is the geometry door's own arithmetic: A's type
+/// `[batch, m, k]`, the reshape's `[batch, k, n]`, and the gathered load's own `[entries, row]`
+/// pair — the row width being the ENTRY-SIZE AUTHORITY, cross-checked against the tile's own
+/// entry count. A rank-2 B never enters (it is the 2-D frame's own form and keeps rung 4's path
+/// below); a batched form whose numbers disagree refuses HERE, by name, rather than materializing
+/// a copy whose bytes the dot cannot address.
+fn batched_geometry_of(
+    f: &IRFunction<'_>,
+    op: &Operation<'_>,
+    pre_through: &[Ssa],
+    gathered_input: usize,
+    g: Gather,
+) -> Result<Option<super::batched_gathered::BatchedGathered>, Error> {
+    if gathered_input != 1 || op.op_type != OpKind::LinalgBatchMatmul {
+        return Ok(None);
+    }
+    let dims_of = |v: Option<&Ssa>, what: &str| -> Result<Vec<i64>, Error> {
+        v.and_then(|v| type_of(f, *v))
+            .and_then(|t| t.dims().map(|d| d.to_vec()))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the batched gathered dot's {what} states no tensor type, so its \
+                     [batch, ·, ·] frame is unknown",
+                    f.name
+                ),
+            })
+    };
+    // A rank-2 B is the 2-D frame's own form — the batched arm does not take it.
+    let b = dims_of(pre_through.get(1), "B")?;
+    if b.len() != 3 {
+        return Ok(None);
+    }
+    let a = dims_of(pre_through.first(), "A")?;
+    let load = dims_of(Some(&g.load), "gathered load")?;
+    let [load_rows, entry_elems] = load[..] else {
+        return err(format!(
+            "{}: the gathered load t{} states {load:?}, not the [entries, row] pair a whole-row \
+             gather fetches",
+            f.name, g.load.0
+        ));
+    };
+    if load_rows != g.entries as i64 {
+        return err(format!(
+            "{}: the gathered load states {load_rows} rows but its tile gathers {} entries",
+            f.name, g.entries
+        ));
+    }
+    let entry_elems = u32::try_from(entry_elems).map_err(|_| Error {
+        message: format!("{}: the gathered row width {entry_elems} is not a u32", f.name),
+    })?;
+    super::batched_gathered::BatchedGathered::of(&a, &b, g.entries, entry_elems)
+        .map(Some)
+        .map_err(|msg| Error {
+            message: format!("{}: {msg}", f.name),
+        })
 }
 
 /// THE SILU RECOGNISER'S FAIL-CLOSED HALF, which no fixture exercises.
