@@ -396,7 +396,7 @@ fn affine_qmv_command(
             }
             .into_baked(),
         ),
-        QmvKernel::Fast | QmvKernel::FastFold => (
+        QmvKernel::Fast | QmvKernel::FastFold | QmvKernel::FastSplitK { .. } => (
             KernelId::AffineQmvFast,
             super::kernel_constants::AffineQmvConstants {
                 k: super::ids::KDimI32(k as i32),

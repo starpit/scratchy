@@ -2408,3 +2408,112 @@ INST_GATHER_QMV_ALL_B2(f16,  half,   f16, half,    64)
 INST_GATHER_QMV_ALL_B2(bf16, bfloat, f16, half,    64)
 INST_GATHER_QMV_ALL_B2(bf16, bfloat, bf16, bfloat, 64)
 INST_GATHER_QMV_ALL_B2(f16,  half,   bf16, bfloat, 64)
+
+// PROBE (#799, never merged): `qmv_fast_impl`'s one-row tile (2 rows a simdgroup, 2 row pairs a
+// threadgroup) with K split across SK simdgroup pairs, the partial dots (and, normalizing on load,
+// the partial sums of squares) summed through threadgroup memory before the row's ends. Measures
+// whether more simdgroups on a short, deep matvec (N=2048, K=4096) keep more of the weight stream
+// in flight.
+template <typename T_act, typename T_scale, int group_size, int bits, int SK>
+[[kernel]] void affine_qmv_fast_sk(
+    const device uint32_t* w [[buffer(0)]],
+    const device T_scale* scales [[buffer(1)]],
+    const device T_scale* biases [[buffer(2)]],
+    const device T_act* x [[buffer(3)]],
+    device T_act* y [[buffer(4)]],
+    const device T_scale* gain [[buffer(15)]],
+    const device T_act* bias [[buffer(16)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int R = QMV_FAST_ROWS;
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  threadgroup float part[SK][2 * R];
+  threadgroup float part_sq[SK];
+
+  const int in_vec_size = IN_VEC_SIZE;
+  const int out_vec_size = OUT_VEC_SIZE;
+  const int rg = simd_gid % 2;
+  const int ks = simd_gid / 2;
+  const int slice = in_vec_size / SK;
+  const int k0 = ks * slice;
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int tile_row = tid.y * (2 * R);
+  const int out_row = tile_row + rg * R;
+
+  const device uint8_t* ws = (const device uint8_t*)w + out_row * in_vec_size_w +
+      k0 * bytes_per_pack / pack_factor + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + k0 / group_size + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + k0 / group_size + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + k0 + simd_lid * values_per_thread;
+  y += tid.x * out_vec_size + tile_row;
+  gain += k0 + simd_lid * values_per_thread;
+
+  float x_thread[values_per_thread];
+  float result[R] = {0};
+  float sum_sq = 0;
+  for (int k = 0; k < slice; k += block_size) {
+    float sum;
+    if (QMV_NORMED) {
+      thread float xg[values_per_thread];
+      qmv_normalize<float, values_per_thread>(x, gain, xg, sum_sq, values_per_thread);
+      sum = load_vector<T_act, float, values_per_thread, bits>(xg, x_thread);
+      gain += block_size;
+    } else {
+      sum = load_vector<T_act, float, values_per_thread, bits>(x, x_thread);
+    }
+    for (int row = 0; row < R; row++) {
+      const device uint8_t* wl = ws + row * in_vec_size_w;
+      float s = scales[row * in_vec_size_g];
+      float b = biases[row * in_vec_size_g];
+      result[row] += qdot<float, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+  for (int row = 0; row < R; row++) {
+    float r = simd_sum(result[row]);
+    if (simd_lid == 0) {
+      part[ks][rg * R + row] = r;
+    }
+  }
+  if (QMV_NORMED) {
+    float sq = simd_sum(sum_sq);
+    if (simd_lid == 0 && rg == 0) {
+      part_sq[ks] = sq;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < uint(2 * R)) {
+    float acc = 0.0f;
+    float total_sq = 0.0f;
+    for (int i = 0; i < SK; i++) {
+      acc += part[i][simd_lid];
+      total_sq += QMV_NORMED ? part_sq[i] : 0.0f;
+    }
+    acc *= qmv_row_scale(total_sq, in_vec_size);
+    qmv_store<T_act>(y + simd_lid, acc, bias, tile_row + simd_lid);
+  }
+}
+
+#define INST_QMV_FAST_SK(act_tag, act_type, scale_tag, scale_type, gs, sk)                     \
+  SCRATCHY_KERNEL(affine_qmv_fast_sk##sk##_##act_tag##_s_##scale_tag##_gs_##gs##_b_4_batch_0,   \
+                  affine_qmv_fast_sk<act_type, scale_type, gs, 4, sk>)
+#define INST_QMV_FAST_SK_ALL(gs, sk)                   \
+  INST_QMV_FAST_SK(f16,  half,   f16,  half,   gs, sk) \
+  INST_QMV_FAST_SK(bf16, bfloat, bf16, bfloat, gs, sk) \
+  INST_QMV_FAST_SK(bf16, bfloat, f16,  half,   gs, sk) \
+  INST_QMV_FAST_SK(f16,  half,   bf16, bfloat, gs, sk)
+INST_QMV_FAST_SK_ALL(32, 2)
+INST_QMV_FAST_SK_ALL(64, 2)
+INST_QMV_FAST_SK_ALL(32, 4)
+INST_QMV_FAST_SK_ALL(64, 4)
+INST_QMV_FAST_SK_ALL(64, 8)

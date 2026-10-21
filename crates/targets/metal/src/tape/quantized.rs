@@ -96,7 +96,13 @@ pub enum QmvKernel {
     /// per-threadgroup vector tile, `ceil(M / ceil(M/5))` capped at 5
     /// (`quantized.cpp:555`).
     Wide { nv: u32 },
+    /// PROBE (#799, never merged): `affine_qmv_fast_sk<sk>_*` — [`QmvKernel::Fast`]'s one-row
+    /// tile with K split across `sk` simdgroup pairs.
+    FastSplitK { sk: u32 },
 }
+
+/// PROBE (#799): the simdgroup pairs a one-row 4-bit matvec splits K across.
+pub const QMV_SPLIT_K: u32 = 4;
 
 /// Pick the right qmv variant per MLX `quantized.cpp:1826 dispatch_qmv`:
 /// quad first (tiny K), then the small-M wide band (`M ≥ 2` on gen-15+ —
@@ -134,6 +140,8 @@ pub fn pick_qmv_kernel_wide(n: u32, k: u32, bits: u32, m: u32, wide_ok: bool) ->
     } else if qmv_fast_covers(n, k) {
         if m >= 2 {
             QmvKernel::FastFold
+        } else if bits == 4 && k.is_multiple_of(QMV_SPLIT_K * 512) && n <= 16384 {
+            QmvKernel::FastSplitK { sk: QMV_SPLIT_K }
         } else {
             QmvKernel::Fast
         }
@@ -193,6 +201,7 @@ pub fn qmv_dispatch_shape(
             ((m, n.div_ceil(bn), b), (32, 1, 1))
         }
         QmvKernel::Fast => ((m, n.div_ceil(QMV_FAST_TILE_ROWS), b), (32, 2, 1)),
+        QmvKernel::FastSplitK { sk } => ((m, n.div_ceil(QMV_FAST_TILE_ROWS), b), (32, 2 * sk, 1)),
         QmvKernel::FastFold => ((m, n.div_ceil(QMV_FAST_FOLD_TILE_ROWS), b), (32, 2, 1)),
         QmvKernel::Generic => ((m, n.div_ceil(8), b), (32, 2, 1)),
         QmvKernel::Tiny => {
@@ -232,6 +241,9 @@ pub fn qmv_kernel_name(
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
+        }
+        QmvKernel::FastSplitK { sk } => {
+            format!("affine_qmv_fast_sk{sk}_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::FastFold => {
             assert!(
@@ -310,6 +322,9 @@ pub fn qmv_kernel_static_name(
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
+        }
+        QmvKernel::FastSplitK { sk } => {
+            format!("affine_qmv_fast_sk{sk}_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::FastFold => {
             format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_t8_batch_0")
