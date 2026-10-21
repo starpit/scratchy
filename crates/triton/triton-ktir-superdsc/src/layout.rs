@@ -161,7 +161,18 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
             });
         }
     }
-    let index_tids: std::collections::BTreeSet<u32> = gathers.iter().map(|g| g.index_tid).collect();
+    // ⭐ AND EVERY SCATTER'S INDEX — an indexed write's index buffer is the same `SenUint32`
+    // table a gather's is (the vendor's `test_scatter_1core` declares it identically).
+    let scatters =
+        ktir_superdsc::emit::lower_ktir_to_superdsc::scatters_of(node).map_err(|e| Error {
+            stage: "layout",
+            message: format!("{e:?}"),
+        })?;
+    let index_tids: std::collections::BTreeSet<u32> = gathers
+        .iter()
+        .map(|g| g.index_tid)
+        .chain(scatters.iter().map(|s| s.index_tid))
+        .collect();
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     // Bytes placed per segment so far — the running high-water [`pack`] appends at.

@@ -264,6 +264,154 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         .collect();
     let mut out: Vec<Gather> = Vec::with_capacity(tiles.len());
     for tile in &tiles {
+        // ⭐ A TILE A `ktdp.store` WRITES THROUGH (and no load reads) IS A SCATTER — [`scatters_of`]
+        // reads it, with the same tile facts.
+        if tile_is_scattered(f, tile) {
+            continue;
+        }
+        let (value_tid, index_tid, entries, first_entry) = indirect_tile_facts(k, &consts, tile)?;
+        // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
+        // walk below joins each op to its own tile by load identity, so two tiles over different
+        // pairs are two descriptors each carrying one index operand.
+        // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
+        // travels with the gather. Exactly one load per tile: two loads over one tile would be two
+        // gathers on one descriptor shape.
+        let Some(tv) = tile.result else {
+            return err(format!(
+                "{}: an indirect access tile states no result, so no `ktdp.load` can read it and \
+                 the gather it describes never happens",
+                f.name,
+            ));
+        };
+        let loads: Vec<&Operation<'_>> = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv))
+            .collect();
+        let [load] = loads[..] else {
+            return err(format!(
+                "{}: {} `ktdp.load` op(s) over one indirect access tile — one tile is ONE gather \
+                 (one index operand per descriptor, DSC2ToDataflowIR.cpp:51), and its rows reach \
+                 consumers through one value",
+                f.name,
+                loads.len(),
+            ));
+        };
+        let Some(load) = load.result else {
+            return err(format!(
+                "{}: the indirect access tile's `ktdp.load` states no result, so the gathered rows \
+                 have no identity to join by",
+                f.name,
+            ));
+        };
+        out.push(Gather {
+            index_tid,
+            value_tid,
+            entries,
+            first_entry,
+            tile: tv,
+            load,
+        });
+    }
+    Ok(out)
+}
+
+/// Whether a `ktdp.store` writes THROUGH this indirect tile and no `ktdp.load` reads it — the
+/// scatter form ([`scatters_of`]).
+fn tile_is_scattered(f: &IRFunction<'static>, tile: &Operation<'_>) -> bool {
+    let Some(tv) = tile.result else { return false };
+    let reads = f
+        .operations
+        .iter()
+        .any(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv));
+    let writes = f
+        .operations
+        .iter()
+        .any(|o| o.op_type == OpKind::KtdpStore && o.operands.get(1) == Some(&tv));
+    writes && !reads
+}
+
+/// ⭐⭐⭐ ONE INDEXED WRITE THE PROGRAM STATES — `tt.descriptor_scatter`, lowered by the front end to
+/// a `ktdp.store` of `value` through a `ktdp.construct_indirect_access_tile`. The store twin of
+/// [`Gather`]: the same tile facts ([`indirect_tile_facts`]), and the stored VALUE instead of the
+/// gathered load. It lowers to the vendor's `test_scatter_1core` shape: an `identity` copy whose
+/// OUTPUT is the indexed table.
+#[derive(Clone, Copy, Debug)]
+pub struct Scatter {
+    /// The parameter holding the index vector.
+    pub index_tid: u32,
+    /// The parameter written THROUGH the index (the table).
+    pub value_tid: u32,
+    /// Rows written: the tile's slow extent, one index entry per row.
+    pub entries: u32,
+    /// Where this scatter's run of entries starts in the index buffer.
+    pub first_entry: crate::superdsc_opspec::EntryBase,
+    /// The tile's own result.
+    pub tile: Ssa,
+    /// The value the `ktdp.store` writes — the rows that land in the table.
+    pub value: Ssa,
+}
+
+/// Every [`Scatter`] the program states, one per indirect tile a `ktdp.store` writes through.
+///
+/// ⛔ EXACTLY ONE STORE PER TILE: a tile is one index operand on one descriptor
+/// (`DSC2ToDataflowIR.cpp:51`), so two stores through one tile would be two writes claiming one
+/// index pairing.
+pub fn scatters_of(k: &KtirNode) -> Result<Vec<Scatter>, Error> {
+    let f = &k.func;
+    let consts = index_constants(&k.func);
+    let mut out = Vec::new();
+    for tile in f
+        .operations
+        .iter()
+        .filter(|o| o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+    {
+        if !tile_is_scattered(f, tile) {
+            continue;
+        }
+        let Some(tv) = tile.result else { continue };
+        let stores: Vec<&Operation<'_>> = f
+            .operations
+            .iter()
+            .filter(|o| o.op_type == OpKind::KtdpStore && o.operands.get(1) == Some(&tv))
+            .collect();
+        let [store] = stores[..] else {
+            return err(format!(
+                "{}: {} `ktdp.store` op(s) through one indirect access tile — one tile is ONE \
+                 indexed write (one index operand per descriptor, DSC2ToDataflowIR.cpp:51)",
+                f.name,
+                stores.len(),
+            ));
+        };
+        let Some(&value) = store.operands.first() else {
+            return err(format!(
+                "{}: a `ktdp.store` through an indirect tile states no value",
+                f.name
+            ));
+        };
+        let (value_tid, index_tid, entries, first_entry) = indirect_tile_facts(k, &consts, tile)?;
+        out.push(Scatter {
+            index_tid,
+            value_tid,
+            entries,
+            first_entry,
+            tile: tv,
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// The four facts an indirect tile states — the table it indexes, the index buffer, the entries it
+/// takes and where its run starts in the index — read ONE way for both a gather and a scatter, so
+/// the two cannot disagree about which parameter is the table.
+fn indirect_tile_facts(
+    k: &KtirNode,
+    consts: &std::collections::HashMap<Ssa, i64>,
+    tile: &Operation<'_>,
+) -> Result<(u32, u32, u32, crate::superdsc_opspec::EntryBase), Error> {
+    let f = &k.func;
+    {
         // The SAME param walk `gather_of` runs, per tile — a closure over this tile's operands so
         // the two readings cannot disagree about which parameter a tile's view names.
         let param_tid = |slot: usize, what: &str| -> Result<u32, Error> {
@@ -396,56 +544,8 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
                 message: format!("{}: {msg}", f.name),
             })?
         };
-        // ⭐ NO CROSS-TILE PAIR CHECK — deliberately. The one-index law is per DESCRIPTOR, and the
-        // walk below joins each op to its own tile by load identity, so two tiles over different
-        // pairs are two descriptors each carrying one index operand — the batched paged-decode
-        // shape (K^T and V gathered through one ids buffer). The per-op guards downstream (the
-        // ScalarMul-or-materialized rule, the materializer's B-side and single-consumer demands,
-        // the uncarried-tile check) are what enforce the law where it binds; a pair check HERE
-        // would refuse a shape those guards admit, which is how this reading used to stop one
-        // generalization short.
-        // ⭐ THIS TILE'S GATHERED LOAD — the `ktdp.load` over the tile, found HERE so the value
-        // travels with the gather. Exactly one load per tile: the tile IS the statement "the row
-        // index is data", and a tile with no load states a gather nothing reads (refused below as
-        // uncarried) while two loads over one tile would be two gathers on one descriptor shape.
-        let Some(tv) = tile.result else {
-            return err(format!(
-                "{}: an indirect access tile states no result, so no `ktdp.load` can read it and \
-                 the gather it describes never happens",
-                f.name,
-            ));
-        };
-        let loads: Vec<&Operation<'_>> = f
-            .operations
-            .iter()
-            .filter(|o| o.op_type == OpKind::KtdpLoad && o.operands.first() == Some(&tv))
-            .collect();
-        let [load] = loads[..] else {
-            return err(format!(
-                "{}: {} `ktdp.load` op(s) over one indirect access tile — one tile is ONE gather \
-                 (one index operand per descriptor, DSC2ToDataflowIR.cpp:51), and its rows reach \
-                 consumers through one value",
-                f.name,
-                loads.len(),
-            ));
-        };
-        let Some(load) = load.result else {
-            return err(format!(
-                "{}: the indirect access tile's `ktdp.load` states no result, so the gathered rows \
-                 have no identity to join by",
-                f.name,
-            ));
-        };
-        out.push(Gather {
-            index_tid,
-            value_tid,
-            entries,
-            first_entry,
-            tile: tv,
-            load,
-        });
+        Ok((value_tid, index_tid, entries, first_entry))
     }
-    Ok(out)
 }
 
 /// ⛔⛔⛔ THE GUARD FOR THE FACT THIS FILE USED TO DROP: an operand this emitter addresses at the

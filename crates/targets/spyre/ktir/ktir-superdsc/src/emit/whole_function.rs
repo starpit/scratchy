@@ -2713,6 +2713,23 @@ pub fn lower_function(
         .filter(|t| !crate::reserved_tids::is_reserved(*t))
         .max()
         .map_or(0, |m| m + 1);
+    // ⭐ A BOUND PARAMETER THE BUNDLE DOES NOT PLACE IS DECLARED AT ITS OWN VIEW — the program's
+    // `ktdp.construct_memory_view` states its full extent and element type, which is the whole
+    // footprint. A producer-numbered per-step input past the graph's tensors (an attention
+    // kernel's index tables and mask) has no graph placement, and this is the one place its
+    // extent is stated. Idempotent: a placed or already-declared tid is left as it is.
+    if let Some(l) = layout {
+        for (i, r) in regions(k)?.iter().enumerate() {
+            if l.placements.contains_key(&r.tid) || crate::reserved_tids::is_reserved(r.tid) {
+                continue;
+            }
+            let df = match param_view_dtype(f, i) {
+                Some(ktir_core::dtypes::DType::I32) => crate::superdsc_opspec::Df::SenUint32,
+                _ => crate::superdsc_opspec::Df::Fp16,
+            };
+            l.synth_df(crate::place::PlaceId::Act(r.tid), &[r.v_rows, r.v_cols], df);
+        }
+    }
     let mut inter: std::collections::HashMap<Ssa, Region> = std::collections::HashMap::new();
     // THE fp8 SCALE MULFS THE DOT ABSORBED. The walk lowers each op once, and an absorbed epilogue
     // (`p * ws`, see the absorption at the `stored` lookup) already rode into its dot's emission —
@@ -2777,6 +2794,8 @@ pub fn lower_function(
         .map(|(i, g)| (g.load, i))
         .collect();
     let mut gather_carried = vec![false; gathers.len()];
+    // The indexed WRITES the program states ([`scatters_of`]), lowered at their stores below.
+    let scatters = super::lower_ktir_to_superdsc::scatters_of(k)?;
     // The row fold's own view of the same analyses — built once here so its helpers read ONE
     // value rather than threading three slices each (see [`FoldAnalyses`]).
     let analyses = FoldAnalyses {
@@ -2786,6 +2805,17 @@ pub fn lower_function(
     };
 
     for op in f.operations.iter() {
+        // ⭐ AN INDEXED STORE — a `ktdp.store` through a scatter tile — lowers HERE, at its own
+        // program position, so a later gather of the same table reads what it wrote (dxp program
+        // order is call order).
+        if op.op_type == OpKind::KtdpStore
+            && let Some(sc) = scatters
+                .iter()
+                .find(|s| op.operands.get(1) == Some(&s.tile))
+        {
+            out.push(lower_indexed_write(k, sc, sym_id_base, layout)?);
+            continue;
+        }
         if is_plumbing(op.op_type) {
             continue;
         }
@@ -3186,7 +3216,10 @@ pub fn lower_function(
         // reading the intermediate as plain-B. See [`gathered_matmul_materializes`], which states the
         // whole argument and does the work.
         let gathered_b = if let Some((g, _ti, gi)) = op_gather
-            && matches!(program, Lowering::Node(Program::Matmul))
+            && !matches!(
+                program,
+                Lowering::ScalarMul(_) | Lowering::BoundScalarMul(_)
+            )
         {
             gathered_matmul_materializes(
                 k,
@@ -3246,7 +3279,7 @@ pub fn lower_function(
             };
             let mut r = *r;
             r.is_out = false;
-            per_op[1] = r;
+            per_op[gi] = r;
             per_op.truncate(n_in);
         }
 
@@ -3723,6 +3756,91 @@ pub fn lower_function(
     Ok(out)
 }
 
+/// The element type parameter `i`'s `ktdp.construct_memory_view` states.
+fn param_view_dtype(f: &IRFunction<'static>, i: usize) -> Option<ktir_core::dtypes::DType> {
+    let (ptr, _) = f.arguments.get(i)?;
+    let view = f
+        .operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))?;
+    view.attributes.iter().find_map(|(k, v)| match (k, v) {
+        (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
+        _ => None,
+    })
+}
+
+/// ⭐ ONE INDEXED WRITE — [`super::assemble_indexed_write`] over the scatter's own facts. The
+/// stored rows must be a LOAD of a parameter (a value this walk has a region for at a whole-tensor
+/// corner); the table and the index are the tile's own parameters.
+fn lower_indexed_write(
+    k: &KtirNode,
+    sc: &super::lower_ktir_to_superdsc::Scatter,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<super::EmittedOp, Error> {
+    let f = &k.func;
+    let Some(src) = region_for_operand(k, sc.value)? else {
+        return err(format!(
+            "{}: the indexed store's value is not a load of a parameter — an indexed write copies \
+             rows a parameter holds",
+            f.name
+        ));
+    };
+    // ⛔ THE SOURCE IS READ FROM ITS BASE, so a row window elsewhere is refused by name rather
+    // than copied from row 0.
+    if src.r_start != 0 || src.c_start != 0 {
+        return err(format!(
+            "{}: the indexed store's rows start at ({}, {}) of t{} — this door copies a source read \
+             from its base",
+            f.name, src.r_start, src.c_start, src.tid
+        ));
+    }
+    if src.r_len != sc.entries {
+        return err(format!(
+            "{}: the indexed store writes {} rows but its tile states {} entries",
+            f.name, src.r_len, sc.entries
+        ));
+    }
+    let all = regions(k)?;
+    let region_of = |tid: u32| -> Result<Region, Error> {
+        k.bindings
+            .iter()
+            .position(|b| b.get() == tid)
+            .and_then(|i| all.get(i).copied())
+            .ok_or_else(|| Error {
+                message: format!("{}: t{tid} is not a bound parameter", f.name),
+            })
+    };
+    let table = region_of(sc.value_tid)?;
+    let _ = region_of(sc.index_tid)?;
+    if table.v_cols != src.c_len {
+        return err(format!(
+            "{}: the indexed store writes {}-wide rows into a {}-wide table",
+            f.name, src.c_len, table.v_cols
+        ));
+    }
+    let run = crate::superdsc_opspec::StickRun::covering(sc.first_entry.entries(), sc.entries)
+        .map_err(|m| Error {
+            message: format!("{}: {m}", f.name),
+        })?;
+    let name = format!("{}_scatter_t{}", f.name, sc.value_tid);
+    super::assemble_indexed_write(
+        super::IndexedWrite {
+            op_name: &name,
+            rows: sc.entries,
+            cols: src.c_len,
+            src: &src.name(),
+            table: &table.name(),
+            table_rows: table.v_rows,
+            index_name: &crate::place::act_name(sc.index_tid),
+            run,
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(Error::from)
+}
+
 /// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
 /// holds the REGIONS and not the ops — re-deriving any of these there would mean re-walking the
 /// chain without them. They ride together as one value because they are one op's row in the walk.
@@ -3955,9 +4073,9 @@ fn gathered_matmul_materializes(
     // A-side gather (a row-gathered activation) is a different program the walk's own fail-closed
     // refusal owns. Returning `false` here hands it back to that refusal, whose message names the
     // arch reason — the control in `zz_the_gathered_matmul_materializes` pins this exact path.
-    if gathered_input != 1 {
-        return Ok(false);
-    }
+    // ⭐ ANY CONSUMER OF A GATHERED LOAD READS THE MATERIALIZED ROWS — the copy is the gather, and
+    // what reads its result (a contraction's B, a transpose, an elementwise op) reads an ordinary
+    // activation. The one exception keeps its own body: `ScalarMul` carries the index itself.
     // ⛔ AND B MUST BE THE GATHERED **LOAD**, proven by identity: the matmul's gathered input IS the
     // value this tile's load produced. A TID comparison cannot prove this — a plain load of the
     // same table resolves to the same tid, and a program whose gather feeds A while B reads the

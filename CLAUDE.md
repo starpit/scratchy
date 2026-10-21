@@ -23,8 +23,8 @@
 
 # Build and test on the pod
 
-We have **4 cards**, one per pod in namespace `a1-vllm-spyre`:
-`nickm`, `nickm2`, `nickm3`, `nickm4`. Use all of them in parallel. Find the
+Card: pod `nickm-*` in namespace `a1-vllm-spyre` — the ONLY one for now.
+**`nickm3-*` and `nickm4-*` are OFF LIMITS.** Find the
 live pod names with `oc get pods -n a1-vllm-spyre | grep nickm`.
 
 Sync the tree (never the target dir), then build warm and chat, on the pod:

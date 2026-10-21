@@ -1608,6 +1608,105 @@ fn one_gathered_leg(
     Ok(emitted)
 }
 
+/// ⭐⭐⭐ AN INDEXED WRITE — `table[ids[row], :] = src[row, :]`, the store twin of
+/// [`assemble_pointwise_broadcast_gather`] and the vendor's `dxp/test/test_scatter_1core` shape: an
+/// `identity` copy over `[rows, cols]` whose OUTPUT is the table, the index declared on it through
+/// [`OpSpec::attach_scatter_index`]. One entry per row ([`PageExtent::single_position`]), so
+/// `skip_addr` is one table row; the work split is [`crate::work::GatherSplit`]'s, `mb` only, for
+/// the same `skip_addr` reason the gather leg states.
+///
+/// ⛔ ONE INDEX STICK: a scatter of more rows than one `SenUint32` stick of entries is refused by
+/// name — the IBR loads a single stick, the gather leg's measured `ids[r mod 32]` wrap.
+pub struct IndexedWrite<'a> {
+    pub op_name: &'a str,
+    pub rows: u32,
+    pub cols: u32,
+    /// The rows written, `[rows, cols]` stick-major.
+    pub src: &'a str,
+    /// The table written through the index.
+    pub table: &'a str,
+    /// The table's own row count — its residency, carried as the output's `N_` row extent the way
+    /// the gather leg's cut carries its tensor's.
+    pub table_rows: u32,
+    pub index_name: &'a str,
+    pub run: crate::superdsc_opspec::StickRun,
+}
+
+pub fn assemble_indexed_write(
+    w: IndexedWrite<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, SuperDscError> {
+    let IndexedWrite {
+        op_name,
+        rows,
+        cols,
+        src,
+        table,
+        table_rows,
+        index_name,
+        run,
+    } = w;
+    let page = crate::superdsc_opspec::PageExtent::single_position();
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if rows > cap || run.sticks() != 1 {
+        return Err(SuperDscError(format!(
+            "{op_name}: an indexed write of {rows} rows over a run of {} stick(s) — ONE op's index is \
+             ONE {cap}-entry stick (the IBR loads a single stick transfer and entries past it wrap). \
+             Write at most {cap} rows per indexed store.",
+            run.sticks()
+        )));
+    }
+    let tile_op = crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(rows, cols, 1, 2);
+    let split = crate::work::GatherSplit::over_entries(
+        &tile_op.dims,
+        crate::superdsc_opspec::MAX_CORES,
+        page.get(),
+    )
+    .map_err(|e| SuperDscError(format!("{op_name}: {e}")))?;
+    let src_h = rb(src, rows, cols);
+    let inputs = [In::full(&src_h).ew()];
+    let mut op = pointwise_broadcast_opspec_from_tile(
+        &tile_op,
+        rows,
+        cols,
+        op_func_from_str("identity"),
+        &inputs,
+        table,
+        crate::addr::OutCorner::ZERO,
+        false,
+        layout,
+        crate::work::CoreDivision::Gathered(split),
+    )
+    .map_err(SuperDscError)?;
+    op.attach_scatter_index(crate::superdsc_opspec::GatherIndex {
+        name: index_name.to_string(),
+        entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
+        page,
+        per_position: None,
+        first_entry: run.start(),
+    })
+    .ok_or_else(|| {
+        SuperDscError(format!(
+            "{op_name}: the scatter declaration was refused — the op's plan has no `mb` dim for the \
+             entries to enumerate"
+        ))
+    })?;
+    // ⛔ A TABLE WIDER THAN ONE STICK IS REFUSED: its stick-plane stride is reconstructed from
+    // `N_`, which this op states at its own `rows` — the gather leg's measured plane-stride trap.
+    // One stick wide, there is one plane and no stride to get wrong.
+    if cols > Fp16::ELEMS_PER_STICK {
+        return Err(SuperDscError(format!(
+            "{op_name}: an indexed write into a {cols}-wide table ({table_rows} rows) — wider than \
+             one {}-element stick, so the table's stick-plane stride would be reconstructed from \
+             this op's {rows}-row `N_` instead of the table's {table_rows}",
+            Fp16::ELEMS_PER_STICK
+        )));
+    }
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    Ok(emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)?)
+}
+
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
 /// COLUMN-BLOCK-SPLIT wide op. The tape splits wide ops (e.g. the granite MLP
 /// intermediate 12800 → the col-blocks `[0,8192)` + `[8192,12800)`) into multiple
