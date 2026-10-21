@@ -2970,9 +2970,11 @@ fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
 ///
 /// ⛔ THE READERS ARE THE DOOR'S OWN, ONE PER DOOR. A whole-kernel program is lowered per-op by the
 /// whole-function walk, which classifies an `arith.mulf` with exactly one splatted constant as a
-/// `ScalarMul` whose multiplier [`scalarmul_at`] resolves by value — so the per-op reader is
-/// [`super::whole_function::splat_scale_of`], the same one that walk calls. A one-node program is
-/// lowered by the per-`Program` door, whose rmsnorm arm resolves its epsilon
+/// `ScalarMul` whose multiplier [`scalarmul_at`] resolves by value — and, the same tiebreak, an
+/// `arith.maxnumf`/`arith.minnumf` with exactly one splatted constant as the extremum's own scalar
+/// form, whose bound [`scalarextremum_at`] resolves by value — so the per-op reader is
+/// [`super::whole_function::splat_scale_of`], the same one that walk calls for both tiebreaks. A
+/// one-node program is lowered by the per-`Program` door, whose rmsnorm arm resolves its epsilon
 /// ([`program_rmsnorm_eps`]) and its `(1+w)` offset ([`program_gain_offset`]) through the same
 /// [`scale_slot`] — so those readers are here too. A constant no door looks up (an
 /// `Elementwise(Mul)` with no splat operand, a fused body's internal `1/cols`) is never collected:
@@ -2980,8 +2982,10 @@ fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
 pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
     let mut stated = Vec::new();
     for op in f.operations.iter() {
-        if op.op_type == OpKind::ArithMulf
-            && let Some((v, _)) = super::whole_function::splat_scale_of(f, op)
+        if matches!(
+            op.op_type,
+            OpKind::ArithMulf | OpKind::ArithMaxnumf | OpKind::ArithMinnumf
+        ) && let Some((v, _)) = super::whole_function::splat_scale_of(f, op)
         {
             stated.push(v);
         }
@@ -3067,6 +3071,88 @@ mod scale_completion_tests {
             grid: (1, 1, 1),
             return_type: None,
         }
+    }
+
+    /// `maximum(x, C)` / `minimum(x, C)` — the extremum's own scalar form, the tiebreak the mulf
+    /// arm states applied to the two ops whose identity lives at the range's edge. The online
+    /// softmax's running-max initial (−65504, the f16 floor, stated by `tl.full`) is exactly this
+    /// shape, and no graph payload names the value.
+    fn clamped(constant: f64, max: bool) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, m) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(constant),
+            ),
+            Operation::new(a, Some(sp), OpKind::TensorSplat, &[c]),
+            Operation::new(
+                a,
+                Some(m),
+                if max {
+                    OpKind::ArithMaxnumf
+                } else {
+                    OpKind::ArithMinnumf
+                },
+                &[x, sp],
+            ),
+        ];
+        IRFunction {
+            name: "extremum_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// THE EXTREMUM'S OWN WALL-3 HALF. A clamp's stated constant is looked up by value exactly
+    /// like a multiplier, and the f16-floor initial is a constant no payload names — both the
+    /// maximum and the minimum forms state it, both get exactly one appended slot.
+    #[test]
+    fn an_extremum_constant_the_census_never_saw_gets_one_appended_slot() {
+        for max in [true, false] {
+            let mut scales = vec![0.5f32];
+            let stated = program_stated_scales(&clamped(-65504.0, max));
+            assert_eq!(
+                stated,
+                vec![-65504.0f32],
+                "the {} form states its bound",
+                if max { "maximum" } else { "minimum" }
+            );
+            complete_scale_registry(&mut scales, stated);
+            assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
+            assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
+            assert_eq!(
+                scale_slot_in(&scales, -65504.0),
+                Some(1),
+                "the door's own lookup now resolves the bound"
+            );
+        }
+    }
+
+    /// A clamp whose bound the registry lacks is REFUSED as the desync it is — and the refusal
+    /// names the extremum kind and the value, the same law `scalarmul_at`'s desync states.
+    #[test]
+    fn an_unregistered_extremum_bound_is_refused_by_name() {
+        let (Err(e), kind) = (scalarextremum_at("m0", -65504.0, true, None, &[], &mut 0, None), "Maximum m0")
+        else {
+            panic!("no registry means no slot: the extremum must refuse")
+        };
+        assert!(
+            e.message.contains(kind) && e.message.contains("-65504"),
+            "names the kind, the op and the bound: {}",
+            e.message
+        );
+        let Err(e) = scalarextremum_at("m0", 448.0, false, None, &[], &mut 0, None) else {
+            panic!("no registry means no slot: the extremum must refuse")
+        };
+        assert!(
+            e.message.contains("Minimum m0") && e.message.contains("448"),
+            "names the kind, the op and the bound: {}",
+            e.message
+        );
     }
 
     /// THE HEADLINE. A folded constant the census never saw gets exactly one appended slot, and
@@ -6963,6 +7049,7 @@ mod elementwise_tests {
                 let ops = scalarmul_scaled(
                     "scalarmul_s1",
                     &ScaleSource::Bound { tid: 99 },
+                    "multiply",
                     None,
                     &r,
                     &mut sym,
@@ -7024,6 +7111,7 @@ mod elementwise_tests {
         let mut ops = scalarmul_scaled(
             "scalarmul_s1",
             &ScaleSource::Bound { tid: 99 },
+            "multiply",
             None,
             &logits,
             &mut sym,
@@ -7888,6 +7976,63 @@ pub fn scalarmul_at(
         &ScaleSource::Registry {
             slot: scalarmul_scale_tid(idx),
         },
+        "multiply",
+        gather,
+        r,
+        sym_id_base,
+        layout,
+    )
+}
+
+/// ⭐⭐⭐ THE EXTREMUM'S OWN SCALAR FORM — `maximum(tile, C)` / `minimum(tile, C)` with `C` a
+/// constant the program states as a splat, the max/min analogue of [`scalarmul_at`].
+///
+/// The 1:1 map already lowers a two-tensor `arith.maxnumf`/`arith.minnumf` as
+/// `Elementwise(Maximum/Minimum)` — the MoE kernel's fp8 clamps ride it, with both bounds as f16
+/// TILES. What that arm cannot take is a splat operand: a splat has no `Region`, so the walk's
+/// input collection refuses it by name rather than choosing a node kind on the producer's behalf.
+/// But a clamp against a STATED CONSTANT is not a two-tensor op at all — it is the extremum's
+/// scalar form, exactly the tiebreak `Program`'s own doc states for `Elementwise(Mul)` vs
+/// `ScalarMul` ("`program_scalarmul_scale` tells them apart by whether an operand is a
+/// `tensor.splat`"), applied to the two ops whose identity lives at the range's edge: the online
+/// softmax's running-max initial (−65504, the f16 floor, stated by `tl.full`), any clamp against
+/// a stated bound.
+///
+/// ⭐ ONE BODY WITH [`scalarmul_at`], NOT A COPY: the descriptor is the same shape (one tile
+/// input, one `In::scalar` over the bound `[1,1]` const), so this delegates to
+/// [`scalarmul_scaled`] with the op's own `opFuncName` — the drift class [`scalarmul_at`]'s
+/// header records is closed by sharing, and `maximum`/`minimum` are commutative, so the gathered
+/// arm's operand swap keeps its argument there.
+///
+/// The bound is resolved through the SAME value lookup ([`scale_slot`]: exact bits, then the f16
+/// image), so the registry's completion pass — the program-stated half — must carry it, and a
+/// program whose extremum constant the registry lacks is refused as the desync it is.
+pub fn scalarextremum_at(
+    name: &str,
+    value: f32,
+    max: bool,
+    // The gather this node's tile is read through, when it is read through one — [`gather_of`]'s
+    // answer, so the whole-function door and the per-`Program` door cannot disagree about whether a
+    // node gathers.
+    gather: Option<Gather>,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let idx = scale_slot(layout, value).ok_or_else(|| Error {
+        message: format!(
+            "{} {name}: bound {value}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor reads a bound `[1,1]` const, so the \
+             value the program uses must have a registry slot (registry desync)",
+            if max { "Maximum" } else { "Minimum" }
+        ),
+    })?;
+    scalarmul_scaled(
+        name,
+        &ScaleSource::Registry {
+            slot: scalarmul_scale_tid(idx),
+        },
+        if max { "maximum" } else { "minimum" },
         gather,
         r,
         sym_id_base,
@@ -7928,6 +8073,7 @@ pub fn scalarmul_bound(
     scalarmul_scaled(
         name,
         &ScaleSource::Bound { tid: bound.tid },
+        "multiply",
         gather,
         r,
         sym_id_base,
@@ -7948,9 +8094,20 @@ enum ScaleSource {
     Bound { tid: u32 },
 }
 
+/// ⭐ THE OP'S DDL `opFuncName`, CARRIED AS THE ONE DIFFERENCE between the constant-operand bodies:
+/// `"multiply"` for the scale bodies, `"maximum"`/`"minimum"` for the extremum's own scalar form
+/// ([`scalarextremum_at`]). The descriptor shape is the same for all three — one tile input, one
+/// `In::scalar` over the bound `[1,1]` const — which is why this is one body and not three copies
+/// that could drift (the drift class [`scalarmul_at`]'s own doc records).
+///
+/// ⛔ ONLY COMMUTATIVE OPS MAY TAKE THE GATHERED SWAP BELOW, and the parameter's every value is
+/// one: `multiply`, `maximum`, `minimum` all compute the same function with their operands
+/// exchanged. A non-commutative op_func here is a caller bug the swap would silently
+/// mis-operand — the caller that names a new one owes the commutativity argument.
 fn scalarmul_scaled(
     name: &str,
     scale: &ScaleSource,
+    op_func: &'static str,
     gather: Option<Gather>,
     r: &[Region],
     sym_id_base: &mut i64,
@@ -8111,7 +8268,8 @@ fn scalarmul_scaled(
         // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
         // `[scalar, table, idx, out]`: adjacent AND output-last.
         //
-        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
+        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS COMMUTATIVE — `multiply`, `maximum`, `minimum`
+        // all compute the same function with their operands exchanged: the SAME two
         // operands and the same `opFuncName`, in the other order. This is not a general licence: a
         // non-commutative pointwise gathering a non-last operand has no such swap, which is why
         // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
@@ -8140,7 +8298,7 @@ fn scalarmul_scaled(
             crate::emit::PointwiseGather {
                 op_name: &op_name,
                 tile_op: &tile_op,
-                op_func: "multiply",
+                op_func,
                 rows,
                 cols,
                 inputs: &gathered_inputs,
@@ -8161,7 +8319,7 @@ fn scalarmul_scaled(
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
-        "multiply",
+        op_func,
         rows,
         cols,
         &inputs,
