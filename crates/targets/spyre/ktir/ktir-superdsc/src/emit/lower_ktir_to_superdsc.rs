@@ -1312,35 +1312,57 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS CANNOT CARRY A CORNER — COLUMN OR ROW — AND ONE NEVER
-    // REACHES THEM FROM THIS FRONT END. A broadcast operand is addressed at its OWN extent (`In::col`:
-    // one lane per row; `In::mb`: one row of values) and the per-row chain writes LANE 0 of a
-    // one-stick output at the buffer base — neither form can state "columns
-    // `[c_start, c_start+c_len)` of a wider stick-blocked tensor" (what a column-blocked chunk is)
-    // nor "rows `[r_start, r_start+r_len)` of a taller one" (what a banded program's window is).
-    // The column-tiling set (`subtile_ir.rs`: `EwKind::Silu | Mul | Add`, `ScalarMul`, `SiluMul`)
-    // is all DENSE, so a corner arriving at either arm is a producer shape this door refuses BY
-    // NAME rather than mis-addressing — the same contract `base_addressed` states for a row corner
-    // on every other body. The DENSE arm below carries both corners; this guard is what keeps the
-    // other two from silently dropping them.
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS PLACE ONLY THE CORNER THEIR ONE CORNERED OPERAND MODE
+    // CAN STATE. A broadcast operand is addressed at its OWN extent (`In::col`: one lane per row;
+    // `In::mb`: one row of values) and the per-row chain writes LANE 0 of a one-stick output at
+    // the buffer base — neither form can state "columns `[c_start, c_start+c_len)` of a wider
+    // stick-blocked tensor" (what a column-blocked chunk is) nor "rows `[r_start, r_start+r_len)`
+    // of a taller one" (what a banded program's window is). The ONE exception is the Mb mode's
+    // own cornered form: an Mb-broadcast source at a whole-stick COLUMN corner of its flat frame
+    // is the per-block slice shape (`In::mb_at` — the card-proven prefix-mask law, one
+    // stick-wide block at a time), and that operand carries its corner into the descriptor. So a
+    // corner is legal on an Mb-flagged operand's COLUMN and NOWHERE ELSE in these arms — the
+    // output, any ROW corner, and any corner on a dense/Col/Y operand or in the per-row chain
+    // are producer shapes this door refuses BY NAME rather than mis-addressing (the same
+    // contract `base_addressed` states for a row corner on every other body). The DENSE arm
+    // below carries both corners; this guard is what keeps the others from silently dropping
+    // them.
+    let corner_unplaceable = |i: usize, x: &Region| {
+        (x.c_start != 0 || x.r_start != 0)
+            && !(matches!(bcast.get(i), Some(Some(BcastAxis::Mb))) && x.r_start == 0)
+    };
     if (bcast.iter().any(Option::is_some) || out.c_len == 1)
         && (out.c_start != 0
-            || ins.iter().any(|x| x.c_start != 0)
             || out.r_start != 0
-            || ins.iter().any(|x| x.r_start != 0))
+            || ins.iter().enumerate().any(|(i, x)| corner_unplaceable(i, x)))
     {
-        let (who, cs) = ins
+        let (who, what, cs) = ins
             .iter()
-            .find(|x| x.c_start != 0)
-            .map(|x| (format!("input t{}", x.tid), x.c_start))
-            .unwrap_or_else(|| (format!("the output t{}", out.tid), out.c_start));
+            .enumerate()
+            .find(|&(i, x)| corner_unplaceable(i, x))
+            .map(|(i, x)| {
+                if x.r_start != 0 {
+                    (format!("input {i} t{}", x.tid), "row", x.r_start)
+                } else {
+                    (format!("input {i} t{}", x.tid), "column", x.c_start)
+                }
+            })
+            .unwrap_or_else(|| {
+                if out.r_start != 0 {
+                    (format!("the output t{}", out.tid), "row", out.r_start)
+                } else {
+                    (format!("the output t{}", out.tid), "column", out.c_start)
+                }
+            });
         return err(format!(
-            "Elementwise({kind:?}) {name}: {who} states column corner {cs} of its view, and the \
+            "Elementwise({kind:?}) {name}: {who} states {what} corner {cs} of its view, and the \
              arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
-             addresses its operands at the BUFFER BASE or at a broadcast mode — neither can place \
-             a column window, and neither a row corner (`base_addressed`'s own argument). A \
-             column-blocked chunk or a banded window is DENSE elementwise; the dense arm carries \
-             both corners, so give the broadcast/per-row chains whole-tensor regions.",
+             addresses its operands at the BUFFER BASE or at a broadcast mode — the one corner \
+             those arms can place is a COLUMN window on an Mb-broadcast source (`In::mb_at`, the \
+             per-block slice law), which this operand is not. A column-blocked chunk or a banded \
+             window is DENSE elementwise; the dense arm carries both corners, so give the \
+             broadcast/per-row chains whole-tensor regions (or an Mb source a whole-stick column \
+             window).",
         ));
     }
     if bcast.iter().any(Option::is_some) {
@@ -1819,6 +1841,14 @@ fn elementwise_broadcast(
             // handle's declaration, so the annotation now states the footprint the storage always
             // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
             Some(BcastAxis::Col) => rb(n, x.v_rows, FP16_ELEMS_PER_STICK),
+            // ⭐⭐⭐ A CORNERED `Mb` SOURCE IS DECLARED AT THE FULL VIEW, not the window. The
+            // operand mint bounds-checks the swept window (one row of `c_len` values) AT the
+            // operand's `col_offset` — the corner — against this declaration, so a `[1, c_len]`
+            // handle would fail its own mint at any nonzero corner. Declaring `[v_rows, v_cols]`
+            // states the buffer the window sits in, the same "true shapes" law `scalarmul_scaled`
+            // states for its chunked tile (the walk's flat Mb frame presents the parent's whole
+            // extent here, window and all).
+            Some(BcastAxis::Mb) if x.c_start != 0 => rb(n, x.v_rows, x.v_cols),
             // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
             // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
             // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
@@ -1829,14 +1859,35 @@ fn elementwise_broadcast(
         .collect();
     let ew: Vec<_> = in_handles
         .iter()
+        .zip(ins)
         .zip(bcast)
-        .map(|(h, b)| match b {
-            None => In::full(h).ew(),
-            Some(BcastAxis::Col) => In::col(h).ew(),
-            Some(BcastAxis::Mb) => In::mb(h).ew(),
-            Some(BcastAxis::Y(y)) => In::y_broadcast(h, *y).ew(),
+        .map(|((h, x), b)| match b {
+            None => Ok(In::full(h).ew()),
+            Some(BcastAxis::Col) => Ok(In::col(h).ew()),
+            // ⭐⭐⭐ THE Mb SOURCE AT A WHOLE-STICK COLUMN CORNER — the per-block slice law
+            // (`In::mb_at`, the card-proven prefix-mask shape): one row of values read at the
+            // corner of the parent's flat frame, broadcast over the output's rows. The corner is
+            // built by `col_window_of`, the ONE typed constructor — it refuses a sub-stick
+            // corner BY NAME (a mid-plane window is not a stick-major tensor of its own, #622's
+            // law), so "where the slice starts" is never re-derived from an integer. A
+            // corner-free source keeps the base `In::mb` — byte-identical to the whole-tensor
+            // emission.
+            Some(BcastAxis::Mb) if x.c_start != 0 => {
+                let df = if x.is_fp8 { Df::Fp8 } else { Df::Fp16 };
+                let w = crate::addr::col_window_of(x.v_rows, x.v_cols, x.c_start, df).map_err(
+                    |e| Error {
+                        message: format!(
+                            "Elementwise({kind:?}) {name}: input t{}: {e}",
+                            x.tid
+                        ),
+                    },
+                )?;
+                Ok(In::mb_at(h, w.dev()).ew())
+            }
+            Some(BcastAxis::Mb) => Ok(In::mb(h).ew()),
+            Some(BcastAxis::Y(y)) => Ok(In::y_broadcast(h, *y).ew()),
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
     // broadcast op is not silently exempt from it. In the Y mode the tile states the OP's own
     // `[mb, out, y]` dims — `mb` one spray's worth of rows, `y` the spray count — which is the
@@ -1858,10 +1909,10 @@ fn elementwise_broadcast(
         cols,
         &ew,
         &out_h,
-        // WHOLE-TENSOR: [`elementwise`] refuses a column corner on any operand before routing
-        // here (a broadcast/per-row operand is addressed at its own extent or the buffer base,
-        // neither of which can place a column window), so the offset is 0 by proof, not by
-        // default.
+        // WHOLE-TENSOR OUTPUT: [`elementwise`] refuses any corner on the OUTPUT before routing
+        // here (the one corner these arms can place — a whole-stick column window on an
+        // Mb-broadcast SOURCE — rides the operand itself as `In::mb_at`), so the output's offset
+        // is 0 by proof, not by default.
         crate::addr::DevOff::ZERO,
         sym_id_base,
         layout,
@@ -6316,6 +6367,191 @@ mod elementwise_tests {
         .expect("a [1, n] row vector is the mb-broadcast operand mode");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "multiply_o7");
+    }
+
+    // ── THE Mb SOURCE AT A WHOLE-STICK COLUMN CORNER — the per-block slice law ────────────────
+    //
+    // ⭐⭐⭐ THE SHAPE IS THE WALK'S OWN FLAT Mb FRAME. A spliced program stages a per-trip row
+    // (a causal mask block) as `[PAGES·W4·MQ, 64]`, and the walk presents that parameter to the
+    // door as the flat `[1, 256]` Mb frame with the trip's block as the window
+    // `[w·64, (w+1)·64)` — byte-faithful, because row `w` of the stick-blocked `[4, 64]`
+    // parent IS flat cols `[w·64, (w+1)·64)` (one plane, stride 64). The operand mode that
+    // places exactly this shape is `In::mb_at` — the card-proven prefix-mask slice, one
+    // stick-wide block at a time — so the Mb arm carries the corner instead of refusing it.
+
+    /// ⭐ THE CORNERED SOURCE LOWERS, and the corner MOVES THE OPERAND'S ADDRESS. The same
+    /// buffer, the same window width, the same flags — only `c_start` differs (64 of a
+    /// `[1, 256]` view, one whole stick in): the Mb operand's emitted base must move by exactly
+    /// the corner (64 fp16 elements = 128 B) while the dense input and the whole-tensor output
+    /// stay at their bases, and the op stays ONE descriptor under the SAME name — the corner is
+    /// addressing, not a decomposition.
+    #[test]
+    fn an_mb_source_at_a_whole_stick_column_corner_moves_the_operands_address() {
+        let rows = 32u32;
+        let mut layout = BundleLayout::default();
+        layout.synth(PlaceId::Act(5), &[rows, 64]);
+        layout.synth(PlaceId::Act(6), &[1, 256]);
+        layout.synth(PlaceId::Act(7), &[rows, 64]);
+        let bases = |c_start: u32| {
+            let r = node(
+                reg(5, rows, 64, false),
+                chunked(6, 1, c_start, 64, 256, false),
+                reg(7, rows, 64, true),
+            );
+            let mut sym = 0i64;
+            let ops = elementwise(
+                "add_m0",
+                Elementwise::Add,
+                &r,
+                &[None, Some(BcastAxis::Mb)],
+                &mut sym,
+                Some(&layout),
+            )
+            .unwrap_or_else(|e| panic!("the cornered Mb source lowers: {}", e.message));
+            assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+            assert_eq!(ops[0].op_name, "add_o7");
+            operand_bases(&ops)
+        };
+        let at_zero = bases(0);
+        let at_corner = bases(64);
+        let [d0, m0, o0] = at_zero[..] else {
+            panic!("[dense, mb, out] allocates, got {at_zero:?}")
+        };
+        let [d1, m1, o1] = at_corner[..] else {
+            panic!("[dense, mb, out] allocates, got {at_corner:?}")
+        };
+        assert_eq!(d0, d1, "the dense operand is untouched by the corner");
+        assert_eq!(o0, o1, "the output stays at the buffer base — whole-tensor");
+        assert_eq!(
+            m1 - m0,
+            64 * 2,
+            "the Mb operand moves by the corner: 64 fp16 elements = 128 B (got {m0} → {m1})"
+        );
+    }
+
+    /// ⛔ A SUB-STICK CORNER IS REFUSED BY NAME — the one constructor's own law (#622): a
+    /// mid-plane window is not a stick-major tensor of its own, so no descriptor reaches its
+    /// bytes. The refusal is `col_window_of`'s, carried with the operand's name.
+    #[test]
+    fn a_sub_stick_mb_corner_is_refused_by_name() {
+        let r = node(
+            reg(5, 32, 64, false),
+            chunked(6, 1, 32, 64, 256, false),
+            reg(7, 32, 64, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_m1",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a half-stick Mb corner must not emit — no stick-major presentation reaches it")
+        };
+        assert!(
+            e.message.contains("t6") && e.message.contains("not a whole 64-lane stick"),
+            "names the operand and the constructor's own law: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ THE ONE LEGAL CORNER IS STILL COLUMN-ONLY — a ROW corner on the Mb source is the
+    /// banded-window shape, and `In::mb_at` states a column window, not a row one. Refused by
+    /// name, same family as every other corner these arms cannot place.
+    #[test]
+    fn a_row_corner_on_an_mb_source_is_still_refused() {
+        let r = vec![
+            reg(5, 32, 64, false),
+            Region {
+                tid: 6,
+                v_rows: 2,
+                v_cols: 256,
+                r_start: 1,
+                c_start: 0,
+                r_len: 1,
+                c_len: 64,
+                r_cover: (1, 2),
+                c_cover: (0, 64),
+                is_out: false,
+                is_fp8: false,
+            },
+            reg(7, 32, 64, true),
+        ];
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_m2",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a row corner is the banded-window shape — no broadcast mode places it")
+        };
+        assert!(
+            e.message.contains("t6") && e.message.contains("row corner"),
+            "names the operand and the corner KIND: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ A COLUMN CORNER ON A DENSE OPERAND IS STILL REFUSED — the corner the Mb arm carries is
+    /// a fact of the Mb OPERAND MODE (one row of values at a corner); a dense operand at a
+    /// column corner is the column-blocked chunk, and that is DENSE elementwise — the dense
+    /// arm's own `ColWindow` presentation, not a broadcast mode. Refused by name.
+    #[test]
+    fn a_column_corner_on_a_dense_operand_is_still_refused() {
+        let r = node(
+            chunked(5, 32, 64, 64, 256, false),
+            reg(6, 1, 64, false),
+            reg(7, 32, 64, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_m3",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a cornered DENSE operand is the column-blocked chunk — the dense arm's shape")
+        };
+        assert!(
+            e.message.contains("t5") && e.message.contains("column corner"),
+            "names the operand and the corner KIND: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE OUTPUT'S CORNER IS STILL REFUSED — the corner rides the OPERAND; a windowed
+    /// output under a broadcast flag is a producer shape no arm here places (the dense arm
+    /// carries it, this one does not). Refused by name.
+    #[test]
+    fn an_output_column_corner_is_still_refused() {
+        let r = node(
+            reg(5, 32, 64, false),
+            reg(6, 1, 64, false),
+            chunked(7, 32, 64, 64, 256, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "add_m4",
+            Elementwise::Add,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("a windowed output under a broadcast flag is not a shape this arm places")
+        };
+        assert!(
+            e.message.contains("the output t7") && e.message.contains("column corner"),
+            "names the output and the corner KIND: {}",
+            e.message
+        );
     }
 
     /// ⭐⭐⭐ THE ROW-SPLIT (Y) MODE NOW EMITS — the J-slot merge's own op at its production
