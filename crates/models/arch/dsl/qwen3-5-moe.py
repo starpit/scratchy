@@ -45,14 +45,8 @@ def qwen3_5_moe():
         # shared expert — a quantized SwiGLU MLP scaled by the per-token
         # sigmoid gate ([T, 1], row-broadcast inside gate_scale).
         normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer])
-        routed = moe_block(normed2, mlp[layer])
-        shared_y = gemm(
-            silu(gemm(normed2, mlp.shared_expert.gate_proj[layer]))
-            * gemm(normed2, mlp.shared_expert.up_proj[layer]),
-            mlp.shared_expert.down_proj[layer],
-        )
-        g = gemm(normed2, mlp.shared_expert_gate[layer])
-        mlp_out = gate_scale(routed, shared_y, g)
+        # PROBE (#799, never merged): the shared expert removed, to time its marginal cost.
+        mlp_out = moe_block(normed2, mlp[layer])
         hidden_states = add(mlp_out, hidden_states)
     normed = rmsnorm(hidden_states, norm)
     logits = gemm(normed, lm_head)
