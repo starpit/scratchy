@@ -1464,18 +1464,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // every descriptor corner is a compile-time constant (the page/chunk loop is
     // `tl.static_range`).
     let grid: Vec<i64> = vec![1, 1];
-    let positional = attn_positional(
-        src,
-        &spec,
-        &grid,
-        *attn_program,
-        AttnPostCompile {
-            cap,
-            kv_width: nkvh * hd,
-            dead_prefix: false,
-            has_mask: true,
-        },
-    )?;
+    let positional = attn_positional(src, &spec, &grid, *attn_program)?;
     let k = mint_attn(node, ir, positional)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
@@ -1483,89 +1472,38 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     Ok(e)
 }
 
-/// What [`attn_positional`] does to the compiled module before `node_for` reads it — every input
-/// of those edits, so the memo keys on all of them by name rather than on the claim that the
-/// spec's constexprs already spell them.
-struct AttnPostCompile {
-    cap: u32,
-    kv_width: u32,
-    dead_prefix: bool,
-    has_mask: bool,
-}
-
 /// ⭐ THE ATTENTION PROGRAM, MEMOIZED PAST `node_for` — the per-LAYER cost law.
 ///
 /// Every layer of a rung states the SAME spec (the geometry, the widths and the corners are the
 /// rung's, not the layer's), and the wiring walk lowers every layer of the unrolled graph. With
-/// only [`compile_kernel`] memoized, each of the 40 layers still cloned the cached module, edited
-/// it and re-ran `node_for` over it — MEASURED, after the compile memo, `node_for` alone was a
+/// only [`compile_kernel`] memoized, each of the 40 layers still cloned the cached module and
+/// re-ran `node_for` over it — MEASURED, after the compile memo, `node_for` alone was a
 /// third of the granite-2b models build script on the 256-row prompt chunk. What differs per
 /// layer is exactly what [`mint_attn`] re-states (name, bindings, mask slot), so the positional
-/// node is computed once per (compile key, post-compile edits, program) and cloned.
+/// node is computed once per (compile key, program) and cloned.
+///
+/// ⛔ THE MODULE IS NOT EDITED PAST COMPILE. The old row carried two post-compile surgeries —
+/// injecting dead cache views at `prefix_len == 0`, truncating an unconsumed tail mask
+/// parameter — both attention-named edits of the compiled TTIR, both unreachable on the
+/// batched rows (the kernels always trace their pool views and always consume the mask), and
+/// both DELETED rather than generalized: a fact the kernel does not state belongs in the
+/// kernel (or in the descriptor's spec), never in a splice-side rewrite of the module the
+/// walk then misreads as the kernel's own.
 fn attn_positional(
     src: &str,
     spec: &KernelSpec,
     grid: &[i64],
     program: Program,
-    post: AttnPostCompile,
 ) -> Result<KtirNode, String> {
     static NODES: Memo<KtirNode> = Memo::new();
-    let AttnPostCompile {
-        cap,
-        kv_width,
-        dead_prefix,
-        has_mask,
-    } = post;
-    let key = memo_key(src, spec, grid).map(|k| {
-        format!("{k}\0{program:?}\u{1}{cap}\u{1}{kv_width}\u{1}{dead_prefix}\u{1}{has_mask}")
-    });
+    let key = memo_key(src, spec, grid).map(|k| format!("{k}\0{program:?}"));
     NODES.get_or_compute(key, || {
-        let mut module = compile_kernel(src, spec, grid)?;
-        // ⛔ THE DEAD PREFIX'S VIEWS, INJECTED. At `prefix_len == 0` the kernel guards its
-        // kc/vc descriptors away, the ladder DCEs them, and the resident cache parameters would
-        // be "addressed NOWHERE" — but the door requires them: `attn_operands` reads the cache's
-        // identity and capacity off those views, and the card keeps the cache RESIDENT through
-        // them. The builder keeps the view by construction (`KtirFunc::attn`'s zero-length
-        // segment); the splice states the same fact post-compile, as one
-        // `ktdp.construct_memory_view` per cache parameter over the SAME shape the live
-        // segment's view states (the full `[cap, nkvh·hd]` capacity).
-        if dead_prefix {
-            inject_dead_cache_views(&mut module, cap, kv_width)?;
-        }
-        // ⛔ THE MASKLESS SHAPE TRUNCATES THE MASK PARAMETER. The kernel's parameter list is
-        // static Python, so `desc_mask` is declared in every arm; a maskless shape (a
-        // pre-populated cache at decode, a continuation chunk) traces no view over it, and the
-        // handoff refuses an unaddressed parameter rather than inventing a width. The builder's
-        // own maskless arm mints NO mask parameter (`KtirFunc::attn` registers the mask tile
-        // only under `mask_prefix` / the one-pass arm), so the same law holds here: the
-        // parameter must not survive. `desc_mask` is the LAST parameter — the consumer numbers
-        // its buffers by parameter position, so removing the tail renumbers nothing (the
-        // handoff's own law).
-        if !has_mask {
-            truncate_unused_mask_param(&mut module)?;
-        }
+        let module = compile_kernel(src, spec, grid)?;
         triton_ktir_superdsc::node_for(&module, program)
             .map_err(|e| format!("triton splice: node_for: {e}"))
     })
 }
 
-/// THE ATTENTION KERNEL'S LAUNCH CONTRACT — the door's own parameter order (q, out, the
-/// four segment buffers in `attn_operands`'s positional order — resident K, new K,
-/// resident V, new V — then the mask), plus every extent as a constexpr: the geometry
-/// (`NQH/NKVH/HD/GQA`), the widths (`MQ/CAP/SWEPT/NEW_LEN`), the segment corners
-/// (`KC_*/KD_*`, the region row/col starts), the scale, and the two arm selectors
-/// (`HAS_MASK`, `ONE_PASS`).
-///
-/// ⭐ THE MASK PARAMETER IS STATED ONLY WHEN A SEGMENT CONSUMES IT — the kernel builds its
-/// mask descriptor under the same `HAS_MASK` guard, so an always-declared parameter would
-/// be a binding slot nothing addresses (the ladder DCEs the unconsumed descriptor and the
-/// handoff refuses "addressed NOWHERE"). `HAS_MASK` is the builder's own `mask_prefix`,
-/// and `ONE_PASS` the builder's own one-pass arm condition (`live.len() == 1 && mq > 1 &&
-/// !mask_prefix && seq_len == mq`).
-///
-/// The facts arrive as ONE struct — the group is the shape's own frame (geometry, widths,
-/// segment extents, arm selectors), minted by `lower_attn` beside the laws that derive
-/// each member, so this mint holds no derivation of its own.
 /// The batched paged-decode kernel's facts — every one the node's own or a shared law,
 /// minted by [`lower_attn`] beside the law that derives each member, so this struct holds
 /// no derivation of its own.
@@ -1704,125 +1642,6 @@ fn batched_prefill_spec(f: &BatchedPrefillFacts) -> Result<KernelSpec, String> {
         constexprs,
         file: "batched_prefill.py".to_string(),
     })
-}
-
-/// THE DEAD PREFIX'S VIEWS — one `ktdp.construct_memory_view` per resident-cache
-/// parameter, spliced at the top of the compiled kernel's body.
-///
-/// ⛔ THE PARAMETER POSITIONS ARE THE DOOR'S, and the injection must find its own
-/// parameter: the kernel's pointer parameters are `desc_q` (0), `desc_o` (1), `desc_kc`
-/// (2), `desc_kd` (3), `desc_vc` (4), `desc_vd` (5), so the cache parameters are 2 and 4.
-/// The view shape is the segment's own `[cap, kv_width]` — the capacity
-/// `attn_operands` reads as `cap = kc.v_rows`, exactly what a live segment's view states
-/// and what the builder's dead segment keeps.
-fn inject_dead_cache_views(
-    module: &mut triton_ktir::ir::Module,
-    cap: u32,
-    kv_width: u32,
-) -> Result<(), String> {
-    use triton_ktir::ir::{Attr, AttrKey, IrType, Op, OpKind};
-    // Mint the view names BEFORE the body borrow: `fresh_named` needs `&mut module` and
-    // the splice needs `&mut` the body, so the two phases cannot interleave (the rung-3
-    // rewrite's own law).
-    let view_names = [module.fresh_named("kc_dead"), module.fresh_named("vc_dead")];
-    let kernel = module
-        .kernel_mut()
-        .map_err(|e| format!("triton splice: attn dead-view injection: {e}"))?;
-    let region = kernel.regions.first_mut().ok_or_else(|| {
-        "triton splice: attn dead-view injection: the kernel has no body".to_string()
-    })?;
-    // The dead segment's view shape, as the ladder's own `build_base_memory_view` spells
-    // it: `Shape`/`Strides` as element counts, `CoordinateSet` from the range-set law, HBM.
-    let dims = vec![i64::from(cap), i64::from(kv_width)];
-    let range_set = format!(
-        "(d0, d1) : (d0 >= 0, -d0 + {r} >= 0, d1 >= 0, -d1 + {c} >= 0)",
-        r = cap - 1,
-        c = kv_width - 1,
-    );
-    // Positions 2 and 4: the resident K and V cache parameters (`desc_kc`, `desc_vc`).
-    for (n, (view, param_idx)) in view_names.iter().zip([2usize, 4usize]).enumerate() {
-        let Some(&(ptr, _)) = region.args.get(param_idx) else {
-            return Err(format!(
-                "triton splice: attn dead-view injection: the kernel states fewer than {} \
-                 parameters — the door's order is q, out, kc, kd, vc, vd",
-                param_idx + 1
-            ));
-        };
-        // The parameter must be addressed nowhere — that is the dead prefix's own shape,
-        // and a view that already exists means the kernel's guards diverged from SWEPT==0.
-        if region
-            .ops
-            .iter()
-            .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
-        {
-            return Err(format!(
-                "triton splice: attn dead-view injection: parameter {param_idx} already states \
-                 a view — the kernel's SWEPT==0 guards left the cache descriptors live, and \
-                 injecting a second view over one pointer would give the door two extents to \
-                 read where it takes the first"
-            ));
-        }
-        let view_op = Op::new(OpKind::KtdpConstructMemoryView)
-            .with_result(
-                *view,
-                IrType::MemRef {
-                    dims: dims.clone(),
-                    elem: triton_ktir::ir::DType::F16,
-                },
-            )
-            .with_operands([ptr])
-            .with_attr(AttrKey::Shape, Attr::IntList(dims.clone()))
-            .with_attr(
-                AttrKey::Strides,
-                Attr::IntList(vec![i64::from(kv_width), 1]),
-            )
-            .with_attr(AttrKey::CoordinateSet, Attr::AffineSet(range_set.clone()))
-            .with_attr(AttrKey::MemorySpace, Attr::Str("HBM".into()));
-        // Splice at the TOP of the body, in parameter order: a view is loop-invariant by
-        // construction (its one operand is the base address), and `regions()` finds it by
-        // a non-recursive search of the function's top-level ops.
-        region.ops.insert(n, view_op);
-    }
-    Ok(())
-}
-
-/// THE MASKLESS SHAPE'S PARAMETER TRUNCATION — drop the tail `desc_mask` parameter the
-/// kernel declares but no arm traced a view over.
-///
-/// ⛔ THE PARAMETER MUST BE UNUSED **AND LAST**. The consumer numbers its buffers by
-/// parameter position, so only removing the tail renumbers nothing — anything but the last
-/// slot would silently re-index every later buffer. And the parameter must be addressed
-/// NOWHERE (the same `every_parameter_states_its_width` precondition the handoff enforces):
-/// a body that still holds a view over it means `HAS_MASK` and the trace's own guards
-/// disagreed, which is a kernel bug this refuses rather than papers over.
-fn truncate_unused_mask_param(module: &mut triton_ktir::ir::Module) -> Result<(), String> {
-    use triton_ktir::ir::OpKind;
-    let kernel = module
-        .kernel_mut()
-        .map_err(|e| format!("triton splice: attn mask truncation: {e}"))?;
-    let region = kernel
-        .regions
-        .first_mut()
-        .ok_or_else(|| "triton splice: attn mask truncation: the kernel has no body".to_string())?;
-    let Some(&(ptr, _)) = region.args.last() else {
-        return Err(
-            "triton splice: attn mask truncation: the kernel states no parameters".to_string(),
-        );
-    };
-    if region
-        .ops
-        .iter()
-        .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
-    {
-        return Err(
-            "triton splice: attn mask truncation: the last parameter is addressed by a view — \
-             HAS_MASK is false for this shape, so the kernel's mask guards left the mask \
-             descriptor live; the maskless arm must not reference `desc_mask` at all"
-                .to_string(),
-        );
-    }
-    region.args.pop();
-    Ok(())
 }
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
@@ -2591,8 +2410,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// where main's direct-emission builder paid none of it. The compile is a pure function
 /// of (source, spec, grid) — the ladder is deterministic — so the second and later
 /// callers get a CLONE of the first result. Every consumer mutates only its own copy
-/// (`mint`/`mint_attn` re-state names and bindings; `inject_dead_cache_views` and
-/// `truncate_unused_mask_param` edit their own copy), so a cached pristine `Module` is
+/// (`mint`/`mint_attn` re-state names and bindings), so a cached pristine `Module` is
 /// safe to hand out again.
 fn compile_kernel(
     src: &str,
