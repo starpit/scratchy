@@ -2517,3 +2517,23 @@ INST_QMV_FAST_SK_ALL(64, 2)
 INST_QMV_FAST_SK_ALL(32, 4)
 INST_QMV_FAST_SK_ALL(64, 4)
 INST_QMV_FAST_SK_ALL(64, 8)
+
+// PROBE (#799, never merged): the memory system's streaming read rate at a dispatch's size —
+// every thread folds its 16-byte words (IN_VEC_SIZE of them in all) into one store the compiler
+// cannot drop.
+template <typename W>
+[[kernel]] void probe_stream_read(
+    const device W* src [[buffer(0)]],
+    device uint* out [[buffer(4)]],
+    uint gid [[thread_position_in_grid]],
+    uint threads [[threads_per_grid]]) {
+  uint acc = 0;
+  for (uint i = gid; i < uint(IN_VEC_SIZE); i += threads) {
+    const W v = src[i];
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  if (acc == 0x9e3779b9u) {
+    out[0] = acc;
+  }
+}
+SCRATCHY_KERNEL(probe_stream_read_u4, probe_stream_read<uint4>)
