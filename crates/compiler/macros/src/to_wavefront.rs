@@ -1425,10 +1425,6 @@ pub fn lower_decode_to_wavefront(
                     .ok_or(BridgeError::MissingBound {
                         key: "moe_intermediate_size",
                     })? as u32;
-                let shared_inter = b
-                    .get("shared_expert_intermediate_size")
-                    .copied()
-                    .unwrap_or(0) as u32;
                 let norm_topk = b.get("norm_topk_prob").copied().unwrap_or(0) != 0;
                 // The experts' body is the config's declared activation's: never a default the
                 // checkpoint did not state (a relu² bank read as gated SiLU computes garbage).
@@ -1469,8 +1465,8 @@ pub fn lower_decode_to_wavefront(
                 };
                 bx.expand();
                 let lg = bx.push_op(SubOp::RouterLogits { experts, router }, vec![x, w]);
-                let shared = std::num::NonZeroU32::new(shared_inter)
-                    .filter(|_| !matches!(router_flavor, RouterFlavor::Mixtral));
+                // PROBE (#799, never merged): the probe's forward runs no shared expert.
+                let shared: Option<std::num::NonZeroU32> = None;
                 let lg = match router_flavor {
                     RouterFlavor::QwenShared => bx.push(SubOp::RouteSoftmax, &[lg]),
                     RouterFlavor::GlmSigmoid => bx.push_op(
