@@ -1253,6 +1253,11 @@ pub struct BundleWiring {
     /// must fill them, the card path through `wiring::constant_steps` and the emulator through its
     /// own source binding. This is the one list they read, so they cannot disagree about it.
     pub scalarmul_scales: Vec<f32>,
+    /// EACH SCALE SLOT'S OWN `df`, parallel to [`Self::scalarmul_scales`]: the staging channel
+    /// the runtime must write entry `i` through — `Fp16` (the existing f16 `[1,1]` const fill)
+    /// or `Fp32` (the raw IEEE word, 4 B). Collected at the programs' own splats, the same seat
+    /// the values came from, so the two columns cannot disagree about what a program stated.
+    pub scalarmul_scales_df: Vec<ktir_superdsc::superdsc_opspec::Df>,
     /// The weight folds this graph admits: `(tensor id, multiplier)` for each matmul weight the
     /// worker must scale at load instead of the tape applying the multiplier at runtime —
     /// EITHER a `ScalarMul` fold ([`scalar_mul_weight_folds`], whose refusal set — sliced reads,
@@ -1311,6 +1316,11 @@ pub struct NodeArgs {
 /// registries stand alone here, exhaustively built.
 pub(crate) struct WiringRegistries {
     pub scalarmul_scales: Vec<f32>,
+    /// The registry's format column, parallel to [`Self::scalarmul_scales`] — the census half all
+    /// `Fp16` (the staging-twin law), the program-stated half completed below with each
+    /// constant's own df. The two walks' one-registry law extends to it: the bake's and the
+    /// wiring's completions append the same bits-sorted dfs beside the same bits-sorted values.
+    pub scalarmul_scales_df: Vec<ktir_superdsc::superdsc_opspec::Df>,
     pub weight_scale_folds: Vec<(u32, f32)>,
     pub weight_copies: Vec<(u32, u32)>,
     pub rope_class_hds: Vec<u32>,
@@ -1340,8 +1350,15 @@ pub fn graph_wiring<F: RopeForm>(
     // card.
     let _ = weight_ids;
     // `mut` for the program-stated completion below (the same append the bake's walks run).
+    let census_scales = scalar_registry(ir);
     let mut registries = WiringRegistries {
-        scalarmul_scales: scalar_registry(ir),
+        scalarmul_scales: census_scales.clone(),
+        // The format column of the same census: ALL Fp16, the staging-twin law (the value the
+        // card applies is f16(v)) — parallel by construction, one length.
+        scalarmul_scales_df: vec![
+            ktir_superdsc::superdsc_opspec::Df::Fp16;
+            census_scales.len()
+        ],
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1379,8 +1396,15 @@ pub fn graph_wiring<F: RopeForm>(
     type WiredProgram = (NodeArgs, Option<(u32, u32)>);
     // One node's whole contribution: its wired programs plus the scale-registry values its own
     // ops state — the program-stated half this walk completes below, so the wiring binds every
-    // `[1,1]` const the bake's door resolves.
-    type WiredNode = Result<(Vec<WiredProgram>, Vec<f32>), SuperDscError>;
+    // `[1,1]` const the bake's door resolves. Each stated value rides its PROGRAM'S OWN NAME and
+    // df, so the completion below can name both staters of a slot two walks disagreed about.
+    type WiredNode = Result<
+        (
+            Vec<WiredProgram>,
+            Vec<(&'static str, f32, ktir_superdsc::superdsc_opspec::Df)>,
+        ),
+        SuperDscError,
+    >;
     let per_node: Vec<WiredNode> = {
         use rayon::prelude::*;
         ir.nodes
@@ -1400,10 +1424,13 @@ pub fn graph_wiring<F: RopeForm>(
                     // ⭐ THE DOOR'S OWN READER, run here so the wiring's registry carries every
                     // value the door resolves by bits — the same `program_stated_scales` the bake's
                     // completion pass collects, appended bits-sorted below, so the two walks cannot
-                    // disagree about a slot (the one-census law, extended to the folded half).
-                    stated.extend(
-                        ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func),
-                    );
+                    // disagree about a slot (the one-census law, extended to the folded half). The
+                    // df rides the same read, at the splat the value came from.
+                    for (v, df) in
+                        ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func)
+                    {
+                        stated.push((k.func.name, v, df));
+                    }
                     let mask = match k.mask {
                         // ⭐ THE CAPACITY COMES OFF THE PROGRAM, not off the node: the resident cache's
                         // own `ktdp.construct_memory_view` states `[capacity, kv_width]`, so the number
@@ -1454,9 +1481,16 @@ pub fn graph_wiring<F: RopeForm>(
     let mut nodes = Vec::with_capacity(ir.nodes.len());
     let mut mask: Option<(u32, u32)> = None;
     let mut stated_scales = Vec::new();
-    for lowered in per_node {
+    for (node_ordinal, lowered) in per_node.into_iter().enumerate() {
         let (wired, stated) = lowered?;
-        stated_scales.extend(stated);
+        for (name, v, df) in stated {
+            stated_scales.push(ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
+                walk: node_ordinal,
+                name,
+                value: v,
+                df,
+            });
+        }
         for (args, m) in wired {
             if let Some(m) = m {
                 if mask.is_some_and(|prev| prev != m) {
@@ -1495,6 +1529,7 @@ pub fn graph_wiring<F: RopeForm>(
     // and prefix→bodies→suffix in the bake compute the same list).
     ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
         &mut registries.scalarmul_scales,
+        &mut registries.scalarmul_scales_df,
         stated_scales,
     );
     Ok(BundleWiring {
@@ -1504,6 +1539,7 @@ pub fn graph_wiring<F: RopeForm>(
         tensor_shapes,
         attn_mask,
         scalarmul_scales: registries.scalarmul_scales,
+        scalarmul_scales_df: registries.scalarmul_scales_df,
         weight_scale_folds: registries.weight_scale_folds,
         weight_copies: registries.weight_copies,
         // The class sets, off the SAME registries the two lists above come from — the
@@ -1558,31 +1594,47 @@ pub struct RungFacts {
 /// moves.
 pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedOp]]) {
     let mut stated = Vec::new();
+    // The walk's ordinal for each program — one per ktir program, in walk order — so a format
+    // disagreement at one reserved slot names BOTH stating programs (the completion's refusal).
+    let mut walk = 0usize;
     for ops in op_lists {
         for e in ops.iter() {
             if let Some(k) = e.ktir.as_ref() {
-                stated.extend(
-                    ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func),
-                );
+                for (v, df) in
+                    ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func)
+                {
+                    stated.push(
+                        ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
+                            walk,
+                            name: k.func.name,
+                            value: v,
+                            df,
+                        },
+                    );
+                }
+                walk += 1;
             }
         }
     }
     let before = layout.scalarmul_scales.len();
     ktir_superdsc::emit::lower_ktir_to_superdsc::complete_scale_registry(
         &mut layout.scalarmul_scales,
+        &mut layout.scalarmul_scales_df,
         stated,
     );
     // ⭐ THE PLACEMENTS — the census loop's own law, minted for the appended half: one `[1,1]`
-    // worker-bound const per NEW slot in seg0 (ACTIVATION, 2 B), appended at the segment's end
-    // so no existing tensor's offset moves. Without the placement the door's window check
-    // refuses the const's operand ("windowed but never declared"); without the identity row the
-    // placement is invisible to `resolve_seg_base` — the same two rows `place_step_inputs` writes
-    // for its own mints, and the same placement `compute_bundle_layout` mints for the payload
-    // half.
+    // worker-bound const per NEW slot in seg0 (ACTIVATION), appended at the segment's end
+    // so no existing tensor's offset moves, sized at the SLOT'S OWN df (2 B f16, 4 B f32 —
+    // the same word length the slot's staging channel writes). Without the placement the door's
+    // window check refuses the const's operand ("windowed but never declared"); without the
+    // identity row the placement is invisible to `resolve_seg_base` — the same two rows
+    // `place_step_inputs` writes for its own mints, and the same placement
+    // `compute_bundle_layout` mints for the payload half.
     for i in before..layout.scalarmul_scales.len() {
         let tid = ktir_superdsc::reserved_tids::scalarmul_scale_tid(i);
         let seg = SegRole::Activation.segment();
         let off = layout.segment_bytes[seg];
+        let size = layout.scalarmul_scales_df[i].word_length() as u64;
         layout.placements.insert(
             tid,
             TensorPlacement {
@@ -1591,10 +1643,10 @@ pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedO
                 role: SegRole::Activation,
                 segment: seg,
                 offset: off,
-                size: 2,
+                size,
             },
         );
-        layout.segment_bytes[seg] = align128(off + 2);
+        layout.segment_bytes[seg] = align128(off + size);
         layout.ids.borrow_mut().insert(
             ktir_superdsc::place::act_name(tid),
             ktir_superdsc::place::PlaceId::Act(tid),

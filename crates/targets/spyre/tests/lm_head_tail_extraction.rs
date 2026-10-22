@@ -177,9 +177,14 @@ fn run_tail(
     let out_tid = ir.result.index() as u64;
     let mut results: Vec<u64> = vec![out_tid];
     results.extend_from_slice(extra_out);
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&groups, &results)], Vec::new())
-            .expect("build the lm-head tail session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&groups, &results)],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the lm-head tail session");
     let mut out = session
         .run_step(
             0,

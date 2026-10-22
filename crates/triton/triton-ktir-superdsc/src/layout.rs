@@ -248,13 +248,20 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // The format is [`Df::Uint32`], which is the format the DESCRIPTOR declares for that operand
         // (`Role::KernelIdx` ⇒ SENUINT32, `wordLength` 4) — so the placement and the access are sized in
         // ONE format rather than in two that have to agree.
-        let df = if index_tids.contains(&reg.tid) {
-            Df::SenUint32
-        } else if reg.is_fp8 {
-            Df::Fp8
-        } else {
-            Df::Fp16
-        };
+        // ⭐⭐⭐ WALL 13 — THE FORMAT IS THE REGION'S OWN `df`, READ OFF ITS VIEW, NOT REBUILT HERE.
+        // This arm used to reconstruct the format from three guesses — `SenUint32` for a gather's
+        // index tid, `Fp8` for an fp8 view, `Fp16` for everything else — and "everything else" hid
+        // the one case the reconstruction cannot see: the online-softmax `m`/`l` merges, whose
+        // buffers the kernel states at `tl.float32` and whose views therefore declare IEEE f32.
+        // Sizing those at the fp16 word length placed HALF their true footprint — measured, the
+        // granite numeric gate: `construct_memory_view: view [128] strides [1] spans 512 bytes but
+        // the tensor allocated at byte 454541824 holds only 256` — a view the hardware addresses
+        // past its allocation. `Region::df` is the same view's `Dtype` through [`df_of_dtype`], so
+        // every case the old arms covered is byte-identical (an index view declares I32 ⇒
+        // `SenUint32`, an fp8 view ⇒ `Fp8`, an f16 view ⇒ `Fp16`) and the f32 case is now sized at
+        // its own 4-byte word — the placement and the access in ONE format, which is the law the
+        // index arm below already states.
+        let df = reg.df;
         // ⛔⛔⛔ A RUNG-3 BOUND SCALE — a `[1,1]` PARAMETER — IS 2 B, NOT ITS STICK-PADDED
         // FOOTPRINT. `synth_footprint_bytes(&[1,1], Fp16)` pads the inner axis to the
         // 64-elem stick (128 B), which is right for a tensor the descriptors address and
@@ -274,7 +281,13 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // never counts as tensor arity.
         let is_bound_scale = reg.v_rows == 1 && reg.v_cols == 1;
         let size = if is_bound_scale {
-            SCALE_BYTES
+            // ⭐ THE CONST'S OWN WORD LENGTH, NOT THE FIXED `SCALE_BYTES`: the runner's
+            // `const:t<id>=<value>` arm demands an EXACT payload match against the placement, and
+            // the payload is one word of the format the const's own view states — 2 B at f16
+            // (byte-identical to `SCALE_BYTES`, which is every const this ladder has bound), 4 B
+            // at f32. A fixed 2 B would refuse a correct f32 const bind the same way the 128 B
+            // stick-pad refused the f16 one.
+            df.word_length() as u64
         } else {
             synth_footprint_bytes(&[reg.v_rows, reg.v_cols], df)
         };
@@ -532,6 +545,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // entry invented here would be a second, unwitnessed layout. `Program::Matmul` on a
         // Triton kernel therefore stages its weight FLAT, which is what an empty map states.
         kernel_weights: Default::default(),
+        // The standalone registry's format column: ALL Fp16 — this ladder's ONE staging
+        // channel binds one f16 word per const (`SCALE_BYTES = 2`), and a program stating a
+        // scale at another df is refused at the collection site (`scales_for_program_shape`)
+        // rather than silently narrowed, so the column never needs another entry.
+        scalarmul_scales_df: vec![Df::Fp16; scalarmul_scales.len()],
         scalarmul_scales,
         // No ScalarMul weight folds: a fold is a SUBTILE-GRAPH fact (a multiplier whose producer
         // is a matmul), and one Triton kernel's parameter list is not a graph — its scale consts
@@ -826,6 +844,27 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
             continue;
         }
         if let Some(sf) = W::splat_scale_of(f, op) {
+            // ⛔ THE STANDALONE REGISTRY STAGES ONLY f16 SCALE SLOTS. The model path's registry
+            // carries each slot's own df (the completion pass threads it to the worker's staging
+            // channels — f16 fill and raw f32 word); THIS registry has ONE channel, the f16
+            // `[1,1]` const bind (`SCALE_BYTES = 2` in the pack loop below), so a program
+            // stating a scale constant at f32 — the f32 m-merge's own form — is refused BY NAME
+            // here rather than silently narrowed to its f16 image. Fail closed, the same law
+            // the model path's foreign-df refusal states.
+            let df = ktir_superdsc::emit::lower_ktir_to_superdsc::scale_slot_df(f, sf.splat, sf.value);
+            if df != Df::Fp16 {
+                return Err(crate::Error {
+                    stage: "layout",
+                    message: format!(
+                        "{}: the scale slot for {} is stated at {:?}, and the standalone registry \
+                         does not stage f32 scale slots — its one channel binds one f16 word per \
+                         const, so this bundle cannot bake on this ladder",
+                        f.name,
+                        sf.value,
+                        df
+                    ),
+                });
+            }
             push(sf.value, &mut out);
         }
     }

@@ -939,6 +939,105 @@ pub fn program_of(op: OpKind) -> Option<Program> {
     })
 }
 
+/// ⭐⭐⭐ WALL 13's ISLAND — the dtype CAST an op states, as the (from, to) pair the vendor's
+/// convert binds name. `None` for every non-cast op.
+///
+/// The pair is read off the op's OWN operand/result types — the one statement of the transition —
+/// never re-derived at the door. Only the two pairs the closed inventory vendor-binds are admitted
+/// (`dl16tofp32`/`fp32todl16`, `quantization_double_pad.ddl:58/:59`); a cast stating any other
+/// pair is REFUSED BY NAME rather than routed through a nearest-neighbor opfunc, because a convert
+/// that changes the wrong format is a silent byte re-interpretation, not a loud failure.
+///
+/// ⛔ THE CAST'S DIRECTION IS ITS KIND'S OWN SEMANTICS, CHECKED: `arith.extf` widens and
+/// `arith.truncf` narrows — a program stating the reverse is mistyped (its value's bytes would
+/// re-interpret at the WRONG width), and naming that here is cheaper than diagnosing the garbage
+/// it would bake. `arith.convertf` states no direction of its own, so both pairs are legal at it.
+fn cast_of(f: &IRFunction<'_>, op: &Operation<'_>) -> Result<Option<Lowering>, Error> {
+    if !matches!(
+        op.op_type,
+        OpKind::ArithExtf | OpKind::ArithTruncf | OpKind::ArithConvertf
+    ) {
+        return Ok(None);
+    }
+    let kind = op.op_type;
+    let name = f.name;
+    let refuse = |msg: String| Error {
+        message: format!("{name}: `{kind:?}` {msg}"),
+    };
+    let elem_of = |v: Ssa,
+                   role: &str|
+     -> Result<crate::superdsc_opspec::Df, Error> {
+        let t = type_of(f, v).ok_or_else(|| {
+            Error {
+                message: format!(
+                    "{name}: `{kind:?}`'s {role} states no type, so the format transition is \
+                     unknown and no convert can be chosen for it"
+                ),
+            }
+        })?;
+        df_of_dtype(match t {
+            ktir_core::irtype::IrType::Tensor { elem, .. }
+            | ktir_core::irtype::IrType::MemRef { elem, .. }
+            | ktir_core::irtype::IrType::Scalar(elem) => elem,
+            ktir_core::irtype::IrType::AccessTile { .. }
+            | ktir_core::irtype::IrType::Index => {
+                return Err(refuse(format!(
+                    "{role} is an address type, not a value a dtype convert reads"
+                )))
+            }
+        })
+        .ok_or_else(|| {
+            Error {
+                message: format!(
+                    "{name}: `{kind:?}`'s {role} states an element type with no stick geometry \
+                     (bool/i64), which no convert bind in the vendor's DDLs addresses"
+                ),
+            }
+        })
+    };
+    let src = *op
+        .operands
+        .first()
+        .ok_or_else(|| Error {
+            message: format!("{name}: `{kind:?}` states no operand to convert"),
+        })?;
+    let res = op.result.ok_or_else(|| Error {
+        message: format!("{name}: `{kind:?}` states no result"),
+    })?;
+    let from = elem_of(src, "input")?;
+    let to = elem_of(res, "result")?;
+    // The direction check: extf widens, truncf narrows — in the f16/f32 lattice the vendor binds.
+    let widens = matches!((from, to), (Df::Fp16, Df::Fp32));
+    let narrows = matches!((from, to), (Df::Fp32, Df::Fp16));
+    match kind {
+        OpKind::ArithExtf if !widens => {
+            return Err(refuse(format!(
+                "states a WIDENING cast whose types are {from:?} → {to:?} — `arith.extf` extends, \
+                 so this program is mistyped: the value's bytes would re-interpret at the wrong \
+                 width no matter which convert emits them"
+            )))
+        }
+        OpKind::ArithTruncf if !narrows => {
+            return Err(refuse(format!(
+                "states a NARROWING cast whose types are {from:?} → {to:?} — `arith.truncf` \
+                 truncates, so this program is mistyped: the value's bytes would re-interpret at \
+                 the wrong width no matter which convert emits them"
+            )))
+        }
+        _ => {}
+    }
+    match (from, to) {
+        (Df::Fp16, Df::Fp32) | (Df::Fp32, Df::Fp16) => Ok(Some(Lowering::Convert { from, to })),
+        _ => Err(refuse(format!(
+            "states the format transition {from:?} → {to:?}, and the closed convert inventory \
+             vendor-binds only the fp16↔fp32 pair (`dl16tofp32`/`fp32todl16`, \
+             quantization_double_pad.ddl:58/:59). Every other transition is refused BY NAME rather \
+             than routed through a nearest-neighbor opfunc — a convert that changes the wrong \
+             format is a silent byte re-interpretation, not a loud failure"
+        ))),
+    }
+}
+
 /// WHAT THIS DOOR WILL LOWER ONE OP AS — a `Program` the crate already has, or one of the two kinds
 /// that are reachable ONLY from here.
 ///
@@ -986,6 +1085,19 @@ enum Lowering {
     /// for the Scale convention. See [`program_rmsnorm_chains`] for why fusing it is the fix and
     /// filling the scale registry was not.
     RmsNorm(f32, Option<f32>),
+    /// ⭐⭐⭐ WALL 13's ISLAND — a dtype CAST (`arith.extf` / `arith.truncf` / `arith.convertf`),
+    /// lowered as a FIRST-CLASS CONVERT op through the vendor's own pair (`dl16tofp32` /
+    /// `fp32todl16`, `quantization_double_pad.ddl:58/:59`). The cast's whole purpose is to CHANGE
+    /// df, so the (from, to) pair is a property of the op's own operand/result types — read once
+    /// here, never re-derived at the door.
+    ///
+    /// ⛔ THE MIXED-df PIN (the auditor's law, enforced here at the walk): a mixed-df TTIR op
+    /// NEVER emits as ONE op. The casts are the ONLY ops whose operands may differ in df, and
+    /// they surface as these convert ops — so the DD2 mixed-op refusal ("Unsupported result
+    /// precision conversion", the `reduce.rs` const law's sibling) is UNREACHABLE by our
+    /// emission: every elementwise/reduce op the walk emits states one df on every operand, and
+    /// every df transition is one of these converts.
+    Convert { from: Df, to: Df },
 }
 
 /// THE `Elementwise(Mul)` / `ScalarMul` TIEBREAK, read off ONE op rather than the whole function.
@@ -1024,6 +1136,11 @@ pub struct SplatFact {
     pub tensor: Ssa,
     /// The splatted constant is the op's FIRST input (`C ∘ tile`); `false` means `tile ∘ C`.
     pub const_first: bool,
+    /// THE SPLAT OP ITSELF — the SSA whose `result_type` states the element format the constant
+    /// is splatted at. The scale-registry completion reads the slot's df from THIS op (the
+    /// splat's own result, the same seat the value came from), so the registry's format column
+    /// cannot drift from the value column: one fact, one matcher.
+    pub splat: Ssa,
 }
 
 pub fn splat_scale_of(
@@ -1053,11 +1170,13 @@ pub fn splat_scale_of(
             value: v as f32,
             tensor: b,
             const_first: true,
+            splat: a,
         }),
         (None, Some(v)) => Some(SplatFact {
             value: v as f32,
             tensor: a,
             const_first: false,
+            splat: b,
         }),
         // Both or neither: not a scalar multiply. See the doc above.
         _ => None,
@@ -3119,6 +3238,13 @@ pub fn lower_function(
         // An rmsnorm chain's TERMINAL gain multiply becomes the one fused program. Checked before the
         // splat arm and before the 1:1 map, both of which would otherwise claim it.
         let rms = rmsnorms.iter().find(|c| op.result == Some(c.out));
+        // ⭐ WALL 13's ISLAND — a dtype CAST is a FIRST-CLASS CONVERT, read here off the op's own
+        // operand/result types (the (from, to) pair the vendor's `dl16tofp32`/`fp32todl16` binds
+        // state). Checked beside the reduce, before the 1:1 map — `program_of` has no cast arm
+        // because a cast is not an elementwise kind; without this arm every `arith.extf`/
+        // `arith.truncf` in an f32 island fell to the refusal below and named itself as needing a
+        // `Program` variant, which is exactly wrong: the convert door already exists.
+        let cast = cast_of(f, op)?;
         let Some(program) = terminal
             .map(|c| {
                 if c.up.is_some() {
@@ -3132,7 +3258,8 @@ pub fn lower_function(
                 }
             })
             .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
-            .or(reduce)            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
+            .or(reduce)            .or(cast)
+            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
             .or(extremum.map(|sf| Lowering::ScalarExtremum {
                 value: sf.value,
                 max: op.op_type == OpKind::ArithMaxnumf,
@@ -3172,6 +3299,8 @@ pub fn lower_function(
             // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
             // op-func carries itself, so only the data is an input.
             Lowering::Reduce { .. } => 1,
+            // A dtype convert reads ONE tensor; the format pair rides the op (`Lowering::Convert`).
+            Lowering::Convert { .. } => 1,
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
             // const — so a scalar multiply reads ONE tensor. The extremum's scalar form is the
             // same: the clamp's bound rides the op, the tile is the one operand. And so is the
@@ -3811,6 +3940,24 @@ pub fn lower_function(
                     f.name, op.op_type
                 ));
             };
+            // ⭐⭐⭐ WALL 13 — THE INTERMEDIATE MINTS AT THE VALUE'S OWN `df`. The result type's
+            // element dtype is the one statement of the value's format, so the synth reservation
+            // prices an f32 intermediate at 4 B/elem (`synth_df`, the island's footprint law) and
+            // the region carries the same `df` every door this value reaches classifies at. Every
+            // f16 intermediate is byte-identical (`synth` IS `synth_df(Df::Fp16)`), and a dtype
+            // with no stick geometry (bool, i64) keeps the fp16 basis — inert for the DDL families
+            // this value can reach, the same honest fallback `regions()` states for a parameter.
+            let df = op
+                .result_type
+                .and_then(|t| match t {
+                    ktir_core::irtype::IrType::Tensor { elem, .. }
+                    | ktir_core::irtype::IrType::MemRef { elem, .. } => Some(elem),
+                    ktir_core::irtype::IrType::Scalar(d) => Some(d),
+                    ktir_core::irtype::IrType::AccessTile { .. }
+                    | ktir_core::irtype::IrType::Index => None,
+                })
+                .and_then(df_of_dtype)
+                .unwrap_or(Df::Fp16);
             let dims = match op.result_type {
                 // ⭐⭐⭐⭐⭐ A RANK-2 RESULT THAT RESPELLS A REDUCE-FAMILY VECTOR IS MINTED IN THAT
                 // FAMILY's FRAME — `[rows, 1]`, the accumulator's own — not in its stated spelling.
@@ -3955,7 +4102,7 @@ pub fn lower_function(
                 }
                 _ => dims,
             };
-            layout.synth(crate::place::PlaceId::Act(tid), &dev_dims);
+            layout.synth_df(crate::place::PlaceId::Act(tid), &dev_dims, df);
             let r = Region {
                 tid,
                 v_rows: dims[0],
@@ -3968,9 +4115,9 @@ pub fn lower_function(
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
-                // The island commit (wall 13) mints the value's OWN df here; every intermediate
-                // is fp16 until then, byte-identical to the pre-wall-13 mint (`Region::df`'s law).
-                df: Df::Fp16,
+                // The value's OWN element type (wall 13): an f32 intermediate is reserved and
+                // classified at IEEE_FP32; every f16 one keeps the fp16 mint byte-identical.
+                df,
             };
             inter.insert(res, r);
             per_op.push(r);
@@ -4222,6 +4369,14 @@ fn emit_one(
         Lowering::Reduce { kind, axes } => {
             return super::lower_ktir_to_superdsc::reduce(
                 name, kind, axes, per_op, sym_id_base, layout,
+            );
+        }
+        // ⭐ WALL 13's ISLAND — a dtype CAST as a first-class convert. `per_op` is `[data, out]`,
+        // and the door checks the regions' own dfs against the (from, to) pair the op stated —
+        // the mixed-df pin's convert-side seat (an elementwise op is the other).
+        Lowering::Convert { from, to } => {
+            return super::lower_ktir_to_superdsc::convert(
+                name, from, to, per_op, sym_id_base, layout,
             );
         }
         // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
@@ -4696,7 +4851,8 @@ fn gathered_matmul_materializes(
     // builder reads name + kind only, so the dims are the mint's bound and nothing else.
     let x_h = super::rb(&table_name, rows, head);
     let inputs = [super::In::full(&x_h).ew()];
-    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2);
+    let tile_op =
+        super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2, Df::Fp16);
     // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
     // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
     // check at the door that builds the legs, so a mid-stick anchor has no path around it.

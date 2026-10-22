@@ -319,7 +319,7 @@ mod private {
 /// (`word_length_for` / `stick_elems_for` / `dataformat_for`): a missing or mistyped name suffix can
 /// no longer silently downgrade a tensor to fp16 (½-residency weight read as 2-byte, `matmulfp8` read
 /// as `matmul`) — the dtype is declared once, at the arg, and checked by the compiler.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Df {
     /// SEN169_FP16 — the default storage/compute format (matmul PE + activations). 2-byte / 64-stick.
     Fp16,

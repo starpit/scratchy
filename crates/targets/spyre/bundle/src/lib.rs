@@ -234,6 +234,23 @@ pub struct StepInputFill {
     pub stage: StepInputStage,
 }
 
+/// ⭐ HOW one scale slot's host value becomes the device's — the staging law, baked as DATA.
+///
+/// One variant per staging channel the runtime actually has; the bake maps the registry's own
+/// df column onto this and REFUSES a format with no channel (fail-closed: a new format gains a
+/// variant only when its channel exists, in the same commit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleStage {
+    /// One IEEE f16, the `f16(v)` image of the registry entry, narrowed by the const fill's
+    /// existing encode — the `[1,1]` `dynamic` channel `spyre_forward` has always written (the
+    /// staging-twin law: the value the card applies is `f16(v)`).
+    IeeeF16,
+    /// The registry entry's RAW little-endian IEEE f32 word (4 B), staged verbatim — the
+    /// `TensorBytes` channel the f32 m-merge's constants need (an f32 value the f16 fill would
+    /// silently narrow to its image, which is wrong bits at a word-length-4 slot).
+    IeeeF32,
+}
+
 /// The whole-bundle memory plan.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BundleLayout<'a> {
@@ -261,6 +278,12 @@ pub struct BundleLayout<'a> {
     /// `scalarmul_scale_tid(i)`, which the worker binds as a `[1,1]` const so the on-device
     /// pointwise `mul` gets its real multiplier (unbound = 0 = wrong output).
     pub scalarmul_scales: Cow<'a, [f32]>,
+    /// ⭐ EACH SCALE SLOT'S STAGING CHANNEL, parallel to [`Self::scalarmul_scales`]: entry `i`
+    /// says HOW the worker stages `scalarmul_scales[i]` at `scalarmul_scale_tid(i)` — the f16
+    /// `[1,1]` const fill or the raw f32 word. The bake maps the registry's own df column onto
+    /// this, so the runtime never re-derives what a program stated; the two lists are parallel
+    /// by construction and one length.
+    pub scalarmul_scales_stage: Cow<'a, [ScaleStage]>,
     /// ⭐ THE SCALARMUL WEIGHT FOLDS — `(weight tensor id, multiplier)`: the compile-time
     /// multipliers that commuted into their matmul's weight and so never became device ops.
     /// The worker multiplies each listed weight's STAGED fp16 bytes by its multiplier at load

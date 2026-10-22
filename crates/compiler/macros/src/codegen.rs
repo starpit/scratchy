@@ -9400,6 +9400,30 @@ fn emit_superdsc_wiring(
         .iter()
         .map(|v| proc_macro2::Literal::f32_suffixed(*v))
         .collect();
+    // Each slot's staging channel, off the bake's own df column through the ONE shared
+    // projection (`wiring::scale_stage_of`) — the same mapping `bake_layout` runs, so the
+    // wiring's channel list and the layout's stage column cannot disagree. The match has NO
+    // wildcard: a new channel is a new variant, and this failing to compile is what forces the
+    // emission to learn it in the same commit.
+    let scalarmul_stage_lits: Vec<proc_macro2::TokenStream> = gk
+        .scalarmul_scales_df
+        .iter()
+        .enumerate()
+        .map(|(i, df)| {
+            let stage = scratchy_target_spyre::wiring::scale_stage_of(
+                *df,
+                &format!("wiring scale slot {i}"),
+            );
+            match stage {
+                scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 => {
+                    quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 }
+                }
+                scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 => {
+                    quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 }
+                }
+            }
+        })
+        .collect();
     // The ScalarMul weight folds, straight off the bake's recognition — the worker scales these
     // staged weights at load, so the list it reads has to be the one the lowering recognized.
     let weight_scale_fold_lits: Vec<proc_macro2::TokenStream> = gk
@@ -9489,6 +9513,7 @@ fn emit_superdsc_wiring(
             attn_class_hds: &[#(#attn_class_hds),*],
             rms_invcols: &[#(#rms_invcols_lits),*],
             scalarmul_scales: &[#(#scalarmul_scale_lits),*],
+            scalarmul_scales_stage: &[#(#scalarmul_stage_lits),*],
             weight_scale_folds: &[#(#weight_scale_fold_lits),*],
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
@@ -9906,6 +9931,7 @@ fn layout_tokens(
         places,
         kernel_weights,
         scalarmul_scales,
+        scalarmul_scales_stage,
         weight_scale_folds,
         weight_copies,
         kv_request_stride_bytes,
@@ -9926,6 +9952,18 @@ fn layout_tokens(
     let scales = scalarmul_scales
         .iter()
         .map(|s| proc_macro2::Literal::f32_suffixed(*s));
+    // Each scale slot's staging channel, off the baked stage column. The match has NO wildcard
+    // on purpose — the same law the step-input stage match below states: a new channel is a new
+    // variant, and this failing to compile is what forces the emission to learn it in the same
+    // commit.
+    let scale_stages = scalarmul_scales_stage.iter().map(|stage| match stage {
+        scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 => {
+            quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF16 }
+        }
+        scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 => {
+            quote! { ::scratchy_target_spyre::bundle_code::ScaleStage::IeeeF32 }
+        }
+    });
     // The fold list, same exact-value rule: a rounded multiplier is a quietly wrong weight scale.
     let folds = weight_scale_folds.iter().map(|(tid, scale)| {
         let tid = proc_macro2::Literal::u32_unsuffixed(*tid);
@@ -9993,6 +10031,7 @@ fn layout_tokens(
             places: ::std::borrow::Cow::Borrowed(&#places),
             kernel_weights: ::std::borrow::Cow::Borrowed(&[#(#kws),*]),
             scalarmul_scales: ::std::borrow::Cow::Borrowed(&[#(#scales),*]),
+            scalarmul_scales_stage: ::std::borrow::Cow::Borrowed(&[#(#scale_stages),*]),
             weight_scale_folds: ::std::borrow::Cow::Borrowed(&[#(#folds),*]),
             weight_copies: ::std::borrow::Cow::Borrowed(&[#(#copies),*]),
             kv_request_stride_bytes: #krs,

@@ -1912,8 +1912,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    layout from, so the bake's list and the wiring's cannot drift); what stays HERE is
     //    only the placement: a `[1,1]` worker-bound const per scale in seg0 (ACTIVATION,
     //    exactly like ATTN_SCALE). The pointwise `mul` the door lowers reads the index here →
-    //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`.
+    //    the const TID it multiplies by; the worker binds each `t{tid}=[scale]`. The PAYLOAD
+    //    half is all `Fp16` — the staging-twin law, the value the card applies is `f16(v)` —
+    //    so every census placement is 2 B and the format column is one flat Fp16 list. The
+    //    program-stated half (which can state `Fp32`) is appended LATER, by the completion
+    //    pass, at each slot's own word length.
     let scalarmul_scales = scalar_registry(ir);
+    let scalarmul_scales_df =
+        vec![ktir_superdsc::superdsc_opspec::Df::Fp16; scalarmul_scales.len()];
     for i in 0..scalarmul_scales.len() {
         let a = SegRole::Activation.segment();
         let off = seg_bytes[a];
@@ -1988,6 +1994,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         weight_tail,
         kernel_weights: std::collections::BTreeMap::new(),
         scalarmul_scales,
+        scalarmul_scales_df,
         weight_scale_folds: weight_scale_folds
             .into_iter()
             .map(|(_, tid, scale)| (tid, scale))
@@ -4212,7 +4219,13 @@ pub fn numeric_gate<F: RopeForm>(
         .filter(|t| bound.contains(t))
         .collect();
     let refs: Vec<(&[bundle::LaunchGroup<'static>], &[u64])> = vec![(groups, &results)];
-    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights)
+    // ⭐ SEAT (i), THE EMPTY TABLE ON PURPOSE: this gate's own scale staging (above) is the
+    // census half — `SubOp::ScalarMul` multipliers, every one staged at the incumbent f16 —
+    // so there is no f32 slot to declare and the session stays byte-identical. A program
+    // stating an f32 scale (the triton m-merge, once its l-line lands) hands the REAL table
+    // here, and a bundle whose f32 slot goes undeclared would fall back to the f16 fill —
+    // which is why the worker's one real call site passes the baked column, not this default.
+    let mut session = crate::runner::SpyreSession::new_multi(&refs, emu_weights, &[])
         .map_err(|e| format!("gate session: {e}"))?;
     let observables = session.observable_tids(0);
     let compare: Vec<(u64, usize)> = golden_tids
@@ -6022,6 +6035,7 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         weight_tail,
         kernel_weights,
         scalarmul_scales,
+        scalarmul_scales_df,
         weight_scale_folds,
         weight_copies,
         synth,
@@ -6176,6 +6190,35 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .collect(),
         ),
         scalarmul_scales: std::borrow::Cow::Owned(scalarmul_scales.clone()),
+        // Each scale slot's staging channel, off the registry's own df column — the same
+        // fail-closed projection `step_inputs` below runs: a format with no channel is a BUILD
+        // PANIC naming the slot, not a launch-time guess. The columns enter parallel (the
+        // completion pass keeps them one length), and the mapping is total over the registry.
+        scalarmul_scales_stage: {
+            assert_eq!(
+                scalarmul_scales.len(),
+                scalarmul_scales_df.len(),
+                "the scale registry's value and format columns are out of parallel — the layout \
+                 was built with one column missing"
+            );
+            std::borrow::Cow::Owned(
+                scalarmul_scales
+                    .iter()
+                    .zip(scalarmul_scales_df.iter())
+                    .enumerate()
+                    .map(|(i, (v, df))| {
+                        crate::wiring::scale_stage_of(
+                            *df,
+                            &format!(
+                                "scale slot {} (value {})",
+                                ktir_superdsc::reserved_tids::scalarmul_scale_tid(i),
+                                v
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        },
         weight_scale_folds: std::borrow::Cow::Owned(weight_scale_folds.clone()),
         weight_copies: std::borrow::Cow::Owned(weight_copies.clone()),
         kv_request_stride_bytes: *kv_request_stride_bytes,

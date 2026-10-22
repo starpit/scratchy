@@ -616,9 +616,14 @@ fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
         }
     }
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -713,9 +718,14 @@ fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
         other => unreachable!("exec fixture for {other:?}"),
     };
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let sources = if matches!(kind, EwKind::Silu) {
         vec![(0u64, a, vec![m as usize, c as usize])]
     } else {
@@ -805,9 +815,14 @@ fn execute_one_spliced_gelu(m: u32, c: u32) {
         })
         .collect();
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(0, vec![(0u64, a, vec![m as usize, c as usize])], &[(2, 0)])
         .unwrap_or_else(|_| panic!("run the spliced gelu program (m={m} c={c})"));
@@ -1119,9 +1134,14 @@ fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
         }
     }
 
-    let mut session =
-        scratchy_target_spyre::runner::SpyreSession::new_multi(&[(&[group], &[2u64])], Vec::new())
-            .expect("build the one-program session");
+    let mut session = scratchy_target_spyre::runner::SpyreSession::new_multi(
+        &[(&[group], &[2u64])],
+        Vec::new(),
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
+    )
+    .expect("build the one-program session");
     let out = session
         .run_step(
             0,
@@ -1453,6 +1473,9 @@ fn execute_fp8_program(
                 vec![1, n as usize],
             ),
         ],
+        // No scale slot in this program's sources — the empty stage table is the
+        // byte-identical incumbent (seat (i) declares nothing when nothing is f32).
+        &[],
     )
     .unwrap_or_else(|e| panic!("build the one-program session (m={m} k={k} n={n}): {e}"));
     let out = session

@@ -156,7 +156,13 @@ def batched_prefill_hm(desc_q, desc_o,  #
     # torch's carry, folded once per (page, window) trip.
     q = tl.reshape(q_desc.load([0, 0]), [BATCH, MQ, HD])
     m = tl.full([BATCH, MQ], -65504.0, tl.float32)
-    l = tl.zeros([BATCH, MQ], tl.float16)
+    # ⭐ THE DENOMINATOR IS f32, LIKE THE MAX IT PAIRS WITH (wall 13): `m` and `l`
+    # are one online-softmax carry — the same per-trip recurrence updates both —
+    # so an f16 `l` rounds every rescale at 2⁻¹¹ while its twin `m` keeps f32
+    # bits, and the final `acc / l` divides an f32-graded sum by a
+    # coarser-graded one. `o`'s landing stays f16 (the store's own dtype); only
+    # the carry widens.
+    l = tl.zeros([BATCH, MQ], tl.float32)
     acc = tl.zeros([BATCH, MQ, HD], tl.float16)
 
     for s in tl.static_range(PAGES):
@@ -193,5 +199,7 @@ def batched_prefill_hm(desc_q, desc_o,  #
             acc = acc * rescale[:, :, None] + pv
             m = m_new
 
-    o = acc / l[:, :, None]                                 # [B, MQ, HD]
+    # ⭐ THE LANDING IS f16 (the store's dtype); the division itself rides the
+    # f32 carry above.
+    o = (acc / l[:, :, None]).to(tl.float16)                 # [B, MQ, HD]
     o_desc.store([0, 0], tl.reshape(o, [BATCH * MQ, HD]))

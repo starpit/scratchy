@@ -1893,7 +1893,8 @@ pub fn assemble_indexed_write(
             run.sticks()
         )));
     }
-    let tile_op = crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(rows, cols, 1, 2);
+    let tile_op =
+        crate::emit::lower_ktir_to_superdsc::pointwise_tile_op(rows, cols, 1, 2, Df::Fp16);
     let split = crate::work::GatherSplit::over_entries(
         &tile_op.dims,
         crate::superdsc_opspec::MAX_CORES,
@@ -6889,13 +6890,19 @@ fn sfp_constant_table(folds: &SdscFoldSet) -> serde_json::Value {
 /// `assemble_pointwise` emits no coordinateMasking_ (guard #3, pointwise twin).
 pub(crate) fn check_pointwise_cols(
     cols: u32,
+    df: Df,
     what: &str,
     out_id: u32,
 ) -> Result<(), SuperDscError> {
-    if !cols.is_multiple_of(FP16_ELEMS_PER_STICK) {
+    // ⭐ WALL 13 — the stick law at the DATA'S OWN df: an f32 op's columns are multiple of the
+    // 32-lane IEEE_FP32 stick, an f16 op's of the 64-lane SEN169 one (`Df::elems_per_stick`,
+    // the same single source every door reads).
+    let stick = df.elems_per_stick();
+    if !cols.is_multiple_of(stick) {
         return Err(SuperDscError(format!(
-            "{what} t{out_id}: cols={cols} not a multiple of the {FP16_ELEMS_PER_STICK}-fp16 \
-             stick (assemble_pointwise emits no coordinateMasking_) — pad cols"
+            "{what} t{out_id}: cols={cols} not a multiple of the {stick}-lane {} stick \
+             (assemble_pointwise emits no coordinateMasking_) — pad cols",
+            df.name()
         )));
     }
     Ok(())

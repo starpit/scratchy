@@ -34,9 +34,9 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, bmm_site,
-    check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str, pointwise_broadcast_opspec_df,
-    pointwise_chunk_out_offset, pw1, pw2, rb, rbo,
+    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
+    bmm_site, check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str,
+    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -817,15 +817,25 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             })
             .unwrap_or((0, cols));
         let is_out = view.result.is_some_and(|v| stored.contains(&v));
-        let is_fp8 = view.attributes.iter().any(|(key, v)| {
-            matches!(
-                (key, v),
-                (
-                    AttrKey::Dtype,
-                    Attr::Dtype(ktir_core::dtypes::DType::Fp8E4m3)
-                )
-            )
+        // ⭐⭐⭐ WALL 13 — THE STICK BASIS IS THE DATA'S OWN `df`, READ OFF THE VIEW ITSELF. The
+        // view's `Dtype` attribute is the one statement of the buffer's element type ([`param_df`]
+        // reads the same op for the placement mint's sizing half), so the region carries it as its
+        // `df` and every door the region reaches classifies at the DATA'S OWN stick: an f32
+        // parameter's 32 survivor lanes are one WHOLE fp32 stick, not half an fp16 one.
+        //
+        // ⛔ A DTYPE WITH NO STICK GEOMETRY (bool, i64) KEEPS THE Fp16 BASIS, STATED HONESTLY. The
+        // reduce/pointwise DDL families bind no operand at those formats, so no classification
+        // this field drives can be reached by one — the basis is inert for them, and inventing a
+        // `Df` variant the vendor does not bind would be a knob, not a fact. [`param_df`]'s own
+        // `None` contract is the same law for a caller that sizes buffers.
+        let dtype = view.attributes.iter().find_map(|(key, v)| match (key, v) {
+            (AttrKey::Dtype, Attr::Dtype(d)) => Some(*d),
+            _ => None,
         });
+        let is_fp8 = dtype.is_some_and(|d| d == ktir_core::dtypes::DType::Fp8E4m3);
+        let df = dtype
+            .and_then(super::whole_function::df_of_dtype)
+            .unwrap_or(Df::Fp16);
         out.push(Region {
             tid: tid.get(),
             v_rows: rows,
@@ -838,10 +848,9 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             c_cover,
             is_out,
             is_fp8,
-            // WALL 13's walk-side threading is the island commit's own work; every parameter
-            // region mints the fp16 basis until then, so the door's classification of every
-            // f16 parameter is byte-identical to the pre-wall-13 hardcode (`Region::df`'s doc).
-            df: Df::Fp16,
+            // The view's OWN element type (wall 13): every f16 parameter keeps the fp16 basis
+            // byte-identical to the pre-wall-13 hardcode; an f32 parameter states IEEE_FP32.
+            df,
         });
     }
     Ok(out)
@@ -1078,7 +1087,11 @@ fn scale_idx_of(layout: Option<&BundleLayout>, tid: u32) -> Option<usize> {
 /// leading-axis broadcast consumer (`elementwise_broadcast`'s Y arm, which derives `y` and
 /// `mb = rows/y` from the checked [`crate::sdsc_abstract::RowSplitFrame`]); every other caller
 /// passes 1 and keeps the size-1 dim this doc describes.
-pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -> TileOp {
+/// ⭐ WALL 13 — the tile op states its OWN df: every dim and the struct carry the output's element
+/// format, which the bridge threads into every `TensorArg` (`.with_df`) and the LX-residency math
+/// (`pointwise_lx_resident_generic`). Every existing caller passes the region's own `df`, so an
+/// f16 op is byte-identical to the pre-wall-13 hardcode; an f32 op states IEEE_FP32 end to end.
+pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32, df: Df) -> TileOp {
     TileOp {
         kind: TileOpKind::PointwiseOrReduce { n_operands },
         dims: vec![
@@ -1087,24 +1100,24 @@ pub(crate) fn pointwise_tile_op(rows: u32, cols: u32, y: u32, n_operands: u32) -
                 size: rows,
                 is_reduction: false,
                 is_stick: false,
-                df: Df::Fp16,
+                df,
             },
             ItDim {
                 name: "out",
                 size: cols.max(1),
                 is_reduction: false,
                 is_stick: true,
-                df: Df::Fp16,
+                df,
             },
             ItDim {
                 name: "y",
                 size: y.max(1),
                 is_reduction: false,
                 is_stick: false,
-                df: Df::Fp16,
+                df,
             },
         ],
-        df: Df::Fp16,
+        df,
     }
 }
 
@@ -1339,6 +1352,77 @@ pub fn elementwise(
     // parameter list, not about how one arm addresses them. The arms that CANNOT carry a corner
     // are refused it by the guard just below; every other body keeps `split_out`'s guard.
     let (ins, out) = split_regions(name, r, layout, arity, &[])?;
+    // ⛔⛔⛔ WALL 13 — THE MIXED-df PIN, ELEMENTWISE SEAT (the auditor's law, the walk-level
+    // enforcement of the reduce.rs const law): every operand of ONE elementwise op states the
+    // SAME df, the output's own. A TTIR op whose operands differ in df is a producer defect —
+    // MLIR's own semantics insert the `arith.extf`/`arith.truncf` the promotion requires, so a
+    // mixed op reaching here uncast means the producer skipped the cast the vocabulary mandates.
+    // Refused BY NAME (never emitted, never re-typed): together with the convert door's own
+    // pair check this makes the DD2 mixed-op refusal ("Unsupported result precision
+    // conversion") UNREACHABLE by our emission — every df transition is a convert op.
+    for (i, x) in ins.iter().enumerate() {
+        if x.df != out.df {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: input {i} t{} states df {:?} but the output t{} \
+                 states {:?} — a MIXED-df op. The vocabulary requires the transition as an \
+                 explicit `arith.extf`/`arith.truncf` (which this walk lowers as a convert with \
+                 each side at its own df), so an uncast mixed op is a producer defect; emitting \
+                 it as one descriptor would hand dxp a mixed [_, _] op the DDL refuses at bake",
+                x.tid, x.df, out.tid, out.df
+            ));
+        }
+    }
+    // ⛔⛔⛔ WALL 13 — THE FP32 ALLOWLIST, fail-closed with TWO different laws named (never
+    // conflated): some opFuncs the HARDWARE lacks at fp32 — the DDL's own comments say so
+    // (`tanh`/`gelu`/`mish`/`fastexp`/`fastsigmoid`, "not possible in fp32 (FEST hardware
+    // limitation)", unary_pipeline.ddl:20-21 and unary_parallel.ddl) — and the rest
+    // (`sigmoid`/`rsqrt`/`sqrt`/`abs`/`silu`/`reciprocal`) ARE fp32-bound in the vendor's
+    // unary_parallel.ddl (:22-:37) but OUTSIDE this island's tested set, so the island refuses
+    // them as NARROW-BY-DEFAULT, not as hardware-absent. The merge chain this island exists for
+    // needs exactly {add, sub, multiply, realdiv, maximum, minimum, exp} — the family
+    // broadcast_ops.ddl binds at [%type_fp16, %type_fp32] plus unary_parallel.ddl:30's `exp`.
+    if out.df == Df::Fp32 {
+        let hardware_lacks = matches!(
+            kind,
+            Elementwise::Tanh
+                | Elementwise::Gelu
+                | Elementwise::Mish
+                | Elementwise::QuickGelu
+                | Elementwise::GeluErf
+        );
+        let in_allowlist = matches!(
+            kind,
+            Elementwise::Add
+                | Elementwise::Sub
+                | Elementwise::Mul
+                | Elementwise::RealDiv
+                | Elementwise::Maximum
+                | Elementwise::Minimum
+                | Elementwise::Exp
+        );
+        if hardware_lacks {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: the output t{} states IEEE_FP32 and `{op_func}` is \
+                 HARDWARE-ABSENT at fp32 — the vendor's own DDL comments say so (\"not possible \
+                 in fp32 (FEST hardware limitation)\", unary_pipeline.ddl:20-21); the fp16 bind is \
+                 the only one. A producer that needs this function at f32 must keep the value at \
+                 f16 through it (cast, compute, cast back)",
+                out.tid
+            ));
+        }
+        if !in_allowlist {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: the output t{} states IEEE_FP32 and `{op_func}` is \
+                 not in the fp32 island's allowlist — the vendor DOES bind it at fp32 \
+                 (unary_parallel.ddl:22-:37), but this island has tested only the merge chain's \
+                 family ({{add, sub, multiply, realdiv, maximum, minimum, exp}}, \
+                 broadcast_ops.ddl's [%type_fp16, %type_fp32] binds plus unary_parallel.ddl:30). \
+                 Widen the allowlist only with a DDL citation and a pin, never by removal of this \
+                 refusal",
+                out.tid
+            ));
+        }
+    }
     if !bcast.is_empty() && bcast.len() != ins.len() {
         return err(format!(
             "Elementwise({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
@@ -1421,7 +1505,7 @@ pub fn elementwise(
     // `1/x`, and the fix was to stop shipping it rather than to hand-build the iteration. The DSM fills
     // them. A comment claiming we emit the table describes the bug, not the fix.
     let cols = out.c_len;
-    check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    check_pointwise_cols(cols, out.df, "Elementwise", out.tid)?;
     // ⭐ THE SWEEP IS COMPUTED BEFORE THE EXTENTS LAW, because the law is now stated OVER it: a
     // windowed (banded) output's sweep is its window, not its whole view, and the operands are
     // held to that basis ([`pointwise_extents_agree`]'s two-basis law below).
@@ -1463,7 +1547,7 @@ pub fn elementwise(
     {
         let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
         let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
-        let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
+        let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1, out.df);
         let op = assemble_pointwise_seeded_from_tile(
             &op_name,
             &tile_op,
@@ -1510,10 +1594,12 @@ pub fn elementwise(
     // corner itself past-the-end (chunk 1 of the `[25, 15360]` MLP intermediate: corner 204800
     // against a 179200-element declaration), which the operand mint refuses — the same
     // annotation-only dims the `rbo` comment promises nothing reads but the checks.
-    let out_h = rb(&out.name(), out.v_rows, out.v_cols);
+    // ⭐ WALL 13 — each handle at its region's OWN df (the mint prices bytes at the handle's word
+    // length; `rb` IS `rb_df(Dp16)`, so every f16 op is byte-identical).
+    let out_h = rb_df(&out.name(), out.v_rows, out.v_cols, out.df);
     let in_handles: Vec<_> = ins
         .iter()
-        .map(|x| rb(&x.name(), x.v_rows, x.v_cols))
+        .map(|x| rb_df(&x.name(), x.v_rows, x.v_cols, x.df))
         .collect();
     let ew: Vec<_> = in_handles
         .iter()
@@ -1526,7 +1612,7 @@ pub fn elementwise(
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
-    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1, out.df);
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
         &tile_op,
@@ -1713,10 +1799,12 @@ fn elementwise_per_row(
             ));
         }
     }
-    let cols = FP16_ELEMS_PER_STICK;
+    // ⭐ WALL 13 — the ONE-STICK width is the data's own df's stick (`Df::elems_per_stick`), not
+    // the f16 hardcode: an f32 per-row chain writes lane 0 of a 32-lane IEEE_FP32 stick.
+    let cols = out.df.elems_per_stick();
     let rows = pointwise_rows(name, out)?;
     let op_name = format!("{op_func}_o{}", out.tid);
-    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1);
+    let tile_op = pointwise_tile_op(rows, cols, 1, arity as u32 + 1, out.df);
     let in_names: Vec<String> = ins.iter().map(|x| x.name()).collect();
     let in_refs: Vec<&str> = in_names.iter().map(|s| s.as_str()).collect();
     let op = assemble_pointwise_seeded_from_tile(
@@ -1856,7 +1944,7 @@ fn elementwise_broadcast(
     } else {
         out.c_len
     };
-    check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    check_pointwise_cols(cols, out.df, "Elementwise", out.tid)?;
     let op_name = format!("{op_func}_o{}", out.tid);
     // The handles: `rb` is RowBlocked, which is what `head_major == false` means on the seeded path —
     // the residual token stream, not the per-head attention layout. An INPUT handle's extents are
@@ -1936,6 +2024,7 @@ fn elementwise_broadcast(
         cols,
         ymode.unwrap_or(1),
         ins.len() as u32 + 1,
+        out.df,
     );
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(
         &op_name,
@@ -1969,7 +2058,7 @@ pub fn silumul(
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, o) = split_out(name, r, layout, 2)?;
     let (gate_r, up_r) = (ins[0], ins[1]);
-    check_pointwise_cols(o.c_len, "SiluMul", o.tid)?;
+    check_pointwise_cols(o.c_len, o.df, "SiluMul", o.tid)?;
     let rows = node_rows(name, &o)?;
     let cols = o.c_len;
     let gate = gate_r.name();
@@ -2105,7 +2194,7 @@ pub fn rmsnorm(
              the value the program uses must have a registry slot (registry desync)"
         ),
     })?;
-    check_pointwise_cols(out.c_len, "RmsNorm", out.tid)?;
+    check_pointwise_cols(out.c_len, out.df, "RmsNorm", out.tid)?;
     let rows = node_rows(name, &out)?;
     let cols = out.c_len;
     // ⭐ THE GAIN OFFSET RIDES THE EPSILON'S LAW. `rmsnorm_oneplus_fwd` states the
@@ -2119,7 +2208,7 @@ pub fn rmsnorm(
     // state it.
     let ones_const = match program_gain_offset(&k.func) {
         None => None,
-        Some(1.0) => {
+        Some((1.0, _)) => {
             let ones_idx = scale_slot(layout, 1.0).ok_or_else(|| Error {
                 message: format!(
                     "RmsNorm {name}: the program states gain offset 1.0 (the OnePlusScale \
@@ -2130,7 +2219,7 @@ pub fn rmsnorm(
             })?;
             Some(crate::place::act_name(scalarmul_scale_tid(ones_idx)))
         }
-        Some(other) => {
+        Some((other, _)) => {
             return Err(Error {
                 message: format!(
                     "RmsNorm {name}: the program states gain offset {other}, which is not a \
@@ -2924,6 +3013,13 @@ fn param_tiles_deep(f: &IRFunction<'static>, ptr: &Ssa) -> usize {
 /// other comments are a record of. The three `program_*` readers are the registry's contract, so they
 /// are part of the door.
 pub fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
+    program_rmsnorm_eps_splat(f).map(|(v, _)| v)
+}
+
+/// [`program_rmsnorm_eps`] WITH the epsilon's own splat SSA — the seat the registry's format
+/// column reads ([`program_stated_scales`]): the value and its df come from the SAME splat, so
+/// the two columns of one registry row cannot disagree about which op stated them.
+pub fn program_rmsnorm_eps_splat(f: &IRFunction<'static>) -> Option<(f32, Ssa)> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     let splat_value = |s: Ssa| -> Option<f64> {
         let sp = def_of(s)?;
@@ -2956,13 +3052,14 @@ pub fn program_rmsnorm_eps(f: &IRFunction<'static>) -> Option<f32> {
     }
     // The other operand is the mean — `arith.divf` here, `arith.mulf` by a splatted `1/cols` in a
     // producer that folds the divisor — and NEITHER is a splat, so exactly one of the two is. That is
-    // the whole discriminator, and it holds for any spelling of the mean.
-    let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
-    let eps = splats.next()?;
+    // the whole discriminator, and it holds for any spelling of the mean. The splat's OWN SSA rides
+    // the answer so the format column reads the same op the value came from.
+    let mut splats = add.operands.iter().filter(|&&s| splat_value(s).is_some());
+    let &eps_splat = splats.next()?;
     if splats.next().is_some() {
         return None;
     }
-    Some(eps as f32)
+    Some((splat_value(eps_splat)? as f32, eps_splat))
 }
 
 /// The SCALARMUL multiplier the program states, read structurally.
@@ -3043,9 +3140,61 @@ fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
         })
 }
 
+/// ⭐⭐⭐ THE SLOT'S OWN FORMAT — the element type the constant's `tensor.splat` states for its
+/// result, read at the SAME SEAT the value came from (the splat op itself), so the registry's
+/// format column cannot drift from its value column. The runtime stages a scale const through
+/// exactly two channels — the existing f16 `[1,1]` fill, and the raw f32 word — so the df law is:
+///
+/// * no `result_type` → `Fp16`, the incumbent: every producer this crate has states its scale
+///   splats at f16 or untyped, and the untyped form is the f16 one the existing channel writes;
+/// * `F16` → [`Df::Fp16`], `F32` → [`Df::Fp32`] — one whole word at the slot's own width;
+/// * ⛔ ANY OTHER element type (fp8, int, bool, an address type) IS A BAKE PANIC naming the
+///   value and the program: a slot stated at a format no channel writes is a bundle that
+///   cannot bake, and the refusal is the whole point — never a nearest-neighbor staging.
+pub fn scale_slot_df(f: &IRFunction<'static>, splat: Ssa, value: f32) -> Df {
+    let name = f.name;
+    let elem = f
+        .operations
+        .iter()
+        .find(|o| o.result == Some(splat))
+        .and_then(|o| o.result_type)
+        .map(|t| match t {
+            ktir_core::irtype::IrType::Tensor { elem, .. }
+            | ktir_core::irtype::IrType::MemRef { elem, .. }
+            | ktir_core::irtype::IrType::Scalar(elem) => elem,
+            ktir_core::irtype::IrType::AccessTile { .. }
+            | ktir_core::irtype::IrType::Index => {
+                panic!(
+                    "{name}: the scale slot for {value} is stated by a splat whose result is an \
+                     ADDRESS type — a scale constant is a value, never an address, so no staging \
+                     channel can write it"
+                )
+            }
+        });
+    let Some(elem) = elem else {
+        return Df::Fp16;
+    };
+    match super::whole_function::df_of_dtype(elem) {
+        Some(Df::Fp16) => Df::Fp16,
+        Some(Df::Fp32) => Df::Fp32,
+        Some(other) => panic!(
+            "{name}: the scale slot for {value} states element format {other:?} — the scale \
+             registry stages only IEEE f16/f32 slots (f16: the existing [1,1] const fill; f32: \
+             the raw-word channel), so this bundle cannot bake"
+        ),
+        None => panic!(
+            "{name}: the scale slot for {value} states element type {elem:?}, which has no stick \
+             geometry — the scale registry stages only IEEE f16/f32 slots, so this bundle cannot \
+             bake"
+        ),
+    }
+}
+
 /// ⭐⭐⭐ THE PROGRAM-STATED HALF OF THE SCALE REGISTRY — the values THIS program's ops will be
 /// looked up BY VALUE in `BundleLayout::scalarmul_scales`, read with the door's own readers so the
-/// collector cannot drift from the door.
+/// collector cannot drift from the door — each value PAIRED WITH ITS OWN `df`, read at the same
+/// splat the value came from, because the slot's staging channel is chosen by the format the
+/// program states, never by a producer-side guess.
 ///
 /// The census that fills the registry (`scalar_registry` in `scratchy-target-spyre`) is a pure walk
 /// of the graph's node payloads: it sees every config-derived scalar a PAYLOAD names. A program can
@@ -3064,11 +3213,11 @@ fn scale_slot_in(scales: &[f32], value: f32) -> Option<usize> {
 /// constant [`scalarsub_at`] resolves by value — so the per-op reader is
 /// [`super::whole_function::splat_scale_of`], the same one that walk calls for both tiebreaks. A
 /// one-node program is lowered by the per-`Program` door, whose rmsnorm arm resolves its epsilon
-/// ([`program_rmsnorm_eps`]) and its `(1+w)` offset ([`program_gain_offset`]) through the same
+/// ([`program_rmsnorm_eps_splat`]) and its `(1+w)` offset ([`program_gain_offset`]) through the same
 /// [`scale_slot`] — so those readers are here too. A constant no door looks up (an
 /// `Elementwise(Mul)` with no splat operand, a fused body's internal `1/cols`) is never collected:
 /// the collector enumerates LOOKUPS, not constants.
-pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
+pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<(f32, Df)> {
     let mut stated = Vec::new();
     for op in f.operations.iter() {
         if matches!(
@@ -3079,22 +3228,34 @@ pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
                 | OpKind::ArithSubf
         ) && let Some(sf) = super::whole_function::splat_scale_of(f, op)
         {
-            stated.push(sf.value);
+            stated.push((sf.value, scale_slot_df(f, sf.splat, sf.value)));
         }
     }
-    if let Some(eps) = program_rmsnorm_eps(f) {
-        stated.push(eps);
+    if let Some((eps, sp)) = program_rmsnorm_eps_splat(f) {
+        stated.push((eps, scale_slot_df(f, sp, eps)));
     }
-    if let Some(off) = program_gain_offset(f) {
-        stated.push(off);
+    if let Some((off, sp)) = program_gain_offset(f) {
+        stated.push((off, scale_slot_df(f, sp, off)));
     }
     stated
+}
+
+/// One program-stated scale WITH ITS PROVENANCE — the walk's ordinal for the program that stated
+/// it and that program's own name — so a format disagreement at one reserved slot can name BOTH
+/// staters in the refusal ([`complete_scale_registry`]). The ordinal is the SEAM's fact (where the
+/// program sits in the walk that collected it), never the function's own.
+#[derive(Clone, Copy, Debug)]
+pub struct StatedScale {
+    pub walk: usize,
+    pub name: &'static str,
+    pub value: f32,
+    pub df: Df,
 }
 
 /// ⭐⭐⭐ THE COMPLETION — append every stated value the registry lacks, in an order NO WALK
 /// CHOOSES. The registry's index IS the device tid (`SCALARMUL_SCALE_BASE - i`), and TWO walks
 /// build it: the bake's layout (`compute_bundle_layout`) and the wiring's registries
-/// (`graph_wiring`) — the worker binds one `[1,1]` const per slot, so a value the two disagreed
+/// (`graph_wiring`) — the worker binds one const per slot, so a value the two disagreed
 /// about would resolve to a slot nobody bound. The payload half is one shared census; the
 /// program-stated half is completed per walk, so its ORDER is the hazard: the bake walks
 /// prefix → bodies → suffix and the wiring walks nodes, and two folded constants appearing in a
@@ -3108,15 +3269,61 @@ pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<f32> {
 /// shipped bundles' descriptors already carry. Which is also the no-op law: completing over a
 /// program whose constants the census registered leaves the registry byte-identical — pinned by
 /// test.
-pub fn complete_scale_registry(scales: &mut Vec<f32>, stated: Vec<f32>) {
-    let mut missing: Vec<f32> = Vec::new();
-    for v in stated {
-        if scale_slot_in(scales, v).is_none() && scale_slot_in(&missing, v).is_none() {
-            missing.push(v);
+///
+/// ⛔⛔ AND THE FORMAT COLUMN MUST AGREE. `dfs` enters parallel to `scales` — the census half's own
+/// dfs (all `Fp16`, the staging-twin law) or an earlier completion's — and a stated value that
+/// resolves to an ALREADY-HELD slot at a DIFFERENT df is a bake refusal naming the slot, both
+/// formats, and the program(s) that stated them: one reserved slot carries one staging channel,
+/// and a completion that silently picked either would bind the other program's const at the wrong
+/// word width. Two programs disagreeing over one NEW slot is refused the same way, both named.
+pub fn complete_scale_registry(scales: &mut Vec<f32>, dfs: &mut Vec<Df>, stated: Vec<StatedScale>) {
+    assert_eq!(
+        scales.len(),
+        dfs.len(),
+        "the scale registry's value and format columns are out of parallel — the caller built \
+         one without the other"
+    );
+    let mut missing_vals: Vec<f32> = Vec::new();
+    let mut missing_prov: Vec<(usize, &'static str, Df)> = Vec::new();
+    for s in stated {
+        if let Some(i) = scale_slot_in(scales, s.value) {
+            if dfs[i] != s.df {
+                panic!(
+                    "scale slot {} (value {}) is stated at two formats: the registry holds it at \
+                     {:?} and program `{}` (walk #{}) states it at {:?} — one reserved slot \
+                     carries one staging channel, so this bundle cannot bake",
+                    crate::reserved_tids::scalarmul_scale_tid(i),
+                    s.value,
+                    dfs[i],
+                    s.name,
+                    s.walk,
+                    s.df
+                );
+            }
+            continue;
         }
+        if let Some(j) = scale_slot_in(&missing_vals, s.value) {
+            let (walk, name, df) = missing_prov[j];
+            if df != s.df {
+                panic!(
+                    "the scale slot for {} is stated at two formats by two programs: `{}` (walk \
+                     #{}) states {:?} and `{}` (walk #{}) states {:?} — one reserved slot carries \
+                     one staging channel, so this bundle cannot bake",
+                    s.value, name, walk, df, s.name, s.walk, s.df
+                );
+            }
+            continue;
+        }
+        missing_vals.push(s.value);
+        missing_prov.push((s.walk, s.name, s.df));
     }
-    missing.sort_unstable_by_key(|v| v.to_bits());
-    scales.extend(missing);
+    // Bits-sorted append — the two-walk law — with the format column riding the same order.
+    let mut order: Vec<usize> = (0..missing_vals.len()).collect();
+    order.sort_unstable_by_key(|&i| missing_vals[i].to_bits());
+    for i in order {
+        scales.push(missing_vals[i]);
+        dfs.push(missing_prov[i].2);
+    }
 }
 
 #[cfg(test)]
@@ -3148,6 +3355,50 @@ mod scale_completion_tests {
             grid: (1, 1, 1),
             return_type: None,
         }
+    }
+
+    /// The same folded multiply with the splat's RESULT TYPED — the form a producer that states
+    /// its formats leaves behind (the f32 m-merge's own constants): the registry's format column
+    /// reads THIS type, at the same splat the value came from.
+    fn folded_at(constant: f64, elem: ktir_core::dtypes::DType) -> IRFunction<'static> {
+        let a: &'static Arena = Arena::global();
+        let (x, c, sp, mul) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let ops = vec![
+            Operation::new(a, Some(c), OpKind::ArithConstant, &[]).with_attr(
+                a,
+                AttrKey::Value,
+                Attr::Float(constant),
+            ),
+            Operation {
+                result_type: Some(IrType::Tensor {
+                    dims: a.ints(vec![1, 1]),
+                    elem,
+                }),
+                ..Operation::new(a, Some(sp), OpKind::TensorSplat, &[c])
+            },
+            Operation::new(a, Some(mul), OpKind::ArithMulf, &[x, sp]),
+        ];
+        IRFunction {
+            name: "folded_typed_probe",
+            arguments: a.args(vec![(x, IrType::Index)]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        }
+    }
+
+    /// The reader's pairs zipped with one program's provenance — the walk ordinal and name the
+    /// seam supplies, so a df disagreement can name BOTH staters.
+    fn stated_of(walk: usize, pairs: Vec<(f32, Df)>) -> Vec<StatedScale> {
+        pairs
+            .into_iter()
+            .map(|(value, df)| StatedScale {
+                walk,
+                name: "probe",
+                value,
+                df,
+            })
+            .collect()
     }
 
     /// `x * y` — two tensors, no splat: an `Elementwise(Mul)` the door never resolves by value, so
@@ -3206,15 +3457,17 @@ mod scale_completion_tests {
     fn an_extremum_constant_the_census_never_saw_gets_one_appended_slot() {
         for max in [true, false] {
             let mut scales = vec![0.5f32];
+            let mut dfs = vec![Df::Fp16];
             let stated = program_stated_scales(&clamped(-65504.0, max));
             assert_eq!(
                 stated,
-                vec![-65504.0f32],
-                "the {} form states its bound",
+                vec![(-65504.0f32, Df::Fp16)],
+                "the {} form states its bound at the incumbent f16 staging",
                 if max { "maximum" } else { "minimum" }
             );
-            complete_scale_registry(&mut scales, stated);
+            complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
             assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
+            assert_eq!(dfs, vec![Df::Fp16, Df::Fp16], "the format column rides the append");
             assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
             assert_eq!(
                 scale_slot_in(&scales, -65504.0),
@@ -3253,10 +3506,16 @@ mod scale_completion_tests {
     #[test]
     fn a_folded_constant_the_census_never_saw_gets_one_appended_slot() {
         let mut scales = vec![0.5f32, 0.25];
+        let mut dfs = vec![Df::Fp16, Df::Fp16];
         let stated = program_stated_scales(&folded(0.022537231));
-        assert_eq!(stated, vec![0.022537231f32], "the reader states the fold");
-        complete_scale_registry(&mut scales, stated);
+        assert_eq!(
+            stated,
+            vec![(0.022537231f32, Df::Fp16)],
+            "the reader states the fold at its own format"
+        );
+        complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
         assert_eq!(scales.len(), 3, "one appended slot, nothing renumbered");
+        assert_eq!(dfs.len(), 3, "the format column rides the append");
         assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
         assert_eq!(scales[1], 0.25, "append-only: slot 1 is untouched");
         assert_eq!(
@@ -3276,12 +3535,19 @@ mod scale_completion_tests {
         let image = half::f16::from_f32(config).to_f32();
         assert_ne!(config.to_bits(), image.to_bits(), "the probe must round");
         let mut scales = vec![config];
-        complete_scale_registry(&mut scales, program_stated_scales(&folded(image as f64)));
+        let mut dfs = vec![Df::Fp16];
+        complete_scale_registry(
+            &mut scales,
+            &mut dfs,
+            stated_of(0, program_stated_scales(&folded(image as f64))),
+        );
         assert_eq!(
             scales.len(),
             1,
             "the f16 image resolves against the f32 entry: no append"
         );
+        assert_eq!(dfs, vec![Df::Fp16], "and no format disagreement: the untyped \
+            splat is the incumbent f16 staging, so the f16-image no-op stays a no-op");
     }
 
     /// ⛔ THE TWO-WALK LAW. The bake completes prefix → bodies → suffix and the wiring completes in
@@ -3292,25 +3558,30 @@ mod scale_completion_tests {
     fn the_appended_order_is_independent_of_the_walk_order() {
         let (a, b) = (0.75f32, 0.125);
         let mut bake_order = Vec::new();
+        let mut bake_dfs = Vec::new();
         complete_scale_registry(
             &mut bake_order,
-            program_stated_scales(&folded(b as f64))
+            &mut bake_dfs,
+            stated_of(0, program_stated_scales(&folded(b as f64)))
                 .into_iter()
-                .chain(program_stated_scales(&folded(a as f64)))
+                .chain(stated_of(1, program_stated_scales(&folded(a as f64))))
                 .collect(),
         );
         let mut wiring_order = Vec::new();
+        let mut wiring_dfs = Vec::new();
         complete_scale_registry(
             &mut wiring_order,
-            program_stated_scales(&folded(a as f64))
+            &mut wiring_dfs,
+            stated_of(0, program_stated_scales(&folded(a as f64)))
                 .into_iter()
-                .chain(program_stated_scales(&folded(b as f64)))
+                .chain(stated_of(1, program_stated_scales(&folded(b as f64))))
                 .collect(),
         );
         assert_eq!(
             bake_order, wiring_order,
             "both walks compute the identical registry"
         );
+        assert_eq!(bake_dfs, wiring_dfs, "both walks compute the identical formats");
         assert_eq!(
             bake_order,
             {
@@ -3356,14 +3627,15 @@ mod scale_completion_tests {
     fn a_subtraction_constant_the_census_never_saw_gets_one_appended_slot() {
         for const_first in [true, false] {
             let mut scales = vec![0.5f32];
+            let mut dfs = vec![Df::Fp16];
             let stated = program_stated_scales(&subtracted(-65504.0, const_first));
             assert_eq!(
                 stated,
-                vec![-65504.0f32],
+                vec![(-65504.0f32, Df::Fp16)],
                 "the {} order states its constant",
                 if const_first { "C − tile" } else { "tile − C" }
             );
-            complete_scale_registry(&mut scales, stated);
+            complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
             assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
             assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
             assert_eq!(
@@ -3405,8 +3677,86 @@ mod scale_completion_tests {
             "an Elementwise(Mul) states no value-looked-up constant"
         );
         let mut scales = vec![0.5f32];
-        complete_scale_registry(&mut scales, program_stated_scales(&elementwise_mul()));
+        let mut dfs = vec![Df::Fp16];
+        complete_scale_registry(
+            &mut scales,
+            &mut dfs,
+            stated_of(0, program_stated_scales(&elementwise_mul())),
+        );
         assert_eq!(scales, vec![0.5], "completion over it is the identity");
+        assert_eq!(dfs, vec![Df::Fp16], "and the format column too");
+    }
+
+    /// ⭐ THE FORMAT COLUMN'S OWN APPEND: a folded constant stated at f32 (the m-merge's own
+    /// form — the splat's result is typed `tensor<1x1xf32>`) completes with [`Df::Fp32`], so the
+    /// slot's staging channel is the one the program stated, never a producer-side guess.
+    #[test]
+    fn an_f32_stated_scale_completes_with_its_own_df() {
+        let mut scales = vec![0.5f32];
+        let mut dfs = vec![Df::Fp16];
+        let stated = program_stated_scales(&folded_at(0.022537231, ktir_core::dtypes::DType::F32));
+        assert_eq!(
+            stated,
+            vec![(0.022537231f32, Df::Fp32)],
+            "the reader states the fold AND its own f32 format"
+        );
+        complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
+        assert_eq!(scales.len(), 2, "one appended slot");
+        assert_eq!(dfs, vec![Df::Fp16, Df::Fp32], "the appended slot is Fp32");
+    }
+
+    /// ⛔ THE SAME-BITS COLLISION, REFUSED: two programs stating the SAME value at DIFFERENT dfs
+    /// (an f16-stated −65504 beside the f32 m-merge's own −65504 initial) cannot share one
+    /// reserved slot — one tid carries one staging channel. The refusal names BOTH programs.
+    #[test]
+    #[should_panic(expected = "is stated at two formats by two programs")]
+    fn a_same_bits_different_df_collision_is_refused_naming_both_programs() {
+        let mut scales = Vec::new();
+        let mut dfs = Vec::new();
+        complete_scale_registry(
+            &mut scales,
+            &mut dfs,
+            vec![
+                StatedScale {
+                    walk: 0,
+                    name: "f16_stater",
+                    value: -65504.0,
+                    df: Df::Fp16,
+                },
+                StatedScale {
+                    walk: 1,
+                    name: "f32_stater",
+                    value: -65504.0,
+                    df: Df::Fp32,
+                },
+            ],
+        );
+    }
+
+    /// ⛔ AND THE HELD HALF TOO: a stated value resolving to an ALREADY-HELD slot at a different
+    /// df is the same refusal with the registry's own holder named — the census's f16 staging
+    /// against a program stating f32 at the same bits.
+    #[test]
+    #[should_panic(expected = "the registry holds it at Fp16")]
+    fn a_stated_f32_against_a_held_f16_slot_is_refused() {
+        let mut scales = vec![-65504.0f32];
+        let mut dfs = vec![Df::Fp16];
+        complete_scale_registry(
+            &mut scales,
+            &mut dfs,
+            stated_of(0, program_stated_scales(&folded_at(
+                -65504.0,
+                ktir_core::dtypes::DType::F32,
+            ))),
+        );
+    }
+
+    /// ⛔ THE FOREIGN-df LAW: a scale splat typed at a format NO channel writes (fp8) is a bake
+    /// panic naming the value and the program — fail closed, never nearest-neighbor staging.
+    #[test]
+    #[should_panic(expected = "the scale registry stages only IEEE f16/f32 slots")]
+    fn a_foreign_df_at_a_scale_slot_panics_naming_the_slot() {
+        program_stated_scales(&folded_at(0.5, ktir_core::dtypes::DType::Fp8E4m3));
     }
 }
 
@@ -3422,7 +3772,7 @@ mod scale_completion_tests {
 /// convention: the whole gemma-4 per-head family and the plain Scale rows), and
 /// `Some(0.0)` never occurs — the producer omits the addf entirely at offset 0, so
 /// a stated zero-offset addf is a producer bug worth seeing.
-fn program_gain_offset(f: &IRFunction<'static>) -> Option<f32> {
+fn program_gain_offset(f: &IRFunction<'static>) -> Option<(f32, Ssa)> {
     let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
     let splat_value = |s: Ssa| -> Option<f64> {
         let sp = def_of(s)?;
@@ -3443,7 +3793,8 @@ fn program_gain_offset(f: &IRFunction<'static>) -> Option<f32> {
         .iter()
         .filter(|o| o.op_type == OpKind::ArithAddf)
     {
-        // The gamma leg's addf: one operand a loaded row, the other the offset splat.
+        // The gamma leg's addf: one operand a loaded row, the other the offset splat. The splat's
+        // OWN SSA rides the answer (the epsilon's law, one seat for the value and its format).
         let has_load = add
             .operands
             .iter()
@@ -3451,12 +3802,12 @@ fn program_gain_offset(f: &IRFunction<'static>) -> Option<f32> {
         if !has_load {
             continue;
         }
-        let mut splats = add.operands.iter().filter_map(|&s| splat_value(s));
-        let v = splats.next()?;
+        let mut splats = add.operands.iter().filter(|&&s| splat_value(s).is_some());
+        let &off_splat = splats.next()?;
         if splats.next().is_some() {
             return None;
         }
-        return Some(v as f32);
+        return Some((splat_value(off_splat)? as f32, off_splat));
     }
     None
 }
@@ -6638,7 +6989,7 @@ mod elementwise_tests {
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
-            &pointwise_tile_op(64, 64, 4, 3),
+            &pointwise_tile_op(64, 64, 4, 3, Df::Fp16),
             256,
             64,
             op_func_from_str("sub"),
@@ -6689,7 +7040,7 @@ mod elementwise_tests {
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
-            &pointwise_tile_op(64, 64, 2, 3),
+            &pointwise_tile_op(64, 64, 2, 3, Df::Fp16),
             256,
             64,
             op_func_from_str("sub"),
@@ -6718,7 +7069,7 @@ mod elementwise_tests {
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
-            &pointwise_tile_op(64, 128, 4, 3),
+            &pointwise_tile_op(64, 128, 4, 3, Df::Fp16),
             256,
             128,
             op_func_from_str("sub"),
@@ -7993,7 +8344,7 @@ pub fn rmsnorm_at(
              the value the program uses must have a registry slot (registry desync)"
         ),
     })?;
-    check_pointwise_cols(out.c_len, "RmsNorm", out.tid)?;
+    check_pointwise_cols(out.c_len, out.df, "RmsNorm", out.tid)?;
     let rows = node_rows(name, &out)?;
     let cols = out.c_len;
     // rms_norm_eps (config) flows via the scalarmul registry (compute_bundle_layout collected it) —
@@ -8077,7 +8428,7 @@ pub fn rmsnorm_unit(
              the value the program uses must have a registry slot (registry desync)"
         )
     })?;
-    check_pointwise_cols(out.c_len, "RmsNormUnit", out.tid)?;
+    check_pointwise_cols(out.c_len, out.df, "RmsNormUnit", out.tid)?;
     let rows = node_rows(name, &out)?;
     let cols = out.c_len;
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
@@ -8182,7 +8533,7 @@ pub fn windowed_rmsnorm(
     } else {
         match program_gain_offset(&k.func) {
             None => None,
-            Some(1.0) => {
+            Some((1.0, _)) => {
                 let ones_idx = scale_slot(layout, 1.0).ok_or_else(|| Error {
                     message: format!(
                         "WindowedRmsNorm {name}: the program states gain offset 1.0 (the \
@@ -8194,7 +8545,7 @@ pub fn windowed_rmsnorm(
                 })?;
                 Some(crate::place::act_name(scalarmul_scale_tid(ones_idx)))
             }
-            Some(other) => {
+            Some((other, _)) => {
                 return err(format!(
                     "{name}: the program states gain offset {other}, which is not a gain \
                      convention — `GainConvention::from_offset` admits 0.0 (Scale) and 1.0 \
@@ -8203,7 +8554,7 @@ pub fn windowed_rmsnorm(
             }
         }
     };
-    check_pointwise_cols(d, "WindowedRmsNorm", out.tid)?;
+    check_pointwise_cols(d, out.df, "WindowedRmsNorm", out.tid)?;
     let stk = crate::superdsc_opspec::Fp16::ELEMS_PER_STICK;
     let eps_const = crate::place::act_name(scalarmul_scale_tid(eps_idx));
     let x = tensors[0].name();
@@ -8429,7 +8780,7 @@ pub fn tanhsoftcap(
              (registry desync)"
         ),
     })?;
-    check_pointwise_cols(out.c_len, "TanhSoftCap", out.tid)?;
+    check_pointwise_cols(out.c_len, out.df, "TanhSoftCap", out.tid)?;
     let rows = node_rows(name, &out)?;
     let cols = out.c_len;
     let cap_const = crate::place::act_name(scalarmul_scale_tid(cap_idx));
@@ -8468,7 +8819,7 @@ pub fn scalarweightmul(
     let (tensors, out) = split_out(name, r, layout, 2)?;
     let rows = node_rows(name, &out)?;
     pointwise_extents_agree(name, Elementwise::Mul, &tensors[0..1], &out, rows)?;
-    check_pointwise_cols(out.c_len, "ScalarWeightMul", out.tid)?;
+    check_pointwise_cols(out.c_len, out.df, "ScalarWeightMul", out.tid)?;
     let cols = out.c_len;
     let x = tensors[0].name();
     let w = tensors[1].name();
@@ -8922,6 +9273,19 @@ fn scalarmul_scaled(
         skip.push(*tid);
     }
     let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
+    // ⛔ WALL 13 — THE MIXED-df PIN, SCALAR-OP SEAT: the tile input states the output's own df
+    // (the same law `elementwise` states for its operands). The BOUND `[1,1]` const rides the op
+    // and is emitted at the op's own df (`pointwise_tile_op`'s), so a tile at a different df
+    // would be the mixed op the DDL refuses at bake — refused here by name instead.
+    if ins[0].df != out.df {
+        return err(format!(
+            "{name}: input t{} states df {:?} but the output t{} states {:?} — a MIXED-df \
+             scalar op. The vocabulary requires the transition as an explicit \
+             `arith.extf`/`arith.truncf` (lowered as a convert with each side at its own df), so \
+             an uncast mixed op is a producer defect",
+            ins[0].tid, ins[0].df, out.tid, out.df
+        ));
+    }
     let scale_tid = match scale {
         ScaleSource::Registry { slot } => *slot,
         ScaleSource::Bound { tid } => *tid,
@@ -8969,8 +9333,11 @@ fn scalarmul_scaled(
     // the placement actually holds per row (the whole-view storage — a chunked piece's corner sits
     // past a piece-width declaration), and the op sweeps `cols` within it. The `[1,1]` scale keeps
     // `rbo`: one RedStick IS its whole swept window.
-    let x_h = rb(&x, rows, store_cols);
-    let out_h = rb(&out_name, rows, store_cols);
+    // ⭐ WALL 13 — the value handles at the op's own df (`rb` IS `rb_df(Fp16)`; an f32 scalar op
+    // must not understate its window 2×). The `[1,1]` scale keeps `rbo` — the scale slot's own
+    // word is the registry's business, not this handle's.
+    let x_h = rb_df(&x, rows, store_cols, out.df);
+    let out_h = rb_df(&out_name, rows, store_cols, out.df);
     let scale_h = rbo(&scale_name);
     // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
     // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
@@ -8995,7 +9362,7 @@ fn scalarmul_scaled(
     };
     // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
     // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
-    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2);
+    let mut tile_op = pointwise_tile_op(rows, cols, 1, 2, out.df);
     tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
     // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON ITS FIRST INPUT — not a different
     // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
@@ -9338,6 +9705,122 @@ pub(crate) fn nonstick_geometry(in_numel: u64, out_numel: u64, df: Df) -> Nonsti
 ///
 /// `attention_flash.py` and `swiglu_mlp.py` still pin `BLOCK_N = 64` — that is those kernels'
 /// own work-division choice (and the fixtures' correctness constraint), not a door law.
+/// ⭐⭐⭐⭐⭐ WALL 13's ISLAND — A DTYPE CAST AS A FIRST-CLASS CONVERT, over `[data, out]` regions.
+///
+/// The cast's whole purpose is to CHANGE df, so the (from, to) pair is a property of the op the
+/// walk read off its own operand/result types ([`super::whole_function::cast_of`]) and is stated
+/// HERE as a fact the door checks against — never re-derived, never defaulted. Only the closed
+/// inventory's fp16↔fp32 pair is admitted: `dl16tofp32` (`quantization_double_pad.ddl:58`) and
+/// `fp32todl16` (`:59`), the two opaques the DDL binds with input LX→SFP `vias=["pe"]`,
+/// `disable_transfer_promotion`, and exactly-one-valid. Every other transition is refused BY
+/// NAME — a convert that changes the wrong format is a silent byte re-interpretation, not a loud
+/// failure.
+///
+/// ⛔⛔ THE MIXED-df PIN, CONVERT SEAT (the auditor's law): the regions' OWN dfs must equal the
+/// pair the op stated — the input region at `from`, the output region at `to`. A mismatch is a
+/// producer defect (a value whose buffer holds a different format than its type says) and is
+/// refused by name. Together with the elementwise door's operand-df agreement this makes a
+/// mixed-df TTIR op UNEMITTABLE as one op: every df transition is one of these converts, so the
+/// DD2 mixed-op refusal ("Unsupported result precision conversion") is unreachable by our
+/// emission.
+///
+/// WHOLE-TENSOR ONLY, and that is stated rather than assumed: the shared body
+/// ([`super::assemble_convert`]) mints both operands at the buffer base, so a windowed or
+/// cornered convert is refused here by name instead of silently reading row 0 — the same
+/// contract [`base_addressed`] states for every other base-addressed body. (The column-window
+/// form exists — [`super::assemble_convert_col`] — and a producer that needs it states its
+/// corner through the nest the way the fp8 quant tail does.)
+pub fn convert(
+    name: &str,
+    from: Df,
+    to: Df,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let op_func = match (from, to) {
+        (Df::Fp16, Df::Fp32) => "dl16tofp32",
+        (Df::Fp32, Df::Fp16) => "fp32todl16",
+        _ => {
+            return err(format!(
+                "convert {name}: the format transition {from:?} → {to:?} is outside the closed \
+                 inventory — the vendor binds only the fp16↔fp32 pair (`dl16tofp32`/`fp32todl16`, \
+                 quantization_double_pad.ddl:58/:59), and routing any other transition through a \
+                 nearest-neighbor opfunc would silently re-interpret the value's bytes at the \
+                 wrong width"
+            ))
+        }
+    };
+    let (ins, out) = split_out(name, r, layout, 1)?;
+    let data = ins[0];
+    // ⛔ THE MIXED-df PIN, checked on what the regions STATE — never on what the op meant.
+    if data.df != from {
+        return err(format!(
+            "convert {name}: the input t{}'s region states df {:?} but the cast reads {:?} — the \
+             value's buffer holds a different format than its own type says, which is a producer \
+             defect, not a convert this door can emit. (The mixed-df law: a cast is the ONE op \
+             whose sides may differ, and it emits as this convert with each side at its own df.)",
+            data.tid, data.df, from
+        ));
+    }
+    if out.df != to {
+        return err(format!(
+            "convert {name}: the output t{}'s region states df {:?} but the cast writes {:?} — \
+             the value's buffer holds a different format than its own type says, which is a \
+             producer defect, not a convert this door can emit",
+            out.tid, out.df, to
+        ));
+    }
+    // ⭐ THE SWEEP IS THE OUTPUT's OWN VIEW (the whole-tensor law): a convert is shape-preserving,
+    // so the input's window must BE the output's — same rows, same columns, both corners at 0
+    // (the shared body mints at the buffer base; a corner it cannot place is a named refusal,
+    // never row 0 by default).
+    let rows = node_rows(name, &out)?;
+    if data.r_len != rows || data.c_len != out.c_len {
+        return err(format!(
+            "convert {name}: the input t{}'s window is `[{}, {}]` but the output t{}'s is \
+             `[{rows}, {}]` — a convert is shape-preserving, so the two windows must be the same",
+            data.tid, data.r_len, data.c_len, out.tid, out.c_len
+        ));
+    }
+    if data.r_start != 0 || data.c_start != 0 || out.r_start != 0 || out.c_start != 0 {
+        return err(format!(
+            "convert {name}: input t{} at corner ({}, {}) and output t{} at ({}, {}) — the \
+             shared convert body addresses both operands at the BUFFER BASE, so a window or \
+             corner it cannot place is refused here rather than silently reading row 0. A \
+             column-windowed convert states its corner through the nest the way the fp8 quant \
+             tail does (`assemble_convert_col`)",
+            data.tid, data.r_start, data.c_start, out.tid, out.r_start, out.c_start
+        ));
+    }
+    let cols = out.c_len;
+    if rows == 0 || cols == 0 {
+        return err(format!(
+            "convert {name}: t{} `[{rows}, {cols}]` — a convert needs a non-empty tile",
+            out.tid
+        ));
+    }
+    // The stick law at the WIDER format's basis is the shared body's own (`assert_df_stick_multiple`
+    // over the pair's wider stick — fp16↔fp32 keeps 64), so a sub-stick width refuses there with
+    // the typed message; nothing here re-states it.
+    let op_name = format!("{op_func}_o{}", out.tid);
+    // ⭐ EACH HANDLE AT ITS OWN df — the window mint prices bytes at the handle's word length, so
+    // the fp32 side must not be annotated at 2 bytes ([`rb_df`]'s own law, the fp8 activation's).
+    // The handles declare each region's OWN view (the storage the base-addressed body sweeps).
+    let in_h = rb_df(&data.name(), data.v_rows, data.v_cols, from);
+    let out_h = rb_df(&out.name(), out.v_rows, out.v_cols, to);
+    Ok(vec![assemble_convert(
+        &op_name,
+        op_func,
+        rows,
+        cols,
+        &in_h,
+        &out_h,
+        sym_id_base,
+        layout,
+    )])
+}
+
 pub fn reduce(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
@@ -9392,8 +9875,13 @@ pub fn reduce(
                         reduced_rows,
                         survivor_cols,
                         data.df,
-                        &rb(&data.name(), rows, cols),
-                        &rb(&out.name(), out.r_len, out.c_len),
+                        // ⭐ WALL 13 — each handle at its region's OWN df: the window mint prices
+                        // bytes at the handle's word length, so an f32 data tensor annotated at
+                        // fp16 would UNDERSTATE its access 2× and let a past-the-end read pass
+                        // the mint. `rb` IS `rb_df(Df::Fp16)`, so every f16 reduce is
+                        // byte-identical.
+                        &rb_df(&data.name(), rows, cols, data.df),
+                        &rb_df(&out.name(), out.r_len, out.c_len, out.df),
                         sym_id_base,
                         layout,
                     ),

@@ -155,7 +155,13 @@ def batched_decode_hm(desc_q, desc_o,  #
     rep_ids = rep_ids_desc.load([0])                    # [BATCH*GQA] i32
     q = tl.reshape(q_desc.gather(rep_ids, 0), [BATCH, GQA, HD])
     m = tl.full([BATCH, GQA], -65504.0, tl.float32)
-    l = tl.zeros([BATCH, GQA], tl.float16)
+    # ⭐ THE DENOMINATOR IS f32, LIKE THE MAX IT PAIRS WITH (wall 13): the same
+    # per-trip recurrence updates `m` and `l`, so an f16 `l` rounds every
+    # rescale at 2⁻¹¹ while its twin keeps f32 bits, and the final `acc / l`
+    # divides an f32-graded sum by a coarser-graded one. `o`'s landing stays
+    # f16 (the store's own dtype); only the carry widens. (Same law as
+    # `batched_prefill.py`'s carry.)
+    l = tl.zeros([BATCH, GQA], tl.float32)
     acc = tl.zeros([BATCH, GQA, HD], tl.float16)
 
     for c in tl.static_range(NUM_CHUNKS):
@@ -203,5 +209,5 @@ def batched_decode_hm(desc_q, desc_o,  #
     w = tl.math.exp2(mm - merged[None, :, :]).to(tl.float16)
     l = tl.sum(w * lm, 0)
     acc = tl.sum(w[:, :, :, None] * am, 0)                  # [B*NKVH, GQA, HD]
-    o = acc / l[:, :, None]
+    o = (acc / l[:, :, None]).to(tl.float16)
     o_desc.store([0, 0], tl.reshape(o, [NUM_SEQS * NKVH * GQA, HD]))

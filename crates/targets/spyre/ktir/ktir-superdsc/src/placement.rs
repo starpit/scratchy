@@ -275,6 +275,16 @@ pub struct BundleLayout {
     /// fold, no host-route — the op is a real on-device pointwise `mul`).
     #[serde(default)]
     pub scalarmul_scales: Vec<f32>,
+    /// ⭐ THE SCALE REGISTRY'S FORMAT COLUMN — `scalarmul_scales[i]`'s own `df`, parallel by
+    /// construction. The PAYLOAD half (the census) is all `Fp16`, the staging-twin law: the
+    /// value the card applies is `f16(v)`, written by the existing `[1,1]` const fill. The
+    /// PROGRAM-STATED half carries the element type each constant's own `tensor.splat` states
+    /// (`Fp32` for the f32 m-merge's constants), appended by the completion pass in the same
+    /// bits-sorted order the values are. The runtime reads this column to pick each slot's
+    /// staging channel — f16 fill vs raw f32 word — so it is baked into the artifact beside the
+    /// values, never re-derived on the host.
+    #[serde(default)]
+    pub scalarmul_scales_df: Vec<Df>,
     /// ⭐ THE WEIGHT FOLDS — `(weight tensor id, multiplier)`, one per fold the producer half
     /// recognized, of EITHER kind: a `ScalarMul` multiplier scaling a MATMUL's whole, unshared
     /// output (`scalar_mul_weight_folds`), or an attention's `√scale` scaling its `W_q`/`W_k`
