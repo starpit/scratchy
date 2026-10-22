@@ -437,9 +437,39 @@ pub fn ladder_stages_one_layout(ceiling: &BundleLayout, rung: &BundleLayout) -> 
             format!("first difference (tid, seg, offset, size): ceiling {a:?} vs rung {b:?}")
         })
         .unwrap_or_else(|| format!("{} vs {} staged activation(s)", c.len(), r.len()));
+    // ⭐ THE REFUSAL CARRIES ITS OWN EVIDENCE. The lists are the whole story — a positional
+    // zip over tid-sorted tuples can only say WHICH entry moved, and the walk order that
+    // assigned the offsets is not recoverable from the first difference alone. Every staged
+    // activation of BOTH layouts, plus the step-input discovery table (the slot identities
+    // behind the tids) and the activation segment's high-water: one refusal, everything a
+    // fix needs, no second build to gather it.
+    let show = |rows: &[(u32, usize, u64, u64)]| {
+        rows.iter()
+            .map(|(tid, seg, off, size)| format!("t{tid}:s{seg}@{off}+{size}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let steps = |l: &BundleLayout| {
+        l.step_inputs
+            .iter()
+            .map(|(tid, row)| format!("t{tid}=slot{}:{:?}", row.slot, row.df))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let act_seg = SegRole::Activation.segment();
     Err(format!(
         "a ladder rung places a host-staged activation apart from its ceiling — the host stages the \
-         ceiling's placements, so the rung would read bytes nobody wrote: {first}"
+         ceiling's placements, so the rung would read bytes nobody wrote: {first}\n  ceiling \
+         staged ({}): {}\n  rung staged ({}): {}\n  ceiling step inputs: {}\n  rung step inputs: \
+         {}\n  activation-segment high-water: ceiling {} B vs rung {} B",
+        c.len(),
+        show(&c),
+        r.len(),
+        show(&r),
+        steps(ceiling),
+        steps(rung),
+        ceiling.segment_bytes[act_seg],
+        rung.segment_bytes[act_seg],
     ))
 }
 
