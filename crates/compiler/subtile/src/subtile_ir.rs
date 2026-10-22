@@ -1349,14 +1349,15 @@ pub enum SubOp<F: RopeForm = NeoX, S: OpStage = Tiled> {
     // ── The greedy token pick (see `kernels/argmax.py`) ─────────────
     /// The FIRST-maximum index of one logits row, as the `[1, BLOCK]` i32 idx
     /// stick the device's index ingestion reads. `inputs` = `[logits, bramp,
-    /// lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc]`: the `[1,
-    /// PAD_V]` fp16 row
+    /// lramp, binc, linc, ones, sixtyfour, vbound, padoff, gramp, ginc,
+    /// table, rowidx, embed-row-slot]`: the `[1, PAD_V]` fp16 row
     /// (whose pad bytes are NOT this op's contract — the lm-head's zero-pad
-    /// columns write 0.0 there every step) then the nine staged tables,
+    /// columns write 0.0 there every step) then the ten staged tables,
     /// functions of `vocab` alone, constant across decode steps — the two
     /// decreasing ramps that make the maxima first-max by monotonicity, the
-    /// two increasing index tables that read the selection back out, the two
-    /// widen tables that keep every broadcast a two-tensor multiply, the
+    /// two increasing index tables that read the selection back out, the
+    /// widen tables that keep every broadcast a two-tensor multiply, the V
+    /// BOUND the row-feedback clamp reads, and the
     /// OFFSET row that carries the pad law (0.0 on the real lanes, −inf on
     /// the pads; the kernel adds it before its first max, so a pad lane can
     /// never win and an all-−inf row still answers lane 0), and the
@@ -1468,7 +1469,7 @@ impl<F: RopeForm> SubtileIR<F> {
 
 // ── The greedy token pick's mint (see `kernels/argmax.py`) ────────
 
-/// What [`mint_argmax`] inserted, for the caller's bake log.
+/// What [`mint_argmax`] inserted, for the caller's bake log and the wiring's own facts.
 #[derive(Clone, Copy, Debug)]
 pub struct ArgmaxMint {
     /// The EMITTED vocab — the result row's own width, the sentinel threshold
@@ -1477,12 +1478,23 @@ pub struct ArgmaxMint {
     /// `argmax_pad_vocab(vocab)` — the width the result row was widened to and
     /// the seven whole-row tables share.
     pub pad_vocab: u32,
+    /// The ROW-FEEDBACK TABLE's source id — `[vocab+1, hidden]`, the
+    /// device-encoded embedding rows plus the pad row. NOT a load-const: the
+    /// worker stages it at load from the model's own embedding mirror (a
+    /// runtime-fed fact the wiring carries by tid, never as baked bytes — a
+    /// vocabulary of rows is not a compile-time constant).
+    pub table: TensorId,
+    /// The CLAMPED-INDEX STICK's source id — `[1, BLOCK]` i32 device scratch
+    /// the kernel itself writes and reads back (the gather's own twin of the
+    /// answer stick). Staged by no one: written before read, inside the kernel.
+    pub rowidx: TensorId,
 }
 
-/// Append the greedy token pick to a ONE-REQUEST decode graph: nine staged-table
-/// sources, the result tail chain's tensors widened to `[1, PAD_V]`, the
-/// `ArgMax` node reading the whole widened row, and the graph's RESULT re-pointed
-/// to the node's idx stick. Pure graph surgery — the GATE
+/// Append the greedy token pick — with its loop-closing row feedback (#603 PR3b) —
+/// to a ONE-REQUEST decode graph: ten staged-table sources, the row-feedback
+/// table and clamped-index stick, the result tail chain's tensors widened to
+/// `[1, PAD_V]`, the `ArgMax` node reading the whole widened row, and the graph's
+/// RESULT re-pointed to the node's idx stick. Pure graph surgery — the GATE
 /// (which rungs mint) is the caller's fact; this fn states only its own
 /// invariants and panics on their violation, which at expansion time is a build
 /// error, never a runtime one.
@@ -1497,15 +1509,35 @@ pub struct ArgmaxMint {
 /// contract's redirect of the ANSWER, never a removal of the row it was picked
 /// from (the wiring's own doc records this contract).
 ///
-/// ⭐ THE NINE SOURCES ARE INSERTED AT `[num_sources, num_sources+9)`, NOT APPENDED:
-/// sources must hold `tensors[0..num_sources]`, so the insert renumbers every
-/// op-output `TensorId` up by nine — nodes' input/output regions, `op_output`, and
-/// `result` (validate demands the result is an op output, so it always moves).
-/// Source ids below the old `num_sources` are UNTOUCHED, which is what keeps the
-/// caller's `weight_ids` and the wiring's binding scan valid against the minted
-/// graph. The tables carry NO `SourceBinding`: they are minted below the
-/// `LoweredDecode` layer and named to the worker through the wiring's own argmax
-/// facts (the `embed_src` law: the answer, not the data to compute it from).
+/// ⭐ THE TWELVE SOURCES ARE INSERTED AT `[num_sources, num_sources+12)`, NOT
+/// APPENDED: sources must hold `tensors[0..num_sources]`, so the insert
+/// renumbers every op-output `TensorId` up by twelve — nodes' input/output
+/// regions, `op_output`, and `result` (validate demands the result is an op
+/// output, so it always moves). Source ids below the old `num_sources` are
+/// UNTOUCHED, which is what keeps the caller's `weight_ids` and the wiring's
+/// binding scan valid against the minted graph. The first ten are the STAGED
+/// TABLES (constant functions of the vocab alone, staged once at load through
+/// the wiring's load-const list); the eleventh is the ROW-FEEDBACK TABLE and
+/// the twelfth the CLAMPED-INDEX STICK — minted sources
+/// with NO load-const (the table is runtime-fed from the model's embedding
+/// mirror; the stick is the kernel's own scratch). All carry NO `SourceBinding`:
+/// they are minted below the `LoweredDecode` layer and named to the worker
+/// through the wiring's own argmax facts (the `embed_src` law: the answer, not
+/// the data to compute it from).
+///
+/// ⭐ THE ROW SLOT IS THE CALLER'S OWN SOURCE, NOT A MINTED ONE — `embed_src`
+/// names the graph's `EmbeddedHidden` source (the `[1, hidden]` row the host
+/// stages per step today), and the node's LAST input is that source's whole
+/// region. The kernel's gathered copy writes the next step's row INTO IT: the
+/// row slot is where the per-step staging already lands, so the device image the
+/// gather must reproduce is the one that source already has — ONE SEN f16 per
+/// f32 value (the staging narrows; it does not double), i.e. `W = hidden` f16
+/// elements, the row tensor's own column count. The table is minted at
+/// `[vocab+1, hidden]` — the SAME width, one row per token plus the PAD ROW at
+/// index `vocab` the sentinel clamp lands on — so a gathered row and a
+/// host-staged row are the same bytes by construction (same elementwise
+/// f32→SEN-f16 conversion, run once over the whole mirror at load instead of
+/// once per step).
 ///
 /// ⭐ THE WHOLE TAIL CHAIN IS WIDENED, NOT THE RESULT ALONE: the tail's writers are
 /// column-CHUNKED at production `nb` (granite's vocab 49155 is seven chunks), and
@@ -1517,7 +1549,7 @@ pub struct ArgmaxMint {
 /// else panics — the admission gate already refused it, so the mint was called
 /// outside its gate). Every writer keeps its own region — `[0, vocab)` exactly as
 /// before — so the pad tail `[vocab, PAD_V)` is written by no node below, and no
-/// staging covers it either: the pad law rides the OFFSET row (the seventh
+/// staging covers it either: the pad law rides the OFFSET row (the eighth
 /// staged table), which the kernel adds to the row before its first max, so the
 /// tail's raw bytes (the lm-head's zero-pad 0.0 columns) never reach a max.
 ///
@@ -1525,22 +1557,39 @@ pub struct ArgmaxMint {
 /// its graph (and its bundle's seg4) carries the padded row — batch and prefill
 /// rungs keep the vocab-wide row and the host readback, and the decode wiring
 /// slot is the single-request graph's by construction.
-pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
+pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>, embed_src: TensorId) -> ArgmaxMint {
     let rows = graph.tensors[graph.result.index()].rows;
     assert!(
         rows == 1,
         "the device argmax serves ONE request's row (the one-request rung); this \
          graph's result tensor has {rows} rows"
     );
+    assert!(
+        embed_src.0 < graph.num_sources,
+        "the device argmax's row slot must be one of the graph's own sources (the \
+         EmbeddedHidden row the host stages per step) — t{embed_src:?} is not a source"
+    );
+    let slot = graph.tensors[embed_src.index()];
+    assert!(
+        slot.rows == 1,
+        "the device argmax's row slot is ONE request's row; the embed source t{} \
+         holds {} rows",
+        embed_src.0,
+        slot.rows
+    );
+    let hidden = slot.cols;
     let vocab = graph.tensors[graph.result.index()].cols;
     let pad_vocab = argmax_pad_vocab(vocab);
-    // The nine staged tables, in the kernel's operand order: the two decreasing
+    // The TEN staged tables, in the kernel's operand order: the two decreasing
     // ramps and the two increasing index tables (whole-row `[1, PAD_V]`), the
-    // two per-lane widen tables (`[1, BLOCK]`), the pad law's offset row
-    // (whole-row `[1, PAD_V]`), then the two-level ramp's group pair — the
-    // group ramp and the group index table (whole-row `[1, PAD_V]`, the LAST
-    // operands before the output). The array's LENGTH is the single derivation
-    // of the renumber shift below.
+    // two per-lane widen tables (`[1, BLOCK]`), the clamp's V-bound table
+    // (`[1, BLOCK]`, the row feedback's own — f32, the island's dtype), the
+    // pad law's offset row (whole-row `[1, PAD_V]`), then the two-level ramp's
+    // group pair — the group ramp and the group index table (whole-row
+    // `[1, PAD_V]`, the LAST staged operands). After them, the two minted
+    // non-staged sources: the row-feedback table `[vocab+1, hidden]` and the
+    // clamped-index stick `[1, BLOCK]`. The array's LENGTH is the single
+    // derivation of the renumber shift below.
     let tables = [
         TensorShape {
             rows: 1,
@@ -1568,7 +1617,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
         },
         TensorShape {
             rows: 1,
-            cols: pad_vocab,
+            cols: ARGMAX_BLOCK,
         },
         TensorShape {
             rows: 1,
@@ -1577,6 +1626,18 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
         TensorShape {
             rows: 1,
             cols: pad_vocab,
+        },
+        TensorShape {
+            rows: 1,
+            cols: pad_vocab,
+        },
+        TensorShape {
+            rows: vocab + 1,
+            cols: hidden,
+        },
+        TensorShape {
+            rows: 1,
+            cols: ARGMAX_BLOCK,
         },
     ];
     let shift = tables.len() as u32;
@@ -1602,7 +1663,7 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
     if graph.result.0 >= n_src {
         graph.result.0 += shift;
     }
-    // 2) Insert the nine sources and widen the RESULT TAIL CHAIN to the padded
+    // 2) Insert the twelve sources and widen the RESULT TAIL CHAIN to the padded
     //    width — the whole chain, per the mint's own law above.
     graph.tensors.splice(n_src as usize..n_src as usize, tables);
     graph.num_sources += shift;
@@ -1627,7 +1688,9 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
         }
     }
     // 3) The idx stick's op-output tensor, then the node reading the whole
-    // widened row and the nine whole tables.
+    //    widened row, the ten whole staged tables, the row-feedback table
+    //    (whole — ALL vocab+1 rows; the gather's clamp picks the row), the
+    //    clamped-index stick, and the caller's own embed row slot.
     let idx = TensorId(graph.tensors.len() as u32);
     graph.tensors.push(TensorShape {
         rows: 1,
@@ -1640,11 +1703,22 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
             cols: Range::new(0, graph.tensors[t.index()].cols),
         },
     };
-    let mut inputs = Vec::with_capacity(10);
+    let table_tid = TensorId(n_src + 10);
+    let rowidx_tid = TensorId(n_src + 11);
+    let mut inputs = Vec::with_capacity(14);
     inputs.push(whole(graph.result));
-    for s in n_src..graph.num_sources {
+    for s in n_src..n_src + 10 {
         inputs.push(whole(TensorId(s)));
     }
+    inputs.push(TensorRegion {
+        tensor: table_tid,
+        region: Region {
+            rows: Range::new(0, graph.tensors[table_tid.index()].rows),
+            cols: Range::new(0, graph.tensors[table_tid.index()].cols),
+        },
+    });
+    inputs.push(whole(rowidx_tid));
+    inputs.push(whole(embed_src));
     graph.nodes.push(SubtileNode {
         id: SubtileId(graph.nodes.len() as u32),
         op: SubOp::ArgMax { vocab },
@@ -1655,7 +1729,12 @@ pub fn mint_argmax<F: RopeForm>(graph: &mut SubtileIR<F>) -> ArgmaxMint {
     //    the result is an op output — the ArgMax node's output qualifies, and
     //    the row keeps its own placement and its own readers either way.
     graph.result = idx;
-    ArgmaxMint { vocab, pad_vocab }
+    ArgmaxMint {
+        vocab,
+        pad_vocab,
+        table: table_tid,
+        rowidx: rowidx_tid,
+    }
 }
 
 // ── Host evaluation ────────────────────────────────────────────────
@@ -4126,26 +4205,33 @@ mod tests {
         assert!(validate(&bad).is_err(), "use-before-def must be rejected");
     }
 
-    /// ⭐ THE ARGMAX MINT'S SURGERY, stated as the graph's own invariants: nine table
-    /// sources INSERTED at `[num_sources, num_sources+9)` (so sources still hold
-    /// `tensors[0..num_sources]`), every op-output tid — the result included —
-    /// renumbered up by nine while the source ids below the old `num_sources` stay
-    /// UNTOUCHED (what keeps the caller's `weight_ids` and the wiring's binding scan
-    /// valid against the minted graph), the result row widened to PAD_V with the
-    /// per-step writer still covering `[0, vocab)` only (the pad tail is written by
-    /// no node and staged by no one — the pad law rides the OFFSET row, the seventh
-    /// table), and the `[1, 64]` idx
-    /// stick appended with the ArgMax node reading whole regions at corner 0. What
-    /// the wiring's guard and the splice's lower both consume; pinned here so a
-    /// surgery regression is a test failure, not a card divergence.
+    /// ⭐ THE ARGMAX MINT'S SURGERY, stated as the graph's own invariants: twelve
+    /// sources INSERTED at `[num_sources, num_sources+12)` (so sources still hold
+    /// `tensors[0..num_sources]`) — the ten staged tables, then the
+    /// row-feedback table and the clamped-index stick — with every op-output
+    /// tid — the result included — renumbered up by twelve while the source ids
+    /// below the old `num_sources` stay UNTOUCHED (what keeps the caller's
+    /// `weight_ids` and the wiring's binding scan valid against the minted
+    /// graph), the result row widened to PAD_V with the per-step writer still
+    /// covering `[0, vocab)` only (the pad tail is written by no node and staged
+    /// by no one — the pad law rides the OFFSET row, the eighth staged table),
+    /// and the `[1, 64]` idx stick appended with the ArgMax node reading whole
+    /// regions at corner 0 — the row-feedback table's region whole over ALL its
+    /// rows, the row slot the CALLER's own embed source. What the wiring's guard
+    /// and the splice's lower both consume; pinned here so a surgery regression
+    /// is a test failure, not a card divergence.
     #[test]
-    fn the_argmax_mint_inserts_nine_tables_and_renumbers_the_op_outputs() {
+    fn the_argmax_mint_inserts_twelve_sources_and_renumbers_the_op_outputs() {
         let nz = |k| std::num::NonZeroU32::new(k).unwrap();
         let input = crate::lower::LoweringInput {
             exported: None,
             sources: vec![
                 SourceShape { rows: 1, cols: 1 },
                 SourceShape { rows: 1, cols: 5 },
+                // The embed row slot: the caller's own source the gathered row
+                // lands in. cols 3 — DISTINCT from every minted width, so a
+                // shape assertion that names the wrong source fails loudly.
+                SourceShape { rows: 1, cols: 3 },
             ],
             ops: vec![OpDesc {
                 op: SubOp::MatmulTile {
@@ -4159,57 +4245,79 @@ mod tests {
         };
         let mut g = lower_region(&input, nz(64));
         assert_eq!(
-            g.num_sources, 2,
-            "the fixture is two sources + one op output"
+            g.num_sources, 3,
+            "the fixture is three sources + one op output"
         );
-        let minted = mint_argmax(&mut g);
+        let minted = mint_argmax(&mut g, TensorId(2));
         assert_eq!((minted.vocab, minted.pad_vocab), (5, 8));
-
-        // The nine sources hold [2, 11); the old op output moved 2 -> 11; the
-        // stick is 12.
-        assert_eq!(g.num_sources, 11, "nine table sources were inserted");
+        assert_eq!(minted.table, TensorId(13), "the row-feedback table source");
         assert_eq!(
-            g.result.0, 12,
+            minted.rowidx,
+            TensorId(14),
+            "the clamped-index stick source"
+        );
+
+        // The twelve sources hold [3, 15); the old op output moved 3 -> 15; the
+        // stick is 16.
+        assert_eq!(g.num_sources, 15, "twelve sources were inserted");
+        assert_eq!(
+            g.result.0, 16,
             "the answer re-point: the rung's result is the idx stick"
         );
         assert_eq!(
             g.op_output,
-            vec![TensorId(11)],
+            vec![TensorId(15)],
             "op_output moved with it (the ROW, still placed and readable by tid)"
         );
         assert_eq!(
-            (g.tensors[11].rows, g.tensors[11].cols),
+            (g.tensors[15].rows, g.tensors[15].cols),
             (1, 8),
             "the result row is widened to PAD_V"
         );
         assert_eq!(
-            (g.tensors[12].rows, g.tensors[12].cols),
+            (g.tensors[16].rows, g.tensors[16].cols),
             (1, ARGMAX_BLOCK),
             "the idx stick"
         );
         for (t, cols) in [
-            (2, 8),
             (3, 8),
             (4, 8),
             (5, 8),
-            (6, ARGMAX_BLOCK),
+            (6, 8),
             (7, ARGMAX_BLOCK),
-            (8, 8),
-            (9, 8),
+            (8, ARGMAX_BLOCK),
+            (9, ARGMAX_BLOCK),
             (10, 8),
+            (11, 8),
+            (12, 8),
         ] {
             assert_eq!(
                 (g.tensors[t].rows, g.tensors[t].cols),
                 (1, cols),
-                "table source {t}"
+                "staged table source {t}"
             );
         }
+        // The row-feedback table: [vocab+1, hidden] — the pad row included, the
+        // row slot's OWN width (one SEN f16 per f32 value; the staging narrows,
+        // it does not double).
+        assert_eq!(
+            (g.tensors[13].rows, g.tensors[13].cols),
+            (6, 3),
+            "the row-feedback table is [vocab+1, hidden]"
+        );
+        assert_eq!(
+            (g.tensors[14].rows, g.tensors[14].cols),
+            (1, ARGMAX_BLOCK),
+            "the clamped-index stick"
+        );
         // Source ids below the old num_sources are untouched.
         assert_eq!((g.tensors[0].rows, g.tensors[0].cols), (1, 1));
         assert_eq!((g.tensors[1].rows, g.tensors[1].cols), (1, 5));
+        assert_eq!((g.tensors[2].rows, g.tensors[2].cols), (1, 3));
 
-        // The node: whole regions at corner 0, the widened row first, the nine
-        // tables in operand order, the stick out.
+        // The node: whole regions at corner 0, the widened row first, the ten
+        // tables in operand order, the table, the stick, the embed row slot,
+        // the idx stick out.
         let node = g.nodes.last().unwrap();
         assert!(
             matches!(node.op, SubOp::ArgMax { vocab: 5 }),
@@ -4218,10 +4326,10 @@ mod tests {
         let tids = node.inputs.iter().map(|tr| tr.tensor.0).collect::<Vec<_>>();
         assert_eq!(
             tids,
-            vec![11, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            "the row first, then the nine tables in operand order"
+            vec![15, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 2],
+            "the row first, the ten tables, the table, the idx stick, the row slot"
         );
-        assert_eq!(node.output.tensor.0, 12);
+        assert_eq!(node.output.tensor.0, 16);
         assert_eq!(
             node.output.tensor, g.result,
             "the stick is the graph result"
@@ -4234,14 +4342,19 @@ mod tests {
                     tr.region.cols.start,
                     tr.region.cols.len
                 ),
-                (0, 1, 0, g.tensors[tr.tensor.0 as usize].cols),
-                "whole region at corner 0"
+                (
+                    0,
+                    g.tensors[tr.tensor.0 as usize].rows,
+                    0,
+                    g.tensors[tr.tensor.0 as usize].cols
+                ),
+                "whole region at corner 0 — the table's over ALL its rows"
             );
         }
         // The matmul's writer region still covers [0, vocab) — the widening adds an
         // unwritten tail, never a wider writer.
         let matmul = &g.nodes[0];
-        assert_eq!(matmul.output.tensor.0, 11);
+        assert_eq!(matmul.output.tensor.0, 15);
         assert_eq!(
             matmul.output.region.cols.len, 5,
             "the per-step writer keeps writing [0, vocab)"
@@ -4268,6 +4381,9 @@ mod tests {
                 sources: vec![
                     SourceShape { rows: 1, cols: 1 },
                     SourceShape { rows: 1, cols: 5 },
+                    // The embed row slot — a distinct width so a wrong-source
+                    // read fails loudly.
+                    SourceShape { rows: 1, cols: 3 },
                 ],
                 ops: vec![OpDesc {
                     op: SubOp::MatmulTile {
@@ -4280,19 +4396,24 @@ mod tests {
                 result: 0,
             };
             let mut g = lower_region(&input, nz(64));
-            mint_argmax(&mut g);
-            // The nine tables are the WORKER's load-time staging, not the host
-            // reference's (eval gathers inputs[0] only) — but eval_dag sizes every
-            // source buffer, so they ride as zeros.
+            mint_argmax(&mut g, TensorId(2));
+            // The twelve minted sources are the WORKER's load-time staging (and
+            // the gather's table/scratch), not the host reference's (eval
+            // gathers the logits row only) — but eval_dag sizes every source
+            // buffer, so they ride as zeros.
             let pad = argmax_pad_vocab(5) as usize;
             let tables: Vec<Vec<f32>> = (0..4)
                 .map(|_| vec![0.0; pad])
-                .chain((0..2).map(|_| vec![0.0; ARGMAX_BLOCK as usize]))
+                .chain((0..3).map(|_| vec![0.0; ARGMAX_BLOCK as usize]))
                 .chain((0..3).map(|_| vec![0.0; pad]))
+                .chain(std::iter::once(vec![0.0; 6 * 3]))
+                .chain(std::iter::once(vec![0.0; ARGMAX_BLOCK as usize]))
                 .collect();
             let act = [1.0f32];
+            let emb = [0.0f32; 3];
             let srcs: Vec<&[f32]> = std::iter::once(&act[..])
                 .chain(std::iter::once(&w0[..]))
+                .chain(std::iter::once(&emb[..]))
                 .chain(tables.iter().map(|t| &t[..]))
                 .collect();
             let bufs = eval_dag(&g, &srcs);
@@ -4347,6 +4468,7 @@ mod tests {
             sources: vec![
                 SourceShape { rows: 1, cols: 1 },
                 SourceShape { rows: 1, cols: 5 },
+                SourceShape { rows: 1, cols: 3 },
             ],
             ops: vec![
                 OpDesc {
@@ -4367,11 +4489,12 @@ mod tests {
         };
         let mut g = lower_region(&input, nz(64));
         let n_src = g.num_sources;
-        mint_argmax(&mut g);
+        mint_argmax(&mut g, TensorId(2));
 
-        // The matmul's output (tid n_src, renumbered up by nine) AND the ScalarMul's
-        // result are BOTH [1, PAD_V] now — the epilogue's chunks cannot disagree.
-        let matmul_out = TensorId(n_src + 9);
+        // The matmul's output (tid n_src, renumbered up by twelve) AND the
+        // ScalarMul's result are BOTH [1, PAD_V] now — the epilogue's chunks
+        // cannot disagree.
+        let matmul_out = TensorId(n_src + 12);
         let row = g.nodes.last().unwrap().inputs[0].tensor;
         assert_ne!(matmul_out, row, "the fixture is a two-link tail");
         assert_eq!(

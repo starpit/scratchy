@@ -4264,7 +4264,11 @@ fn gathered_store_copy(
             "{}: the index buffer t{} states a [{}, {}] view — {idx_len} index(es) — while this \
              copy's run gathers {rows} row(s) at entry {}. The idx→address program converts one \
              entry per gathered row, so a run past the buffer's end reads whatever is placed next.",
-            f.name, g.index_tid, idx_r.v_rows, idx_r.v_cols, g.first_entry.entries(),
+            f.name,
+            g.index_tid,
+            idx_r.v_rows,
+            idx_r.v_cols,
+            g.first_entry.entries(),
         ));
     }
     // ⛔ THE ROWS' FORMAT — fp16/fp32 only, the pointwise stick basis the identity gather states.

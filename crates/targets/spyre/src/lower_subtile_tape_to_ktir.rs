@@ -1301,6 +1301,17 @@ pub struct BundleWiring {
     /// attention classes states its set here the day it lands (the registry row already exists).
     pub rope_class_hds: Vec<u32>,
     pub attn_class_hds: Vec<u32>,
+    /// ⭐ THE ARGMAX ROW-FEEDBACK FACTS — the two minted sources the greedy
+    /// pick's gather rides that are NEVER load-consts: the ROW-FEEDBACK TABLE
+    /// `[vocab+1, hidden]` (runtime-fed at load from the model's own embedding
+    /// mirror — the wiring carries the TID as a fact, never as baked bytes; a
+    /// vocabulary of rows is not a compile-time constant) and the
+    /// CLAMPED-INDEX STICK `[1, BLOCK]` (the kernel's own device scratch:
+    /// written before read, inside the kernel, staged by no one). `None` on a
+    /// graph with no minted argmax — the host readback path, unchanged. The
+    /// one-mint law is [`load_consts_of_ir`]'s own: the same node states both
+    /// lists, so the two derivations cannot disagree about which node minted.
+    pub argmax_row_feedback: Option<(u32, u32)>,
     /// ⭐ THE LOAD-TIME CONSTANTS — `(tid, kind)` for every resident buffer this
     /// graph's own producer minted below the `SourceBinding` layer, derived by
     /// [`load_consts_of_ir`] (the one derivation; the bake's numeric gate reads
@@ -1514,6 +1525,9 @@ pub fn graph_wiring<F: RopeForm>(
         rope_class_hds: registries.rope_class_hds,
         attn_class_hds: registries.attn_class_hds,
         load_consts: registries.load_consts,
+        // ⭐ The row-feedback pair, off the SAME minted node the load-const list
+        // reads — the one-mint law, so the two facts name the same mint.
+        argmax_row_feedback: argmax_row_feedback_of_ir(ir)?,
     })
 }
 
@@ -1632,11 +1646,16 @@ fn result_tail_lm_head<F: RopeForm>(ir: &SubtileIR<F>) -> Option<&SubtileNode<F>
 pub fn load_consts_of_ir<F: RopeForm>(
     ir: &SubtileIR<F>,
 ) -> Result<Vec<(u32, crate::wiring::LoadConst)>, SuperDscError> {
-    // ⭐ THE DEVICE ARGMAX'S MINT — the seven operand tables (functions of the
+    // ⭐ THE DEVICE ARGMAX'S MINT — the ten operand tables (functions of the
     // vocab alone, built by the shared `argmax_staged_tables` derivation the
-    // kind names; the seventh is the pad law's offset row, which the kernel
+    // kind names; the seventh is the clamp's V bound, the eighth the pad law's
+    // offset row, which the kernel
     // adds to the logits row before its first max — the row's own pad bytes
-    // are never its contract).
+    // are never its contract — and the ninth and tenth the two-level ramp's
+    // group pair). The
+    // row-feedback table, the clamped-index stick, and the embed row slot
+    // ride OTHER channels (worker load-time staging and runtime binds) —
+    // they are never load-consts.
     let mut mints = ir
         .nodes
         .iter()
@@ -1654,10 +1673,11 @@ pub fn load_consts_of_ir<F: RopeForm>(
             };
             assert_eq!(
                 node.inputs.len(),
-                10,
-                "the ArgMax node's arity is the registry's own row (logits + nine tables)"
+                14,
+                "the ArgMax node's arity is the registry's own row \
+                 (logits + ten tables + the row-feedback triple + the row slot)"
             );
-            Ok(node.inputs[1..]
+            Ok(node.inputs[1..11]
                 .iter()
                 .enumerate()
                 .map(|(i, tr)| {
@@ -1670,6 +1690,51 @@ pub fn load_consts_of_ir<F: RopeForm>(
                     )
                 })
                 .collect())
+        }
+    }
+}
+
+/// ⭐ THE ARGMAX ROW-FEEDBACK FACTS — `(table tid, clamped-index-stick tid)`
+/// for the one minted [`SubOp::ArgMax`] node, `None` when the graph mints no
+/// argmax (the host readback path). The table is the worker's RUNTIME-FED
+/// fact (staged at load from the model's embedding mirror, never baked
+/// bytes); the stick is the kernel's OWN scratch (written before read, staged
+/// by no one). Both are minted sources with NO `SourceBinding` and NO
+/// load-const — the wiring's guard knows them by THIS list, so a source the
+/// gather needs can never be silently unfilled. The one-mint law is
+/// [`load_consts_of_ir`]'s own: the same node states both lists.
+pub fn argmax_row_feedback_of_ir<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Option<(u32, u32)>, SuperDscError> {
+    let mut mints = ir
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, SubOp::ArgMax { .. }));
+    match (mints.next(), mints.next()) {
+        (None, _) => Ok(None),
+        (Some(_), Some(_)) => Err(SuperDscError(
+            "two ArgMax nodes in one graph — the mint appends exactly one to the one-request \
+             rung; a second means two mints ran over one graph"
+                .to_string(),
+        )),
+        (Some(node), None) => {
+            let need = |i: usize, what: &str| -> Result<u32, SuperDscError> {
+                node.inputs
+                    .get(i)
+                    .map(|tr| tr.tensor.index() as u32)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "the ArgMax node carries {} input(s) — the registry's own row is 14 \
+                             (logits + ten tables + the row-feedback triple + the row slot); \
+                             {what} is missing",
+                            node.inputs.len()
+                        ))
+                    })
+            };
+            Ok(Some((
+                need(11, "the row-feedback table")?,
+                need(12, "the clamped-index stick")?,
+            )))
         }
     }
 }

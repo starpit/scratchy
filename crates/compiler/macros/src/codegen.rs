@@ -9320,6 +9320,16 @@ fn emit_superdsc_wiring(
                 if gk.load_consts.iter().any(|&(tid, _)| tid == id) {
                     continue;
                 }
+                // ⭐ THE ARGMAX ROW-FEEDBACK PAIR — the same mint's two
+                // runtime-fed facts: the row-feedback table (the worker stages
+                // it at load from the model's embedding mirror, through the
+                // weight channel — a fact the wiring carries by tid) and the
+                // clamped-index stick (the kernel's OWN scratch, written
+                // before read, staged by no one). Named by the same
+                // single-mint derivation the load-const list reads.
+                if matches!(gk.argmax_row_feedback, Some((t, s)) if t == id || s == id) {
+                    continue;
+                }
                 fail.push(format!(
                     "source t{id} is inside `num_sources` but has NO binding — nothing fills it"
                 ));
@@ -11052,22 +11062,41 @@ fn dump_wavefront_mega(
                 // lm-head the emitted tail admits (arity-2 Dense fp16 — the ruling's
                 // admission, the #698 tie conjunct DROPPED: no gather link exists to
                 // demand it). The splice is the kernel's ONLY entry — this mint appends
-                // the node and its nine staged-table sources to the graph, and everything
-                // downstream (the splice's row, the door's whole-function walk, the
-                // placement pass, the wiring's argmax facts) is the same machinery every
-                // other Triton kernel takes. Batched rungs, prefill and every staged or
-                // unrecognizable lm-head keep the host readback path unchanged.
+                // the node and its twelve sources (the ten staged tables, the
+                // row-feedback table `[vocab+1, hidden]`, the clamped-index stick) to
+                // the graph, and everything downstream (the splice's row, the door's
+                // whole-function walk, the placement pass, the wiring's argmax facts)
+                // is the same machinery every other Triton kernel takes. The row slot
+                // is the CALLER'S OWN embed source — the position of `EmbeddedHidden`
+                // in the bindings, the same lookup the wiring stamp performs (source
+                // ids below the old `num_sources` are untouched by the insert, so the
+                // position the worker already feeds IS the slot the gather lands in).
+                // Batched rungs, prefill and every staged or unrecognizable lm-head
+                // keep the host readback path unchanged.
                 if one_request
                     && scratchy_target_spyre::lower_subtile_tape_to_ktir::lm_head_admits_the_argmax(
                         &krg,
                     )
                 {
-                    let mint = scratchy_subtile::subtile_ir::mint_argmax(&mut krg);
+                    use crate::to_wavefront::SourceBinding;
+                    let embed_src = lwd
+                        .bindings
+                        .iter()
+                        .position(|b| matches!(b, SourceBinding::EmbeddedHidden))
+                        .map(scratchy_subtile::subtile_ir::TensorId::from_index)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[spyre-superdsc] {base}: the device argmax needs the embed row \
+                                 slot — no EmbeddedHidden source, nowhere for the gather to land"
+                            )
+                        });
+                    let mint = scratchy_subtile::subtile_ir::mint_argmax(&mut krg, embed_src);
                     eprintln!(
                         "[spyre-superdsc] {base}: the device argmax minted — vocab {} (padded \
-                         row {}), nine staged tables + the [1, 64] idx stick appended to the \
-                         one-request graph, and the rung's RESULT re-pointed to the stick (the \
-                         row stays placed and readable by tid)",
+                         row {}), ten staged tables + the [vocab+1, hidden] row-feedback table \
+                         + the [1, 64] clamped-index stick + the [1, 64] idx stick appended to \
+                         the one-request graph, and the rung's RESULT re-pointed to the stick \
+                         (the row stays placed and readable by tid)",
                         mint.vocab, mint.pad_vocab
                     );
                 }

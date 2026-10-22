@@ -26,9 +26,11 @@ THE SPLICE'S OWN CONTRACT (what `scratchy-triton-splice` states about this kerne
 * CONSTEXPRS: `V` (the model's real vocab), `PAD_V` (V rounded up to a
   power-of-two whole row, STRICTLY above V — the descriptor block's law and
   the sentinel's), `NB = PAD_V // BLOCK`, `BLOCK = 64`, `W` (the embedding
-  row's DEVICE width in f16 elements — twice the row tensor's cols, the
-  f32-class row's staged image being byte-length-preserving) — stated by the
-  splice from the node's own geometry, never hardcoded to a model: a different
+  row's DEVICE width in f16 elements — the row tensor's OWN cols: the staging
+  narrows ONE SEN f16 per f32 value (`bind_input_f32` halves the element
+  count), it does not double) — stated by
+  the splice from the node's own geometry (the row-slot operand's region
+  width), never hardcoded to a model: a different
   vocab or hidden bakes its own tables.
 * GRID: `[1]` — the sampler serves the solo greedy decode step's single row.
 * THE PAD LAW RIDES THE STAGED OFFSET TABLE (`padoff`): 0.0 on `[0, V)`, −inf
@@ -257,8 +259,10 @@ def argmax_fwd(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,  #
     # arithmetic sits between the read and the offset (the index view's law).
     tok = tl.load(rowidx_ptr + 0)
     # The table's rows are the DEVICE-encoded embedding rows (f16 elements,
-    # W = 2·hidden of them per row — the f32-class staging is byte-length
-    # preserving); the copy never does arithmetic on them, so it is bit-exact.
+    # W of them per row — the staging narrows ONE SEN f16 per f32 value
+    # (`bind_input_f32`), so the device row is exactly as wide as the tensor
+    # row's own cols); the copy never does arithmetic on them, so it is
+    # bit-exact.
     t_desc = tl.make_tensor_descriptor(table_ptr, shape=[V + 1, W], strides=[W, 1],
                                        block_shape=[1, W])
     row = t_desc.load([tok, 0])
