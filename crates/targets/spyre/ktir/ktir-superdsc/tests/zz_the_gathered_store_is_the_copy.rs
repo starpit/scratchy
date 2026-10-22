@@ -189,11 +189,7 @@ fn gathered_store_program(shape: Shape) -> KtirNode {
             ])),
         ),
         // THE GATHERED ROW — the load the store consumes.
-        shape_attr(
-            Operation::new(a, Some(row), OpKind::KtdpLoad, &[ind]),
-            1,
-            W,
-        ),
+        shape_attr(Operation::new(a, Some(row), OpKind::KtdpLoad, &[ind]), 1, W),
         // OUT: [1, 64] (the accepting shape) or [2, 64] (the window control).
         shape_attr(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_o]),
@@ -419,12 +415,13 @@ fn the_gathered_store_emits_the_identity_copy() {
          whole point): {:?}",
         copy.op_name
     );
-    let has_pair = dsc.scheduleTree_.iter().any(|n| {
-        n.indirectAllocType_ == "value_tensor" && n.relatedIndirectAccessAlloc_.is_some()
-    }) && dsc
-        .scheduleTree_
-        .iter()
-        .any(|n| n.indirectAllocType_ == "index_tensor");
+    let has_pair =
+        dsc.scheduleTree_.iter().any(|n| {
+            n.indirectAllocType_ == "value_tensor" && n.relatedIndirectAccessAlloc_.is_some()
+        }) && dsc
+            .scheduleTree_
+            .iter()
+            .any(|n| n.indirectAllocType_ == "index_tensor");
     assert!(
         has_pair,
         "the copy's value/index alloc pair is the gather itself: {:?}",

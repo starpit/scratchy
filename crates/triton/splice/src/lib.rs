@@ -383,8 +383,10 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
             program: Program::Reshape,
         },
         // ⭐ THE GREEDY TOKEN PICK — the whole vocab scan as ONE kernel: the row, the
-        // nine staged tables (functions of the vocab alone, host-staged at load —
-        // the seventh is the pad law's offset row), and the `[1, 64]` i32 idx stick
+        // ten staged tables (functions of the vocab alone, host-staged at load —
+        // including the clamp's V bound and the pad law's offset row),
+        // the row-feedback table, the clamped-index stick, the embed row slot, and
+        // the `[1, 64]` i32 idx stick
         // out. The vocab rides the node (never a model name); every constexpr below
         // derives from it.
         SubOp::ArgMax { .. } => TritonKernelRow::Spliced {
@@ -1149,12 +1151,14 @@ fn lower_one<F: scratchy_subtile::subtile_ir::RopeForm>(
         // refuses them before the splice — the MoE lowers only from
         // `kernels/moe.py` through KTIR.
         SubOp::ScalarWeightMul => 2,
-        // ⭐ THE ARGMAX'S ARITY IS 10: the logits row plus the nine staged tables
-        // (two decreasing ramps, two increasing index tables, two widen tables,
-        // the pad law's offset row, the two-level ramp's group pair) — every
-        // kernel parameter but the output is a tape operand, per the splice's
-        // own positional law.
-        SubOp::ArgMax { .. } => 10,
+        // ⭐ THE ARGMAX'S ARITY IS 14: the logits row, the ten staged tables
+        // (two decreasing ramps, two increasing index tables, two widen
+        // tables, the clamp's V bound, the pad law's offset row, the
+        // two-level ramp's group pair), the
+        // row-feedback table, the clamped-index stick, and the embed row
+        // slot — every kernel parameter but the output is a tape operand,
+        // per the splice's own positional law.
+        SubOp::ArgMax { .. } => 14,
         SubOp::TanhSoftCap { .. } | SubOp::RmsNormUnit { .. } | SubOp::Reshape { .. } => 1,
         // ⛔ NO `_` ARM. A spliced kind is a row above, and a row without an arity here is
         // an unreachable — the same discipline `lower_one_node`'s match holds.
@@ -2366,11 +2370,31 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
             // vocab still needs pad lanes), ONE derivation shared with the host
             // reference and the load-time table staging), NB its block count, BLOCK
             // the stick (the two-level ramp's lane width and the output stick). The
-            // signature states every kernel parameter's dtype: the row and the eight
-            // f16 tables (the periodic block pair, the lane pair, the two-level
-            // ramp's group pair), the f32 widen table (the island's own dtype), the
-            // pad law's f16 offset row, and the i32 output stick (the
-            // index-ingestion law).
+            // signature states every kernel parameter's dtype in the node's own
+            // operand order (the positional law `operand_dfs` zips against): the row
+            // and the eight f16 index tables (the periodic block pair, the lane pair,
+            // the ones widen table, the two-level ramp's group pair, the pad law's
+            // offset row), the two f32
+            // [1, BLOCK] tables (the widen scale and the clamp's V bound), the
+            // row-feedback table (f16 — the gather's copy is dtype-blind), the
+            // clamped-index stick (i32), the embed row slot (f16), and the i32 output
+            // stick (the index-ingestion law).
+            //
+            // ⛔ GUARDED ACCESS, never indexing panic: `operand_dfs` calls here for
+            // its placement census WITHOUT the arity check above, so a node still in
+            // an older shape must be answered with an Err, not a panic.
+            let need = |i: usize,
+                        what: &str|
+             -> Result<&scratchy_subtile::subtile_ir::TensorRegion, String> {
+                node.inputs.get(i).ok_or_else(|| {
+                    format!(
+                        "triton splice: {file} t{} wants {what} at input {i} (the 14-input \
+                         argmax form), found {} input(s)",
+                        node.output.tensor.index(),
+                        node.inputs.len()
+                    )
+                })
+            };
             let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(*vocab);
             let nb = pad_v / scratchy_subtile::subtile_ir::ARGMAX_BLOCK;
             for p in [
@@ -2383,20 +2407,48 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 "padoff_ptr",
                 "gramp_ptr",
                 "ginc_ptr",
+                "table_ptr",
+                "row_ptr",
             ] {
                 signature.insert(
                     p.to_string(),
                     ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
                 );
             }
-            signature.insert(
-                "sixtyfour_ptr".to_string(),
-                ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
-            );
-            signature.insert(
-                "idx_ptr".to_string(),
-                ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
-            );
+            for p in ["sixtyfour_ptr", "vbound_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*fp32").map_err(|e| e.to_string())?,
+                );
+            }
+            for p in ["rowidx_ptr", "idx_ptr"] {
+                signature.insert(
+                    p.to_string(),
+                    ArgSpec::parse("*i32").map_err(|e| e.to_string())?,
+                );
+            }
+            // W — the embedding row's device width — is the ROW SLOT's OWN region
+            // width (the LAST input, the caller-stated embed source): the staging
+            // narrows ONE SEN f16 per f32 value, so W = hidden, the row tensor's
+            // own column count. Never a model name, never a shape read off the
+            // table.
+            let embed = need(13, "the embed row slot")?;
+            let w = embed.region.cols.len;
+            // The row-feedback table's own seals, by name: [vocab+1, W] — the pad
+            // row included (the sentinel's clamp landing), the row width exact.
+            let table = need(11, "the row-feedback table")?;
+            if table.region.rows.len != vocab + 1 || table.region.cols.len != w {
+                return Err(format!(
+                    "triton splice: {file} t{} row-feedback table is [{}, {}], the kernel's \
+                     law is [vocab+1, W] = [{}, {}] — the pad row and the row width are the \
+                     gather's own bounds",
+                    node.output.tensor.index(),
+                    table.region.rows.len,
+                    table.region.cols.len,
+                    vocab + 1,
+                    w
+                ));
+            }
             let mut ce = |k: &str, v: Val| -> Result<(), String> {
                 signature.insert(k.to_string(), ArgSpec::Constexpr);
                 constexprs.insert(k.to_string(), v);
@@ -2409,6 +2461,7 @@ fn kernel_spec<F: scratchy_subtile::subtile_ir::RopeForm>(
                 "BLOCK",
                 Val::Int(i128::from(scratchy_subtile::subtile_ir::ARGMAX_BLOCK)),
             )?;
+            ce("W", Val::Int(i128::from(w)))?;
         }
         (op, entry) => {
             return Err(format!(

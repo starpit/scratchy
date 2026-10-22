@@ -903,10 +903,11 @@ pub struct Wiring {
 /// choosing fp32-verbatim vs fp16-convert off the ENTRY'S OWN dtype.
 #[derive(Clone, Copy, Debug)]
 pub enum LoadConst {
-    /// One of the device argmax's nine operand tables, by the kernel's operand
-    /// order (1-based over the ArgMax node's inputs; input 0 is the row).
-    /// Bytes from [`argmax_staged_tables`] — the one derivation every stager
-    /// reads, so a table defect cannot hide on one leg only.
+    /// One of the device argmax's ten operand tables, by the kernel's operand
+    /// order (1-based over the ArgMax node's inputs; input 0 is the row, and
+    /// the table/stick/row-slot operands past the tenth are never
+    /// load-consts). Bytes from [`argmax_staged_tables`] — the one derivation
+    /// every stager reads, so a table defect cannot hide on one leg only.
     ArgMaxTable { vocab: u32, operand: u8 },
 }
 
@@ -921,14 +922,14 @@ impl LoadConst {
                 let (bytes, dt, shape) = argmax_staged_tables(vocab)
                     .into_iter()
                     .nth((operand - 1) as usize)
-                    .expect("the mint emits operand 1..=9 — the registry's own row");
+                    .expect("the mint emits operand 1..=10 — the registry's own row");
                 (bytes, dt, shape)
             }
         }
     }
 }
 
-/// ⭐ THE DEVICE ARGMAX'S NINE STAGED TABLES — the kernel's own host contract
+/// ⭐ THE DEVICE ARGMAX'S TEN STAGED TABLES — the kernel's own host contract
 /// (`kernels/argmax.py`'s docstring), stated ONCE for every stager: the
 /// bake-time numeric gate and the worker's load-time staging read this same
 /// fn, so a table defect cannot hide on one leg only (the synth weights' own
@@ -936,7 +937,7 @@ impl LoadConst {
 /// steps, staged ONCE.
 ///
 /// In the kernel's OPERAND ORDER — `bramp, lramp, binc, linc, ones, sixtyfour,
-/// padoff, gramp, ginc` — each entry is `(bytes, dtype, [rows, cols])`:
+/// vbound, padoff, gramp, ginc` — each entry is `(bytes, dtype, [rows, cols])`:
 ///
 /// * `bramp` — strictly DECREASING in the block index WITHIN EACH GROUP and
 ///   PERIODIC across groups (`GROUP_BLOCKS - (b % GROUP_BLOCKS)`), so the
@@ -945,16 +946,20 @@ impl LoadConst {
 ///   ANY vocab. 0 on the pad lanes, which can never win a max the real lanes
 ///   contest.
 /// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
+/// * `lramp` — strictly decreasing within each block, PERIODIC (`BLOCK - l`),
 ///   so the third `max` lands on the first lane of that block.
 /// * `binc` / `linc` — the INCREASING 0-based block-within-group / lane index
 ///   tables the one-hot reads the selected numbers back out through
 ///   (`binc` periodic, `GROUP_BLOCKS` wide); on the pad lanes they stage
 ///   `GROUP_BLOCKS` / `BLOCK` — the SENTINEL's own values.
-/// * `ones` / `sixtyfour` — the `[1, BLOCK]` widen tables: the fp16 ones
-///   broadcast the selected numbers out to the output stick, the fp32 scale
-///   row carries the `·64` of the wide integer combine (used twice: once for
-///   the block term, once squared for the group term's `·4096`; exact in f32
-///   below 2^24).
+/// * `ones` / `sixtyfour` / `vbound` — the `[1, BLOCK]` widen-and-clamp
+///   tables: the fp16 ones broadcast the selected numbers out to the output
+///   stick, the fp32 scale row carries the `·64` of the wide integer combine
+///   (used twice: once for the block term, once squared for the group term's
+///   `·4096`; exact in f32 below 2^24), and the fp32 V bound
+///   is the `minnumf` operand that clamps the picked index onto the table's
+///   rows (row `vocab` = the PAD ROW; the idx stick itself stays UNCLAMPED,
+///   #666 — the clamp is a separate fact on its own stick).
 /// * `padoff` — THE PAD LAW: 0.0 on `[0, vocab)`, −inf on the pads. The
 ///   kernel adds it to the row before its first max, so a pad lane can never
 ///   win whatever the row's pad bytes hold (the lm-head's zero-pad columns
@@ -977,8 +982,9 @@ impl LoadConst {
 /// real lane.
 ///
 /// Every value is a small exact integer on the fp16 grid (`G ≤ 2048` by the
-/// admission gate; `padoff` stages only 0.0 and −inf), so the staging
-/// round trips bit-exactly.
+/// admission gate; `padoff` stages only 0.0 and −inf) or an exact f32
+/// (`sixtyfour`, `vbound` — the vocab is below 2^24), so the staging round
+/// trips bit-exactly.
 pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType, [usize; 2])> {
     let pad_v = scratchy_subtile::subtile_ir::argmax_pad_vocab(vocab) as usize;
     let block = scratchy_subtile::subtile_ir::ARGMAX_BLOCK as usize;
@@ -1028,9 +1034,22 @@ pub fn argmax_staged_tables(vocab: u32) -> Vec<(Vec<u8>, scratchy_tensors::DType
             scratchy_tensors::DType::F16,
             [1, block],
         ),
-        // sixtyfour: [1, BLOCK] of 64.0 — the ONLY fp32 table.
+        // sixtyfour: [1, BLOCK] of 64.0.
         (
             (0..block).flat_map(|_| 64.0f32.to_le_bytes()).collect(),
+            scratchy_tensors::DType::F32,
+            [1, block],
+        ),
+        // vbound: [1, BLOCK] of the VOCAB BOUND — the clamp's operand. The
+        // picked index is minned against it so the row-feedback gather reads
+        // inside the table's rows (row `vocab` is the PAD ROW the sentinel
+        // clamps onto); a staged table, never a `tl.full` splat, per the
+        // whole-function door's no-splat law. fp32: it lives on the island
+        // that computed the index.
+        (
+            (0..block)
+                .flat_map(|_| (vocab as f32).to_le_bytes())
+                .collect(),
             scratchy_tensors::DType::F32,
             [1, block],
         ),
