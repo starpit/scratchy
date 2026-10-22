@@ -893,6 +893,23 @@ pub struct Wiring {
     /// per-op field, no consumer that names the op. The ids are the graph's own
     /// tensor ids (the same ids the placement pass places).
     pub load_consts: &'static [(u32, LoadConst)],
+    /// ⭐ THE ARGMAX ROW-FEEDBACK FACTS — `(row-feedback table tid,
+    /// clamped-index stick tid)` for the greedy pick's gather, `None` on a
+    /// wiring whose graph mints no device argmax (the host readback path,
+    /// unchanged). The TABLE is a RUNTIME-FED resident: staged ONCE at load
+    /// from the model's own embedding mirror (narrowed to f16, a zero pad row
+    /// appended, through the WEIGHT channel — the same IEEE→SEN convert
+    /// per-step staging applies, so a gathered row and a host-staged row are
+    /// the same bytes by construction), with a LOAD REFUSAL when the
+    /// mirror's `[vocab, hidden]` disagrees with the table's `[vocab+1,
+    /// hidden]` shape — runtime-data bounds are loud refusals at load, never
+    /// silent truncations. The STICK is the kernel's OWN device scratch:
+    /// written before read, inside the kernel, staged by no one — declared
+    /// resident so no per-step fill ever names it. Both tids are minted
+    /// sources with NO `SourceBinding` and NO load-const; this field is the
+    /// worker's only naming of them (the answer, not the data to compute it
+    /// from — the `embed_src` law).
+    pub argmax_row_feedback: Option<(u32, u32)>,
 }
 
 /// ⭐ A LOAD-TIME CONSTANT'S KIND — the shared builder that makes its bytes.
@@ -1996,6 +2013,7 @@ mod constant_tape_tests {
             weight_scale_folds: &[],
             weight_copies: &[],
             load_consts: &[],
+            argmax_row_feedback: None,
         }
     }
 

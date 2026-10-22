@@ -773,6 +773,152 @@ pub(crate) fn stage_bound_weights(
     Ok(weights)
 }
 
+/// ⭐ THE ARGMAX ROW-FEEDBACK TABLE (#603) — the gather's runtime-fed operand,
+/// staged ONCE at load from the model's own embedding mirror.
+///
+/// The table is the `[vocab+1, hidden]` f16 image of `embed_tokens` with a
+/// ZERO pad row appended (index `vocab` — where the clamp's sentinel picks
+/// land). It is pushed through the SAME weights vec as every bound weight so
+/// BOTH seats consume identical bytes:
+///
+/// - **Card**: the session's weights loop binds it like any f16 weight and the
+///   stage path applies `ieee_to_sen_bytes` — exactly the transform per-step
+///   activation staging applies to a row (`bind_input_f32` narrows with the
+///   same `f32_to_f16_le`, then the refill applies the same convert), over the
+///   SAME source mirror, so every row is byte-identical to what staging that
+///   row per step would produce, BY CONSTRUCTION. The bundle's own
+///   `resident_source_tids` stamp declares the pair so no per-step fill ever
+///   touches it (this branch states the resident ids on the LAYOUT, at the
+///   bake — the lowering chains `argmax_row_feedback_of_ir` into the stamp).
+/// - **Emulator**: `weight_arg` hands the f16 bytes to the interpreter
+///   verbatim (`TensorBytes`), and the whole-function KTIR the session runs
+///   executes the gathered store itself.
+///
+/// The wiring carries only the FACT (tid + shape) — a vocabulary of rows is
+/// RUNTIME DATA, never a compile-time load-const. ⛔ RUNTIME-DATA BOUNDS = LOUD
+/// REFUSAL AT LOAD, never a silent truncation: the mirror must be EXACTLY the
+/// table minus its pad row. (The staged bytes carry the table's OWN baked
+/// `[vocab+1, hidden]` shape; a model whose hidden width needed a device-width
+/// bump would refuse loudly at the stage's size guard, never corrupt.)
+pub(crate) fn stage_argmax_row_feedback_table(
+    embed_tokens: &[f32],
+    table_tid: u32,
+    wiring: &scratchy_target_spyre::wiring::Wiring,
+) -> ExecutorResult<StagedWeight> {
+    let (t_rows, t_cols) = wiring.tensor_shapes[table_tid as usize];
+    let (t_rows, t_cols) = (t_rows as usize, t_cols as usize);
+    if t_cols == 0 || !embed_tokens.len().is_multiple_of(t_cols) {
+        return Err(werr(format!(
+            "the argmax row-feedback table is [{t_rows}, {t_cols}] but the model's embedding \
+             mirror carries {} f32 value(s) — not row-aligned to the table's width",
+            embed_tokens.len(),
+        )));
+    }
+    if t_rows != embed_tokens.len() / t_cols + 1 {
+        return Err(werr(format!(
+            "the argmax row-feedback table is [{t_rows}, {t_cols}] but the model's embedding \
+             mirror carries {} f32 value(s) — expected [({}, {t_cols})]",
+            embed_tokens.len(),
+            t_rows.saturating_sub(1),
+        )));
+    }
+    let mut table_bytes = scratchy_target_spyre::sen_convert::f32_to_f16_le(embed_tokens);
+    table_bytes.resize(t_rows * t_cols * 2, 0);
+    tracing::info!(
+        "[weights] the argmax row-feedback table staged — [{} rows, {t_cols} cols] ({} KiB, pad \
+         row zeroed)",
+        t_rows - 1,
+        table_bytes.len() / 1024,
+    );
+    Ok((
+        table_tid as usize,
+        table_bytes,
+        SDType::F16,
+        vec![t_rows, t_cols],
+    ))
+}
+
+#[cfg(test)]
+mod argmax_row_feedback_table_tests {
+    use super::*;
+
+    /// A `Wiring` whose ONLY non-default fact is `tensor_shapes` — the helper
+    /// reads the table's baked shape and nothing else, and the test must not be
+    /// able to pass through any other field.
+    fn wiring_with_table(shapes: &'static [(u32, u32)]) -> scratchy_target_spyre::wiring::Wiring {
+        scratchy_target_spyre::wiring::Wiring {
+            result: 0,
+            result_dtype: SDType::F16,
+            num_sources: shapes.len() as u32,
+            attn_mask: None,
+            decode_position: 0,
+            tensor_shapes: shapes,
+            embed_src: 0,
+            cos_srcs: &[],
+            sin_srcs: &[],
+            layers: &[],
+            geometry: scratchy_target_spyre::wiring::Geometry {
+                hidden: 2,
+                kv_dim: 2,
+                vocab: 3,
+                layers: 1,
+                head_dim: 64,
+                nqh: 1,
+                rope_theta_bits: 0,
+            },
+            rope_class_hds: &[],
+            attn_class_hds: &[],
+            rms_invcols: &[],
+            scalarmul_scales: &[],
+            fp8_k_pads: &[],
+            weight_scale_folds: &[],
+            weight_copies: &[],
+            load_consts: &[],
+            argmax_row_feedback: None,
+        }
+    }
+
+    /// The happy path: a `[3, 2]` mirror stages as the f16-LE narrowing of
+    /// itself with a ZERO pad row appended — the exact bytes per-step staging
+    /// of any one row would produce (`f32_to_f16_le`, the bind boundary's own
+    /// conversion), plus the sentinel's landing row.
+    #[test]
+    fn the_table_is_the_narrowed_mirror_plus_a_zero_pad_row() {
+        let mirror = [1.0f32, -2.5, 3.25, 65504.0, 0.0, -0.5];
+        let w = wiring_with_table(&[(2, 2), (4, 2)]);
+        let (id, bytes, dt, shape) =
+            stage_argmax_row_feedback_table(&mirror, 1, &w).expect("the mirror matches");
+        assert_eq!(id, 1);
+        assert_eq!(dt, SDType::F16);
+        assert_eq!(shape, vec![4, 2]);
+        let mut want = scratchy_target_spyre::sen_convert::f32_to_f16_le(&mirror);
+        want.extend(std::iter::repeat_n(0u8, 2 * 2)); // the pad row
+        assert_eq!(bytes, want);
+        // And the pad row is ALL zeros — the clamp's sentinel picks must read 0.
+        assert!(bytes[bytes.len() - 4..].iter().all(|&b| b == 0));
+    }
+
+    /// A mirror whose row count is not the table minus its pad row is a LOUD
+    /// refusal, never a staged truncation.
+    #[test]
+    fn a_row_count_mismatch_refuses_rather_than_truncating() {
+        let mirror = [1.0f32, -2.5, 3.25, 65504.0, 0.0, -0.5];
+        let w = wiring_with_table(&[(2, 2), (5, 2)]); // wants a [4, 2] mirror
+        assert!(stage_argmax_row_feedback_table(&mirror, 1, &w).is_err());
+    }
+
+    /// A mirror not row-aligned to the table's width refuses too — the pad row
+    /// law leaves no partial-row interpretation.
+    #[test]
+    fn a_mirror_not_row_aligned_to_the_width_refuses() {
+        let mirror = [1.0f32, -2.5, 3.25, 65504.0, 0.0, -0.5];
+        let w = wiring_with_table(&[(2, 2), (4, 3)]); // 6 values, width 3
+        assert!(stage_argmax_row_feedback_table(&mirror, 1, &w).is_err());
+        let w = wiring_with_table(&[(2, 2), (4, 0)]); // degenerate width
+        assert!(stage_argmax_row_feedback_table(&mirror, 1, &w).is_err());
+    }
+}
+
 impl SpyreWorker {
     /// Resolve the bundle + load all static weights + derive dims + wiring.
     pub(crate) fn load_inner(&self) -> ExecutorResult<Loaded> {
@@ -959,11 +1105,25 @@ impl SpyreWorker {
             bound.len(),
             wirings.decode.tensor_shapes.len()
         );
-        let weights = stage_bound_weights(&bound, &wirings.decode, gw.allocator_mut())?;
+        let mut weights = stage_bound_weights(&bound, &wirings.decode, gw.allocator_mut())?;
         tracing::info!(
             "[weights] staged {} weight(s) for the session",
             weights.len()
         );
+
+        // ⭐ THE ARGMAX ROW-FEEDBACK TABLE (#603) — the gather's `[vocab+1, hidden]`
+        // image of the embedding, staged ONCE at load and pushed through the SAME
+        // weights vec so BOTH seats consume identical bytes (see
+        // [`stage_argmax_row_feedback_table`]). The wiring carries only the FACT
+        // (tid + shape) — a vocabulary of rows is RUNTIME DATA, never a
+        // compile-time load-const.
+        if let Some((table_tid, _stick_tid)) = wirings.decode.argmax_row_feedback {
+            weights.push(stage_argmax_row_feedback_table(
+                &embed_tokens,
+                table_tid,
+                &wirings.decode,
+            )?);
+        }
         // NOTE: the RoPE rotate-half permutation P (ROPE_P_TID) is NOT a load-time weight.
         // It is a synthetic seg0 ACTIVATION re-bound per step in `superdsc_forward_chunk`
         // (see the `acts` block there) — a seg1 weight would only be H2D'd at PrepareModel,
@@ -975,6 +1135,22 @@ impl SpyreWorker {
         // ascending-cap order — so a bucket's program index is `decode_prog_base + i`.
         #[cfg(not(feature = "spyre-hw"))]
         let (session, decode_prog_base) = {
+            // ⭐ THE EMULATOR'S LOAD-CONST SEAT. The card binds the staged tables
+            // through `bind_load_consts` inside its session constructor; the emu
+            // session takes ONLY the weights vec, so the same tables ride it here —
+            // `weight_arg` hands F16/F32 bytes to the interpreter verbatim, which is
+            // what a table IS on that seat. Without this the interpreter reads
+            // ZEROS wherever a staged table is consumed (the card's equivalent
+            // defect and its measured symptom — argmax answering token 0 — are
+            // documented at the `bind_load_consts` call in sdsc_runner).
+            for &(tid, kind) in wirings.decode.load_consts {
+                let (bytes, dtype, shape) = kind.build();
+                let sdt = match dtype {
+                    SDType::F32 => SDType::F32,
+                    _ => SDType::F16,
+                };
+                weights.push((tid as usize, bytes, sdt, shape.to_vec()));
+            }
             // ⭐ THE PROGRAMS COME OUT OF THE REGISTRY, BY FINGERPRINT. `#[forward]` submitted them
             // as const data; the bundle names which set is this model's. That is the same resolver
             // the ladder rungs and the re-rolled siblings already use, so a program is found in one

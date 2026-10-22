@@ -2010,13 +2010,29 @@ pub fn compute_bundle_layout<F: RopeForm>(
         resident_source_tids: {
             // Prefix-KV (the set the wiring's `layers` derives its prefix_k/prefix_v from — the
             // same `cache_tensor`/`v_cache_tensor` walk) plus the load-const tables (the one
-            // `load_consts_of_ir` derivation the wiring and the numeric gate read). Sorted and
-            // deduped so the stamp is a set, whatever order the walks found.
+            // `load_consts_of_ir` derivation the wiring and the numeric gate read) plus the
+            // argmax row-feedback pair (`argmax_row_feedback_of_ir`, the same node's own fact).
+            // Sorted and deduped so the stamp is a set, whatever order the walks found.
             let mut tids: Vec<u32> = prefix_kv_tids.iter().copied().collect();
             tids.extend(
                 crate::lower_subtile_tape_to_ktir::load_consts_of_ir(ir)?
                     .into_iter()
                     .map(|(tid, _)| tid),
+            );
+            // ⭐ THE ARGMAX ROW-FEEDBACK PAIR — the same loader declaration the pair's own
+            // commit first wrote beside the worker's session build, restated HERE because
+            // this branch's resident ids are STAMPED ON THE LAYOUT, not derived in the
+            // worker: the `[vocab+1, hidden]` table is bound ONCE at load through the
+            // WEIGHT channel (resident by the same law as every bound weight — its
+            // placement can sit outside the aliased segments exactly like a load-const
+            // table, which classifies `Nobody` on a borrowing rung), and the
+            // clamped-index stick is the KERNEL'S OWN device scratch, written before any
+            // read. Neither is filled per step, so `require_sources_filled` must skip
+            // both or every launch that plays the mint is refused.
+            tids.extend(
+                crate::lower_subtile_tape_to_ktir::argmax_row_feedback_of_ir(ir)?
+                    .into_iter()
+                    .flatten(),
             );
             tids.sort_unstable();
             tids.dedup();
@@ -8314,26 +8330,28 @@ mod tests {
     }
 
     /// ⭐ THE BUNDLE STATES ITS OWN WIRING FACTS (#813 review) — `num_sources` and the resident
-    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its nine staged
-    /// tables (the two-level ramp's seven flat-era tables plus the group pair) sit at
-    /// `[num_sources, num_sources+9)` of the ONE-REQUEST graph, so a minted bundle's stamp and
-    /// an unminted bundle's stamp differ by exactly those nine. The worker used to hand every
-    /// rung the minted wiring's numbers — the rung's completeness walk then covered nine ids
-    /// past its own graph, excused by nine minted table ids that only cancelled by
-    /// coincidence. Pinned from both sides of the mint, plus the one-derivation law: the
-    /// stamp's resident list IS [`load_consts_of_ir`]'s, the same derivation the
-    /// wiring's `load_consts` reads, so the layout's list and the wiring's cannot disagree.
+    /// source ids are GRAPH-LOCAL, and the mint is the graph that proves it: its twelve minted
+    /// sources (the ten staged tables, the row-feedback table, the clamped-index stick) sit at
+    /// `[num_sources, num_sources+12)` of the ONE-REQUEST graph, so a minted bundle's stamp and
+    /// an unminted bundle's stamp differ by exactly those twelve. The worker used to hand every
+    /// rung the minted wiring's numbers — the rung's completeness walk then covered ids past its
+    /// own graph, excused by minted table ids that only cancelled by coincidence. Pinned from
+    /// both sides of the mint, plus the derivation law: the stamp's resident list is
+    /// [`load_consts_of_ir`]'s list UNION the row-feedback pair (`argmax_row_feedback_of_ir`,
+    /// the same node's own fact), the same derivations the wiring reads.
     #[test]
     fn the_bundle_states_its_own_source_facts_across_the_mint() {
         use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
-        use scratchy_subtile::subtile_ir::{SourceShape, SubOp, lower_region, mint_argmax};
+        use scratchy_subtile::subtile_ir::{SourceShape, SubOp, TensorId, lower_region, mint_argmax};
         // K=1, vocab 5 — the one-request lm-head shape the mint admits, the same fixture
-        // `argmax_mint_lower` pins the splice seat with.
+        // `argmax_mint_lower` pins the splice seat with. The third source is the embed row
+        // slot the row feedback's gather lands in.
         let input = scratchy_subtile::lower::LoweringInput {
             exported: None,
             sources: vec![
                 SourceShape { rows: 1, cols: 1 },
                 SourceShape { rows: 1, cols: 5 },
+                SourceShape { rows: 1, cols: 3 },
             ],
             ops: vec![OpDesc {
                 op: SubOp::MatmulTile {
@@ -8349,7 +8367,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
-        mint_argmax(&mut minted);
+        mint_argmax(&mut minted, TensorId(2));
         let l_plain =
             compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
         let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
@@ -8360,14 +8378,15 @@ mod tests {
         assert_eq!(l_minted.num_sources, minted.num_sources);
         assert_eq!(
             l_minted.num_sources,
-            l_plain.num_sources + 9,
-            "the mint's nine tables (the two-level ramp's seven flat-era tables plus the group \
-             pair) are the whole difference between the two graphs' source counts — the nine \
-             ids an unminted rung was handed and did not have"
+            l_plain.num_sources + 12,
+            "the mint's twelve sources (ten staged tables, the row-feedback table, the \
+             clamped-index stick) are the whole difference between the two graphs' source \
+             counts — the ids an unminted rung was handed and did not have"
         );
         // The unminted graph has no resident source (no prefix-KV, no load-const tables), and
-        // the minted graph's resident list is EXACTLY the nine tables, at
-        // `[plain's count, minted's count)` — the range the review's coincidence lived in.
+        // the minted graph's resident list is EXACTLY the ten staged tables plus the
+        // row-feedback pair, at `[plain's count, minted's count)` — the range the review's
+        // coincidence lived in.
         assert!(
             l_plain.resident_source_tids.is_empty(),
             "an unminted graph's layout stamps no resident source"
@@ -8375,7 +8394,8 @@ mod tests {
         let tables: Vec<u32> = (l_plain.num_sources..l_minted.num_sources).collect();
         assert_eq!(
             l_minted.resident_source_tids, tables,
-            "the minted graph's resident stamp is its nine tables and nothing else"
+            "the minted graph's resident stamp is its ten staged tables plus the row-feedback \
+             pair, and nothing else"
         );
         // ⛔ AND EVERY STAMPED ID IS A SOURCE OF ITS OWN GRAPH — the bake asserts this where it
         // stamps (an id at or past the count would excuse a REAL source from the runtime's
@@ -8387,17 +8407,27 @@ mod tests {
                 .all(|&t| t < l_minted.num_sources),
             "a resident id past the source count would excuse a real source"
         );
-        // ⭐ THE ONE-DERIVATION LAW: the stamp's list is `load_consts_of_ir`'s — the same
-        // derivation `graph_wiring` reads for the wiring's `load_consts` — so a layout that
-        // disagrees with the wiring is a build error here, not a card incident later.
-        let wiring_tids: Vec<u32> = crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted)
-            .expect("the minted graph's load-const list derives")
-            .into_iter()
-            .map(|(tid, _)| tid)
-            .collect();
+        // ⭐ THE DERIVATION LAW: the stamp's list is `load_consts_of_ir`'s UNION the
+        // row-feedback pair — the same two derivations `graph_wiring` reads for the
+        // wiring's `load_consts` and `argmax_row_feedback` — so a layout that disagrees
+        // with the wiring is a build error here, not a card incident later.
+        let mut wiring_tids: Vec<u32> =
+            crate::lower_subtile_tape_to_ktir::load_consts_of_ir(&minted)
+                .expect("the minted graph's load-const list derives")
+                .into_iter()
+                .map(|(tid, _)| tid)
+                .collect();
+        wiring_tids.extend(
+            crate::lower_subtile_tape_to_ktir::argmax_row_feedback_of_ir(&minted)
+                .expect("the minted graph's row-feedback pair derives")
+                .into_iter()
+                .flatten(),
+        );
+        wiring_tids.sort_unstable();
+        wiring_tids.dedup();
         assert_eq!(
             l_minted.resident_source_tids, wiring_tids,
-            "the layout's resident stamp and the wiring's load-const list are one derivation"
+            "the layout's resident stamp is the wiring's own two derivations, unioned"
         );
     }
 
