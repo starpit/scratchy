@@ -4636,7 +4636,7 @@ impl Executor {
         // D2H transfers the placement's aligned window into one slot, so a stick wider
         // than the slot is a bundle the window was never meant to serve.
         let stick_len = crate::lower_subtile_tape_to_superdsc::align128(lp.size);
-        if lp.size == 0 || stick_len > IDX_SLOT_BYTES {
+        if lp.size == 0 || stick_len > IDX_SLOT_BYTES as u64 {
             bail!(
                 "window_begin: the idx stick {stick} is {} B (aligned {}), which does not \
                  fit the pool's {IDX_SLOT_BYTES} B slot — the mint's one-request stick is \
@@ -4853,7 +4853,9 @@ impl Executor {
         let cbs_this = match self.try_replay_forward(seq_pos)? {
             Some(n) => n,
             None => {
-                self.launch_forward(seq_pos)?;
+                // A window step is a decode step by definition — the suffix runs
+                // (the argmax reads its output), so the walk launches it.
+                self.launch_forward(seq_pos, SuffixLaunch::Launched)?;
                 0 // the walk's CBs are the canvas's own shape; the scheduler's
                 // queue-capacity gate bounds them per submission
             }
