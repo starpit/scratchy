@@ -590,6 +590,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // `Attn` is refused BY NAME at this crate's doors. `None` is "this bundle never
         // gathers", which is the documented meaning, not a placeholder.
         kv_block_index: None,
+        // No paged-fold region: the ceiling is a whole-GRAPH fact derived from a paged-KV pool's
+        // own stride (`compute_bundle_layout` records it beside the prefix mask), and one Triton
+        // kernel's parameter list places no pool — `Attn` is refused BY NAME at this crate's
+        // doors. `None` is "this bundle states no fold region", the documented meaning.
+        paged_fold_region_pages: None,
     })
 }
 

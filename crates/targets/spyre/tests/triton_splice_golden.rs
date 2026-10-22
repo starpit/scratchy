@@ -2110,13 +2110,33 @@ fn spliced_attn_lowers_through_the_door() {
             let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
 
             // The splice — `lower_attn` compiles attn.py for this node's geometry and rung.
-            let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap(), rows_are_requests)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
-                        s.geom, s.mq, s.rung
-                    )
-                });
+            // No fold statement on these fixtures (`None`): the one-shot form, ONE program —
+            // the paged-fold family is the chunked-ladder rung's own statement, pinned by its
+            // own fixtures.
+            let spliced_ops = scratchy_triton_splice::lower_attn(
+                node,
+                &ir,
+                cap,
+                s.active_cap(),
+                rows_are_requests,
+                None,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "splice compiled geom={:?} mq={} rung={} r_ar={rows_are_requests}: {e}",
+                    s.geom, s.mq, s.rung
+                )
+            });
+            assert_eq!(
+                spliced_ops.len(),
+                1,
+                "a foldless `lower_attn` returns exactly the one-shot program (geom={:?} mq={} \
+                 rung={})",
+                s.geom,
+                s.mq,
+                s.rung
+            );
+            let spliced = &spliced_ops[0];
 
             // ⛔ THE NAME LAW — `attn_s{id}`.
             assert_eq!(
@@ -2160,7 +2180,7 @@ fn spliced_attn_lowers_through_the_door() {
             // unplaced-parameter refusal waits for.
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::place_step_inputs(
                 &mut layout,
-                &[std::slice::from_ref(&spliced)],
+                &[std::slice::from_ref(spliced)],
                 ir.tensors.len() as u32,
             )
             .unwrap_or_else(|e| {
@@ -2177,7 +2197,7 @@ fn spliced_attn_lowers_through_the_door() {
             // by-bits lookup resolves it through.
             scratchy_target_spyre::lower_subtile_tape_to_ktir::complete_program_scales(
                 &mut layout,
-                &[std::slice::from_ref(&spliced)],
+                &[std::slice::from_ref(spliced)],
             );
 
             // The program lowers through the production door under the walk's own
@@ -2380,9 +2400,10 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
         let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap(), false)
+        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap(), false, None)
             .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        let k = spliced.ktir.expect("spliced op carries its program");
+        assert_eq!(spliced.len(), 1, "a foldless splice is the one-shot program");
+        let k = spliced[0].ktir.clone().expect("spliced op carries its program");
         assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
         ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
             "continuation",
@@ -2411,9 +2432,12 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
     let ir = attn_ir(decode, 0.015625);
     let node = ir.nodes.last().unwrap();
     let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap(), true)
-        .expect("the decode splice compiles")
+    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap(), true, None)
+        .expect("the decode splice compiles");
+    assert_eq!(unrolled.len(), 1, "a foldless splice is the one-shot program");
+    let unrolled = unrolled[0]
         .ktir
+        .clone()
         .expect("spliced op carries its program");
     use ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows;
     assert!(

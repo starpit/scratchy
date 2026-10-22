@@ -2670,6 +2670,13 @@ pub struct EmittedOp {
     /// 0 for every op of an unbatched bundle and for the first request of a batched one, so the
     /// single-request path is untouched.
     pub kv_request: u32,
+    /// ⭐⭐⭐⭐⭐ THE PAGED FOLD THIS OP'S PROGRAM WAS MINTED AS — the attribute the fold's chain
+    /// of custody runs on. `None` on every op but a spliced fold family's BODY carrier: the
+    /// splice STATES the family's laws here through [`Self::paged_fold`] (the ONE door), the
+    /// walk STAMPS them onto every op it lowers from that carrier's program, and the bake's
+    /// fallback proof CHECKS the stamped groups. The seed and finalize carriers of the same
+    /// family stay `None` — they launch once per step, not once per page.
+    pub kv_paged_fold: Option<crate::sdsc_abstract::PagedFold>,
     /// ⭐ SLOTS PAST THE LAUNCH'S WRITE CURSOR WHERE THIS OP'S KV STARTS — a whole number of pages,
     /// non-zero only for the later PAGE PARTS of a prefill chunk whose window spans more than one page.
     ///
@@ -2785,6 +2792,7 @@ impl EmittedOp {
             kv_fold_rows: Default::default(),
             kv_page_slots: 0,
             kv_request: 0,
+            kv_paged_fold: None,
             kv_slot_offset: 0,
             host_kv_write: false,
             kv_n_skip: 0,
@@ -2797,6 +2805,22 @@ impl EmittedOp {
             kv_hd: 0,
             kv_cap: 0,
         }
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE ONE DOOR FOR THE PAGED-FOLD ATTRIBUTE — a fold family's BODY carrier, with
+    /// the family's launch-ABI laws stated by the layer that minted it (the splice).
+    ///
+    /// ⛔ NOTHING ELSE MAY WRITE [`Self::kv_paged_fold`]. The attribute is the single carrier
+    /// between the splice's statement and the walk's stamp (`ktir_groups_via_superdsc`, which
+    /// copies these facts onto every op it lowers from this carrier's program) and the proof the
+    /// bake runs over the stamped groups — so a second writer is a second source of the fold
+    /// facts, which is the desync the field exists to prevent. The seed and finalize carriers
+    /// of the same family are `bare` ops: they launch once per step, not once per page, and
+    /// carrying the attribute on them would stamp a fold onto programs that must not re-launch.
+    pub fn paged_fold(op_name: String, fold: crate::sdsc_abstract::PagedFold) -> EmittedOp {
+        let mut e = EmittedOp::bare(op_name);
+        e.kv_paged_fold = Some(fold);
+        e
     }
 
     /// A by-value copy, for building a trimmed op list (see `ops_for_grouping`). `EmittedOp` is not
@@ -2816,6 +2840,7 @@ impl EmittedOp {
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
+            kv_paged_fold: self.kv_paged_fold,
             kv_slot_offset: self.kv_slot_offset,
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
@@ -2894,6 +2919,7 @@ impl EmittedOp {
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
+            kv_paged_fold: None,
             kv_slot_offset: 0,
             slab_write: false,
             slab_stride_bytes: 0,

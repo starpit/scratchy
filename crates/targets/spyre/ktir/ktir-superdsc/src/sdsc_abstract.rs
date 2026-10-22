@@ -4454,6 +4454,44 @@ impl FoldRowRegime {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE PAGED FOLD A SPLICED PROGRAM STATES — the attribute the fold's whole chain of
+/// custody runs on.
+///
+/// A chunked decode ladder's `(FULL, no-chunk)` rung lowers its attention as the THREE-PROGRAM
+/// fold family (`kernels/paged_fold.py`: seed, one-page body, finalize), and the family's BODY
+/// is a fold: the runtime re-launches it once per resident page, shifting the activation
+/// segment's base one page's worth of bytes per pass. That fact — and the four launch-ABI
+/// facts `fold_plan` derives the pass count and the shifts from — cannot be read off a KTIR
+/// program (what a kernel steps over is not visible from a session), so the splice STATES them
+/// here, the carrier [`EmittedOp`](crate::emit::EmittedOp) CARRIES them through its ONE
+/// constructor, the walk (`ktir_groups_via_superdsc`) STAMPS them onto every op it lowers from
+/// that carrier's program, and the bake's fallback proof CHECKS the stamped groups
+/// (`emitted_bundle_folds`). One constructor, one attribute, one reader per stage — a stage
+/// deriving any of these facts from anything but the attribute is the desync this type exists
+/// to make impossible.
+///
+/// Every member is a LAW OF THE FAMILY the splice minted, not a per-model fact: the spliced
+/// fold gathers its pages through the host-staged index tables (global stick-block entries,
+/// so a pass takes NO KV-segment shift), its batch axis walks KV heads × GQA groups rather
+/// than requests, and its carry holds every row of the one request it serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagedFold {
+    /// The fold gathers its pages through the host-staged block-entry tables — the entries are
+    /// GLOBAL stick-block numbers (`addr = idx * skip_addr + base`), so the pool's segment base
+    /// never moves per pass. This is `kv_gathered`.
+    pub gathered: bool,
+    /// The fold's batch axis walks KV heads × GQA groups, NOT requests: one request is served
+    /// by the whole pass sequence, so the pass count carries no `× requests` term. This is
+    /// `kv_batched_requests`.
+    pub batched_requests: bool,
+    /// The carry's row regime — whole-batch: the carry holds every `nqh*mq` row of the one
+    /// request, unshifted per pass. This is `kv_fold_rows`.
+    pub fold_rows: FoldRowRegime,
+    /// The pool's page width, for `kv_page_slots`. This is the shared device law
+    /// ([`PagedKvPool::PAGE_SLOTS`]), restated so the stamp never re-derives it.
+    pub page_slots: u32,
+}
+
 /// THE COUNT OF REAL QUERY ROWS — `mq`: the decode batch size, or a prefill chunk's token rows.
 /// Kind-erased (see [`QueryRows`] for the chunk-vs-batch KIND); this is the pure COUNT, typed so it
 /// cannot stand in for the stick-padded row count ([`MqPad`]), the shared-buffer row extent

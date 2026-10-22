@@ -430,6 +430,13 @@ pub struct BundleLayout {
     /// the pending value.
     #[serde(skip)]
     pub kv_block_index: Option<KvBlockIndexReservation>,
+    /// ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — the ONE `max_pages` derivation (a pool is a
+    /// single flex region, so the ceiling is the device's own cap over this bundle's page
+    /// bytes), recorded where the prefix mask's pass grid is sized and read by the tape walk
+    /// to state the region the fold family's tables and mask describe. `None` for a bundle
+    /// with no attention — and for every bundle baked before the field existed.
+    #[serde(default)]
+    pub paged_fold_region_pages: Option<u32>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate

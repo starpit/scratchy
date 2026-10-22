@@ -64,7 +64,7 @@ Staged by the host, per chunk:
   * `desc_kt`      — the resident K^T plane; this kernel reads it as
                      `[PAGES*NKVH*W4, HD*64]` — one stick block a row.
   * `desc_v`       — the resident V plane; read as `[PAGES*NKVH*W4, 64*HD]`.
-  * `desc_ids_kt`  — the K^T plane's block-entry table, `[PAGES * W4 *
+  * `desc_ids_kt`  — the K^T plane's block-entry table, `[REGION_PAGES * W4 *
                      NKVH*GQA]` i32, page-major, window-major within a page,
                      (kv head, group)-major within a window — the group
                      replication rides the values. Every value is a
@@ -72,7 +72,7 @@ Staged by the host, per chunk:
                      block numbering.
   * `desc_ids_v`   — the V plane's own block-entry table, same shape and
                      order, the V plane's own block numbering.
-  * `desc_mask`    — additive fp16 mask `[PAGES * W4*MQ, 64]`, window-major:
+  * `desc_mask`    — additive fp16 mask `[REGION_PAGES * W4*MQ, 64]`, window-major:
                      row `(s*W4 + w)*MQ + t`, `0.0` where the slot is visible
                      to that query row (within the sequence and causally),
                      `-65504.0` where it is not, or where the query row is
@@ -89,10 +89,20 @@ def batched_prefill_hm(desc_q, desc_o,  #
                        MQ: tl.constexpr, NKVH: tl.constexpr,  #
                        GQA: tl.constexpr, HD: tl.constexpr,  #
                        PAGE_SLOTS: tl.constexpr, PAGES: tl.constexpr,  #
+                       REGION_PAGES: tl.constexpr,  #
                        SCALE: tl.constexpr):
     """One prefill chunk for the whole sequence: a per-(page, window) walk
     over the cached pages through the pool's own index unit, an online
-    softmax folded per trip, one store."""
+    softmax folded per trip, one store.
+
+    `REGION_PAGES` is the extent the two id tables and the mask STATE — the
+    page-major region the host stages and a fold's per-pass segment shift
+    walks — and it is NOT this kernel's walk count (`PAGES` is). On a
+    chunked ladder every rung states the SAME region so their step-input
+    placements agree (`ladder_stages_one_layout`), and the per-page fold
+    body the ladder also bakes reads the same region one page per launch;
+    an unchunked bundle passes `REGION_PAGES = PAGES`, which leaves every
+    descriptor byte for byte what a region-less statement would say."""
     # torch's own batch: the KV heads AND the GQA group ride the score dot's
     # batch axis (the g-replicated id stick states it); M is the chunk's
     # query rows.
@@ -138,18 +148,23 @@ def batched_prefill_hm(desc_q, desc_o,  #
         desc_v, shape=[PAGES * NKVH * W4, 64 * HD],
         strides=[64 * HD, 1], block_shape=[1, 64 * HD])
     # The memory-resident block-entry tables (the host's GatherEntry bytes),
-    # one whole stick of ids per (page, window) trip.
+    # one whole stick of ids per (page, window) trip. ⛔ STATED AT THE REGION,
+    # NOT THE WALK: the extent the host stages is the ladder's own region
+    # (every rung of a chunked ladder states the same one, and a fold's
+    # per-pass shift walks it); the loads below stay inside this kernel's own
+    # `PAGES`-page walk.
     KTB: tl.constexpr = NKVH * GQA
     kt_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_kt, shape=[PAGES * W4 * KTB], strides=[1],
+        desc_ids_kt, shape=[REGION_PAGES * W4 * KTB], strides=[1],
         block_shape=[KTB])
     v_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_v, shape=[PAGES * W4 * KTB], strides=[1],
+        desc_ids_v, shape=[REGION_PAGES * W4 * KTB], strides=[1],
         block_shape=[KTB])
     # The causal mask, window-major within each page, added at the score tile
-    # as a leading stride-0 broadcast.
+    # as a leading stride-0 broadcast — stated at the same region for the
+    # same reason the tables are.
     mask_desc = tl.make_tensor_descriptor(
-        desc_mask, shape=[PAGES * W4 * MQ, 64],
+        desc_mask, shape=[REGION_PAGES * W4 * MQ, 64],
         strides=[64, 1], block_shape=[MQ, 64])
 
     # The running softmax across the walk, per (kv head, group, query row):

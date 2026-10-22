@@ -816,6 +816,11 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     active_cap: ActiveCap,
     // See main's `lower_attn_node`: whether this bundle's rows are separate requests.
     rows_are_requests: bool,
+    // ⭐ THE PAGED-FOLD RUNG, expanded by the walk from the rung's statement and the layout's
+    // region ceiling — `None` on every non-fold walk (the unrolled graph walk, the wiring
+    // walk), `Some` on every rung of a chunked one-request ladder. The splice states the
+    // family only when `fold_body` holds; the other rungs take only the region threading.
+    paged_fold: Option<&scratchy_triton_splice::PagedFoldRung>,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1045,8 +1050,15 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             } else {
                 node
             };
-            match scratchy_triton_splice::lower_attn(node_ref, ir, cap, active_cap, rows_are_requests) {
-                Ok(e) => Ops(vec![e]),
+            match scratchy_triton_splice::lower_attn(
+                node_ref,
+                ir,
+                cap,
+                active_cap,
+                rows_are_requests,
+                paged_fold,
+            ) {
+                Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }
         }
@@ -1110,7 +1122,7 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests, None) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1417,7 +1429,7 @@ pub fn graph_wiring<F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false) {
+                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false, None) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -1572,6 +1584,23 @@ pub struct RungFacts {
     /// The split-KV chunk this rung bakes — see `BundleAttnParams::chunk_pages` (a
     /// one-request or prompt-chunk rung; `None` for the whole-cap rungs).
     pub chunk_pages: Option<u32>,
+    /// ⭐ THE PAGED-FOLD STATEMENT — present on every rung of a chunked ONE-REQUEST decode
+    /// ladder (the shape whose fallback the proof demands): [`PagedFoldStatement`] says
+    /// whether THIS rung is the per-page body. The region's page ceiling is NOT stated here —
+    /// it is the layout's own ONE derivation (`BundleLayout::paged_fold_region_pages`), which
+    /// the walk expands the statement against.
+    pub paged_fold: Option<PagedFoldStatement>,
+}
+
+/// Which role a rung plays in a paged-fold ladder — the fold rung's own statement. `true`
+/// ONLY on the `(FULL, None)` rung: the one whose one-shot attention program the fold family
+/// (seed, per-page body, finalize) replaces. Every other rung of the same ladder states
+/// `false`, which threads the region's page ceiling into its prefill kernel's step-input
+/// extents (the one-layout guard compares Activation placements across rungs) without
+/// minting a fold.
+#[derive(Clone, Copy, Debug)]
+pub struct PagedFoldStatement {
+    pub fold_body: bool,
 }
 
 /// ⭐⭐⭐⭐⭐ THE SCALE-REGISTRY COMPLETION PASS — the program-stated half of
@@ -1833,6 +1862,149 @@ pub fn place_step_inputs(
     Ok(())
 }
 
+/// ⭐ THE PAGED FOLD'S CARRY PLACEMENTS — the (max, sum, accumulator) buffers the fold family
+/// threads between its programs, placed the way [`place_step_inputs`] places host-staged inputs:
+/// from the programs' OWN views, refusing conflicts, before the declare pass can ask for them.
+///
+/// The carry rides the INTERMEDIATE segment (seg0), not the activation segment: it is per-layer
+/// scratch whose lifetime is the three sequential launches of one fold statement, never
+/// host-staged, and for the whole-batch m=1 fold the runtime's per-pass intermediate delta is
+/// zero — so an UNshifted seg0 placement is exactly the one the passes need. It is also the
+/// role `ladder_stages_one_layout` does NOT compare across rungs (only Activation placements
+/// are compared), so the carry may exist in the fold rung's bundle alone without failing the
+/// one-layout guard — the fold rung is the only one whose programs bind these tids at all.
+///
+/// Only the fold family's programs ever bind a [`PagedFoldCarry`] tid (the reserved region is
+/// minted by the splice and by nobody else), so binding presence is the trigger: no fold
+/// statement, no placement, byte-identical bundle.
+pub fn place_paged_fold_carry(
+    layout: &mut BundleLayout,
+    op_lists: &[&[EmittedOp]],
+) -> Result<(), SuperDscError> {
+    use ktir_superdsc::reserved_tids::{is_paged_fold_carry, PagedFoldCarry};
+    for ops in op_lists {
+        for e in ops.iter() {
+            let Some(k) = e.ktir.as_ref() else { continue };
+            // The carry tids THIS program binds — most programs bind none, and the regs walk
+            // below only runs for the fold family's three.
+            let carries: Vec<u32> = k
+                .bindings
+                .iter()
+                .map(|b| b.get())
+                .filter(|tid| is_paged_fold_carry(*tid))
+                .collect();
+            if carries.is_empty() {
+                continue;
+            }
+            // The program's own parameter rows — one `regions` walk per program that binds a carry.
+            let regs = ktir_superdsc::emit::lower_ktir_to_superdsc::regions(k)
+                .map_err(|err| SuperDscError(format!("{}: {}", e.op_name, err.message)))?;
+            for tid in carries {
+                let binding = k
+                    .bindings
+                    .iter()
+                    .position(|b| b.get() == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the carry t{tid} is filtered from this program's own bindings — \
+                             the filter and the search disagree, which cannot happen",
+                            e.op_name
+                        ))
+                    })?;
+                let region = regs
+                    .iter()
+                    .find(|r| r.tid == tid)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the carry t{tid} is bound but states no view — nothing says how \
+                             wide the buffer it addresses is",
+                            e.op_name
+                        ))
+                    })?;
+                let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
+                    .ok_or_else(|| {
+                        SuperDscError(format!(
+                            "{}: the carry t{tid}'s view states a dtype with no stick geometry, so \
+                             this ladder cannot size the buffer the program reads",
+                            e.op_name
+                        ))
+                    })?;
+                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                let seg = SegRole::Intermediate.segment();
+                match layout.placements.get(&tid) {
+                    // Every layer's fold statement states the same carry: the second sighting
+                    // must AGREE.
+                    Some(p) => {
+                        if p.role != SegRole::Intermediate
+                            || p.segment != seg
+                            || p.size != size
+                        {
+                            return Err(SuperDscError(format!(
+                                "{}: t{tid} is stated as a carry of {} B, but the bundle already \
+                                 places it as {} B in segment {} — two programs disagree about one \
+                                 buffer's extent",
+                                e.op_name, size, p.size, p.segment
+                            )));
+                        }
+                    }
+                    None => {
+                        let off = layout.segment_bytes[seg];
+                        layout.placements.insert(
+                            tid,
+                            TensorPlacement {
+                                tid,
+                                bank: 0,
+                                role: SegRole::Intermediate,
+                                segment: seg,
+                                offset: off,
+                                size,
+                            },
+                        );
+                        layout.segment_bytes[seg] = align128(off + size);
+                        // ⛔ THE SYNTH CURSOR RIDES ABOVE THE CARRY. The synth allocator was
+                        // seeded at the seg0 head `compute_bundle_layout` left (synthetics are
+                        // the only role-packed residents of this segment), and this pass just
+                        // spent that head — a synthetic minted after this point must start
+                        // ABOVE the carry, or the two silently share bytes (the exact defect
+                        // the identity row below exists to prevent, on the other side).
+                        let mut synth = layout.synth.borrow_mut();
+                        synth.next = synth.next.max(layout.segment_bytes[seg]);
+                        // THE IDENTITY ROW, the same one every placement pass writes: without it
+                        // `resolve_seg_base` treats the program's own parameter as an undeclared
+                        // synthetic. The reserved region's tids collide with nothing — the
+                        // regions are proven disjoint.
+                        layout.ids.borrow_mut().insert(
+                            ktir_superdsc::place::act_name(tid),
+                            ktir_superdsc::place::PlaceId::Act(tid),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // ⛔ EVERY CARRY SLOT HAS A PLACEMENT OR NONE OF THEM DO: the three are one thread of
+    // execution (seed writes all three, the body reads and writes all three, finalize reads
+    // two). A family that places only some of its carry would run a pass against a placement
+    // the door refuses — a bound parameter with no view-backed bytes.
+    let placed = [
+        PagedFoldCarry::Max.tid(),
+        PagedFoldCarry::Sum.tid(),
+        PagedFoldCarry::Acc.tid(),
+    ]
+    .into_iter()
+    .filter(|tid| layout.placements.contains_key(tid))
+    .count();
+    if placed != 0 && placed != 3 {
+        return Err(SuperDscError(format!(
+            "the paged fold's carry is placed for {} of its 3 parts — the (max, sum, accumulator) \
+             are one thread of execution and only a partial placement could produce this, which \
+             means some fold program stated a view the others did not",
+            placed
+        )));
+    }
+    Ok(())
+}
+
 /// RE-ROLLED tape-driven SuperDSC lowering — the mirror of `lower_subtile_tape_to_tk_tape`
 /// for SuperDSC (the fix for the 40-min unrolled-bundle compile). Walks the rerolled
 /// `tape` (`subtile_tape::reroll_subtile_tape`): pre-loop Computes → `prefix`; the
@@ -1858,6 +2030,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let RungFacts {
         one_request: one_request_decode,
         chunk_pages,
+        paged_fold,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
     // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
@@ -1895,6 +2068,23 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         rows_are_requests || chunk_pages.is_some(),
         &per_layer_ext,
     )?;
+    // ⭐ THE PAGED-FOLD RUNG STATEMENT, expanded against the layout's ONE `max_pages` derivation
+    // (`BundleLayout::paged_fold_region_pages`, recorded beside the prefix mask it sizes) — the
+    // walk never re-derives the ceiling, and a statement without a derivation is a REFUSAL,
+    // because a fold family whose tables state a region the bundle never sized is a bundle whose
+    // step-input extents answer a question nobody asked.
+    let paged_fold: Option<scratchy_triton_splice::PagedFoldRung> = match paged_fold {
+        None => None,
+        Some(stmt) => Some(scratchy_triton_splice::PagedFoldRung {
+            region_pages: bundle_layout.paged_fold_region_pages.ok_or_else(|| {
+                SuperDscError(
+                    "reroll-superdsc: this rung states a paged fold but the bundle layout                      carries no region page ceiling — a graph with no attention placement                      cannot be a fold rung"
+                        .to_string(),
+                )
+            })?,
+            fold_body: stmt.fold_body,
+        }),
+    };
     // ── THE TAPE'S SEGMENTS: prefix, ONE RANGE PER LOOP (an attention class's body), suffix ──
     // The rolled tape is `prefix; [OpenLoop(body₀) CloseLoop]…[OpenLoop(bodyₙ) CloseLoop]; suffix`
     // — sibling loops, never nested (the TapeBuilder typestate forbids nesting). One `(range,
@@ -2306,7 +2496,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests) {
+                match lower_one_node(n, ir, active_cap, rows_are_requests, paged_fold.as_ref()) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);
@@ -2417,6 +2607,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     step_input_lists.extend(body_op_lists.iter().map(|v| v.as_slice()));
     step_input_lists.push(&suffix);
     place_step_inputs(&mut bundle_layout, &step_input_lists, ir.tensors.len() as u32)?;
+    // ⭐ THE FOLD'S CARRY, placed from the fold family's own views the same pass — seg0
+    // Intermediate, guard-invisible across rungs (only Activation placements are compared), so
+    // the fold rung's bundle may carry it alone. Before the declare pass, for the same reason
+    // the step inputs are.
+    place_paged_fold_carry(&mut bundle_layout, &step_input_lists)?;
     // ⭐⭐⭐ THE SAME COMPLETION, over the SAME program lists the declare pass below lowers —
     // before that pass, because the door resolves a folded constant by bits. Bits-sorted
     // appends, so this walk's prefix→bodies→suffix order and `graph_wiring`'s node order

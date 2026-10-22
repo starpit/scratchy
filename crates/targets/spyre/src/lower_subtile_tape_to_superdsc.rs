@@ -198,7 +198,7 @@ pub use ktir_superdsc::reserved_tids::{
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
 // (which aliases this module as `superdsc`) constructs it, so it spells through this
 // module's path.
-pub use crate::lower_subtile_tape_to_ktir::RungFacts;
+pub use crate::lower_subtile_tape_to_ktir::{PagedFoldStatement, RungFacts};
 
 // ⭐⭐⭐ THE MEMORY PLAN LIVES IN `ktir_superdsc::placement` — `SegRole`, `TensorPlacement`,
 // `RetileDescriptor`, `BundleLayout` and its whole impl, `SynthAlloc`, `align128`, `syn`.
@@ -829,6 +829,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
 
     let mut placements: std::collections::BTreeMap<u32, TensorPlacement> = Default::default();
     let mut seg_bytes = [0u64; 7];
+    // ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — None until the attention placement below derives it
+    // (the SAME `max_pages` that sizes the prefix-validity mask's rows), then carried on the layout so
+    // the tape walk states the fold family's tables and mask at the region they actually describe —
+    // ONE derivation, one field, no re-computation in the walk.
+    let mut paged_fold_region_pages: Option<u32> = None;
     // Set by the paged-KV placement below, from the SAME `PagedKvPool` that sized the placement, so the
     // stride the runtime shifts by and the stride the addresses were baked with are one value.
     let kv_request_stride_bytes: u64 = 0;
@@ -1663,6 +1668,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 let layers = kv_layers;
                 let page_bytes = pool.layer_stride() as u64 * 2 * layers;
                 let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+                // The fold family's region states the SAME ceiling: recorded here, beside its one
+                // derivation, so the walk reads it off the layout instead of re-deriving it.
+                paged_fold_region_pages = Some(max_pages.min(u32::MAX as u64) as u32);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
                 // separate requests and each carries its own history. The multiplier is the op row
                 // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
@@ -2053,6 +2061,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // derivation above); the walk's `place_kv_block_index_last` spends it after the last
         // host-staged placement.
         kv_block_index,
+        paged_fold_region_pages,
     })
 }
 
@@ -6112,6 +6121,12 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // address — so an unspent reservation is a `cargo build` panic (this runs at bake),
         // never a silent `gathers_kv: false`.
         kv_block_index,
+        // EMIT-ONLY: the paged-fold region's page ceiling is the WALK's input — the fact the
+        // fold family's tables and mask state their extents against. The baked artifact carries
+        // those extents themselves (the step-input placements below), and the runtime's fold
+        // passes answer "how many" from the launch group's own declaration, never by re-reading
+        // a ceiling — so there is nothing for the bake to carry.
+        paged_fold_region_pages: _,
     } = l;
     assert!(
         kv_block_index.is_none(),
@@ -7408,12 +7423,27 @@ fn ktir_groups_via_superdsc(
             ))
         })?;
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
+        let mut lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
             .map_err(|err| {
                 SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
             })?;
         drop(_pc_cls);
         crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
+        // ⭐ THE PAGED-FOLD STAMP — the CHAIN-OF-CUSTODY step. The splice states the fold on the
+        // program's EmittedOp (`kv_paged_fold`, the ONE door: no other site may set it); THIS is
+        // where it reaches the descriptors the bake actually groups, copied VERBATIM onto every
+        // op the door minted from that program — the walk derives nothing, the stamp recomputes
+        // nothing, and `emitted_bundle_folds`'s proof reads what this wrote. A program that
+        // states no fold stamps nothing, so every non-fold bundle stays byte-identical.
+        if let Some(facts) = e.kv_paged_fold {
+            for o in &mut lowered {
+                o.kv_page_fold = true;
+                o.kv_batched_requests = facts.batched_requests;
+                o.kv_gathered = facts.gathered;
+                o.kv_fold_rows = facts.fold_rows;
+                o.kv_page_slots = facts.page_slots;
+            }
+        }
         // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`
         // pre-unrolls each op into `concrete_trips(e)` — `EmittedOp::time` trips, set by
         // `WorkPlan::time_tile_for_lx` when a per-core tile does not fit the scratchpad. So a bundle's

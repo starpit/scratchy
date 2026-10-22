@@ -401,7 +401,7 @@ pub fn rope_p_class_hds(hds: impl Iterator<Item = u32>) -> Vec<u32> {
 }
 
 /// Every reserved region, in one place. Order is high tid → low.
-pub const RESERVED_REGIONS: [TidRegion; 7] = [
+pub const RESERVED_REGIONS: [TidRegion; 8] = [
     // The single sentinels (`ROPE_P_TID` .. `IDENTITY_TID`) occupy MAX-1 .. MAX-19.
     TidRegion {
         name: "sentinels",
@@ -459,6 +459,18 @@ pub const RESERVED_REGIONS: [TidRegion; 7] = [
         name: "kct_resident",
         base: u32::MAX - 1_000_171,
         slots: 1_000_000,
+    },
+    // ⭐ THE PAGED-FOLD CARRY — the online-softmax state (max, sum, accumulator) the per-page
+    // fold body reads and writes in the INTERMEDIATE segment, one placement per family. It is
+    // NOT worker-staged (the seed program writes it on-card once per step, before the first
+    // pass), so unlike a step input it needs a placement the walk cannot mint from a program
+    // view — the census places these tids, gated on the ladder's fold statement. Three slots:
+    // the max row, the sum row, the accumulator. Sits BELOW `kct_resident`'s floor, the next
+    // rung of free space above the real tensor ids (~thousands), addressed by name.
+    TidRegion {
+        name: "paged_fold_carry",
+        base: u32::MAX - 2_000_171,
+        slots: 8,
     },
 ];
 
@@ -539,6 +551,7 @@ pub const EVERY_NAMED_REGION_RESOLVES: () = {
     assert!(reserved_region("rope_p_class").base == ROPE_P_CLASS_BASE);
     assert!(reserved_region("identity_class").base == IDENTITY_CLASS_BASE);
     assert!(reserved_region("kct_resident").slots > 0);
+    assert!(reserved_region("paged_fold_carry").slots >= 3);
 };
 
 pub const SENTINELS_ARE_INSIDE_THEIR_REGION: () = {
@@ -622,6 +635,40 @@ pub const OPROJ_HEADMAJOR_BASE: u32 = reserved_region("oproj_headmajor").base;
 /// Reserved tid for the head-major permuted copy of the o_proj weight with source tid `w_id`.
 pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
     reserved_region("oproj_headmajor").at(w_id)
+}
+
+/// ONE PART OF THE PAGED FOLD'S CARRY — which tensor of the (max, sum, accumulator) triple a
+/// placement or a binding names. The fold body loads all three at the top of a pass and stores
+/// them back at the bottom; the seed program writes all three; the finalize reads the sum and
+/// the accumulator. Numbered as a region and not named as three sentinels because nothing but
+/// the splice's mint and the census's placement ever spell them, and both hold this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagedFoldCarry {
+    /// The running max, `[BATCH*MQ]` f32 — the finite −65504 sentinel at the seed.
+    Max,
+    /// The running softmax denominator, `[BATCH*MQ]` f32.
+    Sum,
+    /// The running weighted accumulator, `[BATCH*MQ, HD]` f16.
+    Acc,
+}
+
+impl PagedFoldCarry {
+    /// This part's reserved tid — the one placement the census mints for it.
+    pub fn tid(self) -> u32 {
+        reserved_region("paged_fold_carry").at(match self {
+            PagedFoldCarry::Max => 0,
+            PagedFoldCarry::Sum => 1,
+            PagedFoldCarry::Acc => 2,
+        })
+    }
+}
+
+/// Whether `tid` is one of the paged fold's three carry tensors — the placement pass's own
+/// question, answered by the region so no caller spells a sentinel. Everything outside the
+/// region — graph tensors, step inputs, other reserved regions — answers `false`.
+pub const fn is_paged_fold_carry(tid: u32) -> bool {
+    let region = reserved_region("paged_fold_carry");
+    region.floor() <= tid && tid <= region.base
 }
 
 /// ⛔⛔⛔ THE REGRESSION THAT ADDING A REGION CAUSED, PINNED — a resident Kᵗ kernel and the gather's

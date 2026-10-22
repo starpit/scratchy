@@ -11112,6 +11112,17 @@ fn dump_wavefront_mega(
                                 superdsc::RungFacts {
                                     one_request,
                                     chunk_pages: chunk_ceiling,
+                                    // ⭐ THE CEILING'S PAGED-FOLD STATEMENT — a chunked ONE-REQUEST
+                                    // decode ladder threads the fold region into every rung's
+                                    // step-input extents (the one-layout guard compares them across
+                                    // rungs), and the ceiling is one of those rungs. The ceiling
+                                    // itself is a CHUNK (its `chunk_pages` is the widest chunk), so
+                                    // it is NOT the fold body: `fold_body: false` states the region
+                                    // without minting a family. The `(FULL, None)` rung below the
+                                    // ceiling is the body.
+                                    paged_fold: (chunk_ceiling.is_some() && one_request).then(|| {
+                                        superdsc::PagedFoldStatement { fold_body: false }
+                                    }),
                                 },
                             ) {
                                 Ok(rolled) => {
@@ -11503,6 +11514,24 @@ fn dump_wavefront_mega(
                                                         superdsc::RungFacts {
                                                             one_request,
                                                             chunk_pages: rung_chunk,
+                                                            // ⭐ THE RUNG'S PAGED-FOLD STATEMENT — every rung of the
+                                                            // same chunked one-request ladder states the region
+                                                            // (`fold_body: false`), and exactly the `(FULL, None)`
+                                                            // rung — the per-page body the widest chunk's contexts
+                                                            // fall back to — is the fold itself: its one-shot
+                                                            // attention program is REPLACED by the three-program
+                                                            // family (seed, per-page body, finalize), which the
+                                                            // proof reads off the emitted fold groups.
+                                                            paged_fold: (chunk_ceiling.is_some()
+                                                                && one_request)
+                                                                .then(|| {
+                                                                    superdsc::PagedFoldStatement {
+                                                                        fold_body: matches!(
+                                                                            rung,
+                                                                            scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL
+                                                                        ) && rung_chunk.is_none(),
+                                                                    }
+                                                                }),
                                                         },
                                                     ) {
                                                         // Same device split as the ceiling rung above: the
