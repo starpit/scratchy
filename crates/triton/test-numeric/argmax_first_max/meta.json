@@ -11,7 +11,8 @@
     "V": 49155,
     "PAD_V": 65536,
     "NB": 1024,
-    "BLOCK": 64
+    "BLOCK": 64,
+    "W": 128
   },
   "grid": [
     1
@@ -76,6 +77,15 @@
       "dtype": "f32"
     },
     {
+      "arg": "vbound_ptr",
+      "file": "in_vbound_ptr.bin",
+      "shape": [
+        1,
+        64
+      ],
+      "dtype": "f32"
+    },
+    {
       "arg": "padoff_ptr",
       "file": "in_padoff_ptr.bin",
       "shape": [
@@ -100,6 +110,95 @@
       "dtype": "f16"
     },
     {
+      "arg": "table_ptr",
+      "file": "in_table_ptr.sparse",
+      "shape": [
+        49156,
+        128
+      ],
+      "dtype": "f16",
+      "sparse": {
+        "format": "SPRSTBL1",
+        "full_shape": [
+          49156,
+          128
+        ],
+        "dtype": "f16",
+        "itemsize": 2,
+        "n_present": 2,
+        "absent_rows": "zero",
+        "endian": "little",
+        "header": [
+          {
+            "field": "magic",
+            "offset": 0,
+            "size": 8,
+            "type": "ascii",
+            "value": "SPRSTBL1"
+          },
+          {
+            "field": "rows",
+            "offset": 8,
+            "size": 8,
+            "type": "u64"
+          },
+          {
+            "field": "cols",
+            "offset": 16,
+            "size": 8,
+            "type": "u64"
+          },
+          {
+            "field": "itemsize",
+            "offset": 24,
+            "size": 4,
+            "type": "u32"
+          },
+          {
+            "field": "n_present",
+            "offset": 28,
+            "size": 4,
+            "type": "u32"
+          }
+        ],
+        "records": {
+          "offset": 32,
+          "count": 2,
+          "stride": 260,
+          "order": "row_index ascending, each row_index distinct and < rows",
+          "layout": [
+            {
+              "field": "row_index",
+              "size": 4,
+              "type": "u32"
+            },
+            {
+              "field": "row",
+              "size": 256,
+              "type": "128 x f16 contiguous"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "arg": "rowidx_ptr",
+      "file": "in_rowidx_ptr.bin",
+      "shape": [
+        64
+      ],
+      "dtype": "i32"
+    },
+    {
+      "arg": "row_ptr",
+      "file": "in_row_ptr.bin",
+      "shape": [
+        1,
+        128
+      ],
+      "dtype": "f16"
+    },
+    {
       "arg": "idx_ptr",
       "file": "in_idx_ptr.bin",
       "shape": [
@@ -117,5 +216,5 @@
     ],
     "dtype": "i32"
   },
-  "reference_note": "THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE CONTRACT, AND THERE ARE THREE: (1) a last-max implementation answers 48000 against these same bytes and must not match `ref_out.bin`; a run that still matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers 40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at [32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 cannot match either; a run that still matches cannot have degraded. The tie lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's exact-integer range and could not see (2) at all. (3) THE PADOFF CONTROL: the row's pads past V=49155 hold 0.0 -- the production shape, the lm-head's zero-pad columns -- and the real lanes sit BELOW ZERO, so a kernel that maxes the RAW row answers a pad lane; only `x + padoff` (the staged offset row, -inf past V) keeps the answer on the real lanes. A kernel that lets a pad lane win answers PAD_V-adjacent garbage, never 40017."
+  "reference_note": "THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE CONTRACT, AND THERE ARE FOUR: (1) a last-max implementation answers 48000 against these same bytes and must not match `ref_out.bin`; a run that still matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers 40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at [32768, 65536)) -- so a kernel whose `b*64 + l` island collapsed out of f32 cannot match either; a run that still matches cannot have degraded. The tie lanes are high ON PURPOSE: the original 100/5000 stimulus sat inside fp16's exact-integer range and could not see (2) at all. (3) THE PADOFF CONTROL: the row's pads past V=49155 hold 0.0 -- the production shape, the lm-head's zero-pad columns -- and the real lanes sit BELOW ZERO, so a kernel that maxes the RAW row answers a pad lane; only `x + padoff` (the staged offset row, -inf past V) keeps the answer on the real lanes. A kernel that lets a pad lane win answers PAD_V-adjacent garbage, never 40017. (4) THE ROW-FEEDBACK CONTROL: `in_table_ptr.sparse` holds ONLY the answer row and the pad row (row 49155, randn bytes, deliberately unlike production's zeros) -- every other row expands to zero, so a gather that reads any row but the clamped answer answers zeros and diverges from the byte-exact row pin; and the sentinel leg (an all-NaN logits row, bound by the test over these same bytes) must land the clamp on the PRESENT pad row, whose nonzero bytes prove the landing row by name."
 }

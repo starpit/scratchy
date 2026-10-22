@@ -85,7 +85,13 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "fixtures"))
+# `../test-fixtures` — the fixtures' real home. A wrong default here does not fail loudly:
+# `importlib` falls through every nonexistent path entry and binds the FIRST namespace
+# package named like the fixture — this script's own output dir
+# (`test-numeric/<config>/`, the .bin files) — which imports "cleanly" and then has no
+# `inputs`. Measured on the pod: `AttributeError: module 'argmax_first_max' has no
+# attribute 'inputs'` over a data directory.
+_FIXTURES = os.path.abspath(os.path.join(_HERE, "..", "test-fixtures"))
 
 SEED = 0
 
@@ -178,8 +184,9 @@ def _attn_ce_1tile():
 def _argmax_ce():
     # A copy of the `argmax` row in `triton-ktir-superdsc/src/cases.rs` (the authority).
     # PAD_V is the host-side -inf padding of the vocab row to a whole power-of-two row
-    # (the descriptor block's law); NB is the two-level split's block count.
-    return {"V": 49155, "PAD_V": 65536, "NB": 1024, "BLOCK": 64}
+    # (the descriptor block's law); NB is the two-level split's block count; W is the
+    # row-feedback width (one embedding row's device elements).
+    return {"V": 49155, "PAD_V": 65536, "NB": 1024, "BLOCK": 64, "W": 128}
 
 
 CONFIGS = {
@@ -563,7 +570,8 @@ def _mul_scale_inputs(mod, ce):
 
 
 def _argmax_inputs(mod, ce):
-    row, bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc = mod.inputs(seed=SEED)
+    row, bramp, lramp, binc, linc, ones, sixtyfour, vbound, padoff, \
+        gramp, ginc, table = mod.inputs(seed=SEED)
     ref = mod.reference(row)
     # THE OUTPUT IS ONE i32 LANE, not an fp16 tile: this is the first config whose
     # reference is an INDEX (the gather ingestion dtype), so `out_dtype` below is
@@ -579,19 +587,39 @@ def _argmax_inputs(mod, ce):
     # vocabs, and a single V - i ramp would need 49155). THE TWO WIDEN TABLES
     # are the [1, BLOCK] ones row (f16) and 64.0 row (f32) the output-stick widen
     # and the island's scale read -- loaded, never splatted, so every multiply in
-    # the kernel stays a two-tensor op. THE OFFSET ROW is the pad law: 0.0 on the
+    # the kernel stays a two-tensor op. THE V-BOUND TABLE is the [1, BLOCK] f32
+    # row of V the row-feedback clamp reads -- staged for the same no-splat law
+    # (a `tl.full` constant tile is a `tensor.splat` operand the whole-function
+    # door refuses by design), keeping the clamp a two-tensor Elementwise(Minimum).
+    # THE OFFSET ROW is the pad law: 0.0 on the
     # real lanes, -inf on the pads, added before the kernel's first max.
+    # THE ROW-FEEDBACK TABLE is stored SPARSELY (the embedding configs' own law):
+    # the kernel reads exactly ONE row -- the clamped answer -- so only the answer
+    # row and the PAD ROW (the all-NaN sentinel's clamp landing row) are kept. An
+    # absent row expands to ZERO, so a gather that misses the clamped row reads
+    # zeros and the byte-exact row comparison DIVERGES: the encoding can produce a
+    # false FAILURE but never a false PASS, the embedding note's own soundness
+    # argument. The pad row is PRESENT with its randn bytes (nonzero, unlike
+    # production's zeros) so the sentinel leg proves the clamp landed on row V by
+    # name rather than on any zeros-expanding accident.
+    answer = int(ref[0].item())
+    present = torch.tensor([answer, ce["V"]], dtype=torch.int32)
+    w = ce["W"]
     ins = [("logits_ptr", row, "f16"), ("bramp_ptr", bramp, "f16"),
            ("lramp_ptr", lramp, "f16"), ("binc_ptr", binc, "f16"),
            ("linc_ptr", linc, "f16"), ("ones_ptr", ones, "f16"),
-           ("sixtyfour_ptr", sixtyfour, "f32"), ("padoff_ptr", padoff, "f16"),
+           ("sixtyfour_ptr", sixtyfour, "f32"), ("vbound_ptr", vbound, "f32"),
+           ("padoff_ptr", padoff, "f16"),
            ("gramp_ptr", gramp, "f16"), ("ginc_ptr", ginc, "f16"),
+           ("table_ptr", table, "f16", ("sparse", present)),
+           ("rowidx_ptr", torch.zeros(64, dtype=torch.int32), "i32"),
+           ("row_ptr", torch.zeros(1, w, dtype=torch.float16), "f16"),
            ("idx_ptr", torch.zeros(64, dtype=torch.int32), "i32")]
     note = (
         f"THE STIMULUS CARRIES A REAL TIE AT HIGH LANES: 40017 and 48000 both hold the "
-        f"row's maximum, so `ref_out.bin`'s single lane is 40017 -- FIRST-max pinned "
+        f"row's maximum, so `ref_out.bin`'s single lane is {answer} -- FIRST-max pinned "
         f"against a tie, not a vacuous uniqueness. THE NEGATIVE CONTROLS ARE PART OF THE "
-        f"CONTRACT, AND THERE ARE THREE: (1) a last-max implementation answers 48000 "
+        f"CONTRACT, AND THERE ARE FOUR: (1) a last-max implementation answers 48000 "
         f"against these same bytes and must not match `ref_out.bin`; a run that still "
         f"matches cannot have taken the tie. (2) an f16-DEGRADED FINAL COMBINE answers "
         f"40032 or 40016 -- 40017 = 625*64 + 17 is not fp16-representable (ULP 32 at "
@@ -603,7 +631,14 @@ def _argmax_inputs(mod, ce):
         f"zero-pad columns -- and the real lanes sit BELOW ZERO, so a kernel that maxes "
         f"the RAW row answers a pad lane; only `x + padoff` (the staged offset row, "
         f"-inf past V) keeps the answer on the real lanes. A kernel that lets a pad "
-        f"lane win answers PAD_V-adjacent garbage, never 40017."
+        f"lane win answers PAD_V-adjacent garbage, never 40017. (4) THE ROW-FEEDBACK "
+        f"CONTROL: `in_table_ptr.sparse` holds ONLY the answer row and the pad row "
+        f"(row {ce['V']}, randn bytes, deliberately unlike production's zeros) -- every "
+        f"other row expands to zero, so a gather that reads any row but the clamped "
+        f"answer answers zeros and diverges from the byte-exact row pin; and the "
+        f"sentinel leg (an all-NaN logits row, bound by the test over these same "
+        f"bytes) must land the clamp on the PRESENT pad row, whose nonzero bytes prove "
+        f"the landing row by name."
     )
     return ins, ref, note
 

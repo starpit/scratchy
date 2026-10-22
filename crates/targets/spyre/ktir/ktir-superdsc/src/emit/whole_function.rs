@@ -2805,6 +2805,36 @@ pub fn lower_function(
     };
 
     for op in f.operations.iter() {
+        // ⭐⭐⭐⭐⭐ THE DEVICE-SIDE GATHER-COPY — a `ktdp.store` whose VALUE is a gathered load.
+        //
+        // A program that copies `table[idx]` into an output parameter states the gather and the
+        // store and NOTHING else: the value is plumbing (a load), so no compute op's input ever
+        // carries the tile, and the walk's gather join — which fires only on classified compute
+        // ops — would leave the gather uncarried and the final `gather_carried` check would
+        // refuse it. That refusal is right about every body that CONSUMES the gathered rows, and
+        // wrong about the one that merely MOVES them: the copy is not "a descriptor reading the
+        // table at its base" waiting to happen, it is the `test_gather_1core` shape — an
+        // `identity` pointwise carrying the index operand — and the door already owns its
+        // emission ([`gathered_matmul_materializes`] mints exactly it for a gathered matmul-B,
+        // through [`assemble_pointwise_broadcast_gather`]). This branch is that emission at its
+        // third call site: no mint (the store's own output parameter is the destination), no
+        // scale (the op is `identity`, so the copy is byte-exact), and the store's own position
+        // in the program order (dxp runs call order, and the rows this copies can be read by
+        // nothing earlier in the function anyway — the store is their first write).
+        //
+        // ⛔ THE BRANCH SITS BEFORE THE PLUMBING SKIP because `ktdp.store` is plumbing — a store
+        // of a COMPUTE result is folded into that op's emission and never reaches the loop top,
+        // so the only stores left by this point are copies, and the gathered-load lookup by
+        // identity ([`Gather::load`]) is what keeps this from touching any of them.
+        if op.op_type == OpKind::KtdpStore
+            && let Some(&ti) = op.operands.first().and_then(|v| gathered_loads.get(v))
+        {
+            let mut copied = gathered_store_copy(k, layout, op, &gathers[ti], sym_id_base)?;
+            out.append(&mut copied);
+            gather_carried[ti] = true;
+            lowered += 1;
+            continue;
+        }
         if is_plumbing(op.op_type) {
             continue;
         }
@@ -4087,6 +4117,209 @@ fn gathered_matmul_materializes(
     // and the caller REPLACES `per_op`'s B slot with it before `emit_one` runs.
     inter.insert(gathered_result, r);
     Ok(true)
+}
+
+/// ⭐⭐⭐⭐⭐ THE DEVICE-SIDE GATHER-COPY — a `ktdp.store` whose VALUE is a gathered load, emitted
+/// as the `test_gather_1core` identity the door already owns.
+///
+/// # WHY THIS IS A THIRD CALL SITE AND NOT A NEW EMISSION
+///
+/// [`gathered_matmul_materializes`] mints exactly this op for a gathered matmul-B (an `identity`
+/// pointwise carrying the index operand, through [`assemble_pointwise_broadcast_gather`]), and the
+/// scalarmul's gathered arm reaches the same assembler for a gathered `multiply`. A program that
+/// merely MOVES the gathered rows — `table[ids] → out`, no compute — states the gather, the store,
+/// and nothing else: the value is plumbing, so no classified op's input ever carries the tile, and
+/// without this door the final `gather_carried` check refuses the whole function. The copy is not
+/// "a descriptor reading the table at its base" waiting to happen — it is the identity gather the
+/// vendor fixture ships — so the door lowers it rather than demanding a compute op the producer
+/// has no need to state.
+///
+/// # THE SEALS (each refuses by name; each is a fact read from the program, never a default)
+///
+/// * ⛔ THE GATHERED LOAD HAS EXACTLY ONE CONSUMER, THIS STORE — rung 4's own seal. A second
+///   consumer needs its own op, and the compute-op join carries its own gather; a copy standing
+///   for two readers would emit one of them.
+/// * ⛔ THE STORE'S OWN TILE IS THE OUTPUT's WINDOW — the store arm's own law
+///   ([`region_of_view_operand`] + [`windowed_region`]), so a banded store addresses the band it
+///   stated, never the parameter's whole view.
+/// * ⛔ THE STORE's WINDOW IS THE GATHERED TILE's SHAPE, EXACTLY — the copy writes whole gathered
+///   rows; a narrower or wider window is a new producer form, refused rather than truncated.
+/// * ⛔ THE COLUMN CORNER IS 0 — the gather addresses its table from the base, so a column-blocked
+///   destination cannot be gathered (the scalarmul's own seal).
+/// * ⛔ THE INDEX BUFFER HOLDS THE RUN — `first_entry + rows` entries at most. The idx→address
+///   program converts one entry per gathered row, so a run past the buffer's end reads whatever is
+///   placed next. (Not EQUALITY: the slab spelling reads ONE word out of a whole stick — the
+///   [1, 64] i32 index stick of the argmax row feedback — so the buffer may legitimately hold
+///   more entries than the run takes. The bound is the sound fact; the equality the scalarmul
+///   states is its `[BLOCK_M]`-shaped own.)
+/// * ⛔ THE ROWS' FORMAT IS fp16/fp32 — the identity gather's stick basis is stated for exactly
+///   those pointwise tiles; anything else is a new producer form, refused by name rather than
+///   emitted on the wrong stick.
+///
+/// # WHY NO MINT
+///
+/// Rung 4 mints an intermediate because a MATMUL consumes the copy; here the store's own output
+/// parameter is the destination, already placed by the caller — `mint_ew_output` inside the
+/// assembler checks the placement holds `[rows, head]`, exactly as it does for the scalarmul's
+/// gathered store.
+fn gathered_store_copy(
+    k: &KtirNode,
+    layout: Option<&BundleLayout>,
+    store: &ktir_core::ir::Operation<'static>,
+    g: &Gather,
+    sym_id_base: &mut i64,
+) -> Result<Vec<super::EmittedOp>, Error> {
+    let f = &k.func;
+    // ⛔ ONE CONSUMER, THIS STORE — rung 4's seal, verbatim in intent.
+    let consumers = f
+        .operations
+        .iter()
+        .filter(|o| o.operands.contains(&g.load))
+        .count();
+    if consumers != 1 {
+        return err(format!(
+            "{}: the gathered rows t{} have {} consumer(s) in this function — the copy this door \
+             emits for a gathered store stands for exactly one, and a second consumer needs its \
+             own op. Split the program so each gathered read is its own store.",
+            f.name, g.load.0, consumers,
+        ));
+    }
+    // THE STORE's OWN OUTPUT WINDOW — the store arm's own law, stated for this copy.
+    let out_tile = store.operands.get(1).copied();
+    let tile = f
+        .operations
+        .iter()
+        .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
+    let Some(tile) = tile else {
+        return err(format!(
+            "{}: the gathered copy's `ktdp.store` names no access tile",
+            f.name
+        ));
+    };
+    let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+        return err(format!(
+            "{}: the gathered copy's `ktdp.store` names no parameter",
+            f.name
+        ));
+    };
+    o = windowed_region(k, o, tile)?;
+    o.is_out = true;
+    // THE INDEX BUFFER IS A BOUND PARAMETER — the gather join's own resolution, so this door and
+    // the compute-op join cannot disagree about the index's placement.
+    let idx_r = f
+        .arguments
+        .iter()
+        .zip(k.bindings.iter())
+        .position(|(_, b)| b.get() == g.index_tid)
+        .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
+    let Some(idx_r) = idx_r else {
+        return err(format!(
+            "{}: the program gathers through t{}, which is not one of this function's bound \
+             parameters — an index buffer with no binding has no placement and no stated length, \
+             and the descriptor makes dbo's idx→address program iterate one entry per row of the \
+             node",
+            f.name, g.index_tid
+        ));
+    };
+    // THE INDIRECT TILE, by identity — rung 4's own lookup, so the walk and this copy cannot
+    // disagree about which trip's gather this is.
+    let Some(indirect) = f.operations.iter().find(|o| o.result == Some(g.tile)) else {
+        return err(format!(
+            "{}: the walk proved the store reads a gather whose tile is t{}, but no operation in \
+             this function states that result — the walk and the program disagree",
+            f.name, g.tile.0,
+        ));
+    };
+    let Some((rows, head)) = super::lower_ktir_to_superdsc::shape_2d(indirect) else {
+        return err(format!(
+            "{}: the indirect access tile states no 2-D `shape`, so the gathered rows' footprint \
+             is unknown and no copy can be sized for them",
+            f.name
+        ));
+    };
+    // ⛔ THE STORE's WINDOW IS THE TILE's SHAPE, EXACTLY — whole gathered rows, nothing else.
+    if o.r_len != rows || o.c_len != head {
+        return err(format!(
+            "{}: the gathered copy stores a [{rows}, {head}] tile into t{}'s [{}, {}] window — the \
+             copy writes whole gathered rows, so the store's window must state exactly the tile's \
+             shape. A narrower window truncates rows this door cannot account for; a wider one \
+             writes rows the gather never took.",
+            f.name, o.tid, o.r_len, o.c_len,
+        ));
+    }
+    // ⛔ AND AT COLUMN CORNER 0 — the gather addresses its table from the base.
+    if o.c_start != 0 {
+        return err(format!(
+            "{}: the gathered copy stores at column corner {} of t{} — the gather addresses its \
+             table from the base, so a column-blocked destination cannot be gathered. Give the \
+             gathered store a whole-tensor region.",
+            f.name, o.c_start, o.tid,
+        ));
+    }
+    // ⛔ THE INDEX BUFFER HOLDS THE RUN — one entry per gathered row, from the anchor on.
+    let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
+    let run_end = g.first_entry.entries() as u64 + rows as u64;
+    if run_end > idx_len {
+        return err(format!(
+            "{}: the index buffer t{} states a [{}, {}] view — {idx_len} index(es) — while this \
+             copy's run gathers {rows} row(s) at entry {}. The idx→address program converts one \
+             entry per gathered row, so a run past the buffer's end reads whatever is placed next.",
+            f.name, g.index_tid, idx_r.v_rows, idx_r.v_cols, g.first_entry.entries(),
+        ));
+    }
+    // ⛔ THE ROWS' FORMAT — fp16/fp32 only, the pointwise stick basis the identity gather states.
+    let Some(load_op) = f.operations.iter().find(|o| o.result == Some(g.load)) else {
+        return err(format!(
+            "{}: the walk proved the store reads the gathered load t{}, but no operation in this \
+             function states that result — the walk and the program disagree",
+            f.name, g.load.0,
+        ));
+    };
+    let df = result_df_of(f.name, load_op)?;
+    if !matches!(df, Df::Fp16 | Df::Fp32) {
+        return err(format!(
+            "{}: the gathered copy's rows are {df:?} — the identity gather's stick basis is stated \
+             for fp16/fp32 pointwise tiles only, and any other format is a new producer form this \
+             door must be re-derived for, not emitted on the wrong stick",
+            f.name
+        ));
+    }
+    // ── THE EMISSION — rung 4's own shape, destination and all: the TABLE as the one (last)
+    // input, the INDEX by its parameter name, the STORE's OUTPUT PARAMETER as `o`. TRUE shapes,
+    // not the table's whole view: the index selects rows within the table, so the read window is
+    // the bound, and the placement door holds it against the table's real footprint.
+    let out_name = o.name();
+    let op_name = format!("gather_o{}", o.tid);
+    let table_name = crate::place::act_name(g.value_tid);
+    let index_name = crate::place::act_name(g.index_tid);
+    let x_h = super::rb(&table_name, rows, head);
+    let inputs = [super::In::full(&x_h).ew()];
+    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op_df(rows, head, 1, 2, df);
+    // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
+    // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
+    // check at the door that builds the legs, so a mid-stick anchor has no path around it.
+    let run = crate::superdsc_opspec::StickRun::covering(g.first_entry.entries(), rows).map_err(
+        |msg| Error {
+            message: format!("{}: {msg}", f.name),
+        },
+    )?;
+    super::assemble_pointwise_broadcast_gather(
+        super::PointwiseGather {
+            op_name: &op_name,
+            tile_op: &tile_op,
+            op_func: "identity",
+            rows,
+            cols: head,
+            inputs: &inputs,
+            gathered_input: 0,
+            index_name: &index_name,
+            run,
+            o: &super::rb(&out_name, rows, head),
+        },
+        sym_id_base,
+        layout,
+    )
+    .map_err(Error::from)
 }
 
 /// THE SILU RECOGNISER'S FAIL-CLOSED HALF, which no fixture exercises.

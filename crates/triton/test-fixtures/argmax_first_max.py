@@ -11,6 +11,28 @@ below the kernel: whatever lowering the splice emits for `tt.reduce`/
 `arith.cmpf`/`arith.mulf` is the lowering this kernel gets, which is the
 whole point.
 
+THE ROW FEEDBACK (#603 PR3b): after the idx store, the kernel gathers the
+picked token's embedding row on device into the next step's input-row slot
+-- the loop-closing hop. It is a POINTER SIDE-EFFECT, not a tensor edge (a
+per-invocation DAG cannot state cross-invocation flow): the table and the
+row slot are kernel ARGUMENTS, and the copy is a descriptor load at the
+clamped index / descriptor store pair, moe.py's scratch law (`tl.load` of a
+stored index through the raw pointer, then a descriptor load at that
+runtime offset -- `expert_slab`'s own indirect-offset shape). THE CLAMP IS
+COMPUTED, STORED, THEN GATHERED -- never clamped in the index path: the
+card's gather reads its index from memory, and arithmetic between a read
+and a gather offset has no index view to point at (the lowering's own
+refusal), so the min rides the fp32 island (`minnumf` against the STAGED
+[1, BLOCK] f32 V-bound table, the no-splat law the ones/sixtyfour tables
+already state -- a `tl.full` constant tile is a `tensor.splat` operand the
+whole-function door refuses by design, and `tl.minimum` on a bare integer
+has no form in the frontend's OP_SET at all) onto a TWIN STICK, and the gather
+reads that stick. The all-NaN sentinel's idx (the two-level PAD_V + 4160,
+past the last real lane) clamps onto the table's LAST row -- the pad row --
+so no descriptor read ever leaves the table, and the pad row's bytes are
+never consumed (the host refuses the token before the row is committed). The
+idx stick itself stays UNCLAMPED: #666's loud refusal reads idx > V off it.
+
 THE ALGORITHM (equality selection over one tile, no inversions)
 ----------------------------------------------------------------
 The block index is split GROUP-major -- G groups of 64 blocks (4096 lanes) --
@@ -100,7 +122,7 @@ DEVICE LAWS THIS SHAPE OBEYS
   the descriptor's iteration space carries the width, so there is NO
   per-stick loop to unroll and the door receives a straight-line program of
   about twenty-five ops (seven reduces, the compare/multiply chain, the
-  island, the store). A per-stick-loop form would splice to ~2300 trips and
+  island, the stores). A per-stick-loop form would splice to ~2300 trips and
   tens of thousands of descriptors; this form is the door-lowerable one.
 * EACH `tt.reduce` IS the golden rank-2 -> rank-1 form over the tile's second
   axis, and `tl.max` of an f16 tile reduces in f32 (upstream's own promotion)
@@ -116,12 +138,15 @@ DEVICE LAWS THIS SHAPE OBEYS
   of their own. A `[1]`-shaped pointwise op is sub-stick on this device and
   the door refuses it; this kernel never states one.
 * NO SPLAT OPERAND ON ANY COMPUTE OP: the widen multiplies read a LOADED
-  [1, BLOCK] table of ones and the island's scale a LOADED [1, BLOCK] f32
-  table of 64.0 -- both host-staged, neither a `tensor.splat`, so every
-  multiply in the kernel is a two-tensor `Elementwise(Mul)` (a splatted
-  operand would route to the scalar-multiply door, which addresses one
-  registry slot, not a sprayed row).
-* V, PAD_V, NB, BLOCK ARE constexpr (SPYRE-SPECIFIC): the emitter derives
+  [1, BLOCK] table of ones, the island's scale a LOADED [1, BLOCK] f32
+  table of 64.0, and the row-feedback clamp a LOADED [1, BLOCK] f32 table
+  of V -- all host-staged, none a `tensor.splat`, so every multiply and
+  the clamp's minimum in the kernel is a two-tensor `Elementwise` (a
+  splatted operand would route to the scalar-multiply door, which addresses
+  one registry slot, not a sprayed row -- and on the minimum there is no
+  served form at all: the whole-function door refuses a constant operand
+  by name).
+* V, PAD_V, NB, BLOCK, W ARE constexpr (SPYRE-SPECIFIC): the emitter derives
   work division from descriptor extents, and Spyre compiles one kernel per
   shape. Same law as every other fixture.
 * ONE PROGRAM (grid [1]): the sampler serves the solo greedy decode step's
@@ -130,10 +155,10 @@ DEVICE LAWS THIS SHAPE OBEYS
 
 HOST CONTRACT (the part that is not in this file)
 -------------------------------------------------
-NINE staged tables, all host obligations for the same reason embedding.py
+ELEVEN staged tables, all host obligations for the same reason embedding.py
 pads nothing in-kernel and attention_sdpa.py's causal mask is
 host-precomputed: the buffers are staging rows the host already owns, and
-`other=`-masked loads are not in this frontend's vocabulary. The first eight
+`other=`-masked loads are not in this frontend's vocabulary. The first ten
 are CONSTANT across decode steps (functions of V alone), so under the
 pooled-substrate regime they live in stable slots and every step's CB reads
 the same addresses:
@@ -168,6 +193,14 @@ the same addresses:
   op) and [1, BLOCK] fp32 of 64.0 (the island's scale, in the island's own
   dtype so the f32 multiply is also two-tensor; used twice -- once for the
   block term, once squared for the group term's 4096).
+* THE V-BOUND TABLE is [1, BLOCK] fp32 of V -- the row-feedback clamp's
+  bound, staged for the same reason the ones/sixtyfour tables are: a
+  `tl.full` constant tile is a `tensor.splat` operand, and the
+  whole-function door refuses a constant operand on a compute op by name
+  (it is neither a load of a parameter nor an intermediate the function
+  produced). The staged table keeps the clamp a two-tensor
+  `Elementwise(Minimum)` over two loaded tiles. V < 2^24, so the f32 bound
+  is exact.
 * THE OFFSET TABLE is [PAD_V] fp16 with 0.0 on `[0, V)` and -inf on the pads
   -- THE PAD LAW, added to the row before the kernel's first max (`xm = x +
   padoff`, xm throughout). Real lanes are untouched (`x + 0` exact); the pads
@@ -185,6 +218,18 @@ the same addresses:
   ramp is two-level.
 * THE GROUP INDEX TABLE is [PAD_V] fp16 with ginc_i = i // 4096 on the real
   lanes and G on the pad lanes -- the sentinel's group half.
+* THE ROW-FEEDBACK TABLE is [V+1, W] fp16 -- the device-encoded embedding
+  rows, one per token, plus the PAD ROW at index V (the sentinel clamp's
+  landing row). In production the host stages it once at load (the whole
+  f32 mirror walked through the same elementwise encoder the per-step row
+  staging uses, so a gathered row is byte-identical to a host-staged one by
+  construction); in THIS fixture it is plain stimulus, and its pad row is
+  deliberately NONZERO (production stages zeros): the sentinel leg must
+  prove the clamp landed on row V BY NAME -- a read that lands on any
+  zeros-expanding accident must diverge, not pass.
+* THE ROW SLOT is [1, W] fp16, the next step's input row. The kernel's only
+  write to it is the gathered row; the harness owes it a zeroed buffer like
+  every output.
 
 Computing the ramps in-kernel would need `V - (start + tl.arange(...))`-style
 arithmetic -- a runtime scalar added to an arange in the tile domain, a form
@@ -194,7 +239,11 @@ aranges, which are dead code in every golden).
 The output is ONE i32 value (the gather ingestion law: index tables are
 SENUINT32 at wordLength 4), stored as a [1, 64] i32 stick with every lane
 equal so the store is a whole stick like every other fixture's; the consumer
-reads word 0.
+reads word 0. The row feedback adds TWO more written buffers -- the [1, 64]
+i32 CLAMPED INDEX STICK (the gather's own twin of the answer, min'd onto
+[0, V] on the fp32 island) and the [1, W] f16 row slot holding the gathered
+embedding row, pinned by the numeric leg to the table's row at the clamped
+index, byte-exact (the copy does no arithmetic).
 
 `reference()` is native PyTorch with the tie law stated EXPLICITLY (mask,
 then the first true index) rather than `torch.argmax`, whose tie behavior is
@@ -208,11 +257,12 @@ import triton
 import triton.language as tl
 
 V = 49155  # granite-3.1's vocab: NOT a power of two -- PAD_V carries the pad lanes
-PAD_V = 65536  # V rounded up to a power-of-two (the descriptor block's law)
+PAD_V = 65536  # V rounded up to a power of two (the descriptor block's law)
 BLOCK = 64  # the stick: the two-level split's lane width, and the output stick
 NB = PAD_V // BLOCK  # the block count: 1024
 GROUP_BLOCKS = 64  # blocks per group: the periodic block ramp's period
 G = NB // GROUP_BLOCKS  # the group count: 16, gramp's ceiling, fp16-exact
+W = 128  # the row-feedback width: one embedding row's device elements (f16)
 
 NEG_INF = float("-inf")
 DTYPE = torch.float16
@@ -220,10 +270,11 @@ DTYPE = torch.float16
 
 @triton.jit
 def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr,
-                            ones_ptr, sixtyfour_ptr, padoff_ptr, gramp_ptr, ginc_ptr,
+                            ones_ptr, sixtyfour_ptr, vbound_ptr, padoff_ptr,
+                            gramp_ptr, ginc_ptr, table_ptr, rowidx_ptr, row_ptr,
                             idx_ptr,
                             V: tl.constexpr, PAD_V: tl.constexpr,
-                            NB: tl.constexpr, BLOCK: tl.constexpr):
+                            NB: tl.constexpr, BLOCK: tl.constexpr, W: tl.constexpr):
     # THE WHOLE ROW IS ONE TILE: one load, [1, PAD_V], the rmsnorm fixture's own
     # whole-row block (its [BLOCK_M, D_MODEL] is larger than this). Every shape
     # below is rank 2; every reduce is the golden rank-2 -> rank-1 form over the
@@ -292,7 +343,8 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr
     jB = tl.max(w2, axis=1).to(tl.float16)
     # lramp is PERIODIC (the same 64 values in every block), so this equality
     # selects lane l* of EVERY block -- and intersected with selG and sel
-    # (group g*, block b*) it is the one-hot at the first maximal lane.
+    # (group g*, block b*) it is the one-hot at the first maximal lane. The
+    # mask is already carried by jG and jA, so it is not needed here.
     selL = (lramp == tl.expand_dims(jB, 1)).to(tl.float16)
     onehot = selG * sel * selL
 
@@ -329,23 +381,65 @@ def argmax_first_max_kernel(logits_ptr, bramp_ptr, lramp_ptr, binc_ptr, linc_ptr
     l64 = tl.expand_dims(lstar, 1) * ones
 
     # THE WIDE INTEGER RIDES THE FP32 ISLAND, ONCE: g* * 4096 + b* * 64 + l*
-    # reaches past fp16's exact range, so the combine widens and
-    # multiply-adds in f32 (exact below 2^24) against the staged f32 scale
-    # table -- twice for the group term (64 * 64 = 4096), once for the block
-    # -- and casts to i32: moe.py's gelu island and the KSPLIT pair's own
-    # device recipe.
+    # reaches past fp16's exact range, so the combine widens, multiplies-adds
+    # in f32 (exact below 2^24) against a staged f32 scale table -- twice for
+    # the group term (64 * 64 = 4096), once for the block -- and casts to i32:
+    # moe.py's gelu island and the KSPLIT pair's own device recipe.
     sf_desc = tl.make_tensor_descriptor(sixtyfour_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
                                         block_shape=[1, BLOCK])
     sf = sf_desc.load([0, 0])
-    idx = (g64.to(tl.float32) * sf * sf + b64.to(tl.float32) * sf
-           + l64.to(tl.float32)).to(tl.int32)
+    idxf = g64.to(tl.float32) * sf * sf + b64.to(tl.float32) * sf \
+        + l64.to(tl.float32)
+    idx = idxf.to(tl.int32)
     i_desc = tl.make_tensor_descriptor(idx_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
                                        block_shape=[1, BLOCK])
     i_desc.store([0, 0], idx)
 
+    # ── the row feedback (#603 PR3b): embed[tok] → the input-row slot ────────
+    # THE CLAMP RIDES THE FP32 ISLAND, NOT THE GATHER'S INDEX PATH. The card's
+    # gather reads its index from memory (`idx · skip_addr + base` — the slab
+    # law), so a clamped index must be COMPUTED in the tile domain and STORED
+    # before the gather reads it: arithmetic between a read and a gather
+    # offset has no index view to point at (the lowering's own refusal), and
+    # the device has no clamp in its index path. The bound is a STAGED [1,
+    # BLOCK] f32 TABLE of V — the no-splat law the ones/sixtyfour tables
+    # already state: a `tl.full` constant tile is a `tensor.splat` operand,
+    # which the whole-function door refuses by design (it is neither a load
+    # of a parameter nor an intermediate the function produced), and the
+    # staged table keeps the clamp a two-tensor `Elementwise(Minimum)` over
+    # two loaded tiles. The bound is exact: V < 2^24 in f32, and the all-NaN
+    # sentinel (the two-level PAD_V + 4160 — finite, the staged tables carry
+    # it, never a NaN) clamps onto V, the table's pad row. THE IDX STICK
+    # ITSELF STAYS UNCLAMPED: #666's loud refusal reads idx > V off the
+    # stick, so the clamp lives on the gather's own twin stick, never on the
+    # answer.
+    vb_desc = tl.make_tensor_descriptor(vbound_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
+                                        block_shape=[1, BLOCK])
+    vb = vb_desc.load([0, 0])
+    rowf = tl.minimum(idxf, vb)
+    r_idx = rowf.to(tl.int32)
+    r_desc = tl.make_tensor_descriptor(rowidx_ptr, shape=[1, BLOCK], strides=[BLOCK, 1],
+                                       block_shape=[1, BLOCK])
+    r_desc.store([0, 0], r_idx)
+    # The gather, moe.py's slab spelling exactly: the clamped index read back
+    # through the RAW POINTER and DIRECTLY offsetting the table load — the
+    # stored stick and the gathered row are pinned to the same word, and no
+    # arithmetic sits between the read and the offset (the index view's law).
+    tok = tl.load(rowidx_ptr + 0)
+    # The table's rows are the DEVICE-encoded embedding rows (f16 elements,
+    # W of them per row); the copy never does arithmetic on them, so it is
+    # bit-exact.
+    t_desc = tl.make_tensor_descriptor(table_ptr, shape=[V + 1, W], strides=[W, 1],
+                                       block_shape=[1, W])
+    row = t_desc.load([tok, 0])
+    o_desc = tl.make_tensor_descriptor(row_ptr, shape=[1, W], strides=[W, 1],
+                                       block_shape=[1, W])
+    o_desc.store([0, 0], row)
+
 
 def inputs(seed: int = 0):
-    """The nine staged tables (host contract) plus the logits row, whose pads
+    """The eleven staged tables (host contract, one per kernel table parameter)
+    plus the logits row, whose pads
     hold 0.0 -- the PRODUCTION shape, the lm-head's zero-pad columns -- so the
     pad law lives entirely in the `padoff` table. The row carries a deliberate
     TIE at the max -- lanes 40017 and 48000 both hold the row's largest value,
@@ -398,7 +492,21 @@ def inputs(seed: int = 0):
         ginc[i] = i // (BLOCK * GROUP_BLOCKS)
     ones = torch.ones((1, BLOCK), dtype=DTYPE)
     sixtyfour = torch.full((1, BLOCK), 64.0, dtype=torch.float32)
-    return row, bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc
+    # THE V-BOUND TABLE: the clamp's bound, deterministic (no generator draw,
+    # so every random byte above and the table below are unchanged). V <
+    # 2^24, exact in f32.
+    vbound = torch.full((1, BLOCK), V, dtype=torch.float32)
+    # THE ROW-FEEDBACK TABLE, drawn LAST so every byte above is unchanged from
+    # the pre-feedback stimulus (the draws share one seeded generator; a later
+    # draw cannot move an earlier one). [V+1, W]: one row per token plus the
+    # PAD ROW at index V -- deliberately NONZERO (production stages zeros
+    # there): the sentinel leg's clamp must land on row V BY NAME, and a
+    # zeros-expanding accident must diverge rather than pass. Every row is
+    # distinct with probability 1, so a gather that reads ANY row other than
+    # the clamped one fails the byte-exact row comparison.
+    table = torch.randn(V + 1, W, generator=g, dtype=DTYPE)
+    return row, bramp, lramp, binc, linc, ones, sixtyfour, vbound, padoff, \
+        gramp, ginc, table
 
 
 def reference(row: torch.Tensor) -> torch.Tensor:

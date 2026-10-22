@@ -770,7 +770,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
         // wanted" ruling was the STANDALONE ladder's (a placeholder sufficed when nothing
         // produced the kind); the splice changed the fact. The whole-function walk
         // (`KTIR_WHOLE=1`) still never reads it; a per-`Program` run refuses loudly at
-        // the program arm (an eleven-parameter whole-function body is `emit_whole`'s, not
+        // the program arm (a fifteen-parameter whole-function body is `emit_whole`'s, not
         // a single-descriptor dispatch's). (⛔ NOT the vendor topk pair: `topk.ddl`'s
         // ripple keeps the LAST index among equals -- `GREATERTHAN(running, candidate)`
         // with an equal candidate displacing -- so `topkindex` at k=1 is LAST-max and
@@ -787,9 +787,13 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
                     ("linc_ptr", "*fp16"),
                     ("ones_ptr", "*fp16"),
                     ("sixtyfour_ptr", "*fp32"),
+                    ("vbound_ptr", "*fp32"),
                     ("padoff_ptr", "*fp16"),
                     ("gramp_ptr", "*fp16"),
                     ("ginc_ptr", "*fp16"),
+                    ("table_ptr", "*fp16"),
+                    ("rowidx_ptr", "*i32"),
+                    ("row_ptr", "*fp16"),
                     ("idx_ptr", "*i32"),
                 ],
                 &[
@@ -797,6 +801,7 @@ pub fn case(name: &str) -> Option<(KernelSpec, Vec<i64>, Option<Program>)> {
                     ("PAD_V", Val::Int(65536)),
                     ("NB", Val::Int(1024)),
                     ("BLOCK", Val::Int(64)),
+                    ("W", Val::Int(128)),
                 ],
             ),
             vec![1],
