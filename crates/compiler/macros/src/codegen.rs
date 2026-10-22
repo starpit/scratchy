@@ -11720,7 +11720,21 @@ fn dump_wavefront_mega(
                                                     &reach,
                                                 ) {
                                                     Ok(at) => at as u32,
-                                                    Err(e) => panic!("[spyre-superdsc] {base}: {e}"),
+                                                    Err(e) => panic!(
+                                                        "[spyre-superdsc] {base}: {e}\n  the ladder as baked (index: swept cols / folds / chunk / fused twin): {}",
+                                                        rung_reach
+                                                            .iter()
+                                                            .enumerate()
+                                                            .map(|(i, (cap, r))| format!(
+                                                                "#{i} {}{}{}{}",
+                                                                cap.get(),
+                                                                if r.folds { " FOLDS" } else { "" },
+                                                                if r.chunk { " CHUNK" } else { "" },
+                                                                if r.fused_twin { " FUSED" } else { "" },
+                                                            ))
+                                                            .collect::<Vec<_>>()
+                                                            .join(" | ")
+                                                    ),
                                                 };
                                             // ⛔ AND NO CHUNK RUNG BAKES A FOLD-FUSED TWIN: the
                                             // selector's one-pass arm would run it for a prompt chunk
