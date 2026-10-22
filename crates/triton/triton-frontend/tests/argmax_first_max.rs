@@ -36,12 +36,31 @@
 //!     one-hot). A subf sneaking back in is the unlowerable form returning;
 //!   * `arith.extf`/`arith.addf`/`arith.fptosi` — the pad law's `x + padoff`
 //!     (the f16 offset-row add before the first max) and the ONE fp32 island:
-//!     the final `b*64 + l*` reaches 49154 (past fp16's exact range), so it
-//!     widens, multiply-adds in f32 (exact below 2^24), and casts to i32 —
-//!     moe.py's gelu island and the KSPLIT pair's own device recipe;
-//!   * `tt.descriptor_load` × 10 / `tt.descriptor_store` — the row, the six
-//!     staged index tables, the two widen tables and the pad law's offset
-//!     row in, the i32 stick out;
+//!     the final `g*·4096 + b*·64 + l*` reaches past fp16's exact range at
+//!     vocab width, so it widens, multiply-adds in f32 (exact below 2^24), and
+//!     casts to i32 — moe.py's gelu island and the KSPLIT pair's own device
+//!     recipe;
+//!   * `tt.descriptor_load` × 12 / `tt.descriptor_store` × 3 — the row, the six
+//!     staged index tables (the two-level ramps and increasing read-outs),
+//!     the two widen tables, the clamp's V-bound table, the pad law's offset
+//!     row and the ROW-FEEDBACK TABLE's gathered row in; the i32 stick, the
+//!     clamped index stick and the input-row slot out;
+//!   * `arith.minnumf` + a second `arith.fptosi` + `tt.load` — the #603 PR3b row
+//!     feedback's clamp and hop: the index is clamped ON THE FP32 ISLAND
+//!     (`minnumf` against the STAGED [1, BLOCK] f32 V-bound table — the
+//!     no-splat law the ones/sixtyfour tables already state; a `tl.full`
+//!     constant tile is a `tensor.splat` operand the whole-function door
+//!     refuses by design — and the card's gather reads its index from memory,
+//!     so arithmetic between a read and a gather offset has no index view to
+//!     point at), stored as a twin
+//!     i32 stick, and read back through the RAW POINTER (`tt.load`, moe.py's
+//!     scratch spelling, `expert_slab`'s indirect-offset shape) to offset the
+//!     table load directly. Pinned as EXACTLY ONE `tt.load` and EXACTLY ONE
+//!     `minnumf`: the hop is clamp → store → read-back → gather, and a second
+//!     `tt.load` or a missing `minnumf` is a different (or dropped) hop. ⛔ NO
+//!     `arith.cmpi`/`arith.select`: the clamp-between-read-and-offset form
+//!     (`where(tok > V, V, tok)`) is unlowerable — the slab gather's index
+//!     view points at memory, never at a computed value;
 //!   * `tt.expand_dims`/`tt.broadcast` — the [1] → [1,1] → [1, BLOCK] seams (the golden
 //!     shapes: rank-2 tiles, rank-1 reduce results, no scalar anywhere, so no
 //!     reduce-to-scalar and no splat of an interior value exists in the kernel).
@@ -146,19 +165,54 @@ fn argmax_first_max_compiles_and_states_the_algorithm_in_generic_ops() {
     );
     assert!(
         count(&ops, "arith.addf") >= 2,
-        "the pad law's x + padoff and the island's b*64 + l*"
+        "the pad law's x + padoff and the island's g*·4096 + b*·64 + l*"
     );
     assert!(
-        count(&ops, "arith.fptosi") >= 1,
-        "the island's f32 -> i32 cast"
+        count(&ops, "arith.fptosi") >= 2,
+        "the island's f32 -> i32 cast and the clamped index stick's"
     );
     assert!(
-        count(&ops, "tt.descriptor_load") >= 10,
-        "the row loads (x, bramp, lramp, binc, linc, ones, sixtyfour, padoff, gramp, ginc)"
+        count(&ops, "tt.descriptor_load") >= 12,
+        "the row loads (x, gramp, bramp, lramp, ginc, binc, linc, ones, sixtyfour, \
+         the clamp's V-bound table, padoff, and the row-feedback table's gathered row)"
     );
     assert!(
-        count(&ops, "tt.descriptor_store") >= 1,
-        "the i32 stick store"
+        count(&ops, "tt.descriptor_store") >= 3,
+        "the i32 stick store, the clamped index stick store, and the row-feedback \
+         input-row slot store"
+    );
+    // THE ROW FEEDBACK'S CLAMP AND HOP, exactly once each: the index clamped on the
+    // fp32 island (minnumf against the staged V-bound table, the no-splat law), the clamped twin stored as
+    // an i32 stick, and that stick read back through the raw pointer to offset the
+    // table's descriptor load directly. A missing `tt.load` is a dropped feedback
+    // (the row slot stays zero and the numeric leg's byte-exact row pin diverges);
+    // a second one is a different hop.
+    assert_eq!(
+        count(&ops, "arith.minnumf"),
+        1,
+        "exactly one fp minimum (the row-feedback clamp on the fp32 island)"
+    );
+    assert_eq!(
+        count(&ops, "tt.load"),
+        1,
+        "exactly one scalar read-back of the clamped stick (the row feedback's index hop)"
+    );
+    // ⛔ AND NO CLAMP IN THE INDEX PATH: the slab gather's index view points at
+    // MEMORY, never at a computed value, so a cmpi/select between the read-back and
+    // the gather offset is the unlowerable form returning.
+    assert_eq!(
+        count(&ops, "arith.cmpi"),
+        0,
+        "an arith.cmpi appeared: the row-feedback clamp rides the fp32 island (minnumf) \
+         onto a stored stick -- a compare in the gather's index path is the \
+         unlowerable between-read-and-offset form"
+    );
+    assert_eq!(
+        count(&ops, "arith.select"),
+        0,
+        "an arith.select appeared: the row-feedback clamp rides the fp32 island (minnumf) \
+         onto a stored stick -- a select in the gather's index path is the \
+         unlowerable between-read-and-offset form"
     );
     assert!(count(&ops, "tt.expand_dims") >= 3, "the [1] -> [1,1] seams");
     assert!(

@@ -234,14 +234,20 @@ pub fn expert_slab() -> Case {
     )
 }
 
-/// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan. The idx
-/// output is `*i32` (the gather ingestion dtype); `PAD_V` is the vocab padded to a whole
-/// power-of-two row whose pads hold 0.0 (the production shape — the lm-head's zero-pad
-/// columns) with SIX fp16 index tables staged (the three decreasing ramps pick
-/// first-group/first-block/first-lane; the three increasing 0-based tables read the
-/// numbers back out), the [1, BLOCK] ones row (f16) and 64.0 row (f32) the widen and
-/// the island's scale read, and the fp16 OFFSET row that carries the pad law (0.0 on
-/// the real lanes, -inf on the pads; the kernel adds it before its first max) -- HOST
+/// `argmax_first_max.py`'s signature: the solo greedy decode step's vocab scan, with the
+/// #603 PR3b row feedback. The idx output is `*i32` (the gather ingestion dtype); `PAD_V`
+/// is the vocab padded to a whole power-of-two row whose pads hold 0.0 (the production
+/// shape — the lm-head's zero-pad columns) with SIX fp16 index tables staged (the three
+/// decreasing ramps pick first-group/first-block/first-lane; the three increasing 0-based
+/// tables read the numbers back out — the two-level split), the [1, BLOCK] ones row (f16),
+/// the 64.0 row (f32) the widen and
+/// the island's scale read, the [1, BLOCK] f32 V-BOUND row the row-feedback clamp reads
+/// (the no-splat law: a `tl.full` constant tile is a `tensor.splat` operand the
+/// whole-function door refuses by design), the fp16 OFFSET row that carries the pad law
+/// (0.0 on the real
+/// lanes, -inf on the pads; the kernel adds it before its first max), and the row
+/// feedback's POINTER PAIR -- the [V+1, W] embedding table (the sentinel clamp's pad row
+/// at index V) and the [1, W] input-row slot the gathered row lands in -- HOST
 /// obligations the fixture's docstring states.
 const ARGMAX: &[(&str, &str)] = &[
     ("logits_ptr", "*fp16"),
@@ -251,20 +257,26 @@ const ARGMAX: &[(&str, &str)] = &[
     ("linc_ptr", "*fp16"),
     ("ones_ptr", "*fp16"),
     ("sixtyfour_ptr", "*fp32"),
+    ("vbound_ptr", "*fp32"),
     ("padoff_ptr", "*fp16"),
     ("gramp_ptr", "*fp16"),
     ("ginc_ptr", "*fp16"),
+    ("table_ptr", "*fp16"),
+    ("rowidx_ptr", "*i32"),
+    ("row_ptr", "*fp16"),
     ("idx_ptr", "*i32"),
     ("V", "constexpr"),
     ("PAD_V", "constexpr"),
     ("NB", "constexpr"),
     ("BLOCK", "constexpr"),
+    ("W", "constexpr"),
 ];
 
 /// The one argmax configuration, matching `cases.rs`' `argmax_first_max` row: granite-3.1's
 /// vocab 49155 (deliberately NOT a multiple of 64, so the pad lanes are real), the
-/// power-of-two padded row (the descriptor block's law), and the two-level split's block
-/// count NB = PAD_V / BLOCK.
+/// power-of-two padded row (the descriptor block's law), the two-level split's block
+/// count NB = PAD_V / BLOCK, and the row-feedback width W (one embedding row's device
+/// elements).
 pub fn argmax_first_max() -> Case {
     build(
         "argmax_first_max",
@@ -276,6 +288,7 @@ pub fn argmax_first_max() -> Case {
             ("PAD_V", Val::Int(65536)),
             ("NB", Val::Int(1024)),
             ("BLOCK", Val::Int(64)),
+            ("W", Val::Int(128)),
         ],
     )
 }
