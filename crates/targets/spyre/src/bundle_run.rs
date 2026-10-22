@@ -422,6 +422,10 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
         // scalarmul multiplier; a bundle whose ops read none states an empty one, and an empty one is
         // what every current Triton-derived bundle states.
         scalarmul_scales: std::borrow::Cow::Owned(Vec::new()),
+        // Parallel-empty by the layout's own law: the stage list is one length with
+        // `scalarmul_scales`, and this runner's registry (`layout::for_regions`) states no
+        // scales at all — so it stages no f32 slots either.
+        scalarmul_scales_stage: std::borrow::Cow::Owned(Vec::new()),
         // No weight folds: the ScalarMul fold multiplies the WORKER's staged weight bytes at load,
         // and this runner stages inputs from files, not through the worker's binding. An empty list
         // is also what every Triton-derived bundle's layout states (`layout::for_regions`).
