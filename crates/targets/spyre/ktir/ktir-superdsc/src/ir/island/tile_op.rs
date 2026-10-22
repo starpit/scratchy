@@ -46,6 +46,16 @@ pub enum TileOpKind {
     /// one-stick-per-row size, never the data's per-trip width — see
     /// [`seeded_reduce_lx_resident_generic`].
     SeededReduce,
+    /// ⭐⭐⭐ WALL 12 — the NONSTICK seeded reduce over `[out,y]`: the REDUCED axis is the
+    /// non-stick `out` dim (this crate's reduce vocabulary names the reduced dim `out`, the
+    /// DDL's own `%reduce_dim:4` "OUT dimension") and the SURVIVORS are the stick `y` dim (the
+    /// DDL's `%outer_dim#0` lane axis). The accumulator is the survivor vector — the lanes the
+    /// PE accumulators hold — not one stick per row. The template's OWN loop is the time-tiling:
+    /// `summeanmaxexx2.ddl` chunks the reduce dims and reads the HBM accumulator only on
+    /// second-and-later reduce-dim chunk trips (`:159-196`, `:582-614`), so the tiled dim is the
+    /// REDUCED `out`, exactly as the stick form tiles its reduced stick. See
+    /// [`nonstick_reduce_lx_resident_generic`].
+    NonstickReduce,
 }
 
 /// One op's full tiling declaration: its iteration domain (the `WorkPlan::divide` input) plus enough
@@ -86,6 +96,9 @@ impl TileOp {
             }
             TileOpKind::SeededReduce => {
                 seeded_reduce_lx_resident_generic(plan, out_per_time, self.df)
+            }
+            TileOpKind::NonstickReduce => {
+                nonstick_reduce_lx_resident_generic(plan, out_per_time, self.df)
             }
         }
     }
@@ -200,6 +213,30 @@ pub fn seeded_reduce_lx_resident_generic(plan: &WorkPlan, out_per_time: u32, df:
     let opt = out_per_time as u64;
     let word = df.word_length() as u64;
     per_core_mb * opt * word + per_core_mb * df.elems_per_stick() as u64 * word
+}
+
+/// ⭐⭐⭐ WALL 12 — THE NONSTICK seeded reduce's per-core LX residency, the survivor-lane mirror
+/// of [`seeded_reduce_lx_resident_generic`]. The stick form charges `data(rows × per-trip
+/// reduced width) + accum(rows × ONE stick)`; the nonstick form swaps the roles — the SURVIVORS
+/// are the lanes, so a core holds `data(reduced-chunk × its survivor share) + accum(its survivor
+/// share)` — the accumulator IS the survivor vector the PE accumulators write, one element per
+/// lane, whole sticks because [`nonstick_geometry`] only fires on a whole-stick survivor width
+/// and `distribute_cores` splits a stick dim by stick count.
+///
+/// The per-trip reduced chunk (`out_per_time`, the tiled dim being the REDUCED `out`) is the
+/// template's own reduce-dim chunking — `summeanmaxexx2.ddl` reads the HBM accumulator only on
+/// second-and-later reduce-dim chunk trips (`:159-196`, `:582-614`), which is exactly a
+/// time-tiled reduce carrying its accum in HBM between trips.
+pub fn nonstick_reduce_lx_resident_generic(plan: &WorkPlan, out_per_time: u32, df: Df) -> u64 {
+    // The core's SURVIVOR share (the reduced `out` axis is never core-split — it is the
+    // accumulation axis; splitting it would need the psum ring the nonstick arm does not bind —
+    // and its per-trip extent IS `out_per_time`, the tiled dim).
+    let per_core_y = plan.per_core_extent("y") as u64;
+    let word = df.word_length() as u64;
+    // The data this trip walks: every survivor lane of the core reads its `out_per_time` run of
+    // the reduced axis (row-major: a reduced-axis chunk is `out_per_time` CONTIGUOUS survivor
+    // vectors). The accum: the core's survivor lanes, once.
+    out_per_time as u64 * per_core_y.max(1) * word + per_core_y.max(1) * word
 }
 
 #[cfg(test)]

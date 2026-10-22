@@ -1478,6 +1478,28 @@ pub enum OpFunc {
     Sum,
     Max,
     Mean,
+    /// ⭐⭐⭐ WALL 12 — the NONSTICK twins of [`Sum`]/[`Max`]: the same `summeanmaxexx2.ddl`
+    /// template's `sumnonstick`/`maxnonstick` binds (`:39`, `:45`), for a reduce whose REDUCED
+    /// axis is a leading prefix and whose SURVIVORS are the stick. The stick binds key the
+    /// lane roles on `%reduce_dim#0` (the reduced axis IS the lane axis — the SFP REDUCE modes
+    /// exist for it); the nonstick binds key them on `%outer_dim#0` (a SURVIVOR is the lane
+    /// axis), so the reduce rides the loop nest over the outer+reduce dims with per-lane PE
+    /// accumulators and NO SFP REDUCE mode — the auditor's mechanism correction, carried here
+    /// because it is the one fact that separates the families on device.
+    ///
+    /// The vendor ships a structural fixture for the max twin
+    /// (`ddc/ddl_templates/test/sdsc_maxnonstick.json`): `exUnit "sfp"`, TWO inputs
+    /// (`[data-idx0, accum-idx1]`), ONE output (`accum-idx1`) — the seeded convention verbatim —
+    /// the accum's scale `-1` on the reduced dim, the stick dim Active on both operands, the
+    /// SURVIVOR core-split (`mb:8`) with the reduced dim UNSPLIT, `coordinateMasking_ {}`, and
+    /// no `genericpartialreduction` anywhere (ringless). NAMES AND THE SOLVER: the fixture's
+    /// own `out` is its stick SURVIVOR while this crate's reduce vocabulary names the REDUCED
+    /// dim `out` (the DDL's own `%reduce_dim:4` is the "OUT dimension", and the wall-11 pins'
+    /// `N_.out_` follow it) — the names do not reach `matchDdl2Dsc`, which binds dims by the
+    /// layout constraint walk, but the collision is stated here so refusal-text readers are
+    /// not misled.
+    SumNonStick,
+    MaxNonStick,
     /// ⭐ `exx2` — the machine's OWN fused `mean(x²)` reduce: the same `summeanmaxexx2.ddl` template
     /// [`Mean`] rides (its `%exx2_op` bind, `:50`), computing the square INSIDE the reduce's SFP
     /// accumulate loop (`SFP_FMA src0=lxlu src1=lxlu src2=R4`, exx2_fwd.smc) so `x` is read ONCE and
@@ -1684,6 +1706,8 @@ impl OpFunc {
             OpFunc::Sum => "sum",
             OpFunc::Max => "max",
             OpFunc::Mean => "mean",
+            OpFunc::SumNonStick => "sumnonstick",
+            OpFunc::MaxNonStick => "maxnonstick",
             // The ONLY runtime-supported spelling: plain `exx2` maps to OpFuncs::EXX2 →
             // exx2_fwd.smc (updatelibrary.cpp's libMapping). The `exx2_zeromean` spelling ddc
             // rewrites to at useZeroMean=1 is a distinct enum with NO smc-table entry — see
@@ -1830,6 +1854,16 @@ impl OpFunc {
             // state is internal, so passing an accumulator makes it unmatchable exactly like the
             // fused scale above.
             OpFunc::TopKIndex | OpFunc::TopKValue => Some(1),
+            // ⭐ WALL 12 — the nonstick twins carry the SEEDED convention: `summeanmaxexx2.ddl`
+            // binds each nonstick op as `([%input_tensor_nonstick, %output_tensor_nonstick],
+            // [%output_tensor_nonstick], [%output_tensor_reduce_nonstick])` — TWO inputs (data +
+            // accumulator), ONE output — and the vendor's own structural fixture states it
+            // (`ddc/ddl_templates/test/sdsc_maxnonstick.json`: `inputLabeledDs` of two, indices
+            // `[0, 1]`, the accumulator at index 1 also the sole output, the seeded convention
+            // verbatim). `None` here is that convention — `reduce_tile_kind` picks the nonstick
+            // kind BEFORE this row is consulted, so this entry exists to keep the emitter's
+            // build-time arity check honest about the two operands it will see.
+            OpFunc::SumNonStick | OpFunc::MaxNonStick => None,
             _ => None,
         }
     }
@@ -1852,7 +1886,23 @@ impl OpFunc {
     /// `mean` is deliberately absent: its `1/N` scaling const is applied per core, so a split mean is a
     /// sum of per-core means. Not a combine this crate has a use for or a test of.
     pub fn template_combines_a_core_split_reduction(self) -> bool {
-        matches!(self, OpFunc::Sum | OpFunc::Max)
+        // ⭐ WALL 12 — the nonstick twins are DDL-TRUE here: the `%psum_op` bind
+        // (`summeanmaxexx2.ddl:64`) sits on the tensors `alias_one_tensor_of` UNIFIED across the
+        // stick and nonstick variants, and the psum ring's compute arms are union-gated over
+        // both forms, so a nonstick reduce whose REDUCED axis were core-split would ring its
+        // partials exactly like the stick form's. The vendor's own nonstick fixture never uses
+        // it (`sdsc_maxnonstick.json` is ringless: `numWkSlicesPerDim_ {"mb": 8}` splits the
+        // SURVIVOR, the reduced dim unsplit), and this crate's nonstick arm matches that —
+        // `ReduceDivision::Rows`, survivor-only splitting; the reduced axis is the accumulation
+        // axis and is never split. The row states the TEMPLATE's fact so a future split caller
+        // is not refused on a false premise; it does not license the split.
+        matches!(
+            self,
+            OpFunc::Sum
+                | OpFunc::Max
+                | OpFunc::SumNonStick
+                | OpFunc::MaxNonStick
+        )
     }
 
     /// ⭐⭐⭐ THE ONE OP PAIR WHOSE SHIPPED `constantInfo_` IS NOT THE GENERIC FORM. Both

@@ -581,4 +581,49 @@ impl ReduceKind {
             ReduceKind::Max => "max",
         }
     }
+
+    /// ⭐ WALL 12 — the NONSTICK twin of [`Self::op_func`]: the wire name the leading-prefix arm
+    /// emits. `summeanmaxexx2.ddl` binds the nonstick family as its own `opFuncName`s
+    /// (`:39` `sumnonstick`, `:45` `maxnonstick`), and matchDdl2Dsc compares the string EXACTLY
+    /// (ddl_conversion.cpp:2117-2122) — a reduce whose reduced axis is a leading dim lowers under
+    /// these names, never under the stick forms'. `sfp` unit for both.
+    pub const fn nonstick_op_func(self) -> &'static str {
+        match self {
+            ReduceKind::Sum => "sumnonstick",
+            ReduceKind::Max => "maxnonstick",
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ WALL 12 — a `linalg.reduce`'s OWN axis facts, as the op states them: the
+/// `Dimensions` it reduces, and the rank it states them against (its result `Shape`'s rank plus
+/// the reduced count). These are the op's own statement, not the walk's 2D frame — the door
+/// reads the block off them ([`crate::emit::lower_ktir_to_superdsc::reduce_axis_block`]) and
+/// never re-derives the axes from a frame that has already merged the leading dims into rows
+/// (which is exactly why a trailing reduce and a row reduce were indistinguishable before).
+///
+/// `dims` is padded to FOUR because the template's own dimension vocabulary is four reduce
+/// symbols (`summeanmaxexx2.ddl:9`, `%reduce_dim:4`) — a reduce stating more reduced dims than
+/// that has no bind to match and is refused where the facts are read, naming the template's own
+/// count. `Copy` so [`Lowering`](crate::emit::whole_function) keeps its `Copy` derive.
+#[derive(Clone, Copy, Debug)]
+pub struct ReduceAxes {
+    /// The `Dimensions` attr verbatim (i64, the IR's int list), zero-padded past `n_dims`.
+    pub dims: [i64; 4],
+    /// How many entries of `dims` the op states.
+    pub n_dims: u8,
+    /// The rank the dims are stated against: the result `Shape`'s rank plus the reduced count.
+    pub in_rank: u8,
+}
+
+impl ReduceAxes {
+    /// The stated `Dimensions`, as a slice.
+    pub fn dims(&self) -> &[i64] {
+        &self.dims[..self.n_dims as usize]
+    }
+
+    /// The rank the dims are stated against.
+    pub fn in_rank(&self) -> u32 {
+        self.in_rank as u32
+    }
 }

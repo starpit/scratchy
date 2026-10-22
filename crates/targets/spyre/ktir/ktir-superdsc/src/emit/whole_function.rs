@@ -47,7 +47,7 @@ use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
 use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gathers_of, regions};
-use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceAxes, ReduceKind};
 // The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
 // from it — so it lives beside that door and this recogniser names the same type rather than a
 // parallel one that would have to be mapped across the boundary.
@@ -953,8 +953,12 @@ enum Lowering {
     /// The five-op silu longhand, PROVEN by [`program_silu_mul_chains`] and lowered as one
     /// `silumul`.
     Silu,
-    /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind.
-    Reduce(ReduceKind),
+    /// A bare `linalg.reduce`, whose combiner is an attribute rather than an op kind. Carries
+    /// the op's own axis facts (wall 12): the `Dimensions` it reduces and the rank it states
+    /// them against, read at the same place the combiner is and threaded as a value — never
+    /// re-derived, never defaulted — because the door classifies trailing-vs-leading off them
+    /// and a frame that has already merged the leading dims into rows cannot.
+    Reduce { kind: ReduceKind, axes: ReduceAxes },
     /// `tile * <splatted constant>` — the multiplier read off THIS op, not the whole function. See
     /// [`splat_scale_of`] for the discriminator and why it cannot be per-function here.
     ScalarMul(f32),
@@ -1165,6 +1169,80 @@ pub fn reduce_kind_of(op: &ktir_core::ir::Operation<'static>) -> Option<ReduceKi
         (AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf)) => Some(ReduceKind::Sum),
         (AttrKey::ReduceFn, Attr::Op(OpKind::ArithMaxnumf)) => Some(ReduceKind::Max),
         _ => None,
+    })
+}
+
+/// ⭐⭐⭐ WALL 12 — a `linalg.reduce`'s own [`ReduceAxes`], read off its `Dimensions` and result
+/// `Shape` attributes the same way [`reduce_kind_of`] reads its combiner: the axes are the OP's
+/// statement, not the walk's frame, and the door classifies the block from them
+/// ([`crate::emit::lower_ktir_to_superdsc::reduce_axis_block`]).
+///
+/// ⛔ FAIL-CLOSED on a missing or oversized statement: a reduce stating no `Dimensions` cannot
+/// be classified (trailing and leading are indistinguishable without it), and one stating more
+/// than four reduced dims has no bind in the template's own vocabulary (`summeanmaxexx2.ddl:9`
+/// declares exactly `%reduce_dim:4`). Both are named here, at the read, rather than guessed at
+/// the door — the same refusal discipline [`reduce_kind_of`]'s caller applies to the combiner.
+pub(crate) fn reduce_axes_of(
+    f_name: &str,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Result<ReduceAxes, Error> {
+    let dims: &[i64] = op
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Dimensions, Attr::IntList(d)) => Some(*d),
+            _ => None,
+        })
+        .ok_or_else(|| Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states no `Dimensions`, so which axes it reduces is \
+                 unknown and the door cannot classify it (a trailing reduce is the row-reduce form, \
+                 a leading prefix is the nonstick form — they are indistinguishable without the \
+                 op's own statement)"
+            ),
+        })?;
+    if dims.is_empty() {
+        return Err(Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states an EMPTY `Dimensions` list — a reduce over \
+                 no axes is the identity, and TTIR never states one; defensively refused rather \
+                 than guessed at the door"
+            ),
+        });
+    }
+    if dims.len() > 4 {
+        return Err(Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` stating {} reduced dims has no bind to match — the \
+                 reduce template's own dimension vocabulary is four reduce symbols \
+                 (`summeanmaxexx2.ddl:9`, `%reduce_dim:4`)",
+                dims.len()
+            ),
+        });
+    }
+    // The rank the dims are stated against: the result `Shape`'s rank plus the reduced count
+    // (a reduce removes exactly the axes it names). A reduce stating no result `Shape` cannot
+    // be ranked — fail-closed, same discipline as the missing `Dimensions` above.
+    let out_rank: usize = op
+        .attributes
+        .iter()
+        .find_map(|(k, v)| match (k, v) {
+            (AttrKey::Shape, Attr::IntList(s)) => Some(s.len()),
+            _ => None,
+        })
+        .ok_or_else(|| Error {
+            message: format!(
+                "{f_name}: a `linalg.reduce` states no result `Shape`, so the rank its \
+                 `Dimensions` are stated against is unknown and the door cannot classify the \
+                 block"
+            ),
+        })?;
+    let mut padded = [0i64; 4];
+    padded[..dims.len()].copy_from_slice(dims);
+    Ok(ReduceAxes {
+        dims: padded,
+        n_dims: dims.len() as u8,
+        in_rank: (out_rank + dims.len()) as u8,
     })
 }
 
@@ -2985,10 +3063,20 @@ pub fn lower_function(
         // beside the 1:1 map rather than from it — and it is carried HERE rather than as a `Program`
         // variant, because `Program` is matched exhaustively by consumers outside this crate and a bare
         // reduce is reachable only through this door. An unrecognised combiner falls through to the
-        // refusal below and is named there.
-        let reduce = (op.op_type == OpKind::LinalgReduce)
-            .then(|| reduce_kind_of(op))
-            .flatten();
+        // refusal below and is named there. The AXIS FACTS ride beside the kind (wall 12): read off
+        // the op's own `Dimensions`/`Shape` attrs, fail-closed on a statement the door cannot
+        // classify — a missing or oversized one is a producer defect to name, not a frame fact to
+        // guess.
+        let reduce = match (
+            op.op_type == OpKind::LinalgReduce,
+            reduce_kind_of(op),
+        ) {
+            (true, Some(kind)) => Some(Lowering::Reduce {
+                kind,
+                axes: reduce_axes_of(f.name, op)?,
+            }),
+            _ => None,
+        };
         // `arith.mulf` by a SPLATTED CONSTANT is a scalar multiply, not an `Elementwise(Mul)` — the
         // tiebreak `Program`'s own doc names. Read per-op, because one decoder layer states four
         // different multipliers. Checked BEFORE the 1:1 map, which would otherwise route it to
@@ -3043,8 +3131,7 @@ pub fn lower_function(
                 }
             })
             .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
-            .or(reduce.map(Lowering::Reduce))
-            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
+            .or(reduce)            .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
             .or(extremum.map(|sf| Lowering::ScalarExtremum {
                 value: sf.value,
                 max: op.op_type == OpKind::ArithMaxnumf,
@@ -3083,7 +3170,7 @@ pub fn lower_function(
             Lowering::Silu => 2,
             // `linalg.reduce`'s operands are `(data, init)`: the init is the SEED, which the reduce
             // op-func carries itself, so only the data is an input.
-            Lowering::Reduce(_) => 1,
+            Lowering::Reduce { .. } => 1,
             // The splat is not an operand of the descriptor — it rides in the op as a bound `[1,1]`
             // const — so a scalar multiply reads ONE tensor. The extremum's scalar form is the
             // same: the clamp's bound rides the op, the tile is the one operand. And so is the
@@ -3737,7 +3824,7 @@ pub fn lower_function(
                         && let Some(rows) = respelled_frame_rows(
                             &per_op,
                             dims[0] as u64 * dims[1] as u64,
-                            (matches!(program, Lowering::Reduce(_)))
+                            (matches!(program, Lowering::Reduce { .. }))
                                 .then(|| {
                                     per_op
                                         .iter()
@@ -3782,7 +3869,7 @@ pub fn lower_function(
                 // it has no such input to consult.
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. })
                     if dims.len() == 1
-                        && (matches!(program, Lowering::Reduce(_))
+                        && (matches!(program, Lowering::Reduce { .. })
                             || per_op.iter().any(|r| !r.is_out && r.c_len == 1)) =>
                 {
                     [dims[0] as u32, 1]
@@ -4128,8 +4215,10 @@ fn emit_one(
         }
         // A BARE ROW REDUCTION. The entry point refuses a multi-row `max` by name — see its doc for
         // the measured device defect that makes that a correctness matter rather than a limitation.
-        Lowering::Reduce(kind) => {
-            return super::lower_ktir_to_superdsc::reduce(name, kind, per_op, sym_id_base, layout);
+        Lowering::Reduce { kind, axes } => {
+            return super::lower_ktir_to_superdsc::reduce(
+                name, kind, axes, per_op, sym_id_base, layout,
+            );
         }
         // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
         // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a

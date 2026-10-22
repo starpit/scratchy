@@ -20,7 +20,7 @@
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, reduce};
-use ktir_superdsc::ktir_node::ReduceKind;
+use ktir_superdsc::ktir_node::{ReduceAxes, ReduceKind};
 
 /// The historical cell's shape family: 4 query-head rows × a 512-wide score row (8 sticks).
 const ROWS: u32 = 4;
@@ -46,7 +46,15 @@ fn lower(kind: ReduceKind, rows: u32, cols: u32) -> Vec<EmittedOp> {
     let data = region(7, rows, cols, false);
     let out = region(8, rows, 1, true);
     let mut sym = 0i64;
-    reduce("attn_bmax_g0", kind, &[data, out], &mut sym, None).unwrap_or_else(|e| {
+    // The TRAILING block this shape always was: a rank-2 `[rows, cols]` reduced over its last
+    // axis (`Dimensions = [1]`) — the row-reduce form's own statement (wall 12 threaded the
+    // op's axes to the door; the classification must keep this path byte-identical).
+    let axes = ReduceAxes {
+        dims: [1, 0, 0, 0],
+        n_dims: 1,
+        in_rank: 2,
+    };
+    reduce("attn_bmax_g0", kind, axes, &[data, out], &mut sym, None).unwrap_or_else(|e| {
         panic!(
             "{kind:?} [{rows}, {cols}]: the door must lower it: {}",
             e.message

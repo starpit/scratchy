@@ -6657,6 +6657,14 @@ pub fn op_func_from_str(s: &str) -> OpFunc {
         "sum" => OpFunc::Sum,
         "max" => OpFunc::Max,
         "mean" => OpFunc::Mean,
+        // ⭐ WALL 12 — the nonstick twins of the seeded reduce (`summeanmaxexx2.ddl:39/:45`,
+        // exact `opFuncName` matches; matchDdl2Dsc compares the string EXACTLY,
+        // ddl_conversion.cpp:2117-2122, so these spellings are load-bearing wire names, never
+        // renamed). These arms MUST land before any assembler touches the names — this function
+        // panics on an unknown name rather than guessing, and the door derives the names from the
+        // IR's own combiner (`ReduceKind::nonstick_op_func`).
+        "sumnonstick" => OpFunc::SumNonStick,
+        "maxnonstick" => OpFunc::MaxNonStick,
         // The ONLY runtime-supported spelling: plain `exx2` maps to `OpFuncs::EXX2` →
         // exx2_fwd.smc (updatelibrary.cpp). The `exx2_zeromean` spelling ddc can rewrite to
         // is a distinct enum with NO smc-table entry — see `exx2_consts`' doc.

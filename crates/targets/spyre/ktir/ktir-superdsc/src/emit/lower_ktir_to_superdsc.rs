@@ -7773,6 +7773,163 @@ mod proofs {
         };
         assert_eq!(verdict, expect);
     }
+
+    /// ⭐ WALL 12's AXIS LAW, over the PURE PREDICATE: the block a reduce's `Dimensions` state
+    /// fires EXACTLY on the stated block facts — a leading prefix (and not the whole rank), a
+    /// trailing block, or neither — and on NOTHING else. The tie (a block that is both, the
+    /// whole rank) is Trailing by the no-drift law, and a malformed statement (no dims, more
+    /// dims than the rank) is Middle.
+    ///
+    /// ⛔ SECONDS-CLASS OR NOTHING (user law, 2026-10-22: "10 minute kani proofs are of no
+    /// value" — the user killed this harness's first encoding themselves). The killed encoding
+    /// mirrored the predicate through `to_vec` + `sort_unstable`: introsort's swap loops unwind
+    /// over a SYMBOLIC length and CBMC produced no verdict in 10 minutes. This encoding is the
+    /// wall-10/11 recipe: the predicate states the set fact by RANGE MEMBERSHIP + PAIRWISE
+    /// DISTINCTNESS, the mirror below states the SAME fact by PER-VALUE COUNTING — two genuinely
+    /// different encodings of one theorem, both plain bounded loops over n ≤ 4, both unwound at
+    /// 8 (n ≤ 4 + headroom), no Vec, no sort, no closures, no enum forests.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn the_nonstick_axes_fire_exactly_on_the_block_facts() {
+        let d0: i64 = kani::any();
+        let d1: i64 = kani::any();
+        let d2: i64 = kani::any();
+        let d3: i64 = kani::any();
+        let n: u32 = kani::any();
+        let rank: u32 = kani::any();
+        kani::assume(d0 >= 0 && d0 <= 8);
+        kani::assume(d1 >= 0 && d1 <= 8);
+        kani::assume(d2 >= 0 && d2 <= 8);
+        kani::assume(d3 >= 0 && d3 <= 8);
+        kani::assume(n <= 4);
+        kani::assume(rank <= 8);
+
+        let dims = [d0, d1, d2, d3];
+        let dims = &dims[..n as usize];
+        let verdict = reduce_axis_block(dims, rank);
+
+        // The spec mirror, as COUNTING: the block is the prefix `[0, n)` resp. the trailing
+        // `[rank−n, rank)`, and it is stated iff EVERY value of the range appears among the dims
+        // EXACTLY ONCE — n values, n range members, each once, so nothing lies outside the range
+        // either. A different encoding than the predicate's range+distinctness form.
+        let expect = if n == 0 || n > rank {
+            ReduceAxisBlock::Middle
+        } else {
+            let mut prefix_ok = true;
+            let mut trailing_ok = true;
+            for v in 0..n as i64 {
+                let mut c = 0u32;
+                let mut ct = 0u32;
+                for i in 0..n as usize {
+                    if dims[i] == v {
+                        c += 1;
+                    }
+                    if dims[i] == (rank as i64 - n as i64) + v {
+                        ct += 1;
+                    }
+                }
+                if c != 1 {
+                    prefix_ok = false;
+                }
+                if ct != 1 {
+                    trailing_ok = false;
+                }
+            }
+            if prefix_ok && !trailing_ok {
+                ReduceAxisBlock::LeadingPrefix
+            } else if trailing_ok {
+                ReduceAxisBlock::Trailing
+            } else {
+                ReduceAxisBlock::Middle
+            }
+        };
+        assert_eq!(verdict, expect);
+        // DISPATCH DISJOINTNESS, stated on its own: the nonstick arm fires only on a block that
+        // is NOT the trailing block — a dim set that is both (the whole rank, reduced to a
+        // scalar) is the row-reduce path's, by the no-drift tie law — and never on an empty or
+        // oversized statement.
+        if matches!(verdict, ReduceAxisBlock::LeadingPrefix) {
+            assert!(!trailing_stated(dims, rank));
+            assert!(n >= 1 && n <= rank);
+        }
+    }
+
+    /// The mirror's trailing fact, factored out so the disjointness assert states it once: every
+    /// value of `[rank−n, rank)` appears among `dims` exactly once (the counting form).
+    fn trailing_stated(dims: &[i64], rank: u32) -> bool {
+        let n = dims.len();
+        if n == 0 || n as u32 > rank {
+            return false;
+        }
+        for v in 0..n as i64 {
+            let mut ct = 0u32;
+            for i in 0..n {
+                if dims[i] == (rank as i64 - n as i64) + v {
+                    ct += 1;
+                }
+            }
+            if ct != 1 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// ⭐ WALL 12's GEOMETRY LAW, over the PURE PREDICATE: the nonstick arm fires EXACTLY on
+    /// `out_numel` dividing `in_numel`, a reduced extent of at least 2, and a whole-stick
+    /// survivor width — and the firing geometry carries the BYTE LAW as arithmetic: the product
+    /// is `in_numel` EXACTLY (no padding hides in it), every `(reduced, survivor)` pair maps to
+    /// a distinct flat offset inside the tensor, and the map is `reduced · survivor_cols +
+    /// survivor` — survivors stride 1, the nonstick data law.
+    ///
+    /// ⛔ SECONDS-CLASS OR NOTHING (the same user law as the axes harness): the universe is
+    /// bounded at 4096 so the two symbolic-operand `%`/`/` stay in the solver's cheap range —
+    /// every wall-12 firing geometry (the epilogue merges and their rungs) lives far inside it,
+    /// and the law is scale-free arithmetic (divisibility, quotient, product), not a bound
+    /// checked at the frontier.
+    #[kani::proof]
+    fn the_nonstick_geometry_fires_exactly_on_the_divisible_stick_facts() {
+        let in_numel: u64 = kani::any();
+        let out_numel: u64 = kani::any();
+        kani::assume(in_numel >= 1 && in_numel <= 4096);
+        kani::assume(out_numel <= 4096);
+
+        let verdict = nonstick_geometry(in_numel, out_numel);
+
+        // The spec mirror, stated as the law names it.
+        let divisible = out_numel >= 1 && in_numel % out_numel == 0;
+        let expect = if !divisible {
+            NonstickGeometry::Indivisible
+        } else if in_numel == out_numel {
+            NonstickGeometry::RemovesNothing
+        } else if out_numel % Df::Fp16.elems_per_stick() as u64 != 0 {
+            NonstickGeometry::SubStick(out_numel as u32)
+        } else {
+            NonstickGeometry::Lowers((in_numel / out_numel) as u32, out_numel as u32)
+        };
+        assert_eq!(verdict, expect);
+
+        // THE BYTE LAW, as arithmetic, over symbolic in-bounds coordinates.
+        if let NonstickGeometry::Lowers(reduced_rows, survivor_cols) = verdict {
+            // The product is exact — the window the descriptor declares IS the tensor.
+            assert_eq!(reduced_rows as u64 * survivor_cols as u64, in_numel);
+            let r_i: u32 = kani::any();
+            let s_i: u32 = kani::any();
+            let r_j: u32 = kani::any();
+            let s_j: u32 = kani::any();
+            kani::assume(r_i < reduced_rows && s_i < survivor_cols);
+            kani::assume(r_j < reduced_rows && s_j < survivor_cols);
+            let flat_i = r_i as u64 * survivor_cols as u64 + s_i as u64;
+            let flat_j = r_j as u64 * survivor_cols as u64 + s_j as u64;
+            // In bounds...
+            assert!(flat_i < in_numel);
+            // ...and injective — distinct coordinates are distinct bytes, so the descriptor
+            // reads and writes every element exactly once.
+            if (r_i, s_i) != (r_j, s_j) {
+                assert_ne!(flat_i, flat_j);
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8975,6 +9132,132 @@ fn scalarmul_scaled(
     )])
 }
 
+/// ⭐⭐⭐⭐⭐ WALL 12's LAW — which axis block a `linalg.reduce`'s own `Dimensions` state, against
+/// the rank they are stated in. PURE over the op's own facts (`Dimensions` verbatim, the result
+/// `Shape`'s rank plus the reduced count); nothing here reads a frame, a placement or a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReduceAxisBlock {
+    /// The trailing block `[rank−n .. rank)` — the row-reduce form this door has always lowered:
+    /// the walk's 2D frame merges every leading dim into rows, so a trailing reduce IS a row
+    /// reduce in that frame, which is why the door could assume last-axis before this law
+    /// existed. The TIE case — a block that is BOTH leading and trailing, i.e. the whole rank
+    /// reduced to a scalar — is deliberately Trailing: that shape lowers through the row-reduce
+    /// path today (a rank-1 `[N]→[]` reduce is a one-row reduce over `N` columns in the frame),
+    /// and this arm must not move its bytes.
+    Trailing,
+    /// The leading prefix `[0 .. n)` that is not also the whole rank — the DDL's NONSTICK form
+    /// (`summeanmaxexx2.ddl`'s `sumnonstick`/`maxnonstick`/`meannonstick`/`minnonstick`/
+    /// `absmaxnonstick` binds, `:39-56`). A leading prefix is exactly what makes row-major flat
+    /// read `reduced · survivor_cols + survivor` — survivors stride 1, the reduced axis slow —
+    /// the nonstick data law (`%slice_layout_nonstick`/`%stick_layout_nonstick` key the lane
+    /// roles on `%outer_dim#0`, a SURVIVOR) with ZERO data movement.
+    LeadingPrefix,
+    /// Neither — a middle block, or a malformed statement (no dims, or more dims than the rank).
+    /// A middle block's survivors are strided on both sides (`[A,B,C]` reducing `B` leaves `A`
+    /// at stride `B·C` and `C` at stride 1), so no dim decomposition states them stride-1 and
+    /// the nonstick form cannot express it; the row-reduce body below owns the refusal, exactly
+    /// as it did before this law existed (byte-identical behavior for every shape it lowers).
+    Middle,
+}
+
+/// The block a reduce's `Dimensions` state. See [`ReduceAxisBlock`] for the law; the door alone
+/// reads this, and the Kani proof below pins it to the stated block facts exactly.
+pub(crate) fn reduce_axis_block(dims: &[i64], in_rank: u32) -> ReduceAxisBlock {
+    let n = dims.len();
+    // Malformed statements are Middle: no dims reduces nothing, and more dims than the rank is
+    // not a tensor this door can read. Both keep the row-reduce body's own guards as the
+    // refusal — the no-drift law. (The walk's own reader refuses the empty and oversized
+    // statements BY NAME before the door ever sees them; this branch is the pure law's
+    // defensive floor, Kani-pinned, never textually misnamed.)
+    if n == 0 || n as u32 > in_rank {
+        return ReduceAxisBlock::Middle;
+    }
+    // The set facts, stated WITHOUT sorting: n values that each lie inside a range of exactly n
+    // integers and are pairwise distinct are precisely that range's permutation (pigeonhole) —
+    // the same fact a `sort + compare` states, in plain bounded loops a solver unwinds in
+    // seconds. (The sort-based form this replaced is the ENCODING the user killed on
+    // 2026-10-22 — "10 minute kani proofs are of no value": `to_vec` + `sort_unstable` unwind
+    // introsort's swap loops over a SYMBOLIC length and CBMC sat in "Checking harness..." with
+    // no verdict for 10+ minutes. The theorem never changed; only the encoding did.)
+    let mut in_prefix = true;
+    let mut in_trailing = true;
+    let mut distinct = true;
+    for i in 0..n {
+        if dims[i] < 0 || dims[i] >= n as i64 {
+            in_prefix = false;
+        }
+        if dims[i] < (in_rank - n as u32) as i64 || dims[i] >= in_rank as i64 {
+            in_trailing = false;
+        }
+        for j in (i + 1)..n {
+            if dims[i] == dims[j] {
+                distinct = false;
+            }
+        }
+    }
+    let prefix = in_prefix && distinct;
+    let trailing = in_trailing && distinct;
+    if prefix && !trailing {
+        ReduceAxisBlock::LeadingPrefix
+    } else if trailing {
+        ReduceAxisBlock::Trailing
+    } else {
+        ReduceAxisBlock::Middle
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ WALL 12's GEOMETRY — what a leading-prefix reduce states, from the op's OWN numels
+/// (the data's and the output's, both frame-invariant: a region's `r_len · c_len` is its true
+/// element count whatever frame the walk threaded). PURE; the door derives everything below
+/// from these two numbers and never from the threaded `[rows, 1]` family frame (wall 11's law).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NonstickGeometry {
+    /// The arm fires: `(reduced_rows, survivor_cols)` with `reduced_rows ≥ 2`,
+    /// `survivor_cols` a whole fp16 stick, and `reduced_rows · survivor_cols == in_numel`
+    /// EXACTLY — the byte law the descriptor's window and the DDL's lane roles both state.
+    Lowers(u32, u32),
+    /// The survivors are SUB-STICK — fewer lanes than one stick. The physical stick would have
+    /// to span `[a_lo × survivor]` (TWO dims), which no `ItDim` table states (one `is_stick`
+    /// dim), and SAMV-padding the survivor dim up to a stick RE-LAYOUTS the bytes
+    /// (`a·64+s ≠ a·32+s`) — movement, which the kernel's contract forbids. WALL 13's open
+    /// case: the online-softmax `m`/`l` merges (`[32,8,4]→[8,4]`, 32 survivor lanes = half a
+    /// stick). The DDL's own governing lines are the subchunk datastage cap over the REDUCE dims
+    /// (`summeanmaxexx2.ddl:94`, max=64) and the above/below-interleave constraint over the
+    /// OUTER dims (`:95`, ∈ {1,2,4}).
+    SubStick(u32),
+    /// The reduced extent is 1 — the op removes nothing (`in_numel == out_numel`). Today's
+    /// row-reduce path owns that shape wherever its guards pass it; the no-drift law keeps it
+    /// there rather than re-routing it through a one-row nonstick descriptor.
+    RemovesNothing,
+    /// `out_numel` does not divide `in_numel` (or an extent overflows `u32`) — not a reduce any
+    /// decomposition states. Refused by name.
+    Indivisible,
+}
+
+/// The geometry a leading-prefix reduce states, or why the nonstick arm does not fire. See
+/// [`NonstickGeometry`] for the law; the Kani proof below pins the firing conditions and the
+/// product law exactly.
+pub(crate) fn nonstick_geometry(in_numel: u64, out_numel: u64) -> NonstickGeometry {
+    if out_numel == 0
+        || !in_numel.is_multiple_of(out_numel)
+        || in_numel > u32::MAX as u64
+        || out_numel > u32::MAX as u64
+    {
+        return NonstickGeometry::Indivisible;
+    }
+    let survivor_cols = out_numel;
+    let reduced_rows = in_numel / out_numel;
+    if reduced_rows == 1 {
+        return NonstickGeometry::RemovesNothing;
+    }
+    // The stick basis is TYPED — `Df::elems_per_stick`, the same basis `stick_basis` derives for
+    // the tiler (superdsc_opspec.rs:1259) — never a literal width.
+    if !survivor_cols.is_multiple_of(Df::Fp16.elems_per_stick() as u64) {
+        return NonstickGeometry::SubStick(survivor_cols as u32);
+    }
+    NonstickGeometry::Lowers(reduced_rows as u32, survivor_cols as u32)
+}
+
 /// A BARE ROW REDUCTION — `[rows, cols]` → `[rows, 1]`, one `sfp` op along the stick axis.
 ///
 /// ⭐ THE ASSEMBLER WAS ALREADY WRITTEN; WHAT WAS MISSING WAS A DOOR — the same story as
@@ -9022,6 +9305,7 @@ fn scalarmul_scaled(
 pub fn reduce(
     name: &str,
     kind: crate::ktir_node::ReduceKind,
+    axes: crate::ktir_node::ReduceAxes,
     r: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -9037,6 +9321,77 @@ pub fn reduce(
             "{name}: reducing t{} `[{rows}, {cols}]` — a reduce needs a non-empty tile",
             data.tid
         ));
+    }
+    // ⭐⭐⭐⭐⭐ WALL 12 — THE LEADING-PREFIX ARM. The op's OWN `Dimensions` state which axis block
+    // it reduces; a LEADING PREFIX (and not the whole rank) is the DDL's nonstick form, whose
+    // survivors stride 1 in row-major flat (`reduced · survivor_cols + survivor`). The geometry
+    // comes from the op's OWN numels — `rows·cols` and `out.r_len·out.c_len` are frame-invariant
+    // (wall 11's law: never the threaded `[rows, 1]` family frame) — so the arm cannot mis-read
+    // a respelled region. Everything that is NOT a leading prefix falls through to the row-reduce
+    // body below BYTE-IDENTICALLY (the no-drift law): Middle (a middle block, or a degenerate
+    // shape the row-reduce body already lowers — hard-refusing Middle outright would regress
+    // shapes like `[A,1,1]` reducing dims `[1]` that lower today), Trailing (the tie included —
+    // a full-rank reduce-to-scalar is deliberately the row-reduce path's), and a
+    // `RemovesNothing` geometry (reduced extent 1 — the op removes nothing; today's row-reduce
+    // body owns it).
+    if matches!(
+        reduce_axis_block(axes.dims(), axes.in_rank()),
+        ReduceAxisBlock::LeadingPrefix
+    ) {
+        let in_numel = rows as u64 * cols as u64;
+        let out_numel = out.r_len as u64 * out.c_len as u64;
+        match nonstick_geometry(in_numel, out_numel) {
+            NonstickGeometry::Lowers(reduced_rows, survivor_cols) => {
+                // The nonstick descriptor: survivors are the lanes, the accumulator is the
+                // survivor vector. The handles carry the regions' OWN frame dims — the
+                // assembler's agreement-assert re-derives the numels from them, so a frame that
+                // disagrees with the geometry is a named build failure, never a mis-walk.
+                let op_func = kind.nonstick_op_func();
+                let op_name = format!("{op_func}_o{}", out.tid);
+                return Ok(vec![
+                    crate::ir::bridge::tiled_op_sdsc_op::reduce::assemble_reduce_nonstick(
+                        &op_name,
+                        op_func,
+                        reduced_rows,
+                        survivor_cols,
+                        &rb(&data.name(), rows, cols),
+                        &rb(&out.name(), out.r_len, out.c_len),
+                        sym_id_base,
+                        layout,
+                    ),
+                ]);
+            }
+            NonstickGeometry::SubStick(survivor_cols) => {
+                // WALL 13's named refusal — claiming only OUR side's certain fact: this
+                // vocabulary states ONE `is_stick` ItDim, and a physical stick spanning the
+                // survivors plus their row groups would be TWO logical dims in one stick
+                // (`a·stick + s ≠ a·survivor + s` re-layouts the bytes). Whether the vendor
+                // vocabulary can state a compound stick is wall-13 investigation, not cited
+                // here. The DDL's own governing lines for that investigation: the subchunk
+                // datastage cap over the REDUCE dims (`summeanmaxexx2.ddl:94`, max=64) and the
+                // above/below-interleave constraint over the OUTER dims (`:95`, ∈ {1,2,4}).
+                let eps = Df::Fp16.elems_per_stick() as u64;
+                return err(format!(
+                    "{name}: the reduce's output t{} is `[{}, {}]` — a leading-axis reduce with \
+                     {survivor_cols} survivor lanes, SUB-STICK (the fp16 stick is {eps} lanes). A \
+                     physical stick spanning the survivors and their row groups would be TWO \
+                     logical dims in one stick, which this vocabulary's one `is_stick` dim cannot \
+                     state, and padding the survivors up to a stick re-layouts the bytes \
+                     (`a·{eps}+s ≠ a·{survivor_cols}+s`) — movement the op's contract forbids.",
+                    out.tid, out.r_len, out.c_len
+                ));
+            }
+            NonstickGeometry::Indivisible => {
+                return err(format!(
+                    "{name}: the reduce's output t{} states {out_numel} elements from t{}'s \
+                     {in_numel} — a leading-axis reduce's survivor count must divide its input \
+                     count exactly; this decomposition is not a reduce any dim decomposition states.",
+                    out.tid, data.tid
+                ));
+            }
+            // The op removes nothing — today's row-reduce body owns the shape (no-drift).
+            NonstickGeometry::RemovesNothing => {}
+        }
     }
     // ⭐ THE WIDE MULTI-ROW MAX PASSES THROUGH — the guard that used to refuse it here was built
     // on a misread diagnostic and is deleted; the corrected law (with the DDL citations and the

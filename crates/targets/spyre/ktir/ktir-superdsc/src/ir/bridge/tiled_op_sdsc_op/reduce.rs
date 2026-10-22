@@ -31,6 +31,12 @@ use crate::work::distribute_cores;
 /// billed 2,641,920 B vs the 1,677,721-B budget). Anything else (`None`/`Some(2)+`) is the
 /// seeded convention.
 fn reduce_tile_kind(op: OpFunc) -> TileOpKind {
+    // ⭐ WALL 12: the nonstick twins are a DISTINCT tiling kind — their accumulator is the
+    // survivor vector, not one stick per row, so the seeded residency formula would charge the
+    // wrong shape. Everything else keeps the arity-picked kind.
+    if matches!(op, OpFunc::SumNonStick | OpFunc::MaxNonStick) {
+        return TileOpKind::NonstickReduce;
+    }
     match op.ddl_input_arity() {
         Some(1) => TileOpKind::PointwiseOrReduce { n_operands: 1 },
         _ => TileOpKind::SeededReduce,
@@ -525,6 +531,212 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_reduce {op_name}: {e}"))
+}
+
+/// ⭐⭐⭐⭐⭐ WALL 12 — the NONSTICK reduce: a leading-axis reduce `[reduced_rows, survivor_cols] →
+/// [survivor_cols]`, the DDL's own nonstick family (`summeanmaxexx2.ddl:39/:45`, `sumnonstick` /
+/// `maxnonstick`). The STICK form above reduces the innermost stick axis (one value per row);
+/// this form reduces the OUTER axis, so the SURVIVORS are the lanes — the accumulator is the
+/// survivor vector, not one stick per row. Row-major flat is `reduced · survivor_cols + survivor`
+/// exactly: survivors stride 1, the reduced axis slow, ZERO data movement — which is what makes a
+/// leading prefix the nonstick form's own geometry (the door's `reduce_axis_block` law).
+///
+/// # THE TYPED SURFACE (what matchDdl2Dsc binds, and why it cannot mis-walk)
+///
+/// * **ItDims `[out, y]`** — `out` = the reduced extent `{is_reduction: true, is_stick: false}`
+///   (the FIRST reduction-non-stick ItDim in this crate; the DDL's `%reduce_dim` "OUT dimension"
+///   reduced through a non-stick lane), `y` = the survivors `{is_stick: true}`. `y` is LAST in
+///   the dim vector, so the survivor stick is the INNERMOST loop dim — the vendor fixture's own
+///   nest (`sdsc_maxnonstick.json`: `x → mb → i → out`, survivor stick innermost) — by the
+///   tiler's dim order, not by a hand-written walk.
+/// * **data `[Active, Active]` R2, accum `[RedNonStick, Active]` R2** over
+///   `layoutDimOrder ["out", "y"]`, stick `y` — the vendor scale law
+///   (`sdsc_maxnonstick.json:711/:738`: data `scale_ [1,1,1,1]`, accum `[1,-1,1,1]`, the −1 on
+///   the REDUCED dim) with the survivor stick carrying `Active` (the `MaterializedStick`
+///   invariant `TensorArg::new` enforces). The DDL's dim↔symbol binding is a CONSTRAINT SOLVER
+///   over these scales (`ddl_conversion.cpp:2360-2460`): `%outer_dim#0` — the SURVIVOR lane axis
+///   — binds to the stick dim `y`, and the reduce symbols bind to the input-only reduced `out`.
+///   This is the same solver path topk ships; there is no declared walk to get wrong.
+/// * **`out` NEVER core-split** — `distribute_cores` splits output dims only and never a
+///   reduction dim, so the cores split the SURVIVOR stick `y` by stick count (the fixture's own
+///   division: `numWkSlicesPerDim_ {"mb": 8}`, the reduced `i` unsplit). The reduced axis is the
+///   accumulation axis; splitting it would need the psum ring, which the fixture proves the
+///   vendor's own nonstick emission does not bind (ringless).
+/// * **NO coordinate mask** — the door's `nonstick_geometry` law admits this form only at a
+///   whole-stick survivor width with `reduced_rows · survivor_cols == in_numel` EXACTLY, so no
+///   pad lane exists anywhere in the op (contrast [`reduce_coordinate_mask`], the STICK form's
+///   padded-width answer).
+/// * **NO SFP REDUCE mode** — the DDL's SFP REDUCE modes and the PE `nfwd` block gate on the
+///   STICK binds directly (`summeanmaxexx2.ddl:485-517`, `:351-438`), not on the
+///   `condition_or` unions; the nonstick form's reduced axis is an outer dim the loop nest
+///   walks, its lanes hold different survivors, and the per-lane PE accumulators are final
+///   after the nest. What serves both forms — subchunk accumulation, the across-subchunk
+///   combine, the psum ring arms — is union-gated and entered through the same
+///   `genericpartialreduction` bind the stick form uses.
+/// * **interimLabeledDs []** — the DDL's nonstick binds carry no interim tensor (the stick
+///   `exx2` does, `%output_tensor_x2`); the vendor fixture states the empty list verbatim
+///   (`sdsc_maxnonstick.json:775`), and this crate's wire emission derives the empty interim
+///   list from the operand list the same way it does for `sum`/`max`.
+///
+/// # TRAP (e) — WHY THIS CANNOT REPRODUCE THE OLD HAND-WRITTEN CARD FAILURE
+///
+/// `attn.rs:2771-2790` records a prior hand-written `maxnonstick` that failed on card
+/// ("walked only part of each core's rows"): those row-major operands carried a DECLARED WALK
+/// hand-picked beside the layout. This path declares NO walk — the `TensorArg` dims/scales ARE
+/// the layout, the DDL solver binds the symbols to them, and the agreement asserts in
+/// [`assemble_reduce_nonstick`] bind the operand handles to the op's own typed geometry, so a
+/// mismatch is a named refusal at assembly (a `cargo build` failure), never a mis-walk.
+///
+/// # THE TIME-TILE LADDER IS THE STICK LADDER — A NAMED REFUSAL, NOT A MIS-WALK
+///
+/// `time_tile_for_lx` searches divisors of the tiled dim's STICK count. This op's tiled dim is
+/// the reduced `out` (the template's own reduce-dim chunk trips — `summeanmaxexx2.ddl:159-196`
+/// reads the HBM accumulator only on second-and-later reduce-dim chunk trips), which is
+/// NON-STICK: a shape whose per-core residency overflows LX at a non-stick-multiple reduced
+/// extent refuses at the stick check with the dim named — fail-closed. The template's own
+/// reduce-dim subchunk cap (`:94`, max 64 over the reduce dims) is the future ladder; wall 12
+/// fires on no such shape (the epilogue merges are stick-wide or sub-stick), and a refusal is
+/// never a silent wrong answer.
+///
+/// **Name collision, stated**: this crate's reduce vocabulary names the REDUCED dim `out` (the
+/// DDL's own `%reduce_dim` "OUT dimension"); the vendor FIXTURE's `out` is its SURVIVOR stick.
+/// The names never reach matchDdl2Dsc (it binds by layout and `opFuncName`, not by dim name) —
+/// the roles are what bind, and they are pinned by the scales above.
+pub fn reduce_nonstick_opspec(
+    op: OpFunc,
+    reduced_rows: u32,
+    survivor_cols: u32,
+    data_name: &str,
+    accum_name: &str,
+) -> Result<OpSpec, String> {
+    // The survivor width is a whole fp16 stick BY CONSTRUCTION (the door's `nonstick_geometry`
+    // law admits nothing else); `StickExtent` re-states it through the SAME typed constructor
+    // the spatial split uses, so a direct caller cannot smuggle a sub-stick width past this fn.
+    let survivor_stick = crate::superdsc_opspec::StickExtent::<Fp16>::new(survivor_cols)
+        .map_err(|e| format!("reduce `{accum_name}` (nonstick): {e}"))?;
+    let dims = vec![
+        crate::superdsc_opspec::ItDim {
+            name: "out",
+            size: reduced_rows,
+            is_reduction: true,
+            is_stick: false,
+            df: Df::Fp16,
+        },
+        crate::superdsc_opspec::ItDim {
+            name: "y",
+            size: survivor_stick.elems(),
+            is_reduction: false,
+            is_stick: true,
+            df: Df::Fp16,
+        },
+    ];
+    let tile_op = TileOp {
+        kind: TileOpKind::NonstickReduce,
+        dims: dims.clone(),
+        df: Df::Fp16,
+    };
+    let tiled = tile_op
+        .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
+        .map_err(|e| e.0)?;
+    let (plan, time_tile) = (tiled.plan, tiled.time_tile);
+    let device_dims = plan.iter_syms(["out", "y"]);
+    let data = AnyTensorArg::R2(
+        TensorArg::<2>::new(
+            true,
+            data_name.to_string(),
+            Role::Output,
+            [Scale::Active, Scale::Active],
+            device_dims,
+            ["out", "y"],
+            "y",
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?,
+    );
+    let accum = AnyTensorArg::R2(
+        TensorArg::<2>::new(
+            false,
+            accum_name.to_string(),
+            Role::Output,
+            // The REDUCED `out` carries RedNonStick (the phantom −1 — legal on a NON-stick dim);
+            // the survivor stick `y` carries Active, the MaterializedStick invariant.
+            [Scale::RedNonStick, Scale::Active],
+            device_dims,
+            ["out", "y"],
+            "y",
+            Allocation::Hbm,
+        )
+        .map_err(|e| e.0)?,
+    );
+    let args = vec![data, accum];
+    let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
+    // The stick form's own sum/max const: `scaling_factor` at 1.0. The DDL gates the scaling
+    // transfer on the MEAN branch only (`summeanmaxexx2.ddl:133-137`), so sum/max never read
+    // it — the stick form ships this exact `OpInfo` card-proven (PR #813's five `tt.reduce`
+    // maxima), and the nonstick binds ride the same family machinery.
+    let op_info = OpInfo::ReduceScaling(sen169_bits(1.0f32) as u32);
+    Ok(OpSpec {
+        op,
+        is_reduction: true,
+        iter: plan,
+        args,
+        op_info,
+        tiled_symbols,
+        time_tile,
+        indirect: None,
+        // None BY LAW (see the doc above): the geometry admits no pad lane anywhere.
+        coordinate_mask: None,
+    })
+}
+
+/// [`reduce_nonstick_opspec`]'s assemble wrapper — the names-form twin of
+/// [`assemble_reduce_seeded`], carrying the AGREEMENT-ASSERT that binds the operand handles to
+/// the op's typed geometry: the data handle's declared element count must be
+/// `reduced_rows · survivor_cols` EXACTLY and the accumulator's `survivor_cols` — the same
+/// frame-invariant numel law the door threaded (wall 11), so a handle minted from any other
+/// frame's rows/cols is a named refusal here, never a descriptor that walks the wrong bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_reduce_nonstick<D: KindTag, A: KindTag>(
+    op_name: &str,
+    op_func: &'static str,
+    reduced_rows: u32,
+    survivor_cols: u32,
+    data: &Stk<D>,
+    accum: &Stk<A>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> EmittedOp {
+    let data_l = data.layout();
+    let data_numel = data_l.rows as u64 * data_l.cols as u64;
+    assert_eq!(
+        data_numel,
+        reduced_rows as u64 * survivor_cols as u64,
+        "{op_name}: the data handle '{}' declares {data_numel} elements but the nonstick \
+         geometry states {reduced_rows}·{survivor_cols} — the handle and the geometry must \
+         come from the SAME law (the op's own numels, frame-invariant)",
+        data.name(),
+    );
+    let accum_l = accum.layout();
+    let accum_numel = accum_l.rows as u64 * accum_l.cols as u64;
+    assert_eq!(
+        accum_numel,
+        survivor_cols as u64,
+        "{op_name}: the accumulator handle '{}' declares {accum_numel} elements but the \
+         nonstick form writes the {survivor_cols}-element survivor vector — one lane per \
+         survivor, not one stick per row",
+        accum.name(),
+    );
+    let op = reduce_nonstick_opspec(
+        op_func_from_str(op_func),
+        reduced_rows,
+        survivor_cols,
+        data.name(),
+        accum.name(),
+    )
+    .unwrap_or_else(|e| panic!("assemble_reduce_nonstick {op_name}: {e}"));
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    crate::emit::emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+        .unwrap_or_else(|e| panic!("assemble_reduce_nonstick {op_name}: {e}"))
 }
 
 /// [`reduce_opspec`] with per-operand ELEMENT offsets — for per-head/offset reduce slices.
