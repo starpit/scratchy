@@ -535,13 +535,22 @@ pub struct EwOperand<'a> {
     col_window: Option<crate::addr::ColWindow>,
     /// ⭐ THE POOLED MARK — the reach the gather door admitted this operand under, set only by
     /// [`mark_pooled`] on the gathered operand of a table whose layout declares a
-    /// `BundleLayout::gather_reach` for it. A pooled table's placement is ONE slice of a pool its
-    /// index re-bases, so the operand's window law at the family mint is ONE ENTRY's coverage
-    /// against the slice — ONE ENTRY being the reach's own `entry_elems`, which is why the mark
-    /// CARRIES the value rather than a bool: the window the mint selects and the bound the door
-    /// admitted under are one value, not two facts that could disagree. Nothing else about the
+    /// `BundleLayout::gather_reach` for it. The mark CARRIES the reach so the window the mint
+    /// selects and the bound the door admitted under are one value, not two facts that could
+    /// disagree; the mint then reads the FAMILY from the placement — a slice of a pool its
+    /// index re-bases takes ONE ENTRY's direct coverage, a placement holding the WHOLE reach
+    /// (a source extent) takes `min(swept, the reach's ceiling)`. Nothing else about the
     /// operand — bytes, scales, offsets — changes; the mark selects a bound, never a descriptor.
     pooled: Option<crate::sdsc_abstract::GatherReach>,
+    /// ⭐ THE GATHERED MARK — set only by [`mark_gathered`] on the operand an index reads through
+    /// ([`assemble_pointwise_broadcast_gather`]'s `gathered_input`) when the table declares NO
+    /// reach. It selects the SOURCE-WINDOW LAW at the family mint ([`mint_ew_operands`]): a
+    /// gathered operand's addressable set is the index's image over the source's rows, never
+    /// the swept rectangle, so a sweep that fits the placement keeps its window and an
+    /// over-sweep is REFUSED, fail-closed, until the table declares its reach (the
+    /// `GatherReach` the pooled mark above then carries) — see that branch's doc for the law.
+    /// Like [`pooled`], the mark selects a bound and never a descriptor.
+    gathered: bool,
 }
 impl<'a> EwOperand<'a> {
     pub(crate) fn scale(&self) -> [Scale; 3] {
@@ -613,6 +622,19 @@ impl<'a> EwOperand<'a> {
     /// [`mark_pooled`]).
     pub(crate) fn pooled(&self) -> Option<crate::sdsc_abstract::GatherReach> {
         self.pooled
+    }
+    /// ⭐ THE GATHERED MARK — the same operand under the gather door's source-window law. Set
+    /// only by [`assemble_pointwise_broadcast_gather`] for the operand its index reads through;
+    /// see the field's own doc for why the mark selects a bound and never a descriptor.
+    pub(crate) fn mark_gathered(&self) -> Self {
+        Self {
+            gathered: true,
+            ..*self
+        }
+    }
+    /// Whether an index reads this operand through (see [`mark_gathered`]).
+    pub(crate) fn gathered(&self) -> bool {
+        self.gathered
     }
     /// The handle's declared [`StickLayout`], captured by the `In` door that built this operand.
     pub(crate) fn declared(&self) -> StickLayout {
@@ -734,12 +756,56 @@ pub(crate) fn mint_ew_operands(
                 if let Some(reach) = i.pooled() {
                     let d = i.declared();
                     let entry = reach.entry_elems() as usize;
+                    // ⭐ THE REACH-DECLARED WINDOW, BY FAMILY (law (b)'s one law,
+                    // [`BundleLayout::gathered_source_rows`]): the mark CARRIES the reach, so
+                    // the window selected here and the bound the door admitted under are one
+                    // number, never two facts that could disagree. A placement holding the
+                    // WHOLE reach is a SOURCE EXTENT — the window is `min(swept, the reach's
+                    // ceiling)`; a placement holding a SLICE is a POOL — the swept rectangle
+                    // is not this operand's access model (its rows are index-named, never
+                    // contiguous) and the runtime re-bases, so the direct window is ONE
+                    // entry's coverage. The VALUES' bound is not here at all: it is the
+                    // ceiling the host-side composition mints through, unconstructible past it.
+                    let rows =
+                        l.gathered_source_rows(i.name(), sw_rows, entry as u32, d.df, Some(reach))?;
                     l.check_window(
                         i.name(),
-                        StickLayout::row_blocked_df(1, entry, d.df),
+                        StickLayout::row_blocked_df(rows as usize, entry, d.df),
                         off as u64,
-                        1,
+                        rows,
                         entry as u32,
+                        &what,
+                    )?
+                } else if i.gathered() {
+                    // ⭐⭐⭐ LAW (b) — A GATHERED SOURCE'S WINDOW IS ITS SWEPT EXTENT WHEREVER
+                    // THE SWEEP FITS THE PLACEMENT, AND AN OVER-SWEEP IS REFUSED, FAIL-CLOSED,
+                    // WITHOUT A DECLARED REACH. For a gathered source the addressable set is
+                    // the index's IMAGE over the source's rows — `addr = idx·skip_addr + base`,
+                    // one source row per entry — so the bytes this op can touch are the rows
+                    // the INDEX names, never the contiguous `sw_rows × sw_cols` rectangle the
+                    // plain window model assumes. Where the image's worst case (the whole
+                    // source) fits the placement, the swept window is honest and kept byte for
+                    // byte; where the sweep EXCEEDS the placement, the placement alone cannot
+                    // bound the values — a repeat gather over a source placed whole may exceed
+                    // it (each row read many entries' worth of times) while a pool slice hides
+                    // a source the layout cannot see — so the over-sweep must carry the TYPED
+                    // statement of its values' bound (a `GatherReach`; this branch is the
+                    // NO-reach mark, so it refuses here, naming the sweep, the placement and
+                    // the missing declaration). The reach-declared form takes the pooled mark
+                    // above, one law, family-forked.
+                    //
+                    // ⛔ TABLE-VALUE CORRECTNESS IS NOT THIS GUARD'S: whether the staged values
+                    // really name in-range rows is the staging family's own law at birth, not a
+                    // fact a window over the placement could check — the same division the
+                    // reach-declared branch's doc states for its ceiling.
+                    let d = i.declared();
+                    let rows = l.gathered_source_rows(i.name(), sw_rows, sw_cols, d.df, None)?;
+                    l.check_window(
+                        i.name(),
+                        StickLayout::row_blocked_df(rows as usize, sw_cols as usize, d.df),
+                        off as u64,
+                        rows,
+                        sw_cols,
                         &what,
                     )?
                 } else {
@@ -1383,7 +1449,16 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled(reach);
         &pooled_inputs[..]
     } else {
-        inputs
+        // ⭐ LAW (b)'s MARK — the operand the index reads through takes the source-window law
+        // at the family mint even when the table is NOT a pool: a sweep that fits its
+        // placement keeps its window byte for byte, and an over-sweep is REFUSED here,
+        // fail-closed, until the table declares a reach (the typed bound on its index values —
+        // a pool's `GatherReach::of_plane`, or a whole-placed source's
+        // `GatherReach::of_source_extent`, which the mark above then carries). See the mark's
+        // own doc and `mint_ew_operands`'s gathered branch for the law.
+        pooled_inputs = inputs.to_vec();
+        pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_gathered();
+        &pooled_inputs[..]
     };
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
@@ -4654,6 +4729,7 @@ impl<'a, K: KindTag> In<'a, K> {
             col_offset: self.col_offset,
             col_window: self.col_window,
             pooled: None,
+            gathered: false,
         }
     }
 }

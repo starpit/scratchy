@@ -3300,39 +3300,39 @@ pub fn lower_function(
         // ⛔ APPENDED AFTER the inputs and BEFORE the output, which both orders below rely on.
         // `bcast_axes` is indexed by input position, so the index may not sit among them; a
         // `ScalarMul`'s gathered table is its one tensor input, so it may not come first either.
-        let op_gather = 'g: {
-            for (i, v) in in_values.iter().enumerate() {
-                if let Some(&ti) = gathered_loads.get(v) {
-                    let g = gathers[ti];
-                    let idx_r = f
-                        .arguments
-                        .iter()
-                        .zip(k.bindings.iter())
-                        .position(|(_, b)| b.get() == g.index_tid)
-                        .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
-                    let Some(mut idx_r) = idx_r else {
-                        return err(format!(
-                            "{}: the program gathers through t{}, which is not one of this function's \
-                             bound parameters — an index buffer with no binding has no placement and no \
-                             stated length, and the descriptor makes dbo's idx→address program iterate \
-                             one entry per row of the node",
-                            f.name, g.index_tid
-                        ));
-                    };
-                    idx_r.is_out = false;
-                    per_op.push(idx_r);
-                    gather_carried[ti] = true;
-                    // ⭐ THE OP'S FIRST GATHERED INPUT, by identity. A second gathered input of the
-                    // same op is NOT checked here: this loop takes the first match, and the whole-
-                    // function consumer counting that refuses a gathered load with two consumers is
-                    // the matmul materializer's own (`gathered_matmul_materializes`). An op whose
-                    // SECOND input is also a gathered load of another tile reaches that refusal, or
-                    // the ScalarMul-only rule below — not a mid-walk one.
-                    break 'g Some((g, ti, i));
-                }
-            }
-            None
-        };
+        // ⭐⭐⭐ LAW (a) — A CONTRACTION MATERIALIZES **EVERY** GATHERED OPERAND. The join below
+        // collects ALL of this op's gathered inputs, in input order. The single-gathered-input
+        // admission this replaced took the FIRST match only, so a contraction whose A and B are
+        // both gathered (the decode attention's dot: A gathers Q through its repetition table,
+        // B gathers the pool's blocks) materialized one side and left the other reading the
+        // walk's raw gathered load — right shape, right dtype, wrong rows, from a clean bake.
+        // Each gathered input now takes its own materialization below; an input that cannot
+        // materialize is refused by name at the door that used to admit only the first.
+        let op_gathers: Vec<(Gather, usize, usize)> = in_values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| gathered_loads.get(v).map(|&ti| (gathers[ti], ti, i)))
+            .collect();
+        for &(g, ti, _gi) in &op_gathers {
+            let idx_r = f
+                .arguments
+                .iter()
+                .zip(k.bindings.iter())
+                .position(|(_, b)| b.get() == g.index_tid)
+                .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
+            let Some(mut idx_r) = idx_r else {
+                return err(format!(
+                    "{}: the program gathers through t{}, which is not one of this function's \
+                     bound parameters — an index buffer with no binding has no placement and no \
+                     stated length, and the descriptor makes dbo's idx→address program iterate \
+                     one entry per row of the node",
+                    f.name, g.index_tid
+                ));
+            };
+            idx_r.is_out = false;
+            per_op.push(idx_r);
+            gather_carried[ti] = true;
+        }
         // ⛔⛔⛔ A GATHERED OPERAND MAY ONLY REACH A BODY THAT DECLARES THE INDEX. `ScalarMul` is the
         // one — `scalarmul_at` takes the [`Gather`] and routes to
         // `assemble_pointwise_broadcast_gather`. Every other arm of [`emit_one`] would emit an
@@ -3340,99 +3340,115 @@ pub fn lower_function(
         // ids: right shape, right dtype, right distribution, wrong rows, and nothing downstream
         // compares the two. So it is refused by name rather than lowered as the nearest thing.
         //
-        // ⭐⭐⭐ THE ONE EXCEPTION — RUNG 4: A MATMUL WHOSE **B** IS THE GATHERED TABLE. The
+        // ⭐⭐⭐ THE ONE EXCEPTION — RUNG 4: A CONTRACTION WHOSE OPERAND IS THE GATHERED TABLE. The
         // materialization is synthesized HERE, before the refusal can fire, because the vendor's own
         // gathered fixtures and IBM's paged attention both spell a gathered contraction exactly one
         // way and this is it: a KERNEL-less gathered copy writing a minted intermediate, the matmul
-        // reading the intermediate as plain-B. See [`gathered_matmul_materializes`], which states the
-        // whole argument and does the work.
+        // reading the intermediate as a plain activation. See [`gathered_matmul_materializes`], which
+        // states the whole argument and does the work.
         // ⭐⭐⭐⭐⭐ AND THE BATCHED FORM IS ADMITTED AT THE SAME DOOR — a `linalg.batch_matmul`
         // whose B is the gathered table read through its reshape states its geometry in its OWN
         // operand types, and the materializer's batch branch writes the C-order copy the
         // per-batch bmm reads (see [`emit::batched_gathered`]). A rank-2 gathered dot never
         // enters it: it keeps rung 4's card-proven `[k, n]` path, byte for byte.
-        let gathered_form = if let Some((g, _ti, gi)) = op_gather
-            && !matches!(
-                program,
-                Lowering::ScalarMul(_)
-                    | Lowering::ScalarExtremum { .. }
-                    | Lowering::ScalarSub { .. }
-                    | Lowering::BoundScalarMul(_)
-            )
-        {
-            gathered_matmul_materializes(
-                k,
-                layout,
-                &mut GatherEmit {
-                    sym_id_base,
-                    out: &mut out,
-                    floor,
-                    inter: &mut inter,
-                },
-                g,
-                gi,
-                &in_values,
-                GatherConsumer {
-                    op,
-                    pre_through: &pre_through,
-                },
-            )?
-        } else {
-            GatheredB::No
-        };
-        let gathered_b = !matches!(gathered_form, GatheredB::No);
-        let batched_geo = match gathered_form {
-            GatheredB::Batched(bg) => Some(bg),
+        // ⭐⭐⭐⭐⭐ AND LAW (a) MAKES IT **EVERY** GATHERED OPERAND, NOT ONLY B — the loop below
+        // materializes each gathered input in turn, so a dot whose A and B are both gathered
+        // (the decode attention's) serves both sides through the same door instead of leaving
+        // the second reading the walk's raw gathered load. The frame each side takes is stated
+        // by the operand's own geometry, never by its position: see the loop's doc.
+        let scalar_body = matches!(
+            program,
+            Lowering::ScalarMul(_)
+                | Lowering::ScalarExtremum { .. }
+                | Lowering::ScalarSub { .. }
+                | Lowering::BoundScalarMul(_)
+        );
+        let mut gathered_forms: Vec<(usize, GatheredB)> = Vec::new();
+        if !scalar_body {
+            for &(g, _ti, gi) in &op_gathers {
+                gathered_forms.push((
+                    gi,
+                    gathered_matmul_materializes(
+                        k,
+                        layout,
+                        &mut GatherEmit {
+                            sym_id_base,
+                            out: &mut out,
+                            floor,
+                            inter: &mut inter,
+                        },
+                        g,
+                        gi,
+                        &in_values,
+                        GatherConsumer {
+                            op,
+                            pre_through: &pre_through,
+                        },
+                    )?,
+                ));
+            }
+        }
+        let gathered_b = gathered_forms
+            .iter()
+            .any(|(_, f)| !matches!(f, GatheredB::No));
+        let batched_geo = gathered_forms.iter().find_map(|(_, f)| match f {
+            GatheredB::Batched(bg) => Some(*bg),
             _ => None,
-        };
-        if op_gather.is_some()
-            && !gathered_b
-            && !matches!(
-                program,
-                Lowering::ScalarMul(_)
-                    | Lowering::ScalarExtremum { .. }
-                    | Lowering::ScalarSub { .. }
-                    | Lowering::BoundScalarMul(_)
-            )
+        });
+        // The FIRST gathered input that did not materialize, by input position — the refusal
+        // names it, so a program with two gathered operands is told which one failed and not
+        // only that "the op reads a tile".
+        let unmaterialized = op_gathers.iter().find_map(|&(g, _ti, gi)| {
+            let materialized = gathered_forms
+                .iter()
+                .any(|&(fgi, ref f)| fgi == gi && !matches!(f, GatheredB::No));
+            (!materialized).then_some((g, gi))
+        });
+        if !scalar_body
+            && let Some((g, gi)) = unmaterialized
         {
             return err(format!(
-                "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` (t{} gathered through \
-                 t{}), and this door declares an index operand only for the constant-operand \
-                 pointwise bodies (`Program::ScalarMul`, the extremum's and the subtraction's own \
-                 scalar forms) — `scalarmul_scaled` is the one body that carries a `Gather`. Every \
-                 other assembler here would emit a descriptor reading the table DIRECTLY at its \
-                 base, which is the right shape and the wrong rows, from a clean bake. Give the \
-                 gathered operand its own `ScalarMul` node, or add the index to the assembler this \
-                 op needs.",
+                "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` at input {gi} (t{} \
+                 gathered through t{}), and this door declares an index operand only for the \
+                 constant-operand pointwise bodies (`Program::ScalarMul`, the extremum's and the \
+                 subtraction's own scalar forms) — `scalarmul_scaled` is the one body that carries a \
+                 `Gather`. Every other assembler here would emit a descriptor reading the table \
+                 DIRECTLY at its base, which is the right shape and the wrong rows, from a clean \
+                 bake. Give the gathered operand its own `ScalarMul` node, or add the index to the \
+                 assembler this op needs.",
                 f.name,
                 op.op_type,
-                op_gather.map_or(0, |(g, _, _)| g.value_tid),
-                op_gather.map_or(0, |(g, _, _)| g.index_tid),
+                g.value_tid,
+                g.index_tid,
             ));
         }
 
         // ⭐⭐⭐ RUNG 4'S SECOND HALF — THE MATMUL READS THE INTERMEDIATE, NOT THE TABLE. The copy was
-        // emitted above and the region recorded under the GATHERED VALUE; this swaps `per_op`'s B slot
-        // for it, so the matmul's own assembler sees a plain `[k, n]` activation. The index region
-        // appended by the gather join is DROPPED from the list at the same time (truncate to `n_in`):
-        // the matmul's descriptor carries no index operand (the copy declared it), and
-        // `matmul_oriented`'s `ins.len() != 2` arity check would read a three-input list as the fp8
+        // emitted above and the region recorded under the GATHERED VALUE; this swaps each gathered
+        // operand's `per_op` slot for it (LAW (a): every one of them, not only the first), so the
+        // matmul's own assembler sees plain activations. The index regions appended by the gather
+        // join are DROPPED from the list at the same time (truncate to `n_in`): the matmul's
+        // descriptor carries no index operand (the copies declared them), and
+        // `matmul_oriented`'s `ins.len() != 2` arity check would read a longer list as the fp8
         // W8A8 form and refuse it.
         if gathered_b {
-            let Some((_, _, gi)) = op_gather else {
-                unreachable!("gathered_b implies op_gather")
-            };
-            let b_value = in_values[gi];
-            let Some(r) = inter.get(&b_value) else {
-                return err(format!(
-                    "{}: the gathered B's materialized intermediate is missing from the walk's own \
-                     map — the copy was emitted but its region was not recorded",
-                    f.name
-                ));
-            };
-            let mut r = *r;
-            r.is_out = false;
-            per_op[gi] = r;
+            for &(gi, ref form) in &gathered_forms {
+                if matches!(form, GatheredB::No) {
+                    continue;
+                }
+                let b_value = in_values[gi];
+                let Some(r) = inter.get(&b_value) else {
+                    return err(format!(
+                        "{}: the gathered operand at input {gi} has no materialized intermediate \
+                         in the walk's own map — the copy was emitted but its region was not \
+                         recorded",
+                        f.name
+                    ));
+                };
+                let mut r = *r;
+                r.is_out = false;
+                per_op[gi] = r;
+            }
             per_op.truncate(n_in);
         }
 
@@ -3805,7 +3821,7 @@ pub fn lower_function(
                 headmajor,
                 WalkProof {
                     b_orient,
-                    gather: op_gather.map(|(g, _, _)| g),
+                    gather: op_gathers.first().map(|&(g, _, _)| g),
                     bcast: &bcast_axes,
                     batched: batched_geo,
                 },
@@ -3852,7 +3868,7 @@ pub fn lower_function(
             headmajor,
             WalkProof {
                 b_orient,
-                gather: op_gather.map(|(g, _, _)| g),
+                gather: op_gathers.first().map(|&(g, _, _)| g),
                 bcast: &bcast_axes,
                 batched: batched_geo,
             },
@@ -4262,22 +4278,25 @@ fn gathered_matmul_materializes(
         inter,
     } = emit;
     let f = &k.func;
-    // ⛔ THE GATHERED OPERAND MUST BE THE MATMUL'S **B** (input 1) — rung 4's own rule, unchanged
-    // by the multi-tile reading. A gather feeding **A** is not this exception's shape: the
-    // materialization below mints a `[k, n]` intermediate for a contraction's B leg, and an
-    // A-side gather (a row-gathered activation) is a different program the walk's own fail-closed
-    // refusal owns. Returning `false` here hands it back to that refusal, whose message names the
-    // arch reason — the control in `zz_the_gathered_matmul_materializes` pins this exact path.
+    // ⛔ THE GATHERED OPERAND MUST BE THE OP'S OWN GATHERED INPUT, proven by identity — the
+    // input at `gathered_input` IS the value this tile's load produced. A TID comparison cannot
+    // prove this — a plain load of the same table resolves to the same tid, and a program whose
+    // gather feeds input 0 while input 1 reads the table directly would otherwise materialize an
+    // intermediate for an operand that is not the gathered value (and then fail looking it up in
+    // `inter`, naming the wrong cause). A transposed K leg (input 1 through a `tt.trans` —
+    // refused at the Triton door with the arch reason) never matches; the walk's own refusal
+    // names it.
+    // ⭐ LAW (a): WHICH SIDE OF THE CONTRACTION THE GATHER FEEDS IS STATED BY THE OPERAND'S OWN
+    // GEOMETRY, NEVER BY AN INPUT-POSITION RULE. A rank-3 B read through its reshape lens
+    // states the batched form's `[batch, k, n]` frame and takes the batch branch below; every
+    // other shape — a contraction's A above all, rung 4's rank-2 B — takes the raw 2-D
+    // `[entries, width]` identity copy this function's tail mints, the flat frame a dot's
+    // corner-0 A sweep reads. The single-gathered-input admission this replaces (B only, first
+    // match only) is gone, not branched beside: no "if input 1" special case survives here, and
+    // the caller materializes EVERY gathered input through this one door.
     // ⭐ ANY CONSUMER OF A GATHERED LOAD READS THE MATERIALIZED ROWS — the copy is the gather, and
     // what reads its result (a contraction's B, a transpose, an elementwise op) reads an ordinary
     // activation. The one exception keeps its own body: `ScalarMul` carries the index itself.
-    // ⛔ AND B MUST BE THE GATHERED **LOAD**, proven by identity: the matmul's gathered input IS the
-    // value this tile's load produced. A TID comparison cannot prove this — a plain load of the
-    // same table resolves to the same tid, and a program whose gather feeds A while B reads the
-    // table directly would otherwise materialize an intermediate for a B that is not the gathered
-    // value (and then fail looking it up in `inter`, naming the wrong cause). A gather feeding A,
-    // or a transposed K leg (B through a `tt.trans` — refused at the Triton door with the arch
-    // reason), never matches; the walk's own refusal names them.
     let Some(b_value) = in_values.get(gathered_input).copied() else {
         return Ok(GatheredB::No);
     };
@@ -4328,11 +4347,15 @@ fn gathered_matmul_materializes(
     // [`batched_geometry_of`] at one door.
     let GatherConsumer { op, pre_through } = consumer;
     if let Some(bg) = batched_geometry_of(f, op, pre_through, gathered_input, g)? {
-        // ── THE POOL ADMISSION FIRST — the b1 door's own law, before any leg is built. A table
-        // whose layout declares a `gather_reach` is a pool slice: the entry-unit check refuses a
-        // read striding at any width but the pool's own, and the SOURCE bound is then ONE ENTRY's
-        // coverage (the pooled window law's own), not the swept rectangle. A table with no reach
-        // keeps the swept-window law byte for byte — the embedding's own form.
+        // ── THE GATHERED SOURCE'S WINDOW, ONE LAW (b) WITH THE POINTWISE FAMILY MINT
+        // ([`BundleLayout::gathered_source_rows`], through [`super::pooled_reach_of`]'s
+        // unit-checked reach lookup): a sweep that fits the placement keeps its window; an
+        // over-sweep REQUIRES a declared reach — the typed bound on the index values — and is
+        // refused, fail-closed, without one; with one, the family is read from the placement
+        // (a placement holding the whole reach is a source extent, `min(swept, ceiling)`; a
+        // slice is a pool, one entry's direct coverage). The values' bound is the reach's
+        // ceiling, enforced where the values are born — the staging family's law, not this
+        // door's.
         let table_name = crate::place::act_name(g.value_tid);
         let index_name = crate::place::act_name(g.index_tid);
         let what = format!(
@@ -4346,23 +4369,20 @@ fn gathered_matmul_materializes(
                 crate::superdsc_opspec::Df::Fp16,
             )
         };
-        match super::pooled_reach_of(&what, Some(layout), &table_name, bg.entry_elems())
-            .map_err(Error::from)?
-        {
-            Some(_) => layout
-                .check_window(&table_name, src_window(1), 0, 1, bg.entry_elems(), &what)
-                .map_err(|message| Error { message })?,
-            None => layout
-                .check_window(
-                    &table_name,
-                    src_window(bg.entries),
-                    0,
-                    bg.entries,
-                    bg.entry_elems(),
-                    &what,
-                )
-                .map_err(|message| Error { message })?,
-        }
+        let reach = super::pooled_reach_of(&what, Some(layout), &table_name, bg.entry_elems())
+            .map_err(Error::from)?;
+        let rows = layout
+            .gathered_source_rows(
+                &table_name,
+                bg.entries,
+                bg.entry_elems(),
+                crate::superdsc_opspec::Df::Fp16,
+                reach,
+            )
+            .map_err(|message| Error { message })?;
+        layout
+            .check_window(&table_name, src_window(rows), 0, rows, bg.entry_elems(), &what)
+            .map_err(|message| Error { message })?;
         // ── THE C-ORDER SCRATCH, minted the way the walk mints its own unstored results: one
         // stick wide, `copy_rows` sub-rows — the contiguous `[batch, k, n]` buffer the reshape
         // names (see the module doc for why the bmm's row-major walk and this buffer are one
@@ -4445,6 +4465,41 @@ fn gathered_matmul_materializes(
             f.name
         ));
     };
+    // ⭐⭐⭐ LAW (a)'s CHECKED HALF — THE MINTED `[entries, width]` FRAME MUST FLAT-EQUAL THE
+    // SWEEP THE CONSUMER ITSELF STATES FOR THIS OPERAND. The tile's `Shape` (the walk's
+    // authority) and the consumer's own operand type (the program's) are two statements of the
+    // same bytes; a disagreement means the copy writes a frame its consumer cannot address —
+    // right count, wrong shape — so it is refused here, by name, with both numbers. Stated
+    // generically over the consumer's OWN type, never over an input position: a batched dot's
+    // A states `[batch, m, k]`, so this is exactly `batch·m·k == entries·k` with the width the
+    // reduction's own; rung 4's rank-2 B states `[k, n]`; an elementwise consumer states the
+    // swept `[rows, cols]` itself and the check holds trivially.
+    {
+        let dims = type_of(f, op.operands[gathered_input])
+            .and_then(|t| t.dims().map(|d| d.to_vec()))
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{}: the gathered operand at input {gathered_input} of `{:?}` states no tensor \
+                     type, so the sweep its materialized copy must serve is unknown",
+                    f.name, op.op_type,
+                ),
+            })?;
+        let flat: i64 = dims.iter().product();
+        if flat != i64::from(rows) * i64::from(head) || dims.last().copied() != Some(i64::from(head))
+        {
+            return err(format!(
+                "{}: the gathered operand at input {gathered_input} of `{:?}` states a sweep of \
+                 {dims:?} ({flat} elements, innermost {}), but its tile gathers [{rows}, {head}] \
+                 ({} elements). The materialized copy would write a frame the consumer cannot \
+                 address — the two authorities must state the same bytes. Fix the tile's shape or \
+                 the consumer's operand type; they disagree here.",
+                f.name,
+                op.op_type,
+                dims.last().copied().unwrap_or(0),
+                i64::from(rows) * i64::from(head),
+            ));
+        }
+    }
     let tid = mint_inter(k, layout, *floor, gathered_result);
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
     let r = Region {

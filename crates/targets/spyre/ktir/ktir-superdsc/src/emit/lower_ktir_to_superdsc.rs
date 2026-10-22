@@ -7597,7 +7597,12 @@ mod proofs {
 
         let out = reg(7, orow, ocol, true);
         let ins = [reg(5, arow, acol, false), reg(6, brow, bcol, false)];
-        let admitted = pointwise_extents_agree("p", Elementwise::Add, &ins, &out).is_ok();
+        // `rows` is the op's sweep basis — for a whole-view output that IS the output's own row
+        // count (the `pointwise_rows` read). The guard's two-bases law then reduces, at these
+        // whole-view operands, to the property this proof pins: admitted iff every input IS the
+        // output's extent.
+        let admitted =
+            pointwise_extents_agree("p", Elementwise::Add, &ins, &out, orow).is_ok();
         assert_eq!(
             admitted,
             (arow, acol) == (orow, ocol) && (brow, bcol) == (orow, ocol)
@@ -7616,7 +7621,8 @@ mod proofs {
 
         let out = reg(7, orow, ocol, true);
         let ins = [reg(5, arow, acol, false)];
-        let admitted = pointwise_extents_agree("p", Elementwise::Silu, &ins, &out).is_ok();
+        let admitted =
+            pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, orow).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
     }
 }

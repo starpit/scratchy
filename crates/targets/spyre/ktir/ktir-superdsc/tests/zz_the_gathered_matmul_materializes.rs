@@ -248,11 +248,21 @@ fn paged_program(slot: GatheredSlot) -> KtirNode {
                 },
             ])),
         ),
-        shape(
-            Operation::new(a, Some(prod), OpKind::KtdpLoad, &[ind]),
-            K,
-            HEAD,
-        ),
+        {
+            // The gathered load's OWN type — the flat-law check's second authority. Every SSA in a
+            // real TTIR function carries one (the splice states it); the fixture states it too, so
+            // the check under test reads a real program and not a stub.
+            let mut op = shape(
+                Operation::new(a, Some(prod), OpKind::KtdpLoad, &[ind]),
+                K,
+                HEAD,
+            );
+            op.result_type = Some(IrType::Tensor {
+                dims: a.ints(vec![K, HEAD]),
+                elem: DType::F16,
+            });
+            op
+        },
         // OUT: [8, 64] in the B case, [64, 64] in the A case.
         shape(
             Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
@@ -646,6 +656,462 @@ fn a_gathered_load_with_two_consumers_is_refused_by_name() {
         e.contains("2 consumer(s)"),
         "the refusal names the consumer count and the law (one copy stands for exactly one \
          consumer) -- got {e}"
+    );
+}
+
+// ── THE BOTH-GATHERED CONTRACTION (the MoE honesty row, at a non-attention geometry) ────────
+//
+// A MoE-style expert contraction gathers BOTH operands — token rows gathered by one index
+// vector over one table, expert weights gathered by another index vector over a second table —
+// and the law (a) series must not care WHICH side a gather feeds: each gathered input
+// materializes through its OWN table and its OWN index buffer, and the contraction reads both
+// minted intermediates. This fixture spells that shape with the file's own constants (no
+// attention geometry: no batch axis, no pool, both tables placed WHOLE):
+//
+//   out = matmul(gather(table_a, ids_a), gather(table_b, ids_b))
+//
+// with `gather(table_a, ids_a)` sweeping `[M, K] = [8, 64]` rows of a `[128, 64]` table and
+// `gather(table_b, ids_b)` sweeping `[K, HEAD] = [64, 64]` rows of a second `[128, 64]` table.
+// The A-side sweep is 8 entries (ONE copy leg at 32 entries per index stick) and the B-side
+// sweep is 64 entries (TWO legs), so the expected emission is 1 + 2 copy legs and the
+// contraction: FOUR ops, each copy carrying its own table's address.
+
+/// The both-gathered program: five parameters (table_a, ids_a, table_b, ids_b, out — the
+/// operand prefix, output LAST, the splice's own binding law), two independent gather chains
+/// built the same way [`paged_program`] builds its one chain, and one `linalg.matmul` over both
+/// gathered loads.
+fn both_gathered_program() -> KtirNode {
+    let a: &'static Arena = Arena::global();
+    let shape = |op: Operation<'static>, r: i64, c: i64| {
+        op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
+            .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
+    };
+
+    // Parameters: %0 = table_a, %1 = ids_a, %2 = table_b, %3 = ids_b, %4 = out.
+    let (p_ta, p_ia, p_tb, p_ib, p_out) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3), Ssa(4));
+    let zero = Ssa(5);
+    // The A chain: table_a's plain view/tile/load, ids_a's view/tile/load, the indirect tile
+    // [M, K] and its gathered load.
+    let (v_ta, t_ta, val_ta, v_ia, t_ia, val_ia, ind_a, load_a) =
+        (Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+    // The B chain: the same five-op shape over table_b/ids_b, sweeping [K, HEAD].
+    let (v_tb, t_tb, val_tb, v_ib, t_ib, val_ib, ind_b, load_b) =
+        (Ssa(14), Ssa(15), Ssa(16), Ssa(17), Ssa(18), Ssa(19), Ssa(20), Ssa(21));
+    // The output view/tile, the zero outs, and the contraction.
+    let (v_o, t_o, outs, matmul) = (Ssa(22), Ssa(23), Ssa(24), Ssa(25));
+
+    // The indirect dim's subscript — `Sym(0) + Dim(0)`, the one form `gather_subscripts` builds.
+    let sub0 = a.expr(AffineExpr::Add(
+        a.expr(AffineExpr::Sym(0)),
+        a.expr(AffineExpr::Dim(0)),
+    ));
+    // One gather chain: the table's plain view/tile/load (the "this is a real tensor" proof),
+    // the ids view/tile/load, then the indirect tile over (table view, ids view) and its load —
+    // `gather_of`'s own reading, data view first, index view second.
+    let gather_chain = |p_table: Ssa,
+                        p_ids: Ssa,
+                        (v_t, t_t, val_t, v_i, t_i, val_i, ind, load): (
+        Ssa,
+        Ssa,
+        Ssa,
+        Ssa,
+        Ssa,
+        Ssa,
+        Ssa,
+        Ssa,
+    ),
+                        rows: i64,
+                        width: i64,
+                        entries: i64,
+                        ops: &mut Vec<Operation<'static>>| {
+        // The table: [V, HEAD] in both chains.
+        ops.push(shape(
+            Operation::new(a, Some(v_t), OpKind::KtdpConstructMemoryView, &[p_table]),
+            V,
+            HEAD,
+        ));
+        ops.push(shape(
+            Operation::new(
+                a,
+                Some(t_t),
+                OpKind::KtdpConstructAccessTile,
+                &[v_t, zero, zero],
+            ),
+            V,
+            HEAD,
+        ));
+        ops.push(shape(
+            Operation::new(a, Some(val_t), OpKind::KtdpLoad, &[t_t]),
+            V,
+            HEAD,
+        ));
+        // The ids: [entries] i32.
+        ops.push(
+            Operation::new(a, Some(v_i), OpKind::KtdpConstructMemoryView, &[p_ids])
+                .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![entries])))
+                .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::I32)),
+        );
+        ops.push(shape(
+            Operation::new(
+                a,
+                Some(t_i),
+                OpKind::KtdpConstructAccessTile,
+                &[v_i, zero, zero],
+            ),
+            entries,
+            1,
+        ));
+        ops.push(shape(
+            Operation::new(a, Some(val_i), OpKind::KtdpLoad, &[t_i]),
+            entries,
+            1,
+        ));
+        // The indirect tile: Shape [rows, width], the anchor triple `gathers_of` folds.
+        ops.push(
+            shape(
+                Operation::new(
+                    a,
+                    Some(ind),
+                    OpKind::KtdpConstructIndirectAccessTile,
+                    &[v_t, v_i],
+                ),
+                rows,
+                width,
+            )
+            .with_attr(
+                a,
+                AttrKey::DimKinds,
+                Attr::StrList(a.names(vec!["indirect", "direct_sub"])),
+            )
+            .with_attr(a, AttrKey::DimData, Attr::IntList(a.ints(vec![0, 0])))
+            .with_attr(
+                a,
+                AttrKey::IntermediateVars,
+                Attr::Ssas(a.ssa(vec![zero, zero])),
+            )
+            .with_attr(
+                a,
+                AttrKey::DimSubs,
+                Attr::AffineMapList(a.maps(vec![
+                    AffineMap {
+                        num_dims: 2,
+                        num_syms: 2,
+                        exprs: std::slice::from_ref(sub0),
+                    },
+                    AffineMap {
+                        num_dims: 2,
+                        num_syms: 2,
+                        exprs: a.exprs(vec![AffineExpr::Dim(1)]),
+                    },
+                ])),
+            ),
+        );
+        // The gathered load — its OWN type stated, the flat-law check's second authority.
+        let mut op = shape(Operation::new(a, Some(load), OpKind::KtdpLoad, &[ind]), rows, width);
+        op.result_type = Some(IrType::Tensor {
+            dims: a.ints(vec![rows, width]),
+            elem: DType::F16,
+        });
+        ops.push(op);
+    };
+
+    let mut ops = vec![Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+        a,
+        AttrKey::Value,
+        Attr::Int(0),
+    )];
+    gather_chain(
+        p_ta,
+        p_ia,
+        (v_ta, t_ta, val_ta, v_ia, t_ia, val_ia, ind_a, load_a),
+        M,
+        K,
+        M,
+        &mut ops,
+    );
+    gather_chain(
+        p_tb,
+        p_ib,
+        (v_tb, t_tb, val_tb, v_ib, t_ib, val_ib, ind_b, load_b),
+        K,
+        HEAD,
+        K,
+        &mut ops,
+    );
+    // OUT: [M, HEAD] = [8, 64].
+    ops.push(shape(
+        Operation::new(a, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+        M,
+        HEAD,
+    ));
+    ops.push(shape(
+        Operation::new(
+            a,
+            Some(t_o),
+            OpKind::KtdpConstructAccessTile,
+            &[v_o, zero, zero],
+        ),
+        M,
+        HEAD,
+    ));
+    ops.push(shape(
+        Operation::new(a, Some(outs), OpKind::TensorEmpty, &[]),
+        M,
+        HEAD,
+    ));
+    ops.push(shape(
+        Operation::new(
+            a,
+            Some(matmul),
+            OpKind::LinalgMatmul,
+            &[load_a, load_b, outs],
+        ),
+        M,
+        HEAD,
+    ));
+    ops.push(Operation::new(a, None, OpKind::KtdpStore, &[matmul, t_o]));
+
+    KtirNode {
+        func: IRFunction {
+            name: "both_gathered_matmul_fwd",
+            arguments: a.args(vec![
+                (p_ta, IrType::Index),
+                (p_ia, IrType::Index),
+                (p_tb, IrType::Index),
+                (p_ib, IrType::Index),
+                (p_out, IrType::Index),
+            ]),
+            operations: a.ops(ops),
+            grid: (1, 1, 1),
+            return_type: None,
+        },
+        program: Program::Matmul,
+        bindings: vec![
+            BufferId::new(301),
+            BufferId::new(302),
+            BufferId::new(303),
+            BufferId::new(304),
+            BufferId::new(305),
+        ],
+        mask: None,
+        step_inputs: Vec::new(),
+        node_out_tid: None,
+        minted: Default::default(),
+    }
+}
+
+/// [`layout_for`]'s shape for the five parameters: both tables placed WHOLE at distinct
+/// non-zero seg3 offsets (table_a at 0x10000, table_b at 0x30000), so each table's device
+/// address is shared by no other operand and an assertion on an address is an assertion on
+/// WHICH table an op reads.
+fn both_gathered_layout(k: &KtirNode) -> BundleLayout {
+    let mut l = BundleLayout::default();
+    for (i, b) in k.bindings.iter().enumerate() {
+        let tid = b.get();
+        l.ids.borrow_mut().insert(act_name(tid), PlaceId::Act(tid));
+        let bytes: u64 = match i {
+            // table_a and table_b: [V, HEAD] f16 each.
+            0 | 2 => (V as u64) * (HEAD as u64) * 2,
+            // ids_a [M] i32, ids_b [K] i32.
+            1 => (M as u64) * 4,
+            3 => (K as u64) * 4,
+            // out: [M, HEAD] f16.
+            _ => (M as u64) * (HEAD as u64) * 2,
+        };
+        l.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                role: SegRole::Activation,
+                segment: 3,
+                bank: 0,
+                offset: ((i + 1) as u64) * 0x10000,
+                size: bytes,
+            },
+        );
+    }
+    l
+}
+
+/// table_a's device address under [`both_gathered_layout`]: seg3 + 0x10000 (parameter 0's
+/// slot). The only buffer in the test at this address.
+const TABLE_A_ADDR: u64 = 0xC_0000_0000 + 0x10000;
+
+/// table_b's device address: seg3 + 0x30000 (parameter 2's slot). The only buffer at this one.
+const TABLE_B_ADDR: u64 = 0xC_0000_0000 + 0x30000;
+
+/// ⭐⭐⭐ THE BOTH-GATHERED HONESTY ROW: a contraction whose EVERY input is gathered materializes
+/// EACH input through its OWN table and index buffer — the A-side sweep is 8 entries (ONE copy
+/// leg), the B-side sweep is 64 entries (TWO legs), and the contraction reads BOTH minted
+/// intermediates, proven by address against BOTH tables. The MoE shape is the motivating case
+/// (token rows × expert weights, both gathered); the law is stated over inputs, so this row is
+/// the one that fails if any "which side is gathered" rule survives in the door.
+#[test]
+fn a_both_gathered_matmul_materializes_each_input_through_its_own_table() {
+    let k = both_gathered_program();
+    let ops = emitted_with(&k, &both_gathered_layout(&k)).expect(
+        "a contraction with both operands gathered materializes each through its own table",
+    );
+    assert_eq!(
+        ops.len(),
+        4,
+        "the both-gathered contraction emits ONE A-side copy leg (8 entries, one index stick), \
+         TWO B-side copy legs (64 entries) and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    let (copy_a, copy_b0, copy_b1, mm) = (&ops[0], &ops[1], &ops[2], &ops[3]);
+    // The A-side copy gathers from table_a — its OWN table, not table_b's.
+    assert_eq!(
+        value_tensor_address(copy_a),
+        Some(TABLE_A_ADDR),
+        "the A-side copy leg gathers from table_a at {TABLE_A_ADDR:#x}: {:?}",
+        copy_a.op_name
+    );
+    // Each B-side copy gathers from table_b.
+    for copy in [copy_b0, copy_b1] {
+        assert_eq!(
+            value_tensor_address(copy),
+            Some(TABLE_B_ADDR),
+            "each B-side copy leg gathers from table_b at {TABLE_B_ADDR:#x}: {:?}",
+            copy.op_name
+        );
+    }
+    // Every copy is the gather itself: identity with the indirect-access index attached.
+    for copy in [copy_a, copy_b0, copy_b1] {
+        let dsc = copy
+            .dsc()
+            .dscs_
+            .first()
+            .and_then(|m| m.values().next())
+            .expect("each copy leg has a descriptor");
+        assert!(
+            dsc.computeOp_
+                .iter()
+                .any(|c| c.opFuncName == "identity" && !c.indirectAccessIndexLabeledDs.is_empty()),
+            "each copy leg is an `identity` carrying the indirect-access index: {:?}",
+            copy.op_name
+        );
+    }
+    // The contraction is a matmul.
+    let mm_dsc = mm
+        .dsc()
+        .dscs_
+        .first()
+        .and_then(|m| m.values().next())
+        .expect("the matmul has a descriptor");
+    assert!(
+        mm_dsc
+            .computeOp_
+            .iter()
+            .any(|c| c.opFuncName == "batchmatmul"),
+        "the last op is the contraction: {:?}",
+        mm.op_name
+    );
+    // ⭐ THE MATMUL READS NEITHER TABLE, IN EITHER SLOT — by address. A direct-read descriptor
+    // (the trap this guard exists to refuse) would put INPUT at table_a's address or KERNEL at
+    // table_b's; a cross-wired materialization would swap them.
+    for tag in ["INPUT", "KERNEL"] {
+        let addr = alloc_address(mm, tag);
+        assert!(
+            addr.is_some(),
+            "the matmul declares its {tag} operand: {:?}",
+            mm.op_name
+        );
+        assert_ne!(
+            addr,
+            Some(TABLE_A_ADDR),
+            "the matmul's {tag} is at {addr:#?}, NOT table_a's {TABLE_A_ADDR:#x} -- an operand at \
+             the table's address is the direct-read trap: {:?}",
+            mm.op_name
+        );
+        assert_ne!(
+            addr,
+            Some(TABLE_B_ADDR),
+            "the matmul's {tag} is at {addr:#?}, NOT table_b's {TABLE_B_ADDR:#x} -- an operand at \
+             the table's address is the direct-read trap: {:?}",
+            mm.op_name
+        );
+    }
+}
+
+/// ⭐⭐⭐ THE SOURCE-EXTENT FAMILY'S OWN ROW: a repeat gather — a sweep whose EVERY LEG honestly
+/// EXCEEDS its source, one row read many entries' worth of times — admits under a declared
+/// `GatherReach::of_source_extent` (ceiling = the source's own row count, unit = its row
+/// width), and REFUSES, fail-closed, without one. The mint runs PER LEG (one op per 32-entry
+/// index stick), so the over-sweep the law bounds is the LEG's: the fixture is the A-slot
+/// program (a 64-entry gather = two 32-row legs) with the table's placement shrunk to 16 of
+/// its 128 rows (2,048 B) — each leg sweeps 32 rows × 64 elements (4,096 B) past a source that
+/// holds 16, and the reach states the bound the placement alone cannot: the values name rows
+/// of the 16 placed rows. The window lands at `min(32, 16) = 16` rows = 2,048 B = the
+/// placement. One variable away, the same placement with NO reach is the refusal — the
+/// fail-closed half, pinned at THIS geometry (the pooled control below pins it at the slice
+/// geometry).
+#[test]
+fn a_repeat_gather_over_a_whole_placed_source_admits_under_a_declared_source_extent_reach() {
+    let k = paged_program(GatheredSlot::A);
+    // The table placed at 16 rows — every 32-row leg over-sweeps it.
+    let shrink = |l: &mut BundleLayout| {
+        let tid = k.bindings[1].get();
+        l.placements.get_mut(&tid).expect("the table is placed").size = 16 * HEAD as u64 * 2;
+    };
+    // ⛔ FAIL-CLOSED FIRST — the same placement with NO reach refuses, naming the sweep, the
+    // placement and the missing declaration.
+    let mut bare = layout_for(&k, GatheredSlot::A);
+    shrink(&mut bare);
+    let e = match emitted_with(&k, &bare) {
+        Err(e) => e,
+        Ok(_) => panic!("an over-sweep with no declared reach must refuse, fail-closed"),
+    };
+    assert!(
+        e.contains("exceeds its placement footprint"),
+        "the refusal names the placement overrun -- got {e}"
+    );
+    assert!(
+        e.contains("Declare the reach"),
+        "the refusal names the missing declaration -- got {e}"
+    );
+    // ⭐ THE ADMISSION — under the declared reach, the same emission the fitting sweep gets.
+    // The reach: the source's OWN extent — ceiling 16 rows, unit the 64-element row.
+    let reach = ktir_superdsc::sdsc_abstract::GatherReach::of_source_extent(16, HEAD as u64)
+        .expect("16 rows at a 64-element unit is a legal source extent");
+    assert_eq!(
+        reach.entry_elems(),
+        HEAD as u64,
+        "the source-extent unit is the row width this read strides at"
+    );
+    assert_eq!(
+        reach.max_entry().get(),
+        16,
+        "the source-extent ceiling is the source's own row count (values < 16)"
+    );
+    let mut l = layout_for(&k, GatheredSlot::A);
+    shrink(&mut l);
+    l.gather_reach.insert(k.bindings[1].get(), reach);
+    let ops = emitted_with(&k, &l).expect(
+        "a repeat gather admits under a declared source-extent reach: the values name rows of \
+         the placed source",
+    );
+    assert_eq!(
+        ops.len(),
+        3,
+        "the repeat gather emits the same two copy legs and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    for copy in &ops[..2] {
+        assert_eq!(
+            value_tensor_address(copy),
+            Some(TABLE_ADDR),
+            "each copy leg gathers from the table's own address: {:?}",
+            copy.op_name
+        );
+    }
+    let mm = &ops[2];
+    let a_addr = alloc_address(mm, "INPUT");
+    assert_ne!(
+        a_addr,
+        Some(TABLE_ADDR),
+        "the matmul's A is the minted intermediate, NOT the table: {:?}",
+        mm.op_name
     );
 }
 

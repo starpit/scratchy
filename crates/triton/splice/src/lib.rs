@@ -1467,7 +1467,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // `tl.static_range`).
     let grid: Vec<i64> = vec![1, 1];
     let positional = attn_positional(src, &spec, &grid, *attn_program)?;
-    let k = mint_attn(node, ir, positional)?;
+    let k = mint_attn(node, ir, positional, rows_are_requests)?;
     let name = format!("attn_s{}", node.id.index());
     let mut e = EmittedOp::bare(name);
     e.ktir = Some(k);
@@ -1522,12 +1522,14 @@ struct BatchedDecodeFacts {
 }
 
 /// THE BATCHED DECODE KERNEL'S LAUNCH CONTRACT — the kernel's own parameter order
-/// (`batched_decode_hm`: q, out, the two pool planes, the id table, the mask), plus every
-/// extent as a constexpr: the geometry (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`,
-/// `PAGE_SLOTS`), the batching (`BLOCKS_PER_CHUNK`, `NUM_CHUNKS`), and the scale.
+/// (`batched_decode_hm`: q, out, the two pool planes, Q's row-repetition table, the two
+/// block-entry tables, the mask), plus every extent as a constexpr: the geometry
+/// (`NUM_SEQS/NKVH/GQA/HD`), the pool (`PAGES`, `PAGE_SLOTS`), the batching
+/// (`BLOCKS_PER_CHUNK`, `NUM_CHUNKS`), and the scale.
 ///
-/// The ids table is `*i32` — the kernel gathers pages through it and the door sizes an
-/// index buffer `SenUint32` by its own gather law. The mask is ALWAYS consumed (the kernel
+/// The ids tables are `*i32` — the kernel gathers pages through them and the door sizes an
+/// index buffer `SenUint32` by its own gather law; `desc_rep_ids` is the same `*i32` form
+/// stating Q's entry-order row repetition. The mask is ALWAYS consumed (the kernel
 /// loads it unconditionally in the chunk loop — the additive -65504 sentinel is what makes
 /// a padded page merge with weight zero), so the parameter is always in the signature.
 fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
@@ -1548,11 +1550,15 @@ fn batched_decode_spec(f: &BatchedDecodeFacts) -> Result<KernelSpec, String> {
     // index entry, through TWO tables — each plane's own block numbering — whose values
     // are the host's `GatherEntry` bytes. No page stride or block offset is a constexpr
     // here: those live in the values, composed at the pool's one door on the host.
+    // `desc_rep_ids` is Q's own row-repetition table (torch's `rep_row_ids` values) —
+    // the same host-staged index-data family, staging the entry-order repetition the
+    // kernel states as its Q gather.
     for (p, ty) in [
         ("desc_q", "*fp16"),
         ("desc_o", "*fp16"),
         ("desc_kt", "*fp16"),
         ("desc_v", "*fp16"),
+        ("desc_rep_ids", "*i32"),
         ("desc_ids_kt", "*i32"),
         ("desc_ids_v", "*i32"),
         ("desc_mask", "*fp16"),
@@ -1667,16 +1673,22 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     positional: KtirNode,
+    rows_are_requests: bool,
 ) -> Result<KtirNode, String> {
     let SubOp::AttnDecode { layout, .. } = &node.op else {
         return Err(
             "triton splice: mint_attn called on a node that is not an AttnDecode".to_string(),
         );
     };
-    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s: q (inputs[0]), OUT (the node's output), then
-    // the K pool plane, the V pool plane, the id table, the mask. `regions()` zips
-    // `bindings[i]` against `arguments[i]`, so a swapped binding is a descriptor over the
-    // wrong tensor.
+    // ⛔ THE KERNEL'S ORDER, NOT `lower_one`'s — and the two rows state DIFFERENT contracts:
+    // the decode kernel (`batched_decode_hm`) takes q, OUT, the two pool planes, Q's
+    // row-repetition table, the two block-entry tables, the mask; the prefill kernel
+    // (`batched_prefill_hm`) states no repetition (its BATCH is Q's own rows, each used
+    // once), so its list stops at the mask. `rows_are_requests` is the same routing bit
+    // that chose the kernel, so the binding list states the contract of the kernel the
+    // router compiled. `regions()` zips `bindings[i]` against `arguments[i]`, so a swapped
+    // or extra binding is a descriptor over the wrong tensor — the parameter-count guard
+    // below refuses the divergence.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     // ⭐ THE SYNTHETIC BINDING SLOTS — the two host-staged inputs past the graph's own tensors,
@@ -1693,13 +1705,19 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         pub const KT_BLOCK_IDS: u32 = 1;
         /// The V plane's block-entry table — the V plane's own block numbering.
         pub const V_BLOCK_IDS: u32 = 2;
+        /// Q's row-repetition table — torch's `rep_row_ids` values, one Q row index
+        /// per `[BATCH, GQA]` entry of the pre-repeated frame the decode kernel's
+        /// score dot pairs with the gathered blocks.
+        pub const REP_ROW_IDS: u32 = 3;
     }
     let n_tensors = ir.tensors.len() as u32;
     let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
     let mask_tid = law(attn_step_slots::MASK);
     let kt_ids_tid = law(attn_step_slots::KT_BLOCK_IDS);
     let v_ids_tid = law(attn_step_slots::V_BLOCK_IDS);
-    let bindings = vec![
+    let rep_ids_tid = law(attn_step_slots::REP_ROW_IDS);
+    // The decode row's repetition table (slot 3); the prefill row states none.
+    let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
         BufferId::new(layout.cache_tensor().index() as u32),
@@ -1708,6 +1726,11 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         v_ids_tid,
         mask_tid,
     ];
+    if rows_are_requests {
+        // Position 4: after the two pool planes, before the block-entry tables —
+        // the decode kernel's own parameter order (`desc_rep_ids` past `desc_v`).
+        bindings.insert(4, rep_ids_tid);
+    }
     let name = Arena::global().str(format!("attn_s{}", node.id.index()));
     let KtirNode { func, program, .. } = positional;
     if func.arguments.len() != bindings.len() {
@@ -1724,20 +1747,29 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         program,
         bindings,
         mask: Some(mask_tid),
-        step_inputs: vec![
-            ktir_superdsc::ktir_node::StepInput {
-                buffer: kt_ids_tid,
-                slot: attn_step_slots::KT_BLOCK_IDS,
-            },
-            ktir_superdsc::ktir_node::StepInput {
-                buffer: v_ids_tid,
-                slot: attn_step_slots::V_BLOCK_IDS,
-            },
-            ktir_superdsc::ktir_node::StepInput {
-                buffer: mask_tid,
-                slot: attn_step_slots::MASK,
-            },
-        ],
+        step_inputs: {
+            let mut staged = vec![
+                ktir_superdsc::ktir_node::StepInput {
+                    buffer: kt_ids_tid,
+                    slot: attn_step_slots::KT_BLOCK_IDS,
+                },
+                ktir_superdsc::ktir_node::StepInput {
+                    buffer: v_ids_tid,
+                    slot: attn_step_slots::V_BLOCK_IDS,
+                },
+                ktir_superdsc::ktir_node::StepInput {
+                    buffer: mask_tid,
+                    slot: attn_step_slots::MASK,
+                },
+            ];
+            if rows_are_requests {
+                staged.push(ktir_superdsc::ktir_node::StepInput {
+                    buffer: rep_ids_tid,
+                    slot: attn_step_slots::REP_ROW_IDS,
+                });
+            }
+            staged
+        },
         node_out_tid: None,
         minted: Default::default(),
     })

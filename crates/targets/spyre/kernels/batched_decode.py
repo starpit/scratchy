@@ -40,11 +40,26 @@ follows them):
 
 Staged by the host, per step:
 
-  * `desc_q`       — Q PRE-REPEATED in entry order (torch's `rep_row_ids`
-                     `index_select`): rows `(j*B + s)*NKVH*GQA + kvh*GQA + g`.
+  * `desc_q`       — Q at its NATURAL shape `[NUM_SEQS*NKVH*GQA, HD]`
+                     (the graph tensor's own bytes); the kernel gathers its
+                     rows in entry order through `desc_rep_ids` below — a
+                     descriptor window plus an index-table gather, the two
+                     access forms this ladder lowers. NO pre-repeated fp16
+                     staging: torch's `batched_decode_head_major` repeats Q
+                     host-side (`rep_row_ids` `index_select`); this kernel
+                     states that same data movement as the gather, so the
+                     card moves the bytes the reference moves host-side and
+                     the splice binds the un-repeated source directly.
+  * `desc_o`       — output, head-major `[NUM_SEQS*NQH, HD]`.
   * `desc_kt`      — the resident K^T plane; this kernel reads it as
                      `[PAGES*NKVH*W4, HD*64]` — one stick block a row.
   * `desc_v`       — the resident V plane; read as `[PAGES*NKVH*W4, 64*HD]`.
+  * `desc_rep_ids` — Q's row-repetition table, `[BATCH*GQA]` i32: entry `e`
+                     names the Q row the pre-repeated buffer's row `e` held,
+                     `(j*B+s)*NKVH*GQA + kvh*GQA + g` → `s*NKVH*GQA +
+                     kvh*GQA + g` (torch's own `rep_row_ids` values, the
+                     index_select's index vector — the SAME bytes the host
+                     reference stages, at i32 width instead of fp16 rows).
   * `desc_ids_kt`  — the K^T plane's block-entry table, `[NUM_CHUNKS *
                      W4*ENTRIES*NKVH]` i32, chunk-major, window-major within
                      a chunk, entry-major within a window (entry, then kv
@@ -61,13 +76,12 @@ Staged by the host, per step:
                      length or a padded window. The finite sentinel is torch's
                      own clamp trick: a slot masked in every chunk still
                      merges with weight exp2(-65504 - m) == 0, never NaN.
-  * `desc_o`       — output, head-major `[NUM_SEQS*NQH, HD]`.
 """
 
 
 @triton.jit
 def batched_decode_hm(desc_q, desc_o,  #
-                      desc_kt, desc_v, desc_ids_kt, desc_ids_v, desc_mask,  #
+                      desc_kt, desc_v, desc_rep_ids, desc_ids_kt, desc_ids_v, desc_mask,  #
                       NUM_SEQS: tl.constexpr, NKVH: tl.constexpr,  #
                       GQA: tl.constexpr, HD: tl.constexpr,  #
                       PAGE_SLOTS: tl.constexpr, PAGES: tl.constexpr,  #
@@ -92,11 +106,19 @@ def batched_decode_hm(desc_q, desc_o,  #
     tl.static_assert(HD == 64, "batched_decode_hm: the V plane's [64, HD] block is one contiguous stick block only at HD 64; a wider head needs the per-(window, slab) V gather this kernel does not state yet")
     tl.static_assert(PAGE_SLOTS % 64 == 0, "batched_decode_hm: a page must be a whole number of 64-slot windows")
 
-    # Q, pre-repeated in entry order by the host: [BATCH, GQA, HD] as one
-    # window at base — the dot's own A operand, at its natural shape.
-    q_desc = tl.make_tensor_descriptor(desc_q, shape=[BATCH * GQA, HD],
+    # Q at its NATURAL shape — the graph tensor's own `[NUM_SEQS*NKVH*GQA, HD]`
+    # bytes — gathered one row per index entry (the same access form the pool
+    # planes take: a descriptor window plus an index-table gather). The
+    # entry-order repetition torch stages host-side (`rep_row_ids`
+    # `index_select`) is stated HERE as the gather, so the dot's A operand is
+    # a load at its natural gathered shape: no pre-repeated staging buffer, no
+    # permute, no broadcast.
+    q_desc = tl.make_tensor_descriptor(desc_q, shape=[NUM_SEQS * NKVH * GQA, HD],
                                        strides=[HD, 1],
-                                       block_shape=[BATCH * GQA, HD])
+                                       block_shape=[1, HD])
+    rep_ids_desc = tl.make_tensor_descriptor(
+        desc_rep_ids, shape=[BATCH * GQA], strides=[1],
+        block_shape=[BATCH * GQA])
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[NUM_SEQS * NKVH * GQA, HD],
                                        strides=[HD, 1],
                                        block_shape=[NUM_SEQS * NKVH * GQA, HD])
@@ -128,7 +150,10 @@ def batched_decode_hm(desc_q, desc_o,  #
 
     # The running softmax, per (entry-slot, kv head, gqa): torch's
     # `_entry_local_update` carry, folded once per (chunk, window) trip.
-    q = tl.reshape(q_desc.load([0, 0]), [BATCH, GQA, HD])
+    # The Q gather: one row per rep-table entry, the whole `[BATCH*GQA, HD]`
+    # frame taken once before the trip loop (Q does not vary per trip).
+    rep_ids = rep_ids_desc.load([0])                    # [BATCH*GQA] i32
+    q = tl.reshape(q_desc.gather(rep_ids, 0), [BATCH, GQA, HD])
     m = tl.full([BATCH, GQA], -65504.0, tl.float32)
     l = tl.zeros([BATCH, GQA], tl.float16)
     acc = tl.zeros([BATCH, GQA, HD], tl.float16)

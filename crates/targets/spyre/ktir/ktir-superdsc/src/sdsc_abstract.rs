@@ -6687,6 +6687,24 @@ impl GatherEntryCeiling {
         self.per_page
     }
 
+    /// The SOURCE-EXTENT family's mint — a table placed WHOLE whose index values name its rows
+    /// directly (a repeat gather: one row read many entries' worth of times). There are no
+    /// pages, so the source is ONE page of `rows` entries and the exclusive limit is the row
+    /// count itself: `GatherEntry::of_page_block(0, row)` composes every legal value
+    /// (`0 · rows + row == row < rows`), and any page ≥ 1 composes at or above the limit —
+    /// refused, the same fail-closed posture the pool's ceiling keeps. `None` on a zero row
+    /// count (no row to name) or a count that leaves `i64`.
+    pub(crate) fn of_source_extent(rows: u64) -> Option<Self> {
+        let limit = i64::try_from(rows).ok()?;
+        if limit <= 0 {
+            return None;
+        }
+        Some(GatherEntryCeiling {
+            per_page: EntriesPerPage(limit),
+            limit,
+        })
+    }
+
     /// The EXCLUSIVE bound on entry values: the first value an index may not hold.
     pub const fn get(self) -> i64 {
         self.limit
@@ -6746,6 +6764,25 @@ impl GatherReach {
     /// The ceiling on entry values this reach admits (see [`GatherEntryCeiling`]).
     pub const fn max_entry(self) -> GatherEntryCeiling {
         self.max_entry
+    }
+
+    /// ⭐⭐⭐⭐ THE SOURCE-EXTENT FAMILY'S MINT — a table placed WHOLE, whose index values name
+    /// rows of the placement itself (a repeat gather: one row read many entries' worth of
+    /// times). The reach is the SOURCE'S OWN EXTENT — ceiling = the source's row count, unit =
+    /// its row width — the trivial bound a bare `min(swept, placement)` assumed silently: now
+    /// STATED, typed, and checked at the door. This is the second family of this one type; the
+    /// pool mint ([`Self::of_plane`]) keeps its own semantics (entries name stick-blocks
+    /// across a paged pool the runtime re-bases), and the gather door tells the families apart
+    /// by the PLACEMENT: a placement holding the whole reach is a source extent, a placement
+    /// holding a slice of it is a pool. `None` on a zero row count or row width.
+    pub fn of_source_extent(rows: u64, row_elems: u64) -> Option<Self> {
+        if row_elems == 0 {
+            return None;
+        }
+        Some(GatherReach {
+            max_entry: GatherEntryCeiling::of_source_extent(rows)?,
+            entry_elems: row_elems,
+        })
     }
 
     /// The entry unit the host's index values address at — the pool's stick block, `hd · 64`

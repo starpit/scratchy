@@ -267,6 +267,70 @@ mod matmul_residency_tests {
             "the known bmm's charge, unchanged: (24·64 + 64·192 + 24·192) · 16 · 2"
         );
     }
+
+    /// A batched matmul plan with a STATED y split (the kani proofs' own construction): the
+    /// split map is declared, not searched — the law under test is the plan's READ of a
+    /// stated split, not the cost model's choice of one.
+    fn stated_split_plan(mb: u32, out: u32, k: u32, y: u32, y_split: u32) -> WorkPlan {
+        let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| {
+            crate::superdsc_opspec::ItDim {
+                name,
+                size,
+                is_reduction,
+                is_stick,
+                df: Df::Fp16,
+            }
+        };
+        let dims = vec![
+            dim("mb", mb, false, false),
+            dim("out", out, false, true),
+            dim("in", k, true, true),
+            dim("y", y, false, false),
+        ];
+        WorkPlan::divide(&dims, MaxCores::<MAX_CORES>, move |_, _| {
+            let mut m: std::collections::BTreeMap<&'static str, u32> = Default::default();
+            m.insert("y", y_split);
+            m
+        })
+        .expect("a stated split within the core budget divides")
+    }
+
+    /// ⭐⭐⭐ THE SPLIT WIRING, ENUMERATED — the wiring half of the per-core batch law (the
+    /// kani harness `matmul_resident_bills_the_batch_the_plan_states` carries the arithmetic
+    /// half at every shape): for every split the matmul splitters can rule — the loop runs
+    /// to the splitters' OWN bound, `MAX_CORES` (the joint arm's `divisors_upto(y,
+    /// max_cores)` and the batch-first arm's `core_split(y, max_cores)` both rule up to 32:
+    /// y=256 → 32) — and every batch it can divide up to 256, a REAL `WorkPlan::divide`
+    /// plan reads
+    /// `per_core_extent("y") == y / y_split` — and the formula charges exactly the per-core
+    /// reference through it. A divided plan cannot cross CBMC's symex (the split map's
+    /// BTreeMap rebalancing does not concretize), so the split's own read is pinned HERE,
+    /// over the whole ruled vocabulary — the 270,336-B pin being the golden's own point in
+    /// this grid. This test is the kani-red-on-parent for the 7ce19a3f9 fix: on the
+    /// pre-fix formula (the batch read at its FULL extent) every row fails by exactly the
+    /// split factor.
+    #[test]
+    fn the_split_wiring_bills_the_per_core_batch_at_every_ruled_split() {
+        for y_split in 2..=MAX_CORES {
+            for y in (y_split..=256u32).step_by(y_split as usize) {
+                let plan = stated_split_plan(4, 64, 64, y, y_split);
+                assert_eq!(
+                    plan.per_core_extent("y"),
+                    y / y_split,
+                    "y={y} split {y_split} ways: each core holds y/y_split planes"
+                );
+                assert_eq!(plan.per_core_extent("mb"), 4, "the rows are unsplit");
+                assert_eq!(plan.per_core_extent("in"), 64, "the contraction is unsplit");
+                let charge = matmul_lx_resident_generic(&plan, 64, Df::Fp16);
+                let reference =
+                    (4 * 64 + 64 * 64 + 4 * 64) as u64 * (y / y_split) as u64 * 2;
+                assert_eq!(
+                    charge, reference,
+                    "y={y} split {y_split}: the charge bills the per-core batch, not the full extent"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(kani)]
@@ -416,5 +480,153 @@ mod proofs {
             mm.resident_bytes(&plan, out),
             matmul_lx_resident_generic(&plan, out, Df::Fp16)
         );
+    }
+
+    /// A BATCHED matmul plan — the dims [`crate::ir::bridge::tiled_op_sdsc_op::matmul::dims::
+    /// matmul_dims`] states (mb / out-stick / in-reduction-stick / y-batch), with the batch split
+    /// `y_split` ways when `y_split > 1`. The split map is stated, not searched: the law under
+    /// proof is the FORMULA's read of the plan (per-core vs full extent), not the cost model's
+    /// choice of split — any split the plan really carries exercises it.
+    fn batched_matmul_plan(mb: u32, out: u32, k: u32, y: u32, y_split: u32) -> WorkPlan {
+        let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction,
+            is_stick,
+            df: Df::Fp16,
+        };
+        let dims = vec![
+            dim("mb", mb, false, false),
+            dim("out", out, false, true),
+            dim("in", k, true, true),
+            dim("y", y, false, false),
+        ];
+        WorkPlan::divide(&dims, MaxCores::<32>, move |_, _| {
+            let mut m: std::collections::BTreeMap<&'static str, u32> = Default::default();
+            if y_split > 1 {
+                m.insert("y", y_split);
+            }
+            m
+        })
+        .unwrap()
+    }
+
+    /// ⭐⭐⭐ THE PER-CORE BATCH LAW, ARITHMETIC HALF (the 7ce19a3f9 fix's own bound,
+    /// PROVEN at the typed vocabulary): at every symbolic shape, the charge is exactly the
+    /// per-core reference — `(per-core mb·k + k·out_per_time + per-core mb·out_per_time) ·
+    /// THE BATCH THE PLAN STATES · word` — read through the REAL production formula. The
+    /// plan states the batch a core HOLDS as its own `y` dim: under a y-split plan that dim
+    /// is the per-core extent `y / y_split` (the wiring half, pinned at runtime — see
+    /// `the_split_wiring_bills_the_per_core_batch_at_every_ruled_split`), and the formula
+    /// must bill exactly it, never the full-extent batch the pre-fix formula read (the
+    /// over-charge that refused the spliced golden's score dot 2,162,688 B against a true
+    /// 270,336 B).
+    ///
+    /// WHY A REPLICATE PLAN, NOT A DIVIDED ONE — a divided plan cannot cross CBMC's symex:
+    /// the split map's `BTreeMap` removal/rebalancing machinery (reached through
+    /// `WorkPlan::divide`'s `retain`) does not concretize — 900+ unwind events in
+    /// `correct_childrens_parent_links` alone, no verdict inside the 15-minute
+    /// no-convergence rule. The same wall is why this harness carries the ARITHMETIC half
+    /// and the runtime grid carries the WIRING half: where nothing splits, per-core extent
+    /// IS the stated dim (so this harness exercises the formula's real read), and the
+    /// split's own `per_core_extent == y / y_split` read is enumerated at runtime over the
+    /// whole ruled vocabulary. The kani-red-on-parent for the fix is correspondingly the
+    /// RUNTIME pin's, not this harness's: the old and new formulas agree wherever nothing
+    /// splits — the defect only manifests under a divided plan, which symex cannot cross.
+    /// (`a_batch_split_across_cores_bills_each_core_its_own_planes` fails at the parent
+    /// with 2,162,688 B against the pinned 270,336 B.)
+    ///
+    /// DIVISION OF LABOR — the runtime pins carry the shipped numbers and this harness
+    /// carries the structural law: the 270,336-B pin at the golden's own
+    /// mb=4/out=64/in=64/y=256 under the cost model's REAL split, the 589,824-B unsplit
+    /// bmm pin, and the split-wiring grid over every (y, y_split) the matmul splitters
+    /// can rule (bounded by their own max_cores, `MAX_CORES`); this harness
+    /// proves the formula at every shape between and around them. The vocabulary is TYPED
+    /// at what the emitter really states, which is also the convergence discipline (no
+    /// two-sided symbolic product survives): `mb` 1..=8 (the real rows-are-requests
+    /// widths), `out` and `k` each picked from {64, 128} (the real whole-stick widths at
+    /// these shapes — a CONCRETE side for every product they touch), the stated batch
+    /// 1..=256 (covering both pins' batches, 16 and 256), and `out_per_time` a whole
+    /// number of fp16 sticks (`sticks · 64`, the only candidate the tiler's stick-dim
+    /// search produces — the same vocabulary the seeded-reduce harness assumes for its own
+    /// bound). `#[kani::unwind(16)]` bounds the `memcmp` loops the `&str`-keyed dim
+    /// lookups lower to (the bound's sufficiency is itself a verified unwinding
+    /// assertion).
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn matmul_resident_bills_the_batch_the_plan_states() {
+        let mb: u32 = kani::any();
+        kani::assume(mb >= 1 && mb <= 8);
+        let out_wide: bool = kani::any();
+        let out: u32 = if out_wide { 128 } else { 64 };
+        let k_wide: bool = kani::any();
+        let k: u32 = if k_wide { 128 } else { 64 };
+        // The batch a core HOLDS — under a y-split plan this is the per-core extent
+        // `y / y_split`; the harness states it as the plan's own y dim, which is the value
+        // the formula must bill.
+        let pc_batch: u32 = kani::any();
+        kani::assume(pc_batch >= 1 && pc_batch <= 256);
+        let opt_sticks: u32 = kani::any();
+        kani::assume(opt_sticks >= 1 && opt_sticks <= out / 64);
+        let out_per_time = opt_sticks * 64;
+
+        let dim = |name: &'static str, size: u32, is_reduction: bool, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction,
+            is_stick,
+            df: Df::Fp16,
+        };
+        let dims = vec![
+            dim("mb", mb, false, false),
+            dim("out", out, false, true),
+            dim("in", k, true, true),
+            dim("y", pc_batch, false, false),
+        ];
+        // REPLICATE — no splits: every per-core extent IS its dim's stated size, so the
+        // stated y dim is exactly the per-core batch the split wiring hands the formula.
+        let plan = WorkPlan::replicate(&dims);
+        assert_eq!(plan.per_core_extent("y"), pc_batch);
+        assert_eq!(plan.per_core_extent("mb"), mb);
+        assert_eq!(plan.per_core_extent("in"), k);
+
+        let charge = matmul_lx_resident_generic(&plan, out_per_time, Df::Fp16);
+        let (pc_mb, pc_k, opt) = (mb as u64, k as u64, out_per_time as u64);
+        let reference = (pc_mb * pc_k + pc_k * opt + pc_mb * opt) * pc_batch as u64 * 2;
+        assert_eq!(charge, reference);
+    }
+
+    /// ⭐ THE UNSPLIT EQUALITY — the fix's byte-identity half: where NO split divides the batch
+    /// (every shipped bmm — the known 589,824-B fixture's y=16 under an mb/out split), the new
+    /// per-core batch read and the OLD full-extent read charge the SAME bytes at every symbolic
+    /// shape. The old formula is spelled inline (the full-extent batch read it was) so the
+    /// equality is between two formulas, not a formula and itself. Same typed vocabulary and
+    /// division of labor as the split harness above — the pins carry 589,824, this carries the
+    /// equality at every unsplit shape around it.
+    #[kani::proof]
+    #[kani::unwind(16)]
+    fn matmul_resident_is_byte_identical_where_the_batch_is_unsplit() {
+        let mb: u32 = kani::any();
+        kani::assume(mb >= 1 && mb <= 8);
+        let out_wide: bool = kani::any();
+        let out: u32 = if out_wide { 128 } else { 64 };
+        let k_wide: bool = kani::any();
+        let k: u32 = if k_wide { 128 } else { 64 };
+        let y: u32 = kani::any();
+        kani::assume(y >= 1 && y <= 256);
+        let opt_sticks: u32 = kani::any();
+        kani::assume(opt_sticks >= 1 && opt_sticks <= out / 64);
+        let out_per_time = opt_sticks * 64;
+
+        // No split at all — the plan every unbatched-scope bmm runs under.
+        let plan = batched_matmul_plan(mb, out, k, y, 1);
+        assert_eq!(plan.per_core_extent("y"), y, "the batch is unsplit");
+
+        let new = matmul_lx_resident_generic(&plan, out_per_time, Df::Fp16);
+        // The pre-7ce19a3f9 formula: the same per-core mb/k/opt reads, the batch at its FULL
+        // extent. Where nothing splits, per-core == extent for every dim, so the two must agree.
+        let (pc_mb, pc_k, opt) = (mb as u64, k as u64, out_per_time as u64);
+        let old = (pc_mb * pc_k + pc_k * opt + pc_mb * opt) * y as u64 * 2;
+        assert_eq!(new, old);
     }
 }

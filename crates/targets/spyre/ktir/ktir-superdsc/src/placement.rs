@@ -736,8 +736,69 @@ impl BundleLayout {
         }
     }
 
-    /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid from this
-    /// bundle's [`Self::attn_class_hds`] registry, the one lookup every identity-kernel copy (krep/vrep,
+    /// ⭐ LAW (b)'s AUTHORITY — a gathered source's window at a sweep, under the TYPED-REACH
+    /// law: a sweep that fits the placement keeps its window (no reach needed, byte-identical);
+    /// a sweep that EXCEEDS the placement must carry a DECLARED reach — the typed statement of
+    /// its index values' bound (entry ceiling + unit, `BundleLayout::gather_reach`) — and the
+    /// family is then read from the placement (a placement holding the whole reach is a source
+    /// extent, `min(swept, ceiling)`; a slice is a pool, one entry). The placement footprint
+    /// (real buffer, LX pin, or synth declaration — the same three arms [`Self::check_window`]'s
+    /// footprint doors read, so the two can never disagree about where a tensor ends) supplies
+    /// the bytes through [`gathered_window_rows`], the one pure statement of the law the proof
+    /// series pins. Refuses, fail-closed: an over-sweep with no reach, a source whose placement
+    /// holds less than one whole row of the stated width, and a name the layout never declared.
+    pub(crate) fn gathered_source_rows(
+        &self,
+        name: &str,
+        swept: u32,
+        row_elems: u32,
+        df: crate::superdsc_opspec::Df,
+        reach: Option<crate::sdsc_abstract::GatherReach>,
+    ) -> Result<u32, String> {
+        let row_bytes = row_elems as u64 * df.word_length() as u64;
+        let fp = if let Some((_pin, fp)) = self.lx_pin(name) {
+            fp
+        } else if let Some(crate::place::PlaceId::Act(tid)) = self.id_of(name)
+            && let Some(p) = self.placements.get(&tid)
+        {
+            align128(p.size).max(128)
+        } else {
+            *self
+                .synth
+                .borrow()
+                .sizes
+                .get(name)
+                .ok_or_else(|| {
+                    format!(
+                        "'{name}' is read through an index but was never declared to the layout \
+                         — every intermediate is known at bake; declare it (`BundleLayout::synth`) \
+                         or bind it before gathering through it"
+                    )
+                })?
+        };
+        let swept_bytes = u64::from(swept).saturating_mul(row_bytes);
+        gathered_window_rows(swept, fp, row_bytes, reach.map(|r| r.max_entry().get() as u64))
+            .ok_or_else(|| {
+                if fp < row_bytes {
+                    format!(
+                        "'{name}' (placed at {fp}B) holds less than one {row_elems}-element row of \
+                         the width this gather strides — the index has no row it could legally name"
+                    )
+                } else {
+                    format!(
+                        "'{name}' is swept for {swept} rows × {row_elems} elements ({swept_bytes}B) \
+                         but placed at {fp}B — the swept window exceeds its placement footprint, and \
+                         a gathered read may address past its placement only under a DECLARED REACH \
+                         (the typed bound on its index values: an entry ceiling and unit, \
+                         `BundleLayout::gather_reach`). Declare the reach for '{name}' or place the \
+                         whole source"
+                    )
+                }
+            })
+    }
+
+    /// ⭐ THE `[hd, hd]` IDENTITY TABLE an attention class of head dim `hd` reads — its tid
+    /// from this bundle's [`Self::attn_class_hds`] registry, the one lookup every identity-kernel copy (krep/vrep,
     /// the KV cache write, the query group re-layout) resolves through. `None` when `hd` is not one of
     /// the tape's attention classes — a registry desync each caller refuses at build.
     pub fn identity_tid_of_class(&self, hd: u32) -> Option<u32> {
@@ -1061,6 +1122,143 @@ impl BundleLayout {
                 m.insert(name.to_string(), want);
                 Ok(want)
             }
+        }
+    }
+}
+
+/// ⭐⭐⭐ LAW (b)'s ONE PURE STATEMENT — a gathered source's window rows at a sweep, a placement
+/// footprint, and the reach the table declared (its entry ceiling; `None` = no reach). For a
+/// gathered source the addressable set is the index's IMAGE over the source's rows — `addr =
+/// idx·skip_addr + base`, one row per entry — so the bytes an op can touch are rows the INDEX
+/// names, never the swept rectangle. The law, in two halves:
+///
+/// * **A SWEEP THAT FITS KEEPS ITS WINDOW** — `swept·row_bytes ≤ fp` ⇒ `window == swept`, no
+///   reach needed. Every existing gather form (the embedding's card-proven emission, every pool
+///   leg under its plane) lands here: byte-identical, no reach required.
+/// * **AN OVER-SWEEP REQUIRES A DECLARED REACH** — the placement alone cannot bound the values:
+///   for a source placed WHOLE the image ⊆ the placement, but for a SLICE of a pool the values
+///   address past the placement into the pool the layout cannot see, and `min(swept, fp)` would
+///   bound nothing they obey. So the over-sweep must carry the TYPED statement of its index
+///   values' bound — a [`GatherReach`](crate::sdsc_abstract::GatherReach), whose unit the door
+///   has already checked against the read's stride — and the family is then read from the
+///   placement: `fp ≥ ceiling·row_bytes` (the placement holds the WHOLE reach) is a SOURCE
+///   EXTENT, `window = min(swept, ceiling)`; a placement holding less is a POOL SLICE the
+///   runtime re-bases, `window = 1` entry's direct coverage. NO reach ⇒ `None`: fail-closed,
+///   the refusal `gathered_source_rows` words.
+///
+/// * **SAFETY** — `window·row_bytes ≤ fp` always: the fitting half is the sweep itself; the
+///   source-extent min is at most the ceiling, and `ceiling·row_bytes ≤ fp` is that family's
+///   own condition; the pool's one entry is at most `fp` because `fp ≥ row_bytes` is a
+///   precondition. The guard's purpose (no aliasing past the placement) is preserved by
+///   construction.
+/// * **MONOTONE** — `window ≤ swept` always: the reach-bounded window never exceeds the swept
+///   window. The law only ever shrinks a handle, the same shape as the residency fix.
+/// * **BYTE-IDENTITY** — where the sweep fits, `window == swept` exactly.
+/// * **TABLE-VALUE CORRECTNESS IS NOT THIS LAW'S** — whether the staged values name in-range
+///   rows is the staging family's own law at birth (the reach's ceiling is enforced where the
+///   values are BORN), not a fact a window over the placement could check.
+/// * **THE FAMILY FORK IS SOUNDNESS-BASED, NOT PROVENANCE-BASED** — `fp ≥
+///   ceiling·row_bytes ⇒ source extent` is safe WHATEVER family minted the reach: a placement
+///   that holds the whole reach cannot be exceeded by the source-extent window (`min(swept,
+///   ceiling)` rows of in-range values, `ceiling·row_bytes ≤ fp` by the fork's own
+///   condition), and the one-entry pool window fires only where the placement does NOT hold
+///   the reach — which is exactly where the pool's own machinery (the runtime re-base, the
+///   birth-door ceiling) governs what the values address. The fork reads WHICH BOUND THE
+///   PLACEMENT CAN CERTIFY, never which producer minted the reach; nobody should read it as a
+///   family recognizer.
+///
+/// The proof series pins the properties above (see `proofs` below).
+pub(crate) fn gathered_window_rows(
+    swept: u32,
+    fp: u64,
+    row_bytes: u64,
+    reach_ceiling: Option<u64>,
+) -> Option<u32> {
+    if row_bytes == 0 || fp < row_bytes {
+        // No whole row of this width to name — the index has no row it could legally address.
+        return None;
+    }
+    if u64::from(swept).checked_mul(row_bytes).is_some_and(|b| b <= fp) {
+        // The sweep fits: byte-identical, no reach needed.
+        return Some(swept);
+    }
+    // The over-sweep: fail-closed without a declared reach.
+    let ceiling = reach_ceiling?;
+    // The reach's own extent at the read's stride — `ceiling · entry_elems · word`, the unit
+    // check having equated the read's row with the reach's entry. Overflow is a refusal: a
+    // reach whose extent does not fit u64 bounds nothing.
+    let coverage = ceiling.checked_mul(row_bytes)?;
+    if fp >= coverage {
+        // SOURCE EXTENT — the placement holds the whole reach; the values name its rows.
+        Some(swept.min(u32::try_from(ceiling).unwrap_or(swept)))
+    } else {
+        // POOL SLICE — the runtime re-bases; the direct window is one entry's coverage.
+        Some(1)
+    }
+}
+
+#[cfg(kani)]
+mod proofs {
+    use super::{gathered_window_rows, Df};
+
+    /// LAW (b), pinned at the compiler's own vocabulary. The grind diagnosis first: this
+    /// harness's first draft gave `row_bytes`, `swept`, `ceiling` and `fp` to z3 as FREE u64s,
+    /// and every product in the law and the harness (`swept × row_bytes`, `ceiling ×
+    /// row_bytes`, `window × row_bytes`) had TWO symbolic sides — nonlinear bitvector
+    /// arithmetic no solver converges on (8 CPU-hours, no verdict; the standing 15-minute
+    /// no-verdict rule exists because of it). The fix is TYPING, not narrowing: `row_bytes`
+    /// is one of `Df::word_length`'s values ({1, 2, 4} — fp8/int8 are 1-byte, fp16/bf16 are
+    /// 2-byte, fp32/uint32 are 4-byte; there is no fifth word length), so every product has
+    /// one CONCRETE side — a multiply by 1, 2 or 4, a shift. `swept`, `ceiling` and `fp` are
+    /// u32, the walk's own row-count and placement-footprint types; a gathered source's
+    /// placement is a pool activation (tile-sized — the real gathered tables are
+    /// hundreds of KiB), far under the 4 GiB the type bounds, and the 16 GiB weight regions
+    /// are not gathered sources. At this vocabulary the u64 headroom the general signature
+    /// keeps for the overflow refusals is unreachable (ceiling ≤ u32::MAX, row_bytes ≤ 4),
+    /// and the law is proved over exactly the values the placement code can hand it.
+    #[kani::proof]
+    fn gathered_source_window_never_exceeds_its_placement() {
+        let df: u8 = kani::any();
+        kani::assume(df < 3);
+        let row_bytes: u64 = match df {
+            0 => u64::from(Df::Fp8.word_length()),
+            1 => u64::from(Df::Fp16.word_length()),
+            _ => u64::from(Df::Fp32.word_length()),
+        };
+        let swept: u32 = kani::any();
+        kani::assume(swept >= 1);
+        let fp = u64::from(kani::any::<u32>());
+        let has_reach: bool = kani::any();
+        let ceiling = u64::from(kani::any::<u32>());
+        let reach = has_reach.then_some(ceiling);
+        let fits = u64::from(swept)
+            .checked_mul(row_bytes)
+            .is_some_and(|b| b <= fp);
+        let Some(w) = gathered_window_rows(swept, fp, row_bytes, reach) else {
+            // The only refusals: no whole row of this width, an over-sweep with no reach, or a
+            // reach whose own extent overflows — each names a fact, none is a silent admit.
+            if fp >= row_bytes && fits {
+                assert!(false, "a fitting sweep never refuses");
+            }
+            if fp >= row_bytes && !fits && reach.is_some() {
+                assert!(
+                    ceiling.checked_mul(row_bytes).is_none(),
+                    "an over-sweep with a reach refuses only when the reach's extent overflows"
+                );
+            }
+            return;
+        };
+        // SAFETY — the window, at the row width, stays inside the footprint.
+        assert!(u64::from(w) * row_bytes <= fp);
+        // BYTE-IDENTITY — a sweep that fits its placement keeps its window exactly.
+        if fits {
+            assert!(w == swept);
+        }
+        // MONOTONE — the reach-bounded window never exceeds the swept window.
+        assert!(w <= swept);
+        // FAIL-CLOSED — an over-sweep admits only under a declared reach.
+        if !fits {
+            assert!(reach.is_some(), "an over-sweep with no reach must refuse");
         }
     }
 }
