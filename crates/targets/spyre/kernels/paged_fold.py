@@ -37,12 +37,24 @@ launch-side arithmetic is single-sourced there):
     running state — so nothing about the carry may move per pass.
 
 The per-trip laws are `batched_prefill_hm`'s own (one full id stick per
-page-window trip, the V block contiguous only at HD 64, the exp2 softmax,
-the f32 max/sum carry paired with the f16 accumulator — wall 13's df-true
-basis), restated at ONE page per launch. `MQ == 1` is this family's own
-law: the mask's per-page block and a table's per-page block step by the
-same bytes only at one query row, and the fold's mask row is one validity
-row per page shared by the whole (single) request.
+page-window trip, the V block contiguous only at HD 64, the exp2 softmax),
+restated at ONE page per launch. `MQ == 1` is this family's own law: the
+mask's per-page block and a table's per-page block step by the same bytes
+only at one query row, and the fold's mask row is one validity row per
+page shared by the whole (single) request.
+
+⛔ THE CARRY'S MEMORY IMAGE IS f16 — the SAME grading the one-shot kernel's
+LEGALIZED program carries, so the fold is numerically IDENTICAL to the
+body it replaces, page for page. `batched_prefill_hm` SPELLS its max/sum
+at f32 in Triton, but `LegalizeTypes` collapses that island to f16 before
+the door ever sees it (the widening casts around the f16 score tile are
+removed and the chain retypes), so an f16 carry here is parity, not a
+degradation. An f32-GRADED carry in device memory is a different campaign
+— it needs a transfer-boundary anchor in `LegalizeTypes` (a genuine-f32
+value persisted between f32 descriptor views must not collapse) plus the
+door's fp32 allowlist extended past the merge chain — and is NOT this
+family's ask. The -65504 sentinel is f16-exact (the format's own max),
+so the seed loses nothing by the narrowing.
 """
 
 
@@ -51,7 +63,8 @@ def paged_fold_seed_hm(desc_m, desc_l, desc_acc,  #
                        MQ: tl.constexpr, NKVH: tl.constexpr,  #
                        GQA: tl.constexpr, HD: tl.constexpr):
     """Seed the fold's carry: max at the finite sentinel, sum and
-    accumulator at zero. Once per step, before the first pass."""
+    accumulator at zero. Once per step, before the first pass. The carry's
+    memory image is f16 (the module doc's law) and the sentinel is f16-exact."""
     BATCH: tl.constexpr = NKVH * GQA
     # The finite sentinel, not -inf: a masked-everywhere row still
     # normalizes with weight 0, never NaN (torch's own clamp trick).
@@ -64,8 +77,8 @@ def paged_fold_seed_hm(desc_m, desc_l, desc_acc,  #
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    m_desc.store([0], tl.full([BATCH * MQ], -65504.0, tl.float32))
-    l_desc.store([0], tl.zeros([BATCH * MQ], tl.float32))
+    m_desc.store([0], tl.full([BATCH * MQ], -65504.0, tl.float16))
+    l_desc.store([0], tl.zeros([BATCH * MQ], tl.float16))
     acc_desc.store([0, 0], tl.zeros([BATCH * MQ, HD], tl.float16))
 
 
@@ -102,8 +115,8 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         desc_q, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
     # The carried online-softmax state, per (kv head, group, query row):
-    # torch's carry, widened per wall 13 (the f32 max/sum pair graded
-    # against the f16 accumulator it rescales).
+    # torch's carry, at the f16 memory image the module doc's law states
+    # (the one-shot's own legalized grading — parity, not degradation).
     m_desc = tl.make_tensor_descriptor(
         desc_m, shape=[BATCH * MQ], strides=[1],
         block_shape=[BATCH * MQ])
@@ -160,7 +173,7 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         qk = qk + tl.reshape(mask_desc.load([w * MQ, 0]),
                              [1, MQ, 64])
         # The online update, folded per trip onto the CARRIED state.
-        m_new = tl.maximum(m, tl.max(qk, 2))             # [B, MQ] f32
+        m_new = tl.maximum(m, tl.max(qk, 2))             # [B, MQ]
         rescale = tl.math.exp2(m - m_new).to(tl.float16)
         p = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
         l = l * rescale + tl.sum(p, 2)
@@ -177,9 +190,9 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
 def paged_fold_finalize_hm(desc_o, desc_l, desc_acc,  #
                            MQ: tl.constexpr, NKVH: tl.constexpr,  #
                            GQA: tl.constexpr, HD: tl.constexpr):
-    """The one normalize: `out = acc / l`, ONCE, after the last pass. The
-    landing is f16 (the store's dtype); the division itself rides the f32
-    carry. The max is spent by the last pass — nothing reads it here."""
+    """The one normalize: `out = acc / l`, ONCE, after the last pass, at the
+    carry's own f16 grading. The max is spent by the last pass — nothing
+    reads it here."""
     BATCH: tl.constexpr = NKVH * GQA
     o_desc = tl.make_tensor_descriptor(
         desc_o, shape=[BATCH * MQ, HD], strides=[HD, 1],
@@ -190,7 +203,7 @@ def paged_fold_finalize_hm(desc_o, desc_l, desc_acc,  #
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    l = tl.reshape(l_desc.load([0]), [BATCH, MQ])        # [B, MQ] f32
+    l = tl.reshape(l_desc.load([0]), [BATCH, MQ])        # [B, MQ]
     acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
     o = (acc / l[:, :, None]).to(tl.float16)             # [B, MQ, HD]
     o_desc.store([0, 0], tl.reshape(o, [BATCH * MQ, HD]))

@@ -644,9 +644,11 @@ pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
 /// the splice's mint and the census's placement ever spell them, and both hold this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagedFoldCarry {
-    /// The running max, `[BATCH*MQ]` f32 — the finite −65504 sentinel at the seed.
+    /// The running max, `[BATCH*MQ]` f16 — the finite −65504 sentinel at the seed (f16-exact:
+    /// the format's own max). The carry's memory image is the one-shot kernel's own legalized
+    /// grading — see `paged_fold.py`'s module doc for the law and the f32-graded follow-up.
     Max,
-    /// The running softmax denominator, `[BATCH*MQ]` f32.
+    /// The running softmax denominator, `[BATCH*MQ]` f16.
     Sum,
     /// The running weighted accumulator, `[BATCH*MQ, HD]` f16.
     Acc,

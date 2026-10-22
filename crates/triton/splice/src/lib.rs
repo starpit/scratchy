@@ -1804,9 +1804,9 @@ struct PagedFoldFamilyFacts {
 }
 
 /// THE SEED PROGRAM'S LAUNCH CONTRACT — `paged_fold_seed_hm`'s own parameter order (the
-/// carry's max, sum, accumulator), plus the geometry as constexprs. The carry is f32 for the
-/// max/sum pair and f16 for the accumulator — wall 13's df-true basis, restated in device
-/// memory.
+/// carry's max, sum, accumulator), plus the geometry as constexprs. The carry's memory image
+/// is f16 throughout — the one-shot kernel's own legalized grading (the kernel's module doc
+/// states the law), so the fold is numerically identical to the body it replaces.
 fn paged_fold_seed_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
     let PagedFoldFamilyFacts {
         mq, nkvh, gqa, hd, ..
@@ -1814,8 +1814,8 @@ fn paged_fold_seed_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> 
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
-        ("desc_m", "*fp32"),
-        ("desc_l", "*fp32"),
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
         ("desc_acc", "*fp16"),
     ] {
         signature.insert(
@@ -1861,8 +1861,8 @@ fn paged_fold_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, String> {
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
         ("desc_q", "*fp16"),
-        ("desc_m", "*fp32"),
-        ("desc_l", "*fp32"),
+        ("desc_m", "*fp16"),
+        ("desc_l", "*fp16"),
         ("desc_acc", "*fp16"),
         ("desc_kt", "*fp16"),
         ("desc_v", "*fp16"),
@@ -1908,7 +1908,7 @@ fn paged_fold_finalize_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, Stri
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for (p, ty) in [
         ("desc_o", "*fp16"),
-        ("desc_l", "*fp32"),
+        ("desc_l", "*fp16"),
         ("desc_acc", "*fp16"),
     ] {
         signature.insert(
