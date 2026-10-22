@@ -184,7 +184,8 @@ fn the_row_feedback_gathers_the_picked_row_byte_exact() {
     // THE VACUITY CONTROL: the answer row and the pad row must differ, else the sentinel
     // leg below cannot discriminate a clamp that landed on the wrong row.
     assert_ne!(
-        expected, &rows[rows.len() - 1],
+        expected,
+        &rows[rows.len() - 1],
         "the answer row and the pad row coincide -- the sentinel leg is vacuous; \
          regenerate the stimulus (the table is seeded randn)"
     );
@@ -195,9 +196,7 @@ fn the_row_feedback_gathers_the_picked_row_byte_exact() {
          another row -- the sparse encoding zeroes every unlisted row, so a missed row \
          reads zeros, and a wrong-but-present row reads its own bytes"
     );
-    println!(
-        "  argmax_first_max row feedback: row slot == table[{want}] byte-exact, {w} elements"
-    );
+    println!("  argmax_first_max row feedback: row slot == table[{want}] byte-exact, {w} elements");
 }
 
 /// THE SENTINEL LEG (#603 PR3b): an all-NaN logits row answers the sentinel index

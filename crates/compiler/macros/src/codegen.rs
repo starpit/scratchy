@@ -9646,6 +9646,18 @@ fn emit_superdsc_wiring(
             quote! { (#tid, #kind) }
         })
         .collect::<Vec<_>>();
+    // ⭐ THE ARGMAX ROW-FEEDBACK PAIR — straight off the bake's own
+    // single-mint derivation (`argmax_row_feedback_of_ir`, the same node the
+    // load-const list reads), never recomputed here: the two minted sources
+    // the gather rides that are NOT load-consts. `None` keeps the quoted
+    // literal the host-readback path always emitted.
+    let argmax_row_feedback_tok = match gk.argmax_row_feedback {
+        None => quote! { ::core::option::Option::None },
+        Some((table, stick)) => {
+            let (table, stick) = (u32l(table), u32l(stick));
+            quote! { ::core::option::Option::Some((#table, #stick)) }
+        }
+    };
     quote! {
         ::scratchy_target_spyre::wiring::Wiring {
             result: #result,
@@ -9675,6 +9687,7 @@ fn emit_superdsc_wiring(
             weight_copies: &[#(#weight_copy_lits),*],
             fp8_k_pads: &[#(#fp8_k_pad_toks),*],
             load_consts: &[#(#load_const_toks),*],
+            argmax_row_feedback: #argmax_row_feedback_tok,
         }
     }
 }
