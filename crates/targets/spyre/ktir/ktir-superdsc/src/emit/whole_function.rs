@@ -2186,6 +2186,53 @@ fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
         .map_or(logical, |x| x.r_len)
 }
 
+/// ⭐⭐⭐⭐⭐ THE ROW SWEEP A RANK-2 RESULT RESPELLS — `None` keeps the stated shape verbatim.
+///
+/// A row reduce writes ONE VALUE PER DATA ROW: the accum is `Scale::RedStick` (one whole stick
+/// per row, value k at stick k — `win_reduce_accum`'s own law), so the reduce's result, however
+/// the program SPELLS it, is the data's row-sweep vector in the accumulator's frame. A `[256, 4]`
+/// result of a reduce over `[256, 4, 64]` (flat data rows 1024, the last axis one stick) IS the
+/// `[1024, 1]` accumulator respelled — while the STICK-BLOCKED `[256, 4]` reading (value (i, j)
+/// at stick i, lane j) is a DIFFERENT BYTE LAYOUT, not a respelling of it, so the verbatim mint
+/// and the accumulator cannot describe one buffer. MEASURED (wall 11, the spliced online
+/// softmax, `attn_s1` geom=(32,8,64) mq=1): the verbatim mint placed the reduce's output at
+/// `[256, 4]` — a 256-stick footprint — while the accum writes 1024 sticks, and the door refused
+/// correctly ("a row reduction along the stick axis writes ONE value per row — `[1024, 1]`").
+///
+/// The discriminator is the NUMEL, and it is exact in both directions:
+///
+/// * THE REDUCE's OWN RESULT (`reduce_rows`, the data's `r_len` — the door's own `rows`
+///   derivation, read off the data rather than the output): one value per row means the result
+///   holds exactly `r_len` values, so the respelling fires iff the stated numel EQUALS it. A
+///   `[4, 64]` result of an axis-0 reduce (numel 256 ≠ 1024) keeps its shape and the door
+///   refuses it by name — the right answer, that reduce is not the row-reduce form.
+/// * EVERY OTHER MEMBER of the family: an op READING a one-column tile is on the reduction's
+///   side of the program (the rank-1 arm's own discriminator, one rank up), and a rank-2 result
+///   whose numel equals that input's `r_len` is the same value vector respelled — elementwise
+///   TTIR semantics preserve the flat index map, so the frame is byte-true. The online
+///   softmax's `[256, 4]` add of two `[1024, 1]` intermediates is the measured shape.
+///
+/// ⛔ AND ONLY THOSE TWO: a WIDE input's row count is not a frame fact for anything but a
+/// reduce (a `[32, 64]` gather copy over a `[2048, 64]` table has numel 2048 == the table's
+/// rows — minting it `[2048, 1]` would reframe the copy the matmul reads as an activation), and
+/// a result whose numel matches NO family input keeps its stated shape and meets its own door's
+/// law — fail-closed there, never silently re-framed here.
+pub(crate) fn respelled_frame_rows(
+    per_op: &[Region],
+    numel: u64,
+    reduce_rows: Option<u32>,
+) -> Option<u32> {
+    if let Some(r) = reduce_rows
+        && r as u64 == numel
+    {
+        return Some(r);
+    }
+    per_op
+        .iter()
+        .find(|r| !r.is_out && r.c_len == 1 && r.r_len as u64 == numel)
+        .map(|r| r.r_len)
+}
+
 /// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
 /// plain and the indirect arm of [`region_for_operand`] share, and the walk the index operand needs a
 /// door of its own for.
@@ -3677,6 +3724,31 @@ pub fn lower_function(
                 ));
             };
             let dims = match op.result_type {
+                // ⭐⭐⭐⭐⭐ A RANK-2 RESULT THAT RESPELLS A REDUCE-FAMILY VECTOR IS MINTED IN THAT
+                // FAMILY's FRAME — `[rows, 1]`, the accumulator's own — not in its stated spelling.
+                // The placement and the region every consumer reads are minted HERE, before the
+                // door runs, so the frame is decided at the one site that owns both (`layout.synth`
+                // below, `inter.insert` below) — a door-side respell could not reach the consumers
+                // and would leave the placement at the wrong footprint. [`respelled_frame_rows`]
+                // is the law and carries the wall-11 measurement; `None` falls through to the
+                // verbatim arm below, so every non-family shape is byte-identical to before.
+                Some(ktir_core::irtype::IrType::Tensor { dims, .. })
+                    if dims.len() == 2
+                        && let Some(rows) = respelled_frame_rows(
+                            &per_op,
+                            dims[0] as u64 * dims[1] as u64,
+                            (matches!(program, Lowering::Reduce(_)))
+                                .then(|| {
+                                    per_op
+                                        .iter()
+                                        .find(|r| !r.is_out)
+                                        .map(|r| r.r_len)
+                                })
+                                .flatten(),
+                        ) =>
+                {
+                    [rows, 1]
+                }
                 Some(ktir_core::irtype::IrType::Tensor { dims, .. }) if dims.len() == 2 => {
                     [dims[0] as u32, dims[1] as u32]
                 }

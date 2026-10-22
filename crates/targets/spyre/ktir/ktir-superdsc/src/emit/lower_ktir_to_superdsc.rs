@@ -7720,6 +7720,59 @@ mod proofs {
         let windowed = r_len == rows && r_start + r_len <= v_rows;
         assert_eq!(verdict, whole_view || windowed);
     }
+
+    /// ⭐ WALL 11's LAW, over the PURE PREDICATE: the reduce family's respelled frame fires
+    /// EXACTLY on the family facts — the reduce's own data sweep at matching numel, or a
+    /// one-column input at matching rows — and on NOTHING else, in particular not on a WIDE
+    /// input's row count (the gather-copy trap: a `[32, 64]` copy result over a `[2048, 64]`
+    /// table has numel == the table's rows and must keep its stated shape). The value-count
+    /// invariance — a respelled frame holds exactly the stated numel — is the `Some` arm of
+    /// the same equivalence: both fire conditions require the match. The predicate is pure
+    /// comparisons over `r_len`/`c_len`/`is_out` — no `format!` in reach, no maps, no products
+    /// — so this is the z3 recipe's class (seconds, not minutes).
+    ///
+    /// ⛔ THE WIRING HALF IS RUNTIME, BY RULING (the law-(a) split):
+    /// `zz_the_reduce_family_respells_its_frame` drives the REAL mint through `lower_function`
+    /// — the reduce, the family members, the placement, and the door's own one-value-per-row
+    /// check included — over the real softmax-slice shapes and both controls.
+    #[kani::proof]
+    fn the_respelled_frame_fires_exactly_on_the_family_facts() {
+        let numel: u32 = kani::any();
+        let a_len: u32 = kani::any();
+        let a_cols: u32 = kani::any();
+        let b_len: u32 = kani::any();
+        let b_cols: u32 = kani::any();
+        let b_out: bool = kani::any();
+        let reduce_rows: u32 = kani::any();
+        kani::assume(numel >= 1 && numel <= 4096);
+        kani::assume(a_len >= 1 && a_len <= 4096);
+        kani::assume(b_len >= 1 && b_len <= 4096);
+        kani::assume(a_cols >= 1 && a_cols <= 256);
+        kani::assume(b_cols >= 1 && b_cols <= 256);
+        kani::assume(reduce_rows <= 4096);
+
+        // Two whole-view inputs (the predicate reads `r_len`/`c_len`/`is_out` only) and the
+        // reduce's own data sweep; `reduce_rows == 0` models the `None` — a non-reduce op.
+        let a = reg(5, a_len, a_cols, false);
+        let b = reg(6, b_len, b_cols, b_out);
+        let verdict = crate::emit::whole_function::respelled_frame_rows(
+            &[a, b],
+            numel as u64,
+            (reduce_rows >= 1).then_some(reduce_rows),
+        );
+        // The law, stated as the spec mirror: the reduce's matching sweep first, then the
+        // FIRST one-column input at matching rows, and nothing else.
+        let expect = if reduce_rows >= 1 && reduce_rows == numel {
+            Some(reduce_rows)
+        } else if a_cols == 1 && a_len == numel {
+            Some(a_len)
+        } else if !b_out && b_cols == 1 && b_len == numel {
+            Some(b_len)
+        } else {
+            None
+        };
+        assert_eq!(verdict, expect);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
