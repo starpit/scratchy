@@ -954,6 +954,41 @@ pub(crate) enum ChunkOut {
     /// picked from stays placed and readable by tid (the wiring doc's greedy
     /// contract); only the ANSWER moved.
     Picked(u32),
+    /// ⭐⭐⭐⭐⭐ THE WINDOW'S k TOKENS (#603 PR3b) — one engine step resolved as k
+    /// device steps enqueued back to back with no host round trip between them:
+    /// every step's argmax fed the next step's embedding row by the minted
+    /// device-side gather, and the window's single synchronize read all k
+    /// answers off the idx pool. The k tokens are COMMITTED positions — the
+    /// engine's shape-based accept algebra (`num_accepted = k−1 =
+    /// num_draft_tokens`) keeps every one of them.
+    ///
+    /// Card-only by construction (the executor's window doors), so the variant
+    /// carries the feature; the KTIR emulator path never constructs it.
+    #[cfg(feature = "spyre-hw")]
+    Window(Vec<u32>),
+}
+
+/// ⭐⭐⭐⭐⭐ WHAT THE WORKER DOES WITH THE ENGINE'S WINDOW PLACEHOLDERS (#603 PR3b) —
+/// the worker-side half of `attach_decode_window`'s contract. The engine rides k−1
+/// placeholder positions on the speculative-decode channel; whether this worker can
+/// resolve them as ONE device visit is a fact of the RUNG and of the REQUEST, and the
+/// three answers differ in what the store holds:
+///
+/// * `None` — no placeholders are attached (n == 1, or a prefill chunk, or the
+///   proposer planned this step's drafts). Every scheduled token is in the store.
+/// * `Take(k)` — the placeholders become ONE window of k steps: the rung mints the
+///   device argmax chain (`argmax_row_feedback` + an index result) and the request's
+///   history is the contiguous `[0, start)` — the two facts below, each of which the
+///   window's correctness leans on.
+/// * `Decline` — placeholders are attached but this worker cannot take them. The
+///   step runs position `start` ALONE (the one committed token) and returns its one
+///   token; the engine's verify algebra reads `num_accepted = 0`, rewinds k−1, and
+///   the request continues at k=1 — the degradation `attach_decode_window`'s doc
+///   promises ("never corrupts"), paid as one rewound schedule per step.
+pub(crate) enum StepWindow {
+    None,
+    Take(usize),
+    Decline,
 }
 
 #[cfg(feature = "spyre-hw")]
@@ -979,7 +1014,16 @@ pub(crate) fn superdsc_forward_chunk(
     id: &str,
     tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
     start: usize,
+    // ⭐⭐⭐⭐⭐ THE COMMITTED TOKENS ONLY (#603 PR3b). A windowed step schedules k
+    // positions but holds ONE host token — position `start`'s, the last committed
+    // — because the k−1 placeholder positions' tokens do not exist on the host
+    // until the window's single synchronize reads them. `toks.len()` is therefore
+    // 1 for a windowed step while `window` is k, and `n = max(toks.len(), window)`
+    // below is the number of positions this forward RUNS.
     toks: &[usize],
+    // The window's k, or 0 for every step that is not a taken window (see
+    // [`StepWindow`] — the derivation is the caller's, in `spyre_exec`).
+    window: usize,
     // THE HOST'S LIST + THE POOL'S OWNER SPLIT — needed because every bind DERIVES this request's page
     // map rather than reading a stored one, and the map's fully-masked and hole pages come from the
     // reserved range.
@@ -988,9 +1032,15 @@ pub(crate) fn superdsc_forward_chunk(
     // `run_request_step` off `Loaded`'s own two numbers).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
 ) -> ExecutorResult<ChunkOut> {
-    let n = toks.len();
-    if n == 0 {
-        return Err(werr("superdsc_forward_chunk: n=0".to_string()));
+    // ⭐ THE POSITIONS THIS FORWARD RUNS: every committed token, or the window's k
+    // when the window is larger — the placeholders' tokens are device-fed (the
+    // minted gather), so a windowed step runs k positions over one committed
+    // token and `toks` alone cannot say how many steps this is.
+    let n = toks.len().max(window);
+    if toks.is_empty() {
+        return Err(werr(
+            "superdsc_forward_chunk: no committed tokens".to_string(),
+        ));
     }
     // ⭐ NO `hd` HERE EITHER — the solo-decode causal tile's head count is the bake's
     // `Geometry::nqh` (see the `num_q_heads` site below), and nothing else in this
@@ -1032,14 +1082,19 @@ pub(crate) fn superdsc_forward_chunk(
     // logits — a second whole forward that re-streamed every weight (~29 ms) to compute one row the
     // prefill already had in hand. Now TTFT is ceil(n/prefill_m) forwards, not that plus one.
     //
-    // Reaching the decode loop below therefore means this call is a single generation step (n == 1):
-    // a multi-token prompt either returns its logits from the batched prefill or is refused, so the
-    // loop runs on `start`/`toks` directly.
+    // Reaching the decode loop below therefore means this call is a single generation step
+    // (toks.len() == 1, window or not): a multi-token prompt either returns its logits from
+    // the batched prefill or is refused, so the loop runs on `start`/`toks` directly.
     // ── SEQUENTIAL mq=1 PREFILL IS NUKED (scripts/verify_prefill_real.sh is the SOLE authority) ──
     // A multi-token PROMPT either goes through the batched mq=N forward, or the request is REFUSED.
     // There is NO env escape, NO silent fallback, NO "walk the prompt one token at a time". Every
     // prompt prefill emits exactly one unconditional, machine-parseable truth line.
-    let n_entry = n; // rows at entry: >1 ⇒ a prompt PREFILL request; ==1 ⇒ a decode step
+    // ⭐⭐⭐ THE TWO REGIMES BY COMMITTED ROWS, WITH THE WINDOW'S CONJUNCT — a windowed
+    // step arrives as ONE committed row carrying k positions, and without this
+    // conjunct the k>1 it derives would route it into the batched prefill below
+    // (a different session, a different graph). A window is a DECODE shape by
+    // construction (`attach_decode_window` never rides a prefill chunk).
+    let n_entry = toks.len(); // committed rows at entry: >1 ⇒ a prompt PREFILL request; ==1 ⇒ a decode step
     let prefill_top_m = prefill_rungs.last().map(|(m, _)| *m).unwrap_or(0);
     if !prefill_rungs.is_empty() {
         // CHUNKED BATCHED PREFILL: cover the WHOLE prompt (all but the last token) as a sequence of
@@ -1050,7 +1105,10 @@ pub(crate) fn superdsc_forward_chunk(
         // at the kernel level. The ONLY thing that was missing was this loop: the prior code called
         // run_prefill_batch ONCE and REFUSED any prompt longer than one prefill_m-sized chunk, even
         // though the exact same call already supported a nonzero `start` for continued generation.
-        if n > 1 {
+        // ⛔ `window == 0` — the window's k positions are NOT a prompt, and routing
+        // them into the prefill session would bind a decode graph's ids into a
+        // prefill bundle (the exact `pmeta` corruption the guard below refuses).
+        if window == 0 && n > 1 {
             let real_total = n; // the WHOLE prompt goes through prefill, last token included
             // Bind with the PREFILL meta (its embed/cos/sin/ONES tensor ids match the prefill session);
             // `b` (decode meta) would SILENTLY bind the wrong ids. batched_prefill is Some whenever the
@@ -1458,7 +1516,7 @@ pub(crate) fn superdsc_forward_chunk(
             return Ok(ChunkOut::Rows(vec![row]));
         }
     }
-    if n_entry > 1 {
+    if window == 0 && n_entry > 1 {
         // Only reachable when there's no prefill bundle at all: chunking covers any prompt length, and
         // a prefill that DOES run returns its logits above rather than falling through to here.
         eprintln!(
@@ -1527,10 +1585,49 @@ pub(crate) fn superdsc_forward_chunk(
             );
         }
     };
-    for (i, &tok) in toks.iter().enumerate() {
-        if tok >= vocab {
-            return Err(werr(format!("token {tok} >= vocab {vocab}")));
+    // ⭐⭐⭐⭐⭐ OPEN THE WINDOW BEFORE ITS FIRST STEP ENQUEUES (#603 PR3b). The stick is
+    // the wiring's own `argmax_row_feedback` pair — the caller's predicate already
+    // asked this rung for the pair, so its absence HERE is a wiring bug, refused
+    // loudly rather than worked around: a window without the minted chain has no
+    // device-fed embedding row and no idx stick to pool-read. The vocab bound is the
+    // same `geometry.vocab` the k=1 token step's `checked_picked_token` reads, so the
+    // per-step sentinel check inside `window_finish` states the same refusal.
+    if window > 0 {
+        let Some(&(_table_tid, stick_tid)) = b.wiring.argmax_row_feedback.as_ref() else {
+            return Err(werr(format!(
+                "superdsc window (k={window}): the rung carries no argmax_row_feedback pair — \
+                 the caller's window predicate asked this rung for the minted chain, so reaching \
+                 here without it is a wiring bug, not a schedule decision"
+            )));
+        };
+        session
+            .run_window_begin(
+                window,
+                scratchy_target_spyre::bundle_code::PlaceId::Act(stick_tid),
+                b.wiring.geometry.vocab as usize,
+            )
+            .map_err(|e| werr(format!("superdsc window_begin (k={window}): {e}")))?;
+    }
+    for i in 0..n {
+        // ⭐ THE TOKEN THIS STEP FEEDS — the committed one at position `start` for step
+        // 0, and NOTHING for a window's ahead-steps: their token ids exist only on the
+        // device (each is the previous step's argmax answer, read by the window's
+        // single synchronize), so the host binds no row for them and the tape's
+        // EmbedRow step is FILTERED OFF below — an unfiltered step would stage an
+        // all-zero row (an empty `tokens` list is zero-filled, silently) and the
+        // preamble H2D would overwrite the device gather's row with it.
+        let tok = toks.get(i).copied();
+        if let Some(t) = tok
+            && t >= vocab
+        {
+            return Err(werr(format!("token {t} >= vocab {vocab}")));
         }
+        // Step 0 of a window binds its row FROM THE HOST (the committed token at
+        // `start`) — the same bind the k=1 step makes, byte-identical to what the
+        // previous step's gather wrote when one did, and REQUIRED when none did (the
+        // first window after prefill: the prefill session runs no minted chain).
+        let ahead = window > 0 && i >= toks.len();
+        let tok_row = [tok.unwrap_or(0)];
         let p = start + i; // absolute position = valid prefix count this step
 
         // ⭐ THE FORWARD, AS A TAPE. What used to be ~110 lines of interleaved
@@ -1570,10 +1667,20 @@ pub(crate) fn superdsc_forward_chunk(
         //
         // NOT `0..p`: a request that has shared a batched step carries a HOLE, and calling that
         // hole valid feeds it another request's keys.
+        //
+        // ⭐⭐⭐⭐⭐ AND A WINDOW'S OWN EARLIER WRITES ARE VALID FOR ITS LATER STEPS: step
+        // `i` attends every key the window wrote at `[start, start + i)`, which
+        // `kv_hist` cannot say yet (the history records the whole window only after
+        // the loop). The range term is exact BECAUSE the caller's window predicate
+        // pinned the history to the contiguous `[0, start)` — the window's k writes
+        // extend it at `[start, start + k)` — and the `contains` term stays the
+        // history's own truth for everything below it.
         let prefix_src = session.pmask_slots.map(|cap| {
             scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
                 cap,
-                holds: |col: usize| req.kv_hist.contains(col),
+                holds: |col: usize| {
+                    req.kv_hist.contains(col) || (window > 0 && col >= start && col < start + i)
+                },
             }
         });
         // The body this launch RUNS: `step_body(p)` is the same selection `run_step(1, p, ..)` makes
@@ -1638,7 +1745,11 @@ pub(crate) fn superdsc_forward_chunk(
             // the head count only for a square Q projection; see the site above).
             causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
             embed_tokens: sh.embed_tokens,
-            tokens: &[tok],
+            // ⭐ THE COMMITTED ROW, OR NOTHING: an ahead-step's token does not exist on
+            // the host, its EmbedRow step is filtered off the tape below, and this
+            // empty slice is therefore never read — kept empty (never a placeholder
+            // token) so a future tape regression that reads it stages no real row.
+            tokens: if ahead { &[] } else { &tok_row },
             positions: &[p as u32],
             causal,
             prefix: prefix_src,
@@ -1654,7 +1765,23 @@ pub(crate) fn superdsc_forward_chunk(
             // address (row 0's first page), so every pass would answer from row 0's keys.
             kv_blocks: kv_blocks.as_deref(),
         };
-        let fsteps = shape.steps();
+        // ⭐⭐⭐⭐⭐ THE AHEAD-STEPS' TAPE DROPS THE EmbedRow STEP — the device gather
+        // chained off the previous step's argmax writes that row, and a staged
+        // (zero-filled) row would overwrite it in the preamble H2D. Every other step
+        // stays: the rope tables, the masks, the block index and the constants are all
+        // host-known per position.
+        let fsteps: Vec<_> = {
+            let all = shape.steps();
+            if ahead {
+                all.into_iter()
+                    .filter(|s| {
+                        s.kernel != scratchy_target_spyre::forward_tape::ForwardKernel::EmbedRow
+                    })
+                    .collect()
+            } else {
+                all
+            }
+        };
         let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
         let ftape = scratchy_target_spyre::forward_tape::tape_steps(&fsteps, &fops);
         let mut launcher = ForwardLauncher {
@@ -1703,7 +1830,20 @@ pub(crate) fn superdsc_forward_chunk(
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
         log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
-        if b.wiring.result_is_index() {
+        if window > 0 {
+            // ⭐⭐⭐⭐⭐ THE WINDOW'S STEP — ENQUEUED, NOT RUN: the same bind set the k=1
+            // step stages (minus the ahead-steps' embedding row), handed to the
+            // executor's window door. No synchronize, no readback, no host round
+            // trip: the step's preamble H2D, its forward, and its idx D2H all queue
+            // on the persistent stream behind the previous step's, and the window's
+            // single `window_finish` synchronize is what makes their answers
+            // exist on the host. An error abandons the window WITH its in-flight
+            // CBs (the executor's own law) and propagates to the request.
+            session
+                .run_window_step(p, &acts, &acts_f16, &acts_i32)
+                .map_err(|e| werr(format!("superdsc window step (pos {p}): {e}")))?;
+            step_timing(p, _t_fwd);
+        } else if b.wiring.result_is_index() {
             // ⭐ THE DEVICE ALREADY PICKED — this rung's result is an index stick
             // (the device argmax's, admitted by the mint at bake). The step runs
             // its suffix and leaves the stick on the device — the ~100 KB logits
@@ -1729,10 +1869,27 @@ pub(crate) fn superdsc_forward_chunk(
             )));
         }
     }
+    // ⭐⭐⭐⭐⭐ RETIRE THE WINDOW — THE ONE SYNCHRONIZE (#603 PR3b). Every step the loop
+    // enqueued retires here and the k idx words come back sentinel-checked (the
+    // executor's own per-step refusal, against the same `geometry.vocab` bound
+    // `window_begin` took), so the k tokens this returns are COMMITTED positions in
+    // step order: `ids[i]` is the answer of window step `i`, i.e. the token at
+    // position `start + i + 1`.
+    let window_ids = if window > 0 {
+        Some(
+            session
+                .run_window_finish()
+                .map_err(|e| werr(format!("superdsc window_finish (k={window}): {e}")))?,
+        )
+    } else {
+        None
+    };
     tokens.set_tokens_in_pool(id, start + n);
     // The solo forward wrote its `n` keys at the slot `bind_request_pages` bound it at — this request's
     // own end, since nobody else was in the launch. Recorded here rather than per token because this
-    // loop is only ever reached with n == 1 (a multi-token prompt returns from the batched path above).
+    // loop is only ever reached with one committed row (a multi-token prompt returns from the batched
+    // path above); `n` is the window's k for a windowed step, and the window's k writes are exactly
+    // the k consecutive slots past that end.
     // ⭐ THE SLOT IS NAMED HERE, not derived inside a helper: this forward wrote at this request's own
     // end because nobody else was in the launch. A PREFILL chunk cannot say that (it may have stepped
     // back), which is why it goes through `record_chunk` instead.
@@ -1745,10 +1902,12 @@ pub(crate) fn superdsc_forward_chunk(
     // per-slot L2 norms for the first few slots. Compare BATCHED vs SEQUENTIAL (same prompt): the
     // sequential t9 is the golden KV. If the batched slot-0..(prompt-1) norms differ, the mq>1
     // prefill computed the wrong KV (H3); if they match, the KV is right and the bug is elsewhere.
+    if let Some(ids) = window_ids {
+        return Ok(ChunkOut::Window(ids));
+    }
     match picked {
         Some(tok) => Ok(ChunkOut::Picked(tok)),
-        None => Err(werr(
-            "decode: the index-result rung ran no step — the n=0 entry refusal was bypassed"
+        None => Err(werr(        "decode: the index-result rung ran no step — the n=0 entry refusal was bypassed"
                 .to_string(),
         )),
     }
@@ -1835,6 +1994,9 @@ pub(crate) fn forward_chunk(
     // The pool's geometry, threaded from the model — one spelling, handed to
     // `superdsc_forward_chunk`'s chunk paths (see `run_request_step`, where it is built).
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    // The window's k, or 0 (see [`StepWindow`] — derived in `spyre_exec`, threaded
+    // through `run_request_step`).
+    window: usize,
 ) -> ExecutorResult<ChunkOut> {
     {
         let SendnnSession::SuperDsc(sb) = session;
@@ -1864,6 +2026,7 @@ pub(crate) fn forward_chunk(
             tokens,
             start,
             toks,
+            window,
             ctx,
             pool,
         );
@@ -1885,8 +2048,19 @@ pub(crate) fn forward_chunk(
         start,
         toks,
     }: Chunk<'_>,
+    // The emulator never windows (its worker declares MAX_DECODE_WINDOW = 1 through the
+    // creation seam, so the engine attaches no placeholder at all); the parameter rides
+    // the shared signature and is refused below if that invariant ever breaks.
+    window: usize,
 ) -> ExecutorResult<ChunkOut> {
     let _ = prefill_meta; // the batched-prefill session pair is a sendnn-only shape
+    if window > 0 {
+        return Err(werr(format!(
+            "forward_chunk: a {window}-step decode window reached the KTIR emulator path — the \
+             emulator's worker declares MAX_DECODE_WINDOW = 1, so the engine attaches no \
+             placeholder positions and this is a wiring bug"
+        )));
+    }
     let n = toks.len();
     // KTIR caps a forward at the baked m_cap. The sendnn paged prefill runs the
     // WHOLE prompt in one forward (s0 = padded bucket up to capacity), so its only
@@ -2182,6 +2356,14 @@ pub(crate) fn select_decode(buckets: &[BundleMeta], need: usize) -> &BundleMeta 
 /// the prompt or is a decode step. n==1 (generation) uses the cheap m=1 DECODE
 /// bundle; n>1 (prompt) uses the batched m=M PREFILL bundle (chunked by m_cap),
 /// falling back to the decode bundle if no prefill bundle was emitted.
+///
+/// ⭐⭐⭐⭐⭐ A WINDOWED STEP RETURNS ITS k TOKENS (#603 PR3b): `step_window` says what
+/// the engine's placeholder positions become (see [`StepWindow`]). A taken window
+/// commits all k — `push_generated` per token — and returns them, so the engine's
+/// shape-based accept algebra (`num_accepted = k−1`) keeps every one; a DECLINED
+/// window runs position `start` alone and returns its one token, and the engine's
+/// rewind degrades the step to sequential. The k−1 placeholder positions are never
+/// read from the store either way — their tokens exist only on the device.
 pub(crate) fn run_request_step(
     model: &mut Loaded,
     req: &mut ReqState,
@@ -2193,19 +2375,33 @@ pub(crate) fn run_request_step(
     tokens: &mut scratchy_serving_engine::input_batch::InputBatch,
     start: usize,
     n: usize,
+    step_window: StepWindow,
     // The host's block list for this request, read from `InputBatch` by the caller, and the pool's owner
     // split. Passed in rather than looked up here so there is one read of the store per step.
     #[cfg(feature = "spyre-hw")] host: &[usize],
     #[cfg(feature = "spyre-hw")] part: PoolPartition,
-) -> ExecutorResult<Option<u32>> {
+) -> ExecutorResult<Option<Vec<u32>>> {
     if n == 0 {
         return Ok(None);
     }
+    // ⭐⭐⭐⭐⭐ THE WINDOW, AND THE COMMITTED-TOKEN COUNT IT IMPLIES. The engine's k
+    // scheduled positions carry ONE host token (position `start`'s, the last
+    // committed) whenever placeholders are attached — taken OR declined — so the
+    // store read below covers `n_committed` positions, never `n`. A step with no
+    // placeholders reads all `n`: a prefill chunk's tokens are all in the store.
+    let window = match step_window {
+        StepWindow::Take(k) => k,
+        StepWindow::None | StepWindow::Decline => 0,
+    };
+    let n_committed = match step_window {
+        StepWindow::None => n,
+        StepWindow::Take(_) | StepWindow::Decline => 1,
+    };
     // The map context for this request's whole step: the host's list (read from `InputBatch` by the
     // caller) and the pool's owner split, derived once.
     #[cfg(feature = "spyre-hw")]
     let ctx = PageMapCtx { host, part };
-    let toks: Vec<usize> = (start..start + n)
+    let toks: Vec<usize> = (start..start + n_committed)
         .map(|p| {
             tokens.token_at(id, p).map(|t| t as usize).ok_or_else(|| {
                 werr(format!(
@@ -2232,13 +2428,16 @@ pub(crate) fn run_request_step(
     );
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.
-    // `start + n` (not `pos + 1`) because `b` is fixed for the whole step below.
-    let b: &BundleMeta = if n == 1 {
-        select_decode(&model.decode, start + n)
+    // ⭐ `start + n_run` (not `pos + 1`) because `b` is fixed for the whole step below — and
+    // `n_run` is the POSITIONS THIS FORWARD RUNS: the window's k when taken, one committed
+    // row for a declined window (the engine rewinds the k−1 it does not get), `n` otherwise.
+    let n_run = window.max(n_committed);
+    let b: &BundleMeta = if window > 0 || n_run == 1 {
+        select_decode(&model.decode, start + n_run)
     } else if let Some(p) = model.prefill.as_ref() {
         p
     } else {
-        select_decode(&model.decode, start + n)
+        select_decode(&model.decode, start + n_run)
     };
     // OPT-IN (user-directed 2026-07-27): was unconditional on every single request -- pure log spam
     // for normal operation. Gate it behind SCRATCHY_SUPERDSC_DBG (the existing verbose-diagnostic
@@ -2358,8 +2557,16 @@ pub(crate) fn run_request_step(
     // `last` below holds the last chunk's row. Under `spyre-hw` there is no
     // other answer: no chunk's row is ever read back for picking.
     let mut picked: Option<u32> = None;
+    // ⭐⭐⭐⭐⭐ THE WINDOW'S k TOKENS, when this step ran as one (#603 PR3b) — the
+    // whole step's answer, superseding `picked`/`last` the way a windowed step
+    // supersedes the per-step readback.
+    let mut windowed: Option<Vec<u32>> = None;
     let mut pos = start;
     for chunk in toks.chunks(chunk_w) {
+        // Only the first chunk can be the window — a windowed step carries one
+        // committed token, so `toks.chunks` is one chunk long; the guard keeps
+        // that a fact of the code rather than a fact of the caller.
+        let w = if pos == start { window } else { 0 };
         match forward_chunk(
             &sh,
             &mut model.session,
@@ -2376,6 +2583,7 @@ pub(crate) fn run_request_step(
             ctx,
             #[cfg(feature = "spyre-hw")]
             pool,
+            w,
         )? {
             ChunkOut::Rows(rows) => {
                 #[cfg(not(feature = "spyre-hw"))]
@@ -2386,102 +2594,130 @@ pub(crate) fn run_request_step(
                 let _ = rows;
             }
             ChunkOut::Picked(tok) => picked = Some(tok),
+            // The whole step in one hand: k committed tokens, in step order.
+            #[cfg(feature = "spyre-hw")]
+            ChunkOut::Window(ids) => windowed = Some(ids),
         }
         pos += chunk.len();
     }
     let p_last = start + n - 1;
     if p_last + 1 >= tokens.prompt_len(id) {
-        // ⭐ THE PICKED TOKEN — and under `spyre-hw` NOTHING ELSE IS POSSIBLE.
-        // The host argmax that used to sit in this arm is deleted: a chunk that
-        // completes a prompt without a device pick gets ONE more chance, below,
-        // through the minted rung itself — never a host pick.
-        let tok = match picked {
-            Some(tok) => tok,
-            None => {
-                #[cfg(not(feature = "spyre-hw"))]
-                {
-                    argmax(&last) as u32
-                }
-                #[cfg(feature = "spyre-hw")]
-                {
-                    // ⭐ THE LAST PROMPT POSITION, PICKED ON THE DEVICE. The
-                    // batched prefill folds its lm-head tail over the final row
-                    // and used to read that row back for the host to argmax —
-                    // token 1 of every request was a HOST pick. Instead, re-run
-                    // that ONE position as a decode step through the minted m=1
-                    // rung, with the history windowed back one slot: the write
-                    // then lands ON `p_last` (overwriting the prefill's key for
-                    // the same token at the same slot — same slot, same token,
-                    // no double append) and the mask covers exactly [0, p_last).
-                    // Every derivation — write slot, mask validity, the
-                    // post-step record — follows the one windowed number.
-                    if p_last + 1 != tokens.prompt_len(id) {
-                        return Err(werr(
-                            "a decode step completed without a device pick — the rung is \
-                             unminted and the host may not pick"
-                                .to_string(),
-                        ));
-                    }
-                    if req.kv_hist.end().get() != p_last as u32 + 1 {
-                        return Err(werr(format!(
-                            "the re-pick step at position {p_last} needs a history ending \
-                             exactly one past it (ends at {}) — the window law requires the \
-                             contiguous prompt history",
-                            req.kv_hist.end().get()
-                        )));
-                    }
-                    let tok_last = tokens.token_at(id, p_last).ok_or_else(|| {
-                        werr(format!(
-                            "token index {p_last} out of range (have {})",
-                            tokens.token_count(id)
-                        ))
-                    })? as usize;
-                    // THE WINDOW, one slot back: the step below sees [0, p_last)
-                    // as its resident prefix and writes at p_last. The pool
-                    // bookkeeping steps back WITH the window — the step's
-                    // idempotent slot rewrite (same token, same slot) then
-                    // re-appends p_last and restores the count, keeping the
-                    // decode path's "holds exactly `start` positions" law true
-                    // at the call.
-                    req.kv_hist = scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last);
-                    tokens.set_tokens_in_pool(id, p_last);
-                    let b_step = select_decode(&model.decode, p_last + 1);
-                    match forward_chunk(
-                        &sh,
-                        &mut model.session,
-                        b_step,
-                        model.batched_prefill.as_ref(),
-                        Chunk {
-                            state: req,
-                            id,
-                            tokens,
-                            start: p_last,
-                            toks: &[tok_last],
-                        },
-                        ctx,
-                        pool,
-                    )? {
-                        ChunkOut::Picked(tok) => tok,
-                        ChunkOut::Rows(_) => {
-                            return Err(werr(
-                                "the re-pick step returned rows, not a device pick — the \
-                                 decode rung's lm-head does not admit the argmax mint and the \
-                                 host may not pick"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-        };
+        // ⭐ THE WINDOW'S k TOKENS, OR THE PICKED TOKEN — and under `spyre-hw`
+        // NOTHING ELSE IS POSSIBLE. The host argmax that used to sit in this
+        // arm is deleted: a chunk that completes a prompt without a device
+        // pick gets ONE more chance, below, through the minted rung itself —
+        // never a host pick. (An index-result rung's stick already holds the
+        // device's pick; the emu seat's `argmax` below is the SAME greedy
+        // contract, so the two answer one question and can never both be
+        // needed. The top-2 gap instrument covers the row path only: a picked
+        // step has no row to gap.)
+        //
+        // ⭐⭐⭐⭐⭐ AND A WINDOW COMMITS ALL k: the engine's kept-truncation loop is
+        // what drops tokens past the first one that finishes the request, so the
+        // worker hands over every token the window produced — one `push_generated`
+        // per token keeps the store's `token_at` aligned with the scheduler's
+        // `num_computed_tokens`, which the engine advanced by k and rewinds only
+        // for the tokens it does not get.
+        //
         // ⭐ THE SAME TOP-2 GAP AS THE BATCHED PATH, so a mixed run's steps are all visible in one log.
         //
         // Without this, `SCRATCHY_TOP2` covered only the batched sampling site — and a step with ONE live
         // request comes down HERE, so two repeat runs printed 8 and 6 lines and the difference read as
         // missing data rather than as "these steps were solo". A gap in an instrument is indistinguishable
         // from a gap in the thing it measures.
-        tokens.push_generated(id, tok);
-        Ok(Some(tok))
+        let ids: Vec<u32> = match windowed.take() {
+            Some(ids) => ids,
+            None => {
+                vec![match picked {
+                    Some(tok) => tok,
+                    None => {
+                        #[cfg(not(feature = "spyre-hw"))]
+                        {
+                            argmax(&last) as u32
+                        }
+                        #[cfg(feature = "spyre-hw")]
+                        {
+                            // ⭐ THE LAST PROMPT POSITION, PICKED ON THE DEVICE. The
+                            // batched prefill folds its lm-head tail over the final row
+                            // and used to read that row back for the host to argmax —
+                            // token 1 of every request was a HOST pick. Instead, re-run
+                            // that ONE position as a decode step through the minted m=1
+                            // rung, with the history windowed back one slot: the write
+                            // then lands ON `p_last` (overwriting the prefill's key for
+                            // the same token at the same slot — same slot, same token,
+                            // no double append) and the mask covers exactly [0, p_last).
+                            // Every derivation — write slot, mask validity, the
+                            // post-step record — follows the one windowed number.
+                            if p_last + 1 != tokens.prompt_len(id) {
+                                return Err(werr(
+                                    "a decode step completed without a device pick — the \
+                                     rung is unminted and the host may not pick"
+                                        .to_string(),
+                                ));
+                            }
+                            if req.kv_hist.end().get() != p_last as u32 + 1 {
+                                return Err(werr(format!(
+                                    "the re-pick step at position {p_last} needs a history \
+                                     ending exactly one past it (ends at {}) — the window law \
+                                     requires the contiguous prompt history",
+                                    req.kv_hist.end().get()
+                                )));
+                            }
+                            let tok_last = tokens.token_at(id, p_last).ok_or_else(|| {
+                                werr(format!(
+                                    "token index {p_last} out of range (have {})",
+                                    tokens.token_count(id)
+                                ))
+                            })? as usize;
+                            // THE WINDOW, one slot back: the step below sees [0, p_last)
+                            // as its resident prefix and writes at p_last. The pool
+                            // bookkeeping steps back WITH the window — the step's
+                            // idempotent slot rewrite (same token, same slot) then
+                            // re-appends p_last and restores the count, keeping the
+                            // decode path's "holds exactly `start` positions" law true
+                            // at the call.
+                            req.kv_hist =
+                                scratchy_subtile::sdsc_abstract::KvHistory::contiguous(p_last);
+                            tokens.set_tokens_in_pool(id, p_last);
+                            let b_step = select_decode(&model.decode, p_last + 1);
+                            match forward_chunk(
+                                &sh,
+                                &mut model.session,
+                                b_step,
+                                model.batched_prefill.as_ref(),
+                                Chunk {
+                                    state: req,
+                                    id,
+                                    tokens,
+                                    start: p_last,
+                                    toks: &[tok_last],
+                                },
+                                ctx,
+                                pool,
+                            )? {
+                                ChunkOut::Picked(tok) => tok,
+                                // The re-pick is itself a solo k=1 step, and a solo
+                                // step now runs as ONE DEVICE WINDOW — the window's
+                                // single committed token is the pick, same contract.
+                                ChunkOut::Window(ids) => ids[0],
+                                ChunkOut::Rows(_) => {
+                                    return Err(werr(
+                                        "the re-pick step returned rows, not a device pick — \
+                                         the decode rung's lm-head does not admit the argmax \
+                                         mint and the host may not pick"
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        };
+        for &t in &ids {
+            tokens.push_generated(id, t);
+        }
+        Ok(Some(ids))
     } else {
         Ok(None)
     }

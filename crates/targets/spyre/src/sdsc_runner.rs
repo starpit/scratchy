@@ -599,6 +599,45 @@ impl SuperDscSession {
         )
     }
 
+    /// ⭐⭐⭐⭐⭐ OPEN A DECODE WINDOW of `k` steps (#603 PR3b) — the runner door over
+    /// [`Executor::window_begin`](crate::superdsc_exec::Executor::window_begin), whose
+    /// own doc is the contract. `stick` is the argmax rung's idx stick (the wiring's
+    /// `argmax_row_feedback` pair names it), `vocab` the sentinel check's own bound —
+    /// the same `geometry.vocab` the k=1 token step's `checked_picked_token` reads.
+    pub fn run_window_begin(
+        &mut self,
+        k: usize,
+        stick: crate::bundle_code::PlaceId,
+        vocab: usize,
+    ) -> Result<()> {
+        self.exec.window_begin(k, stick, vocab)
+    }
+
+    /// ⭐⭐⭐⭐⭐ ENQUEUE ONE STEP OF THE OPEN WINDOW — the runner door over
+    /// [`Executor::window_step`](crate::superdsc_exec::Executor::window_step). The
+    /// bind loop is `run_step_inner`'s OWN (`bind_activations`, the three channels),
+    /// so a window step and a k=1 step cannot drift in how their inputs land; the
+    /// exclusion of the ahead-steps' embedding row is the CALLER'S (it filters the
+    /// `EmbedRow` step off the tape before playing it — the device gather chained off
+    /// the argmax is what writes that row). No synchronize, no readback.
+    pub fn run_window_step(
+        &mut self,
+        seq_pos: usize,
+        activations: &[crate::wiring::Bind],
+        activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+    ) -> Result<()> {
+        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.exec.window_step(SeqPos(seq_pos as i64))
+    }
+
+    /// ⭐⭐⭐⭐⭐ RETIRE THE OPEN WINDOW — the runner door over
+    /// [`Executor::window_finish`](crate::superdsc_exec::Executor::window_finish):
+    /// the ONE synchronize, the k sentinel-checked words, the epilogue.
+    pub fn run_window_finish(&mut self) -> Result<Vec<u32>> {
+        self.exec.window_finish()
+    }
+
     /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
     /// bound keyed. A forward whose key equals it has nothing to bind for `id`.
     ///

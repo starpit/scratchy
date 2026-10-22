@@ -209,6 +209,65 @@ pub(crate) fn solo_step_is_decode(
     num_scheduled == 1 && num_computed >= prompt_len
 }
 
+/// ⭐⭐⭐⭐⭐ THE WORKER-SIDE HALF OF `attach_decode_window` (#603 PR3b) — whether this
+/// step's scheduled positions ride the engine's k−1 placeholders, and what this worker
+/// does with them (see [`StepWindow`]).
+///
+/// PLACEHOLDERS ARE DISTINGUISHABLE FROM DRAFTS WITHOUT A GREEDY FACT: the engine has
+/// exactly three `set_spec_token_ids` sources — the window attach (which requires
+/// `proposer.is_none()`, greedy, solo), the proposer's own planning, and MTP head
+/// drafting — and the latter two mark their requests in `draft_req_ids` BEFORE the
+/// step ships. So `n > 1` at generated positions on a request the proposer did NOT
+/// plan is a window placeholder set, k = n, and greedy is implied by the attach's own
+/// conjunct (the old base's `req.greedy` field is gone; re-deriving its fact from the
+/// engine's guard laws beats threading a new one).
+///
+/// The two facts a window's CORRECTNESS leans on, each checked here:
+/// * THE RUNG MINTS THE CHAIN (`rung_mints_the_chain`) — `argmax_row_feedback` on the
+///   rung this step's last position selects, plus an index result: the device gather
+///   that feeds each ahead-step's row and the idx stick the window pools its answers
+///   from. A rung without them cannot window and the step declines.
+/// * THE HISTORY IS THE CONTIGUOUS `[0, start)` — the window's k writes extend the
+///   history at `[start, start + k)` and its per-step mask marks exactly those columns
+///   valid (see the `prefix_src` holds law in `superdsc_forward_chunk`). A request
+///   that ever shared a batched step carries a HOLE: its keys sit past its token
+///   positions, the window's slot-vs-position identity breaks, and the step declines
+///   to k=1 — the degradation the engine's rewind algebra closes, never a corruption.
+///
+/// A declined step is still correct, just sequential: the worker runs position `start`
+/// alone, returns its one token, and the engine rewinds the k−1 it did not get.
+pub(crate) fn step_window_for(
+    n: usize,
+    start: usize,
+    prompt_len: usize,
+    proposer_planned: bool,
+    rung_mints_the_chain: bool,
+    history: &scratchy_subtile::sdsc_abstract::KvHistory,
+) -> StepWindow {
+    if n <= 1 || start < prompt_len || proposer_planned {
+        return StepWindow::None;
+    }
+    // `is_contiguous` is the history's own law ("every key at its own token
+    // position"); `end == start` adds that the window's writes extend the last
+    // run at exactly `[start, start + k)`.
+    let history_is_contiguous = history.is_contiguous() && history.end().get() as usize == start;
+    if rung_mints_the_chain && history_is_contiguous {
+        StepWindow::Take(n)
+    } else {
+        StepWindow::Decline
+    }
+}
+
+/// The rung half of [`step_window_for`]'s facts, card-only: the decode bucket this
+/// step's last position selects must carry the minted argmax chain (the
+/// `argmax_row_feedback` pair — the device-side row gather and the idx stick — and an
+/// index result, the answer re-point).
+#[cfg(feature = "spyre-hw")]
+fn rung_mints_the_chain(model: &Loaded, need: usize) -> bool {
+    let b = select_decode(&model.decode, need);
+    b.wiring.argmax_row_feedback.is_some() && b.result_is_index
+}
+
 /// CONTINUOUS BATCHING (#45) execute_model for the sendnn PAGED session. Consumes
 /// the scheduler's batched `SchedulerOutput` like the cuda/metal gpu_worker:
 ///   • PREFILL (scheduled_new_reqs + cached chunks with n>1): each request's chunk
@@ -488,7 +547,10 @@ impl Worker for SpyreWorker {
         }
 
         let mut order: Vec<String> = Vec::new();
-        let mut sampled: Vec<Option<u32>> = Vec::new();
+        // ⭐ ONE ENTRY PER REQUEST, OF THAT REQUEST'S OWN TOKENS: a plain step holds
+        // one token (or none, for an intermediate prefill chunk); a windowed step
+        // holds its k — the whole step's answer in step order (#603 PR3b).
+        let mut sampled: Vec<Option<Vec<u32>>> = Vec::new();
 
         // New requests = (chunked) prefill: register the prompt + empty KV cache.
         for nr in &scheduler_output.scheduled_new_reqs {
@@ -558,6 +620,8 @@ impl Worker for SpyreWorker {
                 input_batch,
                 start,
                 n,
+                // A new request's first step is its prompt — no window ever rides it.
+                StepWindow::None,
                 #[cfg(feature = "spyre-hw")]
                 host_now.as_slice(),
                 #[cfg(feature = "spyre-hw")]
@@ -719,6 +783,23 @@ impl Worker for SpyreWorker {
                     part,
                 },
             )?;
+            // ⭐⭐⭐⭐⭐ THE WINDOW DERIVATION (#603 PR3b) — the worker-side half of
+            // `attach_decode_window`, asked of this step's own facts: the schedule's
+            // placeholder shape, the rung this step selects, and the request's KV
+            // history. The emulator's rung fact is a constant false — the KTIR path
+            // has no window doors, so any placeholder step it could ever see declines.
+            #[cfg(feature = "spyre-hw")]
+            let minted = rung_mints_the_chain(model, start + n);
+            #[cfg(not(feature = "spyre-hw"))]
+            let minted = false;
+            let step_window = step_window_for(
+                n,
+                start,
+                input_batch.prompt_len(req_id),
+                scheduler_output.draft_req_ids.contains(req_id),
+                minted,
+                &req.kv_hist,
+            );
             let s = run_request_step(
                 model,
                 req,
@@ -726,6 +807,7 @@ impl Worker for SpyreWorker {
                 input_batch,
                 start,
                 n,
+                step_window,
                 #[cfg(feature = "spyre-hw")]
                 hosts.get(req_id).map_or(&[], |v| v.as_slice()),
                 #[cfg(feature = "spyre-hw")]
@@ -750,11 +832,23 @@ impl Worker for SpyreWorker {
         // before any zero from it was believed.
         // One sampled token per request, in processing order; intermediate
         // prefill chunks (None) carry no token.
-        let tokens: Vec<u32> = sampled.iter().map(|s| s.unwrap_or(0)).collect();
+        let tokens: Vec<u32> = sampled
+            .iter()
+            .map(|s| s.as_ref().and_then(|v| v.first().copied()).unwrap_or(0))
+            .collect();
         let mut out = ModelRunnerOutput::from_ordered(order, tokens);
         for (idx, s) in sampled.iter().enumerate() {
-            if s.is_none() {
-                out.sampled_token_ids[idx].clear();
+            match s {
+                None => out.sampled_token_ids[idx].clear(),
+                // ⭐⭐⭐⭐⭐ THE WINDOW'S k TOKENS, LANDED WHOLE (#603 PR3b): the engine's
+                // verify algebra is SHAPE-based (`num_accepted = generated.len() − 1`),
+                // so a windowed request must hand the engine its k tokens as ONE list —
+                // `from_ordered` above seats one token per request, and this overwrite
+                // replaces the windowed request's entry with the full list. The
+                // engine's kept-truncation loop then drops whatever runs past the
+                // request's finish, exactly as it does a verify step's accepted tail.
+                Some(v) if v.len() > 1 => out.sampled_token_ids[idx] = v.clone(),
+                _ => {}
             }
         }
         // ⭐ REPORT WHAT THIS STEP DID TO EVERY LIVE REQUEST'S KV — the span its blocks must cover and
@@ -815,7 +909,8 @@ impl Worker for SpyreWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::solo_step_is_decode;
+    use super::{StepWindow, solo_step_is_decode, step_window_for};
+    use scratchy_subtile::sdsc_abstract::{BatchSlot, KvHistory, SlotCount};
 
     #[test]
     fn a_one_token_slice_of_an_unfinished_prompt_is_not_a_decode_step() {
@@ -831,5 +926,66 @@ mod tests {
         assert!(solo_step_is_decode(1, 600, 500));
         // A multi-token slice is a continuation wave, never a decode step.
         assert!(!solo_step_is_decode(96, 96, 500));
+    }
+
+    /// The derivation's own contract (#603 PR3b): placeholders at generated
+    /// positions on an un-planned request become a window iff the rung mints the
+    /// chain and the history is the contiguous `[0, start)`; everything else is
+    /// either no placeholders at all or an explicit decline the engine rewinds.
+    #[test]
+    fn window_placeholders_become_a_window_only_on_a_minted_rung_and_a_contiguous_history() {
+        let prompt = 500usize;
+        // The steady shape the loop runs: k = 4 placeholders at start = 600 over
+        // the contiguous [0, 600), minted rung.
+        let hist = KvHistory::contiguous(600);
+        assert!(matches!(
+            step_window_for(4, 600, prompt, false, true, &hist),
+            StepWindow::Take(4)
+        ));
+        // No placeholders: a plain k=1 step, and a prefill chunk's n>1.
+        assert!(matches!(
+            step_window_for(1, 600, prompt, false, true, &hist),
+            StepWindow::None
+        ));
+        assert!(matches!(
+            step_window_for(4, 100, prompt, false, true, &hist),
+            StepWindow::None
+        ));
+        // The proposer planned this step's drafts — its channel, never ours.
+        assert!(matches!(
+            step_window_for(4, 600, prompt, true, true, &hist),
+            StepWindow::None
+        ));
+        // An unminted rung declines: the engine rewinds k−1 and decode stays
+        // sequential — correct, never a corruption.
+        assert!(matches!(
+            step_window_for(4, 600, prompt, false, false, &hist),
+            StepWindow::Decline
+        ));
+    }
+
+    /// A request that ever shared a batched step carries a HOLE — its keys sit
+    /// past its token positions — and the window's per-step mask law
+    /// (`[start, start+i)` valid) is exact only while slot == position. The
+    /// derivation must decline it rather than window over the divergence.
+    #[test]
+    fn a_holed_history_declines_the_window() {
+        // [0, 10) then one key appended at the shared batch slot 64: the shape
+        // every request that joined a batched step carries.
+        let mut holed = KvHistory::contiguous(10);
+        let batch_end = KvHistory::contiguous(64);
+        holed.record(
+            BatchSlot::of(std::iter::once(&batch_end)),
+            SlotCount::new(1),
+        );
+        assert!(!holed.is_contiguous());
+        assert_eq!(holed.end().get(), 65);
+        // start = 11 (the request's own token count): placeholders attached, rung
+        // minted — and still a Decline, because the window's k writes would
+        // extend at [65, 65+k) while its mask marks [11, 11+k).
+        assert!(matches!(
+            step_window_for(4, 11, 10, false, true, &holed),
+            StepWindow::Decline
+        ));
     }
 }
