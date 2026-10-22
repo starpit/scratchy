@@ -585,6 +585,11 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         // which is positional and states none. A node that states per-step inputs is placed by
         // the consumer ladder's producer (`place_step_inputs`), whose layout this is not.
         step_inputs: Default::default(),
+        // No KV block index to carry: the reservation is a whole-GRAPH fact (an `AttnDecode`
+        // node's gathered paged KV), and one Triton kernel's parameter list is not that graph —
+        // `Attn` is refused BY NAME at this crate's doors. `None` is "this bundle never
+        // gathers", which is the documented meaning, not a placeholder.
+        kv_block_index: None,
     })
 }
 

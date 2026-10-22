@@ -1397,8 +1397,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // intermediate classification of the cache ids.
     let mut scale_placed = false;
     // The KV block index's bytes when this bundle gathers — sized below beside the mask whose pass
-    // grid it shares, PLACED after every other activation (see the placement after the scale
-    // registry).
+    // grid it shares, CARRIED UNPLACED on the layout (see the comment at its hand-off below) and
+    // placed by `BundleLayout::place_kv_block_index_last` after the last host-staged activation,
+    // so a body whose gathering differs moves nothing the host stages.
     let mut kv_block_index_bytes: Option<u64> = None;
     // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
     // placements below (the pool those planes' gathers name), consumed by the gather door's
@@ -1968,30 +1969,26 @@ pub fn compute_bundle_layout<F: RopeForm>(
         seg_bytes[a] = align128(off + 2);
     }
 
-    // ⛔⛔⛔ THE KV BLOCK INDEX IS THE LAST ACTIVATION, SO ITS PRESENCE MOVES NOTHING ELSE. One session
-    // runs bodies that gather and bodies that do not — the one-request ladder's per-page bodies within
-    // one page under a split-KV chunk ceiling — and the host stages every input at the CEILING's
-    // placements, while each body's descriptors read its OWN layout. Placed where it was, beside the
-    // mask, it pushed the scale registry above down by its size: a non-gathering body read the
-    // RMSNorm epsilon out of the index's bytes (zero, or the previous long request's block numbers)
-    // and paid a separate DMA run every step for the scales the host staged out of reach. Last, the
-    // two layouts agree on every other tensor — which `ladder_stages_one_layout` holds the macro to.
-    if let Some(bibytes) = kv_block_index_bytes {
-        let a = SegRole::Activation.segment();
-        let bioff = seg_bytes[a];
-        placements.insert(
-            KV_BLOCK_INDEX_TID,
-            TensorPlacement {
-                tid: KV_BLOCK_INDEX_TID,
-                bank: 0,
-                role: SegRole::Activation,
-                segment: a,
-                offset: bioff,
-                size: bibytes,
-            },
-        );
-        seg_bytes[a] = align128(bioff + bibytes);
-    }
+    // ⛔⛔⛔ THE KV BLOCK INDEX IS NOT PLACED HERE — ITS RESERVATION IS CARRIED, AND THE WALK
+    // PLACES IT LAST OF ALL. One session runs bodies that gather and bodies that do not — the
+    // one-request ladder's per-page bodies under a split-KV chunk ceiling gather through the
+    // page table while its unchunked sweep rungs sweep the resident KV — and the host stages
+    // every input at the CEILING's placements, while each body's descriptors read its OWN
+    // layout. Placed where it was — first beside the mask, then at the tail of THIS pass —
+    // the index still sat before the two placements that come after the pass
+    // (`place_step_inputs`, `complete_program_scales`), so a body whose gathering differed
+    // pushed every step input and program scale down by its reservation (279,552 B on
+    // granite-3.1-2b) and `ladder_stages_one_layout` refused the first such rung: the ceiling
+    // staged `t1412` at 603,392 while the rung's own layout read it at 323,840. The
+    // reservation therefore rides the layout as a typed value
+    // ([`BundleLayout::kv_block_index`]), and the ONE door
+    // [`BundleLayout::place_kv_block_index_last`] — called by each walk after the last
+    // host-staged placement — puts it past every offset the guard compares, so the two
+    // layouts agree on every other tensor by construction, which is what
+    // `ladder_stages_one_layout` holds the macro to. A reservation still pending at the bake
+    // is a build panic, never a silently unplaced index.
+    let kv_block_index = kv_block_index_bytes
+        .map(|bytes| ktir_superdsc::placement::KvBlockIndexReservation { bytes });
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
@@ -2052,6 +2049,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
         // ⭐ THE HOST-STAGED STEP INPUTS — empty here (the layout walk places graph tensors and
         // pools only); `place_step_inputs` fills it after the splices state their bindings.
         step_inputs: std::collections::BTreeMap::new(),
+        // ⭐ THE KV BLOCK INDEX'S PENDING RESERVATION — unplaced by design (the comment at its
+        // derivation above); the walk's `place_kv_block_index_last` spends it after the last
+        // host-staged placement.
+        kv_block_index,
     })
 }
 
@@ -6103,7 +6104,21 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
         // job is done at mint time (bundle-unique tids, above every placement). The baked artifact
         // carries the minted RESULTS (the synth placements above), not the minter.
         inter_cursor: _,
+        // ⛔ THE PENDING KV BLOCK INDEX — SPENT OR REFUSED, never silently dropped (checked just
+        // below). The reservation is placed (or this bundle never gathered) by the time any
+        // bundle bakes; a `Some` here means a walk forgot
+        // [`BundleLayout::place_kv_block_index_last`]. The placement's PRESENCE is
+        // `BakeFacts::gathers_kv`, and a gather that finds no table reads entry 0 — a real
+        // address — so an unspent reservation is a `cargo build` panic (this runs at bake),
+        // never a silent `gathers_kv: false`.
+        kv_block_index,
     } = l;
+    assert!(
+        kv_block_index.is_none(),
+        "the KV block index reservation reached the bake unplaced — the walk forgot \
+         BundleLayout::place_kv_block_index_last, and the placement's presence is \
+         BakeFacts::gathers_kv: a gather with no table reads entry 0"
+    );
 
     let mut places: Vec<bundle::Placement> = placements
         .iter()

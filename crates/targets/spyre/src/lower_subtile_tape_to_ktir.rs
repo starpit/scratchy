@@ -1164,6 +1164,13 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
     // re-rolled walk places them ahead of its declare pass for the same reason (see
     // [`place_step_inputs`]).
     place_step_inputs(&mut bundle_layout, &[&programs], ir.tensors.len() as u32)?;
+    // ⭐⭐⭐ THE KV BLOCK INDEX GOES LAST OF ALL — after `complete_program_scales` (which ran
+    // inside `lower_graph_to_ktir`, before the step inputs) and after `place_step_inputs`,
+    // i.e. past the last host-staged placement this walk makes. Same law as the re-rolled
+    // walk's call: the index is the one activation whose presence may differ between a
+    // session's bodies, so it must move nothing the host stages. See
+    // [`BundleLayout::place_kv_block_index_last`].
+    bundle_layout.place_kv_block_index_last();
     // The four facts no KTIR states, read off the graph's own `AttnDecode` nodes and this walk's own
     // parameters — the same call `lower_subtile_tape_to_ktir`'s re-rolled walk makes.
     //
@@ -2415,6 +2422,14 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     // appends, so this walk's prefix→bodies→suffix order and `graph_wiring`'s node order
     // compute the identical registry.
     complete_program_scales(&mut bundle_layout, &step_input_lists);
+    // ⭐⭐⭐ THE KV BLOCK INDEX GOES LAST OF ALL — after the step inputs and the program-stated
+    // scales, the last host-staged placements this walk makes. One session runs bodies that
+    // gather (the chunked ceiling) and bodies that do not (the unchunked sweep rungs), and the
+    // host binds each step at the CEILING's placements — so the index, the one activation
+    // whose presence may differ, must sit past every offset `ladder_stages_one_layout`
+    // compares. See [`BundleLayout::place_kv_block_index_last`] for the law; before the
+    // declare pass, so a gathered read resolving `t{KV_BLOCK_INDEX_TID}` finds its placement.
+    bundle_layout.place_kv_block_index_last();
     // The declare pass walks prefix → EVERY body → suffix, the same order the tape walk
     // declared them in, so every synthetic's first-one-wins offset is fixed identically.
     for ops in std::iter::once(&prefix)

@@ -213,6 +213,29 @@ impl serde::Serialize for StepInputRow {
     }
 }
 
+/// ⭐⭐⭐ THE KV BLOCK INDEX, HELD UNPLACED — the ONE activation a session's bodies may
+/// legitimately disagree about, which is why its offset cannot be taken where the masks take
+/// theirs.
+///
+/// Only a gathering body reserves the index (`gathers_kv`: the batched rungs and a chunked
+/// one-request ceiling gather through the page table; an unchunked sweep rung sweeps the
+/// resident KV and needs no table), while the host binds every step at the CEILING bundle's
+/// placements — so the index's PRESENCE must move nothing the host stages.
+/// [`BundleLayout`] therefore carries the reservation as a VALUE and takes no offset for it in
+/// the placement pass; the one placement door is
+/// [`BundleLayout::place_kv_block_index_last`], which a walk must call AFTER the last
+/// host-staged placement (`place_step_inputs`, `complete_program_scales`). A reservation
+/// still pending at the bake is a `cargo build` panic, never a silently unplaced index: the
+/// placement's PRESENCE is `BakeFacts::gathers_kv`, and a gather that finds no table reads
+/// entry 0 — which is a real address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvBlockIndexReservation {
+    /// The MASK'S OWN PASS-GRID BYTES (`pmbytes`) — one derivation for both tensors: the index
+    /// rides the mask's per-pass shift, so its per-pass pitch is this over the mask's block
+    /// count and its reservation is the whole grid. There is no second spelling of this number.
+    pub bytes: u64,
+}
+
 /// The whole-bundle memory plan: every tensor → (segment, offset, size, role),
 /// plus each segment's total packed bytes. Exported as `bundle_layout.json` for
 /// the resident executor (which allocates one region per occupied segment).
@@ -400,6 +423,13 @@ pub struct BundleLayout {
     /// every bundle with no pooled tensor, keeping those byte-identical.
     #[serde(default)]
     pub gather_reach: std::collections::BTreeMap<u32, crate::sdsc_abstract::GatherReach>,
+    /// ⭐ THE KV BLOCK INDEX'S PENDING RESERVATION — carried UNPLACED out of the placement pass
+    /// ([`KvBlockIndexReservation`] states why), spent by the one door
+    /// [`BundleLayout::place_kv_block_index_last`] after the last host-staged activation has its
+    /// offset. Compile-time only: the baked artifact carries the PLACEMENT the door mints, not
+    /// the pending value.
+    #[serde(skip)]
+    pub kv_block_index: Option<KvBlockIndexReservation>,
 }
 
 /// Bump allocator for synthetic-intermediate offsets within the Intermediate
@@ -1133,6 +1163,44 @@ impl BundleLayout {
                 Ok(want)
             }
         }
+    }
+
+    /// ⭐⭐⭐ THE KV BLOCK INDEX'S ONE PLACEMENT DOOR — the LAST host-staged activation.
+    ///
+    /// ⛔ WHY A DOOR, AND WHY "LAST" IS LOAD-BEARING. One session runs bodies that gather and
+    /// bodies that do not (the one-request ladder's chunked ceiling beside its unchunked sweep
+    /// rungs), and the host binds each step at the CEILING's placements — so
+    /// `ladder_stages_one_layout` exempts exactly `KV_BLOCK_INDEX_TID` from its comparison, an
+    /// exemption that is sound ONLY if the index's presence moves nothing the guard compares.
+    /// Placed where the reservation used to sit — beside the masks, inside the placement pass —
+    /// it pushed every LATER host-staged tensor (the step inputs, then the program-stated
+    /// scales) down by its reservation (279,552 B on granite-3.1-2b), and the guard refused the
+    /// first rung whose gathering differed: the ceiling staged `t1412` at 603,392 while the
+    /// rung's own layout read it at 323,840. Called AFTER `place_step_inputs` and
+    /// `complete_program_scales`, a gathering body's index lands past every compared offset and
+    /// a non-gathering body simply has none — the exemption holds by construction, and every
+    /// gathering body of the session places its index at the SAME tail (their compared
+    /// placements agree, so their tails agree), which is the offset the host stages the table
+    /// at for all of them.
+    pub fn place_kv_block_index_last(&mut self) {
+        let Some(res) = self.kv_block_index.take() else {
+            return;
+        };
+        let seg = SegRole::Activation.segment();
+        let off = self.segment_bytes[seg];
+        let tid = crate::reserved_tids::KV_BLOCK_INDEX_TID;
+        self.placements.insert(
+            tid,
+            TensorPlacement {
+                tid,
+                bank: 0,
+                role: SegRole::Activation,
+                segment: seg,
+                offset: off,
+                size: res.bytes,
+            },
+        );
+        self.segment_bytes[seg] = align128(off + res.bytes);
     }
 }
 
