@@ -1202,6 +1202,32 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
 /// its view), and comparing its `v_rows` instead would refuse exactly the programs the band lift
 /// admits: a banded output's whole view is every core's bands, not this op's sweep. The c_len
 /// equality is unchanged — the op's width is one number every operand shares.
+///
+/// ⛔⛔⛔ THE BASIS IS THE OPERAND'S OWN FORM, NEVER THE PROGRAM-LEVEL COVER. This law was first
+/// implemented gated on `r_cover == (0, v_rows)`: a flush cover selected the whole-view basis,
+/// anything else the windowed one. That conflated two facts — the cover is the UNION of every
+/// window every trip over the parameter states, so it is flush exactly when the program's OTHER
+/// trips tile the buffer, and it says nothing about how THIS op addresses THIS operand. MEASURED
+/// on the spliced batched paged-decode attention (wall 10): the runtime length mask's four chunk
+/// trips tile `[0, 4096)` flush, each trip's add consuming its own `[1024, 64]` window at row
+/// `1024·c` — `r_len == rows == 1024`, the windowed basis's own case — while the flush cover
+/// routed it to the whole-view basis (`v_rows == 4096 != 1024`) and refused it. Every whole-view
+/// operand keeps its verdict — the two bases coincide there (`r_len == v_rows`) — so the
+/// row-blocked family (`v_rows == rows` at row 0 over per-block windows) and the seeded family
+/// stay admitted exactly as before, and the broadcast shapes both bases refuse stay refused.
+///
+/// ⭐ A PURE PREDICATE, DELIBERATELY: the law is stated as a `bool` over the `Region`'s own
+/// fields so the kani proof pins it WITHOUT the refusal path's `format!` in reach — the fmt
+/// machinery's loop forest is the grind site (MEASURED: 36 minutes in CBMC at 98.7% CPU, no
+/// verdict, killed), and a law this small should verify in seconds. The wiring — that the guard
+/// refuses exactly the operands this predicate rejects, with the message selected by the
+/// operand's form — is pinned at runtime by the guard's grid test and the wall-10 unit test.
+fn pointwise_operand_holds_sweep(x: &Region, rows: u32) -> bool {
+    let whole_view = x.r_start == 0 && x.v_rows == rows;
+    let windowed = x.r_len == rows && x.r_start + x.r_len <= x.v_rows;
+    whole_view || windowed
+}
+
 fn pointwise_extents_agree(
     name: &str,
     kind: Elementwise,
@@ -1210,13 +1236,8 @@ fn pointwise_extents_agree(
     rows: u32,
 ) -> Result<(), Error> {
     for (i, x) in ins.iter().enumerate() {
-        let row_ok = if x.r_cover == (0, x.v_rows) {
-            x.r_start == 0 && x.v_rows == rows
-        } else {
-            x.r_len == rows && x.r_start + x.r_len <= x.v_rows
-        };
-        if !row_ok || x.c_len != out.c_len {
-            if x.r_cover == (0, x.v_rows) {
+        if !pointwise_operand_holds_sweep(x, rows) || x.c_len != out.c_len {
+            if x.r_start == 0 && x.r_len == x.v_rows {
                 return err(format!(
                     "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` (view rows × window \
                      cols) but the output t{} is `[{}, {}]`, and this emitter addresses EVERY operand \
@@ -7029,6 +7050,44 @@ mod elementwise_tests {
         }
     }
 
+    /// ⭐ WALL 10's OWN SHAPE, as a unit pin: the FLUSH-COVER WINDOWED operand. The spliced
+    /// batched paged-decode attention's runtime length mask states four chunk trips over one
+    /// `[4096, 64]` view, tiling `[0, 4096)` flush — so the parameter walk's cover is the whole
+    /// view — while each trip's add consumes its OWN `[1024, 64]` window (`r_len == rows ==
+    /// 1024`, at row `1024·c`). The guard's basis is the operand's own form, never the cover,
+    /// so every trip is admitted on its window; a window that does not hold the sweep, or one
+    /// that runs past its view's end, is refused exactly as before.
+    #[test]
+    fn a_flush_cover_windowed_operand_is_admitted_on_its_own_window() {
+        let out = reg(17, 1024, 64, true);
+        let qk = reg(16, 1024, 64, false);
+        let mask = |trip: u32| {
+            let mut m = reg(9, 4096, 64, false);
+            m.r_start = 1024 * trip;
+            m.r_len = 1024;
+            // The flush union of all four trips — the fact that used to be mistaken for "the
+            // operand is addressed whole".
+            m.r_cover = (0, 4096);
+            m
+        };
+        for trip in 0..4u32 {
+            assert!(
+                pointwise_extents_agree("p", Elementwise::Add, &[qk, mask(trip)], &out, 1024)
+                    .is_ok(),
+                "trip {trip}'s [1024, 64] window at row {} holds the sweep at its own corner",
+                1024 * trip
+            );
+        }
+        // A window that does NOT hold the sweep is the broadcast shape — refused by both bases.
+        let mut short = mask(0);
+        short.r_len = 512;
+        assert!(pointwise_extents_agree("p", Elementwise::Add, &[qk, short], &out, 1024).is_err());
+        // A window past its view's end is an out-of-bounds read — refused.
+        let mut over = mask(0);
+        over.r_start = 4096 - 512;
+        assert!(pointwise_extents_agree("p", Elementwise::Add, &[qk, over], &out, 1024).is_err());
+    }
+
     /// The arity of every key, against the arithmetic the op IS. Unary functions take one operand and
     /// binary ones take two; getting this wrong makes `split_out` accept the wrong parameter count
     /// and `pointwise_tile_op` declare the wrong operand count to the LX budget.
@@ -7624,6 +7683,42 @@ mod proofs {
         let admitted =
             pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, orow).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
+    }
+
+    /// ⭐ WALL 10's LAW, over the PURE PREDICATE: an operand holds the op's row sweep by BEING
+    /// the whole view (`r_start == 0`, `v_rows == rows`) or by its OWN window (`r_len == rows`,
+    /// fitting the view) — and by NOTHING else, in particular not the cover. The cover is set to
+    /// ARBITRARY symbolic values here (not pinned flush): the wall-10 defect was a flush cover
+    /// being read as "the operand is addressed whole", so the regression pin is that NO cover
+    /// value moves the verdict. The predicate is pure comparisons — no `format!` in reach, no
+    /// maps, no products — so this is the z3 recipe's class (seconds, not minutes).
+    ///
+    /// ⛔ THE WIRING HALF IS RUNTIME, BY RULING (the law-(a) split): the guard's grid test and
+    /// the wall-10 unit test drive the REAL `pointwise_extents_agree` — message selection
+    /// included — over the real mask Regions, because the refusal path's `format!` is a
+    /// measured CBMC grind (36 min, killed) and the law does not need it to be proved.
+    #[kani::proof]
+    fn the_two_basis_sweep_law_is_cover_independent() {
+        let rows: u32 = kani::any();
+        let v_rows: u32 = kani::any();
+        let r_start: u32 = kani::any();
+        let r_len: u32 = kani::any();
+        let cover_lo: u32 = kani::any();
+        let cover_hi: u32 = kani::any();
+        kani::assume(rows >= 1 && rows <= 64);
+        kani::assume(v_rows >= 1 && v_rows <= 256);
+        kani::assume(r_len >= 1 && r_len <= 256);
+        kani::assume(r_start <= 256);
+
+        let mut x = reg(5, v_rows, 64, false);
+        x.r_start = r_start;
+        x.r_len = r_len;
+        x.r_cover = (cover_lo, cover_hi);
+        let verdict = pointwise_operand_holds_sweep(&x, rows);
+        // The two bases, stated as the disjunction the law names — and NOTHING else.
+        let whole_view = r_start == 0 && v_rows == rows;
+        let windowed = r_len == rows && r_start + r_len <= v_rows;
+        assert_eq!(verdict, whole_view || windowed);
     }
 }
 
