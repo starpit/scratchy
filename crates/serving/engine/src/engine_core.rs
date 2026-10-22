@@ -3012,6 +3012,7 @@ mod tests {
         fn determine_available_memory(&mut self) -> EngineResult<Vec<usize>> {
             Ok(vec![8 << 30])
         }
+        fn set_stop_token_ids(&mut self, _stop_token_ids: &[u32]) {}
         fn shutdown(&mut self) {}
     }
 
