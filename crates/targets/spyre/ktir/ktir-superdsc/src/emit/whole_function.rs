@@ -53,6 +53,7 @@ use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceAxes, ReduceKind};
 // parallel one that would have to be mapped across the boundary.
 use super::lower_ktir_to_superdsc::BcastAxis;
 use crate::placement::BundleLayout;
+use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -3967,6 +3968,9 @@ pub fn lower_function(
                 c_cover: (0, dims[1]),
                 is_out: true,
                 is_fp8: false,
+                // The island commit (wall 13) mints the value's OWN df here; every intermediate
+                // is fp16 until then, byte-identical to the pre-wall-13 mint (`Region::df`'s law).
+                df: Df::Fp16,
             };
             inter.insert(res, r);
             per_op.push(r);
@@ -4565,6 +4569,7 @@ fn gathered_matmul_materializes(
             c_cover: (0, stick),
             is_out: true,
             is_fp8: false,
+            df: Df::Fp16,
         };
         let inter_name = r.name();
         let copies = super::batched_gathered::copy_opspecs(
@@ -4675,6 +4680,7 @@ fn gathered_matmul_materializes(
         c_cover: (0, head),
         is_out: true,
         is_fp8: false,
+        df: Df::Fp16,
     };
     // ── (3) THE GATHERED IDENTITY COPY — the `test_gather_1core` shape, through the one body
     // that declares an index operand. One input (the table), `identity`, the intermediate as
@@ -5305,6 +5311,7 @@ mod presented_flat_tests {
             c_cover: (0, cols),
             is_out: false,
             is_fp8: false,
+            df: Df::Fp16,
         }
     }
 

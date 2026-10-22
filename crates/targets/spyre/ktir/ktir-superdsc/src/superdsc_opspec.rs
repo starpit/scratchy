@@ -350,6 +350,19 @@ impl Df {
             Df::SenUint32 => <SenUint32 as DataFormat>::ELEMS_PER_STICK,
         }
     }
+    /// The format's own name — the same constant [`StickExtent::new`]'s refusal text states —
+    /// for a refusal that names the basis it measured against (wall 13: the sub-stick verdict
+    /// is meaningless until the survivor count is read against the DATA's own stick).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Df::Fp16 => <Fp16 as DataFormat>::NAME,
+            Df::Fp32 => <Fp32 as DataFormat>::NAME,
+            Df::Fp8 => <Fp8 as DataFormat>::NAME,
+            Df::SenInt8 => <SenInt8 as DataFormat>::NAME,
+            Df::Bf16 => <Fp16 as DataFormat>::NAME,
+            Df::SenUint32 => <SenUint32 as DataFormat>::NAME,
+        }
+    }
     /// Bytes per element (`wordLength`) — from the type-level [`DataFormat`] impl.
     pub const fn word_length(self) -> u32 {
         match self {

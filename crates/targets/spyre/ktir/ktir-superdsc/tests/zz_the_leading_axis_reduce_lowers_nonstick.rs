@@ -437,6 +437,40 @@ fn a_sub_stick_survivor_refuses_by_name() {
     );
 }
 
+/// ⭐ THE BATCH BOUNDARY (wall 13's other side): the SAME merge shape family one batch wider —
+/// `[16, 16, 4]` reduced over dims `[0]` to `[16, 4]`, 64 survivor lanes = exactly ONE whole
+/// stick — LOWERS through the wall-12 arm. This is the B=2 decode merge (survivors
+/// `B·NKVH·GQA = 64`; J = `32/B` = 16), the smallest survivor set the arm accepts, pinned beside
+/// the 32-lane B=1 refusal above so the boundary is a test failure on either side of it: the
+/// sub-stick refusal is wall 13's, and everything from one stick up was wall 12's to lower.
+#[test]
+fn a_one_stick_survivor_set_lowers_at_the_batch_boundary() {
+    let k = leading_axis_case((256, 4), &[16, 16, 4], &[0], (16, 4), OpKind::ArithAddf);
+    let ops = lowered(&k, 1024).unwrap_or_else(|e| {
+        panic!("the one-stick survivor merge (B=2's m/l shape) must lower, refused: {e}")
+    });
+    let [red] = &ops[..] else {
+        panic!("the slice is ONE op, got {} ops", ops.len())
+    };
+    // The geometry the door derived from the op's own numels: 1024 in, 64 out, reduced 16 —
+    // the flat frame is the SAME `[256, 4]` the refused B=1 case threads, so only the numels
+    // moved, which is the wall-11 frame-invariance law this boundary pins from the lowering side.
+    assert_eq!(dsc(red).N_.out_, 16, "the reduced extent (J = 32/B at B=2)");
+    assert_eq!(dsc(red).N_.y_, 64, "the survivor lanes (one whole stick)");
+    let j = op_json(red);
+    let c = compute_op(&j);
+    assert_eq!(
+        c["opFuncName"], "sumnonstick",
+        "the one-stick survivor set takes the nonstick form, not a new one"
+    );
+    let body = j["dscs_"][0].as_object().unwrap().values().next().unwrap();
+    let masking = serde_json::to_string(&body["coordinateMasking_"]).unwrap_or_default();
+    assert!(
+        masking == "null" || masking == "{}",
+        "an exact one-stick product has no pad lane (got {masking})"
+    );
+}
+
 /// ⛔ NO-DRIFT (refusal): a MIDDLE-axis reduce (`[32, 32, 64]` reducing dims `[1]`, a wide
 /// output) keeps the row-reduce body's own refusal VERBATIM — the leading-prefix arm did not
 /// move a byte of the path every other block takes.

@@ -10,7 +10,7 @@ use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{BlockCols, KindTag, RowCount, StickKind, Stk};
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, DataFormat, Df, Fp16, Fp32, MAX_CORES, MaxCores, OpFunc, OpInfo,
-    OpSpec, Role, SamvCoordinateMask, Scale, SdscFoldSet, TensorArg,
+    OpSpec, Role, SamvCoordinateMask, Scale, SdscFoldSet, TensorArg, assert_df_stick_multiple,
 };
 use crate::work::distribute_cores;
 
@@ -578,6 +578,28 @@ pub fn assemble_reduce_seeded<D: KindTag, A: KindTag>(
 ///   (`sdsc_maxnonstick.json:775`), and this crate's wire emission derives the empty interim
 ///   list from the operand list the same way it does for `sum`/`max`.
 ///
+/// # ⭐⭐⭐⭐⭐ WALL 13 — THE FP32 TWIN (the df-true stick basis)
+///
+/// The whole typed surface above is df-parameterized: at `Df::Fp32` the survivor stick is 32
+/// lanes (a 128-byte stick is 64 f16 lanes OR 32 f32 lanes), the dims/`TileOp`/operand
+/// `dataFormat`s carry IEEE_FP32, and the op rides the vendor's OWN fp32 nonstick family —
+/// `summeanmaxexx2_fp32.ddl` binds `sumnonstick` (`:40`), `meannonstick` (`:43`),
+/// `maxnonstick` (`:46`), `minnonstick` (`:49`), `absmaxnonstick` (`:55`), `prodnonstick`
+/// (`:57`) at `%type_fp32`, on the SAME nonstick layouts as the f16 template (only the type
+/// differs; the dataflow reads the nonstick input through the same lxlu→sfp transfer, `:232-248`).
+/// This is the online-softmax `m`/`l` merge's own geometry: 32 survivors = EXACTLY one whole
+/// fp32 stick at B=1 (`S = B·NKVH·GQA = 32·B`, whole sticks at every admissible batch width),
+/// with the merge input f32 in the kernel itself (`m` is `tl.float32`; the f16 cast is after
+/// the merge) — ZERO data movement, the `[J,32]` f32 row-major IS the nonstick layout.
+///
+/// ⛔ NO `row_blocked` on the fp32 NONSTICK form (the addendum law, vendor-verified): the fp32
+/// template's nonstick binds are layout-identical to the f16 family's — `row_blocked` is a
+/// property of the fp32 STICK form only (`reduce_opspec_df`'s `with_row_blocked`). The scaling
+/// const DOES follow the fp32 law: the const's element type MUST match the op's data_format
+/// (the reduce.rs:400-405 law — a SEN169_FP16 const feeding an fp32 op is a MIXED [fp16,fp32]
+/// op → DD2 "Unsupported result precision conversion"), so the fp32 nonstick ships
+/// `OpInfo::ReduceScalingFp32` with raw IEEE_FP32 bits, exactly as the fp32 stick form does.
+///
 /// # TRAP (e) — WHY THIS CANNOT REPRODUCE THE OLD HAND-WRITTEN CARD FAILURE
 ///
 /// `attn.rs:2771-2790` records a prior hand-written `maxnonstick` that failed on card
@@ -606,13 +628,15 @@ pub fn reduce_nonstick_opspec(
     op: OpFunc,
     reduced_rows: u32,
     survivor_cols: u32,
+    df: Df,
     data_name: &str,
     accum_name: &str,
 ) -> Result<OpSpec, String> {
-    // The survivor width is a whole fp16 stick BY CONSTRUCTION (the door's `nonstick_geometry`
-    // law admits nothing else); `StickExtent` re-states it through the SAME typed constructor
-    // the spatial split uses, so a direct caller cannot smuggle a sub-stick width past this fn.
-    let survivor_stick = crate::superdsc_opspec::StickExtent::<Fp16>::new(survivor_cols)
+    // The survivor width is a whole stick AT THE DATA'S OWN df BY CONSTRUCTION (the door's
+    // `nonstick_geometry` law, df-parameterized since wall 13, admits nothing else);
+    // `assert_df_stick_multiple` re-states it through the SAME typed df-dispatched witness the
+    // spatial split uses, so a direct caller cannot smuggle a sub-stick width past this fn.
+    assert_df_stick_multiple(survivor_cols, df)
         .map_err(|e| format!("reduce `{accum_name}` (nonstick): {e}"))?;
     let dims = vec![
         crate::superdsc_opspec::ItDim {
@@ -620,20 +644,20 @@ pub fn reduce_nonstick_opspec(
             size: reduced_rows,
             is_reduction: true,
             is_stick: false,
-            df: Df::Fp16,
+            df,
         },
         crate::superdsc_opspec::ItDim {
             name: "y",
-            size: survivor_stick.elems(),
+            size: survivor_cols,
             is_reduction: false,
             is_stick: true,
-            df: Df::Fp16,
+            df,
         },
     ];
     let tile_op = TileOp {
         kind: TileOpKind::NonstickReduce,
         dims: dims.clone(),
-        df: Df::Fp16,
+        df,
     };
     let tiled = tile_op
         .tile(MaxCores::<MAX_CORES>, distribute_cores, "out")
@@ -651,7 +675,11 @@ pub fn reduce_nonstick_opspec(
             "y",
             Allocation::Hbm,
         )
-        .map_err(|e| e.0)?,
+        .map_err(|e| e.0)?
+        // The operand's OWN df — at Fp32 the stick is 32 lanes, wordLength 4, dataFormat
+        // IEEE_FP32 (the same per-operand law `reduce_opspec_df` states; NO row_blocked here,
+        // the nonstick form's own law in this doc's wall-13 section).
+        .with_df(df),
     );
     let accum = AnyTensorArg::R2(
         TensorArg::<2>::new(
@@ -666,15 +694,23 @@ pub fn reduce_nonstick_opspec(
             "y",
             Allocation::Hbm,
         )
-        .map_err(|e| e.0)?,
+        .map_err(|e| e.0)?
+        .with_df(df),
     );
     let args = vec![data, accum];
     let tiled_symbols = time_tile.map(|t| vec![t.dim()]).unwrap_or_default();
     // The stick form's own sum/max const: `scaling_factor` at 1.0. The DDL gates the scaling
     // transfer on the MEAN branch only (`summeanmaxexx2.ddl:133-137`), so sum/max never read
     // it — the stick form ships this exact `OpInfo` card-proven (PR #813's five `tt.reduce`
-    // maxima), and the nonstick binds ride the same family machinery.
-    let op_info = OpInfo::ReduceScaling(sen169_bits(1.0f32) as u32);
+    // maxima), and the nonstick binds ride the same family machinery. At Fp32 the const is
+    // IEEE_FP32 bits (the reduce.rs:400-405 law in this file: the const's element type MUST
+    // match the op's data_format, else the op is MIXED [fp16,fp32] → DD2 "Unsupported result
+    // precision conversion").
+    let op_info = if matches!(df, Df::Fp32) {
+        OpInfo::ReduceScalingFp32(1.0f32.to_bits())
+    } else {
+        OpInfo::ReduceScaling(sen169_bits(1.0f32) as u32)
+    };
     Ok(OpSpec {
         op,
         is_reduction: true,
@@ -701,6 +737,7 @@ pub fn assemble_reduce_nonstick<D: KindTag, A: KindTag>(
     op_func: &'static str,
     reduced_rows: u32,
     survivor_cols: u32,
+    df: Df,
     data: &Stk<D>,
     accum: &Stk<A>,
     sym_id_base: &mut i64,
@@ -730,6 +767,7 @@ pub fn assemble_reduce_nonstick<D: KindTag, A: KindTag>(
         op_func_from_str(op_func),
         reduced_rows,
         survivor_cols,
+        df,
         data.name(),
         accum.name(),
     )

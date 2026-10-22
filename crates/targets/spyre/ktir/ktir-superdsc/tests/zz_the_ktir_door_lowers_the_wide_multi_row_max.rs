@@ -21,6 +21,7 @@
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, reduce};
 use ktir_superdsc::ktir_node::{ReduceAxes, ReduceKind};
+use ktir_superdsc::superdsc_opspec::Df;
 
 /// The historical cell's shape family: 4 query-head rows × a 512-wide score row (8 sticks).
 const ROWS: u32 = 4;
@@ -39,6 +40,9 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
         c_cover: (0, cols),
         is_out,
         is_fp8: false,
+        // Wall 13's f32 rows live in their own door file; every shape here is the f16
+        // emission's own control, byte-identical to the pre-wall-13 basis.
+        df: Df::Fp16,
     }
 }
 

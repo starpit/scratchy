@@ -150,6 +150,17 @@ pub struct Region {
     /// ⭐ THE fp8-NESS IS A VIEW FACT, not an arity guess: the fp8 matmul builds its weight
     /// through `view_fp8`, which writes `Dtype = Fp8E4m3` on the `ktdp.construct_memory_view`.
     pub is_fp8: bool,
+    /// ⭐⭐⭐⭐⭐ WALL 13 — THE STICK BASIS IS THE DATA'S OWN `Df`. A physical stick is 128 bytes:
+    /// 64 `Fp16` lanes, 32 `Fp32` lanes, 128 `Fp8` lanes (`DataFormat::ELEMS_PER_STICK`). The
+    /// nonstick arm's sub-stick question — "are the survivors a whole stick?" — is meaningless
+    /// until the basis is named, and the only honest basis is the one the region's own data
+    /// states: the online-softmax `m`/`l` merges carry 32 survivors, HALF an fp16 stick but
+    /// EXACTLY one whole fp32 stick (`summeanmaxexx2_fp32.ddl` binds the full nonstick family at
+    /// IEEE_FP32), and the f32-ness is the kernel's own statement (`m` is `tl.float32`, the f16
+    /// cast is after the merge). Until the walk threads each region's true element type into
+    /// this field (wall 13's island commit), every region mints `Df::Fp16` — the classification
+    /// of every f16 region is byte-identical to the pre-wall-13 basis hardcode.
+    pub df: Df,
 }
 
 impl Region {
@@ -827,6 +838,10 @@ pub fn regions(k: &KtirNode) -> Result<Vec<Region>, Error> {
             c_cover,
             is_out,
             is_fp8,
+            // WALL 13's walk-side threading is the island commit's own work; every parameter
+            // region mints the fp16 basis until then, so the door's classification of every
+            // f16 parameter is byte-identical to the pre-wall-13 hardcode (`Region::df`'s doc).
+            df: Df::Fp16,
         });
     }
     Ok(out)
@@ -6217,6 +6232,7 @@ mod elementwise_tests {
             c_cover: (0, cols),
             is_out,
             is_fp8: false,
+            df: Df::Fp16,
         }
     }
 
@@ -6497,6 +6513,7 @@ mod elementwise_tests {
                 c_cover: (0, 64),
                 is_out: false,
                 is_fp8: false,
+                df: Df::Fp16,
             },
             reg(7, 32, 64, true),
         ];
@@ -7138,6 +7155,7 @@ mod elementwise_tests {
             c_cover: (c_start, c_start + c_len),
             is_out,
             is_fp8: false,
+            df: Df::Fp16,
         }
     }
 
@@ -7639,6 +7657,7 @@ mod proofs {
             c_cover: (0, cols),
             is_out,
             is_fp8: false,
+            df: Df::Fp16,
         }
     }
 
@@ -7875,12 +7894,17 @@ mod proofs {
         true
     }
 
-    /// ⭐ WALL 12's GEOMETRY LAW, over the PURE PREDICATE: the nonstick arm fires EXACTLY on
-    /// `out_numel` dividing `in_numel`, a reduced extent of at least 2, and a whole-stick
-    /// survivor width — and the firing geometry carries the BYTE LAW as arithmetic: the product
-    /// is `in_numel` EXACTLY (no padding hides in it), every `(reduced, survivor)` pair maps to
-    /// a distinct flat offset inside the tensor, and the map is `reduced · survivor_cols +
-    /// survivor` — survivors stride 1, the nonstick data law.
+    /// ⭐ WALL 12's GEOMETRY LAW (WALL 13: df-parameterized), over the PURE PREDICATE: the
+    /// nonstick arm fires EXACTLY on `out_numel` dividing `in_numel`, a reduced extent of at
+    /// least 2, and a whole-stick survivor width AT THE DATA'S OWN `df` — and the firing
+    /// geometry carries the BYTE LAW as arithmetic: the product is `in_numel` EXACTLY (no
+    /// padding hides in it), every `(reduced, survivor)` pair maps to a distinct flat offset
+    /// inside the tensor, and the map is `reduced · survivor_cols + survivor` — survivors
+    /// stride 1, the nonstick data law. The `df` is SYMBOLIC over the two bases the reduce
+    /// family's DDLs bind (`Fp16` 64 lanes, `Fp32` 32 lanes — `summeanmaxexx2.ddl` /
+    /// `summeanmaxexx2_fp32.ddl`), so the proof pins that the basis is the data's own and not
+    /// a knob: the SAME numels fire at one df and refuse sub-stick at the other, exactly as
+    /// the boundary pin's f32/f16 pair states at runtime.
     ///
     /// ⛔ SECONDS-CLASS OR NOTHING (the same user law as the axes harness): the universe is
     /// bounded at 4096 so the two symbolic-operand `%`/`/` stay in the solver's cheap range —
@@ -7891,18 +7915,20 @@ mod proofs {
     fn the_nonstick_geometry_fires_exactly_on_the_divisible_stick_facts() {
         let in_numel: u64 = kani::any();
         let out_numel: u64 = kani::any();
+        let is_fp32: bool = kani::any();
         kani::assume(in_numel >= 1 && in_numel <= 4096);
         kani::assume(out_numel <= 4096);
+        let df = if is_fp32 { Df::Fp32 } else { Df::Fp16 };
 
-        let verdict = nonstick_geometry(in_numel, out_numel);
+        let verdict = nonstick_geometry(in_numel, out_numel, df);
 
-        // The spec mirror, stated as the law names it.
+        // The spec mirror, stated as the law names it — the stick basis is the data's own df.
         let divisible = out_numel >= 1 && in_numel % out_numel == 0;
         let expect = if !divisible {
             NonstickGeometry::Indivisible
         } else if in_numel == out_numel {
             NonstickGeometry::RemovesNothing
-        } else if out_numel % Df::Fp16.elems_per_stick() as u64 != 0 {
+        } else if out_numel % df.elems_per_stick() as u64 != 0 {
             NonstickGeometry::SubStick(out_numel as u32)
         } else {
             NonstickGeometry::Lowers((in_numel / out_numel) as u32, out_numel as u32)
@@ -9210,20 +9236,27 @@ pub(crate) fn reduce_axis_block(dims: &[i64], in_rank: u32) -> ReduceAxisBlock {
 /// (the data's and the output's, both frame-invariant: a region's `r_len · c_len` is its true
 /// element count whatever frame the walk threaded). PURE; the door derives everything below
 /// from these two numbers and never from the threaded `[rows, 1]` family frame (wall 11's law).
+/// WALL 13 added the third input: the DATA's OWN `df` — a stick is 128 bytes, so the survivor
+/// count is measured against the data's own lanes-per-stick (`Fp16` 64, `Fp32` 32), never a
+/// hardwired width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NonstickGeometry {
     /// The arm fires: `(reduced_rows, survivor_cols)` with `reduced_rows ≥ 2`,
-    /// `survivor_cols` a whole fp16 stick, and `reduced_rows · survivor_cols == in_numel`
-    /// EXACTLY — the byte law the descriptor's window and the DDL's lane roles both state.
+    /// `survivor_cols` a whole stick AT THE DATA'S OWN `df`, and
+    /// `reduced_rows · survivor_cols == in_numel` EXACTLY — the byte law the descriptor's
+    /// window and the DDL's lane roles both state.
     Lowers(u32, u32),
-    /// The survivors are SUB-STICK — fewer lanes than one stick. The physical stick would have
-    /// to span `[a_lo × survivor]` (TWO dims), which no `ItDim` table states (one `is_stick`
-    /// dim), and SAMV-padding the survivor dim up to a stick RE-LAYOUTS the bytes
-    /// (`a·64+s ≠ a·32+s`) — movement, which the kernel's contract forbids. WALL 13's open
-    /// case: the online-softmax `m`/`l` merges (`[32,8,4]→[8,4]`, 32 survivor lanes = half a
-    /// stick). The DDL's own governing lines are the subchunk datastage cap over the REDUCE dims
-    /// (`summeanmaxexx2.ddl:94`, max=64) and the above/below-interleave constraint over the
-    /// OUTER dims (`:95`, ∈ {1,2,4}).
+    /// The survivors are SUB-STICK at the data's own `df` — fewer lanes than one stick. The
+    /// physical stick would have to span `[a_lo × survivor]` (TWO dims), which no `ItDim`
+    /// table states (one `is_stick` dim), and SAMV-padding the survivor dim up to a stick
+    /// RE-LAYOUTS the bytes (`a·stick+s ≠ a·survivor+s`) — movement, which the kernel's
+    /// contract forbids. ⭐ WALL 13's RESOLUTION: the online-softmax `m`/`l` merges
+    /// (`[J,32]→[32]` at B=1) classified here only while the basis was the hardcoded fp16
+    /// stick — at the data's own `Fp32` basis, 32 survivors are EXACTLY one whole stick and
+    /// the arm fires (the merge input `m` is f32 in the kernel, `summeanmaxexx2_fp32.ddl`
+    /// binds the full nonstick family at IEEE_FP32). The DDL's own governing lines are the
+    /// subchunk datastage cap over the REDUCE dims (`summeanmaxexx2.ddl:94`, max=64) and the
+    /// above/below-interleave constraint over the OUTER dims (`:95`, ∈ {1,2,4}).
     SubStick(u32),
     /// The reduced extent is 1 — the op removes nothing (`in_numel == out_numel`). Today's
     /// row-reduce path owns that shape wherever its guards pass it; the no-drift law keeps it
@@ -9236,8 +9269,8 @@ pub(crate) enum NonstickGeometry {
 
 /// The geometry a leading-prefix reduce states, or why the nonstick arm does not fire. See
 /// [`NonstickGeometry`] for the law; the Kani proof below pins the firing conditions and the
-/// product law exactly.
-pub(crate) fn nonstick_geometry(in_numel: u64, out_numel: u64) -> NonstickGeometry {
+/// product law exactly — df-parameterized, so the basis is the data's own, not a knob.
+pub(crate) fn nonstick_geometry(in_numel: u64, out_numel: u64, df: Df) -> NonstickGeometry {
     if out_numel == 0
         || !in_numel.is_multiple_of(out_numel)
         || in_numel > u32::MAX as u64
@@ -9250,9 +9283,12 @@ pub(crate) fn nonstick_geometry(in_numel: u64, out_numel: u64) -> NonstickGeomet
     if reduced_rows == 1 {
         return NonstickGeometry::RemovesNothing;
     }
-    // The stick basis is TYPED — `Df::elems_per_stick`, the same basis `stick_basis` derives for
-    // the tiler (superdsc_opspec.rs:1259) — never a literal width.
-    if !survivor_cols.is_multiple_of(Df::Fp16.elems_per_stick() as u64) {
+    // The stick basis is TYPED — the DATA's OWN `Df::elems_per_stick`, the same basis
+    // `stick_basis` derives for the tiler (superdsc_opspec.rs:1259) — never a hardwired width:
+    // an f32 tensor's 32 survivors are ONE whole stick of its own format, sub-stick only
+    // against a foreign 64-lane basis (wall 13's law; f16 data keeps the fp16 basis and its
+    // classification is byte-identical to the pre-wall-13 hardcode).
+    if !survivor_cols.is_multiple_of(df.elems_per_stick() as u64) {
         return NonstickGeometry::SubStick(survivor_cols as u32);
     }
     NonstickGeometry::Lowers(reduced_rows as u32, survivor_cols as u32)
@@ -9340,7 +9376,8 @@ pub fn reduce(
     ) {
         let in_numel = rows as u64 * cols as u64;
         let out_numel = out.r_len as u64 * out.c_len as u64;
-        match nonstick_geometry(in_numel, out_numel) {
+        // WALL 13: the basis is the DATA's own df (Region::df's law) — never a hardwired width.
+        match nonstick_geometry(in_numel, out_numel, data.df) {
             NonstickGeometry::Lowers(reduced_rows, survivor_cols) => {
                 // The nonstick descriptor: survivors are the lanes, the accumulator is the
                 // survivor vector. The handles carry the regions' OWN frame dims — the
@@ -9354,6 +9391,7 @@ pub fn reduce(
                         op_func,
                         reduced_rows,
                         survivor_cols,
+                        data.df,
                         &rb(&data.name(), rows, cols),
                         &rb(&out.name(), out.r_len, out.c_len),
                         sym_id_base,
@@ -9362,23 +9400,27 @@ pub fn reduce(
                 ]);
             }
             NonstickGeometry::SubStick(survivor_cols) => {
-                // WALL 13's named refusal — claiming only OUR side's certain fact: this
-                // vocabulary states ONE `is_stick` ItDim, and a physical stick spanning the
-                // survivors plus their row groups would be TWO logical dims in one stick
-                // (`a·stick + s ≠ a·survivor + s` re-layouts the bytes). Whether the vendor
-                // vocabulary can state a compound stick is wall-13 investigation, not cited
-                // here. The DDL's own governing lines for that investigation: the subchunk
-                // datastage cap over the REDUCE dims (`summeanmaxexx2.ddl:94`, max=64) and the
-                // above/below-interleave constraint over the OUTER dims (`:95`, ∈ {1,2,4}).
-                let eps = Df::Fp16.elems_per_stick() as u64;
+                // The named refusal, at the DATA's OWN basis: this vocabulary states ONE
+                // `is_stick` ItDim, and a physical stick spanning the survivors plus their row
+                // groups would be TWO logical dims in one stick (`a·stick + s ≠ a·survivor + s`
+                // re-layouts the bytes). WALL 13's resolution lives one fact earlier — if the
+                // data is f32, its own stick is 32 lanes and 32 survivors are ONE WHOLE STICK
+                // (`summeanmaxexx2_fp32.ddl` carries the full nonstick family at IEEE_FP32),
+                // so a 32-survivor refusal here names an fp16 (or narrower-basis) tensor: the
+                // fix is the data's true df in `Region::df`, not a wider vocabulary. The DDL's
+                // own governing lines for any residual case: the subchunk datastage cap over
+                // the REDUCE dims (`summeanmaxexx2.ddl:94`, max=64) and the above/below-
+                // interleave constraint over the OUTER dims (`:95`, ∈ {1,2,4}).
+                let eps = data.df.elems_per_stick() as u64;
                 return err(format!(
                     "{name}: the reduce's output t{} is `[{}, {}]` — a leading-axis reduce with \
-                     {survivor_cols} survivor lanes, SUB-STICK (the fp16 stick is {eps} lanes). A \
-                     physical stick spanning the survivors and their row groups would be TWO \
-                     logical dims in one stick, which this vocabulary's one `is_stick` dim cannot \
-                     state, and padding the survivors up to a stick re-layouts the bytes \
-                     (`a·{eps}+s ≠ a·{survivor_cols}+s`) — movement the op's contract forbids.",
-                    out.tid, out.r_len, out.c_len
+                     {survivor_cols} survivor lanes, SUB-STICK at the data's own format (a {} \
+                     stick is {eps} lanes). A physical stick spanning the survivors and their \
+                     row groups would be TWO logical dims in one stick, which this vocabulary's \
+                     one `is_stick` dim cannot state, and padding the survivors up to a stick \
+                     re-layouts the bytes (`a·{eps}+s ≠ a·{survivor_cols}+s`) — movement the \
+                     op's contract forbids.",
+                    out.tid, out.r_len, out.c_len, data.df.name()
                 ));
             }
             NonstickGeometry::Indivisible => {
