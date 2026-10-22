@@ -1668,9 +1668,20 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 let layers = kv_layers;
                 let page_bytes = pool.layer_stride() as u64 * 2 * layers;
                 let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
-                // The fold family's region states the SAME ceiling: recorded here, beside its one
-                // derivation, so the walk reads it off the layout instead of re-deriving it.
-                paged_fold_region_pages = Some(max_pages.min(u32::MAX as u64) as u32);
+                // ⭐ THE FOLD FAMILY'S REGION — the SAME ceiling, bounded by the pool THIS graph
+                // laid. `max_pages` is the DEVICE-side bound (one flex region over this bundle's
+                // page bytes — the number the mask reservation above keeps, covering every pool a
+                // card could budget); the fold's region is a REACH fact: its tables and mask are
+                // walked one page per pass by entries that gather from THIS pool, and no context
+                // can out-reach the pool's own rows (the cache tensor's row extent, `cap`). The
+                // min is belt-and-braces in the direction that cannot strand a context: a pool
+                // larger than one region cannot be placed, so `cap <= max_pages` in every baked
+                // bundle, and a smaller pool (this 256-page one against the 546-page device
+                // ceiling) takes its own page count as the region — the fold's plane descriptors
+                // state the region, and a region past the pool's placements sweeps past them
+                // (the splice refuses exactly that).
+                paged_fold_region_pages =
+                    Some(max_pages.min(u64::from(cap)).max(1) as u32);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
                 // separate requests and each carries its own history. The multiplier is the op row
                 // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.

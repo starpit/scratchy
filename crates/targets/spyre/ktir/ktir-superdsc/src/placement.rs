@@ -430,11 +430,12 @@ pub struct BundleLayout {
     /// the pending value.
     #[serde(skip)]
     pub kv_block_index: Option<KvBlockIndexReservation>,
-    /// ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — the ONE `max_pages` derivation (a pool is a
-    /// single flex region, so the ceiling is the device's own cap over this bundle's page
-    /// bytes), recorded where the prefix mask's pass grid is sized and read by the tape walk
-    /// to state the region the fold family's tables and mask describe. `None` for a bundle
-    /// with no attention — and for every bundle baked before the field existed.
+    /// ⭐ THE PAGED-FOLD REGION'S PAGE CEILING — the ONE derivation, recorded where the prefix
+    /// mask's pass grid is sized: the device's own cap over this bundle's page bytes (a pool is
+    /// a single flex region) BOUNDED BY the pool this graph actually laid (its cache tensor's
+    /// row extent — a reach fact: no context can out-reach the pool its entries gather). Read
+    /// by the tape walk to state the region the fold family's tables and mask describe. `None`
+    /// for a bundle with no attention — and for every bundle baked before the field existed.
     #[serde(default)]
     pub paged_fold_region_pages: Option<u32>,
 }
