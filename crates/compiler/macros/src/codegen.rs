@@ -9086,6 +9086,14 @@ fn emit_superdsc_wiring(
     // The worker's own walk, run here: find each node that reads the mask, and
     // take the prefix-K/V args plus the argument positionally after each as the
     // new-K/new-V outputs.
+    //
+    // ⭐ THE K-SIDE ARG MAY BE THE RESERVED Kᵀ PLANE. A spliced attention binds its score
+    // gather to `kct_resident_tid(k)` — the naming law, the SAME expression the door's write
+    // tail and main's card-proven reader spell — and that reserved tid is not itself a
+    // PrefixK source. The scan resolves it BACK to the PrefixK source it names, so the layer
+    // and the prefix-K bind stay the wiring's own facts; without this map the scan drops
+    // every layer of a spliced attention and the completeness lock below refuses the bake —
+    // the lock doing its job on a wiring it could no longer read.
     let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
@@ -9097,6 +9105,23 @@ fn emit_superdsc_wiring(
                 _ => None,
             })
             .collect();
+        let pk_kt: std::collections::HashMap<u32, (u32, u64)> = pk
+            .iter()
+            .map(|(&src, &layer)| {
+                (
+                    scratchy_target_spyre::ktir_superdsc::reserved_tids::kct_resident_tid(src),
+                    (src, layer),
+                )
+            })
+            .collect();
+        // Which layer's K plane `a` names: the PrefixK source itself, or the reserved Kᵀ
+        // plane keyed on it. A real source always wins — the reserved regions sit far past
+        // `num_sources`, so the two never collide.
+        let k_plane_of = |a: u32| -> Option<(u32, u64)> {
+            pk.get(&a)
+                .map(|&l| (a, l))
+                .or_else(|| pk_kt.get(&a).copied())
+        };
         let pv: std::collections::HashSet<u32> = lwd
             .bindings
             .iter()
@@ -9113,9 +9138,9 @@ fn emit_superdsc_wiring(
             let (mut layer, mut k_src, mut new_k) = (None, None, None);
             let (mut v_src, mut new_v) = (None, None);
             for (i, a) in node.args.iter().map(|a| *a as u32).enumerate() {
-                if let Some(&l) = pk.get(&a) {
+                if let Some((ks, l)) = k_plane_of(a) {
                     layer = Some(l);
-                    k_src = Some(a);
+                    k_src = Some(ks);
                     new_k = node.args.get(i + 1).map(|x| *x as u32);
                 }
                 if pv.contains(&a) {

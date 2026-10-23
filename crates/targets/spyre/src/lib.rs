@@ -16,6 +16,12 @@ pub mod allocator;
 /// renders those programs as const tokens naming THIS crate's path — the same reason `bundle_code`
 /// is re-exported, so a consumer needs no direct dependency on the IR crate to hold a program.
 pub use ktir_core as ktir;
+/// The SuperDSC-side KTIR laws (reserved tids, the abstract pool). Re-exported because the
+/// `#[forward]` macro's WIRING SCAN calls them at expansion time — it resolves the reserved
+/// Kᵀ plane (`kct_resident_tid`) a spliced attention binds back to the PrefixK source it
+/// names, the same naming law the door's write tail and main's reader spell — so the macro
+/// crate needs no direct dependency on the lowering crate to know which plane a reader reads.
+pub use ktir_superdsc;
 /// ⭐ THE BAKED SuperDSC BUNDLE — `scratchy-spyre-bundle`, re-exported here so ONE path names it.
 ///
 /// The `#[forward]` macro emits against this path
