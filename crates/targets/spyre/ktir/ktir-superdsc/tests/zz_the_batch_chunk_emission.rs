@@ -4,11 +4,13 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, BatchChunk, ChunkScratch, KvHistory, PagedKvPool, StickLayout, attn_bundle_rows,
-    batch_chunk_mask_f16,
+    AttnGeometry, BatchChunk, ChunkScratch, KvExtent, KvHistory, PagedKvPool, SlotCount,
+    StickLayout, attn_bundle_rows, batch_chunk_mask_f16,
 };
 
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 fn named(ops: Vec<ktir_superdsc::emit::EmittedOp>) -> Vec<(String, serde_json::Value)> {
     ops.iter()
@@ -37,8 +39,7 @@ fn emit_batch<const NQH: u32, const NKVH: u32, const HD: u32>(
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -232,8 +233,7 @@ fn the_one_request_chunk_keeps_its_broadcast_mask_row() {
             0,
             geom,
             rows,
-            CAP,
-            CAP,
+            EXTENT,
             "t_qs",
             "t_new_k",
             "t_new_v",
@@ -433,8 +433,7 @@ fn a_batch_chunk_mask_past_its_placement_is_refused_at_bake() {
             0,
             geom,
             rows,
-            CAP,
-            CAP,
+            EXTENT,
             &names[0],
             &names[1],
             &names[2],

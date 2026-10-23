@@ -21,8 +21,9 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
 };
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
-    BlockCols, KernelTag, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement, PerRequestRows,
-    QueryRowCount, RowBlockedTag, RungWidth, SlotWindow, StickLayout, Stk,
+    BlockCols, KernelTag, KvExtent, MaskRows, MatK, MatM, MatN, MatY, OperandPlacement,
+    PerRequestRows, QueryRowCount, RowBlockedTag, RungWidth, SlotCount, SlotWindow, StickLayout,
+    Stk,
 };
 
 const HD: u32 = 64; // the g-form exists only where a head is one stick
@@ -282,8 +283,9 @@ fn assemble_attn_threads_the_form_to_every_gform_op() {
             7,
             geom,
             width,
-            cap,
-            cap,
+            // The storage/sweep pair on the boundary's one carrier — the sweep is the full cap
+            // (no rung).
+            KvExtent::new(SlotCount::new(cap), SlotCount::new(cap)),
             "qs",
             "nks",
             "nvr",

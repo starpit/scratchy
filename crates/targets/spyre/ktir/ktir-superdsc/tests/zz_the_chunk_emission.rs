@@ -3,13 +3,15 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const HD: u32 = 64;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 fn emit_chunk(pages: u32) -> Vec<(String, serde_json::Value)> {
     named(emit_chunk_ops(pages))
@@ -48,8 +50,7 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -455,8 +456,7 @@ fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, se
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         &names[0],
         &names[1],
         &names[2],

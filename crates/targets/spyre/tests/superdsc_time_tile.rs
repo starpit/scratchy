@@ -886,7 +886,9 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
     use ktir_superdsc::place::{PlaceId, SynthRole};
     use ktir_superdsc::placement::{SegRole, TensorPlacement};
-    use ktir_superdsc::sdsc_abstract::{AttnGeometry, ChunkScratch, PagedKvPool, attn_bundle_rows};
+    use ktir_superdsc::sdsc_abstract::{
+        AttnGeometry, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+    };
 
     const NQH: u32 = 32;
     const NKVH: u32 = 8;
@@ -962,8 +964,9 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
         0,
         geom,
         rows,
-        256,
-        256,
+        // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
+        // cap (no rung).
+        KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
         &names[0],
         &names[1],
         &names[2],

@@ -15,7 +15,7 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -24,6 +24,8 @@ const GQA: u32 = NQH / NKVH;
 const HD: u32 = 128;
 const NSLAB: u32 = 2;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 fn emit(pages: u32, mq: u32, classes: &[u32]) -> Vec<(String, serde_json::Value)> {
     emit_rows(pages, mq, classes, false)
@@ -81,8 +83,7 @@ fn emit_rows(
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         &names[0],
         &names[1],
         &names[2],

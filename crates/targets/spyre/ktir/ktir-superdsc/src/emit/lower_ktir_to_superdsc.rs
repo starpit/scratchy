@@ -4929,7 +4929,6 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // shown this — it bakes `ActiveCap::FULL`, where `resolve` is trivially `cap`, which is the same
     // blind spot that let a wrong rope reading through.
     let prefix_rows = param_read_rows(&k.func, &k.func.arguments[ops_in.k_param].0);
-    let active_cap: u32 = prefix_rows;
     // ⛔⛔⛔ THE RUNG AND THE PROGRAM MUST AGREE ABOUT WHETHER THERE IS A PREFIX AT ALL, because
     // that is the one place the two consumers could compute different things and neither would fault.
     // `ActiveCap::NONE` means `nb == 0` here — the new-token block alone seeds and finalizes the
@@ -4947,6 +4946,14 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             ops_in.out_id,
         ));
     }
+    // ⭐ THE EXTENT PAIR, MINTED ONCE — storage from the cache's own view, sweep from the
+    // program's own access tile, AFTER the agreement check above (this is the party that can
+    // name the node in the refusal). `assemble_attn` takes the pair as this carrier, so no call
+    // site can hand the storage extent in the sweep slot or the reverse.
+    let extent = crate::sdsc_abstract::KvExtent::new(
+        crate::sdsc_abstract::SlotCount::new(cap),
+        crate::sdsc_abstract::SlotCount::new(prefix_rows),
+    );
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. The attention
     // program states `attention_multiplier` inline (`self.scalar(f64::from(scale))`) because the emulator
     // interprets these ops and the three attention optimizers recognise the scale by pattern; the
@@ -5497,8 +5504,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         t,
         geom,
         bundle_rows,
-        cap,
-        active_cap,
+        extent,
         &qs,
         &new_k_scaled,
         &new_v_rep,

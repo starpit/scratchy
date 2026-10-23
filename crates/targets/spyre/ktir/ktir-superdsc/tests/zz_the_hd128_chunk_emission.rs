@@ -3,13 +3,15 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
 const NKVH: u32 = 8;
 const HD: u32 = 128;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 const NSLAB: u32 = 2;
 
 /// The slots of each score part and each value part a `pages`-page chunk at `mq` rows emits: one whole
@@ -51,8 +53,7 @@ fn emit(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

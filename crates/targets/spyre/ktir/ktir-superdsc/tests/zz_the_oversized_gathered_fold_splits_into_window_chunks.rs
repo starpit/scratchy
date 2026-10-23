@@ -24,10 +24,12 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, DxGroupCeiling, POOL_STICK, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, DxGroupCeiling, KvExtent, POOL_STICK, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// One emitted op, reduced to what this file asserts: its name, its fold flags and its request tag.
 struct Op {
@@ -46,8 +48,7 @@ fn emit_at<const NQH: u32, const NKVH: u32, const HD: u32>(mq: u32) -> Vec<Op> {
         0,
         geom,
         bundle_rows,
-        CAP,
-        CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

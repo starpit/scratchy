@@ -11,7 +11,7 @@
 //! comment as the only tie.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use scratchy_subtile::sdsc_abstract::FoldRowRegime;
+use scratchy_subtile::sdsc_abstract::{FoldRowRegime, KvExtent, SlotCount};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, bundle, bundle_fingerprint, launch_index,
 };
@@ -27,8 +27,9 @@ fn batch_decode_ops() -> Vec<ktir_superdsc::emit::EmittedOp> {
         7,
         geom,
         width,
-        256,
-        256,
+        // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
+        // cap (no rung).
+        KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
         "qs",
         "nks",
         "nvr",

@@ -13,12 +13,16 @@
 //! drift between the test and the bake is impossible by construction.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use scratchy_subtile::sdsc_abstract::{AttnGeometry, DxGroupCeiling, POOL_STICK, attn_bundle_rows};
+use scratchy_subtile::sdsc_abstract::{
+    AttnGeometry, DxGroupCeiling, KvExtent, POOL_STICK, SlotCount, attn_bundle_rows,
+};
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, bundle::FoldRows, launch_index,
 };
 
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// gemma-4-12b's sliding attention class: nqh=16, nkvh=8, hd=256 — the geometry whose mq=32 fold
 /// was the measured 8,300-descriptor bake explosion.
@@ -59,8 +63,7 @@ fn ops_at(mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
         7,
         geom,
         width,
-        CAP,
-        CAP,
+        EXTENT,
         "qs",
         "nks",
         "nvr",

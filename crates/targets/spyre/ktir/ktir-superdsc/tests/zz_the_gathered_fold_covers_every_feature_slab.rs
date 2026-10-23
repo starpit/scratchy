@@ -33,7 +33,7 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, DxGroupCeiling, POOL_STICK, PagedKvPool, attn_bundle_rows,
+    AttnGeometry, DxGroupCeiling, KvExtent, POOL_STICK, PagedKvPool, SlotCount, attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -43,6 +43,8 @@ const HD_2B: u32 = 64;
 /// granite-3.1-8b: `hidden 4096 / nqh 32` — TWO slabs, the geometry this file exists for.
 const HD_8B: u32 = 128;
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 
 /// One emitted op, reduced to what these assertions are about: its dsc name and its declared extents.
 struct Op {
@@ -104,8 +106,7 @@ fn try_emit_at<const HD: u32>(
         0,
         geom,
         bundle_rows,
-        CAP,
-        CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

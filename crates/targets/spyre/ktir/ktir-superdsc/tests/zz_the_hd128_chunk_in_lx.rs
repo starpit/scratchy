@@ -19,7 +19,8 @@ use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, assemble_rmsnor
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
-    AttnGeometry, ChunkRowKind, ChunkScratch, PagedKvPool, QGroupBlock, attn_bundle_rows,
+    AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, QGroupBlock, SlotCount,
+    attn_bundle_rows,
 };
 
 const NQH: u32 = 32;
@@ -27,6 +28,8 @@ const NKVH: u32 = 8;
 const HD: u32 = 128;
 const NSLAB: u32 = 2;
 const CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full cap (no rung).
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP));
 const ENTRY_BYTES: u64 = HD as u64 * 64 * 2;
 
 fn pool() -> PagedKvPool {
@@ -83,8 +86,7 @@ fn emit_chunk(
         0,
         geom,
         rows,
-        CAP,
-        CAP,
+        EXTENT,
         &names[0],
         &names[1],
         &names[2],

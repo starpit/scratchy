@@ -36,7 +36,9 @@
 //! bundle actually contains.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, DxGroupCeiling, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, DxGroupCeiling, KvExtent, SlotCount, attn_bundle_rows,
+};
 
 /// granite-3.1-2b: 32 query heads, 8 kv heads, head dim 64 — the model every card number above is from.
 const NQH: u32 = 32;
@@ -45,6 +47,8 @@ const HD: u32 = 64;
 /// The resident context the decode bundles are baked for, and the swept extent per fold pass.
 const CAP: u32 = 256;
 const ACTIVE_CAP: u32 = 256;
+/// The storage/sweep pair on the boundary's one carrier — the rung this file's bodies sweep.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 
 /// One emitted op's identity plus the three fields `attn.rs` says to diff, per operand.
 #[derive(Debug, PartialEq, Eq)]
@@ -87,8 +91,7 @@ fn emit_at(mq: u32) -> Vec<OpFields> {
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -228,8 +231,7 @@ fn the_start_address_extractor_sees_real_values() {
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -282,8 +284,7 @@ fn dump_the_score_node_for_stride_comparison() {
             0,
             geom,
             bundle_rows,
-            CAP,
-            ACTIVE_CAP,
+            EXTENT,
             "t_qs",
             "t_new_k",
             "t_new_v",
@@ -342,8 +343,7 @@ fn what_skip_addr_the_gathered_score_leg_would_get() {
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -571,8 +571,7 @@ fn doubling_the_rung_doubles_the_per_core_row_fold() {
             0,
             geom,
             bundle_rows,
-            CAP,
-            ACTIVE_CAP,
+            EXTENT,
             "t_qs",
             "t_new_k",
             "t_new_v",
@@ -654,8 +653,7 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -873,8 +871,8 @@ fn every_run_of_the_cut_pass_addresses_its_own_entries_and_rows() {
         0,
         geom,
         bundle_rows,
-        CAP,
-        128,
+        // The rung-8 body: the sweep is 128, not this file's `ACTIVE_CAP` rung.
+        KvExtent::new(SlotCount::new(CAP), SlotCount::new(128)),
         "t_qs",
         "t_new_k",
         "t_new_v",
@@ -998,8 +996,7 @@ fn the_ungathered_shipped_prefix_fold_still_emits() {
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

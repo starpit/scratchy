@@ -25,7 +25,9 @@
 
 use ktir_superdsc::emit as superdsc;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 use ktir_superdsc::superdsc_opspec::{GatherIndex, KernelAxis, PageExtent, SdscFoldSet};
 
 const NQH: u32 = 32;
@@ -35,6 +37,8 @@ const HD: u32 = 64;
 /// a wider `active_cap` is refused at build, which is the guard that caught the first draft of this file.
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
 const ACTIVE_CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — one page, storage and sweep alike.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 // ⛔ `SCORE_WINDOW` IS GONE — it was the KV columns one op sweeps (one page), and it sized the copy
 // harness's `mb` as `HD * SCORE_WINDOW / POOL_STICK`. A gather copy's width is no longer a sweep: it is
 // ONE INDEX STICK of entries (`CopyDims::ENTRIES_PER_OP`), because that is all dxp loads. The harness
@@ -135,8 +139,7 @@ fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value
         0,
         geom,
         rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

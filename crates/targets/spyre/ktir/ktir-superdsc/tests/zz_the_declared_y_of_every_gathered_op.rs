@@ -156,7 +156,9 @@
 //! failures at bs=1).
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
-use ktir_superdsc::sdsc_abstract::{AttnGeometry, PagedKvPool, attn_bundle_rows};
+use ktir_superdsc::sdsc_abstract::{
+    AttnGeometry, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
+};
 
 /// granite-3.1-2b — the model every card number is from.
 const NQH: u32 = 32;
@@ -164,6 +166,8 @@ const NKVH: u32 = 8;
 const HD: u32 = 64;
 const CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
 const ACTIVE_CAP: u32 = PagedKvPool::PAGE_SLOTS as u32;
+/// The storage/sweep pair on the boundary's one carrier — the sweep is the full page here.
+const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(ACTIVE_CAP));
 
 /// One op's whole declaration, projected.
 #[derive(Debug, Clone)]
@@ -249,8 +253,7 @@ fn emit_at(mq: u32, gather: bool) -> Vec<OpPicture> {
         0,
         geom,
         bundle_rows,
-        CAP,
-        ACTIVE_CAP,
+        EXTENT,
         "t_qs",
         "t_new_k",
         "t_new_v",

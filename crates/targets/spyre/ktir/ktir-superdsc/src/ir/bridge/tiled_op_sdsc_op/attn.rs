@@ -3626,8 +3626,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // compiles out; `mq_pad` and `nqh*mq` are EQUAL at nqh=32/mq=2 and diverge from mq=4 up —
     // exactly the width boundary where the card's batch decode started failing.)
     bundle_rows: crate::sdsc_abstract::AttnBundleRows<NQH>,
-    cap: u32,
-    active_cap: u32,
+    // ⭐ THE STORAGE/SWEEP PAIR, ON ONE CARRIER — `cap` (what the resident cache holds) and the
+    // sweep this bundle takes of it traveled as two adjacent bare `u32`s, swappable at every call
+    // site exactly where `ActiveCap`'s own doc says the confusion lives. The carrier fixes the
+    // order at one mint; the door below reads the fields once, typed.
+    extent: crate::sdsc_abstract::KvExtent,
     qs: &str,
     new_k_scaled: &str,
     new_v: &str,
@@ -3667,6 +3670,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // seven); the body below is unchanged arithmetic on the same numbers.
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let width = bundle_rows.width();
+    // The extent pair, read once at the door as the slot counts they are — the sweep feeds the
+    // window and mask laws directly below, so no `SlotCount::new` re-mint sits between the
+    // carrier and its consumers.
+    let (cap, active_cap) = (extent.cap(), extent.active());
 
     // This function's own typed head count — same reason as the block assembler's: `QueryHead::all` is
     // the only door, so a head reaching an offset is in range by construction. Nonzero is the
@@ -3824,14 +3831,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // const generic, so a block that is not whole sticks cannot be NAMED; the zero-head and
     // zero-row refusals live at the boundary's mint, not here.
     let mask_shape = {
-        use crate::sdsc_abstract::SlotCount;
         let shape = bundle_rows.mask_shape();
         let per_page = shape.cols().get();
-        if !shape.sweep_fits(SlotCount::new(active_cap)) {
+        if !shape.sweep_fits(active_cap) {
             return Err(SuperDscError(format!(
-                "prefix mask: one fold pass sweeps active_cap={active_cap} columns but a mask block \
+                "prefix mask: one fold pass sweeps active_cap={} columns but a mask block \
                  holds only {per_page} — the pass would read the NEXT block's validity rows, i.e. \
-                 another pass's history. Block the mask by active_cap, or cap the sweep at a page."
+                 another pass's history. Block the mask by active_cap, or cap the sweep at a page.",
+                active_cap.get()
             )));
         }
         shape
@@ -4666,7 +4673,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             layout,
         )?;
     }
-    let sweep_cap = if chunk.is_some() { 0 } else { active_cap };
+    let sweep_cap = if chunk.is_some() {
+        crate::sdsc_abstract::SlotCount::new(0)
+    } else {
+        active_cap
+    };
     let fold_from = ops.len();
     // ⭐⭐⭐⭐⭐ THE WINDOW-CHUNK SPLIT — the gathered fold's own answer to the dxp group ceiling.
     //
@@ -4710,7 +4721,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // guard forbids, and the two consts cannot disagree about legality.
     let nslab =
         crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
-    let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
+    let nb = SlotWindow::count_in(active_cap).get();
     let chunking = gather.map(|(_, scratch)| {
         // ONE CHUNK'S FIXED COST (its own copies) and PER-WINDOW COST (both legs + the 11-op
         // ladder), straight off the scratch's own extents — the quantities `copies()` and the two
@@ -4847,7 +4858,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
     // `SlotWindow::count_in`, where the 64 is the window's SLOT count — quantity (2), the reduce's
     // one-stick column budget — not the lane count it used to be spelled as.
-    for w in SlotWindow::sweep(crate::sdsc_abstract::SlotCount::new(sweep_cap)) {
+    for w in SlotWindow::sweep(sweep_cap) {
         let b = w.index();
         // ⭐ A NEW CHUNK STARTS HERE — its own copies first (the self-containment the group-major
         // law demands; see the split note above). `emitted_chunk_copies` is `None` before the first
@@ -4908,9 +4919,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ),
             );
             let at = |win: SlotWindow| -> u32 { pool.addr(kt_block.at_slot(win.first_slot())) };
-            let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
+            let nb = SlotWindow::count_in(active_cap).get();
             eprintln!(
-                "[fold-block] b={b}/{nb} cap={active_cap} stick={} hd={hd} mq={mq} rows={} | kt_off={} delta_b0={} | mask_slab={} slab_step={}",
+                "[fold-block] b={b}/{nb} cap={} stick={} hd={hd} mq={mq} rows={} | kt_off={} delta_b0={} | mask_slab={} slab_step={}",
+                active_cap.get(),
                 BlockCols::of_one_stick(Lanes::FP16).get(),
                 block_rows.extent(),
                 at(w),
@@ -5030,7 +5042,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // view step `from_view_step` is contracted for.
                 crate::addr::DevOff::of_mask_corner(mask_shape.slab_elems(0, w.mask_slab()))
             } else {
-                Nest::new(&["row", "feat"], &[1, cap], <Fp16 as DataFormat>::DF)
+                Nest::new(&["row", "feat"], &[1, cap.get()], <Fp16 as DataFormat>::DF)
                     .view()
                     .slab(w.mask_slab())
                     .dev()

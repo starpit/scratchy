@@ -3338,6 +3338,47 @@ impl SlotCount {
     }
 }
 
+/// ⭐ THE KV EXTENT PAIR — the resident cache's STORAGE extent and the sweep this bundle takes of
+/// it, minted together because the two are one fact at the boundary: the cache's own view states
+/// the storage and the program's own access tile states the sweep, and the caller that reads both
+/// is the one place the agreement is checked (a sweep past the storage addresses bytes nothing
+/// wrote — refused there, where the node ids are, not here).
+///
+/// ⛔ THIS EXISTS BECAUSE THE PAIR TRAVELED AS TWO ADJACENT BARE `u32`s (`cap`, `active_cap`) —
+/// a call site could hand the storage extent in the sweep slot or the reverse, which is exactly
+/// the confusion [`crate::ktir_node::ActiveCap`]'s own doc says that type exists to prevent,
+/// undone at the emitter's boundary where the rung has already resolved to a concrete extent and
+/// the rung type no longer protects it. As one carrier the order is fixed at ONE mint; as two
+/// same-typed parameters it would still be swappable, which is why the fields do not travel as
+/// parameters at all.
+///
+/// Both extents are RESOLVED (the rung's `ActiveCap::resolve` has run) and slot-counted: the
+/// sweep feeds `SlotWindow::sweep`/`count_in` and the mask's `sweep_fits` directly, with no
+/// `SlotCount::new` re-mint between the carrier and its consumers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KvExtent {
+    cap: SlotCount,
+    active: SlotCount,
+}
+
+impl KvExtent {
+    /// The one mint: storage and sweep, in that order. The caller owns the agreement
+    /// (`active ≤ cap`) — it is the party that can name the node and the buffer in the refusal.
+    pub const fn new(cap: SlotCount, active: SlotCount) -> KvExtent {
+        KvExtent { cap, active }
+    }
+
+    /// The resident cache's storage extent.
+    pub const fn cap(self) -> SlotCount {
+        self.cap
+    }
+
+    /// The swept extent — O(active) attention over the same resident cache.
+    pub const fn active(self) -> SlotCount {
+        self.active
+    }
+}
+
 /// ⭐⭐⭐⭐ QUANTITY (2) OF THE FOUR MEANINGS OF 64: one 64-SLOT KV WINDOW of a fold sweep — WHICH block
 /// of the resident cache one fold pass's score/reduce group reads.
 ///
