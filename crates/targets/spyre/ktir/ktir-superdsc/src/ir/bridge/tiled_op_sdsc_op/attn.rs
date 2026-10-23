@@ -73,6 +73,7 @@ use crate::emit::{
     EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
     assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
 };
+use crate::exp_base::ExpBase;
 use crate::placement::BundleLayout;
 use crate::sdsc_abstract::{
     BlockCols, DxGroupCeiling, FeatIdx, FlatTag, KernelTag, KtTileFeats, KtTileSlots, Lanes,
@@ -1372,7 +1373,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         ));
         ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}corre_o{t}"),
-            "exp",
+            ExpBase::E.op_func(),
             rows.swept(),
             BlockCols::of_one_stick(Lanes::FP16),
             &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
@@ -1413,7 +1414,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ));
     ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_{tag}ee_o{t}"),
-        "exp",
+        ExpBase::E.op_func(),
         rows.swept(),
         width,
         &[In::full(&fl(esubt, rows_n, width_n)).ew()],
@@ -2291,7 +2292,7 @@ fn assemble_new_block_chunk(
         ));
         ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_ncexp_{bn}_o{t}"),
-            "exp",
+            ExpBase::E.op_func(),
             grp_rows,
             cols,
             &[In::sliced(&rb(esub, g_rows, slots), at_pin).ew()],
@@ -2969,7 +2970,7 @@ fn assemble_attn_chunk(
         ));
     }
     for (op_name, func, inp, out) in [
-        ("corre", "exp", &bufs.corrsubt, &bufs.corr),
+        ("corre", ExpBase::E.op_func(), &bufs.corrsubt, &bufs.corr),
         ("mset", "identity", &bufs.newm, &bufs.run_m),
     ] {
         ops.push(assemble_pointwise_broadcast_off(
@@ -3064,7 +3065,7 @@ fn assemble_attn_chunk(
             ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cexp_{bn}{suffix}_o{t}"),
-                    op_func: "exp",
+                    op_func: ExpBase::E.op_func(),
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
@@ -3396,7 +3397,7 @@ fn prompt_probabilities_in_lx(
             ));
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_cexp_{bn}_s{p}_o{t}"),
-                "exp",
+                ExpBase::E.op_func(),
                 grp_rows,
                 pw,
                 &[In::sliced(&rb(&cb.cesub, g_rows, ps), DevOff::ZERO).ew()],
@@ -3713,7 +3714,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // directly — there is no kv-side `BlockNests` to hold row/width slots the kv stream cannot
     // truthfully fill (its rows are the chunk's `mq`, not the shared-buffer extent a nest frames).
     let nslab =
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
     for kvh in 0..nkvh {
         for rw in mq_pad_t.row_windows() {
             let j = rw.index();
@@ -3954,7 +3955,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     let score_form = SharedKernelBmmForm::of_score_leg(
         rows_are_requests,
         width.mq(),
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, Df::Fp16),
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16),
     );
     let bmm_form = SharedKernelBmmForm::of_attn_rows(rows_are_requests, width.mq());
     // ⭐⭐⭐ NO HEAD-DIM GATE. This arm required `hd == one stick`, and the reason was ONE stride: the
@@ -4683,7 +4684,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // fires here always lands under what the guard would refuse): the emitter aims BELOW what the
     // guard forbids, and the two consts cannot disagree about legality.
     let nslab =
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(hd, crate::superdsc_opspec::Df::Fp16).get();
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
     let nb = SlotWindow::count_in(crate::sdsc_abstract::SlotCount::new(active_cap)).get();
     let chunking = gather.map(|(_, scratch)| {
         // ONE CHUNK'S FIXED COST (its own copies) and PER-WINDOW COST (both legs + the 11-op

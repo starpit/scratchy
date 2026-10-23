@@ -45,6 +45,7 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
+use ktir_superdsc::exp_base::ExpBase;
 use ktir_superdsc::score_scale::{NewK, PoolKLaw, ScoreScaleLaw};
 
 /// ⭐⭐⭐ THE FOUR THINGS THE PROGRAM CANNOT STATE — `ibm/main`'s `lower_one_node` PARAMETERS, at the
@@ -293,13 +294,16 @@ pub fn lower(
                     // are the identity in the program's own base, compared at the f16 image
                     // because that is the only form a program constant carries. Anything else
                     // under a carried-elsewhere law is a real multiplier behind pre-scaled
-                    // weights — the double-scale.
+                    // weights — the double-scale. The restatement factor itself is the
+                    // EXP-BASE LAW's const ([`ExpBase::LOG2E`]) — the same law the ladder's
+                    // exp op key derives from, so the guard and the emission cannot spell the
+                    // base differently.
                     (
                         Some(v),
                         law @ (ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel),
                     ) if v != 1.0
                         && half::f16::from_f32(v)
-                            != half::f16::from_f32(std::f32::consts::LOG2_E) =>
+                            != half::f16::from_f32(ExpBase::LOG2E) =>
                     {
                         return err(format!(
                             "{name}: the bundle's attention scale is {law:?}, but the program \

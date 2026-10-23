@@ -1215,7 +1215,9 @@ pub fn elementwise_op_func(name: &str, kind: Elementwise) -> Result<(&'static st
         // ── The rest of the `OpFunc` pointwise set. Each already had an `OpFunc` variant AND an
         // `op_func_from_str` arm before this table named it, and most are already emitted on card by
         // the attention / rmsnorm / fp8-quantiser bodies; what was missing was only the door.
-        Elementwise::Exp => ("exp", 1),
+        // The exp key is DERIVED from the exp-base law (`ExpBase`), never spelled — the device's
+        // one exponential is e^x and the recurrence's spelling of it is one fact, not two.
+        Elementwise::Exp => (crate::exp_base::ExpBase::E.op_func(), 1),
         Elementwise::Rsqrt => ("rsqrt", 1),
         Elementwise::Sqrt => ("sqrt", 1),
         Elementwise::Abs => ("abs", 1),

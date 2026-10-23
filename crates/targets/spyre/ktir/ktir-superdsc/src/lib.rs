@@ -66,6 +66,14 @@ pub mod emit;
 /// `new_k: &str`.
 pub mod score_scale;
 
+/// THE EXP-BASE LAW, AS A TYPE — [`exp_base::ExpBase`] (the softmax recurrence's exponential
+/// step, carrying its base): the device's one exponential is e^x, so the op-func key the
+/// ladder's exp emissions use and the LOG2E restatement the door's identity guard checks are
+/// DERIVED from one law, not spelled at six sites and a guard. Deletes the bare `"exp"` strings
+/// in the attention ladder and the inline `LOG2_E` at the door — the two-spellings class, dead
+/// by type.
+pub mod exp_base;
+
 /// THE PAGE-PART LAW, AS A TYPE — [`page_part::PagePart`] (which page of a multi-page window an op
 /// addresses), minted only by the cutting law (`PagedKvPool::write_parts`), compared as an opaque
 /// type in the fusion walk, and carried to the launch from the walk's own trip. Deletes the
