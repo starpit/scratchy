@@ -917,6 +917,125 @@ mod argmax_row_feedback_table_tests {
         let w = wiring_with_table(&[(2, 2), (4, 0)]); // degenerate width
         assert!(stage_argmax_row_feedback_table(&mirror, 1, &w).is_err());
     }
+
+    /// ⭐⭐⭐⭐⭐ THE ROW-BYTES PIN (#603 slice E, auditer-ordered 10-23): for
+    /// every token t, the DEVICE bytes the gather's table holds for row t must
+    /// equal the DEVICE bytes the k=1 step's EmbedRow preamble binds for token
+    /// t. The window's ahead-steps feed their embedding rows by the DEVICE
+    /// gather off this table; the k=1 step host-binds the same row; greedy
+    /// identity between the two paths (the E-leg-1 md5 law) IS this
+    /// byte-identity — the comment at the window's step-0 bind states it, and
+    /// this test is the checked form of that comment.
+    ///
+    /// Both sides run their ACTUAL production staging: the table narrows the
+    /// mirror (`stage_argmax_row_feedback_table`) and takes the weight stage's
+    /// Convert arm (`ieee_to_sen_bytes` — the table is no matmul's kernel
+    /// weight, so the retile arm cannot claim it); the row stages through
+    /// `kernel_values`' EmbedRow step (raw f32; `stick_scatter` is the identity
+    /// at one row) and takes the f32 bind (`f32_to_sen_bytes`).
+    /// `one_pass_f32_to_sen_is_the_two_pass_form` pins the CONVERTER
+    /// composition; this pins that the two PATHS feed it the same f32s — a
+    /// divergence here is the k=4-vs-k=1 greedy flip defect by construction.
+    #[test]
+    fn the_tables_device_rows_are_the_embedrow_preambles_device_rows() {
+        use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+        use scratchy_target_spyre::bundle_code::PlaceId;
+        use scratchy_target_spyre::forward_tape::{
+            ForwardInputs, ForwardKernel, ForwardShape, ForwardStep, Staged, kernel_values,
+        };
+
+        const VOCAB: usize = 97; // odd: the table's rows are not a whole stick-group
+        const H: usize = 128; // a whole-stick width, like every real hidden dim
+        // The mirror: pseudo-random f32s with every 7th element pinned to an
+        // f16 MIDPOINT (exactly between two neighbouring f16 values) — the
+        // inputs where a second rounding or a different composition would
+        // flip a byte.
+        let mut mirror = Vec::with_capacity(VOCAB * H);
+        let mut s = 0x9E37_79B9u32;
+        for i in 0..VOCAB * H {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let mut v = f32::from_bits(s);
+            if !v.is_finite() {
+                v = (i as f32) * 0.25 - 12.0;
+            }
+            if i % 7 == 0 {
+                let b = (i % 65_500) as u16;
+                let x = half::f16::from_bits(b).to_f32();
+                let y = half::f16::from_bits(b.wrapping_add(1)).to_f32();
+                if x.is_finite() && y.is_finite() {
+                    v = ((x as f64 + y as f64) / 2.0) as f32;
+                }
+            }
+            mirror.push(v);
+        }
+
+        // THE TABLE SIDE, as production stages it: narrow the whole mirror,
+        // append the zero pad row, then the weight stage's Convert arm.
+        let w = wiring_with_table(&[(2, H as u32), ((VOCAB + 1) as u32, H as u32)]);
+        let (tid, f16_bytes, dt, shape) =
+            stage_argmax_row_feedback_table(&mirror, 1, &w).expect("the mirror matches");
+        assert_eq!(tid, 1);
+        assert_eq!(dt, SDType::F16);
+        assert_eq!(shape, vec![VOCAB + 1, H]);
+        let mut table_dev = vec![0u8; f16_bytes.len()];
+        scratchy_target_spyre::sen_convert::ieee_to_sen_bytes(&f16_bytes, &mut table_dev);
+
+        // THE ROW SIDE, as production stages it: the EmbedRow step over one
+        // token, then the f32 bind's one-pass convert.
+        let fshape = ForwardShape {
+            rows: 1,
+            embed_src: 0,
+            cos_srcs: &[],
+            sin_srcs: &[],
+            prefix_mask: false,
+            kv_block_index: false,
+            n_consts: 0,
+        };
+        let step = ForwardStep {
+            kernel: ForwardKernel::EmbedRow,
+            tensor: PlaceId::Act(0),
+        };
+        let causal = CausalKey::chunk(RungWidth::of_baked_rows(1).expect("1 is a width"), 1)
+            .expect("one real row of a one-row rung");
+        for t in 0..VOCAB {
+            let inp = ForwardInputs::<fn(usize) -> bool> {
+                hidden: H,
+                num_q_heads: 1,
+                mq_pad: 64,
+                causal_heads_per_block: 1,
+                embed_tokens: &mirror,
+                tokens: &[t],
+                positions: &[0],
+                causal,
+                prefix: None,
+                consts: &[],
+                mask_neg: scratchy_subtile::sdsc_abstract::ATTN_MASK_NEG,
+                stick_major: true,
+                kv_blocks: None,
+            };
+            let row = match kernel_values(&step, &fshape, &inp).expect("the EmbedRow stages") {
+                Staged::F32(v) => v.into_owned(),
+                _ => panic!("the EmbedRow step stages as f32"),
+            };
+            assert_eq!(row.len(), H, "one row of the hidden width");
+            let mut row_dev = vec![0u8; H * 2];
+            scratchy_target_spyre::sen_convert::f32_to_sen_bytes(&row, &mut row_dev);
+            assert_eq!(
+                row_dev.as_slice(),
+                &table_dev[t * H * 2..(t + 1) * H * 2],
+                "token {t}: the gather's table row and the k=1 EmbedRow bind disagree — this IS \
+                 the k=4-vs-k=1 greedy flip defect"
+            );
+        }
+        // The pad row stays ZERO through the convert (the sentinel's landing
+        // row reads 0 on device).
+        assert!(
+            table_dev[VOCAB * H * 2..].iter().all(|&b| b == 0),
+            "the pad row must read zero on device"
+        );
+    }
 }
 
 impl SpyreWorker {
