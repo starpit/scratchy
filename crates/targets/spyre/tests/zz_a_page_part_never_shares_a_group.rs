@@ -33,7 +33,9 @@ fn no_kind_fuses_across_page_parts() {
     let cut = PagedKvPool::new(1, 64).write_parts(0, 512, false);
     for kind in [
         GroupKind::Pure,
-        GroupKind::Slot { req: 0 },
+        GroupKind::Slot {
+            req: TripRequest(0),
+        },
         GroupKind::Slab,
         GroupKind::Gathered,
     ] {

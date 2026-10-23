@@ -4749,8 +4749,10 @@ pub enum GroupKind {
     /// cache writes are `nkvh · requests · 2` per layer, and making each its own singleton (which is
     /// what treating them as distinct-slot did) cost ~5,300 extra launches per forward and ran a
     /// batch of 8 twenty times slower than one request. 0 for an unbatched bundle, so its grouping
-    /// is exactly what it was.
-    Slot { req: u32 },
+    /// is exactly what it was. The request rides as a [`TripRequest`] — the same wrapper [`Trip`]
+    /// carries — so the kind's own comparison (`fusable_kind_with`) cannot match it against a
+    /// bare small integer that happens to equal a request.
+    Slot { req: TripRequest },
     /// `slot_write` PREFILL cachewr: writes a DISTINCT per-entry slot (baked at `s·hd`). The
     /// shim's single per-group slot-shift CANNOT express distinct slots, so each is its OWN
     /// singleton group (launched with its baked slot doff; prefill `slot_pos==0` ⇒ no shift).
@@ -5313,7 +5315,9 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
                 if e.slot_no_fuse {
                     GroupKind::SlotSolo
                 } else {
-                    GroupKind::Slot { req: e.kv_request }
+                    GroupKind::Slot {
+                        req: TripRequest(e.kv_request),
+                    }
                 }
             } else {
                 GroupKind::Pure

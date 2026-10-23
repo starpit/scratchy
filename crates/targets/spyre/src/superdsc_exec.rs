@@ -29,7 +29,8 @@ use tracing::{debug, info};
 use crate::bundle_code::{self as bundle, KernelWeight, NUM_SEGMENTS, Placement, SweptCols};
 use crate::cb_plan;
 use crate::fold_plan::{
-    self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
+    self, Bytes, OpKv, PageOrd, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlabStride,
+    SlotPos, SlotStride, fused_rungs,
 };
 use crate::runtime::{
     BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
@@ -618,9 +619,14 @@ impl OpProg {
                 page_fold: kv.page_fold,
                 slot_write: kv.slot_write(),
                 page_slots: kv.page_slots as u64,
-                slot_stride_bytes: kv.slot_stride_bytes as u64,
+                // ⭐ THE PORT MINTS — the manifest's raw `kv_*_stride_bytes` become typed
+                // strides exactly once, here where the launch index is read; the values
+                // leave the types only through `PlaneSlot::shifted_by` /
+                // `SlabIdx::shifted_by`, so a slot stride multiplying a slab index (the
+                // mixed-stride group's wrong base shift) has no spelling past this point.
+                slot_stride: SlotStride::of_bytes(Bytes(kv.slot_stride_bytes as u64)),
                 slab_write: kv.slab_write(),
-                slab_stride_bytes: kv.slab_stride_bytes as u64,
+                slab_stride: SlabStride::of_bytes(Bytes(kv.slab_stride_bytes as u64)),
                 batched_requests: kv.batched_requests,
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
@@ -2626,7 +2632,7 @@ impl Executor {
         // the slot a fold writes are different addresses; the write base is request 0's page 2 —
         // a real block-table walk, not a zero.
         let slot = SeqPos(2 * per + 5);
-        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), 2)
+        let kv_page_base = RowPage::of(&fold, RowIdx::from_launch_row(0), PageOrd::of_index(2))
             .map(|rp| fold_plan::page_base_bytes(&fold, rp))
             .unwrap_or(Bytes(0));
         let mk = |bank: usize, off: [u64; NUM_SEGMENTS]| LaunchWhere {
@@ -3289,8 +3295,13 @@ impl Executor {
         let mut pages: Vec<i64> = Vec::new();
         let mut first = String::new();
         for op in ops.iter().filter(|o| o.kv.slot_write) {
+            // The geometry mint, per op — each op carries its own baked modulus. A
+            // disagreement yields no line (the walk's own refusal follows, naming the op).
+            let Ok(geo) = fold_plan::PageGeometry::agree(&op.kv, &self.fold) else {
+                return None;
+            };
             let Some(delta) =
-                fold_plan::seg_deltas(&op.kv, &self.fold, 0, per, launch, where_.kv_page_base)
+                fold_plan::seg_deltas(&op.kv, &self.fold, geo, 0, per, launch, where_.kv_page_base)
                     .deltas()
             else {
                 continue;
@@ -5285,8 +5296,12 @@ impl Executor {
             return Bytes(0);
         }
         let lp = seq_pos.0 / self.kv.page_slots.0.max(1);
-        RowPage::of(&self.fold, RowIdx::from_launch_row(0), lp)
-            .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
+        RowPage::of(
+            &self.fold,
+            RowIdx::from_launch_row(0),
+            PageOrd::of_index(lp),
+        )
+        .map_or(Bytes(0), |rp| fold_plan::page_base_bytes(&self.fold, rp))
     }
 
     // ──────────────────────────────────────────────────────────────────────────────────────────

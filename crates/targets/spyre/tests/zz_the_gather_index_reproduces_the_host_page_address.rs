@@ -36,7 +36,7 @@
 //! is ever changed the correspondence fails here rather than on the card.
 
 use scratchy_target_spyre::fold_plan::{
-    Bytes, PageSlots, RowCursors, RowIdx, RowPage, SessionKv, page_base_bytes,
+    Bytes, PageOrd, PageSlots, RowCursors, RowIdx, RowPage, SessionKv, page_base_bytes,
 };
 
 const ITERS: i64 = 40; // layers in the rolled loop
@@ -83,8 +83,12 @@ fn the_gather_index_lands_exactly_where_the_host_would_have_pointed() {
     for row in 0..s.block_tables.len() {
         for lp in 0..s.block_tables[row].len() {
             // What the host computes today, per launch: one base for this (row, page).
-            let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64)
-                .expect("the row holds this page");
+            let rp = RowPage::of(
+                &s,
+                RowIdx::from_launch_row(row as u64),
+                PageOrd::of_index(lp as i64),
+            )
+            .expect("the row holds this page");
             let host_page_base = page_base_bytes(&s, rp).0;
 
             for layer in 0..ITERS {
@@ -129,7 +133,12 @@ fn two_rows_are_reachable_from_one_base_by_index_alone() {
     // Each still matches its own host-computed address, so reaching both from one base costs no
     // correctness.
     for (row, addr) in [(0usize, a), (1usize, b)] {
-        let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), 0).expect("page 0");
+        let rp = RowPage::of(
+            &s,
+            RowIdx::from_launch_row(row as u64),
+            PageOrd::of_index(0),
+        )
+        .expect("page 0");
         assert_eq!(
             addr,
             base + page_base_bytes(&s, rp).0 + layer as u64 * KV_STRIDE,
@@ -213,7 +222,12 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
     for row in 0..s.block_tables.len() {
         for lp in 0..s.block_tables[row].len() {
             let phys = s.block_tables[row][lp];
-            let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64).unwrap();
+            let rp = RowPage::of(
+                &s,
+                RowIdx::from_launch_row(row as u64),
+                PageOrd::of_index(lp as i64),
+            )
+            .unwrap();
             assert_eq!(
                 page_base_bytes(&s, rp).0,
                 phys as u64 * stride,
@@ -231,11 +245,11 @@ fn page_addresses_are_uniformly_spaced_however_scrambled_the_table_is() {
     for p in 1..4i64 {
         let hi = page_base_bytes(
             &ident,
-            RowPage::of(&ident, RowIdx::from_launch_row(0), p).unwrap(),
+            RowPage::of(&ident, RowIdx::from_launch_row(0), PageOrd::of_index(p)).unwrap(),
         );
         let lo = page_base_bytes(
             &ident,
-            RowPage::of(&ident, RowIdx::from_launch_row(0), p - 1).unwrap(),
+            RowPage::of(&ident, RowIdx::from_launch_row(0), PageOrd::of_index(p - 1)).unwrap(),
         );
         assert_eq!(hi.0 - lo.0, stride, "physical pages are one stride apart");
     }
@@ -295,8 +309,12 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
         let base = 0x4000_0000u64;
         for row in 0..s.block_tables.len() {
             for lp in 0..s.block_tables[row].len() {
-                let rp = RowPage::of(&s, RowIdx::from_launch_row(row as u64), lp as i64)
-                    .expect("the row holds this page");
+                let rp = RowPage::of(
+                    &s,
+                    RowIdx::from_launch_row(row as u64),
+                    PageOrd::of_index(lp as i64),
+                )
+                .expect("the row holds this page");
                 let host = base + page_base_bytes(&s, rp).0;
                 let idx = s.block_tables[row][lp] * per_page.get();
                 let via_gather = gather_addr(idx, pool.stick_block_bytes(), base);
@@ -364,7 +382,7 @@ fn a_page_that_is_not_whole_entries_has_no_index_at_all() {
 #[test]
 fn an_entry_at_or_above_the_pools_ceiling_is_unconstructible() {
     use scratchy_subtile::sdsc_abstract::{
-        GatherEntry, PagedKvPool, gather_entry_ceiling, gather_entries_per_page,
+        GatherEntry, PagedKvPool, gather_entries_per_page, gather_entry_ceiling,
     };
     let pool = PagedKvPool::new(8, 64);
     let page_ceiling = 4u64;
@@ -392,11 +410,7 @@ fn an_entry_at_or_above_the_pools_ceiling_is_unconstructible() {
         "a page the pool's budget does not hold must be unconstructible, not merely unlikely"
     );
     assert_eq!(
-        GatherEntry::of_page_block(
-            ceiling,
-            (page_ceiling - 1) as i64,
-            plane_blocks
-        ),
+        GatherEntry::of_page_block(ceiling, (page_ceiling - 1) as i64, plane_blocks),
         None,
         "the block one past the plane's own extent is the ceiling itself — the FIRST illegal value"
     );
