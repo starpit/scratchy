@@ -9234,6 +9234,72 @@ pub fn scalarfill_at(
     )])
 }
 
+/// ⭐⭐⭐⭐⭐ THE WRITE-BACK COPY — a `ktdp.store` of a value this function MINTED. The store arm
+/// binds a store to its producing op only when the result is the store's alone; a result other
+/// compute ops still read (the online-softmax fold body's running max: stored at the trip's end,
+/// read by `m − m_new` and `qk − m_new[.., .., None]` on the way there) is minted as an
+/// intermediate like any other, and the STORE lowers at its own program position — the
+/// indexed-store arm's own law — as this identity copy from the mint to the store's window. The
+/// copy is what keeps the read ORDER honest: binding the store to the producer would emit the
+/// producer writing the carry IN PLACE at its own position, and the subtraction afterwards would
+/// read `m_new − m_new = 0`; minting keeps the buffer untouched until the copy, so the old value
+/// is live for every consumer that states it.
+///
+/// Same descriptor shape as [`scalarfill_at`] and lmlast's identity copies — one input, one
+/// output, `identity` — with the input a FULL window over the mint rather than an `In::scalar`
+/// broadcast: the mint's own placement holds the swept width (both names go to
+/// `pointwise_width_the_output_holds`, so a mint that held less than the window refuses by name
+/// rather than reading past its footprint).
+pub fn mintcopy_at(
+    name: &str,
+    src: &Region,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    if src.df != out.df {
+        return Err(Error {
+            message: format!(
+                "Copy {name}: the minted t{} is {:?} and the store's window t{} is {:?} — a \
+                 store that changes dtype on the way to memory is a new producer form this door \
+                 must be re-derived for",
+                src.tid, src.df, out.tid, out.df
+            ),
+        });
+    }
+    let src_name = src.name();
+    let out_name = out.name();
+    let rows = pointwise_rows(name, out)?;
+    // The scalar bodies' own corner law: a column-blocked piece reads and writes ONE window.
+    let corner = chunk_window(name, rows, out)?;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&src_name, &out_name],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let src_h = rb_df(&src_name, rows, store_cols, out.df);
+    let out_h = rb_df(&out_name, rows, store_cols, out.df);
+    // `n_operands: 2` is the `_df` funnel's own count for a one-input op (the input plus the
+    // output) — the count the fill and lmlast's identity copies already state.
+    let tile_op = pointwise_tile_op(rows, cols, 1, 2, out.df);
+    let inputs = [In::full(&src_h).ew()];
+    let op_name = format!("copy_o{}", out.tid);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        "identity",
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        corner,
+        sym_id_base,
+        layout,
+    )])
+}
+
 /// ⭐ THE RUNG-3 BODY: a scalar multiply whose multiplier is a LAUNCH BINDING, not a baked value.
 ///
 /// Same emission as [`scalarmul_at`] — the descriptor is identical, `In::scalar` over the bound

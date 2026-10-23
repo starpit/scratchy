@@ -1452,6 +1452,63 @@ fn is_plumbing(op: OpKind) -> bool {
     )
 }
 
+/// ⭐⭐⭐⭐⭐ IS THIS RESULT READ BY ANYTHING OTHER THAN ITS STORE? The store arm binds a store to
+/// its producing op only when the result is the store's ALONE — that arm emits the op writing the
+/// store's window IN PLACE, at the op's own program position, which is correct only while no later
+/// op still reads the value the window held BEFORE. The online-softmax fold body's running max is
+/// the first value this door has seen that is BOTH stored (the carry's write-back at the trip's
+/// end) and consumed on the way there (`m − m_new`, `qk − m_new[.., .., None]`): binding it would
+/// overwrite the old max before the subtraction reads it (`m_new − m_new = 0` — a descriptor reads
+/// at ITS OWN program position, never at the load's). When this returns true the walk mints the
+/// result as the intermediate it already is to those consumers, and the STORE lowers at its own
+/// position as the write-back copy (`mintcopy_at`).
+///
+/// The walk is FORWARD over users: a STORE user is the binder (or a second store of the same value
+/// — also a binder); a user that only REFRAMES the value without computing on it (the reshape and
+/// broadcast/expand plumbing the store's own value chain runs through) hands its result to the
+/// frontier; anything else — a compute op, a yield, a return — is a consumer. The yields and
+/// returns are consumers rather than reframes on purpose: they carry real dataflow, and treating
+/// one as a reframe would silently drop it from the frontier.
+fn result_consumed_beyond_store(f: &IRFunction<'static>, res: Ssa) -> bool {
+    let carries = |c: &ktir_core::ir::Operation<'static>| {
+        (is_plumbing(c.op_type)
+            && !matches!(
+                c.op_type,
+                OpKind::KtdpStore | OpKind::FuncReturn | OpKind::LinalgYield | OpKind::ScfYield
+            ))
+            || matches!(
+                c.op_type,
+                OpKind::TensorReshape
+                    | OpKind::LinalgBroadcast
+                    | OpKind::TensorExpandShape
+                    | OpKind::TensorCollapseShape
+            )
+    };
+    let mut frontier = vec![res];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(v) = frontier.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        for c in f.operations.iter() {
+            if !c.operands.contains(&v) {
+                continue;
+            }
+            if c.op_type == OpKind::KtdpStore {
+                continue; // the binder itself
+            }
+            if carries(c) {
+                if let Some(r) = c.result {
+                    frontier.push(r);
+                }
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
 /// chain started from, plus the axis.
 ///
@@ -3239,6 +3296,57 @@ pub fn lower_function(
             lowered += 1;
             continue;
         }
+        // ⭐⭐⭐⭐⭐ A STORE OF A VALUE THIS FUNCTION MINTED — the write-back copy. A result other
+        // compute ops still read is not the store's to bind (the unbind at the `stored` find
+        // states the law), so its producer minted it an intermediate above; the STORE lowers
+        // HERE, at its own program position, as an identity copy from the mint to the store's
+        // window — the same window resolution the compute store arm and the fill above take.
+        // Order is the whole point: the copy is the ONLY write to the buffer, and it lands at
+        // the position the store occupies (dxp program order is call order), so every consumer
+        // before it read the bytes the program says they read. The value reads through reshape
+        // hops exactly as the `stored` find does — the store's operand may be spelled through a
+        // lens — and a store whose value is neither scattered, filled, minted, nor bound to its
+        // producer below keeps the walk's own named refusal rather than a silent unwritten
+        // window.
+        if op.op_type == OpKind::KtdpStore
+            && let Some(v) = op.operands.first().copied()
+        {
+            let mut cur = v;
+            while let Some(&next) = reshape_hops.get(&cur) {
+                cur = next;
+            }
+            if let Some(src) = inter.get(&cur).copied() {
+                let out_tile = op.operands.get(1).copied();
+                let tile = f.operations.iter().find(|o| {
+                    o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile
+                });
+                let Some(tile) = tile else {
+                    return err(format!(
+                        "{}: a store of a minted value names no access tile — nothing states \
+                         the window it writes back to",
+                        f.name
+                    ));
+                };
+                let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+                    return err(format!(
+                        "{}: a store of a minted value names no parameter — a write-back with \
+                         no bound buffer has no window to write",
+                        f.name
+                    ));
+                };
+                o = windowed_region(k, o, tile)?;
+                o.is_out = true;
+                out.append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
+                    f.name,
+                    &src,
+                    &o,
+                    sym_id_base,
+                    layout,
+                )?);
+                lowered += 1;
+                continue;
+            }
+        }
         if is_plumbing(op.op_type) {
             continue;
         }
@@ -3903,6 +4011,22 @@ pub fn lower_function(
                 }
                 cur = next;
             }
+        }
+        // ⭐⭐⭐⭐⭐ AND NOT WHEN THE RESULT IS STILL READ. The arm below emits this op writing the
+        // store's window IN PLACE at this op's own position — honest only while the result is the
+        // store's alone. A result other compute ops still read (the fold body's running max:
+        // stored at the trip's end, read by `m − m_new` and `qk − m_new[.., .., None]` on the way
+        // there) would have its old value overwritten before those consumers read it — a
+        // descriptor reads at ITS OWN program position, never at the load's. Such a result is
+        // minted as the intermediate it already is to those consumers, and the store itself
+        // lowers at its own position as the write-back copy the `mintcopy` arm at the top of the
+        // walk states. This runs BEFORE the fp8 epilogue arm so that absorption (whose absorbed
+        // `arith.mulf` has exactly the one dot consumer) is untouched by it.
+        if let Some(res) = op.result
+            && stored.is_some()
+            && result_consumed_beyond_store(f, res)
+        {
+            stored = None;
         }
         // ⭐⭐⭐ THE fp8 WEIGHT-SCALE EPILOGUE, ABSORBED AT THE DOT. `matmul_fp8.py` spells the W8A8
         // contraction's scale multiply IN THE KERNEL — `p * ws` between the dot and the store — so
