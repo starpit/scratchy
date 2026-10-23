@@ -1811,6 +1811,7 @@ mod constant_tape_tests {
             offset: 0,
             size: placed_bytes,
             is_logits: false,
+            parity: None,
         });
         // The BAKED count's staging covers the placement — the pair agrees.
         wiring
@@ -1843,6 +1844,7 @@ mod constant_tape_tests {
             offset: 0,
             size: quotient_bytes,
             is_logits: false,
+            parity: None,
         });
         let why = wiring
             .verify_causal_placement(&lay_quotient, mq, width)
@@ -1958,6 +1960,7 @@ mod constant_tape_tests {
                     offset: 0,
                     size: staged.len() as u64 * 2,
                     is_logits: false,
+                    parity: None,
                 });
                 w.verify_causal_placement(&lay, rows, mq_pad as u32)
                     .unwrap_or_else(|e| panic!("{at}: {e}"));
@@ -2030,6 +2033,7 @@ mod constant_tape_tests {
                         offset: 0,
                         size: hd as u64 * hd as u64 * 2,
                         is_logits: false,
+                        parity: None,
                     })
                     .collect(),
             ),

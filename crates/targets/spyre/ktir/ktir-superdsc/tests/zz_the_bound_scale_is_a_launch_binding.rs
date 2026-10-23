@@ -191,6 +191,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x10000,
                 size: bytes,
+                parity: None,
             },
         );
     }
@@ -409,6 +410,7 @@ fn a_baked_scale_does_not_read_the_scale_parameter() {
                 bank: 0,
                 offset: 0,
                 size: 2,
+                parity: None,
             },
         );
         lower_function(&k, Some(&layout), &mut sid, None)

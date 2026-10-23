@@ -345,6 +345,15 @@ pub struct OpKv {
     /// `addr = idx * skip_addr + base` from whatever base the launch installed, so a per-pass page shift
     /// on top of an absolute entry composes two bases and lands inside neither: fluent, no fault.
     pub gathered: bool,
+    /// A launch-time fact about the ADDRESS WORD, not the KV: this group's rope ops address
+    /// their cos/sin sources through the route's logical slot, and the runtime must install
+    /// that slot word as the parity-shifted Activation base (see `launch_site` in
+    /// `superdsc_exec`). `None` for the overwhelming majority of groups.
+    ///
+    /// Carried here, beside the other baked launch facts, for the same reason they are: the
+    /// route is decided by the LAYOUT at bake time and invisible from the session, and the
+    /// group (not the op) is the unit the runtime launches.
+    pub parity: Option<crate::bundle_code::ParityRoute>,
 }
 
 /// The session state the arithmetic reads.

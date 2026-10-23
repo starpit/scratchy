@@ -916,6 +916,7 @@ mod tests {
             offset: 0,
             size: 64,
             is_logits: false,
+            parity: None,
         };
         // Everything placed ⇒ nothing unplaced.
         let full = BundleLayout {

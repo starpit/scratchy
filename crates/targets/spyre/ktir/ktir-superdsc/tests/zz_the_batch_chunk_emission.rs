@@ -423,6 +423,7 @@ fn a_batch_chunk_mask_past_its_placement_is_refused_at_bake() {
                     offset: (i as u64) << 30,
                     // tid 6 is the prefix mask (`names[5]` below).
                     size: if tid == 6 { mask_bytes } else { 1 << 30 },
+                    parity: None,
                 },
             );
         }

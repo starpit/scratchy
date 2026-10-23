@@ -10003,6 +10003,7 @@ fn placement_tokens(
         offset,
         size,
         is_logits,
+        parity,
     } = p;
     let id = place_id_tokens(id);
     let (segment, bank, offset, size) = (
@@ -10011,10 +10012,33 @@ fn placement_tokens(
         proc_macro2::Literal::u64_unsuffixed(*offset),
         proc_macro2::Literal::u64_unsuffixed(*size),
     );
+    // The rope ping-pong's route, or its absence — `None` for every placement that is not a
+    // rope source, which is every placement of every bundle that places none.
+    let parity = match parity {
+        Some(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::ParityRoute {
+                slot,
+                backing,
+                stride,
+            },
+        ) => {
+            let (slot, backing, stride) = (
+                proc_macro2::Literal::u32_unsuffixed(*slot),
+                proc_macro2::Literal::u32_unsuffixed(*backing),
+                proc_macro2::Literal::u64_unsuffixed(*stride),
+            );
+            quote! {
+                ::std::option::Option::Some(::scratchy_target_spyre::bundle_code::ParityRoute {
+                    slot: #slot, backing: #backing, stride: #stride,
+                })
+            }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
     quote! {
         ::scratchy_target_spyre::bundle_code::Placement {
             id: #id, segment: #segment, bank: #bank, offset: #offset, size: #size,
-            is_logits: #is_logits,
+            is_logits: #is_logits, parity: #parity,
         }
     }
 }
@@ -10214,6 +10238,7 @@ fn launch_tokens(
         batched_requests,
         gathered,
         fold_rows,
+        parity,
     } = kv;
     let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
@@ -10223,6 +10248,29 @@ fn launch_tokens(
         *slot_offset,
     ]
     .map(proc_macro2::Literal::u32_unsuffixed);
+    // The rope ping-pong's route for this group — `None` for every group that reads no
+    // parity placement.
+    let parity = match parity {
+        Some(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::ParityRoute {
+                slot: p_slot,
+                backing: p_backing,
+                stride: p_stride,
+            },
+        ) => {
+            let (p_slot, p_backing, p_stride) = (
+                proc_macro2::Literal::u32_unsuffixed(*p_slot),
+                proc_macro2::Literal::u32_unsuffixed(*p_backing),
+                proc_macro2::Literal::u64_unsuffixed(*p_stride),
+            );
+            quote! {
+                ::std::option::Option::Some(::scratchy_target_spyre::bundle_code::ParityRoute {
+                    slot: #p_slot, backing: #p_backing, stride: #p_stride,
+                })
+            }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
     let fold_rows = match fold_rows {
         scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::FoldRows::WholeBatch => {
             quote! { ::scratchy_target_spyre::bundle_code::FoldRows::WholeBatch }
@@ -10258,6 +10306,7 @@ fn launch_tokens(
                 batched_requests: #batched_requests,
                 gathered: #gathered,
                 fold_rows: #fold_rows,
+                parity: #parity,
             },
             programs: ::std::borrow::Cow::Borrowed(&[#(#progs),*]),
             init_binary: #image,

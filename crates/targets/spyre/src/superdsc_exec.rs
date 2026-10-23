@@ -118,6 +118,17 @@ pub struct PageSlots(pub i64);
 /// An ABSOLUTE sequence position — how many positions are already resident for this forward.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SeqPos(pub i64);
+
+/// ⭐ THE ROPE PARITY (#603 PR3b E) — the ONE function both halves of the ping-pong consult, so
+/// the writer and the reader can never disagree. Position `p`'s rope rows live in slot
+/// `p % 2` of their placement: the decode window's run-ahead upload for position `p` writes
+/// that slot (`stage_bound_activations`), and the canvas launched at `p` reads it
+/// (`launch_site`'s slot override). With one step of run-ahead the writer is always in the
+/// OTHER parity's slot, which is the whole fix — so any third reader of this fact must come
+/// through here too, never re-derive `pos % 2` at its own call site.
+pub(crate) fn step_parity(pos: SeqPos) -> u64 {
+    pos.0.rem_euclid(2) as u64
+}
 /// How many NEW positions one forward appends.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NewTokens(pub i64);
@@ -634,6 +645,10 @@ impl OpProg {
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
                 gathered: kv.gathered,
+                // ⭐ THE ROPE PARITY ROUTE (#603 PR3b E) — the group's slot-word override fact,
+                // carried from the bake to `launch_site`, which installs the parity-shifted
+                // Activation base at `route.slot`.
+                parity: kv.parity,
             },
         }
     }
@@ -1735,7 +1750,21 @@ impl Executor {
     /// The placement checks the refill makes for a `bound` activation are made here instead, where
     /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
     /// bind longer than its own placement, or past its segment's shadow, is refused.
-    pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
+    ///
+    /// ⭐ THE WRITE LANDS IN THE STEP'S PARITY SLOT (#603 PR3b E): a parity-routed tensor's
+    /// conversion goes straight into `[offset + parity·stride, +len)` — the slot this step's
+    /// upload sends and this step's canvas reads. The parity arrives as a parameter because the
+    /// bind loop knows the step's position and this function must not guess it; both derive it
+    /// through [`step_parity`], the one law, so the bytes and the run can never disagree. The
+    /// parity-0 slot keeps the PREVIOUS even step's bytes in the host shadow — which is what
+    /// makes the 4 KiB alignment bleed of the parity-1 run harmless: it re-sends bytes the
+    /// device already holds (see `h2d_run`).
+    pub fn bind_input_f32(
+        &mut self,
+        id: bundle::PlaceId,
+        vals: &[f32],
+        parity: u64,
+    ) -> Result<()> {
         if !self.prepared {
             bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
         }
@@ -1751,17 +1780,19 @@ impl Executor {
             return Ok(());
         };
         let len = vals.len() as u64 * 2;
-        if len > p.size {
+        let pshift = p.parity.map_or(0, |r| parity * r.stride);
+        if pshift + len > p.size {
             bail!(
-                "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
-                 REFUSING, this would corrupt the following tensors",
+                "bind: activation '{id}' binds {len} B at parity shift {pshift} into a {} B \
+                 placement (seg{} off {}) — REFUSING, this would corrupt the following tensors",
                 p.size,
                 p.segment,
                 p.offset
             );
         }
+        let off = p.offset + pshift;
         let dst = self.seg_host[seg.get()]
-            .get_mut(p.offset as usize..(p.offset + len) as usize)
+            .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", p.segment))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
         self.raw_ids.remove(&id);
@@ -1837,7 +1868,10 @@ impl Executor {
             );
         }
         self.bind_input_keyed(id, key, bytes)?;
-        let (_, sent) = self.refill_activations(Diag::get())?;
+        // Parity 0: a keyed tensor is a CONSTANT under its key — position-independent bytes —
+        // so it is never a rope source (whose rows change every position), and its staging
+        // must fill the placement's row 0 exactly as the readers of a fresh canvas find it.
+        let (_, sent) = self.refill_activations(Diag::get(), 0)?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("stage_keyed('{id}'): sync: {e}"))?;
@@ -4362,7 +4396,7 @@ impl Executor {
         // allocations live on the runtime either way.
         let t_stream0 = Instant::now();
         let t0 = t_stream0;
-        let (h2d_note, h2d_bytes) = self.refill_activations(d)?;
+        let (h2d_note, h2d_bytes) = self.refill_activations(d, step_parity(seq_pos))?;
         let t0b = Instant::now();
         if d.phase_time {
             let _ = self.stream_ref()?.synchronize();
@@ -4792,8 +4826,12 @@ impl Executor {
         timers().rb_seq.clear();
 
         // (1) The shared staging half — the binds sen-converted into `seg_host` at
-        // their placements, and the merged-run plan per dirty segment.
-        let staged = self.stage_bound_activations(d)?;
+        // their placements, and the merged-run plan per dirty segment. The step's
+        // parity comes from its own absolute position (`step_parity`): the canvas
+        // this staging feeds launches at the same position, so the two halves of the
+        // rope ping-pong — this upload and the launch's slot word — agree by
+        // construction.
+        let staged = self.stage_bound_activations(d, step_parity(seq_pos))?;
 
         // (2) The snapshot + upload, from this step's OWN copies. A whole-segment plan
         // is REFUSED, not fallen back to: the window's per-step staging is bounded by
@@ -4973,7 +5011,16 @@ impl Executor {
     /// ([`Self::window_step`]). Weights (seg1) and KV (seg2) stay RESIDENT — never
     /// re-uploaded, which is the whole perf point. No H2D, no stream: pure host work, so
     /// the window can upload each step's runs from that step's OWN copy of the bytes.
-    fn stage_bound_activations(&mut self, d: &Diag) -> Result<StagedActivations> {
+    fn stage_bound_activations(&mut self, d: &Diag, parity: u64) -> Result<StagedActivations> {
+        // ⭐ THE ROPE PARITY SHIFT (#603 PR3b E): a parity-routed tensor's bytes for the step
+        // being staged live at `offset + parity·stride` — the other slot of the ping-pong. The
+        // canvas reads the same slot through `launch_site`'s slot-word override; both sides
+        // derive the parity from the step's absolute position through [`step_parity`], the one
+        // function that knows the law, so the writer and the reader cannot disagree. For every
+        // non-routed tensor the shift is 0 and the staging is byte-identical to before.
+        let parity_shift = |p: &Placement| -> u64 {
+            p.parity.map_or(0, |r| parity * r.stride)
+        };
         // ⛔ A WHOLE-SEGMENT H2D IS THE O(cap) DECODE CLIFF. seg3 is 8425 KB and a bs=8 decode step
         // writes a small fraction of it, so nearly every byte uploaded is unchanged — a flat
         // ~1.5 ms no amount of shrinking the mask could reach, because the transfer is sized by the
@@ -5007,22 +5054,25 @@ impl Executor {
             // vs an [mq_pad,hd] bind zeroed the fp8 clamp constants at mq_pad=128 and made every
             // fp8 projection emit 0 (all-zero prefill KV, fluent but off-topic output). MUST be `>`
             // and not `!=`: several activations legitimately bind LESS than their placement (pmask
-            // reserves [nqh*mq, cap] but binds a single broadcast row).
-            if src.len() as u64 > p.size {
+            // reserves [nqh*mq, cap] but binds a single broadcast row). For a parity-routed tensor
+            // the write lands at the parity shift, so the guard bounds the SHIFTED window — the
+            // placement's size carries the stride growth for exactly this check.
+            let pshift = parity_shift(p);
+            if pshift + src.len() as u64 > p.size {
                 bail!(
-                    "predict: activation '{nm}' binds {} B into a {} B placement (seg{} off {}) — \
-                     REFUSING, this would corrupt the following tensors",
+                    "predict: activation '{nm}' binds {} B at parity shift {pshift} into a {} B \
+                     placement (seg{} off {}) — REFUSING, this would corrupt the following tensors",
                     src.len(),
                     p.size,
                     p.segment,
                     p.offset
                 );
             }
-            if p.offset as usize + src.len() > self.seg_host[seg.get()].len() {
+            if p.offset as usize + pshift as usize + src.len() > self.seg_host[seg.get()].len() {
                 bail!("predict: activation '{nm}' overflows seg{}", p.segment);
             }
             seg_dirty[seg.get()] = true;
-            seg_runs[seg.get()].push(h2d_run(p.offset, src.len() as u64));
+            seg_runs[seg.get()].push(h2d_run(p.offset + pshift, src.len() as u64));
             if d.phase_time {
                 eprintln!(
                     "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB",
@@ -5042,13 +5092,14 @@ impl Executor {
             let Some(seg) = SegIdx::checked(p.segment as i64) else {
                 continue;
             };
+            let pshift = parity_shift(p);
             seg_dirty[seg.get()] = true;
-            seg_runs[seg.get()].push(h2d_run(p.offset, len));
+            seg_runs[seg.get()].push(h2d_run(p.offset + pshift, len));
             if d.phase_time {
                 eprintln!(
                     "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB (converted at bind)",
                     p.segment,
-                    p.offset,
+                    p.offset + pshift,
                     len as f64 / 1048576.0
                 );
             }
@@ -5069,7 +5120,9 @@ impl Executor {
             let Some(seg) = SegIdx::checked(p.segment as i64) else {
                 continue;
             };
-            let dst = &mut self.seg_host[seg.get()][p.offset as usize..][..src.len()];
+            let pshift = parity_shift(p) as usize;
+            let off = p.offset as usize + pshift;
+            let dst = &mut self.seg_host[seg.get()][off..][..src.len()];
             // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
             // pairs; for the gather's int32 index table that rewrites every entry into a different
             // valid block number. See [`Self::raw_ids`].
@@ -5113,8 +5166,8 @@ impl Executor {
     /// H2D before the next step's binds overwrite the staging. The decode window's step
     /// stages the SAME plan and uploads each step's runs from that step's OWN copy
     /// instead ([`Self::window_step`] states the race).
-    fn refill_activations(&mut self, d: &Diag) -> Result<(String, u64)> {
-        let staged = self.stage_bound_activations(d)?;
+    fn refill_activations(&mut self, d: &Diag, parity: u64) -> Result<(String, u64)> {
+        let staged = self.stage_bound_activations(d, parity)?;
         let mut note = String::new();
         let mut total = 0u64;
         for i in 0..NUM_SEGMENTS {
@@ -5622,7 +5675,9 @@ impl Executor {
         if !self.prepared {
             bail!("run_prefix_only before prepare");
         }
-        self.refill_activations(Diag::get())?;
+        // Parity 0: the selftest renders at SeqPos(0), and `step_parity(SeqPos(0))` is 0 —
+        // the staging and the launch below agree through the same law.
+        self.refill_activations(Diag::get(), step_parity(SeqPos(0)))?;
         let zero = [0u64; NUM_SEGMENTS];
         let (sel, bank) = match self.rolled.as_ref() {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
@@ -5645,7 +5700,9 @@ impl Executor {
         if self.rolled.is_none() {
             return Ok(false);
         }
-        self.refill_activations(Diag::get())?;
+        // Parity 0, for the same reason as `run_prefix_only`: the launch below is at
+        // SeqPos(0).
+        self.refill_activations(Diag::get(), step_parity(SeqPos(0)))?;
         self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
         self.stream_ref()?
             .synchronize()
