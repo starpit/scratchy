@@ -238,6 +238,57 @@ impl KtKernelPitch {
     }
 }
 
+/// THE V VALUE KERNEL'S DECLARED ROW EXTENT (`Stk::kernel`'s `k_in`) — WHICH V plane the value
+/// leg's shared kernel reads, carried as the type. Exactly two planes are ever that kernel, and
+/// each is a door:
+///
+/// - [`VKernelRows::Page`] — the resident V page plane `[PAGE_SLOTS, hd]`, and the gathered
+///   scratch's byte-for-byte copy of it (a scratch row IS a page row — the copy is the gather's
+///   own contract — so the scratch's row extent is the pool's own page slots on both the gathered
+///   and ungathered paths).
+/// - the NEW block's wide stream ([`VKernelRows::of_new_block_stream`]) — never restickified, so
+///   the sub-block value leg declares its per-head slice `[hd, hd]`.
+///
+/// ⭐ THE GATHERED VALUE LEG REFUSES EVERY PLANE BUT THE PAGE. Its scratch rows are page rows, so
+/// a window's or a stream's extent there would declare a stick-group stride the buffer does not
+/// have — the exact defect that once made the gathered geometry differ from the pool's (the
+/// gathered arms "used to declare ONE WINDOW … where the pool declares a whole page"). The
+/// refusal sits at the arm's door; the ungathered arms take either plane. A bare `u32` in that
+/// slot — as this was, fed the head dim at the new-block call — pairs any number with any plane,
+/// and the pairing is invisible exactly where the two agree.
+/// ```
+/// use ktir_superdsc::sdsc_abstract::{PagedKvPool, VKernelRows};
+/// // The page plane's rows are the pool's own page slots — and nothing else's number.
+/// assert_eq!(VKernelRows::Page.rows(), PagedKvPool::PAGE_SLOTS as u32);
+/// // A new-block stream of the SAME row count is still not the page plane: the pairing the
+/// // gathered value leg refuses was inexpressible as a bare `u32`, where 256 == 256.
+/// assert_ne!(VKernelRows::Page, VKernelRows::of_new_block_stream(PagedKvPool::PAGE_SLOTS as u32));
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VKernelRows {
+    /// The resident V page plane — and the gathered scratch's byte-for-byte copy of it.
+    Page,
+    /// The new-token block's unrestickified wide stream, its per-head slice declared `hd` rows.
+    NewBlockStream(u32),
+}
+
+impl VKernelRows {
+    /// The NEW block's door: its V operand keeps the wide `[*, nkvh·hd]` stream (never
+    /// restickified — unlike its Kᵗ twin, which compacts into `[nkvh, hd, mq_pad]`), and the
+    /// sub-block value leg declares the per-head slice's rows as the head dim.
+    pub const fn of_new_block_stream(hd: u32) -> VKernelRows {
+        VKernelRows::NewBlockStream(hd)
+    }
+
+    /// The plane's own row extent — `Stk::kernel`'s `k_in` slot.
+    pub const fn rows(self) -> u32 {
+        match self {
+            VKernelRows::Page => PagedKvPool::PAGE_SLOTS as u32,
+            VKernelRows::NewBlockStream(n) => n,
+        }
+    }
+}
+
 /// THE Kᵀ RESTICKIFY TILE'S SLOT EXTENT — how many slots one `assemble_restickify_kt_2d` tile
 /// re-sticks (the natural `[slots, feats]` rows in, the Kᵀ `[feats, slots]` columns out). Exactly
 /// two tiles exist and each is a door: one row window of the NEW block (whose rows ARE its slots —

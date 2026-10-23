@@ -800,7 +800,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // finished address by the caller.
     kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
     v_kernel: &str,
-    v_stride: u32,
+    // The V kernel's own row extent — WHICH plane the value legs read, with the gathered arm
+    // refusing every plane but the page. The K-side twin (`kt_stride: KtKernelPitch`) was already
+    // typed; this sat as a bare `u32` fed the head dim at the new-block call — a head-dim fact
+    // standing in a plane-rows slot, coincident only where `hd` is one stick.
+    v_stride: crate::sdsc_abstract::VKernelRows,
     // Takes (query head, head-dim slab): the slab is a coordinate on the V operand's own nest,
     // so it is applied INSIDE the law rather than added to a finished address by the caller. That
     // addition was the last place in this file where a stride was composed by hand.
@@ -1522,6 +1526,20 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
             .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
         let gqa = nqh / nkvh_nz.get();
+        // ⭐ THE GATHERED SCRATCH IS THE PAGE PLANE, BYTE FOR BYTE — so its kernel rows are the
+        // pool's own page slots and no other plane's extent. The type refuses the pairing here, at
+        // the arm's door, rather than trusting the caller to have passed the page fact: a window
+        // or a stream extent here once declared a stick-group stride the scratch does not have.
+        let v_rows = match v_stride {
+            crate::sdsc_abstract::VKernelRows::Page => crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS,
+            crate::sdsc_abstract::VKernelRows::NewBlockStream(n) => {
+                return Err(SuperDscError(format!(
+                    "the gathered value leg reads the V scratch — a byte-for-byte copy of the \
+                     page plane — so its kernel rows are the pool's own page slots; a new-block \
+                     stream of {n} row(s) is not a plane any gathered op addresses"
+                )))
+            }
+        };
         // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
         // the ungathered batched arm below already makes, for the same reason.
         //
@@ -1577,11 +1595,12 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         bmm_form,
                         &rb(expb, rows_n, width_n),
                         rn.score_rows(h0, width),
-                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS NOW THE PAGE — the scratch
-                        // row is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
-                        // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE
-                        // WINDOW, which is what made the gathered geometry differ from the pool's at all.
-                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
+                        // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS THE PAGE — the scratch
+                        // row is a byte-for-byte copy of the V page plane, so `v_rows` (the page
+                        // rows the match above refused everything else to obtain) is the pool's own
+                        // `PAGE_SLOTS`. It used to be ONE WINDOW, which is what made the gathered
+                        // geometry differ from the pool's at all.
+                        &Stk::<KernelTag>::kernel(v_rows, HD as usize, v_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
                         &rb(run_o, rows_n, hd),
                         rn.head_major(h0, s),
@@ -1669,7 +1688,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // `fold_request_axis_strides.rs` off the emitted per-core addresses.
                         &rb(expb, rows_n, width_n),
                         nests.score_rows(h0, width),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
                         // ⛔ THE SAME PLACEMENT THE PER-HEAD ARM BELOW WRITES. Both arms produce this
                         // buffer, and they used to answer "where does head `h` live" differently — this
@@ -1710,7 +1729,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         bmm_form,
                         &rb(expb, rows_n, width_n),
                         nests.score_rows(h0, width).off(),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
                         &rb(run_o, rows_n, hd),
                         nests.head_major(h0, s),
@@ -1787,7 +1806,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(expb, rows_n, width_n),
                     nests.score_rows(hi, width).off(),
-                    &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
+                    &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                     v_off_fn(h, s),
                     &rb(run_o, rows_n, hd),
                     nests.head_major(hi, s),
@@ -4320,7 +4339,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // was missing for kvh>=1.
                 // V rows `[j*stick, (j+1)*stick)` on top of the kv-head base — the prefix side's `b*stick*hd`.
                 new_v,
-                hd,
+                // The wide stream's own per-head slice, declared `HD` rows — the door that names
+                // this fact, where a bare `u32` let the head dim stand in a plane-rows slot. The
+                // const, not the runtime `hd`: this call sits inside `assemble_attn`'s own
+                // geometry threading, so the door takes the same const the ladder carries.
+                crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
                 |h, sl| {
                     let hi = h.get();
                     // `new_v_rep` keeps the wide `[mq, nkvh*hd]` shape RoPE packed, so the kv head is a
@@ -4813,7 +4836,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         Some(_) => gv.as_str(),
         None => vc,
     };
-    let v_pitch = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
+    // The resident plane's own row extent, NAMED as the page fact it is — the same door the
+    // Kᵗ side takes through `KT_KERNEL_PITCH`, so a window's or a stream's extent cannot reach
+    // this slot even where the number coincides.
+    let v_pitch = crate::sdsc_abstract::VKernelRows::Page;
     // Windows ONE launch folds. `active_cap` is the sk_bucket rung as before, and the page equals the
     // pre-paged capacity, so this is bit-for-bit the baseline's fold; contexts past one page cost
     // additional LAUNCHES of this same group, never a wider sweep. The `active_cap / 64` lives in
