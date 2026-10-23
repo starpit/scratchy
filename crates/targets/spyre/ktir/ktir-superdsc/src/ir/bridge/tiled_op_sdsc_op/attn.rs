@@ -4505,7 +4505,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     };
                     if per_req { format!("{b}_r{r}") } else { b }
                 };
-                let kt_off = |h, sl| {
+                let kt_off = |h: crate::sdsc_abstract::QueryHead, sl: u32| {
                     let hi = h.get();
                     // `new_kt` is nkvh separate `[hd, mq_pad]` blocks — a block index over the block's own
                     // footprint, plus this row window's slot-stick plane inside it (the MqPad rows/slots
@@ -4525,7 +4525,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .slab_of::<crate::addr::Feat>(sl)
                         .dev()
                 };
-                let v_off = |h, sl| {
+                let v_off = |h: crate::sdsc_abstract::QueryHead, sl: u32| {
                     let hi = h.get();
                     // `new_v_rep` keeps the wide `[mq, nkvh*hd]` shape RoPE packed, so the kv head is a
                     // COLUMN there, not a block; the row window `j` rides on top.
