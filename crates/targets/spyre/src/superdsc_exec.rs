@@ -3288,7 +3288,12 @@ impl Executor {
             else {
                 continue;
             };
-            let abs = byte_off[SEG_KV.get()] + where_.kv_page_base.0 + delta.kv.0;
+            let abs = byte_off[SEG_KV.get()] + delta.kv.0;
+            // ⛔ NOT `+ where_.kv_page_base`: `nonfold_page_delta` already RETURNS the caller's
+            // base as the delta (fold_plan.rs `Some(caller_base)` — the solo arm), so the walk
+            // composes the base exactly ONCE (`off = byte_off; off[seg] += delta.kv`). Adding
+            // `kv_page_base` on top double-counted it and printed page 2 for a page-1 write —
+            // chatG's pg1/pg2 windows caught the instrument, not the launch (pg2 never written).
             let pg = if stride > 0 { (abs / stride) as i64 } else { -1 };
             if !pages.contains(&pg) {
                 pages.push(pg);
@@ -3337,8 +3342,8 @@ impl Executor {
         // rolled body re-launches per layer, so the line is keyed on the write slot + the DISTINCT
         // target pages and only prints when that key moves). The aim is the SAME `seg_deltas` the
         // walk calls, never a re-derivation: the page each slot-write lands in is
-        // `(byte_off_kv + kv_page_base + delta.kv) / page_stride` — the in-segment offset divided
-        // by the bytes-per-page the session declared.
+        // `(byte_off_kv + delta.kv) / page_stride` — the caller's page base arrives ONCE, inside
+        // the delta (`nonfold_page_delta` returns it), never as a separate addend.
         if d.segaddr {
             if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages)
             {
