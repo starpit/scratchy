@@ -1872,7 +1872,7 @@ pub(crate) fn superdsc_forward_chunk(
                 ahead,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, crate::error::ExecutorError>>()?;
     for (i, sc) in scaffold.iter().enumerate() {
         // ⭐ THE TOKEN THIS STEP FEEDS — the committed one at position `start` for step
         // 0, and NOTHING for a window's ahead-steps: their token ids exist only on the
