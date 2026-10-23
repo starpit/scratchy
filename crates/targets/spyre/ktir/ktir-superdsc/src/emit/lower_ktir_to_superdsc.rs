@@ -1432,24 +1432,29 @@ pub fn elementwise(
             ins.len(),
         ));
     }
-    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS PLACE ONLY THE CORNER THEIR ONE CORNERED OPERAND MODE
+    // ⛔⛔⛔ THE BROADCAST AND PER-ROW ARMS PLACE ONLY THE CORNERS THEIR CORNERED OPERAND MODES
     // CAN STATE. A broadcast operand is addressed at its OWN extent (`In::col`: one lane per row;
     // `In::mb`: one row of values) and the per-row chain writes LANE 0 of a one-stick output at
     // the buffer base — neither form can state "columns `[c_start, c_start+c_len)` of a wider
     // stick-blocked tensor" (what a column-blocked chunk is) nor "rows `[r_start, r_start+r_len)`
-    // of a taller one" (what a banded program's window is). The ONE exception is the Mb mode's
-    // own cornered form: an Mb-broadcast source at a whole-stick COLUMN corner of its flat frame
-    // is the per-block slice shape (`In::mb_at` — the card-proven prefix-mask law, one
-    // stick-wide block at a time), and that operand carries its corner into the descriptor. So a
-    // corner is legal on an Mb-flagged operand's COLUMN and NOWHERE ELSE in these arms — the
-    // output, any ROW corner, and any corner on a dense/Col/Y operand or in the per-row chain
-    // are producer shapes this door refuses BY NAME rather than mis-addressing (the same
+    // of a taller one" (what a banded program's window is). TWO cornered forms are legal: the Mb
+    // mode's own — an Mb-broadcast source at a whole-stick COLUMN corner of its flat frame, the
+    // per-block slice shape (`In::mb_at` — the card-proven prefix-mask law, one stick-wide block
+    // at a time) — and the Y mode's own — a row-split source at a per-trip ROW window of a
+    // region-stated view, the prefill mask (`In::y_at`): the source is single-stick by the frame
+    // law, so the window's row corner composes additively with the mb-row addressing. Each
+    // carries its corner into the descriptor, and the broadcast extent check inside
+    // [`elementwise_broadcast`] still refuses a window whose shape the mode cannot address — the
+    // exemptions here are placement facts, not shape admissions. Everything else — the output,
+    // any corner on a dense/Col operand, a Y corner off column 0, any corner in the per-row
+    // chain — is a producer shape this door refuses BY NAME rather than mis-addressing (the same
     // contract `base_addressed` states for a row corner on every other body). The DENSE arm
     // below carries both corners; this guard is what keeps the others from silently dropping
     // them.
     let corner_unplaceable = |i: usize, x: &Region| {
         (x.c_start != 0 || x.r_start != 0)
             && !(matches!(bcast.get(i), Some(Some(BcastAxis::Mb))) && x.r_start == 0)
+            && !(matches!(bcast.get(i), Some(Some(BcastAxis::Y(_)))) && x.c_start == 0)
     };
     if (bcast.iter().any(Option::is_some) || out.c_len == 1)
         && (out.c_start != 0
@@ -1479,10 +1484,11 @@ pub fn elementwise(
              arm this shape routes to (a broadcast operand or the per-row one-stick chain) \
              addresses its operands at the BUFFER BASE or at a broadcast mode — the one corner \
              those arms can place is a COLUMN window on an Mb-broadcast source (`In::mb_at`, the \
-             per-block slice law), which this operand is not. A column-blocked chunk or a banded \
+             per-block slice law) or a row window on a Y-broadcast source (`In::y_at`, the \
+             per-trip mask law), which this operand is not. A column-blocked chunk or a banded \
              window is DENSE elementwise; the dense arm carries both corners, so give the \
              broadcast/per-row chains whole-tensor regions (or an Mb source a whole-stick column \
-             window).",
+             window, or a Y source a row window at column 0).",
         ));
     }
     if bcast.iter().any(Option::is_some) {
