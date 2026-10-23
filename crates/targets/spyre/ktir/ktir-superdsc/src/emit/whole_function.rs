@@ -2481,10 +2481,28 @@ fn windowed_region(k: &KtirNode, mut r: Region, tile: &Operation<'_>) -> Result<
 
 /// The rows a banded op's minted intermediate must hold: a WINDOWED input's band (`r_len`), or
 /// `logical` when every input is whole-view. See the mint's own doc for the full argument.
-fn band_rows_of(ins: &[Region], logical: u32) -> u32 {
+///
+/// ⛔⭐⭐⭐ A BROADCAST OPERAND's WINDOW IS NOT A BAND THE OP SWEEPS, so it states nothing here.
+/// The band law reads the sweep off an input the op addresses ROW BY ROW — a dense operand of a
+/// banded program (the per-core uniform rope copy). A broadcast operand is addressed at its
+/// MODE's own extent, never at the output's rows: `Col` one lane per row, `Mb` one row once,
+/// and `Y` one spray's worth (`rows/y`) at a per-trip window whose corner rides `In::y_at` —
+/// the prefill mask law, where the window is exactly the thing that is NOT the sweep (the op
+/// sweeps the output's whole `[B·mq, 64]` while the mask window holds one `[mq, 64]` slice).
+/// Reading the band off a broadcast operand mints the output at the SOURCE's window height and
+/// refuses the dense operand beside it as an extent mismatch. MEASURED (wall 18, build 9, the
+/// granite-2b prefill re-roll at `prefill_mq=256`): the fold statement threads the ladder's
+/// 8-page region into every rung's mask view (`[8192, 64]`) while the one-shot twin's own
+/// 1-page walk hulls its load windows to `(0, 1024)` — the mask became the first "banded"
+/// input, the add's output minted at the mask window's `[256, 64]`, and qk (`[8192, 64]`,
+/// dense) was refused against it. `bcast` is indexed by input position exactly as `ins` is
+/// ([`lower_function`]'s region loop pushes one region per `in_values` entry in order); the
+/// gathered-index regions appended past the inputs have no flag and keep the verbatim law.
+fn band_rows_of(ins: &[Region], bcast: &[Option<BcastAxis>], logical: u32) -> u32 {
     ins.iter()
-        .find(|x| x.r_cover != (0, x.v_rows))
-        .map_or(logical, |x| x.r_len)
+        .enumerate()
+        .find(|(i, x)| bcast.get(*i).is_none() && x.r_cover != (0, x.v_rows))
+        .map_or(logical, |(_, x)| x.r_len)
 }
 
 /// ⭐⭐⭐⭐⭐ THE ROW SWEEP A RANK-2 RESULT RESPELLS — `None` keeps the stated shape verbatim.
@@ -4248,14 +4266,18 @@ pub fn lower_function(
             // positions), but [`windowed_region`] resolves each operand as the BAND (`[1024, 64]`
             // — the launch's own tiles, flush), and the op sweeps the band: a mint at the tile's
             // height would be a buffer the emission overruns by `positions − 1` tiles on every
-            // core past the first. The band is read off the inputs the same way
-            // [`pointwise_rows`] reads the sweep off the output — a WINDOWED input states it as
-            // its `r_len` — while a function whose inputs are all whole-view keeps the result
-            // type's own rows, so every mint this door has ever made is byte-identical. (A chain
-            // whose every input is a minted band intermediate states no windowed input; its mint
-            // stays at the tile and the extents law refuses the sweep mismatch by name — refused
-            // at the op that could have extended it, not silently mis-sized.)
-            let dims = [band_rows_of(&per_op, dims[0]), dims[1]];
+            // core past the first. The band is read off the DENSE inputs the same way
+            // [`pointwise_rows`] reads the sweep off the output — a WINDOWED dense input states
+            // it as its `r_len` — while a function whose inputs are all whole-view keeps the
+            // result type's own rows, so every mint this door has ever made is byte-identical.
+            // (A chain whose every input is a minted band intermediate states no windowed input;
+            // its mint stays at the tile and the extents law refuses the sweep mismatch by name —
+            // refused at the op that could have extended it, not silently mis-sized.) ⛔ AND A
+            // BROADCAST OPERAND DOES NOT STATE THE BAND even when its region is windowed: its
+            // mode addresses it at the mode's own extent (`Col` a lane per row, `Mb` one row,
+            // `Y` one spray at a per-trip window), so its `r_len` is the source's slice height,
+            // never the sweep — [`band_rows_of`]'s own law, with the wall-18 measurement.
+            let dims = [band_rows_of(&per_op, &bcast_axes, dims[0]), dims[1]];
             let Some(layout) = layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
