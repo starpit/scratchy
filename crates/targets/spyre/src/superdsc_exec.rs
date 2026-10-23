@@ -22,8 +22,7 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use flex_rs::address::RegionId;
-use flex_rs::memory_region::{DomainId, MemoryType};
+use flex_rs::memory_region::MemoryType;
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
@@ -33,8 +32,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCompute, ByteOffset, ByteSize, Chunk0, ComputeWireBatch, ControlBlockWire, DevAddr,
-    HwError, Stream,
+    BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
+    Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -950,7 +949,7 @@ struct TensorDump {
     /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
     snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
     /// Last-seen bytes per POOL WINDOW (see the LEG-2 watch in [`Executor::tensordump`]), in the
-    /// fixed order the watch builds them: pg1, pg2, baked. `None` until first read.
+    /// fixed order the watch builds them: pg1, pg2. `None` until first read.
     wins: Vec<Option<Vec<u8>>>,
 }
 
@@ -4049,7 +4048,7 @@ impl Executor {
                 prog,
                 op: 0,
                 snap: std::collections::HashMap::new(),
-                wins: vec![None; 3],
+                wins: vec![None; 2],
             });
         }
         let _ = self.stream_ref()?.synchronize();
@@ -4139,31 +4138,30 @@ impl Executor {
         // ── LEG-2: the pool windows NO PLACEMENT NAMES. The placement watch above covers page 0 of
         // seg2 only (the one-page host shadow), but the paged KV path lives at page 1 (the
         // request's block — the gather's read target) and page 2 (the doubled base the LEG-1 aim
-        // line pinned as the cachewr target), and the emitter's own baked plan addresses seg2 at
-        // SEGMENT_OFFSETS[2] — a 16 GiB region NO runtime allocation holds (the runtime's pool is
-        // its own region; whether any op honors the baked absolute is exactly what this settles).
-        // Three fixed 1 MiB windows (layer 0's K/V/Kt planes = 3 × 256 KiB, plus margin), same
-        // first-writer/change detection and file naming as the placements: a window whose content
-        // appears, moves or stays empty is a FACT about where the chunk KV landed, not an
-        // inference from page 0's leftovers.
+        // line pinned as the cachewr target). Two fixed 1 MiB windows (layer 0's K/V/Kt planes =
+        // 3 × 256 KiB, plus margin), same first-writer/change detection and file naming as the
+        // placements: a window whose content appears, moves or stays empty is a FACT about where
+        // the chunk KV landed, not an inference from page 0's leftovers.
+        //
+        // ⛔ NO BAKED-ABSOLUTE WINDOW, BY MEASUREMENT (chatG, 10-23): the emitter's own plan
+        // addresses seg2 at SEGMENT_OFFSETS[2] = 0x8_0000_0000, a 16 GiB region no runtime
+        // allocation holds — and the runtime CANNOT even address it: a D2H minted over that
+        // region is rejected by the DeviceAddressResolver ("could not resolve region"), and the
+        // rejection leaves a DEFERRED ERROR on the stream that refuses the next real launch. So
+        // baked absolutes are unrepresentable at runtime — the symbolic bundle's segbase + off
+        // decomposition is the only mechanism any op's addresses run under — and attempting the
+        // read kills the run. The window set therefore stops at the pool's own pages.
         let stride = self.fold.page_stride_bytes.0;
         if stride > 0 {
             if let Some(pool) = self.seg_addr[SEG_KV.get()].clone() {
                 const WIN: u64 = 1 << 20;
-                let baked = DevAddr::from_chunk(Chunk0 {
-                    region: RegionId(ktir_superdsc::wire::SEGMENT_OFFSETS[SEG_KV.get()]),
-                    offset: ByteOffset(0),
-                    size: ByteSize(WIN),
-                    domain: DomainId(0),
-                });
-                let wants: [(&str, Option<DevAddr>); 3] = [
+                let wants: [(&str, Option<DevAddr>); 2] = [
                     ("pg1", pool.window(ByteOffset(stride), ByteSize(WIN))),
                     ("pg2", pool.window(ByteOffset(2 * stride), ByteSize(WIN))),
-                    ("baked", Some(baked)),
                 ];
                 // Read every window BEFORE touching `dump` (the stream borrow and the dump borrow
                 // are disjoint phases, the same split `d2h_seg_clamped` makes).
-                let mut bufs: [Option<Vec<u8>>; 3] = [None, None, None];
+                let mut bufs: [Option<Vec<u8>>; 2] = [None, None];
                 for (bi, (_, waddr)) in wants.iter().enumerate() {
                     let Some(waddr) = waddr else {
                         continue; // a window past the pool's end — not addressable, nothing to read
