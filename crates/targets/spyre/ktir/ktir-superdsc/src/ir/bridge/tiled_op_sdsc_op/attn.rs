@@ -181,13 +181,17 @@ struct BlockBufs {
 /// prefix-block comment below). There is no window and no gap to express.
 /// The nests this block addresses through. Every extent an offset below is allowed to use comes from
 /// here, so a stride cannot be written at a call site — the caller names a coordinate and the nest
-/// supplies the arithmetic. `slabs` answers through the one `hd / lanes` law (`Shape::slabs_of`).
+/// supplies the arithmetic. `slabs` answers through the one `hd / lanes` law (`Shape::<HD>::slabs`).
+///
+/// ⭐ THE HEAD COUNT AND HEAD DIM ARE CONSTS, NOT FIELDS. Both were runtime re-spellings of the
+/// assembler's own geometry — `heads: nqh` at every construction this struct has ever had, `hd`
+/// the `HD` the assembler is instantiated at — the two-derivations defect: the count a nest framed
+/// its buffers with and the count the geometry states could drift apart, or be any model's. The
+/// struct carries them as const generics instead, so a nest cannot exist at a geometry its
+/// assembler was not instantiated at, and [`Self::slabs`] closes the file's last `slabs_of`
+/// runtime hatch by reading the const.
 #[derive(Clone, Copy)]
-struct BlockNests {
-    /// The head count this stream is WIDE in — nqh for the query side, nkvh for the kv side. Kept
-    /// explicitly rather than derived from `rows/mq`, because the two are independent quantities.
-    heads: u32,
-    hd: u32,
+struct BlockNests<const NQH: u32, const HD: u32> {
     /// The chunk's REAL query rows. Typed apart from `rows`, which it equals at nqh=1.
     mq: crate::sdsc_abstract::QueryRowCount,
     /// The ROW REGIME these nests frame the shared buffers with, carrying the extent that regime
@@ -253,7 +257,7 @@ impl BlockRows {
         }
     }
 }
-impl BlockNests {
+impl<const NQH: u32, const HD: u32> BlockNests<NQH, HD> {
     /// The ROW head `h` starts at, for the head-major buffer offsets — decided by the named row
     /// laws (`RequestHeadRow` / `HeadRequestRow`), the same laws `score_rows` mints its placements
     /// from, so neither order has a second spelling anywhere.
@@ -274,7 +278,7 @@ impl BlockNests {
             // Request-major: the pass is already rebased onto one request's block, so THAT request's
             // `nqh` rows are the contiguous ones — which is what makes `mb = gqa` legal here.
             BlockRows::PerRequest(_) => {
-                crate::sdsc_abstract::RequestHeadRow::of(self.req, h, self.heads).get()
+                crate::sdsc_abstract::RequestHeadRow::of(self.req, h, NQH).get()
             }
             // THE ONE ROW LAW, shared with the mask that says which of these rows are valid. Restating
             // `h * self.mq` here is what let the two drift.
@@ -290,7 +294,7 @@ impl BlockNests {
         Idx::<crate::addr::Row>::n(row)
     }
     fn slabs(&self) -> u32 {
-        crate::addr::Shape::<0, 0, 0, 0>::slabs_of(self.hd, crate::superdsc_opspec::Df::Fp16).get()
+        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get()
     }
     /// ⭐⭐⭐⭐⭐ THESE NESTS RE-BASED ONTO **ONE REQUEST** — the collapsed fold's per-request legs, in one
     /// coordinate change.
@@ -300,7 +304,7 @@ impl BlockNests {
     /// four laws asked for a different row. That is what makes a per-request OFFSET a substitute for a
     /// per-request kernel DIM — the shape the card refused — and what keeps the emitter's rows the same
     /// rows the mask's validity is staged into.
-    fn at_request(&self, r: u32) -> BlockNests {
+    fn at_request(&self, r: u32) -> BlockNests<NQH, HD> {
         BlockNests { req: r, ..*self }
     }
     /// Head-major `[nqh*mq, hd]` — the online-softmax buffers. Head `h`, slab `s`.
@@ -311,7 +315,7 @@ impl BlockNests {
     fn head_major(&self, h: u32, s: u32) -> crate::addr::DevOff {
         crate::addr::Nest::new(
             &["row", "feat"],
-            &[self.rows.extent(), self.hd],
+            &[self.rows.extent(), HD],
             crate::superdsc_opspec::Df::Fp16,
         )
         .view()
@@ -353,7 +357,7 @@ impl BlockNests {
     /// and the stick plane it lands in is the law's business, not the caller's.
     fn token_stream(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
         crate::sdsc_abstract::OperandPlacement::of_token_stream(
-            self.mq, self.heads, self.hd, h, self.req, s,
+            self.mq, NQH, HD, h, self.req, s,
         )
     }
     /// The same stream, for a walk that contracts ONE STICK per op — see
@@ -362,8 +366,8 @@ impl BlockNests {
     fn token_stream_by_slab(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
         crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
             self.mq,
-            self.heads,
-            self.hd,
+            NQH,
+            HD,
             h,
             self.req,
             s,
@@ -861,9 +865,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     let nqh_nz = std::num::NonZeroU32::new(nqh)
         .ok_or_else(|| SuperDscError("attention needs at least one query head".into()))?;
 
-    let nests = BlockNests {
-        heads: nqh,
-        hd,
+    let nests = BlockNests::<NQH, HD> {
         mq,
         rows,
         req,
@@ -5122,9 +5124,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The finalize nests address `token_stream`/`head_major` only. There is no score block here, so
     // there is no width to state: `score_rows` takes its width as a parameter, and a nest without a
     // score buffer simply cannot be asked that question.
-    let nests = BlockNests {
-        heads: nqh,
-        hd,
+    let nests = BlockNests::<NQH, HD> {
         mq: width.mq(),
         rows: BlockRows::WholeBatch(rows),
         req: 0,
