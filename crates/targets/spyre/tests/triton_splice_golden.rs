@@ -2285,6 +2285,7 @@ fn rmsnorm_recognizers_agree_on_the_shipped_programs() {
 /// (`rmsnormunit.py`, the head-norm sandwich's unit): one input, no gamma. t0 = x
 /// source, t1 = result. Eps is gemma-4's `1e-6` — the subnormal regime the DLF16
 /// landing exists for.
+#[cfg(feature = "spyre-emu")]
 fn rmsnormunit_ir(m: u32, c: u32) -> SubtileIR {
     let tensors = vec![
         TensorShape { rows: m, cols: c },
