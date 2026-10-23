@@ -936,12 +936,17 @@ pub(crate) enum AttnStepRows<'a> {
     /// chunked ladder's fold), or the solo decode's single row (the fold at `mq == 1`). Both
     /// bodies read the SAME region form — the padded pitch convergence law — so one arm stages
     /// both. `start`/`real` are the chunk's own facts (`real == 1` is the decode row), and `map`
-    /// is the sequence's logical→physical page map, the very map the launch installed.
+    /// is the sequence's logical→physical page map, the very map the launch installed. `real`
+    /// is [`std::num::NonZeroU32`] because the fold's seed-safety law — window (0, 0) always
+    /// holds a
+    /// valid lane for every query row, so the carry's −65504 seed never meets an all-masked
+    /// first window — is a THEOREM of `real ≥ 1` and `start ≥ 0`, not a runtime check (see
+    /// `ValidityMask`'s law in sdsc_abstract).
     Chunk {
         rows: scratchy_subtile::sdsc_abstract::ChunkRows,
         mq: scratchy_subtile::sdsc_abstract::RungWidth,
         start: usize,
-        real: usize,
+        real: std::num::NonZeroU32,
         map: Vec<i64>,
     },
     /// Separate requests: a decode batch (`batched_decode_hm`), whose rows are the rung's launch
@@ -1056,27 +1061,37 @@ pub(crate) fn fill_attn_step_inputs(
                      number of STICK BLOCKS — no integer index can name a page boundary"
                 ))
             })?;
-            let build = |what_plane: &str| {
-                sd::spliced_attn_ids_table(region, &map, ceiling).ok_or_else(|| {
+            // ⭐ THE THREE STEP INPUTS, MINTED BY ONE WALK of the region — id tables and validity
+            // mask as fields of ONE value (`chunk_step_inputs`), so a staging that wanted the
+            // tables of one region and the mask of another has no spelling. The refusal is one
+            // door naming the whole family's failure classes.
+            let inputs = region
+                .chunk_step_inputs(&map, rows, start, real, ceiling)
+                .ok_or_else(|| {
                     werr(format!(
-                        "{what}: could not build the {what_plane} plane's block-entry table from \
-                         this sequence's page map — an empty map, or an entry past the pool's \
-                         ceiling (never a zero table: zero is block 0, a REAL address)"
+                        "{what}: could not build the chunk family's step inputs from this \
+                         sequence's page map and chunk — an empty map, an entry past the pool's \
+                         ceiling (never a zero table: zero is block 0, a REAL address), or real \
+                         {} row(s) against the rung's {} row(s) is not a chunk this region states",
+                        real.get(),
+                        mq.count()
                     ))
-                })
-            };
-            let kt = build("Kᵀ")?;
-            let v = build("V")?;
-            let mask = sd::spliced_attn_mask_f16(region, rows, start, real).ok_or_else(|| {
-                werr(format!(
-                    "{what}: could not build the validity mask — real {real} rows against the \
-                     rung's {} row(s) is not a chunk this region states",
-                    mq.count()
-                ))
-            })?;
-            fill(session, attn_step_slots::KT_BLOCK_IDS, encode(&kt))?;
-            fill(session, attn_step_slots::V_BLOCK_IDS, encode(&v))?;
-            fill(session, attn_step_slots::MASK, mask)?;
+                })?;
+            fill(
+                session,
+                attn_step_slots::KT_BLOCK_IDS,
+                encode(inputs.kt_entries()),
+            )?;
+            fill(
+                session,
+                attn_step_slots::V_BLOCK_IDS,
+                encode(inputs.v_entries()),
+            )?;
+            fill(
+                session,
+                attn_step_slots::MASK,
+                inputs.mask().wire_bytes().to_vec(),
+            )?;
         }
         AttnStepRows::Batch { rows, maps, write } => {
             if let (None, None, None, None) = (mask_ext, kt_ext, v_ext, rep_ext) {
@@ -1138,7 +1153,11 @@ pub(crate) fn fill_attn_step_inputs(
                     .flat_map(|&r| r.to_le_bytes())
                     .collect::<Vec<u8>>(),
             )?;
-            fill(session, attn_step_slots::MASK, mask)?;
+            fill(
+                session,
+                attn_step_slots::MASK,
+                mask.wire_bytes().to_vec(),
+            )?;
         }
     }
     Ok(())
@@ -1519,7 +1538,13 @@ pub(crate) fn superdsc_forward_chunk(
                         rows: scratchy_subtile::sdsc_abstract::ChunkRows::chunk(rung.rows()),
                         mq: rung,
                         start: chunk_start,
-                        real: chunk_len,
+                        real: std::num::NonZeroU32::new(chunk_len as u32).ok_or_else(|| {
+                            werr(
+                                "superdsc batched prefill: a prompt chunk of ZERO rows reached the \
+                                 fill — the rung selection above is wrong, not this site"
+                                    .to_string(),
+                            )
+                        })?,
                         map: req
                             .chunk_page_map(
                                 ctx,
@@ -1850,7 +1875,7 @@ pub(crate) fn superdsc_forward_chunk(
                 mq: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
                     .expect("1 is a width"),
                 start: p,
-                real: 1,
+                real: std::num::NonZeroU32::MIN,
                 map: req
                     .page_map(
                         ctx,
@@ -1867,6 +1892,40 @@ pub(crate) fn superdsc_forward_chunk(
                     .as_i64(),
             },
         )?;
+        // ⭐⭐⭐⭐⭐ THE FOLD'S OWN WALK COUNT, DECLARED — the same door the batched path takes
+        // (`spyre_exec.rs`): `FoldPages::resident_before` off the solo write slot (this
+        // request's own end — `BatchSlot::solo`, the constructor that cannot reach for a token
+        // count), the form off the RUNNING body's own `gathers()` (the per-body door; the
+        // bundle's placement answers for ANY body and is not this step's fact). The executor's
+        // `n_fold_pages(p)` is the SAME derivation — `ceil(p / PAGE_SLOTS)` — so `reps`'s
+        // walk-vs-declaration guard now CHECKS the solo fold where it was SKIPPED before:
+        // undeclared (0), arm (i) refused nothing, and the solo path's walk ran on the
+        // executor's derivation alone — the one guard the batched family has had since the
+        // 2048-wall. `None` (an empty history — zero pages to fold) has no `FoldPages` by
+        // type and refuses here rather than folding over a page count nobody can name.
+        scratchy_subtile::sdsc_abstract::FoldPages::resident_before(
+            scratchy_subtile::sdsc_abstract::BatchSlot::solo(&req.kv_hist),
+            scratchy_subtile::sdsc_abstract::SlotCount::new(
+                scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32,
+            ),
+        )
+        .ok_or_else(|| {
+            werr(format!(
+                "solo decode at pos {p}: the request's history holds no whole page to fold — \
+                 decode always follows a prefill of at least one token, so this is a population \
+                 bug, not a context length"
+            ))
+        })?
+        .grid(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
+            if step.gathers().get() {
+                scratchy_subtile::sdsc_abstract::MaskBlockForm::PerPage
+            } else {
+                scratchy_subtile::sdsc_abstract::MaskBlockForm::PerRowPage
+            },
+        )
+        .declare_to(session)
+        .map_err(|e| werr(format!("solo decode: declare fold: {e}")))?;
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
             // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT — the causal tile is `nqh` rows at mq==1, and

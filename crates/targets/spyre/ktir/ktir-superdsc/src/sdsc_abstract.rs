@@ -11738,6 +11738,138 @@ impl SplicedAttnRegion {
     pub fn sticks_per_page(self) -> u32 {
         self.w4() * self.mq.get()
     }
+
+    /// ⭐⭐⭐⭐⭐ THE CHUNK FAMILY'S STEP INPUTS, MINTED BY ONE WALK — both id tables and the
+    /// validity mask, as ONE value. The tables and the mask already derive their coverage from
+    /// this ONE region (the same `pages`, the same pitch); this constructor is the binding made
+    /// structural: a staging that wanted the tables of one region and the mask of another has no
+    /// spelling, because there is no longer a site that names them separately. The mask's rows
+    /// carry their own [`ValidKeys`] counts (the `l`-invariant, as a type), and `real` is
+    /// [`NonZeroU32`] because the seed-safety law is a THEOREM of `real ≥ 1` — see
+    /// [`ValidityMask`].
+    pub fn chunk_step_inputs(
+        self,
+        map: &[i64],
+        rows: ChunkRows,
+        start: usize,
+        real: NonZeroU32,
+        ceiling: GatherEntryCeiling,
+    ) -> Option<AttnStepInputs> {
+        Some(AttnStepInputs {
+            kt: spliced_attn_ids_table(self, map, ceiling)?,
+            v: spliced_attn_ids_table(self, map, ceiling)?,
+            mask: spliced_attn_mask_f16(self, rows, start, real)?,
+        })
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ HOW MANY LANES OF ONE MASK ROW ARE VALID — the count the fold's `l` may sum over.
+///
+/// The fold's online-softmax denominator is a STRICT running sum: validity enters at exactly
+/// one point (the additive mask the body adds to its score tile), so every lane the mask did
+/// not validate enters `l` forever. The count is minted by the same loop that writes the row's
+/// bytes, so the bytes and the count are one fact, not two that agree.
+///
+/// ⛔ NO CONSTRUCTOR FROM A STAGED BUFFER. The count exists only where the row was WRITTEN — a
+/// mask read back off a device segment has no count, and re-deriving one from the bytes would
+/// be a second derivation of the same fact (the class [`MaskPassGrid`]'s doc names: three
+/// readings of one decision that must all move together).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ValidKeys(u32);
+
+impl ValidKeys {
+    /// The only constructor: a count of valid lanes in ONE 64-lane row. `None` past 64 — a row
+    /// has 64 lanes, so a larger count is some other buffer's number wearing this one's type.
+    pub fn of(lanes: u32) -> Option<ValidKeys> {
+        (lanes <= 64).then_some(ValidKeys(lanes))
+    }
+
+    /// The valid-lane count, ≤ 64.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ AN ADDITIVE VALIDITY MASK TOGETHER WITH ITS OWN VALID-LANE COUNTS — the fold's
+/// `l`-invariant, as a type.
+///
+/// THE INVARIANT: `l ≡ Σ over windows of Σ over the lanes each row marks valid of
+/// exp2(score − m_final)`. A lane the mask does not validate contributes EXACTLY zero to `l`
+/// and to `acc` — in the kernel's arithmetic, because a masked lane's score plus the −65504
+/// sentinel underflows `exp2` to zero (the finite-sentinel clamp trick), and in the staging,
+/// because the row's [`ValidKeys`] count is minted by the loop that wrote those very bytes.
+///
+/// ⛔ THE SENTINEL PAIR IS LOAD-BEARING, AND ITS EDGE IS THE SEED-SAFETY LAW. The carry's seed
+/// `m` is the SAME finite −65504 the invalid lanes carry, so a masked lane's `p` is exactly
+/// zero only because some VALID lane in the same or an earlier window raised `m` past the
+/// sentinel (`exp2(−65504 − m)` underflows). An ALL-masked window read while `m` still sits at
+/// the seed would give `p = exp2(0) = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
+/// nothing. The chunk family's first window CANNOT be that window: with `real ≥ 1` (the
+/// builder takes [`NonZeroU32`]) and `start ≥ 0` (a `usize`), `row_logical_pos(t, real) ≥ 0`,
+/// so slot 0 is valid for every query row of window (0, 0) and
+/// [`ValidityMask::first_window_valid_keys`] answers ≥ 1 there — a theorem of the builder's
+/// own input types, not a check at runtime.
+#[derive(Clone, Debug)]
+pub struct ValidityMask {
+    bytes: Vec<u8>,
+    valid: Vec<ValidKeys>,
+}
+
+impl ValidityMask {
+    /// The row bytes in the kernel's own read order — the f16 additive lanes, LE.
+    pub fn wire_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// How many rows the mask states — `pages·W4·mq` for the chunk family, the pre-replicated
+    /// score-tile row count for the batch family.
+    pub fn rows(&self) -> usize {
+        self.valid.len()
+    }
+
+    /// One row's valid-lane count.
+    pub fn row_valid(&self, row: usize) -> ValidKeys {
+        self.valid[row]
+    }
+
+    /// ⭐ THE SEED-SAFETY LAW, READ OFF THE MINTED COUNTS: the least valid-lane count over the
+    /// FIRST window's query rows (`0..mq` in the kernel's row order) — ≥ 1 for every mask the
+    /// chunk family's builder mints, by the theorem its input types state. The batch family's
+    /// rows carry their counts so the same reading answers for them too.
+    pub fn first_window_valid_keys(&self, mq: NonZeroU32) -> Option<ValidKeys> {
+        let mq = (mq.get() as usize).min(self.valid.len());
+        self.valid[..mq].iter().copied().min()
+    }
+}
+
+/// THE CHUNK FAMILY'S THREE STAGED STEP INPUTS AS ONE VALUE — minted solely by
+/// [`SplicedAttnRegion::chunk_step_inputs`], staged through the session's fill door slot by
+/// slot. The ids and the mask are fields of one value because they are one coverage: a bundle
+/// that declared one without the other is the partial-set refusal the fill already makes, and
+/// a staging that built them from two regions has no spelling left.
+#[derive(Clone, Debug)]
+pub struct AttnStepInputs {
+    kt: Vec<GatherEntry>,
+    v: Vec<GatherEntry>,
+    mask: ValidityMask,
+}
+
+impl AttnStepInputs {
+    /// The Kᵀ plane's block-entry table — LE u32 per entry on the wire (see `encode` at the
+    /// fill).
+    pub fn kt_entries(&self) -> &[GatherEntry] {
+        &self.kt
+    }
+
+    /// The V plane's block-entry table — same law, same coverage, the V plane's own entries.
+    pub fn v_entries(&self) -> &[GatherEntry] {
+        &self.v
+    }
+
+    /// The validity mask, with its own valid-lane counts.
+    pub fn mask(&self) -> &ValidityMask {
+        &self.mask
+    }
 }
 
 /// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE BLOCK-ENTRY TABLE — the index values in the KERNEL'S OWN READ
@@ -11799,11 +11931,12 @@ pub fn spliced_attn_mask_f16(
     region: SplicedAttnRegion,
     rows: ChunkRows,
     start: usize,
-    real: usize,
-) -> Option<Vec<u8>> {
-    if real == 0 || real > region.mq.get() as usize {
+    real: NonZeroU32,
+) -> Option<ValidityMask> {
+    if real.get() > region.mq.get() {
         return None;
     }
+    let real = real.get() as usize;
     let w4 = region.w4() as usize;
     if w4 == 0 {
         return None;
@@ -11814,6 +11947,7 @@ pub fn spliced_attn_mask_f16(
     let neg = half::f16::MIN.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut m = Vec::with_capacity(total * 64 * 2);
+    let mut valid = Vec::with_capacity(total);
     for r in 0..total {
         // Row r is `(s·W4 + w)·mq + t` — the kernel's own load corner, decomposed once here.
         let s = r / (w4 * mq);
@@ -11821,12 +11955,22 @@ pub fn spliced_attn_mask_f16(
         let (w, t) = (rem / mq, rem % mq);
         let pos = start + rows.row_logical_pos(t, real);
         let slot_base = s * page_slots + w * 64;
+        // The count is minted by the same loop that writes the bytes: the lanes `c` with
+        // `slot_base + c ≤ pos` are `0..=pos−slot_base`, so the count is that difference plus
+        // one, clamped to the row's 64 lanes — `ValidKeys` carries it out (the `l`-invariant's
+        // own number). Zero when the whole window is past `pos`.
+        let lanes = if pos < slot_base {
+            0
+        } else {
+            (pos - slot_base + 1).min(64)
+        };
+        valid.push(ValidKeys::of(lanes as u32)?);
         for c in 0..64 {
             let bytes = if slot_base + c <= pos { &zero } else { &neg };
             m.extend_from_slice(bytes);
         }
     }
-    Some(m)
+    Some(ValidityMask { bytes: m, valid })
 }
 
 /// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE FAMILY'S STEP-INPUT FACTS — what `batched_decode_hm` stated, as
@@ -11970,12 +12114,14 @@ pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
 /// `hists` is one history per LAUNCH ROW in slot order (padding rows carry live 0's), and
 /// `write` is the batch's ONE shared write slot — every row's new key lands there this step, in
 /// its own page, so the slot is valid for every row that reads it back. `None` on a history
-/// count that is not the launch's row count.
+/// count that is not the launch's row count. The rows carry their [`ValidKeys`] counts with the
+/// bytes (minted by the same loop) — this family's coverage is a placement fact, checked at
+/// mint, not a theorem of the constructor's own types like the chunk family's seed-safety law.
 pub fn spliced_decode_mask_f16(
     batch: SplicedDecodeBatch,
     hists: &[KvHistory],
     write: BatchSlot,
-) -> Option<Vec<u8>> {
+) -> Option<ValidityMask> {
     if hists.len() != batch.num_seqs.get() as usize {
         return None;
     }
@@ -11993,6 +12139,7 @@ pub fn spliced_decode_mask_f16(
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let rows = batch.chunks() as usize * w4 as usize * ktb as usize * gqa as usize;
     let mut m = Vec::with_capacity(rows * 64 * 2);
+    let mut valid = Vec::with_capacity(rows);
     for c in 0..batch.chunks() {
         for w in 0..w4 {
             for b in 0..ktb {
@@ -12005,20 +12152,22 @@ pub fn spliced_decode_mask_f16(
                 // states the tile's own row count, not new facts.
                 for _g in 0..gqa {
                     let slot_base = (c * bpc + j) as usize * page_slots + w as usize * 64;
+                    let mut lanes = 0u32;
                     for cc in 0..64 {
                         let slot = slot_base + cc;
-                        let bytes = if hist.contains(slot) || slot == write.get() as usize {
-                            &zero
+                        if hist.contains(slot) || slot == write.get() as usize {
+                            lanes += 1;
+                            m.extend_from_slice(&zero);
                         } else {
-                            &neg
-                        };
-                        m.extend_from_slice(bytes);
+                            m.extend_from_slice(&neg);
+                        }
                     }
+                    valid.push(ValidKeys::of(lanes)?);
                 }
             }
         }
     }
-    Some(m)
+    Some(ValidityMask { bytes: m, valid })
 }
 
 #[cfg(kani)]
