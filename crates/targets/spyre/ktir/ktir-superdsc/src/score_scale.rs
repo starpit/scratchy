@@ -62,6 +62,23 @@ pub enum ScoreScaleLaw {
     UnitByModel,
 }
 
+impl ScoreScaleLaw {
+    /// ⭐ THE POOL LAW THIS LAW'S WRITES CARRY — the pairing, stated ONCE and consumed by BOTH
+    /// sides of the pool contract. The write mint (the rope append's [`NewK`]) and every read
+    /// check (the door's `Program::Attn` cross-check, the splice's `SCALE` derivation) derive
+    /// the pool's bytes through THIS method, so the two sides cannot disagree about what the
+    /// pool carries: a reader that stated its obligation from one spelling of the pairing over
+    /// a write minted from another would read a `SqrtScaled` pool as raw (scores missing √s,
+    /// the ~10× dilution) or a `Raw` one as pre-scaled (scores carrying a stray s) — both
+    /// invisible to every extent law, both now one derivation.
+    pub const fn pool_k(self) -> PoolKLaw {
+        match self {
+            ScoreScaleLaw::CommutedIntoWeights => PoolKLaw::SqrtScaled,
+            ScoreScaleLaw::StatedByProgram | ScoreScaleLaw::UnitByModel => PoolKLaw::Raw,
+        }
+    }
+}
+
 /// What a pool write's K BYTES carry — a byte fact about the write, stated by the constructor
 /// that minted it. The reader's OBLIGATION is derived from the bundle's [`ScoreScaleLaw`] (the
 /// proof), not from this: a `Raw` pool under `UnitByModel` needs no reader-side multiply just as

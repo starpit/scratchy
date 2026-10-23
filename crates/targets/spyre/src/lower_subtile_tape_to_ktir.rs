@@ -661,6 +661,61 @@ pub fn chunk_swept_per_request<F: RopeForm>(
 ///
 /// `None` when the graph has no attention node: there is then nothing for the facts to be facts
 /// of, and an attention program arriving at the door without them is that door's own build error.
+/// ⭐⭐⭐ THE GRAPH'S ONE SCORE-SCALE LAW — the conjunction over every attention node, as ONE
+/// derivation shared by every consumer: [`attn_bundle_params`] (the door's
+/// `BundleAttnParams::scale_law`, which the write mint and the door's read cross-check read)
+/// AND the walks that thread the law to the splice's SCALE site — so the fold's program
+/// states its multiplier from the same proof the pool's write derived its bytes' law from.
+///
+/// MINTED WHERE EACH PROOF EXISTS, never a bare bool: the fold's own list
+/// ([`attn_scale_weight_folds`]) IS the receipt for `CommutedIntoWeights` (its gates — fp8
+/// payload, shared readers, the f16 floor, pair-wise — are the proof, and a refused fold
+/// mints nothing); the IR node's own payload is the arch's statement (`&SubtileIR` is
+/// shared-immutable and every fold rewrite happens on a clone, so a `1.0` read here is the
+/// model's and never a rewrite's residue), and a `1.0` there is `UnitByModel`; everything
+/// else states its multiplier in the program.
+///
+/// `None` when the graph has no attention node at all. Refuses — never chooses — a graph
+/// whose attention nodes carry different laws: one bundle is one model.
+pub(crate) fn score_scale_law<F: RopeForm>(
+    ir: &SubtileIR<F>,
+) -> Result<Option<ScoreScaleLaw>, SuperDscError> {
+    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
+    let mut first: Option<(u32, ScoreScaleLaw)> = None;
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { scale, .. } = &n.op else {
+            continue;
+        };
+        let n_law = if folded.contains(&n.id) {
+            ScoreScaleLaw::CommutedIntoWeights
+        } else if *scale == 1.0 {
+            ScoreScaleLaw::UnitByModel
+        } else {
+            ScoreScaleLaw::StatedByProgram
+        };
+        let t = n.output.tensor.index() as u32;
+        match first {
+            None => first = Some((t, n_law)),
+            Some((t0, f0)) => {
+                if f0 != n_law {
+                    return Err(SuperDscError(format!(
+                        "AttnDecode t{t0} carries its attention scale {f0:?} while AttnDecode t{t} \
+                         carries {n_law:?}. One bundle is one model, and every consumer of the law \
+                         (the door's pool write, its read cross-check, the splice's SCALE) takes \
+                         ONE such law for the whole bundle; a graph carrying both cannot lower one \
+                         attention without mislowering the other, so this refuses instead of \
+                         choosing."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(first.map(|(_, law)| law))
+}
+
 pub(crate) fn attn_bundle_params<F: RopeForm>(
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
@@ -680,14 +735,14 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // (a node at scale 1.0 folds nothing), which is also why the door's `scale_law` is a fact
     // about what the program cannot state, not a restatement of one of its values — see
     // `BundleAttnParams::scale_law`.
-    let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
-        .into_iter()
-        .map(|(id, ..)| id)
-        .collect();
+    //
+    // ⭐ THE LAW ITSELF IS MINTED BY [`score_scale_law`] — the one derivation, shared by this
+    // mint and by every walk that threads the law to the splice's SCALE site (the fold's
+    // program states its multiplier from the same proof the door's cross-check reads).
+    let scale_law = score_scale_law(ir)?;
     let mut found: Option<(u32, u32)> = None;
-    let mut first_law: Option<ScoreScaleLaw> = None;
     for n in &ir.nodes {
-        let SubOp::AttnDecode { scale, .. } = &n.op else {
+        let SubOp::AttnDecode { .. } = &n.op else {
             continue;
         };
         let t = n.output.tensor.index() as u32;
@@ -695,44 +750,8 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // the request count (`lower_attn` reads this same `region.rows.len` as its `mq`). The
         // head-major handoff is minted exactly where this is ONE row.
         let rows = n.output.region.rows.len;
-        // ⭐⭐⭐ THE LAW, MINTED WHERE EACH PROOF EXISTS — never a bare bool. The fold's own
-        // list IS the receipt for `CommutedIntoWeights` (its gates — fp8 payload, shared
-        // readers, the f16 floor, pair-wise — are the proof, and a refused fold mints nothing);
-        // the IR node's own payload is the arch's statement (`&SubtileIR` is shared-immutable
-        // and every fold rewrite happens on a clone, so a `1.0` read here is the model's and
-        // never a rewrite's residue), and a `1.0` there is `UnitByModel`; everything else
-        // states its multiplier in the program.
-        let n_law = if folded.contains(&n.id) {
-            ScoreScaleLaw::CommutedIntoWeights
-        } else if *scale == 1.0 {
-            ScoreScaleLaw::UnitByModel
-        } else {
-            ScoreScaleLaw::StatedByProgram
-        };
-        match (found, first_law) {
-            (None, _) => {
-                found = Some((t, rows));
-                first_law = Some(n_law);
-            }
-            (Some((t0, _r0)), Some(f0)) => {
-                // ⛔ THE GEOMETRY CHECK IS GONE, AND THE HYBRID MODEL IS THE REASON: gemma-4's
-                // sliding layers and every-sixth global layer carry TWO attention classes in one
-                // graph, and the door MINTS each program's geometry from its own views (the same
-                // reading rope takes for its head dim) — so no per-bundle geometry exists to agree
-                // on, and two classes in one graph is legitimate. The scale law below keeps the
-                // one-value-per-bundle law.
-                if f0 != n_law {
-                    return Err(SuperDscError(format!(
-                        "AttnDecode t{t0} carries its attention scale {f0:?} while AttnDecode t{t} \
-                         carries {n_law:?}. One bundle is one model, and the door takes ONE such \
-                         law for the whole bundle; a graph carrying both cannot lower one \
-                         attention without mislowering the other, so this refuses instead of \
-                         choosing."
-                    )));
-                }
-            }
-            // `found` and `first_law` are set in the same arm and never apart.
-            (Some(_), None) => unreachable!("first_law tracks found"),
+        if found.is_none() {
+            found = Some((t, rows));
         }
     }
     let oproj = oproj_edges(ir)?;
@@ -804,7 +823,7 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // cannot feed (see `BundleAttnParams::gathers_kv`).
         gathers_kv: rows_are_requests || chunk_pages.is_some(),
         chunk_pages,
-        scale_law: first_law.unwrap_or(ScoreScaleLaw::StatedByProgram),
+        scale_law: scale_law.unwrap_or(ScoreScaleLaw::StatedByProgram),
         headmajor_handoff,
         // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
         // representative. `Some` whenever the dataflow found the o matmul, whatever the
@@ -835,6 +854,12 @@ pub(crate) fn lower_one_node<F: RopeForm>(
     // walk), `Some` on every rung of a chunked one-request ladder. The splice states the
     // family only when `fold_body` holds; the other rungs take only the region threading.
     paged_fold: Option<&scratchy_triton_splice::PagedFoldRung>,
+    // ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW ([`score_scale_law`]'s one derivation) — threaded so the
+    // splice's SCALE site derives its multiplier by EXHAUSTIVE MATCH over the law instead of a
+    // naked read off the node. `None` only when the graph has no attention node at all (the
+    // AttnDecode arm below never runs); the arm refuses a `None` arriving with an AttnDecode —
+    // a law the walk did not mint over a node that needs one is a walk/splice desync.
+    scale_law: Option<ScoreScaleLaw>,
 ) -> NodeLowering {
     use NodeLowering::{HostRouted, Ops, Unhandled};
     // ⭐⭐⭐ A FOLDED SCALARMUL'S READERS BIND THE PRODUCER'S OUTPUT. The fold takes the node
@@ -1082,6 +1107,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 active_cap,
                 rows_are_requests,
                 paged_fold,
+                scale_law,
             ) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
@@ -1146,8 +1172,11 @@ pub fn lower_graph_to_ktir<F: RopeForm>(
     // RE-ROLLED tape-driven path reuses the SAME helper, walking only the loop body
     // once — see `lower_subtile_tape_to_superdsc`.) MatmulTile's Err is still a hard
     // stop; everything else collects into the worklist/host-routed sets below.
+    // ⭐ THE LAW, MINTED ONCE FOR THE WHOLE WALK — the splice's SCALE site derives every
+    // attention program's multiplier from it ([`score_scale_law`]'s one derivation).
+    let scale_law = score_scale_law(ir)?;
     for node in &ir.nodes {
-        match lower_one_node(node, ir, active_cap, rows_are_requests, None) {
+        match lower_one_node(node, ir, active_cap, rows_are_requests, None, scale_law) {
             NodeLowering::Ops(v) => ops.extend(v),
             NodeLowering::Unhandled(s) => {
                 // A MALFORMED matmul is an immediate hard stop (it must never bake);
@@ -1489,7 +1518,17 @@ pub fn graph_wiring<F: RopeForm>(
         ir.nodes
             .par_iter()
             .map(|node| {
-                let ops = match lower_one_node(node, ir, ActiveCap::FULL, false, None) {
+                let ops = match lower_one_node(
+                    node,
+                    ir,
+                    ActiveCap::FULL,
+                    false,
+                    None,
+                    // The walk's OWN law mint — the same derivation the bake's
+                    // `attn_bundle_params` runs, so the wiring's programs and the
+                    // shipped bundle's state one multiplier spelling.
+                    score_scale_law(ir)?,
+                ) {
                     NodeLowering::Ops(v) => v,
                     // A host-routed op runs off the device, so it has no program and binds nothing. It
                     // still occupies a position in the node order, so it contributes an empty entry.
@@ -2112,6 +2151,12 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         paged_fold,
     } = rung;
     let _pc = crate::pc::Pc::start("producer");
+    // ⭐ THE LAW, MINTED ONCE FOR THE WHOLE BUNDLE — every attention program this walk mints
+    // (the fold family included) derives its SCALE from it: [`score_scale_law`]'s one
+    // derivation, the same one the door's `BundleAttnParams::scale_law` and the write mint
+    // read, so the fold's stated multiplier and the pool's written bytes cannot disagree
+    // about where the scale lives.
+    let scale_law = score_scale_law(ir)?;
     // ⭐ THE CHUNK THIS GRAPH'S EVERY ATTENTION CLASS CAN EXPRESS, decided ONCE for both of its
     // consumers — the index placement (`compute_bundle_layout`'s `gathers_kv`) and the door's
     // `BundleAttnParams` — so an index is reserved exactly where a chunk gathers through it.
@@ -2576,7 +2621,14 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         group_weight_banks[seg].insert(p.bank);
                     }
                 }
-                match lower_one_node(n, ir, active_cap, rows_are_requests, paged_fold.as_ref()) {
+                match lower_one_node(
+                    n,
+                    ir,
+                    active_cap,
+                    rows_are_requests,
+                    paged_fold.as_ref(),
+                    scale_law,
+                ) {
                     NodeLowering::Ops(v) => {
                         if seg == 0 {
                             prefix.extend(v);

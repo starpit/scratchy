@@ -2120,6 +2120,10 @@ fn spliced_attn_lowers_through_the_door() {
                 s.active_cap(),
                 rows_are_requests,
                 None,
+                // The fixtures' nodes carry real multipliers (0.015625/0.0078125 below) and no
+                // fold receipt, so their law is the one every real-batch model lives under: the
+                // program states the whole scale.
+                Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
             )
             .unwrap_or_else(|e| {
                 panic!(
@@ -2400,10 +2404,26 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
         let ir = attn_ir(s, 0.015625);
         let node = ir.nodes.last().unwrap();
         let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-        let spliced = scratchy_triton_splice::lower_attn(node, &ir, cap, s.active_cap(), false, None)
-            .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
-        assert_eq!(spliced.len(), 1, "a foldless splice is the one-shot program");
-        let k = spliced[0].ktir.clone().expect("spliced op carries its program");
+        let spliced = scratchy_triton_splice::lower_attn(
+            node,
+            &ir,
+            cap,
+            s.active_cap(),
+            false,
+            None,
+            // The node's 0.015625 is a real multiplier with no fold receipt — StatedByProgram.
+            Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+        )
+        .unwrap_or_else(|e| panic!("splice compiled mq={mq}: {e}"));
+        assert_eq!(
+            spliced.len(),
+            1,
+            "a foldless splice is the one-shot program"
+        );
+        let k = spliced[0]
+            .ktir
+            .clone()
+            .expect("spliced op carries its program");
         assert!(k.mask.is_some(), "mq={mq}: the continuation binds its mask");
         ktir_superdsc::emit::lower_ktir_to_superdsc::attn_program_is_flat_in_rows(
             "continuation",
@@ -2432,9 +2452,22 @@ fn a_continuation_programs_size_does_not_grow_with_its_rows() {
     let ir = attn_ir(decode, 0.015625);
     let node = ir.nodes.last().unwrap();
     let cap = ir.tensors[node.inputs[1].tensor.index()].rows;
-    let unrolled = scratchy_triton_splice::lower_attn(node, &ir, cap, decode.active_cap(), true, None)
-        .expect("the decode splice compiles");
-    assert_eq!(unrolled.len(), 1, "a foldless splice is the one-shot program");
+    let unrolled = scratchy_triton_splice::lower_attn(
+        node,
+        &ir,
+        cap,
+        decode.active_cap(),
+        true,
+        None,
+        // The node's 0.015625 is a real multiplier with no fold receipt — StatedByProgram.
+        Some(ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram),
+    )
+    .expect("the decode splice compiles");
+    assert_eq!(
+        unrolled.len(),
+        1,
+        "a foldless splice is the one-shot program"
+    );
     let unrolled = unrolled[0]
         .ktir
         .clone()

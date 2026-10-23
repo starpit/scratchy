@@ -1617,6 +1617,11 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     _active_cap: ktir_superdsc::ktir_node::ActiveCap,
     rows_are_requests: bool,
     paged_fold: Option<&PagedFoldRung>,
+    // ⭐⭐⭐ THE BUNDLE'S SCORE-SCALE LAW — threaded from the walk that minted it
+    // (`score_scale_law`'s ONE derivation, the same one the door's `BundleAttnParams` and the
+    // pool write read). `None` only over a graph with no attention node; an AttnDecode under a
+    // `None` is a walk/splice desync and refuses below.
+    scale_law: Option<ktir_superdsc::score_scale::ScoreScaleLaw>,
 ) -> Result<Vec<EmittedOp>, String> {
     let row = if rows_are_requests {
         attn_decode_row()
@@ -1642,6 +1647,63 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
     let (nkvh, hd) = (geom.nkvh().get(), geom.hd().get());
     let gqa = geom.gqa().get();
+    // ⭐⭐⭐⭐⭐ THE SCALE, DERIVED BY EXHAUSTIVE MATCH OVER THE LAW — never a naked read off
+    // the node. The node handed in may be a REWRITE (the walk rewrites `scale = 1.0` under the
+    // fold's receipt, and only then); the ORIGINAL IR payload is the arch's own statement (the
+    // IR is `&`-shared and every rewrite happens on a clone, so `ir.nodes[node.id]` is the
+    // model's number and never a rewrite's residue); and the LAW is the bundle's proof of
+    // WHERE the scale lives. The three arms:
+    //   * `StatedByProgram` — the fold was REFUSED (fp8 payload, shared readers, the f16
+    //     floor), the pool is RAW ([`ScoreScaleLaw::pool_k`]), and the program MUST state the
+    //     arch's whole multiplier;
+    //   * `CommutedIntoWeights` — the receipt: √s lives in BOTH projection weights, the pool
+    //     is born scaled, and the program states the identity;
+    //   * `UnitByModel` — the arch's own multiplier IS 1.0; nothing for anyone to carry.
+    // The derived value is then CROSS-CHECKED against the node's carried scale: a rewritten
+    // 1.0 arriving under `StatedByProgram` is the HALF-APPLIED FOLD (the recognition rewrote
+    // the node while the gates refused the weight side — scores missing s, a flat softmax,
+    // attention ≈ mean-V, invisible to every extent law), and a real multiplier arriving
+    // under a carried-elsewhere law is the DOUBLE-APPLY. Both are build errors naming the
+    // layer and both values, not emissions.
+    let original = match &ir.nodes[node.id.index()].op {
+        SubOp::AttnDecode { scale, .. } => *scale,
+        _ => {
+            return Err(format!(
+                "triton splice: AttnDecode t{} is not in the graph the walk handed over — the \
+                 ORIGINAL scale payload is read off `ir` (the rewrite happens on a clone), so a \
+                 node the IR does not carry has no arch statement to derive the scale from",
+                node.output.tensor.index()
+            ));
+        }
+    };
+    let Some(law) = scale_law else {
+        return Err(format!(
+            "triton splice: AttnDecode t{} reached the splice with no score-scale law — the \
+             walk mints one over every graph with an attention node, so a None here is a \
+             walk/splice desync, not a lawless graph",
+            node.output.tensor.index()
+        ));
+    };
+    let lawful = match law {
+        ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram => original,
+        ktir_superdsc::score_scale::ScoreScaleLaw::CommutedIntoWeights => 1.0,
+        ktir_superdsc::score_scale::ScoreScaleLaw::UnitByModel => original,
+    };
+    if *scale != lawful {
+        return Err(format!(
+            "triton splice: AttnDecode t{} carries scale {} but the bundle's law is {law:?} over \
+             an IR payload of {original}, which mints {}. A rewritten 1.0 under StatedByProgram is \
+             the HALF-APPLIED FOLD — the recognition rewrote the node while its gates refused the \
+             weight side, so the pool is raw K and this program would compute scores at t = 1, a \
+             flat softmax no extent law can see; a real multiplier under a carried-elsewhere law \
+             is the DOUBLE-APPLY. Either the recognition must not rewrite when its gates refuse, \
+             or the gates must pass",
+            node.output.tensor.index(),
+            scale,
+            lawful,
+        ));
+    }
+    let scale = lawful;
     // THE PAGE GEOMETRY IS A SHARED DEVICE LAW, NOT A MODEL NUMBER: the pool's page width
     // and the id stick's entry count live beside the pool types every other consumer reads.
     let page_slots = ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
@@ -1690,7 +1752,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 cap
             ));
         }
-        return mint_paged_fold(node, ir, nkvh, gqa, hd, *scale, pf.region_pages);
+        return mint_paged_fold(node, ir, nkvh, gqa, hd, scale, pf.region_pages);
     }
     // ⛔ A RUNG ON A CHUNKED LADDER THAT IS NOT THE FOLD BODY still states the region: every
     // rung of the ladder places its step inputs identically (`ladder_stages_one_layout`), so
@@ -1736,7 +1798,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             page_slots,
             blocks_per_chunk,
             num_chunks,
-            scale: *scale,
+            scale,
         })?
     } else {
         // ── THE PREFILL ROW: the chunk's query rows are M. ──
@@ -1779,7 +1841,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
             pages,
             page_slots,
             region_pages,
-            scale: *scale,
+            scale,
         })?
     };
     // ONE PROGRAM FOR THE WHOLE BATCH/CHUNK — grid [1, 1] is both kernels' own contract:

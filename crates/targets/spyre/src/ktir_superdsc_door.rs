@@ -45,7 +45,7 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
-use ktir_superdsc::score_scale::{NewK, ScoreScaleLaw};
+use ktir_superdsc::score_scale::{NewK, PoolKLaw, ScoreScaleLaw};
 
 /// ⭐⭐⭐ THE FOUR THINGS THE PROGRAM CANNOT STATE — `ibm/main`'s `lower_one_node` PARAMETERS, at the
 /// site that now needs them.
@@ -626,16 +626,20 @@ fn rope_append(
             hd,
             rows_are_requests,
             row_start,
-            // ⭐ THE WRITE'S K, TYPED BY ITS SCALE LAW — minted from the bundle's own law, not
-            // chosen here. A fold that commuted √s into the k_proj stages K BORN SCALED
+            // ⭐ THE WRITE'S K, TYPED BY ITS SCALE LAW — minted from the bundle's own law through
+            // the ONE pool pairing ([`ScoreScaleLaw::pool_k`]), not chosen here. A fold that
+            // commuted √s into the k_proj stages K BORN SCALED
             // ([`NewK::born_scaled_by_fold`] — the pool then carries √s and no reader states a
             // multiplier); every other law (the fold REFUSED — fp8 payloads always are; a unit
             // model) stages RAW K whose readers state the whole scale in their own programs
             // ([`NewK::reader_stated`]). The recipe writes whichever bytes it is handed; WHICH
             // law they carry is the type of this argument, not a comment beside the call — the
-            // old signature's `new_k: &str` held both laws with nothing to tell them apart.
-            new_k: match attn_params.map(|p| p.scale_law) {
-                Some(ScoreScaleLaw::CommutedIntoWeights) => NewK::born_scaled_by_fold(&k_name),
+            // old signature's `new_k: &str` held both laws with nothing to tell them apart. The
+            // read side (the splice's SCALE derivation, the `Program::Attn` cross-check) derives
+            // its obligation through the SAME method, so the two sides of the pool contract
+            // cannot disagree about what the pool carries.
+            new_k: match attn_params.map(|p| p.scale_law.pool_k()) {
+                Some(PoolKLaw::SqrtScaled) => NewK::born_scaled_by_fold(&k_name),
                 _ => NewK::reader_stated(&k_name),
             },
             new_v: &r[3].name(),
