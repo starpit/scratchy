@@ -1611,10 +1611,10 @@ fn spliced_rope_lowers_through_the_door() {
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // Not in weights: this fixture's q/k are Ext sources with no projection
+                // Stated by the program: this fixture's q/k are Ext sources with no projection
                 // matmuls, so the program states its real scale and the door emits the score
                 // multiplies.
-                scale_in_weights: false,
+                scale_law: ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram,
                 // No handoff: this fixture's rope program has no o matmul at all, and a stated
                 // handoff without one is the door's own refusal.
                 headmajor_handoff: false,
@@ -2210,9 +2210,9 @@ fn spliced_attn_lowers_through_the_door() {
                 // rung to widen it: the gather follows the row kind here.
                 gathers_kv: rows_are_requests,
                 chunk_pages: None,
-                // Not in weights: same as the rope door's fixture — the program states its real
-                // scale.
-                scale_in_weights: false,
+                // Stated by the program: same as the rope door's fixture — the program states
+                // its real scale.
+                scale_law: ktir_superdsc::score_scale::ScoreScaleLaw::StatedByProgram,
                 // No handoff: this fixture's attention output is the graph RESULT (no o matmul
                 // consumes it), so the dataflow the handoff keys on finds no edge — stated here
                 // exactly as `attn_bundle_params` would state it for such a graph.

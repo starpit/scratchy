@@ -48,6 +48,7 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
+use crate::score_scale::{NewK, ScoreScaleLaw};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
@@ -2703,13 +2704,15 @@ pub struct AttnAt<'a> {
     /// `Some` lowers the prefix through [`crate::sdsc_abstract::ChunkScratch`] (every resident page in
     /// one pass); `None` keeps the per-page fold.
     pub chunk_pages: Option<u32>,
-    /// Whether this bundle's attention score scale is carried by the staged weights — the
-    /// caller-side twin of the spyre door's `BundleAttnParams::scale_in_weights`. The fold removes
-    /// the score mulf from the program, so a folded program states NO multiplier; a model whose
-    /// attention scale genuinely IS 1.0 states none either (the triton→ktir pipeline folds a
-    /// multiply by 1.0 away). This fact is what tells the door that absence is one of those two
-    /// and not a broken program.
-    pub scale_in_weights: bool,
+    /// ⭐ WHERE THIS BUNDLE'S ATTENTION SCORE SCALE LIVES — the caller-side twin of the spyre
+    /// door's `BundleAttnParams::scale_law` ([`ScoreScaleLaw`], the proof-carrying replacement
+    /// for the `scale_in_weights: bool` this pack used to carry). The fold removes the score
+    /// mulf from the program, so a folded program states NO multiplier; a model whose attention
+    /// scale genuinely IS 1.0 states none either (the triton→ktir pipeline folds a multiply by
+    /// 1.0 away). The law is what tells the door that absence is one of those two and not a
+    /// broken program — and its arms are matched exhaustively below, so the two skip reasons and
+    /// the multiply case cannot be conflated the way a `bool`'s single true could.
+    pub scale_law: ScoreScaleLaw,
     /// ⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj SLAB-MAJOR — the caller-side twin of the spyre
     /// door's `BundleAttnParams::headmajor_handoff`, and the SAME fact the matmul door swaps the o
     /// matmul's B operand on (the permuted `oproj_headmajor_tid` copy): one fact, both halves of the
@@ -3929,6 +3932,29 @@ pub fn program_windowed_eps(f: &IRFunction<'static>) -> Option<f32> {
 /// ⭐ `pub` FOR THE SAME REASON AS [`program_rmsnorm_eps`]: the caller builds the registry this
 /// value is looked up in, by bits, so it must be able to read the same value rather than restate the
 /// reading.
+///
+/// TWO FACTS ABOUT THE VALUE, BOTH READ FROM THE PROGRAM AND NEVER ASSUMED:
+/// * the score dot appears rank-2 (`linalg.matmul`) or rank-3 (`linalg.batch_matmul`), and the
+///   multiplier mulf sits directly on either — see `is_matmul` below;
+/// * the attention family states the multiplier EXP2-RESTATED (`qk · (SCALE · LOG2E)`, a
+///   front-end fold of two config constants — the softmax is `exp2` end to end), so the value
+///   returned is the product, never the raw config scale, and at a scale of one it is `log2e`
+///   and not `1.0`. Consumers therefore compare EXISTENCE and LAW, never magnitude against a
+///   payload — the one fact that stays a value ([`crate::score_scale`]'s module doc).
+/// ⭐ DOES THIS PROGRAM COMPUTE SCORES AT ALL — the paged-fold family's other half. The fold
+/// is THREE programs (seed, body, finalize): the body computes scores (`qk · scale` over the
+/// QK contraction), while the seed initializes the online-softmax carry (`-65504` / `0` /
+/// `0` — stores only) and the finalize normalizes it (`acc / l` — a division, no
+/// contraction), so neither has a multiplier to state and neither may be held to the door's
+/// score-law cross-check. The door demands a stated multiplier only where a QK contraction
+/// exists: a contraction-bearing program with no stated multiplier is the `t = 1.0` wall, and
+/// a carry program is not that.
+pub fn program_has_score_contraction(f: &IRFunction<'static>) -> bool {
+    f.operations
+        .iter()
+        .any(|o| matches!(o.op_type, OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul))
+}
+
 pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
     let const_of: std::collections::HashMap<Ssa, f64> = f
         .operations
@@ -3949,10 +3975,16 @@ pub fn program_score_scale(f: &IRFunction<'static>) -> Option<f32> {
         .filter(|o| o.op_type == OpKind::TensorSplat)
         .filter_map(|o| Some((o.result?, *const_of.get(o.operands.first()?)?)))
         .collect();
+    // ⭐ THE QK DOT HAS TWO SPELLINGS, AND BOTH ARE THE DOT. The flash family's is rank-2
+    // (`linalg.matmul`, `[MQ, SWEPT]`); the batched decode/prefill/fold family's is rank-3
+    // (`linalg.batch_matmul`, `[B, GQA, 64]` — the batched arm of `dot_to_linalg`), and the
+    // score mulf sits directly on either. Admitting only the rank-2 form read the whole
+    // batched family as "no multiplier" — the exact silence the door's `Program::Attn`
+    // cross-check exists to catch, pointed at a program that states one.
     let is_matmul: std::collections::HashSet<Ssa> = f
         .operations
         .iter()
-        .filter(|o| o.op_type == OpKind::LinalgMatmul)
+        .filter(|o| matches!(o.op_type, OpKind::LinalgMatmul | OpKind::LinalgBatchMatmul))
         .filter_map(|o| o.result)
         .collect();
     f.operations
@@ -4803,7 +4835,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         rows_are_requests,
         gathers_kv,
         chunk_pages,
-        scale_in_weights,
+        scale_law,
         headmajor_handoff,
         sym_id_base,
         layout,
@@ -4873,13 +4905,15 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // attention scale genuinely is 1.0 (gemma-4's arch defaults `attention_multiplier` to it) has
     // no multiply to state in the first place, and the same pipeline folding takes it — and the
     // skip arm below is the correct lowering for both, because `√1.0` leaves the weights carrying
-    // the whole scale either way. `scale_in_weights` is the caller's statement that one of these
+    // the whole scale either way. `scale_law` is the caller's proof that one of these
     // is the case; a multiplier-less program without it is still the build error below, and a
     // program that states a real multiplier WHILE the caller says the weights carry the scale is
     // the half-applied fold — the multiplies would double-scale pre-scaled weights, so it is
     // refused, not best-efforted.
     let scale_val = match program_score_scale(&k.func) {
-        None if scale_in_weights => None,
+        None if matches!(scale_law, ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel) => {
+            None
+        }
         None => {
             return Err(Error {
                 message: format!(
@@ -4888,12 +4922,14 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                      descriptor's `[1,1]` scale const is resolved from that value, so a program \
                      without one cannot be lowered — unless the bundle's score scale is already \
                      carried by its staged weights (folded into W_q/W_k, or a unit attention \
-                     scale), which the caller must then state in `BundleAttnParams::scale_in_weights`.",
+                     scale), which the caller must then state in `BundleAttnParams::scale_law`.",
                     ops_in.out_id,
                 ),
             });
         }
-        Some(v) if scale_in_weights && v != 1.0 => {
+        Some(v) if v != 1.0
+            && matches!(scale_law, ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel) =>
+        {
             return Err(Error {
                 message: format!(
                     "AttnDecode t{}: the bundle states its attention scale is carried by the staged \
@@ -5484,7 +5520,31 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             // main's own call always wrote the window starting at the cursor's row 0; the
             // rope arm below is the second caller, and it states its node's window.
             row_start: 0,
-            new_k: &new_k_scaled,
+            // ⭐ THE WRITE'S K, TYPED BY ITS LAW — minted from the same `scale_law` the score
+            // legs above lowered under, so the write and the readers cannot disagree about
+            // what the pool carries: the multiply arm's `new_k_scaled` is `qs`'s twin (an
+            // EMITTED multiply scaled it); the fold's skip arm hands K born scaled out of
+            // weights proven to carry √s; a unit scale's bytes are raw with nothing for a
+            // reader to state.
+            new_k: {
+                // The emitted-multiply case first: a program stating a real multiplier put
+                // `qs`'s twin on the K, so the pool takes it scaled. `Some(1.0)` is the
+                // identity — the multiply above elided it — so only the LAW decides. The
+                // match is over `(bool, ScoreScaleLaw)`: guard-free, so exhaustiveness is
+                // checked, not asserted. (A `(true, folded)` pair is the half-applied fold
+                // the contract region above already refused; if it ever reached here, the
+                // multiply arm's bytes really are scaled, which is what the type would say.)
+                let multiplied = scale_val.is_some_and(|v| v != 1.0);
+                match (multiplied, scale_law) {
+                    (true, _) => NewK::sqrt_scaled_by_multiply(&new_k_scaled),
+                    (false, ScoreScaleLaw::CommutedIntoWeights) => {
+                        NewK::born_scaled_by_fold(&new_k_scaled)
+                    }
+                    (false, ScoreScaleLaw::UnitByModel | ScoreScaleLaw::StatedByProgram) => {
+                        NewK::reader_stated(&new_k_scaled)
+                    }
+                }
+            },
             new_v: &new_v_rep,
             kc: &kc,
             vc: &vc,
@@ -5513,13 +5573,15 @@ pub struct KvCacheWrite<'a> {
     /// append arm passes its NODE's window (`row_start > 0` for a per-row node of a batch,
     /// whose rows share one output tensor and whose request is the row itself).
     pub row_start: u32,
-    /// This step's new K and V, `[mq, nkvh·hd]` row-blocked. ⭐ THE SCALE CONTRACT, RESTATED AT
-    /// THE SIGNATURE: the SPLICED path passes the rope's PLAIN rotated K — the fp8 k_proj's
-    /// `attn_scale_weight_folds` fold is refused there, so every pool reader states its own
-    /// scale — while main's attention path passes its pre-√-scaled `new_k_scaled` (a folded
-    /// model's K composes at the other end, `√s·√s = s`). The recipe writes whatever it is
-    /// given; the scale law belongs to the caller.
-    pub new_k: &'a str,
+    /// This step's new K and V, `[mq, nkvh·hd]` row-blocked. ⭐ THE SCALE CONTRACT IS THE TYPE:
+    /// `new_k` is [`NewK`], minted by one of three proof-named constructors, so the two callers
+    /// with OPPOSITE laws — the spliced append's RAW rotated K (the fp8 k_proj's fold is refused
+    /// there, so every pool reader states its own scale) and this path's `√s`-carrying K (an
+    /// emitted multiply, or a fold's born-scaled staging, whose future prefix scores state
+    /// nothing) — cannot hand the recipe the same bare `&str` and leave the difference to a
+    /// comment. The recipe writes whichever bytes it is given; WHICH law they carry is what the
+    /// argument says.
+    pub new_k: NewK<'a>,
     pub new_v: &'a str,
     /// The resident natural-K, V and Kᵀ planes.
     pub kc: &'a str,
@@ -5529,11 +5591,14 @@ pub struct KvCacheWrite<'a> {
     pub ident: &'a str,
 }
 
-/// ── (4) KV CACHE WRITE: append this step's new_k_scaled (nkvh-wide, dedup)/new_v_rep (nqh-wide)
+/// ── (4) KV CACHE WRITE: append this step's new K (nkvh-wide, dedup)/new_v_rep (nqh-wide)
 /// into the resident cache, then (5) re-transpose the Kᵀ plane from it. K writes only the nkvh
 /// representative slots (kvh*gqa) — `kctpost` (below) only ever reads those; the other slots were
 /// always dead. V is UNCHANGED (nqh writes, genuinely all read via `vc`'s own nqh-replicated
-/// convention). Writes K ALREADY sqrt-scaled, so future steps' prefix scores need no further K scaling.
+/// convention). ⛔ WHAT THE K CARRIES IS THE ARGUMENT'S TYPE, NOT THIS COMMENT: [`NewK`] states
+/// whether these bytes carry √s (an emitted multiply, or a fold's born-scaled staging — future
+/// steps' prefix scores then state no multiplier) or are raw (every reader states the whole
+/// scale in its own program).
 ///
 /// REQUEST-MAJOR, so that one request's kv-head copies are CONSECUTIVE and fuse into a
 /// single launch. A group resolves one request's page table and write cursor, so the run
@@ -5556,7 +5621,7 @@ pub fn kv_cache_write(
         hd,
         rows_are_requests,
         row_start,
-        new_k: new_k_scaled,
+        new_k,
         new_v: new_v_rep,
         kc,
         vc,
@@ -5683,7 +5748,7 @@ pub fn kv_cache_write(
                     // K writes only the nkvh representative slots (`kctpost` only ever reads those); V is the
                     // nkvh-wide `new_v_rep`, whose reader is kv-head indexed too. Both sides of both writes are
                     // therefore kv-head indexed, which is what lets ONE `y` axis serve them.
-                    for (base, src, dst) in [("kc", new_k_scaled, kc), ("vc", new_v_rep, vc)] {
+                    for (base, src, dst) in [("kc", new_k.name(), kc), ("vc", new_v_rep, vc)] {
                         ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
                         &if heads_on_y {
                             format!("cachewr_{base}s{s}{rq}{pt}_o{t}")

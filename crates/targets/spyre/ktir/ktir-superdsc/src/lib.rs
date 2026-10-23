@@ -58,6 +58,13 @@ pub mod addr;
 /// and `ir::bridge::tiled_op_sdsc_op::attn` — which its doc always said could not — now really
 /// cannot.
 pub mod emit;
+
+/// THE SCORE-SCALE LAW, AS TYPES — [`ScoreScaleLaw`] (where one bundle's attention multiplier
+/// lives, minted only where its proof exists), [`NewK`] (the K a KV-pool write carries, typed by
+/// its scale law), and the wall→type table for every way a score scale can go missing,
+/// mis-placed, or double-applied. Replaces `scale_in_weights: bool` and the recipe's bare
+/// `new_k: &str`.
+pub mod score_scale;
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.

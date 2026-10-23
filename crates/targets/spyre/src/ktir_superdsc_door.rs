@@ -43,6 +43,7 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, err, regions, r
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
+use ktir_superdsc::score_scale::{NewK, ScoreScaleLaw};
 
 /// ⭐⭐⭐ THE FOUR THINGS THE PROGRAM CANNOT STATE — `ibm/main`'s `lower_one_node` PARAMETERS, at the
 /// site that now needs them.
@@ -98,23 +99,23 @@ pub struct BundleAttnParams {
     /// PROGRAM sweeps one page whatever the rung, so the chunk width cannot be read back from it, and it
     /// is folded into the bundle fingerprint for exactly that reason. `None` = the per-page fold.
     pub chunk_pages: Option<u32>,
-    /// ⭐ WHETHER THIS BUNDLE'S ATTENTION SCORE SCALE IS CARRIED BY THE STAGED WEIGHTS — and it is
-    /// here because both cases that make it so leave the program UNABLE to state the one fact that
-    /// remains.
+    /// ⭐⭐⭐ WHERE THIS BUNDLE'S ATTENTION SCORE SCALE LIVES — [`ScoreScaleLaw`], the proof-carrying
+    /// replacement for the `bool` this field used to be. The scale must appear exactly once on each
+    /// side of the score dot product, and the two halves may live in different places (both in the
+    /// program, both folded into the weights, split between a scaled Q and a scaled pool) — what
+    /// must never happen is a scale that lives NOWHERE.
     ///
-    /// The score multiplier was the one thing the program stated and the door read back
-    /// (`program_score_scale`, on the `qk · scale` mulf). A FOLD rewrites the node's scale to 1.0
-    /// before the splice mints the program, and the triton→ktir pipeline folds a multiply by 1.0
-    /// away entirely — so a folded attention program states NO multiplier, which is the truth (no
-    /// device multiply is left to do: the weights carry `√scale` each). A model whose attention
-    /// scale genuinely IS 1.0 (gemma-4's arch defaults `attention_multiplier` to it) states none
-    /// either, for the same reason and just as truthfully — `√1.0` leaves the weights carrying
-    /// the whole scale with nothing folded. This bool is the caller's statement that one of those
-    /// two is the case, and the door HARD-REFUSES a multiplier-less program without it — a fact
-    /// about what the program cannot say, not a value duplicated from what it does (the
-    /// caller-stated `f32` this struct once carried beside the program's own reading, and lost
-    /// for exactly that reason).
-    pub scale_in_weights: bool,
+    /// ⛔ A `bool` COULD NOT SAY WHICH. `scale_in_weights: true` was true for the fold (√s commuted
+    /// into `W_q`/`W_k` at load) and for the model's own unit multiplier (√1 = 1) — two different
+    /// proofs — while its consumer could not be made exhaustive over cases a `bool` cannot
+    /// distinguish. The law is minted where each proof exists ([`attn_bundle_params`]: the fold's
+    /// own receipt, or the IR node's own payload, which is the arch's statement — the IR is
+    /// `&`-shared and every fold rewrite happens on a clone) and every consumer matches it
+    /// exhaustively: the [`Program::Attn`] arm cross-checks it against the program's own statement
+    /// (`program_score_scale`, on the `qk · scale` mulf), and the rope append's cache write derives
+    /// its [`NewK`] from it. A multiplier-less program under `StatedByProgram` — the scale living
+    /// nowhere, `t = 1.0` — is a build error naming both facts, not an emission.
+    pub scale_law: ScoreScaleLaw,
     /// ⭐ WHETHER THIS BUNDLE'S o_proj READS THE HEAD-MAJOR COPY — the finalize/weight contract of
     /// the multi-slab single-row body, and the SECOND fact the program cannot state.
     ///
@@ -254,7 +255,72 @@ pub fn lower(
         // The hand-built `attn()` door this arm used to call minted `AttnGeometry` off the views
         // attn.py writes, so any other attention program was misread (granite-2b's build stop:
         // the page-slot axis read as kv heads) — deleted with its `AttnAt` carrier.
-        Program::Attn => lower_function(k, layout, sym_id_base, None),
+        //
+        // ⭐⭐⭐ AND THE SCORE-SCALE LAW IS CROSS-CHECKED HERE — the read side of the pool law the
+        // rope append's write minted. The program states its own multiplier (`program_score_scale`,
+        // on the `qk · scale` mulf) and the bundle states where the scale LIVES
+        // ([`BundleAttnParams::scale_law`], minted where each proof exists). A disagreement is a
+        // scale that lives NOWHERE (a multiplier-less program over a raw-K pool — `t = 1.0`,
+        // fluent garbage on the card only) or one applied TWICE (a program still stating a
+        // multiplier over weights a fold already scaled) — and either is a BUILD ERROR naming
+        // both facts, not an emission. This is the contract the deleted attention door enforced
+        // at its own boundary, moved to the arm that actually lowers attention now. The demand
+        // is scoped by `program_has_score_contraction`: the paged-fold family's seed and
+        // finalize carry the online-softmax state without computing scores, and a program that
+        // contracts nothing has no multiplier to state.
+        Program::Attn => {
+            if let Some(p) = attn_params {
+                match (lk::program_score_scale(&k.func), p.scale_law) {
+                    (None, ScoreScaleLaw::StatedByProgram)
+                        if lk::program_has_score_contraction(&k.func) =>
+                    {
+                        return err(format!(
+                            "{name}: the bundle's attention scale is stated by the program, but \
+                             the program states no score multiplier. The pool this attention \
+                             reads is written raw K (the fold was refused for its projection), so \
+                             every reader must state the whole scale in its own program — a \
+                             multiplier-less one computes scores at t = 1. Fix the splice so the \
+                             program states the node's multiplier, or the graph so the node \
+                             states the scale its program actually carries."
+                        ));
+                    }
+                    // ⛔ THE IDENTITY IS RESTATED, AND THE GUARD KNOWS BOTH FORMS. The splice
+                    // states the multiplier exp2-restated (`qk · (SCALE · LOG2E)` — the
+                    // softmax is `exp2` end to end), so a program whose scale is genuinely ONE
+                    // states `log2e`, never `1.0`; a raw-restated program states `1.0`. Both
+                    // are the identity in the program's own base, compared at the f16 image
+                    // because that is the only form a program constant carries. Anything else
+                    // under a carried-elsewhere law is a real multiplier behind pre-scaled
+                    // weights — the double-scale.
+                    (Some(v), law @ (ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel))
+                        if v != 1.0
+                            && half::f16::from_f32(v)
+                                != half::f16::from_f32(std::f32::consts::LOG2_E) =>
+                    {
+                        return err(format!(
+                            "{name}: the bundle's attention scale is {law:?}, but the program \
+                             still states a score multiplier of {v}. Both cases that carry the \
+                             scale elsewhere mint the program at the identity (the fold rewrites \
+                             the node to 1.0; a unit model states 1.0 — which the exp2 softmax \
+                             restates as log2e, and the guard admits), so a real multiplier here \
+                             means the graph and the splice disagreed — emitting it would scale \
+                             weights that already carry the scale."
+                        ));
+                    }
+                    // (Some(_), StatedByProgram): the walk lowers the multiplier the program
+                    // states — the one live spelling for every model whose scale is real.
+                    // (None | the identity in either restatement, CommutedIntoWeights |
+                    // UnitByModel): nothing left to state, and the pool write derived its law
+                    // from the same fact. And (None, StatedByProgram) with NO contraction in
+                    // the program is the paged-fold family's CARRY half — the seed (stores
+                    // `-65504`/`0`/`0`) and the finalize (`acc / l`) compute no scores, so
+                    // there is no multiplier for them to state; the check is scoped to
+                    // programs that contract.
+                    _ => {}
+                }
+            }
+            lower_function(k, layout, sym_id_base, None)
+        }
         // ⭐ NO DOOR TO CROSS. A transpose's descriptor is parameterised by the two extents its own
         // program states and by nothing about the model, so the arm is the body — unlike `rope`
         // above, whose head geometry has to become const generics on this side.
@@ -542,6 +608,9 @@ fn rope_append(
                 layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
             ),
         })?;
+    // The new K's name, hoisted beside `ident` so the typed write below can borrow it for
+    // the whole call — the recipe's other names borrow the same way (`r[i].name()`).
+    let k_name = ktir_superdsc::place::act_name(t);
     // ── THE WRITE, main's mechanism wholesale: the copies + stamps (4) and the Kᵀ
     // re-transpose tail (5), one implementation, self-stamping — which is what latches
     // this bundle paged.
@@ -553,9 +622,18 @@ fn rope_append(
             hd,
             rows_are_requests,
             row_start,
-            // ⭐ PLAIN rotated K — the fp8 k_proj's scale fold is refused on this path, so
-            // the readers own the scale (the signature's own scale contract).
-            new_k: &ktir_superdsc::place::act_name(t),
+            // ⭐ THE WRITE'S K, TYPED BY ITS SCALE LAW — minted from the bundle's own law, not
+            // chosen here. A fold that commuted √s into the k_proj stages K BORN SCALED
+            // ([`NewK::born_scaled_by_fold`] — the pool then carries √s and no reader states a
+            // multiplier); every other law (the fold REFUSED — fp8 payloads always are; a unit
+            // model) stages RAW K whose readers state the whole scale in their own programs
+            // ([`NewK::reader_stated`]). The recipe writes whichever bytes it is handed; WHICH
+            // law they carry is the type of this argument, not a comment beside the call — the
+            // old signature's `new_k: &str` held both laws with nothing to tell them apart.
+            new_k: match attn_params.map(|p| p.scale_law) {
+                Some(ScoreScaleLaw::CommutedIntoWeights) => NewK::born_scaled_by_fold(&k_name),
+                _ => NewK::reader_stated(&k_name),
+            },
             new_v: &r[3].name(),
             kc: &r[4].name(),
             vc: &r[5].name(),

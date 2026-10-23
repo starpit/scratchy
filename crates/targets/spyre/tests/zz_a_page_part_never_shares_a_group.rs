@@ -10,6 +10,7 @@
 //! emission's launch index.
 
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
+use ktir_superdsc::score_scale::NewK;
 use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
     FoldGrouping, GroupKind, Trip, TripRequest, group_ranges, launch_index,
 };
@@ -58,7 +59,9 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
                 nkvh: 8,
                 hd,
                 rows_are_requests: false,
-                new_k: "t_newk",
+                // The door's own main-call spelling: the window starts at the cursor's row 0.
+                row_start: 0,
+                new_k: NewK::reader_stated("t_newk"),
                 new_v: "t_newv",
                 kc: "t_kc",
                 vc: "t_vc",
@@ -87,7 +90,9 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
                 nkvh: 8,
                 hd,
                 rows_are_requests: false,
-                new_k: "t_newk",
+                // The door's own main-call spelling: the window starts at the cursor's row 0.
+                row_start: 0,
+                new_k: NewK::reader_stated("t_newk"),
                 new_v: "t_newv",
                 kc: "t_kc",
                 vc: "t_vc",

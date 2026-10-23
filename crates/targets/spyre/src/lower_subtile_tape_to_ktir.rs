@@ -19,6 +19,7 @@ use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
 use ktir_superdsc::sdsc_abstract::POOL_STICK;
+use ktir_superdsc::score_scale::ScoreScaleLaw;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
@@ -676,15 +677,15 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
     // attention-fold recognition named it, OR the node states a UNIT scale — `√1.0` leaves the
     // weights carrying the whole scale with nothing folded, which is the gemma-4 arch's own
     // default (`attention_multiplier` 1.0). The two are disjoint by the recognition's own skip
-    // (a node at scale 1.0 folds nothing), which is also why the door's `scale_in_weights` is a
-    // fact about what the program cannot state, not a restatement of one of its values — see
-    // `BundleAttnParams::scale_in_weights`.
+    // (a node at scale 1.0 folds nothing), which is also why the door's `scale_law` is a fact
+    // about what the program cannot state, not a restatement of one of its values — see
+    // `BundleAttnParams::scale_law`.
     let folded: std::collections::HashSet<SubtileId> = attn_scale_weight_folds(ir)
         .into_iter()
         .map(|(id, ..)| id)
         .collect();
     let mut found: Option<(u32, u32)> = None;
-    let mut first_in_weights: Option<bool> = None;
+    let mut first_law: Option<ScoreScaleLaw> = None;
     for n in &ir.nodes {
         let SubOp::AttnDecode { scale, .. } = &n.op else {
             continue;
@@ -694,31 +695,44 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // the request count (`lower_attn` reads this same `region.rows.len` as its `mq`). The
         // head-major handoff is minted exactly where this is ONE row.
         let rows = n.output.region.rows.len;
-        let n_in_weights = folded.contains(&n.id) || *scale == 1.0;
-        match (found, first_in_weights) {
+        // ⭐⭐⭐ THE LAW, MINTED WHERE EACH PROOF EXISTS — never a bare bool. The fold's own
+        // list IS the receipt for `CommutedIntoWeights` (its gates — fp8 payload, shared
+        // readers, the f16 floor, pair-wise — are the proof, and a refused fold mints nothing);
+        // the IR node's own payload is the arch's statement (`&SubtileIR` is shared-immutable
+        // and every fold rewrite happens on a clone, so a `1.0` read here is the model's and
+        // never a rewrite's residue), and a `1.0` there is `UnitByModel`; everything else
+        // states its multiplier in the program.
+        let n_law = if folded.contains(&n.id) {
+            ScoreScaleLaw::CommutedIntoWeights
+        } else if *scale == 1.0 {
+            ScoreScaleLaw::UnitByModel
+        } else {
+            ScoreScaleLaw::StatedByProgram
+        };
+        match (found, first_law) {
             (None, _) => {
                 found = Some((t, rows));
-                first_in_weights = Some(n_in_weights);
+                first_law = Some(n_law);
             }
             (Some((t0, _r0)), Some(f0)) => {
                 // ⛔ THE GEOMETRY CHECK IS GONE, AND THE HYBRID MODEL IS THE REASON: gemma-4's
                 // sliding layers and every-sixth global layer carry TWO attention classes in one
                 // graph, and the door MINTS each program's geometry from its own views (the same
                 // reading rope takes for its head dim) — so no per-bundle geometry exists to agree
-                // on, and two classes in one graph is legitimate. The in-weights fact below keeps
-                // the one-value-per-bundle law.
-                if f0 != n_in_weights {
+                // on, and two classes in one graph is legitimate. The scale law below keeps the
+                // one-value-per-bundle law.
+                if f0 != n_law {
                     return Err(SuperDscError(format!(
-                        "AttnDecode t{t0} carries its attention scale in its staged weights while \
-                         AttnDecode t{t} states a device score multiply. One bundle is one model, \
-                         and the door takes ONE such fact for the whole bundle; a graph carrying \
-                         both cannot lower one attention without mislowering the other, so this \
-                         refuses instead of choosing."
+                        "AttnDecode t{t0} carries its attention scale {f0:?} while AttnDecode t{t} \
+                         carries {n_law:?}. One bundle is one model, and the door takes ONE such \
+                         law for the whole bundle; a graph carrying both cannot lower one \
+                         attention without mislowering the other, so this refuses instead of \
+                         choosing."
                     )));
                 }
             }
-            // `found` and `first_in_weights` are set in the same arm and never apart.
-            (Some(_), None) => unreachable!("first_in_weights tracks found"),
+            // `found` and `first_law` are set in the same arm and never apart.
+            (Some(_), None) => unreachable!("first_law tracks found"),
         }
     }
     let oproj = oproj_edges(ir)?;
@@ -790,7 +804,7 @@ pub(crate) fn attn_bundle_params<F: RopeForm>(
         // cannot feed (see `BundleAttnParams::gathers_kv`).
         gathers_kv: rows_are_requests || chunk_pages.is_some(),
         chunk_pages,
-        scale_in_weights: first_in_weights.unwrap_or(false),
+        scale_law: first_law.unwrap_or(ScoreScaleLaw::StatedByProgram),
         headmajor_handoff,
         // The CANONICAL o_proj — the first edge's weight, the rolled body's layer-0
         // representative. `Some` whenever the dataflow found the o matmul, whatever the
@@ -3810,7 +3824,7 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::UnitByModel),
             "a unit scale is carried by the weights trivially — √1.0 — so the program states \
              no multiplier and the door must take the skip arm"
         );
@@ -3826,14 +3840,14 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::CommutedIntoWeights),
             "the fold puts √scale into W_q/W_k — no device multiply is left to state"
         );
     }
 
     /// A scale the fold refused STRUCTURALLY (here: an unroped query — the gate permits the
     /// up-multiplier, so the refusal is the chain's own) must state its multiplier in the
-    /// program — the weights carry none of it, so the door fact stays false.
+    /// program — the weights carry none of it, so the law stays `StatedByProgram`.
     #[test]
     fn an_unfolded_real_scale_states_no_door_fact() {
         let ir = attn_graph(4.0, true, false, false, false, false);
@@ -3841,7 +3855,7 @@ mod attn_scale_weight_fold_tests {
             .expect("the bundle states its attention params")
             .expect("the graph has an attention node");
         assert!(
-            !p.scale_in_weights,
+            matches!(p.scale_law, ScoreScaleLaw::StatedByProgram),
             "an unfolded node at a real scale must have its multiplier stated by the program"
         );
     }
@@ -4010,20 +4024,20 @@ mod attn_scale_weight_fold_tests {
 
     /// ⭐ THE DISAGREEMENT, WIDENED: one graph whose attentions disagree about WHERE the score
     /// scale lives — one carries it in its staged weights (here: a unit multiplier), the other
-    /// states a device score multiply — is a build error at the recognition, naming both nodes,
-    /// because the door takes ONE such fact per bundle and either choice mislowers one layer.
+    /// states a device score multiply — is a build error at the recognition, naming both nodes
+    /// AND both laws, because the door takes ONE such law per bundle and either choice
+    /// mislowers one layer.
     #[test]
     fn a_graph_mixing_in_weights_and_stated_scales_refuses_to_choose() {
         let ir = two_attn_graph(1.0, 4.0, true);
         let err = attn_bundle_params(&ir, false, false, None).expect_err("a mixed graph refuses");
         assert!(
-            err.0
-                .contains("carries its attention scale in its staged weights"),
-            "the refusal names the in-weights side: {err:?}"
+            err.0.contains("carries its attention scale UnitByModel"),
+            "the refusal names the unit side by its law: {err:?}"
         );
         assert!(
-            err.0.contains("states a device score multiply"),
-            "the refusal names the stated side: {err:?}"
+            err.0.contains("carries StatedByProgram"),
+            "the refusal names the stated side by its law: {err:?}"
         );
     }
 

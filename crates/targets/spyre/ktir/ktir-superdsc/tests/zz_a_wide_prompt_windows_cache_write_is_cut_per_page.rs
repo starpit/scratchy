@@ -11,6 +11,7 @@
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
+use ktir_superdsc::score_scale::NewK;
 use ktir_superdsc::sdsc_abstract::PagedKvPool;
 
 const NKVH: u32 = 8;
@@ -26,7 +27,9 @@ fn write(mq: u32, hd: u32, rows_are_requests: bool) -> Vec<EmittedOp> {
             nkvh: NKVH,
             hd,
             rows_are_requests,
-            new_k: "t_newk",
+            // The door's own main-call spelling: the window starts at the cursor's row 0.
+            row_start: 0,
+            new_k: NewK::reader_stated("t_newk"),
             new_v: "t_newv",
             kc: "t_kc",
             vc: "t_vc",
