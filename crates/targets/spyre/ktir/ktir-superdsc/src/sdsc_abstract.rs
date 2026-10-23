@@ -5795,7 +5795,7 @@ const _: () = {
 // here. This one is not generic, so it belongs at module level where the forcing cannot be forgotten.
 //
 // ⭐ A WINDOW WIDER THAN A PAGE IS A WHOLE NUMBER OF PAGES. Its cache write is cut into page parts, each
-// resolving its OWN page through the request's block table (`EmittedOp::kv_slot_offset`), so a window of
+// resolving its OWN page through the request's block table (`EmittedOp::kv_part`), so a window of
 // `PREFILL_WINDOW_PAGES` pages starting at a page boundary is as safe as one page was. A window that is not
 // a whole number of pages would leave a part straddling a page, which no part can address.
 const _: () = assert!(
@@ -5880,6 +5880,13 @@ pub struct KvWritePart {
     /// The request this part's KV belongs to — the `kv_request` stamp (`0` unless the
     /// window's rows are requests).
     pub request: u32,
+    /// ⭐ THE PART'S OWN [`PagePart`](crate::page_part::PagePart) — which page of the window this
+    /// part addresses, minted HERE by the same cut that computed its rows. The consumers
+    /// ([`crate::emit::kv_cache_write`]'s op stamps, and through them the fusion walk and the
+    /// launch's shift) copy this value; none re-derives it. Before it existed each stamp
+    /// respelled `if rows_are_requests { 0 } else { part.row0 }`, and the offset a group's
+    /// ops carried was a second derivation the launch index had to `assert!` agreement with.
+    pub page: crate::page_part::PagePart,
 }
 
 impl PagedKvPool {
@@ -6304,7 +6311,7 @@ impl PagedKvPool {
     /// ⭐ HOW MANY SLOTS A PREFILL CHUNK STARTING AT `start` MAY CLAIM — the room left in its window.
     ///
     /// A chunk's cache write is cut into one part per PAGE, each part resolving its own page through the
-    /// request's block table (`EmittedOp::kv_slot_offset`) — so a chunk starting at a page boundary may
+    /// request's block table (`EmittedOp::kv_part`) — so a chunk starting at a page boundary may
     /// fill all [`PREFILL_WINDOW_PAGES`](Self::PREFILL_WINDOW_PAGES) pages of its window, and part `p`
     /// lands at the start of the window's page `p`.
     ///
@@ -6393,6 +6400,9 @@ impl PagedKvPool {
                     row0,
                     rows: 1,
                     request: row0,
+                    // A request-major part states no offset: its page is the request's own
+                    // block-table entry and its slot the launch's `seq_pos` shift.
+                    page: crate::page_part::PagePart::at_cursor(),
                 })
                 .collect();
         }
@@ -6407,6 +6417,10 @@ impl PagedKvPool {
                 row0,
                 rows,
                 request: 0,
+                // ⭐ THE PART'S OWN PAGE, minted by the same cut that computed the rows: the
+                // part's first row past the write cursor, as the `Slots` newtype. The op stamps
+                // copy this value; none re-derives it.
+                page: crate::page_part::PagePart::at_slots(crate::page_part::Slots::of(row0)),
             });
             row0 += rows;
         }

@@ -2677,16 +2677,19 @@ pub struct EmittedOp {
     /// fallback proof CHECKS the stamped groups. The seed and finalize carriers of the same
     /// family stay `None` — they launch once per step, not once per page.
     pub kv_paged_fold: Option<crate::sdsc_abstract::PagedFold>,
-    /// ⭐ SLOTS PAST THE LAUNCH'S WRITE CURSOR WHERE THIS OP'S KV STARTS — a whole number of pages,
-    /// non-zero only for the later PAGE PARTS of a prefill chunk whose window spans more than one page.
+    /// ⭐ WHICH PAGE OF A MULTI-PAGE WINDOW THIS OP ADDRESSES — a
+    /// [`PagePart`](crate::page_part::PagePart), never a number.
     ///
-    /// One launch resolves ONE page per op from the request's block table, at the page holding the op's
-    /// cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the emitter cuts
-    /// each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and part `p` carries `p·PAGE_SLOTS`
-    /// here, so the runtime resolves ITS page at `cursor + offset` (`fold_plan::op_slot_pos`). A part
-    /// whose page the request does not hold (a short last chunk's padding) is SKIPPED, never aimed at
-    /// part 0's page. Ops with different offsets never share a group: one group is one page shift.
-    pub kv_slot_offset: u32,
+    /// One launch resolves ONE page per op from the request's block table, at the page holding the
+    /// op's cursor. A window of `PREFILL_WINDOW_PAGES` pages therefore cannot be one write: the
+    /// emitter cuts each `(kv head, slab)` copy into parts of `PAGE_SLOTS` rows, and the op carries
+    /// THE CUT'S OWN part (stamped from the [`KvWritePart`](crate::sdsc_abstract::KvWritePart)
+    /// `write_parts` returned — the only minter), so the runtime resolves ITS page at
+    /// `cursor + part` (`fold_plan::op_slot_pos`). A part whose page the request does not hold (a
+    /// short last chunk's padding) is SKIPPED, never aimed at part 0's page. Ops of different parts
+    /// never share a group: one group is one page shift, and the fusion walk compares THIS TYPE —
+    /// what the part carries is the argument's type, not this comment.
+    pub kv_part: crate::page_part::PagePart,
     /// TRUE for a cache-write copy that writes a DISTINCT per-entry slot (the mq>1 PREFILL
     /// per-slot cachewr copies, baked at `qh·cap·hd + s·hd` for distinct `s`). Such copies
     /// MUST NOT be fused into a `GroupKind::Slot` group: the shim applies ONE `slot_pos`
@@ -2793,7 +2796,7 @@ impl EmittedOp {
             kv_page_slots: 0,
             kv_request: 0,
             kv_paged_fold: None,
-            kv_slot_offset: 0,
+            kv_part: crate::page_part::PagePart::at_cursor(),
             host_kv_write: false,
             kv_n_skip: 0,
             kv_new_k_tid: 0,
@@ -2841,7 +2844,7 @@ impl EmittedOp {
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
             kv_paged_fold: self.kv_paged_fold,
-            kv_slot_offset: self.kv_slot_offset,
+            kv_part: self.kv_part,
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
             slot_no_fuse: self.slot_no_fuse,
@@ -2920,7 +2923,7 @@ impl EmittedOp {
             kv_page_slots: 0,
             kv_request: 0,
             kv_paged_fold: None,
-            kv_slot_offset: 0,
+            kv_part: crate::page_part::PagePart::at_cursor(),
             slab_write: false,
             slab_stride_bytes: 0,
             slot_no_fuse: false,

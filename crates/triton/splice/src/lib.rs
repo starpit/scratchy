@@ -770,7 +770,7 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     // body is never walked (the door's `Program::RopeAppend` arm lowers the write through
     // `kv_cache_write`), so its constexprs state the CONTRACT: the node's window and the
     // pool's plane law, `SLOT_START = 0` because the runtime aims every slot (the
-    // recipe's `kv_slot_offset` / `slot_stride_bytes` stamps, never a baked corner).
+    // recipe's `kv_part` / `slot_stride_bytes` stamps, never a baked corner).
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
     for param in ["desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc"] {

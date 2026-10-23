@@ -612,7 +612,9 @@ impl OpProg {
             addr: None,
             kv: OpKv {
                 request: kv.request as u64,
-                slot_offset: kv.slot_offset as u64,
+                // The group's own part, off the launch index's single derivation — the typed value
+                // the fusion walk compared, not a re-read number.
+                part: kv.part,
                 page_fold: kv.page_fold,
                 slot_write: kv.slot_write(),
                 page_slots: kv.page_slots as u64,

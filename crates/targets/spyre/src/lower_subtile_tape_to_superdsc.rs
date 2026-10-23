@@ -4796,11 +4796,17 @@ pub struct TripRequest(pub u32);
 pub struct Trip {
     pub kind: GroupKind,
     pub req: TripRequest,
-    /// ⭐ THE OP'S [`EmittedOp::kv_slot_offset`] — which PAGE PART of a multi-page prefill window it
-    /// addresses. Checked beside the request, for every kind, and for the same reason: a launch resolves
-    /// ONE page per group, so a cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the
-    /// window's second page cannot share a group with anything aimed at its first.
-    pub slot_offset: u32,
+    /// ⭐ THE OP'S [`EmittedOp::kv_part`] — which page of a multi-page window it addresses. A
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart), minted only by the cutting law
+    /// (`PagedKvPool::write_parts`) and copied op → trip → launch, so the value the walk
+    /// compares and the value the launch shifts by are ONE value. Compared beside the request,
+    /// for every kind, and for the same reason: a launch resolves ONE page per group, so a
+    /// cache-write part (a `Slot`) and a Kᵀ re-transpose part (a `Pure`) of the window's second
+    /// page cannot share a group with anything aimed at its first. WHAT THE PART CARRIES IS THE
+    /// ARGUMENT'S TYPE, NOT THIS COMMENT — a bare `u32` here is what made the walk's comparison
+    /// and the launch's re-read two derivations that could disagree (and did, guarded only by an
+    /// assert at bake).
+    pub part: ktir_superdsc::page_part::PagePart,
 }
 
 impl GroupKind {
@@ -4896,16 +4902,17 @@ impl GroupKind {
 impl Trip {
     /// A trip addressing its request's page at the write cursor — every trip but a page part's.
     pub fn new(kind: GroupKind, req: TripRequest) -> Trip {
-        Trip::at_slot_offset(kind, req, 0)
+        Trip::at_part(kind, req, ktir_superdsc::page_part::PagePart::at_cursor())
     }
 
-    /// A trip addressing the page `slot_offset` slots past the write cursor (see [`Trip::slot_offset`]).
-    pub fn at_slot_offset(kind: GroupKind, req: TripRequest, slot_offset: u32) -> Trip {
-        Trip {
-            kind,
-            req,
-            slot_offset,
-        }
+    /// A trip addressing the page `part` names past the write cursor — the part the cutting law
+    /// minted for the op this trip was built from (see [`Trip::part`]).
+    pub fn at_part(
+        kind: GroupKind,
+        req: TripRequest,
+        part: ktir_superdsc::page_part::PagePart,
+    ) -> Trip {
+        Trip { kind, req, part }
     }
 
     /// THE ONE RULE THAT DECIDES EVERY GROUP BOUNDARY: same request, same page part, and kinds that fuse.
@@ -4913,11 +4920,13 @@ impl Trip {
     /// A group is one launch; a launch resolves one request's page table and one write cursor and
     /// shifts the segment base ONCE. Two requests therefore cannot share a group whatever their
     /// kinds — so the request test lives HERE, above the kind test, and applies to kinds that do not
-    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page.
+    /// exist yet. Two page parts cannot either: their pages differ, and the shift is one page — the
+    /// part comparison is over the OPAQUE [`PagePart`](ktir_superdsc::page_part::PagePart) type,
+    /// which the cutting law alone mints, so it cannot be confused with a slot index, a page count
+    /// or a `rep`, and the value compared here is the value the launch later shifts by (there is no
+    /// second derivation to disagree with it).
     fn fusable_with(&self, other: &Trip) -> bool {
-        self.req == other.req
-            && self.slot_offset == other.slot_offset
-            && self.kind.fusable_kind_with(other.kind)
+        self.req == other.req && self.part == other.part && self.kind.fusable_kind_with(other.kind)
     }
 }
 
@@ -5296,10 +5305,10 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::at_slot_offset(
+            kinds.push(Trip::at_part(
                 k,
                 TripRequest(e.kv_request),
-                e.kv_slot_offset,
+                e.kv_part,
             ));
             owner.push(oi);
         }
@@ -5630,21 +5639,14 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         } else {
             0
         };
-        // ONE PAGE PART per group, of ANY kind — the runtime resolves the group's page once, at the
-        // owner's offset, so an op of another part would land on the wrong page. `group_ranges` breaks a
-        // run where the offset changes (`Trip::fusable_with`), so this cannot fire; it is here because a
-        // part on the wrong page is a cache write nothing downstream can detect.
-        for t in r.clone() {
-            let o = &ops[owner[t]];
-            assert!(
-                o.kv_slot_offset == e.kv_slot_offset,
-                "group {gi}: op '{}' addresses slot offset {} but the group resolves {} — one group is \
-                 one page shift, so a page part must not share a group with another part",
-                o.op_name,
-                o.kv_slot_offset,
-                e.kv_slot_offset
-            );
-        }
+        // ⭐ ONE PAGE PART per group, of ANY kind — AS A TYPE, NOT AN ASSERT. The runtime resolves the
+        // group's page once, at the group's part, so an op of another part would land on the wrong
+        // page: a cache write nothing downstream can detect. That guard used to be an `assert!` here,
+        // re-reading the owner op's field against every member's — two derivations that could only be
+        // proven to agree by running them. There is ONE derivation now: [`Trip::fusable_with`] breaks
+        // every run where the part changes, and the shift below reads the group's own first trip's
+        // part — the same value the walk compared — so "the members disagree with the shift" is not a
+        // state the emitter can construct. What the part carries is [`Trip::part`]'s type.
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
@@ -5655,7 +5657,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // absolute-position shift and land past the page.
             page_slots: e.kv_page_slots,
             request: e.kv_request,
-            slot_offset: e.kv_slot_offset,
+            // ⭐ THE GROUP'S PART, OFF THE WALK'S OWN TRIP — the first trip of the run `group_ranges`
+            // formed, whose part every other member's was compared against by `fusable_with`. Never
+            // the owner op's field: before this was a second read of a second derivation, and the
+            // assert that proved the two agreed was a refusal at bake. One derivation, one source.
+            part: kinds[r.start].part,
             // `page_fold` marks the group the runtime re-launches once per page.
             page_fold: fold_group,
             // ONE PASS PER PAGE INSTEAD OF PER (REQUEST, PAGE) — only when the fold's kernels actually
@@ -7457,7 +7463,7 @@ fn ktir_groups_via_superdsc(
         // ⭐ THE CACHE-WRITE FACTS NEED NO STAMP SITE — the append's recipe
         // (`kv_cache_write`, called from the door's `Program::RopeAppend` arm)
         // SELF-STAMPS every op it mints (`kv_page_slots`, `kv_request`,
-        // `kv_slot_offset`, the slot stride), which is what `latch_paged_geometry`
+        // `kv_part`, the slot stride), which is what `latch_paged_geometry`
         // reads off the final ops. A carrier-borne stamp copied here would be a second
         // stamping site for one fact; there is none.
         // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`

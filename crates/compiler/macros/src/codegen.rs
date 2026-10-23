@@ -10091,18 +10091,21 @@ fn launch_tokens(
         slab_stride_bytes,
         page_slots,
         request,
-        slot_offset,
+        part,
         page_fold,
         batched_requests,
         gathered,
         fold_rows,
     } = kv;
+    // The group's `PagePart` relays through `at_slots(Slots::of(n))` — the one mint that can
+    // rebuild a cut part inside a generated literal (a token stream carries a number, not a
+    // private field). The number is the bake's own, off the launch index's single derivation.
     let [slot, slab, slots, req, slot_off] = [
         *slot_stride_bytes,
         *slab_stride_bytes,
         *page_slots,
         *request,
-        *slot_offset,
+        part.slots().get(),
     ]
     .map(proc_macro2::Literal::u32_unsuffixed);
     let fold_rows = match fold_rows {
@@ -10135,7 +10138,9 @@ fn launch_tokens(
                 slab_stride_bytes: #slab,
                 page_slots: #slots,
                 request: #req,
-                slot_offset: #slot_off,
+                part: ::scratchy_target_spyre::bundle_code::PagePart::at_slots(
+                    ::scratchy_target_spyre::bundle_code::Slots::of(#slot_off),
+                ),
                 page_fold: #page_fold,
                 batched_requests: #batched_requests,
                 gathered: #gathered,
@@ -10364,7 +10369,7 @@ const PREFILL_LX_SAFE: u32 = 31;
 /// causal block stays sub-blocked (the gemma bakes, hd ≥ 256) keeps its 128-row ladder byte for byte.
 ///
 /// ⭐ 384 AND 512 SPAN TWO PAGES. Their cache write is cut into page parts at emission (each part
-/// aimed at its own page through the block table — `EmittedOp::kv_slot_offset`), which is what
+/// aimed at its own page through the block table — `EmittedOp::kv_part`), which is what
 /// lets a chunk outgrow the page: the weights are re-streamed once per chunk, so a 10k prompt's
 /// 40 chunks of 256 become 20 of 512.
 const PREFILL_RUNGS: [u32; 27] = [
@@ -12931,7 +12936,7 @@ fn dump_wavefront_mega(
                 //
                 // ⛔ NOT BY THE RESIDENT CACHE (`prefix_len`, 256 by default). That cap dates from the
                 // unpaged cache, where a chunk's keys had to fit the baked prefix rows. A paged chunk
-                // writes the POOL, one page part per page (`EmittedOp::kv_slot_offset`), so its width is
+                // writes the POOL, one page part per page (`EmittedOp::kv_part`), so its width is
                 // the pool's law (`PagedKvPool::PREFILL_CHUNK_SLOTS`, asserted equal to the ladder
                 // ceiling above) and not the cache's. MEASURED: with the cap, the 512-row ladder baked
                 // to 256 in silence — `PREFILL ladder = [..., 192, 256]` at load, and every TTFT cell

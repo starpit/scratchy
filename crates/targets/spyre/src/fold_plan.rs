@@ -265,6 +265,15 @@ impl SlotPos {
         SlotPos(pos)
     }
 
+    /// ⭐ ADVANCE A POSITION BY A PART'S SLOT COUNT — the ONE arithmetic that combines the two,
+    /// so no caller adds a bare number to a position. A page part is whole pages past the write
+    /// cursor ([`OpKv::part`]), and the sum is exactly a cursor that had advanced that far: the
+    /// part's write slot within its page and its page past the cursor both follow from the one
+    /// position.
+    pub fn advanced_by(self, slots: ktir_superdsc::page_part::Slots) -> SlotPos {
+        SlotPos(self.0 + slots.get() as i64)
+    }
+
     pub fn get(self) -> i64 {
         self.0
     }
@@ -302,11 +311,12 @@ impl std::ops::Add for Bytes {
 pub struct OpKv {
     /// `kv_request`: whose KV this op touches. 0 for every op of an unbatched bundle.
     pub request: u64,
-    /// `kv_slot_offset`: slots past the write cursor where this op's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. Added to the cursor
-    /// by [`op_slot_pos`], so the part's page is resolved from the block table like any other; a page the
-    /// request does not hold makes the launch skip the group ([`OpAim::UnheldPage`]).
-    pub slot_offset: u64,
+    /// ⭐ `kv_part`: which page of a multi-page window this op addresses — a
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart) carried off the launch index's own trip,
+    /// never a number re-read from the op. Added to the cursor by [`op_slot_pos`], so the part's
+    /// page is resolved from the block table like any other; a page the request does not hold
+    /// makes the launch skip the group ([`OpAim::UnheldPage`]).
+    pub part: ktir_superdsc::page_part::PagePart,
     /// `kv_page_fold`: this group folds ONE page of resident prefix and is re-launched per page.
     pub page_fold: bool,
     /// `slot_write`: this op appends the new token's KV at the write cursor.
@@ -729,14 +739,14 @@ impl LaunchPages {
 }
 
 /// The write cursor an op uses — [`RequestSlot::resolve`], reached from an op instead of from a
-/// request index, plus the op's own [`OpKv::slot_offset`]. One arithmetic, so the two cannot drift.
+/// request index, plus the op's own [`OpKv::part`]. One arithmetic, so the two cannot drift.
 ///
 /// ⭐ THE OFFSET IS ADDED HERE, ONCE, and every term below reads the sum: a page part's write slot
 /// within its page (the offset is whole pages, so it is the cursor's own) and its page (`p` pages past
 /// the cursor's) both follow from the one position, exactly as a cursor that had advanced that far.
 pub fn op_slot_pos(op: &OpKv, s: &SessionKv, launch: SlotPos) -> SlotPos {
     let at = RequestSlot::resolve(s, RowIdx::from_launch_row(op.request), launch).pos();
-    SlotPos::of_launch(at.get() + op.slot_offset as i64)
+    at.advanced_by(op.part.slots())
 }
 
 /// Whether this op's group is the prefix fold — re-launched once per resident page.
@@ -1143,7 +1153,7 @@ pub fn slot_write_delta(op: &OpKv, pos: SlotPos) -> Bytes {
 /// composes two bases and gathers another page's keys with a clean bake.
 ///
 /// ⭐ `None` IS "THIS PAGE PART HAS NO PAGE" — and only a page part can say it. An op with an
-/// [`OpKv::slot_offset`] addresses the page `pos` (cursor + offset) falls in, which is NOT the caller's
+/// [`OpKv::part`] addresses the page `pos` (cursor + part) falls in, which is NOT the caller's
 /// base: that is the cursor's own page, i.e. part 0's, so falling back to it would write the part's rows
 /// over part 0's keys. A part whose page the row does not hold is a short last chunk's padding past the
 /// request's pages; nothing reads it, so the launch skips the group ([`OpAim::UnheldPage`]).
@@ -1162,7 +1172,7 @@ pub fn nonfold_page_delta(
         0
     };
     let page = RowPage::of(s, RowIdx::from_launch_row(op.request), lp);
-    if op.slot_offset > 0 {
+    if !op.part.is_cursor() {
         return page.map(|rp| page_base_bytes(s, rp));
     }
     if op.request > 0 {
@@ -1213,7 +1223,7 @@ pub struct SegDeltas {
 pub enum OpAim {
     /// Launch with these segment shifts.
     At(SegDeltas),
-    /// ⛔ SKIP THIS GROUP: a page part ([`OpKv::slot_offset`]) whose page the request does not hold — a
+    /// ⛔ SKIP THIS GROUP: a page part ([`OpKv::part`]) whose page the request does not hold — a
     /// short last chunk's padding rows past the request's pages, which nothing will read.
     UnheldPage,
 }
@@ -1987,11 +1997,14 @@ mod tests {
             &[3, 7, 9],
         );
         let per = UniformPages::of(&s).expect("one row");
-        let part = |p: u64| OpKv {
+        // The parts the ONE cutting law mints for a 512-row window — offsets 0 and 256. Taken from
+        // `write_parts`, never spelled as numbers here: a part is what the cut says it is.
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(0, 512, false);
+        let part = |p: usize| OpKv {
             slot_write: true,
             page_slots: 256,
             slot_stride_bytes: 128,
-            slot_offset: p * 256,
+            part: cut[p].page,
             ..Default::default()
         };
         let caller = Bytes(7000); // the launch's own page: page 1, physical 7
@@ -2022,7 +2035,7 @@ mod tests {
         );
         // The Kᵀ re-transpose's part is no slot write but takes the same page.
         let kt = OpKv {
-            slot_offset: 256,
+            part: cut[1].page,
             ..Default::default()
         };
         assert_eq!(
@@ -2050,11 +2063,12 @@ mod tests {
             &[3, 7, 9],
         );
         let per = UniformPages::of(&s).expect("one row");
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(0, 512, false);
         let part1 = OpKv {
             slot_write: true,
             page_slots: 256,
             slot_stride_bytes: 128,
-            slot_offset: 256,
+            part: cut[1].page,
             ..Default::default()
         };
         assert_eq!(
@@ -2067,7 +2081,7 @@ mod tests {
         );
         // Part 0 of the same chunk still launches, on the caller's page.
         let part0 = OpKv {
-            slot_offset: 0,
+            part: cut[0].page,
             ..part1
         };
         assert_eq!(

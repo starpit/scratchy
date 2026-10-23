@@ -482,7 +482,7 @@ fn rope(
 /// shape, the four read-only stream operands, the two stored pool planes — and its body is
 /// NEVER WALKED (rope_fwd's own precedent: the kernel states the contract, the recipe
 /// states the mechanism). The recipe self-stamps every op it mints (`kv_page_slots`,
-/// `kv_request`, `kv_slot_offset`, the slot stride), which is what latches the bundle
+/// `kv_request`, `kv_part`, the slot stride), which is what latches the bundle
 /// paged — the carrier program carries NO stamps.
 ///
 /// HONESTY NOTE, the re-home's own: main's call site was `attn_at` (the attention's door

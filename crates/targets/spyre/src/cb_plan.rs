@@ -170,7 +170,7 @@ impl LaunchSite {
     }
 }
 
-/// `Ok(None)` = THIS (op, pass) DOES NOT LAUNCH — a page part ([`OpKv::slot_offset`]) whose
+/// `Ok(None)` = THIS (op, pass) DOES NOT LAUNCH — a page part ([`OpKv::part`]) whose
 /// page the request does not hold, a short last chunk's padding rows past the request's pages
 /// (#620). Its rows are never read, and the only base left to aim it at is the cursor's own
 /// page, which is part 0's keys. Every caller — the submit walk, `walk_items`, the render —

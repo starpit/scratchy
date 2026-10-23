@@ -5662,7 +5662,7 @@ pub fn kv_cache_write(
     // `PAGE_SLOTS` slots of ONE kv head — so a single `[mq, hd]` copy of more rows than that would run off
     // the page into the NEXT KV HEAD's block. Instead each `(kv head, slab)` copy is cut into parts of
     // `PAGE_SLOTS` rows: part `p` reads the chunk's rows from `p·PAGE_SLOTS` and writes the SAME baked
-    // destination, carrying `kv_slot_offset = p·PAGE_SLOTS` so the runtime aims it at the page that slot
+    // destination, carrying its `PagePart` off the cut so the runtime aims it at the page that slot
     // falls in (`fold_plan::op_slot_pos`), and skips it when the request holds no such page (a short
     // last chunk's padding). A window is a whole number of pages (`PREFILL_CHUNK_SLOTS`'s module law)
     // and starts at a page boundary (`chunk_write_start`), so every part fills its page from slot 0.
@@ -5799,11 +5799,10 @@ pub fn kv_cache_write(
                             // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
                             // into that row's page through the host's block table.
                             o.kv_request = req;
-                            // ⭐ THE PART'S FIRST ROW PAST THE WRITE CURSOR — main's own `p·page` at
-                            // `row_start = 0` (the part's row0 IS `p·page` there, the same number).
-                            // A request-major part states no offset: its page is the request's own
-                            // block-table entry and its slot the launch's `seq_pos` shift.
-                            o.kv_slot_offset = if rows_are_requests { 0 } else { part.row0 };
+                            // ⭐ THE PART'S OWN PAGE, off the cut — `write_parts` minted it beside the
+                            // rows; this stamp COPIES it, never re-derives it (the `if rows_are_requests`
+                            // that used to live here WAS the re-derivation, and it lived twice).
+                            o.kv_part = part.page;
                         }
                     }
                 }
@@ -5828,7 +5827,7 @@ pub fn kv_cache_write(
     //
     // ⭐ AND ONE PER PAGE PART, PART-MAJOR — the window's second page holds natural K the cache write
     // just wrote, and its Kᵀ is as stale as the first page's was. A whole-page re-transpose is already
-    // the per-page form, so a part is the same op aimed `p` pages on (`kv_slot_offset`), skipped with
+    // the per-page form, so a part is the same op aimed `p` pages on (its `PagePart`), skipped with
     // its cache write when the request holds no such page.
     //
     // ⭐ THE PARTS CARRY THE REQUESTS: at `row_start = 0` this is main's own
@@ -5883,9 +5882,9 @@ pub fn kv_cache_write(
             // thing that tells the runtime which page that is.
             if let Some(o) = ops.last_mut() {
                 o.kv_request = req;
-                // The part's first row past the write cursor — the copies' own law (main's
-                // `p·page` at `row_start = 0`), and no offset on a request-major part.
-                o.kv_slot_offset = if rows_are_requests { 0 } else { part.row0 };
+                // The part's own page, off the cut — the copies' law (main's `p·page` at
+                // `row_start = 0`), copied from the same `write_parts` row that carried `row0`.
+                o.kv_part = part.page;
             }
         }
     }

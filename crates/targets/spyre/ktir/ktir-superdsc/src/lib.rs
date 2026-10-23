@@ -65,6 +65,14 @@ pub mod emit;
 /// mis-placed, or double-applied. Replaces `scale_in_weights: bool` and the recipe's bare
 /// `new_k: &str`.
 pub mod score_scale;
+
+/// THE PAGE-PART LAW, AS A TYPE — [`page_part::PagePart`] (which page of a multi-page window an op
+/// addresses), minted only by the cutting law (`PagedKvPool::write_parts`), compared as an opaque
+/// type in the fusion walk, and carried to the launch from the walk's own trip. Deletes the
+/// `EmittedOp::kv_slot_offset`/`Trip::slot_offset` bare numbers and the per-group assert that
+/// guarded them: "a page part never shares a group" is unconstructible now, not checked.
+pub mod page_part;
+
 /// THE TileIR PIPELINE — the assemblers' INPUT type (`TileOp`/`TileOpKind`/`TiledOp`) and the tiler
 /// between them, plus the span-overflow refusal. Came in as an audit correction: the extraction filed
 /// the lowering's input as `KtirNode`, but every assembler under it takes a `&TileOp`.

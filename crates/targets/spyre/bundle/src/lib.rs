@@ -143,6 +143,12 @@ pub use ktir_superdsc::place::{PlaceId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
+/// ⭐ THE PAGE-PART LAW'S TYPES — which page of a multi-page window a launch group addresses
+/// ([`PagePart`]), and the slot count it carries ([`Slots`], the newtype no raw scalar crosses).
+/// Re-exported here because the proc-macro's generated literal rebuilds a part through
+/// [`PagePart::at_slots`] under this crate's path, and because [`KvShifts::part`] is public in
+/// it: a field's type is part of the crate's surface whether or not it is named.
+pub use ktir_superdsc::page_part::{PagePart, Slots};
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -456,11 +462,13 @@ pub struct KvShifts {
     pub page_slots: u32,
     /// Which request's KV this group addresses (batched decode). `0` when unbatched.
     pub request: u32,
-    /// Slots past the launch's write cursor where this group's KV starts — a whole number of pages,
-    /// non-zero only for a later PAGE PART of a prefill window wider than one page. The runtime resolves
-    /// the group's page at `cursor + slot_offset` through the request's block table, and SKIPS the group
-    /// when the request holds no such page. `0` for every other group.
-    pub slot_offset: u32,
+    /// ⭐ WHICH PAGE OF A MULTI-PAGE WINDOW THIS GROUP ADDRESSES — a
+    /// [`PagePart`](ktir_superdsc::page_part::PagePart), read off the group's own first trip by
+    /// the launch index (the value the fusion walk compared), never off the owner op, so the
+    /// group's shift and its members' parts are ONE value. The runtime resolves the group's page
+    /// at `cursor + part` through the request's block table, and SKIPS the group when the request
+    /// holds no such page. The cursor part for every other group.
+    pub part: ktir_superdsc::page_part::PagePart,
     /// This is the group the runtime re-launches once per page of resident KV.
     pub page_fold: bool,
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
