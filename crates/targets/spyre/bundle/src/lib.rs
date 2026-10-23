@@ -140,12 +140,12 @@ pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
 pub use ktir_superdsc::place::{PlaceId, SynthRole};
-/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
-/// same reason as [`PlaceId`]: both ends read the one type.
-pub use ktir_superdsc::placement::WeightTail;
 /// The rope ping-pong's addressing route (#603 PR3b E), declared beside the placements that
 /// carry it and the launch groups whose CBs move with it — same reason as [`WeightTail`].
 pub use ktir_superdsc::placement::ParityRoute;
+/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
+/// same reason as [`PlaceId`]: both ends read the one type.
+pub use ktir_superdsc::placement::WeightTail;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1156,6 +1156,10 @@ mod place_id_tests {
             is_logits: false,
             parity: None,
         };
-        assert_eq!(plain.logical_size(), 4096, "un-routed: `size` is the extent");
+        assert_eq!(
+            plain.logical_size(),
+            4096,
+            "un-routed: `size` is the extent"
+        );
     }
 }

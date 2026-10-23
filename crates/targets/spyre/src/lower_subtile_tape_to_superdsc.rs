@@ -773,12 +773,7 @@ fn pmask_reserve_bytes<F: RopeForm>(
     // only the live blocks it is also `mq`x less mask uploaded every step: at bs=8 and three
     // pages, 3 blocks instead of 24.
     let pm_rows = if rows_are_requests { nqh * mq } else { 1 };
-    Some(
-        pm_rows
-            * max_pages
-            * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
-            * 2,
-    )
+    Some(pm_rows * max_pages * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2)
 }
 
 pub fn compute_bundle_layout<F: RopeForm>(
@@ -968,24 +963,14 @@ pub fn compute_bundle_layout<F: RopeForm>(
     let rope_source_tids: std::collections::BTreeSet<u32> = ir
         .nodes
         .iter()
-        .filter(|n| {
-            matches!(
-                n.op,
-                SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }
-            )
-        })
+        .filter(|n| matches!(n.op, SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }))
         .flat_map(|n| {
             // The door's operand order is `[x, cos, sin]` (`split_out(…, 3)`), the tape's own
             // declaration — and a node with fewer than 3 inputs is not a rope this walk knows;
             // the door refuses it separately.
             n.inputs
                 .get(1..3)
-                .map(|cs| {
-                    [
-                        cs[0].tensor.index() as u32,
-                        cs[1].tensor.index() as u32,
-                    ]
-                })
+                .map(|cs| [cs[0].tensor.index() as u32, cs[1].tensor.index() as u32])
                 .into_iter()
                 .flatten()
         })

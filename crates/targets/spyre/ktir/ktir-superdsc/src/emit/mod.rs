@@ -3096,7 +3096,8 @@ fn resolve_seg_base(
                     } else {
                         String::new()
                     },
-                    p.size, p.segment
+                    p.size,
+                    p.segment
                 )));
             }
             // ⭐ A PARITY PLACEMENT RESOLVES AGAINST ITS ROUTE'S SLOT, not its physical segment:

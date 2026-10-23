@@ -1759,12 +1759,7 @@ impl Executor {
     /// parity-0 slot keeps the PREVIOUS even step's bytes in the host shadow — which is what
     /// makes the 4 KiB alignment bleed of the parity-1 run harmless: it re-sends bytes the
     /// device already holds (see `h2d_run`).
-    pub fn bind_input_f32(
-        &mut self,
-        id: bundle::PlaceId,
-        vals: &[f32],
-        parity: u64,
-    ) -> Result<()> {
+    pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32], parity: u64) -> Result<()> {
         if !self.prepared {
             bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
         }
@@ -5018,9 +5013,7 @@ impl Executor {
         // derive the parity from the step's absolute position through [`step_parity`], the one
         // function that knows the law, so the writer and the reader cannot disagree. For every
         // non-routed tensor the shift is 0 and the staging is byte-identical to before.
-        let parity_shift = |p: &Placement| -> u64 {
-            p.parity.map_or(0, |r| parity * r.stride)
-        };
+        let parity_shift = |p: &Placement| -> u64 { p.parity.map_or(0, |r| parity * r.stride) };
         // ⛔ A WHOLE-SEGMENT H2D IS THE O(cap) DECODE CLIFF. seg3 is 8425 KB and a bs=8 decode step
         // writes a small fraction of it, so nearly every byte uploaded is unchanged — a flat
         // ~1.5 ms no amount of shrinking the mask could reach, because the transfer is sized by the

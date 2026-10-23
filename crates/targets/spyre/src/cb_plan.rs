@@ -264,8 +264,7 @@ pub(crate) fn launch_site(
     // hands the canvas the OTHER parity's bytes, which is the original torn read wearing a
     // patch-table costume.
     if let Some(route) = op.kv.parity {
-        let sh = off[route.backing as usize]
-            + step_parity(where_.slot_pos) * route.stride;
+        let sh = off[route.backing as usize] + step_parity(where_.slot_pos) * route.stride;
         let base = segment_base(seg, banks, where_.weight_bank, route.backing as usize)?;
         let Some(s) = base.shifted(ByteSize(sh)) else {
             bail!(
@@ -462,7 +461,8 @@ impl CbPlan {
             // two overrides must move together or prepare refuses — which is the point.
             if let Some(route) = e.kv.parity {
                 let (base, static_off) = &e.bases[route.backing as usize];
-                let sh = *static_off + dyn_off[route.backing as usize]
+                let sh = *static_off
+                    + dyn_off[route.backing as usize]
                     + step_parity(where_.slot_pos) * route.stride;
                 let Some(s) = base.shifted(ByteSize(sh)) else {
                     bail!(
@@ -989,8 +989,7 @@ pub(crate) fn build_patch_plan(
             if d1 == 0 && d2 == 0 && d3 == 0 {
                 continue;
             }
-            let (a_slot, b_slab, c_parity) =
-                solve_word(d1, d2, d3, dslot_slab, dparity_slot)?;
+            let (a_slot, b_slab, c_parity) = solve_word(d1, d2, d3, dslot_slab, dparity_slot)?;
             patches.push(Patch {
                 cb,
                 dst,
@@ -1185,9 +1184,9 @@ mod tests {
             for dslot_slab in [64i64, 64 - 2048] {
                 for (a, b, c) in [
                     (0x4000i64, 0x20_0000i64, 0x1000i64), // XLAT-paddr-like magnitudes
-                    (0i64, 0i64, 0x1000),                  // a parity-ONLY word
-                    (128, 0, 0),                           // a slot-ONLY word
-                    (0, 0x80_0000, 0),                     // a slab-ONLY word
+                    (0i64, 0i64, 0x1000),                 // a parity-ONLY word
+                    (128, 0, 0),                          // a slot-ONLY word
+                    (0, 0x80_0000, 0),                    // a slab-ONLY word
                 ] {
                     // The differentials, from their definitions: +1 (slot, parity
                     // flipped), slab (slot +dslot_slab, slab +1), +2 (slot only).
@@ -1244,12 +1243,27 @@ mod tests {
         let cb = Cbw::compute(
             ResponseTag(1),
             &[
-                (DevicePhysicalAddress(0x1_0000_0000), AllocationTotalSize(0x0100_0000)),
-                (DevicePhysicalAddress(0x2_0000_0000), AllocationTotalSize(0x0100_0000)),
-                (DevicePhysicalAddress(0x3_0000_0000), AllocationTotalSize(0x0100_0000)),
-                (DevicePhysicalAddress(0x4_0000_0000), AllocationTotalSize(0x0100_0000)),
+                (
+                    DevicePhysicalAddress(0x1_0000_0000),
+                    AllocationTotalSize(0x0100_0000),
+                ),
+                (
+                    DevicePhysicalAddress(0x2_0000_0000),
+                    AllocationTotalSize(0x0100_0000),
+                ),
+                (
+                    DevicePhysicalAddress(0x3_0000_0000),
+                    AllocationTotalSize(0x0100_0000),
+                ),
+                (
+                    DevicePhysicalAddress(0x4_0000_0000),
+                    AllocationTotalSize(0x0100_0000),
+                ),
             ],
-            (DevicePhysicalAddress(0x7_0000_0000), AllocationTotalSize(0x1000)),
+            (
+                DevicePhysicalAddress(0x7_0000_0000),
+                AllocationTotalSize(0x1000),
+            ),
             VirtualAddressSbf::new(7, Flits(0x40)),
         )
         .expect("a host-side compute CB renders without a device");

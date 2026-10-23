@@ -4151,7 +4151,8 @@ mod attn_scale_weight_fold_tests {
         let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(1, 128);
         let page_bytes = pool.layer_stride() as u64 * 2;
         let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
-        let pmbytes = max_pages * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2;
+        let pmbytes =
+            max_pages * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2;
         let logical = pm.size - route.stride;
         assert_eq!(
             logical, pmbytes,
