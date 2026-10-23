@@ -290,13 +290,21 @@ impl StepImageCache {
         self.map.insert(key, image);
     }
 
-    /// The largest canvas any cached image carries — the window budget's
-    /// early-check number (§4.7): `cbs_per_step` for the keys this session has
-    /// already derived. `None` until the first derivation, which is exactly the
-    /// first window's documented deferral — [`Executor::window_step`]'s running
-    /// counter covers it with the real counts as they land.
+    /// The largest canvas any cached WIDTH-1 image carries — the window
+    /// budget's early-check number (§4.7): `cbs_per_step` for the keys this
+    /// session has already derived. Prefill images (#603 PR4) are excluded
+    /// on purpose: a window's steps replay one-token images, and a prefill
+    /// chunk's canvas (a fold pass per prefix page) is bigger than any
+    /// step's — counting it would refuse windows that fit. `None` until the
+    /// first width-1 derivation, which is exactly the first window's
+    /// documented deferral — [`Executor::window_step`]'s running counter
+    /// covers it with the real counts as they land.
     fn max_canvas_len(&self) -> Option<usize> {
-        self.map.values().map(|i| i.data.canvas.len()).max()
+        self.map
+            .iter()
+            .filter(|(k, _)| k.width == 1)
+            .map(|(_, i)| i.data.canvas.len())
+            .max()
     }
 }
 
