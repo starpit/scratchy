@@ -1919,7 +1919,25 @@ fn elementwise_broadcast(
             // honest is the frame law above, already proven.
             Some(BcastAxis::Y(y)) => (rows / y, out.c_len),
         };
-        if (x.v_rows, x.c_len) != want {
+        // ⭐⭐⭐ AND THE ROW-SPLIT SOURCE MAY BE A PER-TRIP WINDOW of a region-stated view — the
+        // prefill mask: `[REGION·W4·mq, 64]` staged page-major, loaded per trip at its own row
+        // corner, sprayed over the batch. The dense law's own pair ([`pointwise_extents_agree`]:
+        // whole view OR window) stated for the spray: one spray's worth of rows is the WINDOW's
+        // rows (`r_len`), and the corner rides the emission below (`In::y_at`) exactly as a
+        // banded dense operand's row corner does — the source is single-stick by the frame law,
+        // so a row corner is a plain element offset that composes with the mb-row addressing.
+        // Every other mode keeps the verbatim equality.
+        let ok = match bcast[i] {
+            Some(BcastAxis::Y(_)) => {
+                (x.v_rows, x.c_len) == want
+                    || (x.c_start == 0
+                        && x.r_len == want.0
+                        && x.c_len == want.1
+                        && x.r_start + x.r_len <= x.v_rows)
+            }
+            _ => (x.v_rows, x.c_len) == want,
+        };
+        if !ok {
             return err(format!(
                 "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
                  ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
@@ -2009,7 +2027,24 @@ fn elementwise_broadcast(
                 Ok(In::mb_at(h, w.dev()).ew())
             }
             Some(BcastAxis::Mb) => Ok(In::mb(h).ew()),
-            Some(BcastAxis::Y(y)) => Ok(In::y_broadcast(h, *y).ew()),
+            // ⭐⭐⭐ THE Y SOURCE AT A PER-TRIP ROW WINDOW — the corner form of the row-split
+            // source: the window's own device offset in the parent's stick-blocked storage
+            // (`rc_of` at `(r_start, 0)`), the same typed corner law `In::mb_at` states for the
+            // Mb source's column window. The source is single-stick by the frame law, so one
+            // stick per row means the corner composes additively with the mb-row addressing and
+            // the spray reads exactly the window's rows. A corner-free source keeps the base
+            // `In::y_broadcast` — byte-identical to the whole-tensor emission.
+            Some(BcastAxis::Y(y)) => Ok(if x.r_start == 0 {
+                In::y_broadcast(h, *y).ew()
+            } else {
+                let df = if x.is_fp8 { Df::Fp8 } else { Df::Fp16 };
+                In::y_at(
+                    h,
+                    *y,
+                    crate::addr::rc_of(x.v_rows, x.v_cols, x.r_start, x.c_start, df),
+                )
+                .ew()
+            }),
         })
         .collect::<Result<Vec<_>, Error>>()?;
     // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a

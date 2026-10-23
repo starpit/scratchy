@@ -4746,6 +4746,28 @@ impl<'a, K: KindTag> In<'a, K> {
             col_window: None,
         }
     }
+    /// [`y_broadcast`](Self::y_broadcast) AT A ROW CORNER — the per-trip window form of the
+    /// row-split source: a `[mb, out]` window at row `r_start` of a taller region-stated view
+    /// (the prefill mask, page-major). The corner is the window's own device offset in the
+    /// parent's stick-blocked storage (`rc_of` at `(r_start, 0)` — the same typed corner law
+    /// [`In::mb_at`](Self::mb_at) states for the Mb source's column window); the source is
+    /// single-stick by the frame law, so one stick per row means the corner composes
+    /// additively with the mb-row addressing and the spray reads exactly the window's rows.
+    pub fn y_at(h: &'a Stk<K>, y: u32, off: crate::addr::DevOff) -> Self {
+        assert!(
+            y > 1,
+            "In::y_at: a spray count of {y} is not a broadcast — the leading dim must \
+             spray a real count (the walk's Y admission refuses y == 1 upstream)"
+        );
+        In {
+            h,
+            mb_broadcast: false,
+            out_broadcast: false,
+            y_broadcast: y,
+            col_offset: off.into_raw_elems(),
+            col_window: None,
+        }
+    }
     pub fn ew(&self) -> EwOperand<'a> {
         EwOperand {
             name: self.h.name(),
