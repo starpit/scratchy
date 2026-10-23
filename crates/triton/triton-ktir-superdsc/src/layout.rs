@@ -735,6 +735,9 @@ fn pack(
             bank: 0,
             offset,
             size,
+            // The Triton-runner layout places no rope sources through this walk — the
+            // step-parity dimension is the dxp path's alone, so no placement here routes.
+            parity: None,
         },
     ) {
         // A repeated tid means one buffer reached this walk twice — two parameters bound to it, or a

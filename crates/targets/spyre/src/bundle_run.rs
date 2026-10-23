@@ -402,6 +402,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             // whichever the producer marked `Logits`; a launcher that picked "the last place" or "the
             // highest segment" would read the wrong buffer on any bundle whose output is not last.
             is_logits: p.role == "Logits",
+            // The Triton runner's manifests predate the rope ping-pong and carry no route —
+            // no parity-routed tensor ever runs through this path.
+            parity: None,
         })
         .collect();
     let out_ids: Vec<u32> = pf

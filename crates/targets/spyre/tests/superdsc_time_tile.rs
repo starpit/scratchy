@@ -373,6 +373,7 @@ fn rmsnorm_rinv_is_pinned_lx() {
                     bank: 0,
                     offset: 0,
                     size,
+                    parity: None,
                 },
             );
         };
@@ -540,6 +541,7 @@ fn two_norm_layout() -> ktir_superdsc::placement::BundleLayout {
                 bank: 0,
                 offset: 0,
                 size,
+                parity: None,
             },
         );
     };
@@ -915,6 +917,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                parity: None,
             },
         );
     }
@@ -931,6 +934,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
                 bank: 0,
                 offset: 40 << 30,
                 size,
+                parity: None,
             },
         );
     };

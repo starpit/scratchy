@@ -840,6 +840,93 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // stride the runtime shifts by and the stride the addresses were baked with are one value.
     let kv_request_stride_bytes: u64 = 0;
 
+    // ── ⭐⭐⭐⭐⭐ THE ROPE PING-PONG (#603 PR3b E) — the step-parity dimension on the rope
+    //    cos/sin sources. The decode window's run-ahead preamble H2D for step i+1 lands
+    //    mid-canvas of step i, and the only per-step-mutating bytes it carries whose torn read
+    //    changes the answer are the ROPE ROWS (the embed row is device-written by the gather
+    //    that chains off the argmax; the consts are idempotent). The ruling-#9/#10 fix: the
+    //    rope placement gets a step-parity dimension — the upload for position p writes slot
+    //    `p % 2`, the canvas at p reads slot `p % 2`, one step of run-ahead puts writer and
+    //    reader in different slots at every k and every cadence.
+    //
+    //    IDENTIFIED STRUCTURALLY, from the tape itself: a rope node's inputs `[x, cos, sin]`
+    //    name their own tables, so this walk needs nothing the wiring carries. Every rope
+    //    source of one bundle shares ONE route — one CB has one `tensor_allocs` word for the
+    //    slot, so the stride must be common — and the stride is the WIDEST rope row, which is
+    //    what puts each tensor's parity-1 window INSIDE its own grown placement, clear of its
+    //    row 0 and of every other tensor's reservation (disjoint BY CONSTRUCTION — the placement
+    //    is exclusive). The bytes stay in the Activation segment: same region, same shadow,
+    //    same merged H2D run structure; only the CB-local addressing slot and the parity
+    //    alternation are new.
+    let rope_source_tids: std::collections::BTreeSet<u32> = ir
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.op,
+                SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }
+            )
+        })
+        .flat_map(|n| {
+            // The door's operand order is `[x, cos, sin]` (`split_out(…, 3)`), the tape's own
+            // declaration — and a node with fewer than 3 inputs is not a rope this walk knows;
+            // the door refuses it separately.
+            n.inputs
+                .get(1..3)
+                .map(|cs| {
+                    [
+                        cs[0].tensor.index() as u32,
+                        cs[1].tensor.index() as u32,
+                    ]
+                })
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    let rope_parity = if rope_source_tids.is_empty() {
+        None
+    } else {
+        let stride = rope_source_tids
+            .iter()
+            .map(|&tid| {
+                // The per-position row the decode bind uploads: the tensor's stick-padded
+                // column extent at its device word length — the same derivation `nbytes`
+                // applies to the whole tensor, applied to ONE row.
+                let s = ir.tensors[tid as usize];
+                let df = if let Some(wide) = kernel_dfs.get(&tid) {
+                    *wide
+                } else {
+                    Df::Fp16
+                };
+                bump_sticks_to_splittable(s.cols.next_multiple_of(df.elems_per_stick())) as u64
+                    * df.word_length() as u64
+            })
+            .max()
+            .expect("the set is non-empty");
+        Some(ktir_superdsc::placement::ParityRoute {
+            // The LOGICAL slot: Logits (4) — the one `tensor_allocs` entry no rope-carrying
+            // program otherwise references (the logits are suffix-only), and per-CB, so
+            // re-pointing it in the attention CBs cannot move the suffix's logits.
+            slot: SegRole::Logits.segment() as u32,
+            // The PHYSICAL backing stays the Activation segment — where the bytes have always
+            // lived. It is NOT the moving `ta[3]` word itself: seg3 also carries the
+            // prefix-validity mask the attention program reads in the same launch, so moving
+            // `ta[3]` would tear the mask read. The bytes stay; only their addressing slot
+            // moves.
+            backing: SegRole::Activation.segment() as u32,
+            stride,
+        })
+    };
+    // The one lookup `pack` stamps: `Some(route)` for exactly the rope sources, `None` for
+    // every other tensor — which keeps every rope-free bundle byte-identical to before.
+    let parity_of = |tid: u32| {
+        if rope_source_tids.contains(&tid) {
+            rope_parity
+        } else {
+            None
+        }
+    };
+
     // ── Pack WEIGHTS (seg1) + ACTIVATIONS (seg0) + LOGITS (seg4): all simultaneously
     //    live within their role (weights resident the whole program; the single
     //    logits row lives to the end), so dense contiguous packing by tensor id. ──
@@ -849,7 +936,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 place: &mut std::collections::BTreeMap<u32, TensorPlacement>| {
         let seg = role.segment();
         let off = seg_bytes[seg];
-        let sz = nbytes(tid);
+        let parity = parity_of(tid);
+        // A parity placement's size CARRIES THE STRIDE GROWTH: the odd-step window is
+        // `[offset + stride, offset + stride + bind)`, and the placement must cover it so the
+        // parity-1 upload can never leave the tensor's own footprint (the grow happens HERE,
+        // inside the pack, so no neighbour is ever packed onto the grown tail).
+        let sz = nbytes(tid) + parity.map_or(0, |r| r.stride);
         place.insert(
             tid,
             TensorPlacement {
@@ -861,6 +953,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: sz,
+                parity,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -933,6 +1026,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: companion.bank,
                     offset: off,
                     size: companion.size,
+                    parity: None,
                 },
             );
             seg_bytes[seg] = align128(off + companion.size);
@@ -1063,6 +1157,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                parity: None,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1138,6 +1233,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     segment: seg,
                     offset: off,
                     size: sz,
+                    parity: None,
                 },
             );
             seg_bytes[seg] = align128(off + sz);
@@ -1213,6 +1309,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                parity: None,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1245,6 +1342,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: hoff,
                 size: sz,
+                parity: None,
             },
         );
         seg_bytes[a] = align128(hoff + sz);
@@ -1259,6 +1357,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: ioff,
                 size: sz,
+                parity: None,
             },
         );
         seg_bytes[a] = align128(ioff + sz);
@@ -1286,6 +1385,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: 0,
                     offset: off,
                     size: sz,
+                    parity: None,
                 },
             );
             seg_bytes[a] = align128(off + sz);
@@ -1374,6 +1474,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: nbytes(tid),
+                parity: None,
             },
         );
     }
@@ -1493,6 +1594,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         bank: 0,
                         offset: layer_base + plane_off,
                         size: plane_bytes,
+                        parity: None,
                     },
                 );
             }
@@ -1541,6 +1643,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: seg3i,
                             offset: off,
                             size: pbytes,
+                            parity: None,
                         },
                     );
                     seg_bytes[seg3i] = align128(off + pbytes);
@@ -1659,6 +1762,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: mseg,
                         offset: pmoff,
                         size: pmbytes,
+                        parity: None,
                     },
                 );
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
@@ -1676,6 +1780,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: a,
                         offset: cmoff,
                         size: cmbytes,
+                        parity: None,
                     },
                 );
                 seg_bytes[a] = align128(cmoff + cmbytes);
@@ -1843,6 +1948,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: a,
                             offset: npoff,
                             size: npbytes,
+                            parity: None,
                         },
                     );
                     seg_bytes[a] = align128(npoff + npbytes);
@@ -1917,6 +2023,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: 2,
+                parity: None,
             },
         );
         seg_bytes[a] = align128(off + 2);
@@ -1942,6 +2049,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: bioff,
                 size: bibytes,
+                parity: None,
             },
         );
         seg_bytes[a] = align128(bioff + bibytes);
@@ -2256,6 +2364,7 @@ mod weight_tail_tests {
                     bank: 0,
                     offset,
                     size,
+                    parity: None,
                 },
             );
             seg_bytes[w] = align128(offset + size);
@@ -5799,10 +5908,40 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             );
         }
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
+        // ⭐ THE ROPE PARITY ROUTE (#603 PR3b E): the runtime overrides this group's
+        // `ta[route.slot]` with the parity-shifted Activation base, so a group may carry at most
+        // ONE route — exactly the Slot/Slab uniformity law above (one shift, applied once,
+        // group-wide). Two DIFFERENT routes in one group is the un-catchable defect (one of the
+        // rope readers would read the other parity's slot); a `None` op beside a routed one is
+        // FINE and expected: the override only moves the group's slot-4 word, and the ops the
+        // rope fuses with (rmsnorm, qkv, attention, o-proj — the attention-block group) never
+        // reference that word, so they are compatible by not caring. The door stamps the route
+        // on exactly the ops whose descriptors address a rope source through the slot.
+        let parity = {
+            let mut folded: Option<ktir_superdsc::placement::ParityRoute> = None;
+            for t in r.clone() {
+                let o = &ops[owner[t]];
+                if let Some(route) = o.parity {
+                    assert!(
+                        folded.map_or(true, |f| f == route),
+                        "group {gi}: op '{}' carries parity route {:?} but the group already \
+                         carries {:?} — the runtime applies ONE parity shift to the group's slot \
+                         word, so two different routes in one launch put a rope reader at the \
+                         other parity's slot",
+                        o.op_name,
+                        route,
+                        folded
+                    );
+                    folded = Some(route);
+                }
+            }
+            folded
+        };
         let _ = gi; // launch order is the slice position now, not a field
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
             slab_stride_bytes: slab,
+            parity,
             // PAGED: `page_slots` is the write-slot modulus AND the declaration that this bundle is
             // paged — a runtime that does not know the key must refuse rather than apply an
             // absolute-position shift and land past the page.
@@ -6279,6 +6418,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             offset: p.offset,
             size: p.size,
             is_logits: p.role == SegRole::Logits,
+            // The rope route rides the placement verbatim — the runtime's staging and the
+            // CB-local addressing both need the same stride/slot/backing the layout minted.
+            parity: p.parity,
         })
         .collect();
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
@@ -6307,6 +6449,8 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .get(name)
                 .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
             is_logits: false,
+            // Synthetics are minted intermediates — never a rope source, so never parity-routed.
+            parity: None,
         }
     }));
 
@@ -9712,6 +9856,7 @@ mod tests {
                     bank: 0,
                     offset: u64::from(tid) * 0x10000,
                     size: 8 * 64 * 2,
+                    parity: None,
                 },
             );
         }

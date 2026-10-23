@@ -169,6 +169,7 @@ fn a_layout_in_hand_consults_the_placement_footprint() {
             bank: 0,
             offset: 0,
             size: 1024,
+            parity: None,
         },
     );
     let err = win_reduce_data(

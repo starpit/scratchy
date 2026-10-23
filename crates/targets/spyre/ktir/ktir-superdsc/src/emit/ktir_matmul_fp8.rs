@@ -681,6 +681,7 @@ mod tests {
                     bank: 0,
                     offset: off,
                     size,
+                    parity: None,
                 },
             );
             l.segment_bytes[seg] = crate::placement::align128(off + size);

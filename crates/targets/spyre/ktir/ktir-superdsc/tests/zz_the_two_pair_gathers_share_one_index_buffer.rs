@@ -280,6 +280,7 @@ fn layout_for(k: &KtirNode) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x10000,
                 size: bytes,
+                parity: None,
             },
         );
     }

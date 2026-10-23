@@ -63,6 +63,7 @@ fn emit_rows(
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                parity: None,
             },
         );
     }

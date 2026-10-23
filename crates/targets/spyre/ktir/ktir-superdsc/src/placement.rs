@@ -148,6 +148,64 @@ impl SegRole {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE STEP-PARITY ADDRESSING ROUTE (#603 PR3b E) — the rope ping-pong.
+///
+/// The decode window's preamble H2D for step i+1 lands mid-canvas of step i (measured: the
+/// rope-row upload W1 seats inside attn35's ~120 µs attention CMPT at every k and every cadence
+/// — k=4 flip and k=3 clean alike), and the cos/sin rows it overwrites are the ones that step's
+/// rope trips are still staging in (the loads are input-staging, hoisted to the program head by
+/// dxp's prefetch machinery — see the ruling-#9 audit). The fix the ruling ordered: the rope
+/// rows PING-PONG — the upload for position p writes slot `p % 2`, the canvas at position p
+/// reads slot `p % 2`, and a run-ahead of one step therefore puts writer and reader in
+/// DIFFERENT slots at every phase.
+///
+/// This type is the BAKE'S half of that fact, and it is a ROUTE, not an offset, because of what
+/// it has to dodge: the rope's physical home is the Activation segment (seg3), but seg3's
+/// `tensor_allocs` word ALSO carries the prefix-validity mask the attention program reads in the
+/// same launch, so the moving base cannot be `ta[3]`. Instead the rope's AllocNodes are baked
+/// against the LOGICAL segment [`Self::slot`] — the one slot (Logits, 4) no rope-carrying
+/// program otherwise references — while the BYTES stay physically in seg3:
+///
+/// * the EMIT side resolves a parity placement's address as `SEGMENT_OFFSETS[slot] + offset`,
+///   so the compiled program's rope reads resolve against the CB's `tensor_allocs[slot]` word;
+/// * the RUNTIME side hands a rope-carrying CB `tensor_allocs[slot] = <backing segment's
+///   region> + parity·stride` — a different entry per CB, which is the whole mechanism
+///   (tensor_allocs are positional PER LAUNCH, so the suffix CBs' `ta[4]` still names the logits
+///   region and nothing about the logits moves);
+/// * the STAGING side writes the shadow (still the backing segment's own) at
+///   `offset + parity·stride`, so the H2D run carries the rows to the slot the canvas will read.
+///
+/// ⛔ THE STRIDE IS ONE COMMON VALUE, not a per-tensor offset: one CB has ONE `ta` word for the
+/// slot, so every parity placement of one bundle must share it. `stride` is the WIDEST rope
+/// row, which makes each tensor's parity-1 window `[offset+stride, offset+stride+bind)` land
+/// INSIDE that tensor's own grown placement, clear of its row 0 and of every other tensor's
+/// reservation — disjoint BY CONSTRUCTION, not by the luck of current offsets. The placement's
+/// `size` carries the growth (`nbytes + stride`), and the emit-side footprint guard in
+/// `resolve_seg_base` refuses any access whose parity-shifted window would leave it: the bound
+/// is a BUILD error, never a runtime check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ParityRoute {
+    /// The LOGICAL `tensor_allocs` slot the rope AllocNodes resolve against. The Logits segment
+    /// id — free in every program that reads rope (rope is fused into the attention block; the
+    /// logits are suffix-only), and per-CB, so re-pointing it in the attention CBs cannot move
+    /// the suffix's logits.
+    pub slot: u32,
+    /// The segment whose PHYSICAL region backs that slot in the rope-carrying CBs (Activation,
+    /// 3 — where the bytes have always lived: same shadow, same merged H2D run structure, same
+    /// D2H disjointness).
+    pub backing: u32,
+    /// Bytes between the two parity slots — the widest rope row (see the struct doc).
+    pub stride: u64,
+}
+
+impl ParityRoute {
+    /// A route with no stride addresses nothing — `None` in spirit, for the bundle-side
+    /// `Option`-free carriers that follow the `slot_stride_bytes == 0` house convention.
+    pub const fn is_none(&self) -> bool {
+        self.stride == 0
+    }
+}
+
 /// One tensor's global placement in the packed bundle.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct TensorPlacement {
@@ -160,8 +218,13 @@ pub struct TensorPlacement {
     pub bank: u32,
     /// Byte offset WITHIN the segment region (128 B aligned), and within its BANK when banked.
     pub offset: u64,
-    /// Byte size (f16 = 2 B/elem, rows*cols*2).
+    /// Byte size (f16 = 2 B/elem, rows*cols*2). For a parity placement this INCLUDES the
+    /// `stride` growth — see [`ParityRoute`].
     pub size: u64,
+    /// ⭐ THE STEP-PARITY DIMENSION, on exactly the tensors whose bytes the decode window
+    /// re-uploads while a canvas may still be reading them (the rope cos/sin sources).
+    /// `None` for every other tensor, which keeps every such bundle byte-identical.
+    pub parity: Option<ParityRoute>,
 }
 
 /// The device-tile re-tile spec the executor (C++ shim) consumes to stage a matmul

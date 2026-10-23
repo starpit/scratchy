@@ -439,6 +439,7 @@ fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, se
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                parity: None,
             },
         );
     }

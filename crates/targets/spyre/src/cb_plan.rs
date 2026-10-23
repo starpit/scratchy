@@ -57,7 +57,7 @@ use crate::bundle_code::NUM_SEGMENTS;
 use crate::fold_plan::{self, OpKv, SessionKv, SlotPos, UniformPages};
 use crate::runtime::{BatchedCompute, ByteSize, DevAddr, Stream, prog_offset_base};
 use crate::superdsc_exec::{
-    LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT, SeqPos,
+    LaunchWhere, Ops, SEG_INTERMEDIATE, SEG_KV, SEG_MASK, SEG_WEIGHT, SeqPos, step_parity,
 };
 
 /// The fold pass count for one op — `fold_plan::reps` plus the walk's refusal,
@@ -253,6 +253,30 @@ pub(crate) fn launch_site(
             },
         );
     }
+    // ⭐ THE ROPE SLOT OVERRIDE (#603 PR3b E): a parity-routed group's rope descriptors
+    // address their cos/sin rows through the route's LOGICAL slot, so that slot's word must
+    // carry the Activation base at this step's parity — `ta[backing]`'s own shift plus one
+    // more `parity·stride`. The parity comes from `step_parity(where_.slot_pos)`, the same
+    // single law the staging half consults, so the slot the canvas reads is always the slot
+    // this step's upload filled. ⛔ REFUSED, never fallen back: the loop above can silently
+    // drop a shift (a multi-chunk base degrades to its unshifted self — safe there, the
+    // shift is a fold convenience), but THIS shift is the ping-pong itself — a dropped one
+    // hands the canvas the OTHER parity's bytes, which is the original torn read wearing a
+    // patch-table costume.
+    if let Some(route) = op.kv.parity {
+        let sh = off[route.backing as usize]
+            + step_parity(where_.slot_pos) * route.stride;
+        let base = segment_base(seg, banks, where_.weight_bank, route.backing as usize)?;
+        let Some(s) = base.shifted(ByteSize(sh)) else {
+            bail!(
+                "launch: op {oi}'s rope parity shift {sh} leaves the Activation region — the \
+                 parity-1 slot does not fit, so the rope would read the other slot's bytes. The \
+                 layout's footprint guard should have refused this bundle at bake; refusing the \
+                 launch rather than tearing the read."
+            );
+        };
+        ta[route.slot as usize] = s;
+    }
 
     let prog = op
         .addr
@@ -432,6 +456,25 @@ impl CbPlan {
                     },
                 );
             }
+            // ⭐ THE ROPE SLOT OVERRIDE — the render's twin of `launch_site`'s, verbatim in
+            // law: the routed slot's word carries the Activation base at the step's parity.
+            // The parity gate and patch_check compare this render against the walk, so the
+            // two overrides must move together or prepare refuses — which is the point.
+            if let Some(route) = e.kv.parity {
+                let (base, static_off) = &e.bases[route.backing as usize];
+                let sh = *static_off + dyn_off[route.backing as usize]
+                    + step_parity(where_.slot_pos) * route.stride;
+                let Some(s) = base.shifted(ByteSize(sh)) else {
+                    bail!(
+                        "cb_plan render: '{}'s rope parity shift {sh} leaves the Activation \
+                         region — the parity-1 slot does not fit. The layout's footprint guard \
+                         should have refused this bundle at bake; refusing the render rather \
+                         than tearing the read.",
+                        e.label
+                    );
+                };
+                tensor_allocs[route.slot as usize] = s;
+            }
             barrier |= e.barrier;
             items.push(BatchedCompute {
                 prog: e.prog.clone(),
@@ -593,12 +636,19 @@ pub(crate) fn parity_check(
 
 /// The per-step scalars — the WHOLE of what varies between two steps that
 /// share an image key. Every address term the step moves is affine in these
-/// two and nothing else:
+/// three and nothing else:
 ///
 /// * `slot_in_page` — `slot_write_delta`'s term: the write cursor's slot
 ///   within its page (`pos % page_slots`; the ABSOLUTE position for an
 ///   unpaged bundle, whose ops carry `page_slots == 0` and never wrap);
-/// * `slab` — `slab_delta`'s index, `pos / SLAB_SLOTS`.
+/// * `slab` — `slab_delta`'s index, `pos / SLAB_SLOTS`;
+/// * `parity` — the rope ping-pong's slot (#603 PR3b E): `pos % 2`, the
+///   activation slot a parity-routed group's rope rows live in. NOT affine in
+///   `slot_in_page` (a slot wrap moves the position by `per−1` at either
+///   parity) nor in `slab` (`SLAB_SLOTS` is even, so a slab step never flips
+///   it) — it is a scalar of its own, and the patch model measures its
+///   coefficient with the parity-flipping differential (the +1 step) after
+///   the +2 step has isolated the slot term.
 ///
 /// The write PAGE is deliberately not one of them. Every step an image
 /// replays writes the page its canvas was rendered on; the one step that
@@ -620,6 +670,7 @@ pub(crate) fn parity_check(
 pub(crate) struct StepScalars {
     pub(crate) slot_in_page: u64,
     pub(crate) slab: u64,
+    pub(crate) parity: u64,
 }
 
 /// The scalar rule the player runs per step — ONE implementation shared by
@@ -640,6 +691,10 @@ pub(crate) fn step_scalars(paged: bool, per: i64, pos: i64) -> StepScalars {
             pos
         }) as u64,
         slab: (pos / fold_plan::SLAB_SLOTS) as u64,
+        // The rope ping-pong's slot — the same ONE law (`step_parity`) the staging
+        // half consults, so the player's patched canvas and the window's upload can
+        // never disagree about which slot a step's rope rows live in.
+        parity: step_parity(SeqPos(pos)),
     }
 }
 
@@ -695,6 +750,11 @@ pub(crate) struct Patch {
     dst: usize,
     a_slot: i64,
     b_slab: i64,
+    /// The rope ping-pong's term: the addend per FLIP of the step parity
+    /// (`d_parity` is −1, 0 or +1 — the word moves by `c_parity` per flip, so
+    /// the sign of `d_parity` carries the direction). Zero for every word the
+    /// parity override does not touch.
+    c_parity: i64,
 }
 
 /// The patches that turn one image into any step's CBs: the scalars the
@@ -727,8 +787,11 @@ impl PatchPlan {
     pub(crate) fn apply(&self, image: &mut [ControlBlockWire], s: &StepScalars) {
         let d_slot = s.slot_in_page as i128 - self.reference.slot_in_page as i128;
         let d_slab = s.slab as i128 - self.reference.slab as i128;
+        let d_parity = s.parity as i128 - self.reference.parity as i128;
         for p in &self.patches {
-            let addend = (p.a_slot as i128 * d_slot + p.b_slab as i128 * d_slab) as u64;
+            let addend = (p.a_slot as i128 * d_slot
+                + p.b_slab as i128 * d_slab
+                + p.c_parity as i128 * d_parity) as u64;
             let b = image[p.cb].bytes_mut();
             let mut w = [0u8; 8];
             w.copy_from_slice(&b[p.dst..p.dst + 8]);
@@ -744,6 +807,50 @@ fn word_at(image: &[ControlBlockWire], cb: usize, dst: usize) -> u64 {
     let mut w = [0u8; 8];
     w.copy_from_slice(&image[cb].bytes()[dst..dst + 8]);
     u64::from_le_bytes(w)
+}
+
+/// One moving word's three measured differences to its three affine
+/// coefficients — the per-word heart of [`build_patch_plan`]'s solve, factored
+/// out so the algebra is pin-testable without a render door. The
+/// differentials' DEFINITIONS live at the call site (which render each came
+/// from); only the solve lives here:
+///
+/// * `d1` — the +1 step: Δslot = +1, Δslab = 0, parity FLIPPED by
+///   `dparity_slot` (±1);
+/// * `d2` — the slab step: Δslab = +1, Δslot = `dslot_slab`, parity held;
+/// * `d3` — the +2 step: Δslot = +2, Δslab = 0, parity held.
+///
+/// Returns `(a_slot, b_slab, c_parity)`. REFUSES a `d3` that is not even: a
+/// word that moved an odd amount under a two-slot step with the slab and the
+/// parity held is not affine in the model's scalars, and rounding a
+/// coefficient in would replay a wrong address every step.
+fn solve_word(
+    d1: i64,
+    d2: i64,
+    d3: i64,
+    dslot_slab: i64,
+    dparity_slot: i64,
+) -> Result<(i64, i64, i64)> {
+    // Δslot = +2 with the slab and the parity held ⇒ the slot coefficient is half
+    // the raw difference.
+    if d3 % 2 != 0 {
+        bail!(
+            "a word moves {d3} over a +2 slot step with slab and parity held — not affine in \
+             the step scalars (an even multiple of the slot term was the only lawful \
+             movement). Refusing to build a patch table with a rounded coefficient."
+        );
+    }
+    let a_slot = d3 / 2;
+    // d1 — Δslot = +1 with the parity FLIPPED ⇒ what remains of the difference
+    // after the slot's contribution is the parity coefficient, signed by the
+    // flip's direction (`dparity_slot` is ±1, so multiplying by it is dividing
+    // by it).
+    let c_parity = (d1.wrapping_sub(a_slot)).wrapping_mul(dparity_slot);
+    // d2 — Δslab = +1 with the slot moving `dslot_slab` and the parity held ⇒ the
+    // slab coefficient is what remains after the slot's contribution is
+    // subtracted.
+    let b_slab = d2.wrapping_sub(a_slot.wrapping_mul(dslot_slab));
+    Ok((a_slot, b_slab, c_parity))
 }
 
 /// Derive one image's patch table: render the canvas (the plan's own render —
@@ -771,16 +878,18 @@ pub(crate) fn build_patch_plan(
 ) -> Result<(Vec<ControlBlockWire>, PatchPlan)> {
     let per = fold.page_slots.get().max(1);
     let pos = where_.slot_pos.0;
-    if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 1 {
+    if pos % fold_plan::SLAB_SLOTS >= fold_plan::SLAB_SLOTS - 2 {
         bail!(
-            "cb_plan patch: canvas position {pos} sits on a slab boundary — the +1 differential \
-             cannot isolate the slot term from the slab term"
+            "cb_plan patch: canvas position {pos} sits within two of a slab boundary — the +2 \
+             differential (the one that isolates the slot term from the parity term) cannot \
+             hold the slab"
         );
     }
-    if fold.paged && pos.rem_euclid(per) > per - 2 {
+    if fold.paged && pos.rem_euclid(per) > per - 3 {
         bail!(
-            "cb_plan patch: canvas position {pos} sits on a page boundary — the +1 differential \
-             cannot isolate the slot term from the page wrap"
+            "cb_plan patch: canvas position {pos} sits within two of a page boundary — the +2 \
+             differential (the one that isolates the slot term from the parity term) cannot \
+             hold the page"
         );
     }
     // The op-vs-session page-modulus law, checked DIRECTLY (this is the canary
@@ -815,12 +924,20 @@ pub(crate) fn build_patch_plan(
     // every step of this image with.
     let (items, barrier) = plan.render(fold, where_)?;
     let canvas = stream.render_compute_batch(&items, 1)?;
-    // The two differentials. Each moves exactly one scalar's worth of
-    // arithmetic — the other held — so each moving word's measured difference
-    // is one equation in that word's coefficients. There is NO page
-    // differential: the write page never moves inside an image's replayed
-    // span (the boundary step walks; see [`StepScalars`]), so no coefficient
-    // for it exists to measure.
+    // The three differentials. Each holds every scalar but one's worth of
+    // arithmetic, so each moving word's measured difference is one equation
+    // in that word's coefficients. There is NO page differential: the write
+    // page never moves inside an image's replayed span (the boundary step
+    // walks; see [`StepScalars`]), so no coefficient for it exists to
+    // measure.
+    //
+    // * +1 — the parity differential: slot +1, slab held, parity FLIPPED.
+    // * +SLAB_SLOTS — the slab differential: slab +1, parity held
+    //   (`SLAB_SLOTS` is even), slot moving `dslot_slab`.
+    // * +2 — the slot differential: slot +2 with slab AND parity held (2 is
+    //   even), the equation that isolates the slot term — without it, the +1
+    //   difference entangles slot and parity irrecoverably (one equation,
+    //   two unknowns) and the solve would guess.
     let img_slot = render(&LaunchWhere {
         slot_pos: SeqPos(pos + 1),
         ..*where_
@@ -829,7 +946,15 @@ pub(crate) fn build_patch_plan(
         slot_pos: SeqPos(pos + fold_plan::SLAB_SLOTS),
         ..*where_
     })?;
-    for (name, img) in [("slot", &img_slot), ("slab", &img_slab)] {
+    let img_parity = render(&LaunchWhere {
+        slot_pos: SeqPos(pos + 2),
+        ..*where_
+    })?;
+    for (name, img) in [
+        ("slot", &img_slot),
+        ("slab", &img_slab),
+        ("parity", &img_parity),
+    ] {
         if img.len() != canvas.len() {
             bail!(
                 "cb_plan patch: the {name} differential renders {} CB(s) but the canvas holds {} \
@@ -849,25 +974,29 @@ pub(crate) fn build_patch_plan(
     } else {
         fold_plan::SLAB_SLOTS
     };
+    // Which way the +1 differential flips the parity — the sign the solve
+    // divides by (±1, so multiplying by it again is dividing by it).
+    let dparity_slot = (step_parity(SeqPos(pos + 1)) as i64) - (step_parity(SeqPos(pos)) as i64);
     let mut patches = Vec::new();
     for cb in 0..canvas.len() {
         for dst in (0..CB_NUM_BYTES).step_by(8) {
             let c = word_at(&canvas, cb, dst);
-            let d_slot = word_at(&img_slot, cb, dst).wrapping_sub(c) as i64;
-            let d_slab = word_at(&img_slab, cb, dst).wrapping_sub(c) as i64;
-            if d_slot == 0 && d_slab == 0 {
+            // d1 — the +1 step: slot +1, parity flipped. d2 — the slab step. d3 — the +2
+            // step: slot +2, slab and parity held.
+            let d1 = word_at(&img_slot, cb, dst).wrapping_sub(c) as i64;
+            let d2 = word_at(&img_slab, cb, dst).wrapping_sub(c) as i64;
+            let d3 = word_at(&img_parity, cb, dst).wrapping_sub(c) as i64;
+            if d1 == 0 && d2 == 0 && d3 == 0 {
                 continue;
             }
-            // Δslot = +1 with the slab held ⇒ the slot coefficient is the raw difference.
-            let a_slot = d_slot;
-            // Δslab = +1 with the slot moving `dslot_slab` ⇒ the slab coefficient is what
-            // remains after the slot's contribution is subtracted.
-            let b_slab = d_slab.wrapping_sub(a_slot.wrapping_mul(dslot_slab));
+            let (a_slot, b_slab, c_parity) =
+                solve_word(d1, d2, d3, dslot_slab, dparity_slot)?;
             patches.push(Patch {
                 cb,
                 dst,
                 a_slot,
                 b_slab,
+                c_parity,
             });
         }
     }
@@ -1036,4 +1165,150 @@ pub(crate) fn patch_check(
             plan: patch_plan,
         },
     ))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  #603 PR3b E — the rope parity's patch-model tests
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The solve recovers all three coefficients from the three differentials,
+    /// at BOTH flip directions of the +1 step (the canvas can sit at either
+    /// parity) and with the slab differential's slot term wrapped or not — the
+    /// 3×3 system is solved, not assumed.
+    #[test]
+    fn the_solve_recovers_all_three_coefficients() {
+        for dparity_slot in [-1i64, 1] {
+            for dslot_slab in [64i64, 64 - 2048] {
+                for (a, b, c) in [
+                    (0x4000i64, 0x20_0000i64, 0x1000i64), // XLAT-paddr-like magnitudes
+                    (0i64, 0i64, 0x1000),                  // a parity-ONLY word
+                    (128, 0, 0),                           // a slot-ONLY word
+                    (0, 0x80_0000, 0),                     // a slab-ONLY word
+                ] {
+                    // The differentials, from their definitions: +1 (slot, parity
+                    // flipped), slab (slot +dslot_slab, slab +1), +2 (slot only).
+                    let d1 = a.wrapping_add(c.wrapping_mul(dparity_slot));
+                    let d2 = a.wrapping_mul(dslot_slab).wrapping_add(b);
+                    let d3 = a.wrapping_mul(2);
+                    let got = solve_word(d1, d2, d3, dslot_slab, dparity_slot)
+                        .unwrap_or_else(|e| panic!("a lawful word refused: {e}"));
+                    assert_eq!(
+                        got,
+                        (a, b, c),
+                        "solve did not recover the coefficients (flip {dparity_slot}, \
+                         slab-slot {dslot_slab})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A word that moves an ODD amount under the +2 step (slab and parity held)
+    /// is not affine in the model's scalars — the solve REFUSES it rather than
+    /// rounding a coefficient in. Without this arm the solve would silently
+    /// truncate `d3 / 2` and replay a wrong address every step.
+    #[test]
+    fn the_solve_refuses_a_non_affine_word() {
+        assert!(
+            solve_word(0, 0, 3, 64, 1).is_err(),
+            "an odd +2 difference must refuse, never round"
+        );
+        assert!(
+            solve_word(0, 0, -1, 64, -1).is_err(),
+            "an odd negative +2 difference must refuse too"
+        );
+    }
+
+    /// ⭐ THE DELIBERATELY-WRONG PARITY (#603 PR3b E, ruling #10's criterion):
+    /// patch_check's off-sample compare is `apply(canvas, scalars(s)) ==
+    /// walk_render(s)` — here driven with a hand-stated walk truth for one
+    /// moving word, exactly the compare the gate runs per sample. The correct
+    /// parity coefficient reproduces a FLIPPED-parity off-sample step (pos+5);
+    /// a corrupted one — the pre-fix model, `c_parity = 0`, "the parity does
+    /// not move the word" — does not, which is the off-sample extension
+    /// CATCHING a wrong parity: the gate refuses rather than loading the image.
+    /// A test that cannot fail proves nothing, so both arms are asserted: the
+    /// correct plan MUST match and the corrupted one MUST NOT.
+    #[test]
+    fn a_wrong_parity_coefficient_fails_the_off_sample_step() {
+        use flex_rs::control_block_wire::{
+            AllocationTotalSize, ControlBlockWire as Cbw, DevicePhysicalAddress, Flits,
+            ResponseTag, VirtualAddressSbf,
+        };
+        // One real compute CB, host-side — the render door's own constructor, so
+        // the word under test sits inside genuinely-encoded wire bytes.
+        let cb = Cbw::compute(
+            ResponseTag(1),
+            &[
+                (DevicePhysicalAddress(0x1_0000_0000), AllocationTotalSize(0x0100_0000)),
+                (DevicePhysicalAddress(0x2_0000_0000), AllocationTotalSize(0x0100_0000)),
+                (DevicePhysicalAddress(0x3_0000_0000), AllocationTotalSize(0x0100_0000)),
+                (DevicePhysicalAddress(0x4_0000_0000), AllocationTotalSize(0x0100_0000)),
+            ],
+            (DevicePhysicalAddress(0x7_0000_0000), AllocationTotalSize(0x1000)),
+            VirtualAddressSbf::new(7, Flits(0x40)),
+        )
+        .expect("a host-side compute CB renders without a device");
+        let mut canvas = vec![cb; 3];
+        // The word the plan patches: the routed slot's base word, at a fixed
+        // 8-aligned offset, seeded with a known value.
+        let (cb_i, dst) = (1usize, 64usize);
+        let word0 = 0x3_0000_0000u64;
+        canvas[cb_i].bytes_mut()[dst..dst + 8].copy_from_slice(&word0.to_le_bytes());
+        // The coefficients the solve would measure for this word: the rope
+        // stride per parity flip, a slot term, no slab term.
+        let (a_slot, b_slab, stride) = (0x2000i64, 0i64, 0x1000i64);
+        let plan = |c_parity: i64| PatchPlan {
+            reference: step_scalars(false, 2048, 5),
+            patches: vec![Patch {
+                cb: cb_i,
+                dst,
+                a_slot,
+                b_slab,
+                c_parity,
+            }],
+            barrier: false,
+        };
+        // The off-sample step: position 10 — slot +5, slab 0, parity FLIPPED
+        // (the canvas sits at position 5, parity 1; 10 is parity 0). The walk
+        // truth for an affine word is the canvas word plus the coefficients'
+        // own movement, measured from the REFERENCE scalars the plan carries.
+        let s = step_scalars(false, 2048, 10);
+        let reference = step_scalars(false, 2048, 5);
+        let truth = (word0 as i128
+            + a_slot as i128 * (s.slot_in_page as i128 - reference.slot_in_page as i128)
+            + stride as i128 * (s.parity as i128 - reference.parity as i128))
+            as u64;
+        // The correct plan reproduces the walk at the flipped-parity step —
+        // the off-sample compare passes.
+        let mut got = canvas.clone();
+        plan(stride).apply(&mut got, &s);
+        assert_eq!(
+            word_at(&got, cb_i, dst),
+            truth,
+            "the correct parity coefficient must reproduce the off-sample step"
+        );
+        // The corrupted plan — the pre-fix model, no parity term — does not:
+        // the off-sample compare REFUSES, which is the catch this test exists
+        // to show.
+        let mut corrupted = canvas.clone();
+        plan(0).apply(&mut corrupted, &s);
+        assert_ne!(
+            word_at(&corrupted, cb_i, dst),
+            truth,
+            "a zeroed parity coefficient must NOT reproduce the flipped-parity step — \
+             if it does, the off-sample extension catches nothing"
+        );
+        // And the corrupted word is exactly the parity stride away from the
+        // truth — the torn-read distance, not noise.
+        assert_eq!(
+            word_at(&corrupted, cb_i, dst).wrapping_sub(truth),
+            stride as u64,
+            "the corrupted plan's error is exactly one parity stride"
+        );
+    }
 }

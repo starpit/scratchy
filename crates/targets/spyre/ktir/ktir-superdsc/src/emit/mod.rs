@@ -2374,6 +2374,17 @@ pub struct EmittedOp {
     pub kv_nkvh: u32,
     pub kv_hd: u32,
     pub kv_cap: u32,
+    /// ⭐⭐⭐⭐⭐ (#603 PR3b E) THIS OP'S PROGRAM READS A STEP-PARITY PLACEMENT — the rope
+    /// cos/sin tables, whose per-step H2D lands mid-canvas of the previous step inside a decode
+    /// window and must therefore ping-pong (see [`crate::placement::ParityRoute`]).
+    ///
+    /// Set at the rope door (the one place that knows which placements a rope node's cos/sin
+    /// operands resolve to), read by the launch-group cut, which asserts group UNIFORMITY the
+    /// same way it does a Slot group's stride: one CB is one program, and a group whose members
+    /// disagreed about the parity route would hand its rope reads a base that moves by another
+    /// group's stride. `None` for every op of every bundle that places no rope source there —
+    /// which is every bundle that worked before, byte-identically.
+    pub parity: Option<crate::placement::ParityRoute>,
 }
 
 impl EmittedOp {
@@ -2459,6 +2470,7 @@ impl EmittedOp {
             kv_nkvh: 0,
             kv_hd: 0,
             kv_cap: 0,
+            parity: None,
         }
     }
 
@@ -2493,6 +2505,7 @@ impl EmittedOp {
             kv_nkvh: self.kv_nkvh,
             kv_hd: self.kv_hd,
             kv_cap: self.kv_cap,
+            parity: self.parity,
         }
     }
 
@@ -2571,6 +2584,7 @@ impl EmittedOp {
             kv_nkvh: 0,
             kv_hd: 0,
             kv_cap: 0,
+            parity: None,
         }
     }
 }
@@ -3060,17 +3074,38 @@ fn resolve_seg_base(
             // cache every layer of every step for weeks before a bus fence. Compared against the
             // 128-B GRANULE the device reads in, so a sub-granule broadcast const (the `[1,1]`
             // scale) is not a false positive.
-            if window_end > align128(p.size).max(128) {
+            //
+            // ⭐ A PARITY PLACEMENT IS GUARDED AT ITS PARITY-1 SLOT TOO — the typed bound of the
+            // rope ping-pong (#603 PR3b E). The runtime moves the CB's `tensor_allocs[slot]`
+            // word by `stride` on odd steps, so the odd-step access window is
+            // `[stride + slice, stride + window_end)` and the placement must cover THAT, not
+            // just the even-step window. `size` already carries the growth the placement pass
+            // added, so an access that fails here is a lowering/placement disagreement — a
+            // `cargo build` Err, never a runtime check (the out-of-bounds-unwritable-by-type
+            // law, applied to the second slot exactly as to the first).
+            let parity_stride = p.parity.map_or(0, |r| r.stride);
+            if parity_stride + window_end > align128(p.size).max(128) {
                 return Err(SuperDscError(format!(
                     "t{tid}: access window end {window_end}B (offset {slice}B, operand \
-                         {arg_bytes}B) exceeds its placement footprint {}B (seg{}) — the op \
+                         {arg_bytes}B{}) exceeds its placement footprint {}B (seg{}) — the op \
                          addresses PAST its own tensor and would alias whatever is placed next. \
                          The offset arithmetic and the placement must come from the SAME layout \
                          authority.",
+                    if parity_stride > 0 {
+                        format!(", parity-1 slot +{parity_stride}B")
+                    } else {
+                        String::new()
+                    },
                     p.size, p.segment
                 )));
             }
-            return Ok((segment_base(p.segment)?, p.offset + slice));
+            // ⭐ A PARITY PLACEMENT RESOLVES AGAINST ITS ROUTE'S SLOT, not its physical segment:
+            // the bytes stay in `p.segment`'s region, but the AllocNode's segment base is the
+            // LOGICAL slot whose per-CB `tensor_allocs` word the runtime moves by the step
+            // parity — see `ParityRoute`. Every other tensor resolves byte-identically to
+            // before.
+            let addr_seg = p.parity.map_or(p.segment, |r| r.slot as usize);
+            return Ok((segment_base(addr_seg)?, p.offset + slice));
         }
         // 2. A SYNTHETIC intermediate (silu/rmsnorm decomposition: `t{id}_silu`,
         //    `t{id}_sq`, …) — no `t{id}` placement. Assign it a STABLE offset in the

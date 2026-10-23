@@ -11,7 +11,9 @@
 //! caller: the worker routes every sendnn bundle to `SuperDsc`. Under `sendnn` the only bundle that
 //! runs is the dxp-compiled SuperDSC bundle.
 
-use crate::superdsc_exec::{Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab};
+use crate::superdsc_exec::{
+    Executor, KvDim, Logits, NewTokens, PoolPages, SegIdx, SeqPos, Vocab, step_parity,
+};
 use anyhow::{Result, anyhow, bail};
 use scratchy_subtile::sdsc_abstract::{
     FoldPages, FoldRowRegime, FoldWalker, MaskBlocks, PrefixMaskShape,
@@ -627,7 +629,12 @@ impl SuperDscSession {
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
     ) -> Result<()> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.bind_activations(
+            activations,
+            activations_f16,
+            activations_i32,
+            step_parity(SeqPos(seq_pos as i64)),
+        )?;
         self.exec.window_step(SeqPos(seq_pos as i64))
     }
 
@@ -687,6 +694,12 @@ impl SuperDscSession {
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
+        // ⭐ THE STEP'S ROPE PARITY (#603 PR3b E) — from the step's own absolute position
+        // (`step_parity`), so the f32 channel's shadow write lands in the slot this step's
+        // upload sends and this step's canvas reads. One parameter, threaded from the two
+        // callers that each know their step's position, so the bind and the staging can
+        // never disagree about which parity slot the rope rows live in.
+        parity: u64,
     ) -> Result<()> {
         // BIND-LOOP TIMING (SCRATCHY_SDSC_PHASE_TIME, the same flag as the executor's phase
         // breakdown): this loop runs BEFORE predict, so it is invisible to the
@@ -700,7 +713,7 @@ impl SuperDscSession {
         // `Vec` per bind per step in between and no second convert pass at the refill.
         for (id, vals) in activations {
             bind_elems += vals.len();
-            self.exec.bind_input_f32(*id, vals)?;
+            self.exec.bind_input_f32(*id, vals, parity)?;
         }
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
@@ -753,7 +766,12 @@ impl SuperDscSession {
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
-        self.bind_activations(activations, activations_f16, activations_i32)?;
+        self.bind_activations(
+            activations,
+            activations_f16,
+            activations_i32,
+            step_parity(SeqPos(seq_pos as i64)),
+        )?;
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
         match logits {
             StepLogits::ReadBack => {

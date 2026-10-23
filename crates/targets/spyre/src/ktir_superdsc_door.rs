@@ -568,7 +568,7 @@ fn rope_at_geometry(
                 layout.map(|l| l.rope_class_hds.clone()).unwrap_or_default(),
             ),
         })?;
-    scratchy_subtile::model_geometry::with_config_head_dim(
+    let mut ops = scratchy_subtile::model_geometry::with_config_head_dim(
         scratchy_subtile::model_geometry::HeadDim::new(hd),
         RopeAt(lk::RopeAt {
             name,
@@ -593,5 +593,32 @@ fn rope_at_geometry(
              from the model configs in scope ({}); this head dim belongs to none of them.",
             scratchy_subtile::model_geometry::geometry_sources(),
         ),
-    })?
+    })??;
+    // ⭐ THE PARITY STAMP (#603 PR3b E) — the one place an op learns its rope route. The
+    // layout minted the route on the cos/sin placements (the rope-source walk in
+    // `compute_bundle_layout`); every op THIS lowering emitted addresses a rope source
+    // through the route's slot word, so every one of them carries it — `launch_index` folds
+    // the stamps into the group's one `KvShifts::parity`, and the runtime's `launch_site`
+    // applies the override. A layout whose rope placements carry NO route while the door is
+    // lowering rope ops is a desync between the two halves of the same bake — refuse it by
+    // name rather than emitting descriptors the runtime would address at the un-routed slot.
+    if let Some(l) = layout {
+        let route = l
+            .placements
+            .get(&ins[1].tid)
+            .and_then(|p| p.parity)
+            .ok_or_else(|| Error {
+                message: format!(
+                    "{name}: the cos source t{} has no parity route in the layout — the rope \
+                     ping-pong is minted by the same layout pass that placed it, so a missing \
+                     route is a desync between the placement walk and this lowering (the \
+                     emitted descriptors would address the slot the runtime never routes)",
+                    ins[1].tid,
+                ),
+            })?;
+        for op in &mut ops {
+            op.parity = Some(route);
+        }
+    }
+    Ok(ops)
 }

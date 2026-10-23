@@ -143,6 +143,9 @@ pub use ktir_superdsc::place::{PlaceId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
+/// The rope ping-pong's addressing route (#603 PR3b E), declared beside the placements that
+/// carry it and the launch groups whose CBs move with it — same reason as [`WeightTail`].
+pub use ktir_superdsc::placement::ParityRoute;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +178,12 @@ pub struct Placement {
     pub size: u64,
     /// This is the graph result read back each step (`SegRole::Logits`).
     pub is_logits: bool,
+    /// ⭐⭐⭐⭐⭐ (#603 PR3b E) THE STEP-PARITY DIMENSION — on exactly the rope cos/sin sources,
+    /// whose per-step H2D lands mid-canvas of the previous step inside a decode window. The
+    /// staging side writes (and uploads) at `offset + step_parity·stride`; the bytes stay in
+    /// this placement's own segment and shadow. `None` for every other tensor — every bundle
+    /// that places no rope source is byte-identical to before. See [`ParityRoute`].
+    pub parity: Option<ParityRoute>,
 }
 
 /// A matmul KERNEL weight's device-tile walk — the PT array reads the device TILE layout
@@ -365,6 +374,14 @@ pub struct KvShifts {
     pub slot_offset: u32,
     /// This is the group the runtime re-launches once per page of resident KV.
     pub page_fold: bool,
+    /// ⭐⭐⭐⭐⭐ (#603 PR3b E) THIS GROUP'S PROGRAM READS A STEP-PARITY PLACEMENT (the rope
+    /// cos/sin tables). The runtime hands this group's CB `tensor_allocs[parity.slot] =
+    /// <parity.backing segment's region> + step_parity·parity.stride` — a base that alternates
+    /// with the step's ABSOLUTE position, so the run-ahead rope upload (slot `(p+1) % 2`) and
+    /// the in-flight canvas read (slot `p % 2`) never share a slot. `None` for every group that
+    /// reads no rope source — which is every group of every bundle that places none. See
+    /// [`ParityRoute`].
+    pub parity: Option<ParityRoute>,
     /// The fold's kernels carry the request axis, so one pass per PAGE suffices instead of one per
     /// (request, page).
     pub batched_requests: bool,
@@ -926,6 +943,7 @@ mod tests {
                     offset: 0,
                     size: 98304,
                     is_logits: true,
+                    parity: None,
                 },
                 Placement {
                     id: PlaceId::Act(728).synth(SynthRole::Sq16),
@@ -934,6 +952,7 @@ mod tests {
                     offset: 4096,
                     size: 2048,
                     is_logits: false,
+                    parity: None,
                 },
             ]),
             ..BundleLayout::default()
