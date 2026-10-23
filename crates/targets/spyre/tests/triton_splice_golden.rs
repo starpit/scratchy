@@ -555,6 +555,7 @@ fn spliced_dense_matmul_executes_the_real_program() {
 
 /// One spliced dense matmul through the production session entry, checked against a
 /// host reference over the SAME on-disk `[n, k]` weight bytes the worker binds.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_matmul(m: u32, k: u32, n: u32) {
     use std::borrow::Cow;
 
@@ -661,6 +662,7 @@ fn spliced_elementwise_executes_the_real_program() {
 
 /// One spliced elementwise program through the production session entry, checked
 /// against a host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_elementwise(m: u32, c: u32, kind: EwKind) {
     use std::borrow::Cow;
 
@@ -753,6 +755,7 @@ fn spliced_gelu_executes_the_real_program() {
 
 /// One spliced gelu program through the production session entry, checked against the
 /// tanh-form host reference.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_gelu(m: u32, c: u32) {
     use std::borrow::Cow;
 
@@ -1032,6 +1035,7 @@ fn a_prompt_chunks_rope_does_not_grow_with_its_rows() {
 
 /// One spliced rope program through the production session entry, checked against a
 /// host NeoX reference over the worker-staged bytes.
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_rope(mq: u32, heads: u32, hd: u32) {
     use std::borrow::Cow;
 
@@ -1332,6 +1336,7 @@ fn spliced_fp8_matmul_executes_the_real_program() {
 /// a host reference over the SAME packed e4m3 bytes and per-channel scale the
 /// worker binds (`spyre_load.rs`'s fp8 arm stages the weight verbatim 1-byte;
 /// `weight_arg`'s `Fp8E4m3` arm mirrors it here).
+#[cfg(feature = "spyre-emu")]
 fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
     let ir = matmul_fp8_ir(m, k, n);
     let node = &ir.nodes[0];
@@ -1386,6 +1391,7 @@ fn execute_one_spliced_fp8_matmul(m: u32, k: u32, n: u32) {
 
 /// Run ONE fp8 matmul KtirNode through the production session entry with the
 /// given host bytes, returning the `[m, n]` output.
+#[cfg(feature = "spyre-emu")]
 fn execute_fp8_program(
     m: u32,
     k: u32,
