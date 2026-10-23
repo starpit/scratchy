@@ -239,6 +239,12 @@ pub fn lower(
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
+        // ⭐ THE APPEND FORM — the whole-function walk (the program states its own
+        // rotation, pass-through and plane stores; no hand-built body), PLUS the Kᵀ
+        // re-transpose the pool layout's three-plane law requires. Keyed on the TYPED
+        // contract ([`Program::RopeAppend`] — the arity-6 cache-writing form), never on
+        // recognising a rope's op chain.
+        Program::RopeAppend => rope_append(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ THE WHOLE-FUNCTION WALK, NOT A HAND-BUILT DOOR. The card-proven path for the batched
         // attention kernels is the same per-op walk `Program::Matmul`/`Program::Elementwise` take
         // (`whole_function::lower_function` — exactly what the drivers and bake_py reach through
@@ -389,6 +395,148 @@ fn rope(
         layout,
         attn_params,
     )
+}
+
+/// ⭐⭐⭐ THE APPEND FORM'S DOOR — the whole-function walk, PLUS the Kᵀ re-transpose the
+/// pool layout's three-plane law requires.
+///
+/// The program (`rope.py`'s `rope_append_fwd`) states its own body — the rotation, the V
+/// pass-through, and the STORES INTO THE POOL PLANES — so the rotation needs no hand-built
+/// arm: [`lower_function`] lowers what the kernel states, op for op, exactly as it lowers
+/// the batched attention kernels. What the program CANNOT state is the pool's third plane:
+/// the `KvCacheLayout`'s law is that a store into the natural-K plane requires the Kᵀ plane
+/// to track (the score gather reads Kᵀ), so THIS arm — keyed on the typed
+/// [`Program::RopeAppend`] contract, never on recognising the rope's chain — appends one
+/// re-transpose per kv head through the same recipe main's `kv_cache_write` tail used
+/// (`assemble_restickify_kt_2d`, the re-homed slab-transpose recipe), in program order
+/// after the stores and before the attention gather.
+///
+/// The tail's aiming facts (`kv_request`, `kv_slot_offset`) are DERIVED here from the
+/// program's own row window through the ONE shared law (`PagedKvPool::write_aim`), and the
+/// walk's stamp site CHECKS them against the splice's carrier — a divergence is a build
+/// refusal, never a silently mis-aimed transpose. The tail carries NO slot stride (main's
+/// own law: the whole-page transpose takes no `seq_pos` shift) and states `kv_page_slots`
+/// itself, which is what marks it pre-stamped for the walk's stamp.
+fn rope_append(
+    name: &str,
+    k: &KtirNode,
+    r: &[Region],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<BundleAttnParams>,
+) -> Result<Vec<EmittedOp>, Error> {
+    use ktir_superdsc::sdsc_abstract::{
+        KvCoord, KvHead, KtTileFeats, KtTileSlots, KvPlane, PagedKvPool,
+    };
+    // ⛔ THE CONTRACT, CHECKED BEFORE ANYTHING IS EMITTED: six parameters, the four stream
+    // operands unstored, the two pool planes stored, and both planes the pool's own
+    // `[heads · PLANE_SLOTS, hd]` shape. A program that is not this shape reaching this
+    // arm is a producer bug, and the refusal names the divergence.
+    if r.len() != 6 {
+        return err(format!(
+            "{name}: {} parameter(s) — the append contract is exactly \
+             [x, cos, sin, v, K_cache, V_cache]",
+            r.len()
+        ));
+    }
+    for (i, role) in r.iter().enumerate().take(4) {
+        if role.is_out {
+            return err(format!(
+                "{name}: parameter {i} (t{}) is stored — the append's four stream operands \
+                 are read-only; only the two pool planes are written",
+                role.tid
+            ));
+        }
+    }
+    if !r[4].is_out || !r[5].is_out {
+        return err(format!(
+            "{name}: the cache parameters (t{}, t{}) must both be stored — the append's \
+             outputs ARE the cache writes",
+            r[4].tid, r[5].tid
+        ));
+    }
+    let hd = r[4].v_cols;
+    if hd == 0 || r[5].v_cols != hd {
+        return err(format!(
+            "{name}: the K and V planes state widths {} and {} — the pool's planes share one \
+             head dim",
+            r[4].v_cols, r[5].v_cols
+        ));
+    }
+    let plane_slots = PagedKvPool::PLANE_SLOTS as u32;
+    if r[4].v_rows == 0 || !r[4].v_rows.is_multiple_of(plane_slots) || r[5].v_rows != r[4].v_rows {
+        return err(format!(
+            "{name}: the K plane states [{}, {}] and the V plane [{}, {}] — each pool plane \
+             is `[heads · {plane_slots}, {hd}]`, one plane per kv head",
+            r[4].v_rows, r[4].v_cols, r[5].v_rows, r[5].v_cols
+        ));
+    }
+    let heads = r[4].v_rows / plane_slots;
+    // The part's first row, off the program's own row window (the x view's first access
+    // tile states it) — the ONE input to the shared aiming law.
+    let row0 = r[0].r_start;
+    // ⛔ THE ROW KIND IS A BUNDLE FACT the program cannot state (the same law `rope`'s
+    // arm reads `attn_params` for): a request-major window's page is the request's own
+    // block-table entry, a position-major window's is the write cursor's. A bundle with
+    // no attention params cannot state it, and guessing is a mis-aimed write.
+    let rows_are_requests = attn_params
+        .map(|p| p.rows_are_requests)
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: an append program in a bundle that states no attention params — the \
+                 row kind (requests or positions) decides which block-table entry aims this \
+                 write, and it is a bundle fact the program cannot state"
+            ),
+        })?;
+    let (request, page_offset) = PagedKvPool::new(heads as usize, hd as usize)
+        .write_aim(row0, rows_are_requests);
+    // ── THE PROGRAM'S OWN BODY: the walk, op for op. ──
+    let mut ops = lower_function(k, layout, sym_id_base, None)?;
+    // ── THE Kᵀ TAIL: one re-transpose per kv head, the pool layout's three-plane law. ──
+    let pool = PagedKvPool::new(heads as usize, hd as usize);
+    let k_id = r[4].tid;
+    let kct_tid = ktir_superdsc::reserved_tids::kct_resident_tid(k_id);
+    let knat_name = ktir_superdsc::place::act_name(k_id);
+    let kct_name = ktir_superdsc::place::act_name(kct_tid);
+    let nkvh = std::num::NonZeroU32::new(heads).ok_or_else(|| Error {
+        message: format!("{name}: the pool states {heads} kv heads — a pool needs at least one"),
+    })?;
+    for kvh in 0..heads {
+        let kv_head = KvHead::new(kvh, nkvh).ok_or_else(|| Error {
+            message: format!(
+                "{name}: kv head {kvh} is past the pool's {heads} head(s) — the re-transpose \
+                 would read another plane's bytes into Kᵀ"
+            ),
+        })?;
+        ops.push(ktir_superdsc::emit::assemble_restickify_kt_2d(
+            &format!("{name}_kctpost{kvh}"),
+            KtTileSlots::of_page(),
+            KtTileFeats::of_head_dim(hd),
+            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each
+            // plane is its own named tensor), so the bound is the plane's `plane_stride()`.
+            &ktir_superdsc::emit::rb(&knat_name, 1, pool.plane_stride() as u32),
+            ktir_superdsc::addr::DevOff::from_view_step(
+                pool.addr(KvCoord::block(KvPlane::Knat, kv_head)),
+            ),
+            &ktir_superdsc::emit::rb(&kct_name, 1, pool.plane_stride() as u32),
+            ktir_superdsc::addr::DevOff::from_view_step(
+                pool.addr(KvCoord::block(KvPlane::Kt, kv_head)),
+            ),
+            sym_id_base,
+            layout,
+        ));
+        // ⭐ THE TAIL'S OWN STAMPS — main's `attn_kctpost` law: tagged with its row, aimed
+        // at its page part, and NO slot stride (the whole-page transpose takes no
+        // `seq_pos` shift). `kv_page_slots` is stated too — the paged mark that makes the
+        // tail self-identifying for the walk's stamp (pre-stamped ops are CHECKED against
+        // the carrier, never overwritten).
+        if let Some(o) = ops.last_mut() {
+            o.kv_page_slots = PagedKvPool::PAGE_SLOTS as u32;
+            o.kv_request = request;
+            o.kv_slot_offset = page_offset;
+        }
+    }
+    Ok(ops)
 }
 
 /// What a rope program states about its plane, whichever form stated it: the head dim, and the

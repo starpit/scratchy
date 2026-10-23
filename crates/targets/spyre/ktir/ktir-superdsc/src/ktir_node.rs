@@ -200,6 +200,15 @@ pub enum Program {
     /// The last-row extraction half of an lm-head tail — see [`KtirNode::node_out_tid`].
     LmLast,
     Rope,
+    /// ⭐ THE APPEND FORM — `RopeAppend`'s OWN contract, stated on the type and never sniffed
+    /// out of a region shape: the front end's arity-6 `[K, cos, sin, V, K_cache, V_cache]`
+    /// whose STORES ARE THE CACHE WRITES (there is no rotated intermediate — nothing on the
+    /// device path reads one). The kernel (`rope.py`'s `rope_append_fwd`) writes the rotated
+    /// K and the pass-through V into the paged pool planes; the lowering (`Program::RopeAppend`'s
+    /// door arm) lowers the program through the whole-function walk and then re-transposes the
+    /// Kᵀ plane after it — the pool layout's three-plane law, keyed on this contract, never on
+    /// recognising a rope. `Rope` above stays the q stream's rotation (no cache).
+    RopeAppend,
     Attn,
     /// A 2-D BLOCK TRANSPOSE of a whole tensor — `[mb, out]` → `[out, mb]`, one
     /// `interslicetranspose_fp16` on the PT unit. See

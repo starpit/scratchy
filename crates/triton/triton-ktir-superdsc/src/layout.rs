@@ -673,8 +673,11 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
             "kct_resident_tid(k)",
         ]),
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
-        // from an extent the program states.
+        // from an extent the program states. `RopeAppend` joins it: its own body states no
+        // reserved constant (the stores are ordinary plane stores), and the Kᵀ tail that
+        // names `kct_resident_tid` is the SPYRE door's emission, not this ladder's.
         Program::Rope
+        | Program::RopeAppend
         | Program::RmsNorm
         | Program::ScalarMul
         | Program::Elementwise(_)
@@ -933,7 +936,8 @@ fn scales_for(p: Program, f: &IRFunction<'static>) -> Vec<f32> {
         | Program::LmLast
         | Program::Transpose
         | Program::Matmul
-        | Program::Rope => Vec::new(),
+        | Program::Rope
+        | Program::RopeAppend => Vec::new(),
         // ⭐ EMPTY FOR THE SAME REASON, ONE STEP EARLIER: none of these programs has a body on
         // this ladder (the splice produces none of them and the door refuses them by name), so
         // there is no body to ask which values it looks up. A value registered for a program that

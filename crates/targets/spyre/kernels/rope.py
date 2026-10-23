@@ -36,6 +36,11 @@ THE ROW ORDER, kept from the fixture (delta 7, measured): row = position * H + h
 TOKEN-MAJOR, which is `addr_eq`'s same-bytes reshape of the worker's `[mq, heads*hd]`
 row-major staging — the arrangement the attention that consumes this tensor reads.
 
+⭐ THE APPEND FORM (`rope_append_fwd`, below) is `RopeAppend`'s OWN contract — the
+front-end arity-6 `[K, cos, sin, V, K_cache, V_cache]` the arity-3 port collapsed.
+It rotates K and writes it, with V, straight into the pool planes; its own doc states
+the store laws. `rope_fwd` above stays `RopeRotate`'s (the q stream's, no cache).
+
 ⭐ THE ROW WINDOW (per-row rope): the real front end's per-position decomposition
 produces rope nodes whose regions are ONE row's `[1, qw]` slice of the shared q
 plane, and a row slice is expressed by the ACCESS TILE's row corner, never by a
@@ -157,3 +162,79 @@ def _rope_per_head(desc_x, desc_cos, desc_sin, desc_o,
         s = sin_desc.load([0, col])
         o_desc.store([0, col], x1 * c - x2 * s)
         o_desc.store([0, col + HALF], x2 * c + x1 * s)
+
+
+@triton.jit
+def rope_append_fwd(desc_x, desc_cos, desc_sin, desc_v, desc_kc, desc_vc,
+                    H: tl.constexpr, HEAD_DIM: tl.constexpr, HALF: tl.constexpr,
+                    X_ROWS: tl.constexpr, ROW_START: tl.constexpr,
+                    PART_ROWS: tl.constexpr, SLOT_START: tl.constexpr,
+                    PLANE_SLOTS: tl.constexpr):
+    """THE APPEND FORM — `RopeAppend`'s own contract, the front-end arity-6 shape the
+    arity-3 port dropped: rotate K AND write it, with the un-rotated V, into the paged
+    KV pool. The rotation is `_rope_per_head`'s math; the STORES ARE THE CACHE WRITES —
+    there is no `desc_o`, because nothing on the device path reads the rotated
+    intermediate (the splice never binds `AttnDecode`'s `new_k`), and the reference's
+    shape — the outputs ARE the cache stores — wins.
+
+    ⭐ THE SCALE LAW, STATED AT THE WRITE. The cached K is the rope's PLAIN output:
+    `attn_scale_weight_folds` REFUSES the fold for an fp8 k_proj (the weight is
+    `Fp8Dynamic`, arity-3), so no `√scale` rides the projection, and every pool READER
+    states its own scale (`qk * (SCALE * LOG2E)` in the batched kernels). A model whose
+    fold fired composes at the other end (`√s · √s = s` at scale 1.0). Do not fold a
+    scale into this store.
+
+    THE POOL PLANES, at `PagedKvPool`'s own law: one plane per kv head, `[PLANE_SLOTS,
+    HEAD_DIM]` row-major, head `h`'s plane at row `h * PLANE_SLOTS`. A part's rows land
+    at slots `[SLOT_START, SLOT_START + PART_ROWS)` of its page — the part is cut so it
+    stays inside one page (`PagedKvPool::write_parts`, the shared cutting law), the page
+    itself is named by the RUNTIME through the block table (`kv_request` /
+    `kv_slot_offset`), and the decode slot by the launch's `seq_pos` shift
+    (`slot_stride_bytes`). The stores therefore bake `SLOT_START` and nothing else.
+
+    THE ROW WINDOW, per head: the x/cos/sin/v views are the worker-staged plane
+    `[X_ROWS, H * HEAD_DIM]`, and this part's rows are `[ROW_START, ROW_START +
+    PART_ROWS)` — the same window law `rope_fwd`'s tall form states, at the plane view
+    where one row IS one position. cos/sin are the head-replicated tables, read at the
+    part's own row base so each head's tiles line up row for row.
+    """
+    tl.static_assert(HALF + HALF == HEAD_DIM)
+    tl.static_assert(
+        PART_ROWS >= 1,
+        "rope_append_fwd: a part covers at least one row")
+    tl.static_assert(
+        SLOT_START + PART_ROWS <= PLANE_SLOTS,
+        "rope_append_fwd: a part must stay inside one page of the pool plane")
+    width = H * HEAD_DIM
+    x_desc = tl.make_tensor_descriptor(desc_x, shape=[X_ROWS, width], strides=[width, 1],
+                                       block_shape=[PART_ROWS, HALF])
+    cos_desc = tl.make_tensor_descriptor(desc_cos, shape=[X_ROWS, width],
+                                         strides=[width, 1],
+                                         block_shape=[PART_ROWS, HALF])
+    sin_desc = tl.make_tensor_descriptor(desc_sin, shape=[X_ROWS, width],
+                                         strides=[width, 1],
+                                         block_shape=[PART_ROWS, HALF])
+    v_desc = tl.make_tensor_descriptor(desc_v, shape=[X_ROWS, width], strides=[width, 1],
+                                       block_shape=[PART_ROWS, HEAD_DIM])
+    # The two pool planes: `[H * PLANE_SLOTS, HEAD_DIM]` — head h's plane is rows
+    # `[h * PLANE_SLOTS, (h + 1) * PLANE_SLOTS)`, and this part writes slots
+    # `[SLOT_START, SLOT_START + PART_ROWS)` of it.
+    kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[H * PLANE_SLOTS, HEAD_DIM],
+                                        strides=[HEAD_DIM, 1],
+                                        block_shape=[PART_ROWS, HALF])
+    vc_desc = tl.make_tensor_descriptor(desc_vc, shape=[H * PLANE_SLOTS, HEAD_DIM],
+                                        strides=[HEAD_DIM, 1],
+                                        block_shape=[PART_ROWS, HEAD_DIM])
+    for h in tl.range(0, H, 1):
+        col = h * HEAD_DIM
+        x1 = x_desc.load([ROW_START, col])
+        x2 = x_desc.load([ROW_START, col + HALF])
+        c = cos_desc.load([ROW_START, col])
+        s = sin_desc.load([ROW_START, col])
+        # rotate_half, per half — `_rope_per_head`'s own math, stored straight into the
+        # K plane instead of an intermediate.
+        kc_desc.store([h * PLANE_SLOTS + SLOT_START, 0], x1 * c - x2 * s)
+        kc_desc.store([h * PLANE_SLOTS + SLOT_START, HALF], x2 * c + x1 * s)
+        # V passes through un-rotated, head for head, slot for slot.
+        v = v_desc.load([ROW_START, col])
+        vc_desc.store([h * PLANE_SLOTS + SLOT_START, 0], v)

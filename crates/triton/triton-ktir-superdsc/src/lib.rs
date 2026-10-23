@@ -268,13 +268,15 @@ fn emit_regions(
         // selected by geometry match) is REMOVED — attention is lowered from its compiled ops
         // through the whole-function door, and a per-`Program` dispatch would be a second,
         // hand-rolled path. Do not re-add one.
-        Program::Attn | Program::Rope => {
+        Program::Attn | Program::Rope | Program::RopeAppend => {
             return Err(Error {
                 stage: "program",
                 message: format!(
-                    "{:?} crosses the model-geometry const door (`rope_at::<HD>`), so it cannot \
-                     be dispatched from a runtime `Program`. Call the generic entry with the \
-                     fixture's own tl.constexpr values",
+                    "{:?} crosses a door this ladder does not hold (`rope_at::<HD>`'s \
+                     model-geometry consts for Rope; the spyre target's whole-function walk \
+                     plus the Kᵀ tail for Attn and the append), so it cannot be dispatched \
+                     from a runtime `Program`. Call the entry the fixture's own tl.constexpr \
+                     values name",
                     node.program
                 ),
             });
