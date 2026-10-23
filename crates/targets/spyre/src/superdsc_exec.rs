@@ -1164,11 +1164,6 @@ struct DecodeWindow {
     cbs: u64,
 }
 
-/// The one-request rung's [1, ARGMAX_BLOCK] SenUint32 idx stick — 256 B, the
-/// readback pool's slot width. One word per step is read; the width is the stick's
-/// whole placement, the same shape law `window_begin` refuses against.
-const IDX_SLOT_BYTES: usize = 256;
-
 /// The per-step DMA CB count the window's begin-time budget check assumes — the
 /// preamble's merged runs (2–4 at decode shapes) plus the idx D2H, stated
 /// conservatively as 8. The number's point is the ORDER of k·(cbs + dma), not its
@@ -4602,14 +4597,15 @@ impl Executor {
     /// round trip, no tag return, and no synchronize happens in between.
     ///
     /// The refusals mirror the k=1 token step's own, hoisted to once-per-window:
-    /// the idx stick must be placed, and must fit the pool's slot — the window's
+    /// the idx stick must be placed and non-empty — the window's
     /// only inter-step dependency is the next token's embedding row, which the
     /// DEVICE argmax + gather feed writes (the mint's follow-on chain), so the
     /// caller gates on the wiring's `result_is_index` before opening a window
     /// and states the stick's [`bundle::PlaceId`] and the vocab HERE — the
     /// executor holds no wiring fact of its own. The pool: #606's
     /// [`SharedHostPool`] is built at the FIRST window and kept for
-    /// the session's life; a larger k than its geometry rebuilds it here — safe
+    /// the session's life; a larger k, or a stick placement wider than its
+    /// slots, rebuilds it here — safe
     /// because the previous window's finish synchronized, retiring every transfer
     /// the old slots served (the pool's own drop law).
     pub fn window_begin(&mut self, k: usize, stick: bundle::PlaceId, vocab: usize) -> Result<()> {
@@ -4630,18 +4626,23 @@ impl Executor {
             .get(&stick)
             .cloned()
             .ok_or_else(|| anyhow!("window_begin: the idx stick {stick} has no placement"))?;
-        // ⛔ THE STICK MUST FIT THE POOL'S SLOT — the one-request rung's minted stick is
-        // `[1, ARGMAX_BLOCK]` i32 (256 B exactly, matching [`IDX_SLOT_BYTES`]); the pooled
-        // D2H transfers the placement's aligned window into one slot, so a stick wider
-        // than the slot is a bundle the window was never meant to serve.
+        // ⛔ THE SLOT IS THE PLACEMENT'S OWN ALIGNED FOOTPRINT, NEVER THE STICK'S FLAT
+        // SHAPE. The mint's one-request stick is `[1, ARGMAX_BLOCK]` SenUint32 — 256 B
+        // flat — but the layout's `nbytes` reserves the DEVICE footprint, and the
+        // util-floor bump pads a 1-stick width to 8: 512 elems × 4 B = 2048 B (MEASURED
+        // on card, 10e572a827's first smoke: "the idx stick t738 is 2048 B (aligned
+        // 2048), which does not fit the pool's 256 B slot"). The pool door always
+        // transfers the device window's `total_size` — the aligned footprint — so a slot
+        // sized from the flat shape is a DMA past the slot's end into its NEIGHBOR; the
+        // door's own `DeviceSizeExceedsSlot` check would refuse one DMA late, after the
+        // pool pinned. The slot width is therefore DERIVED here, from the one fact the
+        // executor owns: the placement. A second constant would be the flat shape's own
+        // drift trap — this exact refusal is what a duplicated 256 already was.
         let stick_len = crate::lower_subtile_tape_to_superdsc::align128(lp.size);
-        if lp.size == 0 || stick_len > IDX_SLOT_BYTES as u64 {
+        if lp.size == 0 {
             bail!(
-                "window_begin: the idx stick {stick} is {} B (aligned {}), which does not \
-                 fit the pool's {IDX_SLOT_BYTES} B slot — the mint's one-request stick is \
-                 `[1, ARGMAX_BLOCK]` i32, and the window serves exactly that shape",
-                lp.size,
-                stick_len
+                "window_begin: the idx stick {stick} has a zero-byte placement — the mint's \
+                 stick is `[1, ARGMAX_BLOCK]` SenUint32, so zero bytes is a wiring bug"
             );
         }
         let seg = SegIdx::checked(lp.segment as i64)
@@ -4653,7 +4654,8 @@ impl Executor {
         let lo = lp.offset;
         let len = stick_len.min(tot - lo);
         // The placement's OWN window, never a whole-region fallback: the pool door
-        // transfers `device.total_size()` into a 256 B slot, so a window that cannot
+        // transfers `device.total_size()` — here the placement's aligned footprint —
+        // into a slot of exactly that width, so a window that cannot
         // form here is a loud refusal, not a silent region read (the k=1 step could
         // fall back to the region only because its host buffer was the whole segment).
         let idx_win = (len < tot)
@@ -4667,20 +4669,31 @@ impl Executor {
                     lp.segment
                 )
             })?;
+        // The rebuild law, BOTH axes: a larger k needs more slots, and a wider stick
+        // placement needs wider ones. The second axis is live because the pool persists
+        // across windows while the rung can change (a later window on a rung whose mint
+        // pads differently — or a wiring bug handing the pair's TABLE tid as the stick,
+        // whose `[vocab+1, hidden]` placement would build an absurd pool rather than
+        // corrupt a neighbor). A SMALLER stick reuses the pool as-is: the door checks
+        // the device size against the slot's capacity per copy, so over-capacity slots
+        // are safe and only under-capacity rebuilds. Rebuilding is safe for the same
+        // reason the k axis always was: no window is open here (refused above), so the
+        // previous window's finish synchronized and every transfer the old slots
+        // served has retired (the pool's own drop law).
         let need_rebuild = match self.idx_pool.as_ref() {
             None => true,
-            Some(p) => p.slot_count() < k,
+            Some(p) => p.slot_count() < k || (p.slot_bytes() as u64) < stick_len,
         };
         if need_rebuild {
             let mapper = PfIommuMapper::new();
-            self.idx_pool = Some(
-                SharedHostPool::new(k, IDX_SLOT_BYTES, &mapper).map_err(|e| {
+            self.idx_pool = Some(SharedHostPool::new(k, stick_len as usize, &mapper).map_err(
+                |e| {
                     anyhow!(
-                        "window_begin: the idx-readback pool ({k} × {IDX_SLOT_BYTES} B) \
-                         refused to pin: {e:?}"
+                        "window_begin: the idx-readback pool ({k} × {stick_len} B, the stick \
+                         placement's own aligned footprint) refused to pin: {e:?}"
                     )
-                })?,
-            );
+                },
+            )?);
         }
         // §4.7's budget, early-checked against the largest canvas this session has
         // already derived — the steady state (image cached) refuses HERE, before any
@@ -4934,7 +4947,7 @@ impl Executor {
             // Slot i is step i's — `window_step`'s D2H targeted it by construction.
             let word: [u8; 4] = pool.slot(i).expect("window_begin sized the pool to k")[..4]
                 .try_into()
-                .expect("the slot is IDX_SLOT_BYTES wide");
+                .expect("the slot is the stick's aligned placement, at least one word wide");
             let idx = u32::from_le_bytes(word);
             if idx as usize >= idx_vocab {
                 bail!(
