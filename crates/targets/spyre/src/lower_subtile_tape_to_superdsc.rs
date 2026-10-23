@@ -5995,7 +5995,7 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
                 let o = &ops[owner[t]];
                 if let Some(route) = o.parity {
                     assert!(
-                        folded.map_or(true, |f| f == route),
+                        folded.is_none_or(|f| f == route),
                         "group {gi}: op '{}' carries parity route {:?} but the group already \
                          carries {:?} — the runtime applies ONE parity shift to the group's slot \
                          word, so two different routes in one launch put a rope reader at the \
