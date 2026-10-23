@@ -4163,29 +4163,120 @@ impl Drop for TagLease {
     }
 }
 
+/// #603 — a `DmaBuf`'s staging state: the aligned shadow buffer and the ONE
+/// IOMMU mapping over its full extent, acquired together and held for the
+/// buffer's life.
+///
+/// DELIBERATE DIVERGENCE from the C++ (`DmaBuf::setup_dma_buf`,
+/// `scheduler_config.cpp:54-105`): the C++ remaps on EVERY chunk — its remap
+/// condition compares `mapped_hmva` (which the unaligned arm assigns the
+/// SHADOW address) against the member `hmva_ptr` (the ORIGINAL address), so
+/// on the shadow path the two are never equal and every chunk of every
+/// transfer unmaps and remaps. Under host starvation that map/unmap churn is
+/// what provokes senlib's IOVA allocator into handing out LIVE IOVAs —
+/// load4's log caught it twice returning the startup SharedHostPool's
+/// permanent IOVA 0x400001400000 to a fresh staging map ("iova pointer
+/// 400001400000 already present in table", 18:00:34.915650Z and
+/// 18:01:00.925219Z). This type deletes the churn: buffer and mapping are
+/// minted together and no method drops, replaces, or re-creates the mapping,
+/// so the IOVA a control block carries is stable for the buffer's whole
+/// life. Honest framing: this removes the provocation, it does not claim the
+/// collision is proven the seat — that is what the saturation acceptance
+/// cell is for.
+struct ShadowDma {
+    buffer: crate::host_interface::RaiiBuffer,
+    mapping: crate::iommu::IommuMapping,
+}
+
+impl ShadowDma {
+    /// Mint the pair once per buffer: the shadow at the pool's max chunk size
+    /// (never smaller than the chunk that mints it — every later chunk of
+    /// the same transfer is at most `DataTransferBufferSize()`), and the
+    /// mapping over the buffer's FULL extent, ALWAYS writable — one mapping
+    /// serves both directions, so the direction axis the C++ remapped on
+    /// (`mapped_writable`) has no field to live in.
+    ///
+    /// Held-IOVA bound: at most `DataTransferBufferCount()` (default 8) such
+    /// mappings per in-flight transfer, each `DataTransferBufferSize()`
+    /// (default 4 MiB) — 32 MiB at the defaults, against senlib's 4 GiB
+    /// total-allocation bound.
+    fn acquire(
+        minting_chunk: u64,
+        mapper: &Arc<crate::iommu::PfIommuMapper>,
+    ) -> Result<Self, SchedulerError> {
+        let alignment_bytes = mapper.alignment() as u64;
+        let alignment =
+            crate::host_interface::Alignment::new(alignment_bytes as u32).ok_or_else(|| {
+                mock_error(&format!(
+                    "DmaBuf: invalid IOMMU alignment {alignment_bytes} (not a power of two)"
+                ))
+            })?;
+        let size = (RuntimeConfig::data_transfer_buffer_size().value() as usize)
+            .max(minting_chunk as usize);
+        let buffer = crate::host_interface::RaiiBuffer::new(size, alignment)
+            .map_err(|e| mock_error(&format!("DmaBuf: shadow buffer allocation failed: {e:?}")))?;
+        let mapping = mapper.map_buffer(&buffer, true).map_err(|e| {
+            mock_error(&format!(
+                "DmaBuf: DmaIommuMappingFailed (hmva={:#x}, size={size}): {e:?}",
+                buffer.as_ptr() as usize
+            ))
+        })?;
+        Ok(Self { buffer, mapping })
+    }
+
+    /// The device-visible address of the staged bytes: the one mapping's
+    /// IOVA, identical for every chunk this buffer serves.
+    fn iova(&self) -> HostPhysicalAddress {
+        HostPhysicalAddress::of_mapping(&self.mapping)
+    }
+
+    /// Stage one H2D chunk in. The destination is a real slice of the
+    /// buffer's full extent, so a chunk larger than the mapped extent is a
+    /// bounds panic, not a copy past the allocation — the size check the
+    /// C++ did inside its remap condition, made a slice index.
+    fn stage_in(&mut self, src: usize, bytes: u64) {
+        // SAFETY: `buffer` owns `as_mut_ptr()..+size_bytes()`, and the
+        // mapping covers exactly that extent (`map_buffer`), so what this
+        // slice names is what the card can master.
+        let extent = unsafe {
+            std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr(), self.buffer.size_bytes())
+        };
+        // SAFETY: `src`/`bytes` name a valid readable host buffer of at
+        // least `bytes` bytes per `DmaParams`' contract.
+        let chunk = unsafe { std::slice::from_raw_parts(src as *const u8, bytes as usize) };
+        extent[..bytes as usize].copy_from_slice(chunk);
+    }
+
+    /// Copy one D2H chunk back out of the shadow once the transfer is
+    /// complete. Same bounds story as `stage_in`, read side.
+    fn copy_back(&self, dst: usize, bytes: u64) {
+        // SAFETY: as `stage_in`'s destination slice.
+        let extent =
+            unsafe { std::slice::from_raw_parts(self.buffer.as_ptr(), self.buffer.size_bytes()) };
+        let chunk = &extent[..bytes as usize];
+        // SAFETY: `dst`/`bytes` name the same valid, writable host buffer
+        // `setup_dma_buf` staged from.
+        unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst as *mut u8, chunk.len()) };
+    }
+}
+
 /// Port of `flex::DmaBuf` (`scheduler_config.hpp:45-79` + `setup_dma_buf`,
 /// `scheduler_config.cpp:54-105`): the per-chunk host-side state of a
-/// multi-chunk DMA — the aligned shadow buffer used when the host pointer is
-/// not IOVA-aligned, and the IOMMU mapping that produces the chunk's IOVA.
-/// One of these exists per IN-FLIGHT chunk, and they are recycled through
-/// [`DmaBufPool::avail_bufs`] as chunks complete.
+/// multi-chunk DMA. One of these exists per IN-FLIGHT chunk, and they are
+/// recycled through [`DmaBufPool::avail_bufs`] as chunks complete. The
+/// staging state itself lives in [`ShadowDma`] — see there for the #603
+/// divergence from the C++'s per-chunk remap.
 struct DmaBuf {
-    /// `raii_buffer` — allocated at `RuntimeConfig::DataTransferBufferSize()`
-    /// (NOT at the transfer size) and only when `unaligned`.
-    raii_buffer: Option<crate::host_interface::RaiiBuffer>,
-    /// `iomap`.
-    iomap: Option<crate::iommu::IommuMapping>,
+    /// The buffer's own staging pair, minted on its first non-premapped
+    /// chunk and held for its life; `None` only before that first chunk and
+    /// on the pre-mapped path, which never stages.
+    shadow: Option<ShadowDma>,
     /// `hmva_ptr` — the ORIGINAL (possibly unaligned) host pointer.
     hmva_ptr: usize,
-    /// `mapped_hmva` — the address `iomap` was actually built for, used to
-    /// detect a stale mapping on reuse.
-    mapped_hmva: usize,
     /// `size`.
     size: u64,
     /// `to_device`.
     to_device: bool,
-    /// `unaligned` — "True when raii_buffer is the active transfer buffer".
-    unaligned: bool,
     /// `iova` (the caller-supplied, pre-mapped one): non-null skips both the
     /// shadow copy and the copy-back.
     user_iova: Option<usize>,
@@ -4194,149 +4285,81 @@ struct DmaBuf {
     /// this backend took out and a caller-supplied pre-mapped IOVA, so a host
     /// virtual address cannot reach a CB through this field.
     iova: HostPhysicalAddress,
-    /// Not a real `DmaBuf` member: `PfIommuMapper::map` in this crate takes a
-    /// `writable` flag that senlib's `IommuMapperInterface::Map(&iomap, ptr,
-    /// size)` does not, so the remap condition below has to notice when a
-    /// recycled buffer's cached mapping was created for the other direction.
-    mapped_writable: bool,
 }
 
 /// One chunk's worth of "what buffer do I need": the host address and byte
-/// count, the direction, whether the host address is IOMMU-page-aligned, and a
-/// caller-supplied IOVA if the caller already mapped it. These are precisely the
-/// fields `setup_dma_buf` copies into the `DmaBuf`, and passing them as one
-/// value removes a run of adjacent `bool`s from its signature.
+/// count, the direction, and a caller-supplied IOVA if the caller already
+/// mapped it. These are precisely the fields `setup_dma_buf` copies into the
+/// `DmaBuf`, and passing them as one value removes a run of adjacent
+/// `bool`s from its signature. (The C++ also threaded whether the host
+/// address was IOMMU-page-aligned; that axis is gone — every non-premapped
+/// chunk stages through its buffer's [`ShadowDma`] whatever the caller's
+/// alignment, part of the divergence named there.)
 #[derive(Debug, Clone, Copy)]
 struct DmaBufRequest {
     hmva: usize,
     size: u64,
     to_device: bool,
-    unaligned: bool,
     iova: Option<usize>,
 }
 
 impl DmaBuf {
     fn new() -> Self {
         Self {
-            raii_buffer: None,
-            iomap: None,
+            shadow: None,
             hmva_ptr: 0,
-            mapped_hmva: 0,
             size: 0,
             to_device: false,
-            unaligned: false,
             user_iova: None,
             // A buffer that has never been mapped: the zero IOVA is what
             // `setup_dma_buf` overwrites before any CB is built from it.
             iova: HostPhysicalAddress::UNMAPPED,
-            mapped_writable: false,
         }
     }
 
-    /// Port of `DmaBuf::setup_dma_buf` (`scheduler_config.cpp:54-105`).
+    /// Port of `DmaBuf::setup_dma_buf` (`scheduler_config.cpp:54-105`), with
+    /// the #603 mapping-lifetime divergence: the mapping is minted WITH the
+    /// buffer ([`ShadowDma::acquire`]) and never remapped — the C++'s remap
+    /// arm (unmap + re-map per chunk) is deleted, not guarded.
     ///
-    /// `req` carries exactly the five values this assigns into `self` before
+    /// `req` carries exactly the four values this assigns into `self` before
     /// doing any work, so they cannot be passed in the wrong order — three of
     /// them were adjacent `bool`/integer parameters.
     fn setup_dma_buf(
         &mut self,
         req: DmaBufRequest,
-        new_buf: bool,
         iommu_mapper: &Arc<crate::iommu::PfIommuMapper>,
     ) -> Result<(), SchedulerError> {
         let DmaBufRequest {
             hmva,
             size: cur_size,
             to_device,
-            unaligned: buf_unaligned,
             iova: iova_in,
         } = req;
         self.hmva_ptr = hmva;
         self.size = cur_size;
         self.to_device = to_device;
-        self.unaligned = buf_unaligned;
         self.user_iova = iova_in;
 
         // "When the caller supplies a pre-mapped IOVA the host buffer is
         // already IOMMU-aligned and fully populated, so skip the RAII shadow
         // buffer allocation and memcpy."
         if let Some(iova) = iova_in {
-            self.mapped_hmva = hmva;
             self.iova = HostPhysicalAddress::of_caller_supplied_iova(crate::dma::IovaAddress(iova));
             return Ok(());
         }
 
-        let alignment_bytes = iommu_mapper.alignment() as u64;
-        let mut xfer_ptr = hmva;
-        if self.unaligned {
-            // "Buffer not aligned to IOMMU page size, shadow copies required."
-            if new_buf || self.raii_buffer.is_none() {
-                let alignment = crate::host_interface::Alignment::new(alignment_bytes as u32)
-                    .ok_or_else(|| {
-                        mock_error(&format!(
-                            "DmaBuf: invalid IOMMU alignment {alignment_bytes} (not a power of two)"
-                        ))
-                    })?;
-                let size = (RuntimeConfig::data_transfer_buffer_size().value() as usize)
-                    .max(cur_size as usize);
-                self.raii_buffer = Some(
-                    crate::host_interface::RaiiBuffer::new(size, alignment).map_err(|e| {
-                        mock_error(&format!("DmaBuf: shadow buffer allocation failed: {e:?}"))
-                    })?,
-                );
-            }
-            let buf = self.raii_buffer.as_mut().expect("allocated directly above");
-            if to_device {
-                // SAFETY: `hmva`/`cur_size` name a valid host buffer of at
-                // least `cur_size` bytes per `DmaParams`' contract, and the
-                // shadow buffer is at least that long.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        hmva as *const u8,
-                        buf.as_mut_ptr(),
-                        cur_size as usize,
-                    );
-                }
-            }
-            xfer_ptr = buf.as_ptr() as usize;
+        // Every other chunk — aligned or not — stages through this buffer's
+        // own shadow (the divergence named on `ShadowDma`): mint the pair on
+        // the first chunk that needs it, reuse it for the buffer's life.
+        if self.shadow.is_none() {
+            self.shadow = Some(ShadowDma::acquire(cur_size, iommu_mapper)?);
         }
-
-        // "Check if we need to create a new IOMMU mapping. Remap if: no
-        // mapping exists, address changed, or mapping too small."
-        //
-        // Note the real condition compares `mapped_hmva` against the member
-        // `hmva_ptr` (the ORIGINAL host address) while assigning
-        // `mapped_hmva = hmva_ptr_ref` (the SHADOW address when unaligned) —
-        // so on the unaligned path it always remaps, every chunk. Ported as
-        // written rather than "fixed": that is the real steady-state
-        // behaviour on that path.
-        let writable = !to_device;
-        let needs_remap = match &self.iomap {
-            None => true,
-            Some(m) => {
-                self.mapped_hmva != self.hmva_ptr
-                    || m.size_bytes() < cur_size as usize
-                    || self.mapped_writable != writable
-            }
-        };
-        if needs_remap {
-            // Release the stale mapping before taking a new one for the same
-            // host pages (`Map(&iomap, ...)` overwrites the unique_ptr, which
-            // destroys the old `IommuMapping` first).
-            self.iomap = None;
-            let mapping = iommu_mapper
-                .map(xfer_ptr, cur_size as usize, writable)
-                .map_err(|e| {
-                    mock_error(&format!(
-                        "DmaBuf: DmaIommuMappingFailed (hmva={xfer_ptr:#x}, size={cur_size}): {e:?}"
-                    ))
-                })?;
-            self.mapped_hmva = xfer_ptr;
-            self.mapped_writable = writable;
-            self.iomap = Some(mapping);
+        let shadow = self.shadow.as_mut().expect("minted directly above");
+        if to_device {
+            shadow.stage_in(hmva, cur_size);
         }
-        self.iova =
-            HostPhysicalAddress::of_mapping(self.iomap.as_ref().expect("mapped directly above"));
+        self.iova = shadow.iova();
         Ok(())
     }
 }
@@ -4391,12 +4414,14 @@ impl DmaBufPool {
     /// `pool->avail_bufs.enqueue(chunk_buf)`.
     ///
     /// ⛔ Takes a [`CbRetired`] and does nothing with it. That is the guard: a
-    /// buffer re-enters the pool to be REMAPPED by the next `setup_dma_buf`,
-    /// and remapping unmaps the IOVA a control block the card is still holding
-    /// would master — a fatal `RAS::PCI::BusFence`. The token cannot be
-    /// conjured, only obtained from `CbRetired::from_completion` (which
-    /// refuses a timed-out CB) or `CbRetired::never_submitted`, so "put it
-    /// back without checking whether the card is done" is not expressible.
+    /// buffer re-enters the pool to be RE-STAGED by the next `setup_dma_buf`,
+    /// overwriting its shadow's bytes while a timed-out CB the card still
+    /// holds may be mastering them — and the buffer's eventual drop unmaps
+    /// the IOVA that CB carries, a fatal `RAS::PCI::BusFence`. The token
+    /// cannot be conjured, only obtained from `CbRetired::from_completion`
+    /// (which refuses a timed-out CB) or `CbRetired::never_submitted`, so
+    /// "put it back without checking whether the card is done" is not
+    /// expressible.
     fn enqueue(&self, buf: Box<DmaBuf>, _retired: CbRetired) {
         self.avail_bufs
             .lock()
@@ -4442,10 +4467,11 @@ pub struct PfBackend {
     /// `pending_requests_` table and the completion thread.
     response_worker: std::sync::OnceLock<Arc<ResponseWorker>>,
     /// `DmaBuf`s whose CB timed out. A timed-out CB may still be sitting in
-    /// the hardware queue, so its buffer's IOMMU mapping must stay alive and
-    /// its buffer must never re-enter the reuse pool: recycling it remaps
-    /// (= unmaps) an IOVA the card can still master a PCIe access against,
-    /// which the card reports as a fatal `RAS::PCI::BusFence`. Parked here for
+    /// the hardware queue, so its shadow buffer must never be re-staged and
+    /// its mapping must stay alive: recycling it stages new bytes under a CB
+    /// the card can still master, and dropping it unmaps the IOVA that CB
+    /// carries, which the card reports as a fatal `RAS::PCI::BusFence`.
+    /// Parked here for
     /// the backend's lifetime — a deliberate, bounded leak (one buffer per
     /// timed-out chunk) traded for the card's bus staying alive.
     ///
@@ -4457,15 +4483,15 @@ pub struct PfBackend {
 
 /// One iteration of `submitDma`'s chunking loop: where this piece starts in the
 /// caller's host buffer (`hmva` plus `offset_bytes`), how many bytes it moves,
-/// whether the base host address was IOMMU-page-aligned (computed ONCE from the
-/// base `hmva`, per `pf_runtime_scheduler.cpp:117`, not per chunk), and which
-/// pipeline it rides.
+/// and which pipeline it rides. (The C++ also carried whether the base host
+/// address was IOMMU-page-aligned, computed once per
+/// `pf_runtime_scheduler.cpp:117`; that axis is gone with the
+/// [`ShadowDma`] divergence — every non-premapped chunk stages.)
 #[derive(Debug, Clone, Copy)]
 struct DmaChunk {
     hmva: usize,
     offset_bytes: u64,
     cur_size: u64,
-    buf_unaligned: bool,
     pipeline: PipelineId,
 }
 
@@ -4496,8 +4522,10 @@ impl PfBackend {
     }
 
     /// Port of `PfRuntimeScheduler::submitDmaChunk` (`pf_runtime_scheduler.cpp:158-229`):
-    /// acquire (or create) a pool buffer, IOMMU-map it, build this chunk's own
-    /// control block, and submit it — asynchronously. The completion lambda
+    /// acquire (or create) a pool buffer, stage the chunk through its shadow
+    /// (mapping minted on first use, held for the buffer's life — see
+    /// [`ShadowDma`]), build this chunk's own control block, and submit it —
+    /// asynchronously. The completion lambda
     /// copies a D2H shadow-buffer result back, returns the buffer to the pool
     fn submit_dma_chunk(
         &self,
@@ -4512,7 +4540,6 @@ impl PfBackend {
             hmva,
             offset_bytes,
             cur_size,
-            buf_unaligned,
             pipeline,
         } = chunk;
         let to_device = dma.direction() == DmaDirection::HostToDevice;
@@ -4531,11 +4558,9 @@ impl PfBackend {
                 hmva,
                 size: cur_size,
                 to_device,
-                unaligned: buf_unaligned,
                 // `iova` is advanced by `cur_size` per chunk in `submitDma`'s loop.
                 iova: dma.iova().map(|i| i.0 + offset_bytes as usize),
             },
-            new_buf,
             &self.iommu_mapper,
         )?;
 
@@ -4559,9 +4584,10 @@ impl PfBackend {
                 // chunk cannot be recycled even by a future edit that forgets
                 // why. `None` = the hardware may still hold the CB, and that
                 // CB carries this buffer's IOVA: the buffer must neither be
-                // reused (reuse remaps, i.e. unmaps) nor dropped (drop
-                // unmaps) — either hands the card a dangling IOVA and a later
-                // card-side access fences the PCIe bus.
+                // reused (reuse re-stages its shadow under the card) nor
+                // dropped (drop unmaps) — either hands the card a dangling or
+                // corrupted IOVA and a later card-side access fences the PCIe
+                // bus.
                 let Some(retired) = CbRetired::from_completion(&result) else {
                     tracing::error!(
                         hmva = format_args!("{:#x}", chunk_buf.hmva_ptr),
@@ -4588,22 +4614,14 @@ impl PfBackend {
                 // "For D2H with an unaligned shadow buffer, copy result back
                 // to the original host pointer now that the transfer is
                 // complete. Skip the copy-back when user provided iova is set
-                // — the caller owns the buffer."
+                // — the caller owns the buffer." The `unaligned` flag the C++
+                // keyed this on is gone: every non-premapped chunk staged, so
+                // the shadow's presence IS the condition.
                 if !chunk_buf.to_device
-                    && chunk_buf.unaligned
                     && chunk_buf.user_iova.is_none()
-                    && let Some(buf) = chunk_buf.raii_buffer.as_ref()
+                    && let Some(shadow) = chunk_buf.shadow.as_ref()
                 {
-                    // SAFETY: `hmva_ptr`/`size` name the same valid,
-                    // writable host buffer `setup_dma_buf` copied from,
-                    // and the shadow buffer holds this chunk's DMA'd bytes.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            buf.as_ptr(),
-                            chunk_buf.hmva_ptr as *mut u8,
-                            chunk_buf.size as usize,
-                        );
-                    }
+                    shadow.copy_back(chunk_buf.hmva_ptr, chunk_buf.size);
                 }
                 pool_for_cb.enqueue(chunk_buf, retired);
                 pool_for_cb.release(result.err());
@@ -4674,10 +4692,10 @@ impl SchedulerBackend for PfBackend {
         // never clamped to the resolved device chunk.
         let total_size = dma.dma_size().as_u64();
         let hmva_base = dma.hmva().0;
-        // "Check alignment and setup buffer pool": computed ONCE from the base
-        // `hmva`, not per chunk (`pf_runtime_scheduler.cpp:117`).
-        let buf_unaligned =
-            !(hmva_base as u64).is_multiple_of(self.iommu_mapper.alignment() as u64);
+        // (`pf_runtime_scheduler.cpp:117` computed the base `hmva`'s IOMMU
+        // page alignment once here; that axis is gone — every non-premapped
+        // chunk stages through its buffer's `ShadowDma` whatever the
+        // caller's alignment. See `ShadowDma`'s divergence note.)
         let max_buf_size = RuntimeConfig::data_transfer_buffer_size().value().max(1);
 
         let pool = DmaBufPool::new(callback);
@@ -4694,7 +4712,6 @@ impl SchedulerBackend for PfBackend {
                     hmva: hmva_base + offset as usize,
                     offset_bytes: offset,
                     cur_size,
-                    buf_unaligned,
                     pipeline,
                 },
                 &mut bufs_created,
