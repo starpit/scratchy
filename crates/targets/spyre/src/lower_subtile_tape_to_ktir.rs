@@ -1272,6 +1272,11 @@ pub fn lower_graph_to_superdsc<F: RopeForm>(
 /// reading someone else's tensor.
 pub struct BundleWiring {
     pub nodes: Vec<NodeArgs>,
+    /// Each attention layer's own wiring facts — the sealed cache pair and the node's new-K/new-V
+    /// inputs — one row per `SubOp::AttnDecode` node, in node order. Read where the roles are
+    /// needed (the wiring scan); ⛔ never re-derived from the programs' parameter lists — see
+    /// [`AttnWiring`]'s doc for the positional disease this replaces.
+    pub attn: Vec<AttnWiring>,
     pub num_sources: u32,
     pub result_tensor: u32,
     /// `tensor_shapes[id] = (rows, cols)` for every tensor. When `attn_mask` is set, the LAST entry
@@ -1345,6 +1350,39 @@ pub struct BundleWiring {
 /// One program's parameter order: `args[i]` is the tensor the i-th parameter addresses.
 pub struct NodeArgs {
     pub args: Vec<usize>,
+}
+
+/// ⭐ ONE ATTENTION LAYER'S OWN FACTS — each from its ONE owner, never re-derived downstream.
+///
+/// The wiring used to carry each program's parameter list alone ([`NodeArgs`]) and let the
+/// consumer re-derive these roles POSITIONALLY from it — "the argument after the prefix-K
+/// argument is the new-K output". That was a second implementation of the AttnDecode contract,
+/// correct only while a program's parameter order happened to spell it: the paged fold binds
+/// `[q, m, l, acc, Kᵀ, V, kt_ids, v_ids, mask]` — no new-K/new-V parameter at all — so the
+/// positional read handed out the V cache tensor as "new K" and an id table as "new V", and no
+/// extent law could notice. The facts live here instead, read off the same seats every other
+/// consumer already reads:
+///
+/// - `prefix_k`/`prefix_v` off the node's SEALED `KvCacheLayout` — the witness that exists to
+///   make producer/consumer cache drift structurally impossible;
+/// - `new_k`/`new_v` off the AttnDecode input contract `[q, prefix_k, prefix_v, new_k, new_v]`
+///   (`inputs[3]`/`inputs[4]`) — the same spelling the door reads (`ops_in.new_k_id`) and the
+///   placement pass re-places at the padded size.
+///
+/// The layer index is NOT here: it is the source registry's fact (`SourceBinding::PrefixK
+/// { layer }`), joined at the one seat that holds both — the wiring scan. ⛔ NOTHING DOWNSTREAM
+/// MAY RE-DERIVE A ROLE FROM A PROGRAM'S PARAMETER ORDER; the scan joins programs to rows by
+/// VALUE (the reserved Kᵀ name's own source key), never by position.
+pub struct AttnWiring {
+    /// The layer's prefix-K cache source tid — the sealed pair's K tensor, the `PrefixK`
+    /// source the host/pool binds.
+    pub prefix_k: u32,
+    /// The layer's prefix-V cache source tid — the sealed pair's V tensor.
+    pub prefix_v: u32,
+    /// The node's new-K input (`inputs[3]`): this step's roped K rows, the readback target.
+    pub new_k: u32,
+    /// The node's new-V input (`inputs[4]`).
+    pub new_v: u32,
 }
 
 /// ⭐ THE WIRING'S REGISTRIES — the layout facts [`graph_wiring`] rebuilds as pure functions of
@@ -1573,8 +1611,33 @@ pub fn graph_wiring<F: RopeForm>(
         &mut registries.scalarmul_scales_df,
         stated_scales,
     );
+    // ⭐ THE ATTENTION ROWS — each AttnDecode node's own facts, read where the door and the
+    // placement pass read them. A pure function of `ir.nodes`, like every registry here; the
+    // programs' parameter lists (`NodeArgs`) no longer carry roles for anyone to re-derive.
+    let mut attn: Vec<AttnWiring> = Vec::new();
+    for n in &ir.nodes {
+        let SubOp::AttnDecode { layout, .. } = &n.op else {
+            continue;
+        };
+        if n.inputs.len() < 5 {
+            return Err(SuperDscError(format!(
+                "AttnDecode t{} states {} inputs — the contract is [q, prefix_k, prefix_v, \
+                 new_k, new_v], and a node that does not state it has no fact for the wiring \
+                 to carry",
+                n.output.tensor.index(),
+                n.inputs.len()
+            )));
+        }
+        attn.push(AttnWiring {
+            prefix_k: layout.cache_tensor().index() as u32,
+            prefix_v: layout.v_cache_tensor().index() as u32,
+            new_k: n.inputs[3].tensor.index() as u32,
+            new_v: n.inputs[4].tensor.index() as u32,
+        });
+    }
     Ok(BundleWiring {
         nodes,
+        attn,
         num_sources: ir.num_sources,
         result_tensor: ir.result.index() as u32,
         tensor_shapes,

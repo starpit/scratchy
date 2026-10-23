@@ -8689,7 +8689,8 @@ pub fn emit_per_layer_kv_token_elems_arm_body(
 fn refuse_if_wiring_disagrees_with_manifest(
     stem: &str,
     manifest_json: &str,
-    emitted_layers: &[(u64, u32, u32, u32, u32)],
+    // (layer, prefix_k, prefix_v) — the projection of the typed rows built at the one call.
+    emitted_layers: &[(u64, u32, u32)],
     emitted_embed: u32,
     emitted_cos: &[(u32, u32, proc_macro2::TokenStream)],
     emitted_sin: &[(u32, u32, proc_macro2::TokenStream)],
@@ -8788,16 +8789,15 @@ fn refuse_if_wiring_disagrees_with_manifest(
     }
     // ⛔ POSITION BY POSITION. The worker indexes `layers[i]` for layer `i`, so "same set, other
     // order" is exactly as wrong as a missing entry.
-    for (i, (&(mlayer, mk), &(wlayer, wk, wv, _, _))) in pk.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mk), &(wlayer, wk, _))) in pk.iter().zip(emitted_layers).enumerate() {
         if mlayer != wlayer || mk != wk as usize {
             fail.push(format!(
                 "layers[{i}]: manifest says layer {mlayer} prefix_k t{mk}, wiring says layer \
                  {wlayer} prefix_k t{wk}"
             ));
         }
-        let _ = wv;
     }
-    for (i, (&(mlayer, mv), &(_, _, wv, _, _))) in pv.iter().zip(emitted_layers).enumerate() {
+    for (i, (&(mlayer, mv), &(_, _, wv))) in pv.iter().zip(emitted_layers).enumerate() {
         if mv != wv as usize {
             fail.push(format!(
                 "layers[{i}] (layer {mlayer}): manifest says prefix_v t{mv}, wiring says t{wv}"
@@ -9083,21 +9083,27 @@ fn emit_superdsc_wiring(
     });
 
     // ── Per-layer AttnDecode wiring ──
-    // The worker's own walk, run here: find each node that reads the mask, and
-    // take the prefix-K/V args plus the argument positionally after each as the
-    // new-K/new-V outputs.
+    // THE FACTS COME FROM THE NODES, THE LAW FROM THE PROGRAMS. `gk.attn` carries each
+    // AttnDecode node's own facts — the sealed cache pair and the new-K/new-V inputs, read
+    // where the door and the placement pass read them — so this scan no longer re-derives
+    // roles from the programs' parameter lists. (The positional read it replaces — "the
+    // argument after the prefix-K argument is the new-K output" — matched the OLD kernel
+    // order `q, out, kc, kd, vc, vd` and nothing else: the paged fold binds
+    // `[q, m, l, acc, Kᵀ, V, kt_ids, v_ids, mask]`, no new-K/new-V parameter at all, so it
+    // handed out the V cache tensor as "new K" and an id table as "new V", silently.)
     //
-    // ⭐ THE K-SIDE ARG MAY BE THE RESERVED Kᵀ PLANE. A spliced attention binds its score
-    // gather to `KctResident::of(k)` — the naming law, the SAME expression the door's write
-    // tail and main's card-proven reader spell — and that reserved tid is not itself a
-    // PrefixK source. The scan resolves it BACK to the PrefixK source it names through the
-    // TYPE'S OWN SCAN DOOR (`KctResident::of_wire(a).source_k()`), so the layer and the
-    // prefix-K bind stay the wiring's own facts; without this resolution the scan drops every
-    // layer of a spliced attention and the completeness lock below refuses the bake — the lock
-    // doing its job on a wiring it could no longer read. ⛔ `source_k` is a SCAN fact and this
-    // is the scan: nowhere else may a reserved plane name become its source tid, and the
-    // gather door does not carry this door at all.
-    let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
+    // ⭐ THE ONE THING ONLY THE PROGRAM CAN STATE IS THE NAMING LAW, and the scan states it
+    // as a refusal: an attention program's score side is the RESERVED Kᵀ plane —
+    // `KctResident::of(k).wire_tid()` keyed on the layer's K source, the SAME expression the
+    // fold mint, the one-shot mint and the door's write tail spell — never the natural plane
+    // the cachewr copies fill (same size, wrong plane, invisible to every extent law). A
+    // mask-mentioning program that binds no reserved Kᵀ name is a build failure naming the
+    // layer. The join to the row is the reserved name's OWN source key — by value, never by
+    // position.
+    let mut layers: Vec<(
+        u64,
+        &scratchy_target_spyre::lower_subtile_tape_to_superdsc::AttnWiring,
+    )> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
             .bindings
@@ -9108,46 +9114,63 @@ fn emit_superdsc_wiring(
                 _ => None,
             })
             .collect();
-        // Which layer's K plane `a` names: the PrefixK source itself, or the reserved Kᵀ
-        // plane keyed on it. A real source always wins — the reserved regions sit far past
-        // `num_sources`, so the two never collide.
-        let k_plane_of = |a: u32| -> Option<(u32, u64)> {
-            pk.get(&a).map(|&l| (a, l)).or_else(|| {
-                scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(a)
-                    .and_then(|kct| pk.get(&kct.source_k()).map(|&l| (kct.source_k(), l)))
-            })
-        };
-        let pv: std::collections::HashSet<u32> = lwd
-            .bindings
-            .iter()
-            .enumerate()
-            .filter_map(|(i, b)| match b {
-                SourceBinding::PrefixV { .. } => Some(i as u32),
-                _ => None,
-            })
-            .collect();
+        let row_of: std::collections::HashMap<u32, _> =
+            gk.attn.iter().map(|r| (r.prefix_k, r)).collect();
         for node in &gk.nodes {
             if !node.args.iter().any(|a| *a as u32 == mask) {
                 continue;
             }
-            let (mut layer, mut k_src, mut new_k) = (None, None, None);
-            let (mut v_src, mut new_v) = (None, None);
-            for (i, a) in node.args.iter().map(|a| *a as u32).enumerate() {
-                if let Some((ks, l)) = k_plane_of(a) {
-                    layer = Some(l);
-                    k_src = Some(ks);
-                    new_k = node.args.get(i + 1).map(|x| *x as u32);
-                }
-                if pv.contains(&a) {
-                    v_src = Some(a);
-                    new_v = node.args.get(i + 1).map(|x| *x as u32);
-                }
+            // ⭐ THE NAMING LAW, BY VALUE: the program must bind its layer's reserved Kᵀ plane.
+            let Some(kct) = node
+                .args
+                .iter()
+                .filter_map(|a| {
+                    scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(*a as u32)
+                })
+                .next()
+            else {
+                panic!(
+                    "[superdsc-wiring] {}: an attention program binds no reserved Kᵀ plane, so \
+                     its score side would read the natural K plane the cachewr copies fill — \
+                     same size, wrong plane, invisible to every extent law. The fold and \
+                     one-shot mints bind KctResident::of(k).wire_tid(); a program that does \
+                     not is a regression of that naming law",
+                    model.source_stem
+                );
+            };
+            let src = kct.source_k();
+            let Some(&row) = row_of.get(&src) else {
+                panic!(
+                    "[superdsc-wiring] {}: an attention program's Kᵀ plane names source t{src}, \
+                     which no AttnDecode node's sealed cache pair claims — the program and the \
+                     graph disagree about which layer it serves",
+                    model.source_stem
+                );
+            };
+            // ⭐ THE LAYER OFF THE SOURCE KEY — the one seat that holds both the registry's
+            // layer and the program's reserved name. `prefix_k` stays the SOURCE tid the
+            // host/pool binds (the wiring's own fact); the plane half of the join lives only
+            // in the naming law above.
+            let Some(&layer) = pk.get(&src) else {
+                panic!(
+                    "[superdsc-wiring] {}: the Kᵀ plane's source t{src} is not a PrefixK source \
+                     — the layer's cache would never be bound",
+                    model.source_stem
+                );
+            };
+            // THE PAIRING, CARRIED AND CHECKED: the program must also bind the sealed pair's V
+            // tensor, the same fact the fold's mint spells. A mint that bound some other V is
+            // a second implementation of the pairing — refused here, not discovered on the card.
+            if !node.args.iter().any(|a| *a as u32 == row.prefix_v) {
+                panic!(
+                    "[superdsc-wiring] {}: layer {layer}'s attention program binds its Kᵀ plane \
+                     but not the sealed pair's V tensor t{} — the program and the node's \
+                     KvCacheLayout disagree about the pairing",
+                    model.source_stem,
+                    row.prefix_v
+                );
             }
-            if let (Some(l), Some(ks), Some(nk), Some(vs), Some(nv)) =
-                (layer, k_src, new_k, v_src, new_v)
-            {
-                layers.push((l, ks, vs, nk, nv));
-            }
+            layers.push((layer, row));
         }
         layers.sort_by_key(|x| x.0);
     }
@@ -9194,9 +9217,19 @@ fn emit_superdsc_wiring(
         // ── every layer's prefix KV is wired ──
         if layers.len() != n_layers_expected {
             fail.push(format!(
-                "{} of {n_layers_expected} layers have prefix-KV wiring. The rest were dropped by \
-                 the positional arg scan; their K/V cache would never be bound",
+                "{} of {n_layers_expected} layers have prefix-KV wiring. The rest have no \
+                 attention program joining their sealed cache pair — their K/V cache would \
+                 never be bound",
                 layers.len(),
+            ));
+        }
+        if layers.len() != gk.attn.len() {
+            fail.push(format!(
+                "the attention programs and the graph's AttnDecode nodes do not join one-to-one \
+                 ({} joined, {} rows) — a row whose program lost its reserved Kᵀ binding has no \
+                 cache gather, and a row joined twice is a double bind",
+                layers.len(),
+                gk.attn.len()
             ));
         }
         let mut seen_layers: Vec<u64> = layers.iter().map(|x| x.0).collect();
@@ -9342,23 +9375,34 @@ fn emit_superdsc_wiring(
         })
         .map(|(i, _)| i as u32)
         .collect();
+    // What the manifest check reads of a layer: its index and its sealed cache pair — the
+    // projection of the typed rows, built once at this call.
+    let emitted_layers: Vec<(u64, u32, u32)> = layers
+        .iter()
+        .map(|(l, r)| (*l, r.prefix_k, r.prefix_v))
+        .collect();
     refuse_if_wiring_disagrees_with_manifest(
         &model.source_stem,
         manifest_json,
-        &layers,
+        &emitted_layers,
         embed_src,
         &cos_v,
         &sin_v,
         &emitted_weight_ids,
     );
 
-    let layer_toks = layers.iter().map(|(_, ks, vs, nk, nv)| {
+    let layer_toks = layers.iter().map(|(_, row)| {
         // ⭐ THE LAYER'S OWN KV WIDTH, off the prefix-K source's baked shape. A hybrid-attention
         // arch (gemma-4) gives sliding and global layers DIFFERENT kv_heads×head_dim, so the
         // model-wide `Geometry::kv_dim` cannot size a per-layer host buffer or readback — the
         // prefix-K source's column count IS the width this layer's K/V rows carry.
-        let kvw = u32l(gk.tensor_shapes[*ks as usize].1);
-        let (ks, vs, nk, nv) = (u32l(*ks), u32l(*vs), u32l(*nk), u32l(*nv));
+        let kvw = u32l(gk.tensor_shapes[row.prefix_k as usize].1);
+        let (ks, vs, nk, nv) = (
+            u32l(row.prefix_k),
+            u32l(row.prefix_v),
+            u32l(row.new_k),
+            u32l(row.new_v),
+        );
         quote! {
             ::scratchy_target_spyre::wiring::LayerWiring {
                 prefix_k: #ks, prefix_v: #vs, new_k: #nk, new_v: #nv,
