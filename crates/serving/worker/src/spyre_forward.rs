@@ -1856,8 +1856,7 @@ pub(crate) fn superdsc_forward_chunk(
                 if ahead {
                     all.into_iter()
                         .filter(|s| {
-                            s.kernel
-                                != scratchy_target_spyre::forward_tape::ForwardKernel::EmbedRow
+                            s.kernel != scratchy_target_spyre::forward_tape::ForwardKernel::EmbedRow
                         })
                         .collect()
                 } else {
@@ -1873,7 +1872,7 @@ pub(crate) fn superdsc_forward_chunk(
                 ahead,
             })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
     for (i, sc) in scaffold.iter().enumerate() {
         // ⭐ THE TOKEN THIS STEP FEEDS — the committed one at position `start` for step
         // 0, and NOTHING for a window's ahead-steps: their token ids exist only on the
@@ -1943,7 +1942,7 @@ pub(crate) fn superdsc_forward_chunk(
         // page and a rung the bytes are IDENTICAL step to step, so the held-key skip builds
         // nothing and the [sdsc-bind] note loses the table's rebuild+convert+upload every step.
         let index_key = BindKey::KvIndex {
-            swept: step.swept(),
+            swept: sc.step.swept(),
             pages: scratchy_subtile::sdsc_abstract::RowPages::holding(SlotCount::new(p as u32 + 1)),
         };
         let index_held = session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
@@ -1956,7 +1955,7 @@ pub(crate) fn superdsc_forward_chunk(
                 "solo decode",
                 pool,
                 session,
-                step,
+                sc.step,
                 req,
                 ctx,
                 ChunkKeys {
@@ -1977,8 +1976,9 @@ pub(crate) fn superdsc_forward_chunk(
             mq_pad: 64,
             // One row: always the sub-blocked form (`NewBlockForm::of(1, …)`), whose block is every
             // head — the SAME baked count as `num_q_heads` above, never the `h / hd` quotient (that is
-            // the head count only for a square Q projection; see the site above).
-            causal_heads_per_block: b.wiring.causal_heads_per_block(causal),
+            // the head count only for a square Q projection; see the site above). The scaffold
+            // hoisted the derivation (#603 L2-2) — `causal` never moves inside the loop.
+            causal_heads_per_block: causal_heads,
             embed_tokens: sh.embed_tokens,
             // ⭐ THE COMMITTED ROW, OR NOTHING: an ahead-step's token does not exist on
             // the host, its EmbedRow step is filtered off the tape below, and this
@@ -2004,24 +2004,14 @@ pub(crate) fn superdsc_forward_chunk(
         // chained off the previous step's argmax writes that row, and a staged
         // (zero-filled) row would overwrite it in the preamble H2D. Every other step
         // stays: the rope tables, the masks, the block index and the constants are all
-        // host-known per position.
-        let fsteps: Vec<_> = {
-            let all = shape.steps();
-            if ahead {
-                all.into_iter()
-                    .filter(|s| {
-                        s.kernel != scratchy_target_spyre::forward_tape::ForwardKernel::EmbedRow
-                    })
-                    .collect()
-            } else {
-                all
-            }
-        };
-        let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
-        let ftape = scratchy_target_spyre::forward_tape::tape_steps(&fsteps, &fops);
+        // host-known per position. The filter itself ran in the scaffold — this step's
+        // lists are the ones it built.
+        let fsteps = &sc.fsteps;
+        let fops = &sc.fops;
+        let ftape = scratchy_target_spyre::forward_tape::tape_steps(fsteps, fops);
         let mut launcher = ForwardLauncher {
-            shape: &shape,
-            steps: &fsteps,
+            shape: &sc.shape,
+            steps: fsteps,
             inputs: &inputs,
             acts: Vec::with_capacity(fsteps.len()),
             acts_f16: Vec::new(),
