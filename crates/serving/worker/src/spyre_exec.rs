@@ -1398,6 +1398,7 @@ impl Worker for SpyreWorker {
                             // ⛔ THE UNIT IS THE STICK BLOCK, AND IT IS THE POOL'S OWN NUMBER. `per_page`
                             // is `page_stride_bytes / stick_block_bytes` and `skip_addr` is one stick
                             // block, so `entry * stick_block_bytes` IS the byte the card computes —
+                            // read through the ceiling's own `per_page()` door, never re-derived here —
                             // converting with any other unit would mis-report the reach by `nkvh *
                             // PAGE_SLOTS / POOL_STICK` (32× at the shipped 2b geometry). A diagnostic
                             // that mis-reports an address is worse than none: this is the one print that
@@ -1416,10 +1417,10 @@ impl Worker for SpyreWorker {
                                     scratch.entries_per_row(),
                                     pass_stride.get(),
                                     max_pages,
-                                    per_page.get(),
+                                    ceiling.per_page().get(),
                                     scratch.rows(),
                                     hi as i64 * stick,
-                                    per_page.get() * stick,
+                                    ceiling.per_page().get() * stick,
                                     page_maps.len(),
                                     mask_shape.rep_stride_bytes(),
                                     table.len() * 4,
