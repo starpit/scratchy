@@ -176,13 +176,14 @@ impl SegRole {
 ///   `offset + parity·stride`, so the H2D run carries the rows to the slot the canvas will read.
 ///
 /// ⛔ THE STRIDE IS ONE COMMON VALUE, not a per-tensor offset: one CB has ONE `ta` word for the
-/// slot, so every parity placement of one bundle must share it. `stride` is the WIDEST rope
-/// row, which makes each tensor's parity-1 window `[offset+stride, offset+stride+bind)` land
-/// INSIDE that tensor's own grown placement, clear of its row 0 and of every other tensor's
-/// reservation — disjoint BY CONSTRUCTION, not by the luck of current offsets. The placement's
-/// `size` carries the growth (`nbytes + stride`), and the emit-side footprint guard in
-/// `resolve_seg_base` refuses any access whose parity-shifted window would leave it: the bound
-/// is a BUILD error, never a runtime check.
+/// slot, so every parity placement of one bundle must share it. `stride` is the WIDEST per-step
+/// bind any routed tensor uploads — the widest rope row, and in the broadcast mask form the
+/// prefix mask's whole reserved row — which makes each tensor's parity-1 window
+/// `[offset+stride, offset+stride+bind)` land INSIDE that tensor's own grown placement, clear of
+/// its row 0 and of every other tensor's reservation — disjoint BY CONSTRUCTION, not by the luck
+/// of current offsets. The placement's `size` carries the growth (`logical + stride`), and the
+/// emit-side footprint guard in `resolve_seg_base` refuses any access whose parity-shifted window
+/// would leave it: the bound is a BUILD error, never a runtime check.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ParityRoute {
     /// The LOGICAL `tensor_allocs` slot the rope AllocNodes resolve against. The Logits segment
@@ -194,7 +195,7 @@ pub struct ParityRoute {
     /// 3 — where the bytes have always lived: same shadow, same merged H2D run structure, same
     /// D2H disjointness).
     pub backing: u32,
-    /// Bytes between the two parity slots — the widest rope row (see the struct doc).
+    /// Bytes between the two parity slots — the widest routed per-step bind (see the struct doc).
     pub stride: u64,
 }
 
@@ -219,11 +220,13 @@ pub struct TensorPlacement {
     /// Byte offset WITHIN the segment region (128 B aligned), and within its BANK when banked.
     pub offset: u64,
     /// Byte size (f16 = 2 B/elem, rows*cols*2). For a parity placement this INCLUDES the
-    /// `stride` growth — see [`ParityRoute`].
+    /// `stride` growth — see [`ParityRoute`]; readers that mean the tensor's own extent take
+    /// the runtime twin's `logical_size` (`size - stride`), never `size`.
     pub size: u64,
     /// ⭐ THE STEP-PARITY DIMENSION, on exactly the tensors whose bytes the decode window
-    /// re-uploads while a canvas may still be reading them (the rope cos/sin sources).
-    /// `None` for every other tensor, which keeps every such bundle byte-identical.
+    /// re-uploads while a canvas may still be reading them (the rope cos/sin sources, and the
+    /// prefix mask in its broadcast form). `None` for every other tensor, which keeps every
+    /// such bundle byte-identical.
     pub parity: Option<ParityRoute>,
 }
 

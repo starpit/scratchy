@@ -178,12 +178,31 @@ pub struct Placement {
     pub size: u64,
     /// This is the graph result read back each step (`SegRole::Logits`).
     pub is_logits: bool,
-    /// ⭐⭐⭐⭐⭐ (#603 PR3b E) THE STEP-PARITY DIMENSION — on exactly the rope cos/sin sources,
-    /// whose per-step H2D lands mid-canvas of the previous step inside a decode window. The
+    /// ⭐⭐⭐⭐⭐ (#603 PR3b E) THE STEP-PARITY DIMENSION — on the rope cos/sin sources and, in the
+    /// broadcast mask form, the attention prefix mask: the two per-step-staged writers whose
+    /// preamble H2D lands mid-canvas of the previous step inside a decode window. The
     /// staging side writes (and uploads) at `offset + step_parity·stride`; the bytes stay in
     /// this placement's own segment and shadow. `None` for every other tensor — every bundle
     /// that places no rope source is byte-identical to before. See [`ParityRoute`].
     pub parity: Option<ParityRoute>,
+}
+
+impl Placement {
+    /// ⭐ THE TENSOR'S OWN BYTES, EXCLUDING THE PARITY-1 SLOT'S RESERVATION — the number every
+    /// COLUMN- or CAPACITY-reading consumer of a placement must take, never `size`.
+    ///
+    /// A parity-routed placement's `size` is `logical + stride` (the growth that keeps the
+    /// parity-1 window inside the tensor's own footprint), so reading `size` where the
+    /// tensor's extent is meant counts the OTHER slot's tail as content. For the prefix mask
+    /// that is not a rounding error but the dangerous direction: the mask is additive and an
+    /// unstaged byte reads as ZERO — VALID — so a capacity derived from `size` would let a
+    /// fold step past the staged mask into the other parity's row (and a staged row length
+    /// derived from `size` would bind past the placement's own guard). `size - stride` for a
+    /// routed placement, `size` for an un-routed one — the un-routed case is byte-identical
+    /// to before, which is the point.
+    pub fn logical_size(&self) -> u64 {
+        self.size - self.parity.map_or(0, |r| r.stride)
+    }
 }
 
 /// A matmul KERNEL weight's device-tile walk — the PT array reads the device TILE layout
@@ -1090,5 +1109,53 @@ mod place_id_tests {
             let a = PlaceId::Act(tid).to_string();
             assert!(!a.contains('_'), "an act's spelling has no role part: {a}");
         }
+    }
+
+    /// ⭐ A PARITY PLACEMENT'S `logical_size` IS ITS OWN BYTES, NOT THE OTHER SLOT'S — the number
+    /// every column- or capacity-reading consumer must take (#603 PR3b E, ruling #13: the prefix
+    /// mask joined the route, so its `size` grew by the stride). The deliberately-wrong arm is the
+    /// naive `size` reading: for a routed placement it counts the parity-1 tail as content, which
+    /// for an ADDITIVE mask admits folds past the mask the host stages (unstaged bytes read as
+    /// ZERO, i.e. VALID). A test that cannot fail proves nothing, so both readings are asserted
+    /// against the pre-growth extent the test states itself.
+    #[test]
+    fn a_parity_placement_reports_its_own_bytes_not_the_other_slot() {
+        let pm = Placement {
+            id: PlaceId::Act(u32::MAX - 3),
+            segment: 3,
+            bank: 0,
+            offset: 4096,
+            // one reserved row of 256 pages, and a stride that spans it — the broadcast form
+            size: 2 * 256 * 128,
+            is_logits: false,
+            parity: Some(ParityRoute {
+                slot: 4,
+                backing: 3,
+                stride: 256 * 128,
+            }),
+        };
+        assert_eq!(
+            pm.logical_size(),
+            256 * 128,
+            "the logical extent is the mask's own row — the columns the host stages and the \
+             fold reads"
+        );
+        assert_ne!(
+            pm.logical_size(),
+            pm.size,
+            "the naive `size` reading counts the other parity slot's tail as mask columns — \
+             this is the arm that fails if `logical_size` ever degenerates to `size`"
+        );
+        // and an UN-ROUTED placement is byte-identical to before — no growth, no subtraction.
+        let plain = Placement {
+            id: PlaceId::Act(7),
+            segment: 3,
+            bank: 0,
+            offset: 8192,
+            size: 4096,
+            is_logits: false,
+            parity: None,
+        };
+        assert_eq!(plain.logical_size(), 4096, "un-routed: `size` is the extent");
     }
 }

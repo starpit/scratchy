@@ -370,7 +370,7 @@ fn attn(
     })?;
     // ⭐⭐ THE ONE PLACE THE MODEL'S HEAD GEOMETRY STOPS BEING VALUES for the attention path — the SAME
     // door `lower_one_node` crossed, now crossed with the geometry the program itself states.
-    scratchy_subtile::model_geometry::with_config_attn_geometry(
+    let mut ops = scratchy_subtile::model_geometry::with_config_attn_geometry(
         geom,
         AttnAt(lk::AttnAt {
             name,
@@ -393,7 +393,31 @@ fn attn(
              scope ({}); this geometry belongs to none of them.",
             scratchy_subtile::model_geometry::geometry_sources(),
         ),
-    })?
+    })??;
+    // ⭐ THE PMASK PARITY STAMP (#603 PR3b E, ruling #13) — the twin of the rope stamp in `rope_at`.
+    // The layout routes the prefix mask's placement onto the same step-parity route as the rope
+    // sources in the BROADCAST form (`rows_are_requests == false`), so this lowering's score legs
+    // address the mask through the route's slot word: every op emitted here carries the route, the
+    // group fold puts it in the group's one `KvShifts::parity`, and `launch_site` moves the slot
+    // word to this step's parity — the slot this step's upload filled. ⛔ UNLIKE THE ROPE ARM there
+    // is no refuse-on-missing-route here, and the asymmetry is the law: the route's EXISTENCE is
+    // keyed on the ROPE walk (a rope-free bundle routes nothing, mask included), so "mask placed,
+    // no route" is the rope-free bundle's shipped state, not a desync. The placement IS the single
+    // authority — the stamp is read off it in the same breath the emitted descriptors were baked
+    // against it, so there is no path where the mask is routed and these ops are not stamped (an
+    // unstamped attention op over a routed mask would read the LOGITS region at the mask's offset:
+    // the stamp is load-bearing, not decorative).
+    if let Some(l) = layout
+        && let Some(route) = l
+            .placements
+            .get(&ktir_superdsc::reserved_tids::ATTN_MASK_TID)
+            .and_then(|p| p.parity)
+    {
+        for op in &mut ops {
+            op.parity = Some(route);
+        }
+    }
+    Ok(ops)
 }
 
 /// The orphan-rule carrier for [`lk::RopeAt`] — see the module header.

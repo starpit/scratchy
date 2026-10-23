@@ -689,6 +689,98 @@ fn stage_registry_scalars<F: RopeForm>(op: &mut SubOp<F>) -> bool {
 /// All sizes are f16 bytes (`rows*cols*2`), 128 B aligned. A build-time disjointness
 /// guard ([`bundle_layout_aliases`]) asserts no two SIMULTANEOUSLY-LIVE tensors in a
 /// segment overlap — a silent on-card aliasing write is a `cargo build` Err.
+/// ⭐⭐⭐⭐⭐ THE PREFIX MASK'S RESERVED ROW — the bytes one pmask parity slot must hold, derived
+/// ONCE for both of its readers (the stride max in the rope/pmask route walk below, and the
+/// `ATTN_MASK_TID` placement), so the stride a route carries and the size the placement reserves
+/// cannot disagree.
+///
+/// The extent is the form's: ONE broadcast row over the reserved pages when the bundle's rows are
+/// one sequence (`pm_rows == 1` — a one-request decode step or a prompt chunk), one row per query
+/// row when they are separate requests (`nqh·mq` — a decode batch, where the fold reads one
+/// request's block per pass and the host stages only the live blocks). `None` when the graph has
+/// no attention at all, which is exactly when no pmask is placed.
+fn pmask_reserve_bytes<F: RopeForm>(
+    ir: &SubtileIR<F>,
+    rows_are_requests: bool,
+    per_layer_ext: &[std::collections::BTreeMap<u32, Vec<u32>>],
+) -> Option<u64> {
+    let node = ir
+        .nodes
+        .iter()
+        .find(|n| matches!(n.op, SubOp::AttnDecode { .. }))?;
+    let SubOp::AttnDecode { geom, .. } = &node.op else {
+        return None; // the find's own predicate — unreachable, stated for the destructure
+    };
+    let nqh = geom.nqh().get() as u64;
+    let nkvh = geom.nkvh().get() as u64;
+    let hd = geom.hd().get() as u64;
+    let mq = node.output.region.rows.len as u64;
+    // ⭐⭐⭐⭐⭐ THE CONTEXT CEILING IS DERIVED FROM THE DEVICE, NOT CHOSEN.
+    //
+    // A row may hold as many pages as ONE POOL can, and a pool is a single flex region
+    // (`bundle::MAX_SEGMENT_BYTES` — the same cap the runtime budget takes from
+    // `card_bytes.max_single_allocation()`, which `runtime` guards equal to it).
+    // The reservation is that cap over the model's own page bytes, so it covers every
+    // pool any card can budget for and MEMORY binds at runtime, exactly as it does on
+    // metal: a bigger budget, a wider card or a denser page (fp8 KV) raises the served
+    // context by arithmetic, not by editing a constant. The number is per-bundle fact —
+    // read back at load as `BakedMaskBlocks` — not a shared const, because the page
+    // stride is a MODEL fact and no model-independent constant can be its ceiling.
+    //
+    // The page bytes are this bundle's own placement facts: `layer_stride` (three planes
+    // of `nkvh · hd · PAGE_SLOTS` elements — the same deltas the runtime derives the
+    // pool stride from) × 2 B × the layer count. The layer count is the roll's trip
+    // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
+    // per layer.
+    //
+    // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
+    // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
+    // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
+    // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
+    // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
+    // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
+    // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
+    // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
+    // derived ceiling here met the per-class slice type and kept `.len()` silently —
+    // it type-checks against both the single-map and per-class shapes.)
+    let layers = if per_layer_ext.is_empty() {
+        ir.nodes
+            .iter()
+            .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
+            .count()
+    } else {
+        per_layer_ext
+            .iter()
+            .map(|class| class.values().next().map_or(0, Vec::len))
+            .sum::<usize>()
+    }
+    .max(1) as u64;
+    let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    let page_bytes = pool.layer_stride() as u64 * 2 * layers;
+    let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+    // ONE validity row over the max context, or one PER QUERY ROW when the rows are
+    // separate requests and each carries its own history. The multiplier is the op row
+    // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
+    // It stays 1 for a prompt chunk — at prefill's mq=96 the widened form would be
+    // tens of MB of mask re-uploaded every forward, and a prompt does not need it.
+    // ONE BLOCK PER FOLD PASS when the rows are requests. A pass reads ONE request's
+    // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
+    // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
+    // broadcast row per page, which is all its rows can need.
+    // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO ITS PASSES ARE THE PAGES
+    // ONE ROW CAN HOLD — `max_pages` here — where an uncollapsed fold's are `pages × requests`
+    // over the shared pool. That is a SMALLER reservation per page, and since the host stages
+    // only the live blocks it is also `mq`x less mask uploaded every step: at bs=8 and three
+    // pages, 3 blocks instead of 24.
+    let pm_rows = if rows_are_requests { nqh * mq } else { 1 };
+    Some(
+        pm_rows
+            * max_pages
+            * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
+            * 2,
+    )
+}
+
 pub fn compute_bundle_layout<F: RopeForm>(
     ir: &SubtileIR<F>,
     weight_ids: &std::collections::HashSet<u32>,
@@ -852,12 +944,27 @@ pub fn compute_bundle_layout<F: RopeForm>(
     //    IDENTIFIED STRUCTURALLY, from the tape itself: a rope node's inputs `[x, cos, sin]`
     //    name their own tables, so this walk needs nothing the wiring carries. Every rope
     //    source of one bundle shares ONE route — one CB has one `tensor_allocs` word for the
-    //    slot, so the stride must be common — and the stride is the WIDEST rope row, which is
+    //    slot, so the stride must be common — and the stride spans the WIDEST routed row,
+    //    which is
     //    what puts each tensor's parity-1 window INSIDE its own grown placement, clear of its
     //    row 0 and of every other tensor's reservation (disjoint BY CONSTRUCTION — the placement
     //    is exclusive). The bytes stay in the Activation segment: same region, same shadow,
     //    same merged H2D run structure; only the CB-local addressing slot and the parity
     //    alternation are new.
+    //
+    //    ⭐⭐ THE PREFIX MASK JOINS THE ROUTE (ruling #13's fix): the pmask row is the other
+    //    per-step-mutating preamble writer whose torn read changes the answer — the rope parity
+    //    fix moved W2's phase one full CB and put its 2-byte delta INSIDE attn36's CMPT, and
+    //    the null-CB control proved the seat. The pmask's per-step bind in the BROADCAST form
+    //    (`rows_are_requests == false` — the one-request decode window this defect lives in,
+    //    and the prompt chunk) IS the whole reserved row, so the common stride must ALSO span
+    //    it or the two slots of the mask would overlap and the tear would survive the
+    //    ping-pong. A DECODE BATCH (`rows_are_requests == true`) keeps the shipped un-routed
+    //    mask: its bind is the fold's live blocks (never the whole `nqh·mq·max_pages`
+    //    reservation — routing it would grow every rope placement by that ~GB-sized stride),
+    //    and its path stages per-step under a synchronize, with no run-ahead preamble to
+    //    tear. The rope walk remains the gate: no rope sources, no route, and the pmask
+    //    stays byte-identical to before too.
     let rope_source_tids: std::collections::BTreeSet<u32> = ir
         .nodes
         .iter()
@@ -883,9 +990,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 .flatten()
         })
         .collect();
-    let rope_parity = if rope_source_tids.is_empty() {
+    let parity_route = if rope_source_tids.is_empty() {
         None
     } else {
+        // ⭐ THE PMASK'S BROADCAST ROW JOINS THE STRIDE MAX, and only in the form whose
+        // per-step bind is that whole row — see the block comment above.
+        let pmask_stride_term = if rows_are_requests {
+            None
+        } else {
+            pmask_reserve_bytes(ir, rows_are_requests, per_layer_ext)
+        };
         let stride = rope_source_tids
             .iter()
             .map(|&tid| {
@@ -901,6 +1015,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bump_sticks_to_splittable(s.cols.next_multiple_of(df.elems_per_stick())) as u64
                     * df.word_length() as u64
             })
+            .chain(pmask_stride_term)
             .max()
             .expect("the set is non-empty");
         Some(ktir_superdsc::placement::ParityRoute {
@@ -919,9 +1034,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
     };
     // The one lookup `pack` stamps: `Some(route)` for exactly the rope sources, `None` for
     // every other tensor — which keeps every rope-free bundle byte-identical to before.
+    // (The pmask is not packed here — it is placed directly below, where the route it joins
+    // is decided by the same `rows_are_requests` gate as the stride term above.)
     let parity_of = |tid: u32| {
         if rope_source_tids.contains(&tid) {
-            rope_parity
+            parity_route
         } else {
             None
         }
@@ -1683,76 +1800,30 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // touches nothing else in the activation segment, so the shift moves nothing it reads.
                 let mseg = SegRole::Activation.segment();
                 let pmoff = seg_bytes[mseg];
-                // ⭐⭐⭐⭐⭐ THE CONTEXT CEILING IS DERIVED FROM THE DEVICE, NOT CHOSEN.
-                //
-                // A row may hold as many pages as ONE POOL can, and a pool is a single flex region
-                // (`bundle::MAX_SEGMENT_BYTES` — the same cap the runtime budget takes from
-                // `card_bytes.max_single_allocation()`, which `runtime` guards equal to it).
-                // The reservation is that cap over the model's own page bytes, so it covers every
-                // pool any card can budget for and MEMORY binds at runtime, exactly as it does on
-                // metal: a bigger budget, a wider card or a denser page (fp8 KV) raises the served
-                // context by arithmetic, not by editing a constant. The number is per-bundle fact —
-                // read back at load as `BakedMaskBlocks` — not a shared const, because the page
-                // stride is a MODEL fact and no model-independent constant can be its ceiling.
-                //
-                // The page bytes are this bundle's own placement facts: `layer_stride` (three planes
-                // of `nkvh · hd · PAGE_SLOTS` elements — the same deltas the runtime derives the
-                // pool stride from) × 2 B × the layer count. The layer count is the roll's trip
-                // count for a re-rolled tape; an unrolled graph states its own, one AttnDecode node
-                // per layer.
-                //
-                // ⭐ THE TRIP COUNT, NEVER THE CONTAINER LENGTH. `per_layer_ext` is ONE MAP PER
-                // ATTENTION CLASS, and every value in a class's map is that class's per-layer tid
-                // list — filed by [`per_layer_external_tids`] under the law `pl.len() == iters`, so
-                // a value's LENGTH is the class loop's iteration count. A page spans EVERY layer of
-                // EVERY class, so the count is the SUM of the class trip counts. `.len()` on the
-                // slice is the CLASS COUNT — 1 for any uniform model — which understates the page
-                // 40× on granite, multiplies `max_pages` by the same factor, and reserves two
-                // 10.67 GiB mask/index tensors that seg3 cannot hold. (The merge that brought the
-                // derived ceiling here met the per-class slice type and kept `.len()` silently —
-                // it type-checks against both the single-map and per-class shapes.)
-                let layers = if per_layer_ext.is_empty() {
-                    ir.nodes
-                        .iter()
-                        .filter(|n| matches!(n.op, SubOp::AttnDecode { .. }))
-                        .count()
-                } else {
-                    per_layer_ext
-                        .iter()
-                        .map(|class| class.values().next().map_or(0, Vec::len))
-                        .sum::<usize>()
-                }
-                .max(1) as u64;
-                let page_bytes = pool.layer_stride() as u64 * 2 * layers;
-                let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
-                // ONE validity row over the max context, or one PER QUERY ROW when the rows are
-                // separate requests and each carries its own history. The multiplier is the op row
-                // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.
-                // It stays 1 for a prompt chunk — at prefill's mq=96 the widened form would be
-                // tens of MB of mask re-uploaded every forward, and a prompt does not need it.
-                // ONE BLOCK PER FOLD PASS when the rows are requests. A pass reads ONE request's
-                // page, so every other row must be masked off for it — the mask is `[pass][row][page]`
-                // and the runtime steps it by a whole `rows * page` block. A prompt keeps one
-                // broadcast row per page, which is all its rows can need.
-                // ⭐⭐⭐ AND A GATHERED BUNDLE BLOCKS THE MASK **PER PAGE**, SO ITS PASSES ARE THE PAGES
-                // ONE ROW CAN HOLD — `max_pages` here — where an uncollapsed fold's are `pages × requests`
-                // over the shared pool. That is a SMALLER reservation per page, and since the host stages
-                // only the live blocks it is also `mq`x less mask uploaded every step: at bs=8 and three
-                // pages, 3 blocks instead of 24.
-                //
                 // ⛔ WHICH FORM THIS BUNDLE USES IS THE SAME `rows_are_requests` CONDITION THE INDEX
                 // PLACEMENT AND `assemble_attn`'s gather are gated on — one predicate, three consumers.
                 // Getting it wrong is silent in the dangerous direction: too few blocks against the fold
                 // is a fold reading mask bytes nobody staged, which read as ZERO and therefore VALID.
-                let (pm_rows, pm_blocks) = if rows_are_requests {
-                    (nqh * mq, max_pages)
+                // The size and its derivation live in [`pmask_reserve_bytes`], the one spelling both
+                // this placement and the parity route's stride max read.
+                let pmbytes = pmask_reserve_bytes(ir, rows_are_requests, per_layer_ext).expect(
+                    "the pmask placement site runs inside the AttnDecode arm, so the same scan \
+                     that found this node found the node it sizes the mask for",
+                );
+                // ⭐⭐ THE MASK JOINS THE ROPE PING-PONG (ruling #13) — in the BROADCAST form only
+                // (`rows_are_requests == false`), where the per-step bind IS this whole row and the
+                // route's stride already spans it (the walk's stride max took `pmbytes` in exactly
+                // this branch). The size carries the stride growth like every routed placement, so
+                // the parity-1 upload `[offset+stride, +pmbytes)` lands inside the mask's OWN
+                // footprint — and every reader of the mask's column count (`pmask_slots`,
+                // `BakedMaskBlocks`) takes the placement's `logical_size`, never `size`, or it would
+                // count the other slot's tail as mask columns. A decode batch keeps `parity: None`
+                // and this placement byte-identical to before (see the walk's block comment).
+                let pm_parity = if rows_are_requests {
+                    None
                 } else {
-                    (1, max_pages)
+                    parity_route
                 };
-                let pmbytes = pm_rows
-                    * pm_blocks
-                    * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
-                    * 2;
                 placements.insert(
                     ATTN_MASK_TID,
                     TensorPlacement {
@@ -1761,11 +1832,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         role: SegRole::Activation,
                         segment: mseg,
                         offset: pmoff,
-                        size: pmbytes,
-                        parity: None,
+                        size: pmbytes + pm_parity.map_or(0, |r| r.stride),
+                        parity: pm_parity,
                     },
                 );
-                seg_bytes[mseg] = align128(pmoff + pmbytes);
+                seg_bytes[mseg] = align128(pmoff + pmbytes + pm_parity.map_or(0, |r| r.stride));
                 let a = SegRole::Activation.segment();
                 let cmoff = seg_bytes[a];
                 // The mask is `[nqh·mq, mq_pad]`: `mq_pad` is its COLUMN count, the score width —
@@ -1922,8 +1993,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // `SegRole::Activation` IS `SEG_MASK` — so it rides the MASK's shift, and its per-pass
                     // pitch must BE the mask's block stride.
                     //
-                    // ⛔ SO THE TWO PLACEMENTS DERIVE THEIR PITCH FROM ONE NUMBER, `pmbytes / pm_blocks`,
-                    // computed just above for the mask itself. A pitch that disagrees puts pass `p`'s gather
+                    // ⛔ SO THE TWO PLACEMENTS DERIVE THEIR PITCH FROM ONE NUMBER — the mask's
+                    // per-page grid, the reserve [`pmask_reserve_bytes`] states (`pmbytes`, just
+                    // above). A pitch that disagrees puts pass `p`'s gather
                     // on some other pass's entries — a clean bake reading real block numbers from the wrong
                     // page. `gather_index_table` takes the SAME value as `pass_stride_entries`.
                     //

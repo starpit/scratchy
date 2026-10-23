@@ -2754,7 +2754,11 @@ impl SpyreWorker {
                         // from `num_attention_heads` at the same bounds the tape was lowered at.
                         let g = &wirings.decode.geometry;
                         let nqh = g.nqh.max(1) as u64;
-                        let bytes = pmask.size;
+                        // ⭐ THE PLACEMENT'S `logical_size`, NEVER ITS `size` — a parity-routed
+                        // mask's size carries the other parity slot's stride growth, and a
+                        // capacity read off `size` would admit folds past the mask the host
+                        // stages (unstaged additive bytes read as ZERO, i.e. VALID).
+                        let bytes = pmask.logical_size();
                         let per = nqh * rn as u64 * 2;
                         let cap = if per > 0 { bytes / per } else { 0 };
                         let page = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64;

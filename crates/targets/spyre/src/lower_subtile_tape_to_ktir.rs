@@ -4101,4 +4101,96 @@ mod attn_scale_weight_fold_tests {
              its head-major copy"
         );
     }
+
+    /// ⭐⭐⭐ THE PREFIX MASK JOINS THE ROPE ROUTE, AND THE COMMON STRIDE SPANS ITS ROW (#603 PR3b E,
+    /// ruling #13 — the W2/pmask seat the null-CB control proved). Three laws, each asserted so it
+    /// can FAIL:
+    ///
+    /// 1. ONE COMMON ROUTE: the pmask placement carries the SAME `ParityRoute` the rope cos source
+    ///    carries — the group fold's one-route-per-launch law, and the door stamps attention ops
+    ///    with this same value.
+    /// 2. THE STRIDE SPANS THE MASK'S OWN ROW: the broadcast bind IS the whole reserved row, so the
+    ///    two parity slots are disjoint only while `stride >= logical`. Dropping the pmask term
+    ///    from the walk's stride max leaves `stride` = the widest ROPE row (≤1 KiB here, against a
+    ///    42 MiB row) and THIS assertion fails — the tear would survive the ping-pong silently.
+    /// 3. THE BATCHED TWIN STAYS UN-ROUTED: a `rows_are_requests` bundle keeps `parity: None` on
+    ///    the mask (its bind is the fold's live blocks, never the whole `nqh·mq·max_pages`
+    ///    reservation) — routing it would grow every rope placement by a GB-class stride.
+    #[test]
+    fn the_pmask_row_joins_the_rope_route_and_the_stride_spans_it() {
+        let ir = uniform_fp8_oproj_graph();
+        let weight_ids: std::collections::HashSet<u32> = [1u32, 2, 8, 9].into_iter().collect();
+        let layout = crate::lower_subtile_tape_to_superdsc::compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            false,
+            false,
+            &[],
+        )
+        .expect("the same graph lays out");
+        let pm = layout
+            .placements
+            .get(&ATTN_MASK_TID)
+            .expect("the fixture's attention places a prefix mask");
+        let route = pm
+            .parity
+            .expect("a rope-carrying bundle routes its broadcast pmask");
+        // (1) one common route, carried by the rope sources too
+        let cos = layout
+            .placements
+            .get(&6)
+            .expect("the fixture's q-side cos source is placed");
+        assert_eq!(
+            cos.parity,
+            Some(route),
+            "the pmask and the rope sources share ONE route — one group, one slot word, one shift"
+        );
+        // (2) the stride spans the mask's own row. The reserve is re-derived here from the
+        // fixture's own geometry (one kv head, head_dim 128, ONE layer — the fixture has one
+        // AttnDecode node and an empty per-class map), the same arithmetic the placement walks.
+        let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(1, 128);
+        let page_bytes = pool.layer_stride() as u64 * 2;
+        let max_pages = (bundle::MAX_SEGMENT_BYTES / page_bytes).max(1);
+        let pmbytes = max_pages * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2;
+        let logical = pm.size - route.stride;
+        assert_eq!(
+            logical, pmbytes,
+            "the growth is exactly the stride — the mask's own columns are unchanged"
+        );
+        assert!(
+            route.stride >= logical,
+            "the common stride must span the pmask's whole reserved row (stride {}, logical {}): \
+             the broadcast bind IS that row, so a shorter stride leaves the two parity slots \
+             overlapping and the torn read survives the ping-pong",
+            route.stride,
+            logical
+        );
+        // and the rope placements grew by the SAME common stride: the cos table's own extent
+        // (one row of its stick-padded width, fp16) plus the stride.
+        let cos_row = bump_sticks_to_splittable(256) as u64 * 2;
+        assert_eq!(
+            cos.size,
+            cos_row + route.stride,
+            "every routed placement grows by the ONE common stride"
+        );
+        // (3) the batched twin keeps the shipped un-routed mask
+        let batched = crate::lower_subtile_tape_to_superdsc::compute_bundle_layout(
+            &ir,
+            &weight_ids,
+            true,
+            true,
+            &[],
+        )
+        .expect("the batched form of the same graph lays out");
+        let bpm = batched
+            .placements
+            .get(&ATTN_MASK_TID)
+            .expect("the batched form places its per-row mask");
+        assert!(
+            bpm.parity.is_none(),
+            "a decode batch keeps the shipped un-routed mask — its bind is the fold's live \
+             blocks, and routing it would charge every rope placement the nqh·mq·max_pages \
+             reserve as a stride"
+        );
+    }
 }
