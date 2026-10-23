@@ -9088,12 +9088,15 @@ fn emit_superdsc_wiring(
     // new-K/new-V outputs.
     //
     // ⭐ THE K-SIDE ARG MAY BE THE RESERVED Kᵀ PLANE. A spliced attention binds its score
-    // gather to `kct_resident_tid(k)` — the naming law, the SAME expression the door's write
+    // gather to `KctResident::of(k)` — the naming law, the SAME expression the door's write
     // tail and main's card-proven reader spell — and that reserved tid is not itself a
-    // PrefixK source. The scan resolves it BACK to the PrefixK source it names, so the layer
-    // and the prefix-K bind stay the wiring's own facts; without this map the scan drops
-    // every layer of a spliced attention and the completeness lock below refuses the bake —
-    // the lock doing its job on a wiring it could no longer read.
+    // PrefixK source. The scan resolves it BACK to the PrefixK source it names through the
+    // TYPE'S OWN SCAN DOOR (`KctResident::of_wire(a).source_k()`), so the layer and the
+    // prefix-K bind stay the wiring's own facts; without this resolution the scan drops every
+    // layer of a spliced attention and the completeness lock below refuses the bake — the lock
+    // doing its job on a wiring it could no longer read. ⛔ `source_k` is a SCAN fact and this
+    // is the scan: nowhere else may a reserved plane name become its source tid, and the
+    // gather door does not carry this door at all.
     let mut layers: Vec<(u64, u32, u32, u32, u32)> = Vec::new();
     if let Some(mask) = gk.attn_mask {
         let pk: std::collections::HashMap<u32, u64> = lwd
@@ -9105,22 +9108,14 @@ fn emit_superdsc_wiring(
                 _ => None,
             })
             .collect();
-        let pk_kt: std::collections::HashMap<u32, (u32, u64)> = pk
-            .iter()
-            .map(|(&src, &layer)| {
-                (
-                    scratchy_target_spyre::ktir_superdsc::reserved_tids::kct_resident_tid(src),
-                    (src, layer),
-                )
-            })
-            .collect();
         // Which layer's K plane `a` names: the PrefixK source itself, or the reserved Kᵀ
         // plane keyed on it. A real source always wins — the reserved regions sit far past
         // `num_sources`, so the two never collide.
         let k_plane_of = |a: u32| -> Option<(u32, u64)> {
-            pk.get(&a)
-                .map(|&l| (a, l))
-                .or_else(|| pk_kt.get(&a).copied())
+            pk.get(&a).map(|&l| (a, l)).or_else(|| {
+                scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(a)
+                    .and_then(|kct| pk.get(&kct.source_k()).map(|&l| (kct.source_k(), l)))
+            })
         };
         let pv: std::collections::HashSet<u32> = lwd
             .bindings
@@ -11162,9 +11157,7 @@ fn dump_wavefront_mega(
                                     // family is the m>1 follow-up the splice refuses.
                                     paged_fold: (chunk_ceiling.is_some()
                                         && (one_request || prompt_chunk_prefix))
-                                        .then(|| {
-                                            superdsc::PagedFoldStatement { fold_body: false }
-                                        }),
+                                        .then(|| superdsc::PagedFoldStatement { fold_body: false }),
                                 },
                             ) {
                                 Ok(rolled) => {

@@ -1785,7 +1785,12 @@ impl Executor {
     /// the table names a tid this bundle never placed (a bake desync, which the fill would
     /// refuse anyway; seeing it here names it earlier).
     pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
-        let si = self.code.layout.step_inputs.iter().find(|s| s.slot == slot)?;
+        let si = self
+            .code
+            .layout
+            .step_inputs
+            .iter()
+            .find(|s| s.slot == slot)?;
         Some(self.code.layout.place_of_tid(si.tid)?.size)
     }
 
@@ -3296,7 +3301,11 @@ impl Executor {
             // composes the base exactly ONCE (`off = byte_off; off[seg] += delta.kv`). Adding
             // `kv_page_base` on top double-counted it and printed page 2 for a page-1 write —
             // chatG's pg1/pg2 windows caught the instrument, not the launch (pg2 never written).
-            let pg = if stride > 0 { (abs / stride) as i64 } else { -1 };
+            let pg = if stride > 0 {
+                (abs / stride) as i64
+            } else {
+                -1
+            };
             if !pages.contains(&pg) {
                 pages.push(pg);
             }
@@ -3325,9 +3334,7 @@ impl Executor {
         let text = format!(
             "[cachewr] slot_pos={} kv_page_base={} page_stride={} row_pages={row:?} \
              distinct_target_pages={pages:?} first: {first}",
-            where_.slot_pos.0,
-            where_.kv_page_base.0,
-            stride
+            where_.slot_pos.0, where_.kv_page_base.0, stride
         );
         Some(((where_.slot_pos.0, pages), text))
     }
@@ -3347,8 +3354,7 @@ impl Executor {
         // `(byte_off_kv + delta.kv) / page_stride` — the caller's page base arrives ONCE, inside
         // the delta (`nonfold_page_delta` returns it), never as a separate addend.
         if d.segaddr {
-            if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages)
-            {
+            if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages) {
                 if self.cachewr_seen.as_ref() != Some(&key) {
                     self.cachewr_seen = Some(key);
                     eprintln!("{text}");
@@ -4175,7 +4181,10 @@ impl Executor {
                     };
                     let mut buf = vec![0u8; WIN as usize];
                     let stream = self.stream_ref()?;
-                    match stream.d2h(&mut buf, waddr).and_then(|_| stream.synchronize()) {
+                    match stream
+                        .d2h(&mut buf, waddr)
+                        .and_then(|_| stream.synchronize())
+                    {
                         Ok(()) => bufs[bi] = Some(buf),
                         Err(e) => {
                             use std::io::Write as _;

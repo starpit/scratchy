@@ -18,7 +18,7 @@ pub mod allocator;
 pub use ktir_core as ktir;
 /// The SuperDSC-side KTIR laws (reserved tids, the abstract pool). Re-exported because the
 /// `#[forward]` macro's WIRING SCAN calls them at expansion time — it resolves the reserved
-/// Kᵀ plane (`kct_resident_tid`) a spliced attention binds back to the PrefixK source it
+/// Kᵀ plane (`KctResident::wire_tid`) a spliced attention binds back to the PrefixK source it
 /// names, the same naming law the door's write tail and main's reader spell — so the macro
 /// crate needs no direct dependency on the lowering crate to know which plane a reader reads.
 pub use ktir_superdsc;

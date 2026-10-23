@@ -48,12 +48,12 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
 use crate::place::{PlaceId, SynthRole};
-use crate::score_scale::{NewK, ScoreScaleLaw};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{
-    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, LAST_HIDDEN_TID, kct_resident_tid,
+    ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_ZERO_TID, KctResident, LAST_HIDDEN_TID,
     scalarmul_scale_tid,
 };
+use crate::score_scale::{NewK, ScoreScaleLaw};
 use crate::sdsc_abstract::{KernelTag, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
@@ -171,6 +171,48 @@ impl Region {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ WHAT A GATHERED READ READS — the value side of an indirect access tile, classified
+/// ONCE at the only door that mints a [`Gather`].
+///
+/// ⛔⛔⛔ THE DEFECT THIS TYPE EXISTS TO MAKE UNWRITABLE: the reserved Kᵀ plane's name and its
+/// K-cache SOURCE tensor were both bare `u32`s, so the score gather's value side could be
+/// resolved through the source tensor's own placement and bake over the NATURAL-K plane —
+/// same size, wrong plane, invisible to every extent law. Classified here, a binding in the
+/// `kct_resident` region is a [`GatherSource::KtPlane`] and resolves through the reserved
+/// tid's own placement (the pool's Kᵀ plane law). There is NO arm that yields the K-cache
+/// source: [`KctResident::source_k`] is a SCAN fact (the wiring completeness marker), never a
+/// placement fact, and this enum does not carry it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatherSource {
+    /// A real graph tensor, resolved by its own placement.
+    Tensor(u32),
+    /// The reserved Kᵀ plane — the score gather's ONLY legal K side.
+    KtPlane(crate::reserved_tids::KctResident),
+}
+
+impl GatherSource {
+    /// The tid this source NAMES — the operand name and the placement key. For a Kᵀ plane this
+    /// is the reserved tid, so the descriptor gathers from the placement the pool law placed,
+    /// never from the source tensor's.
+    pub fn tid(&self) -> u32 {
+        match self {
+            GatherSource::Tensor(tid) => *tid,
+            GatherSource::KtPlane(kct) => kct.wire_tid(),
+        }
+    }
+
+    /// ⭐ THE ONE CLASSIFICATION DOOR — a bound value tid becomes a source HERE or nowhere. A
+    /// tid in the `kct_resident` region is a Kᵀ plane binding; every other tid is a tensor.
+    /// `pub` so the splice's mint and the placement's sizing can classify the same way, and
+    /// `const`-shaped so nothing downstream "re-derives" it.
+    pub fn of_bound(tid: u32) -> Self {
+        match crate::reserved_tids::KctResident::of_wire(tid) {
+            Some(kct) => GatherSource::KtPlane(kct),
+            None => GatherSource::Tensor(tid),
+        }
+    }
+}
+
 /// ⭐⭐⭐ A GATHER THE PROGRAM STATES — the index parameter, the gathered parameter, and how many
 /// entries are taken.
 ///
@@ -181,8 +223,10 @@ impl Region {
 pub struct Gather {
     /// The parameter holding the index vector — `crate::place::act_name(index_tid)` is its operand name.
     pub index_tid: u32,
-    /// The parameter being gathered FROM (the table).
-    pub value_tid: u32,
+    /// ⭐ WHAT the gather reads, CLASSIFIED — never a bare tid. The score gather's K side is a
+    /// [`GatherSource::KtPlane`] and resolves through the reserved placement; a bare source tid
+    /// here is the wrong-plane defect this field's type exists to refuse.
+    pub source: GatherSource,
     /// Entries the gather takes: the gathered tile's SLOW extent, one index per gathered row.
     pub entries: u32,
     /// ⭐ WHERE THIS GATHER'S RUN OF ENTRIES STARTS IN THE INDEX BUFFER — the indirect dim's own
@@ -318,7 +362,9 @@ pub fn gathers_of(k: &KtirNode) -> Result<Vec<Gather>, Error> {
         };
         out.push(Gather {
             index_tid,
-            value_tid,
+            // ⭐ THE ONE CLASSIFICATION — the value side is a source, classified here at the only
+            // mint, so a `kct_resident` binding can never arrive downstream as a bare source tid.
+            source: GatherSource::of_bound(value_tid),
             entries,
             first_entry,
             tile: tv,
@@ -1460,7 +1506,10 @@ pub fn elementwise(
     if (bcast.iter().any(Option::is_some) || out.c_len == 1)
         && (out.c_start != 0
             || out.r_start != 0
-            || ins.iter().enumerate().any(|(i, x)| corner_unplaceable(i, x)))
+            || ins
+                .iter()
+                .enumerate()
+                .any(|(i, x)| corner_unplaceable(i, x)))
     {
         let (who, what, cs) = ins
             .iter()
@@ -2023,14 +2072,12 @@ fn elementwise_broadcast(
             // emission.
             Some(BcastAxis::Mb) if x.c_start != 0 => {
                 let df = if x.is_fp8 { Df::Fp8 } else { Df::Fp16 };
-                let w = crate::addr::col_window_of(x.v_rows, x.v_cols, x.c_start, df).map_err(
-                    |e| Error {
-                        message: format!(
-                            "Elementwise({kind:?}) {name}: input t{}: {e}",
-                            x.tid
-                        ),
-                    },
-                )?;
+                let w =
+                    crate::addr::col_window_of(x.v_rows, x.v_cols, x.c_start, df).map_err(|e| {
+                        Error {
+                            message: format!("Elementwise({kind:?}) {name}: input t{}: {e}", x.tid),
+                        }
+                    })?;
                 Ok(In::mb_at(h, w.dev()).ew())
             }
             Some(BcastAxis::Mb) => Ok(In::mb(h).ew()),
@@ -3206,8 +3253,7 @@ pub fn scale_slot_df(f: &IRFunction<'static>, splat: Ssa, value: f32) -> Df {
             ktir_core::irtype::IrType::Tensor { elem, .. }
             | ktir_core::irtype::IrType::MemRef { elem, .. }
             | ktir_core::irtype::IrType::Scalar(elem) => elem,
-            ktir_core::irtype::IrType::AccessTile { .. }
-            | ktir_core::irtype::IrType::Index => {
+            ktir_core::irtype::IrType::AccessTile { .. } | ktir_core::irtype::IrType::Index => {
                 panic!(
                     "{name}: the scale slot for {value} is stated by a splat whose result is an \
                      ADDRESS type — a scale constant is a value, never an address, so no staging \
@@ -3266,10 +3312,7 @@ pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<(f32, Df)> {
     for op in f.operations.iter() {
         if matches!(
             op.op_type,
-            OpKind::ArithMulf
-                | OpKind::ArithMaxnumf
-                | OpKind::ArithMinnumf
-                | OpKind::ArithSubf
+            OpKind::ArithMulf | OpKind::ArithMaxnumf | OpKind::ArithMinnumf | OpKind::ArithSubf
         ) && let Some(sf) = super::whole_function::splat_scale_of(f, op)
         {
             stated.push((sf.value, scale_slot_df(f, sf.splat, sf.value)));
@@ -3520,7 +3563,11 @@ mod scale_completion_tests {
             );
             complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
             assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
-            assert_eq!(dfs, vec![Df::Fp16, Df::Fp16], "the format column rides the append");
+            assert_eq!(
+                dfs,
+                vec![Df::Fp16, Df::Fp16],
+                "the format column rides the append"
+            );
             assert_eq!(scales[0], 0.5, "append-only: slot 0 is untouched");
             assert_eq!(
                 scale_slot_in(&scales, -65504.0),
@@ -3534,8 +3581,10 @@ mod scale_completion_tests {
     /// names the extremum kind and the value, the same law `scalarmul_at`'s desync states.
     #[test]
     fn an_unregistered_extremum_bound_is_refused_by_name() {
-        let (Err(e), kind) = (scalarextremum_at("m0", -65504.0, true, None, &[], &mut 0, None), "Maximum m0")
-        else {
+        let (Err(e), kind) = (
+            scalarextremum_at("m0", -65504.0, true, None, &[], &mut 0, None),
+            "Maximum m0",
+        ) else {
             panic!("no registry means no slot: the extremum must refuse")
         };
         assert!(
@@ -3599,8 +3648,12 @@ mod scale_completion_tests {
             1,
             "the f16 image resolves against the f32 entry: no append"
         );
-        assert_eq!(dfs, vec![Df::Fp16], "and no format disagreement: the untyped \
-            splat is the incumbent f16 staging, so the f16-image no-op stays a no-op");
+        assert_eq!(
+            dfs,
+            vec![Df::Fp16],
+            "and no format disagreement: the untyped \
+            splat is the incumbent f16 staging, so the f16-image no-op stays a no-op"
+        );
     }
 
     /// ⛔ THE TWO-WALK LAW. The bake completes prefix → bodies → suffix and the wiring completes in
@@ -3634,7 +3687,10 @@ mod scale_completion_tests {
             bake_order, wiring_order,
             "both walks compute the identical registry"
         );
-        assert_eq!(bake_dfs, wiring_dfs, "both walks compute the identical formats");
+        assert_eq!(
+            bake_dfs, wiring_dfs,
+            "both walks compute the identical formats"
+        );
         assert_eq!(
             bake_order,
             {
@@ -3686,7 +3742,11 @@ mod scale_completion_tests {
                 stated,
                 vec![(-65504.0f32, Df::Fp16)],
                 "the {} order states its constant",
-                if const_first { "C − tile" } else { "tile − C" }
+                if const_first {
+                    "C − tile"
+                } else {
+                    "tile − C"
+                }
             );
             complete_scale_registry(&mut scales, &mut dfs, stated_of(0, stated));
             assert_eq!(scales.len(), 2, "one appended slot, nothing renumbered");
@@ -3797,10 +3857,10 @@ mod scale_completion_tests {
         complete_scale_registry(
             &mut scales,
             &mut dfs,
-            stated_of(0, program_stated_scales(&folded_at(
-                -65504.0,
-                ktir_core::dtypes::DType::F32,
-            ))),
+            stated_of(
+                0,
+                program_stated_scales(&folded_at(-65504.0, ktir_core::dtypes::DType::F32)),
+            ),
         );
     }
 
@@ -4911,7 +4971,11 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the half-applied fold — the multiplies would double-scale pre-scaled weights, so it is
     // refused, not best-efforted.
     let scale_val = match program_score_scale(&k.func) {
-        None if matches!(scale_law, ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel) => {
+        None if matches!(
+            scale_law,
+            ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel
+        ) =>
+        {
             None
         }
         None => {
@@ -4927,8 +4991,12 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ),
             });
         }
-        Some(v) if v != 1.0
-            && matches!(scale_law, ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel) =>
+        Some(v)
+            if v != 1.0
+                && matches!(
+                    scale_law,
+                    ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel
+                ) =>
         {
             return Err(Error {
                 message: format!(
@@ -5010,7 +5078,9 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     let new_v = crate::place::act_name(ops_in.new_v_id); // new-V       [mq_pad, nkvh·hd]
     let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
-    let kct = crate::place::act_name(kct_resident_tid(k_id)); // resident Kᵀ scratch [nqh, hd, cap]
+    // ⭐ THE Kᵀ PLANE'S NAME — minted through the reserved binding's own type, so the only tid
+    // this name can resolve to is the plane the pool law placed (never the K-cache source).
+    let kct = crate::place::act_name(KctResident::of(k_id).wire_tid()); // resident Kᵀ scratch [nqh, hd, cap]
     // ⭐⭐⭐ AN ATTENTION WHOSE SCALE THE WEIGHTS CARRY STATES NO SCALE AT ALL. The √scale was
     // FOLDED into W_q and W_k (the producer half's `attn_scale_weight_folds` recognition), or the
     // model's attention scale IS 1.0 and there was nothing to fold: the splice minted this program
@@ -8071,7 +8141,11 @@ mod elementwise_tests {
             "the tile and the scale must not share a base — the swap would be invisible"
         );
         // `tile − C`: the tile stays first, exactly the multiply's layout.
-        assert_eq!(&t_first, &[m0, m1, m2], "tile − C keeps the tile-first order");
+        assert_eq!(
+            &t_first,
+            &[m0, m1, m2],
+            "tile − C keeps the tile-first order"
+        );
         // `C − tile`: the scalar and the tile SWAP; the output stays last.
         assert_eq!(c_first, [m1, m0, m2], "C − tile puts the scalar first");
     }
@@ -8176,8 +8250,7 @@ mod proofs {
         // count (the `pointwise_rows` read). The guard's two-bases law then reduces, at these
         // whole-view operands, to the property this proof pins: admitted iff every input IS the
         // output's extent.
-        let admitted =
-            pointwise_extents_agree("p", Elementwise::Add, &ins, &out, orow).is_ok();
+        let admitted = pointwise_extents_agree("p", Elementwise::Add, &ins, &out, orow).is_ok();
         assert_eq!(
             admitted,
             (arow, acol) == (orow, ocol) && (brow, bcol) == (orow, ocol)
@@ -8196,8 +8269,7 @@ mod proofs {
 
         let out = reg(7, orow, ocol, true);
         let ins = [reg(5, arow, acol, false)];
-        let admitted =
-            pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, orow).is_ok();
+        let admitted = pointwise_extents_agree("p", Elementwise::Silu, &ins, &out, orow).is_ok();
         assert_eq!(admitted, (arow, acol) == (orow, ocol));
     }
 
@@ -9515,7 +9587,9 @@ enum ScalarOp {
     /// `tile − C` / `C − tile` — NOT commutative: the two operand orders are different
     /// functions, so the program's stated order rides the discriminant itself
     /// (`const_first`: the splatted constant is the op's first input, `C − tile`).
-    Subtract { const_first: bool },
+    Subtract {
+        const_first: bool,
+    },
 }
 
 impl ScalarOp {
@@ -9634,10 +9708,7 @@ fn scalarmul_scaled(
     // `subtract` computes input 0 − input 1 (the old attention path's `corrsub`:
     // `[run_m, newm]` → `run_m − newm`, card-proven), so `C − tile` puts the scalar first and
     // `tile − C` the tile first, exactly as stated.
-    let (tile_in, scalar_in) = (
-        In::col_window(&x_h, corner).ew(),
-        In::scalar(&scale_h).ew(),
-    );
+    let (tile_in, scalar_in) = (In::col_window(&x_h, corner).ew(), In::scalar(&scale_h).ew());
     let inputs = if op.commutative() || matches!(op, ScalarOp::Subtract { const_first: false }) {
         [tile_in, scalar_in]
     } else {
@@ -9669,12 +9740,13 @@ fn scalarmul_scaled(
                 out.c_start, out.tid,
             ));
         }
-        if g.value_tid != ins[0].tid {
+        if g.source.tid() != ins[0].tid {
             return err(format!(
                 "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
                  operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
                  op does not read has no position in the descriptor.",
-                g.value_tid, ins[0].tid,
+                g.source.tid(),
+                ins[0].tid,
             ));
         }
         // ⛔⛔⛔ THE GATHER'S ENTRIES MUST **TILE** THE NODE, AND THE INDEX BUFFER MUST HOLD ONE INDEX
@@ -10031,7 +10103,7 @@ pub fn convert(
                  quantization_double_pad.ddl:58/:59), and routing any other transition through a \
                  nearest-neighbor opfunc would silently re-interpret the value's bytes at the \
                  wrong width"
-            ))
+            ));
         }
     };
     let (ins, out) = split_out(name, r, layout, 1)?;
@@ -10191,7 +10263,10 @@ pub fn reduce(
                      one `is_stick` dim cannot state, and padding the survivors up to a stick \
                      re-layouts the bytes (`a·{eps}+s ≠ a·{survivor_cols}+s`) — movement the \
                      op's contract forbids.",
-                    out.tid, out.r_len, out.c_len, data.df.name()
+                    out.tid,
+                    out.r_len,
+                    out.c_len,
+                    data.df.name()
                 ));
             }
             NonstickGeometry::Indivisible => {

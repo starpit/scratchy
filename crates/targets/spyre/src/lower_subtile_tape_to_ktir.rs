@@ -18,8 +18,8 @@
 use crate::lower_subtile_tape_to_superdsc::*;
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::ktir_node::ActiveCap;
-use ktir_superdsc::sdsc_abstract::POOL_STICK;
 use ktir_superdsc::score_scale::ScoreScaleLaw;
+use ktir_superdsc::sdsc_abstract::POOL_STICK;
 use scratchy_subtile::subtile_ir::{RopeForm, SubOp, SubtileIR, SubtileId, SubtileNode, TensorId};
 use scratchy_subtile::superdsc_opspec::{DataFormat, DeviceTileLayout};
 
@@ -1020,12 +1020,10 @@ pub(crate) fn lower_one_node<F: RopeForm>(
                 Err(reason) => Unhandled(reason),
             }
         }
-        SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_rope_append(node, ir) {
-                Ok(ops) => Ops(ops),
-                Err(reason) => Unhandled(reason),
-            }
-        }
+        SubOp::RopeAppend { .. } => match scratchy_triton_splice::lower_rope_append(node, ir) {
+            Ok(ops) => Ops(ops),
+            Err(reason) => Unhandled(reason),
+        },
         // ⭐ THE LOGITS SCALARMUL RIDES `lower_all` WITH THE MATMUL — the vocab-wide
         // tail folds BOTH halves to m=1 (main's `is_prefill_lm_head_tail` covers this
         // arm too), and the fold is the splice's `lower_all` now. Every other
@@ -1401,10 +1399,7 @@ pub fn graph_wiring<F: RopeForm>(
         scalarmul_scales: census_scales.clone(),
         // The format column of the same census: ALL Fp16, the staging-twin law (the value the
         // card applies is f16(v)) — parallel by construction, one length.
-        scalarmul_scales_df: vec![
-            ktir_superdsc::superdsc_opspec::Df::Fp16;
-            census_scales.len()
-        ],
+        scalarmul_scales_df: vec![ktir_superdsc::superdsc_opspec::Df::Fp16; census_scales.len()],
         // Same rule as the placement pass's own field: the fold list the worker applies to
         // staged bytes at load, keyed by weight tid (the `SubtileId` half is a placement-pass
         // fact and does not ship).
@@ -1666,14 +1661,12 @@ pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedO
                 for (v, df) in
                     ktir_superdsc::emit::lower_ktir_to_superdsc::program_stated_scales(&k.func)
                 {
-                    stated.push(
-                        ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
-                            walk,
-                            name: k.func.name,
-                            value: v,
-                            df,
-                        },
-                    );
+                    stated.push(ktir_superdsc::emit::lower_ktir_to_superdsc::StatedScale {
+                        walk,
+                        name: k.func.name,
+                        value: v,
+                        df,
+                    });
                 }
                 walk += 1;
             }
@@ -1801,16 +1794,13 @@ pub fn place_step_inputs(
                             e.op_name
                         ))
                     })?;
-                let region = regs
-                    .iter()
-                    .find(|r| r.tid == tid)
-                    .ok_or_else(|| {
-                        SuperDscError(format!(
-                            "{}: the host-staged input t{tid} states no view — nothing says how \
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the host-staged input t{tid} states no view — nothing says how \
                              wide the buffer it addresses is",
-                            e.op_name
-                        ))
-                    })?;
+                        e.op_name
+                    ))
+                })?;
                 let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
                     .ok_or_else(|| {
                         SuperDscError(format!(
@@ -1834,10 +1824,7 @@ pub fn place_step_inputs(
                                 "{}: t{tid} is stated as a host-staged input of {} B, but the \
                                  bundle already places it as {} B in segment {} — two programs \
                                  disagree about one buffer's extent",
-                                e.op_name,
-                                size,
-                                p.size,
-                                p.segment
+                                e.op_name, size, p.size, p.segment
                             )));
                         }
                     }
@@ -1872,11 +1859,7 @@ pub fn place_step_inputs(
                             "{}: t{tid} is stated as (slot {}, {:?}) here but (slot {}, {:?}) \
                              earlier — one buffer cannot answer to two slots, nor to two element \
                              formats",
-                            e.op_name,
-                            row.slot,
-                            row.df,
-                            prev.slot,
-                            prev.df
+                            e.op_name, row.slot, row.df, prev.slot, prev.df
                         )));
                     }
                     _ => {
@@ -1908,7 +1891,7 @@ pub fn place_paged_fold_carry(
     layout: &mut BundleLayout,
     op_lists: &[&[EmittedOp]],
 ) -> Result<(), SuperDscError> {
-    use ktir_superdsc::reserved_tids::{is_paged_fold_carry, PagedFoldCarry};
+    use ktir_superdsc::reserved_tids::{PagedFoldCarry, is_paged_fold_carry};
     for ops in op_lists {
         for e in ops.iter() {
             let Some(k) = e.ktir.as_ref() else { continue };
@@ -1938,16 +1921,13 @@ pub fn place_paged_fold_carry(
                             e.op_name
                         ))
                     })?;
-                let region = regs
-                    .iter()
-                    .find(|r| r.tid == tid)
-                    .ok_or_else(|| {
-                        SuperDscError(format!(
-                            "{}: the carry t{tid} is bound but states no view — nothing says how \
+                let region = regs.iter().find(|r| r.tid == tid).ok_or_else(|| {
+                    SuperDscError(format!(
+                        "{}: the carry t{tid} is bound but states no view — nothing says how \
                              wide the buffer it addresses is",
-                            e.op_name
-                        ))
-                    })?;
+                        e.op_name
+                    ))
+                })?;
                 let df = ktir_superdsc::emit::lower_ktir_to_superdsc::param_df(k, binding)
                     .ok_or_else(|| {
                         SuperDscError(format!(
@@ -1974,10 +1954,7 @@ pub fn place_paged_fold_carry(
                     // Every layer's fold statement states the same carry: the second sighting
                     // must AGREE.
                     Some(p) => {
-                        if p.role != SegRole::Intermediate
-                            || p.segment != seg
-                            || p.size != size
-                        {
+                        if p.role != SegRole::Intermediate || p.segment != seg || p.size != size {
                             return Err(SuperDscError(format!(
                                 "{}: t{tid} is stated as a carry of {} B, but the bundle already \
                                  places it as {} B in segment {} — two programs disagree about one \
@@ -2478,27 +2455,28 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
                         }
                     }
                     // RESIDENT kct per-layer registration (kill-the-restickify residency): the score reads a
-                    // per-layer RESIDENT Kᵀ kernel `kct_resident_tid(k_id)`. It's neither an External nor a node
+                    // per-layer RESIDENT Kᵀ kernel `KctResident::of(k_id)`. It's neither an External nor a node
                     // output, so the loops above never add it — insert it manually: map each layer's
-                    // K-cache source tid k_Lv → kct_resident_tid(k_Lv), keyed under the layer-0 kct tid.
+                    // K-cache source tid k_Lv → the layer's Kᵀ plane name, keyed under the layer-0 name.
                     // REQUIRED so the launch-table guard validates kct's per-layer offset matches k/v — the
                     // executor shifts seg2 by the launch's kv_off for every op, so a kct packed out of step
                     // with k/v would SILENTLY read the wrong layer (runtime-errors-need-compile-
                     // time-checks). per_layer[k_id] was just inserted by the External loop above.
+                    // ⭐ NAMED THROUGH THE TYPE: the per-layer key is the plane's WIRE NAME (one door),
+                    // and the source tid stays inside `KctResident`, where only a scan can read it.
                     if let SubOp::AttnDecode { layout: kv, .. } = &n.op
                         && iters > 1
                         && let Some(k_layers) =
                             per_layer.get(&(kv.cache_tensor().index() as u32)).cloned()
                         && k_layers.len() as u32 == iters
                     {
-                        let kct_tids: Vec<u32> = k_layers
-                            .iter()
-                            .map(|&k_lv| kct_resident_tid(k_lv))
-                            .collect();
-                        body_representatives[bi]
-                            .push(kct_resident_tid(kv.cache_tensor().index() as u32));
+                        let kct_of =
+                            |k: u32| ktir_superdsc::reserved_tids::KctResident::of(k).wire_tid();
+                        let kct_tids: Vec<u32> =
+                            k_layers.iter().map(|&k_lv| kct_of(k_lv)).collect();
+                        body_representatives[bi].push(kct_of(kv.cache_tensor().index() as u32));
                         per_layer
-                            .entry(kct_resident_tid(kv.cache_tensor().index() as u32))
+                            .entry(kct_of(kv.cache_tensor().index() as u32))
                             .or_insert(kct_tids);
                     }
                     // ⭐ THE CLASS'S LAYER IDS, from its OWN rope table: the body's RopeAppend node
@@ -2645,7 +2623,11 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
     let mut step_input_lists: Vec<&[EmittedOp]> = vec![&prefix];
     step_input_lists.extend(body_op_lists.iter().map(|v| v.as_slice()));
     step_input_lists.push(&suffix);
-    place_step_inputs(&mut bundle_layout, &step_input_lists, ir.tensors.len() as u32)?;
+    place_step_inputs(
+        &mut bundle_layout,
+        &step_input_lists,
+        ir.tensors.len() as u32,
+    )?;
     // ⭐ THE FOLD'S CARRY, placed from the fold family's own views the same pass — seg0
     // Intermediate, guard-invisible across rungs (only Activation placements are compared), so
     // the fold rung's bundle may carry it alone. Before the declare pass, for the same reason

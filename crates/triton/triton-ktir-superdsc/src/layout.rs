@@ -37,7 +37,8 @@
 //! states (`[hd, hd]` at the head dim its own output view declares). It does not place the
 //! constants whose extent nothing in the program says: `ATTN_MASK_TID` and `ATTN_CAUSAL_TID` are
 //! the worker's per-step tables sized by a prefix CAPACITY, `IDENTITY_TID` by the head dim of a
-//! geometry the program does not carry, `kct_resident_tid` is resident scratch. A placement with an
+//! geometry the program does not carry, the reserved Kᵀ name (`KctResident::wire_tid`) is
+//! resident scratch. A placement with an
 //! invented extent is the footprint guard's false negative — the guard compares an access against
 //! `p.size`, so a size this module made up turns the one check that catches an over-run into a
 //! rubber stamp. [`for_node`] therefore REFUSES a program whose entry point needs those, by name —
@@ -90,7 +91,8 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     //
     // ⭐ AND THE REFUSAL IS ABOUT THE **BODY THAT WILL RUN**, WHICH IS WHY IT IS GATED ON
     // [`is_per_program_node`]. The reserved constants below are named by the per-`Program` entry
-    // points — `attn_at`'s `ATTN_MASK_TID`/`IDENTITY_TID`/`kct_resident_tid(k)` are that hand-written
+    // points — `attn_at`'s `ATTN_MASK_TID`/`IDENTITY_TID`/the reserved Kᵀ name
+    // (`KctResident::of(k).wire_tid()`) are that hand-written
     // body's device state, and it is the body that looks them up. The WHOLE-FUNCTION door never
     // calls it: it walks the function's own ops, every operand of which is a parameter or an
     // in-function value, so nothing in that emission can reach a name this module did not place.
@@ -628,7 +630,7 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 ///
 /// ⛔ READ OFF THE BODIES, one by one. `rope_at` opens with `crate::place::act_name(ROPE_P_TID)`
 /// (the rotate matrix) and `attn_at` names `ATTN_MASK_TID`, `ATTN_CAUSAL_TID`, `IDENTITY_TID` and
-/// `kct_resident_tid(k_id)`. None of those is a buffer a Triton kernel declares. Every other body
+/// the reserved Kᵀ name (`KctResident::of(k_id).wire_tid()`). None of those is a buffer a Triton kernel declares. Every other body
 /// names only its parameters and its own declared synthetics.
 ///
 /// ⭐ THE LINE IS NOT "IS IT A PARAMETER", IT IS "DOES THE PROGRAM STATE ITS EXTENT" — and that is
@@ -639,7 +641,7 @@ fn index_view_dtype(node: &KtirNode, tid: u32) -> Option<ktir_core::dtypes::DTyp
 /// Attention's are not, and none of them is close: `ATTN_MASK_TID` is `[nqh·mq, cap]` over a prefix
 /// CAPACITY the worker chooses per step, `ATTN_CAUSAL_TID` the same, `IDENTITY_TID` is `[hd, hd]` at
 /// the head dim of a GQA geometry that reaches `attn_at` as a const generic and not as a view, and
-/// `kct_resident_tid` is resident scratch whose extent is the K cache's. So `Attn` stays refused BY
+/// the reserved Kᵀ name (`KctResident::wire_tid`) is resident scratch whose extent is the K cache's. So `Attn` stays refused BY
 /// NAME, which is the whole point of this function: `resolve_seg_base` PANICS on a name in neither
 /// `ids` nor the synth map, so the choice is a diagnostic here or a build crash there.
 /// Does this function go through the PER-`Program` door, or the whole-function walk?
@@ -670,12 +672,12 @@ fn reserved_consts_for(p: Program) -> Option<&'static [&'static str]> {
             "ATTN_MASK_TID",
             "ATTN_CAUSAL_TID",
             "IDENTITY_TID",
-            "kct_resident_tid(k)",
+            "KctResident::of(k).wire_tid()",
         ]),
         // `Rope` is HERE and not above: its one reserved constant is placed by [`for_regions`],
         // from an extent the program states. `RopeAppend` joins it: its own body states no
         // reserved constant (the stores are ordinary plane stores), and the Kᵀ tail that
-        // names `kct_resident_tid` is the SPYRE door's emission, not this ladder's.
+        // names the reserved Kᵀ name is the SPYRE door's emission, not this ladder's.
         Program::Rope
         | Program::RopeAppend
         | Program::RmsNorm
@@ -864,7 +866,8 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
             // stating a scale constant at f32 — the f32 m-merge's own form — is refused BY NAME
             // here rather than silently narrowed to its f16 image. Fail closed, the same law
             // the model path's foreign-df refusal states.
-            let df = ktir_superdsc::emit::lower_ktir_to_superdsc::scale_slot_df(f, sf.splat, sf.value);
+            let df =
+                ktir_superdsc::emit::lower_ktir_to_superdsc::scale_slot_df(f, sf.splat, sf.value);
             if df != Df::Fp16 {
                 return Err(crate::Error {
                     stage: "layout",
@@ -872,9 +875,7 @@ fn scales_for_program_shape(p: Program, f: &IRFunction<'static>) -> Result<Vec<f
                         "{}: the scale slot for {} is stated at {:?}, and the standalone registry \
                          does not stage f32 scale slots — its one channel binds one f16 word per \
                          const, so this bundle cannot bake on this ladder",
-                        f.name,
-                        sf.value,
-                        df
+                        f.name, sf.value, df
                     ),
                 });
             }

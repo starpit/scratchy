@@ -909,10 +909,7 @@ impl Wiring {
 /// disagree about what a slot's df means. A format with no channel is a PANIC naming the slot
 /// (`slot` is the caller's own context — the reserved tid at the bake, the wiring index in the
 /// macro): fail closed, never a nearest-neighbor staging.
-pub fn scale_stage_of(
-    df: ktir_superdsc::superdsc_opspec::Df,
-    slot: &str,
-) -> bundle::ScaleStage {
+pub fn scale_stage_of(df: ktir_superdsc::superdsc_opspec::Df, slot: &str) -> bundle::ScaleStage {
     match df {
         ktir_superdsc::superdsc_opspec::Df::Fp16 => bundle::ScaleStage::IeeeF16,
         ktir_superdsc::superdsc_opspec::Df::Fp32 => bundle::ScaleStage::IeeeF32,

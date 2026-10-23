@@ -5639,10 +5639,10 @@ pub struct PhysPage(pub u32);
 /// memory rather than a constant.
 ///
 /// ```text
-///   pool : [page][layer][Kᵀ | V | Knat][kvh][request][ ... ]
-///            Kᵀ   : [kvh][hd][PAGE_SLOTS]         stick-major on slots — the score kernel
-///            V    : [kvh][PAGE_SLOTS][hd]         sticked on hd       — the value kernel
+///   pool : [page][layer][Knat | V | Kᵀ][kvh][ ... ]
 ///            Knat : [kvh][PAGE_SLOTS][hd]         natural K           — the Kᵀ re-transpose source
+///            V    : [kvh][PAGE_SLOTS][hd]         sticked on hd       — the value kernel
+///            Kᵀ   : [kvh][hd][PAGE_SLOTS]         stick-major on slots — the score kernel
 /// ```
 ///
 /// ⛔ **THE REQUEST IS NOT A DIMENSION HERE AT ALL — IT IS A CHOICE OF PAGES.**
@@ -5887,6 +5887,85 @@ pub struct KvWritePart {
     /// respelled `if rows_are_requests { 0 } else { part.row0 }`, and the offset a group's
     /// ops carried was a second derivation the launch index had to `assert!` agreement with.
     pub page: crate::page_part::PagePart,
+}
+
+/// ⭐⭐⭐⭐⭐ ONE POOL PLANE, AS A TYPE — which plane of a page+layer an address names, stated by
+/// the pool that owns the layout and derivable from nothing else.
+///
+/// ⛔⛔⛔ THE DEFECT THIS TYPE EXISTS TO MAKE UNWRITABLE: a reserved plane's NAME
+/// ([`crate::reserved_tids::KctResident`]) and its SOURCE TENSOR were both bare `u32`s, so a
+/// consumer needing "the Kᵀ plane" could resolve the name through the K cache source's own
+/// placement and bake a score gather over the NATURAL-K plane — same size, wrong plane,
+/// invisible to every extent law, because both planes are `plane_stride` per kv head. The
+/// handles below are the only derivation of a plane's base, and a `KctResident` binding
+/// resolves to [`KtPlane`] and to nothing else.
+pub struct PoolPlane<'p, P: PlaneKind> {
+    pool: &'p PagedKvPool,
+    _kind: std::marker::PhantomData<P>,
+}
+
+/// Which plane of a page+layer a [`PoolPlane`] names — the pool's own taxonomy, one type per
+/// resident plane, each carrying its OWN base derivation so no consumer can spell a sibling
+/// arithmetic. Sealed through the file's ONE seal module (the `Stk<K>` kind tags'): only
+/// crate-level constructors mint plane kinds, so the variant set is the pool's, not a caller's.
+pub trait PlaneKind: sealed::Sealed {
+    /// This plane's element offset within a page+layer — the ONE base derivation.
+    fn base_elems(pool: &PagedKvPool) -> usize;
+}
+
+/// The natural-K plane — FIRST in a page+layer, where the pre-paged `kc` was. The cache write
+/// fills it; the re-transpose reads it.
+pub struct KnatPlane;
+/// The V plane — SECOND, where `vc` was.
+pub struct VPlane;
+/// The transposed-K plane — LAST, where `kct` was. The re-transpose writes it; the score
+/// gather reads it, and ONLY through [`crate::reserved_tids::KctResident`].
+pub struct KtPlane;
+
+impl sealed::Sealed for KnatPlane {}
+impl sealed::Sealed for VPlane {}
+impl sealed::Sealed for KtPlane {}
+
+impl PlaneKind for KnatPlane {
+    fn base_elems(_pool: &PagedKvPool) -> usize {
+        0
+    }
+}
+impl PlaneKind for VPlane {
+    fn base_elems(pool: &PagedKvPool) -> usize {
+        pool.plane_stride()
+    }
+}
+impl PlaneKind for KtPlane {
+    fn base_elems(pool: &PagedKvPool) -> usize {
+        2 * pool.plane_stride()
+    }
+}
+
+impl PagedKvPool {
+    /// ⭐ THE ONE DOOR to a plane — typed by the plane it names, so every base that comes back is
+    /// the pool's own law and never a tensor's placement.
+    pub const fn plane<P: PlaneKind>(&self) -> PoolPlane<'_, P> {
+        PoolPlane {
+            pool: self,
+            _kind: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P: PlaneKind> PoolPlane<'_, P> {
+    /// This plane's element offset within a page+layer — [`PlaneKind::base_elems`], read back.
+    pub fn base_elems(&self) -> usize {
+        P::base_elems(self.pool)
+    }
+
+    /// This plane's byte offset within a page+layer — the placement's own unit, derived so the
+    /// element fact and the byte fact cannot disagree.
+    pub fn base_bytes(&self) -> u64 {
+        self.base_elems() as u64
+            * <crate::superdsc_opspec::Fp16 as crate::superdsc_opspec::DataFormat>::WORD_LENGTH
+                as u64
+    }
 }
 
 impl PagedKvPool {
@@ -6546,17 +6625,17 @@ impl PagedKvPool {
 
     /// Element offset of the natural-K plane within a page+layer — FIRST, where `kc` was.
     pub fn knat_plane_base(&self) -> usize {
-        0
+        self.plane::<KnatPlane>().base_elems()
     }
 
     /// Element offset of the V plane — SECOND, where `vc` was. Applied by the PLACEMENT, never an op.
     pub fn v_plane_base(&self) -> usize {
-        self.plane_stride()
+        self.plane::<VPlane>().base_elems()
     }
 
     /// Element offset of the transposed-K plane — LAST, where `kct` was.
     pub fn kt_plane_base(&self) -> usize {
-        2 * self.plane_stride()
+        self.plane::<KtPlane>().base_elems()
     }
 
     #[allow(dead_code)]
@@ -6859,11 +6938,7 @@ pub struct GatherReach {
 impl GatherReach {
     /// ONE door — the same three numbers [`gather_entry_ceiling`] takes, plus the pool's own
     /// entry width. `None` for the same reasons.
-    pub fn of_plane(
-        page_ceiling: u64,
-        page_stride_bytes: u64,
-        pool: PagedKvPool,
-    ) -> Option<Self> {
+    pub fn of_plane(page_ceiling: u64, page_stride_bytes: u64, pool: PagedKvPool) -> Option<Self> {
         Some(GatherReach {
             max_entry: gather_entry_ceiling(page_ceiling, page_stride_bytes, pool)?,
             entry_elems: pool.stick_block_elems() as u64,
@@ -7045,11 +7120,7 @@ pub fn gather_index_table(
                     // — is now [`GatherEntry::of_page_block`]'s and nothing else's, and the ceiling it
                     // takes is the pool's own bound on the value.
                     out[p * stride + scratch.row_of(kvh, b, r)? as usize] =
-                        GatherEntry::of_page_block(
-                            ceiling,
-                            phys,
-                            scratch.block_in_page(kvh, b)?,
-                        )?;
+                        GatherEntry::of_page_block(ceiling, phys, scratch.block_in_page(kvh, b)?)?;
                 }
             }
         }
@@ -11693,8 +11764,9 @@ pub fn spliced_attn_ids_table(
     let last = *map.last()?;
     let ktb = region.ktb()?;
     let w4 = region.w4();
-    let mut out =
-        Vec::with_capacity(region.pages() as usize * region.sticks_per_page() as usize * ktb as usize);
+    let mut out = Vec::with_capacity(
+        region.pages() as usize * region.sticks_per_page() as usize * ktb as usize,
+    );
     for s in 0..region.pages() {
         let phys = map.get(s as usize).copied().unwrap_or(last);
         for k in 0..region.sticks_per_page() {
@@ -11850,8 +11922,7 @@ pub fn spliced_decode_ids_table(
     let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
     let nkvh = batch.pool.nkvh as u32;
     let seqs = batch.num_seqs.get();
-    let mut out =
-        Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
+    let mut out = Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
     for c in 0..batch.chunks() {
         for w in 0..w4 {
             for b in 0..ktb {

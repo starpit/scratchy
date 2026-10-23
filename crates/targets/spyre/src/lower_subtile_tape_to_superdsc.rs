@@ -103,6 +103,10 @@ pub use ktir_superdsc::work::{
 // be a NEW name in a file that already resolves this one. See `DxGroupCeiling`'s own doc for
 // the measured pedigree of 4204.
 pub use ktir_superdsc::sdsc_abstract::DxGroupCeiling;
+// ⭐ THE POOL'S TYPED PLANE KINDS — brought in beside the ceiling re-export because this file
+// places the pool's planes (`pool.plane::<KtPlane>().base_bytes()`): the placement's byte fact
+// and the pool's element fact must be one derivation, stated through the pool's own handles.
+use ktir_superdsc::sdsc_abstract::{KnatPlane, KtPlane, VPlane};
 
 // ── EMIT-TIME CONSTANTS THAT USED TO BE ENVIRONMENT READS ───────────────────
 //
@@ -179,20 +183,20 @@ const _: () = assert!(bundle::MAX_SEGMENT_BYTES == SEGMENT_SIZE);
 
 // ⭐⭐⭐ THE RESERVED TID SPACE LIVES IN `ktir_superdsc::reserved_tids` — every `*_TID` sentinel, the
 // `TidRegion`/`RESERVED_REGIONS` table with both of its compile-time disjointness proofs,
-// `scalarmul_scale_tid` and `kct_resident_tid`.
+// `scalarmul_scale_tid` and the `KctResident` plane-name type.
 //
 // ⭐ IT IS THE PRODUCER↔LOWERING ABI, not scratchy's plan: each id names a tensor the LOWERING
 // invents or requires and the caller binds, so a third-party KTIR producer has to agree with these
 // numbers to bind anything at all. Re-exported so every path in the tree resolves unchanged.
 pub use ktir_superdsc::reserved_tids::{
     ATTN_CAUSAL_TID, ATTN_MASK_TID, ATTN_SCALE_TID, ATTN_ZERO_TID, FP8_INV448_TID, FP8_NEG448_TID,
-    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, LAST_HIDDEN_TID,
-    NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
+    FP8_POS448_TID, IDENTITY_TID, KCT_RESIDENT_BASE, KV_BLOCK_INDEX_TID, KctResident,
+    LAST_HIDDEN_TID, NEW_V_PROBE_TID, ONES_REDUCE_TID, OPROJ_HEADMAJOR_BASE, RESERVED_REGIONS,
     RESERVED_REGIONS_ARE_DISJOINT, RMS_HALF_TID, RMS_INVCOLS_TID, RMS_RSQRT_PROBE_TID,
     RMS_SEED_TID, RMS_VAR_PROBE_TID, ROPE_P_TID, SCALARMUL_SCALE_BASE, SEL_HEADMAJOR_TID,
     SEL_KV_HEADMAJOR_TID, SELT_HEADMAJOR_TID, SENTINELS_ARE_INSIDE_THEIR_REGION, TidRegion,
-    identity_class_tid, is_kernel_table_class_tid, kct_resident_tid, oproj_headmajor_tid,
-    reserved_region, rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
+    identity_class_tid, is_kernel_table_class_tid, oproj_headmajor_tid, reserved_region,
+    rope_p_class_hds, rope_p_class_tid, scalarmul_scale_tid,
 };
 
 // The rung facts the walk takes as one explicit struct — the `#[forward]` expansion
@@ -1507,13 +1511,18 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // PAGE, through the host's block table. Left at 0, which is what an unbatched bundle always
             // published and what `LaunchPages` reads as "no request dimension".
             let layer_base = seg_bytes[seg];
-            // Kᵀ at 0, V at `v_plane_base`, natural K at `knat_plane_base` — the offsets
-            // `PagedKvPool` bakes into the ops' plane-relative bases.
+            // Natural K at 0 (`knat_plane_base`), V at `v_plane_base`, Kᵀ at `kt_plane_base` —
+            // the offsets `PagedKvPool` bakes into the ops' plane-relative bases, stated here
+            // through the pool's TYPED plane handles so the placement's byte fact and the
+            // pool's element fact are one derivation.
             for (tid, plane_off) in [
                 // natural K, V, transposed K — the pre-paged cache's own order.
-                (k_id, pool.knat_plane_base() as u64 * 2),
-                (v_id, pool.v_plane_base() as u64 * 2),
-                (kct_resident_tid(k_id), pool.kt_plane_base() as u64 * 2),
+                (k_id, pool.plane::<KnatPlane>().base_bytes()),
+                (v_id, pool.plane::<VPlane>().base_bytes()),
+                (
+                    ktir_superdsc::reserved_tids::KctResident::of(k_id).wire_tid(),
+                    pool.plane::<KtPlane>().base_bytes(),
+                ),
             ] {
                 placements.insert(
                     tid,
@@ -1557,7 +1566,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                      gathered read this bundle emits cannot address the pool"
                 ))
             })?;
-            for tid in [k_id, v_id, kct_resident_tid(k_id)] {
+            for tid in [
+                k_id,
+                v_id,
+                ktir_superdsc::reserved_tids::KctResident::of(k_id).wire_tid(),
+            ] {
                 gather_reach.insert(tid, reach);
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
@@ -5305,11 +5318,7 @@ fn trip_kinds_and_owner(ops: &[EmittedOp]) -> (Vec<Trip>, Vec<usize>) {
             } else {
                 GroupKind::Pure
             };
-            kinds.push(Trip::at_part(
-                k,
-                TripRequest(e.kv_request),
-                e.kv_part,
-            ));
+            kinds.push(Trip::at_part(k, TripRequest(e.kv_request), e.kv_part));
             owner.push(oi);
         }
     }
@@ -7951,7 +7960,7 @@ mod tests {
         // positional form could not make: it compares two INDEPENDENTLY derived tids rather than one
         // constant against its own definition.
         assert_ne!(
-            kct_resident_tid(0),
+            KctResident::of(0).wire_tid(),
             KV_BLOCK_INDEX_TID,
             "the resident Kᵗ kernel of layer 0 and the gather's index tensor are ONE tid"
         );

@@ -656,7 +656,10 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
 ) -> Result<Vec<EmittedOp>, String> {
-    let SubOp::RopeAppend { head_dim, layout, .. } = &node.op else {
+    let SubOp::RopeAppend {
+        head_dim, layout, ..
+    } = &node.op
+    else {
         return Err(
             "triton splice: lower_rope_append called on a node that is not a RopeAppend"
                 .to_string(),
@@ -773,7 +776,9 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     // recipe's `kv_part` / `slot_stride_bytes` stamps, never a baked corner).
     let mut signature: HashMap<String, ArgSpec> = HashMap::new();
     let mut constexprs: HashMap<String, Val> = HashMap::new();
-    for param in ["desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc"] {
+    for param in [
+        "desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc",
+    ] {
         signature.insert(
             param.to_string(),
             ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
@@ -804,7 +809,8 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     let module = compile_kernel(src, &spec, &[1])?;
     // The bindings in the KERNEL's parameter order: the four stream operands, then the
     // two pool planes — the pair's OWN tensors, the WRITE's destinations (natural K and V;
-    // the Kᵀ tail re-transposes from the K one into the reserved `kct_resident_tid` plane,
+    // the Kᵀ tail re-transposes from the K one into the reserved Kᵀ plane
+    // (`KctResident::of(k).wire_tid()`),
     // which is what `mint_attn`'s gather reads — the pair's K tid KEYS that plane, and the
     // carrier never reads it, only fills its source). The pair is the one the contract
     // check above pinned to the graph edges.
@@ -1569,8 +1575,8 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //    shapes it served are the prefill kernel's to serve, refused by name until that row
 //    lands);
 //  * the DOOR's parameter order is q, out, kt, v, ids, mask — the output is SECOND, the
-//    Kᵀ plane is the RESERVED tid keyed on the sealed pair's K tid (the door's own naming
-//    law, `kct_resident_tid` — the same derivation the write's tail fills and main's
+//    Kᵀ plane is the RESERVED name keyed on the sealed pair's K tid (the door's own naming
+//    law, `KctResident::of(k).wire_tid()` — the same derivation the write's tail fills and main's
 //    card-proven reader reads; the pair's OWN K tensor is the NATURAL plane the write's
 //    cachewr copies fill, and reading it here would misread real K as transposed — same
 //    size, wrong plane, invisible to every extent law), the V plane is the pair's own V
@@ -2168,8 +2174,7 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 ) -> Result<Vec<EmittedOp>, String> {
     let SubOp::AttnDecode { layout, .. } = &node.op else {
         return Err(
-            "triton splice: mint_paged_fold called on a node that is not an AttnDecode"
-                .to_string(),
+            "triton splice: mint_paged_fold called on a node that is not an AttnDecode".to_string(),
         );
     };
     let mq = node.output.region.rows.len;
@@ -2196,19 +2201,9 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     let (seed_src, seed_prog) = row_src(&paged_fold_seed_row())?;
     let (fold_src, fold_prog) = row_src(&paged_fold_row())?;
     let (fin_src, fin_prog) = row_src(&paged_fold_finalize_row())?;
-    let seed_pos = attn_positional(
-        seed_src,
-        &paged_fold_seed_spec(&facts)?,
-        &grid,
-        seed_prog,
-    )?;
+    let seed_pos = attn_positional(seed_src, &paged_fold_seed_spec(&facts)?, &grid, seed_prog)?;
     let fold_pos = attn_positional(fold_src, &paged_fold_spec(&facts)?, &grid, fold_prog)?;
-    let fin_pos = attn_positional(
-        fin_src,
-        &paged_fold_finalize_spec(&facts)?,
-        &grid,
-        fin_prog,
-    )?;
+    let fin_pos = attn_positional(fin_src, &paged_fold_finalize_spec(&facts)?, &grid, fin_prog)?;
     // ⭐ THE TAPE'S REAL TENSOR INDICES over the adapter's positional ones — the same law
     // `mint_attn` states: a splice that kept the positional ids would emit descriptors over
     // `t0/t1/t2` while the tape's buffers are elsewhere.
@@ -2216,9 +2211,7 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     // The carry's three reserved tids — the census places exactly these, gated on the fold
     // statement, so a binding and a placement can never disagree about which tensor is which.
-    let carry = |which: ktir_superdsc::reserved_tids::PagedFoldCarry| {
-        BufferId::new(which.tid())
-    };
+    let carry = |which: ktir_superdsc::reserved_tids::PagedFoldCarry| BufferId::new(which.tid());
     let m_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Max);
     let l_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Sum);
     let acc_tid = carry(ktir_superdsc::reserved_tids::PagedFoldCarry::Acc);
@@ -2280,16 +2273,20 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
             m_tid,
             l_tid,
             acc_tid,
-            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `kct_resident_tid` keyed on the
+            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
             // sealed pair's K tid, the SAME expression the door's write tail
             // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
             // body-representative table before them: the THIRD sayer of one derivation. The
             // pair's own K tensor is the NATURAL plane the write's cachewr copies fill; binding
             // it here misreads real K as transposed — same size, wrong plane, invisible to every
-            // extent law (both planes are `plane_stride` per kv head).
-            BufferId::new(ktir_superdsc::reserved_tids::kct_resident_tid(
-                layout.cache_tensor().index() as u32,
-            )),
+            // extent law (both planes are `plane_stride` per kv head). Minted through the TYPE
+            // so the binding cannot be spelled as the source tid: the gather door classifies it
+            // by kind, and a `KctResident` resolves to the reserved plane placement and nothing
+            // else.
+            BufferId::new(
+                ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                    .wire_tid(),
+            ),
             BufferId::new(layout.v_cache_tensor().index() as u32),
             kt_ids_tid,
             v_ids_tid,
@@ -2322,16 +2319,15 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
     // The BODY carries the fold attribute — the family's launch-ABI laws, stated at the one
     // door the walk's stamp and the bake's proof read. `page_slots` is restated from the
     // shared device law so the stamp never re-derives it.
-    let mut body =
-        EmittedOp::paged_fold(
-            format!("attn_s{id}_fold"),
-            ktir_superdsc::sdsc_abstract::PagedFold {
-                gathered: true,
-                batched_requests: false,
-                fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
-                page_slots,
-            },
-        );
+    let mut body = EmittedOp::paged_fold(
+        format!("attn_s{id}_fold"),
+        ktir_superdsc::sdsc_abstract::PagedFold {
+            gathered: true,
+            batched_requests: false,
+            fold_rows: ktir_superdsc::sdsc_abstract::FoldRowRegime::WholeBatch,
+            page_slots,
+        },
+    );
     body.ktir = Some(fold);
     let mut seed_op = EmittedOp::bare(format!("attn_s{id}_fseed"));
     seed_op.ktir = Some(seed);
@@ -2342,8 +2338,8 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
 /// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
-/// pool planes, the two block-entry tables, the mask), the Kᵀ plane bound to the RESERVED tid
-/// keyed on the sealed pair's K tid (the door's own naming law, `kct_resident_tid` — the same
+/// pool planes, the two block-entry tables, the mask), the Kᵀ plane bound to the RESERVED name
+/// keyed on the sealed pair's K tid (the door's own naming law, `KctResident::of(k).wire_tid()` — the same
 /// derivation the write's tail fills and main's card-proven reader reads; the pair's OWN K
 /// tensor is the NATURAL plane the write's cachewr copies fill, and the score gather must not
 /// read it — same size, wrong plane, invisible to every extent law) and the V plane to the
@@ -2386,16 +2382,19 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
-        // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `kct_resident_tid` keyed on the
+        // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `KctResident` keyed on the
         // sealed pair's K tid, the SAME expression the door's write tail
         // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
         // body-representative table before them: the THIRD sayer of one derivation. The pair's
         // own K tensor is the NATURAL plane the write's cachewr copies fill; binding it here
         // misreads real K as transposed — same size, wrong plane, invisible to every extent law
-        // (both planes are `plane_stride` per kv head).
-        BufferId::new(ktir_superdsc::reserved_tids::kct_resident_tid(
-            layout.cache_tensor().index() as u32,
-        )),
+        // (both planes are `plane_stride` per kv head). Minted through the TYPE so the binding
+        // cannot be spelled as the source tid: the gather door classifies it by kind, and a
+        // `KctResident` resolves to the reserved plane placement and nothing else.
+        BufferId::new(
+            ktir_superdsc::reserved_tids::KctResident::of(layout.cache_tensor().index() as u32)
+                .wire_tid(),
+        ),
         BufferId::new(layout.v_cache_tensor().index() as u32),
         kt_ids_tid,
         v_ids_tid,

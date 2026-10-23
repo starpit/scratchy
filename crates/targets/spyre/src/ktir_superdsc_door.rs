@@ -39,7 +39,9 @@
 
 use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc as lk;
-use ktir_superdsc::emit::lower_ktir_to_superdsc::{Error, Region, err, regions, rope_at, split_out};
+use ktir_superdsc::emit::lower_ktir_to_superdsc::{
+    Error, Region, err, regions, rope_at, split_out,
+};
 use ktir_superdsc::emit::whole_function::lower_function;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
@@ -292,10 +294,12 @@ pub fn lower(
                     // because that is the only form a program constant carries. Anything else
                     // under a carried-elsewhere law is a real multiplier behind pre-scaled
                     // weights — the double-scale.
-                    (Some(v), law @ (ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel))
-                        if v != 1.0
-                            && half::f16::from_f32(v)
-                                != half::f16::from_f32(std::f32::consts::LOG2_E) =>
+                    (
+                        Some(v),
+                        law @ (ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel),
+                    ) if v != 1.0
+                        && half::f16::from_f32(v)
+                            != half::f16::from_f32(std::f32::consts::LOG2_E) =>
                     {
                         return err(format!(
                             "{name}: the bundle's attention scale is {law:?}, but the program \
@@ -637,9 +641,12 @@ fn rope_append(
             new_v: &r[3].name(),
             kc: &r[4].name(),
             vc: &r[5].name(),
-            kct: &ktir_superdsc::place::act_name(ktir_superdsc::reserved_tids::kct_resident_tid(
-                r[4].tid,
-            )),
+            // ⭐ The Kᵀ plane the write's re-transpose tail fills — named through the reserved
+            // binding's own type, so the placement it resolves to is the pool's Kᵀ plane and
+            // never the K-cache source's.
+            kct: &ktir_superdsc::place::act_name(
+                ktir_superdsc::reserved_tids::KctResident::of(r[4].tid).wire_tid(),
+            ),
             ident: &ktir_superdsc::place::act_name(ident),
         },
         sym_id_base,

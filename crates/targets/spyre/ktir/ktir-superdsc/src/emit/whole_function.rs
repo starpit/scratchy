@@ -964,43 +964,33 @@ fn cast_of(f: &IRFunction<'_>, op: &Operation<'_>) -> Result<Option<Lowering>, E
     let refuse = |msg: String| Error {
         message: format!("{name}: `{kind:?}` {msg}"),
     };
-    let elem_of = |v: Ssa,
-                   role: &str|
-     -> Result<crate::superdsc_opspec::Df, Error> {
-        let t = type_of(f, v).ok_or_else(|| {
-            Error {
-                message: format!(
-                    "{name}: `{kind:?}`'s {role} states no type, so the format transition is \
+    let elem_of = |v: Ssa, role: &str| -> Result<crate::superdsc_opspec::Df, Error> {
+        let t = type_of(f, v).ok_or_else(|| Error {
+            message: format!(
+                "{name}: `{kind:?}`'s {role} states no type, so the format transition is \
                      unknown and no convert can be chosen for it"
-                ),
-            }
+            ),
         })?;
         df_of_dtype(match t {
             ktir_core::irtype::IrType::Tensor { elem, .. }
             | ktir_core::irtype::IrType::MemRef { elem, .. }
             | ktir_core::irtype::IrType::Scalar(elem) => elem,
-            ktir_core::irtype::IrType::AccessTile { .. }
-            | ktir_core::irtype::IrType::Index => {
+            ktir_core::irtype::IrType::AccessTile { .. } | ktir_core::irtype::IrType::Index => {
                 return Err(refuse(format!(
                     "{role} is an address type, not a value a dtype convert reads"
-                )))
+                )));
             }
         })
-        .ok_or_else(|| {
-            Error {
-                message: format!(
-                    "{name}: `{kind:?}`'s {role} states an element type with no stick geometry \
+        .ok_or_else(|| Error {
+            message: format!(
+                "{name}: `{kind:?}`'s {role} states an element type with no stick geometry \
                      (bool/i64), which no convert bind in the vendor's DDLs addresses"
-                ),
-            }
+            ),
         })
     };
-    let src = *op
-        .operands
-        .first()
-        .ok_or_else(|| Error {
-            message: format!("{name}: `{kind:?}` states no operand to convert"),
-        })?;
+    let src = *op.operands.first().ok_or_else(|| Error {
+        message: format!("{name}: `{kind:?}` states no operand to convert"),
+    })?;
     let res = op.result.ok_or_else(|| Error {
         message: format!("{name}: `{kind:?}` states no result"),
     })?;
@@ -1015,14 +1005,14 @@ fn cast_of(f: &IRFunction<'_>, op: &Operation<'_>) -> Result<Option<Lowering>, E
                 "states a WIDENING cast whose types are {from:?} → {to:?} — `arith.extf` extends, \
                  so this program is mistyped: the value's bytes would re-interpret at the wrong \
                  width no matter which convert emits them"
-            )))
+            )));
         }
         OpKind::ArithTruncf if !narrows => {
             return Err(refuse(format!(
                 "states a NARROWING cast whose types are {from:?} → {to:?} — `arith.truncf` \
                  truncates, so this program is mistyped: the value's bytes would re-interpret at \
                  the wrong width no matter which convert emits them"
-            )))
+            )));
         }
         _ => {}
     }
@@ -1219,13 +1209,10 @@ pub fn stored_splat_of(
     if c.op_type != OpKind::ArithConstant {
         return None;
     }
-    let value = c
-        .attributes
-        .iter()
-        .find_map(|(k, val)| match (k, val) {
-            (AttrKey::Value, Attr::Float(x)) => Some(*x),
-            _ => None,
-        })?;
+    let value = c.attributes.iter().find_map(|(k, val)| match (k, val) {
+        (AttrKey::Value, Attr::Float(x)) => Some(*x),
+        _ => None,
+    })?;
     Some((value as f32, v))
 }
 
@@ -2686,7 +2673,9 @@ fn classify_row_fold(
     // The subtraction's scalar tiebreak, the same precedence and for the same reason — and the
     // ORDER rides the kind, because `C − tile` and `tile − C` are different functions a merge
     // must not average over.
-    if op.op_type == OpKind::ArithSubf && let Some(sf) = splat_scale_of(f, op) {
+    if op.op_type == OpKind::ArithSubf
+        && let Some(sf) = splat_scale_of(f, op)
+    {
         return Some(RowFoldKind::ScalarSub {
             value: sf.value,
             const_first: sf.const_first,
@@ -3286,9 +3275,10 @@ pub fn lower_function(
             && let Some((value, _splat)) = stored_splat_of(f, op)
         {
             let out_tile = op.operands.get(1).copied();
-            let tile = f.operations.iter().find(|o| {
-                o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile
-            });
+            let tile = f
+                .operations
+                .iter()
+                .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
             let Some(tile) = tile else {
                 return err(format!(
                     "{}: a constant store names no access tile — nothing states the window it fills",
@@ -3335,9 +3325,10 @@ pub fn lower_function(
             }
             if let Some(src) = inter.get(&cur).copied() {
                 let out_tile = op.operands.get(1).copied();
-                let tile = f.operations.iter().find(|o| {
-                    o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile
-                });
+                let tile = f
+                    .operations
+                    .iter()
+                    .find(|o| o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile);
                 let Some(tile) = tile else {
                     return err(format!(
                         "{}: a store of a minted value names no access tile — nothing states \
@@ -3401,10 +3392,7 @@ pub fn lower_function(
         // the op's own `Dimensions`/`Shape` attrs, fail-closed on a statement the door cannot
         // classify — a missing or oversized one is a producer defect to name, not a frame fact to
         // guess.
-        let reduce = match (
-            op.op_type == OpKind::LinalgReduce,
-            reduce_kind_of(op),
-        ) {
+        let reduce = match (op.op_type == OpKind::LinalgReduce, reduce_kind_of(op)) {
             (true, Some(kind)) => Some(Lowering::Reduce {
                 kind,
                 axes: reduce_axes_of(f.name, op)?,
@@ -3472,7 +3460,8 @@ pub fn lower_function(
                 }
             })
             .or(rms.map(|c| Lowering::RmsNorm(c.eps, c.ones)))
-            .or(reduce)            .or(cast)
+            .or(reduce)
+            .or(cast)
             .or(scalar.map(|sf| Lowering::ScalarMul(sf.value)))
             .or(extremum.map(|sf| Lowering::ScalarExtremum {
                 value: sf.value,
@@ -3882,9 +3871,7 @@ pub fn lower_function(
                 .any(|&(fgi, ref f)| fgi == gi && !matches!(f, GatheredB::No));
             (!materialized).then_some((g, gi))
         });
-        if !scalar_body
-            && let Some((g, gi)) = unmaterialized
-        {
+        if !scalar_body && let Some((g, gi)) = unmaterialized {
             return err(format!(
                 "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` at input {gi} (t{} \
                  gathered through t{}), and this door declares an index operand only for the \
@@ -3896,7 +3883,7 @@ pub fn lower_function(
                  assembler this op needs.",
                 f.name,
                 op.op_type,
-                g.value_tid,
+                g.source.tid(),
                 g.index_tid,
             ));
         }
@@ -4203,12 +4190,7 @@ pub fn lower_function(
                             &per_op,
                             dims[0] as u64 * dims[1] as u64,
                             (matches!(program, Lowering::Reduce { .. }))
-                                .then(|| {
-                                    per_op
-                                        .iter()
-                                        .find(|r| !r.is_out)
-                                        .map(|r| r.r_len)
-                                })
+                                .then(|| per_op.iter().find(|r| !r.is_out).map(|r| r.r_len))
                                 .flatten(),
                         ) =>
                 {
@@ -4466,7 +4448,10 @@ pub fn lower_function(
                  consulted. That is the right shape and the wrong rows, from a clean bake, and \
                  nothing downstream compares the two. The gathered value must be an input of an op \
                  this door lowers.",
-                f.name, ti, g.value_tid, g.index_tid,
+                f.name,
+                ti,
+                g.source.tid(),
+                g.index_tid,
             ));
         }
     }
@@ -4602,7 +4587,12 @@ fn emit_one(
         // the measured device defect that makes that a correctness matter rather than a limitation.
         Lowering::Reduce { kind, axes } => {
             return super::lower_ktir_to_superdsc::reduce(
-                name, kind, axes, per_op, sym_id_base, layout,
+                name,
+                kind,
+                axes,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         // ⭐ WALL 13's ISLAND — a dtype CAST as a first-class convert. `per_op` is `[data, out]`,
@@ -4610,7 +4600,12 @@ fn emit_one(
         // the mixed-df pin's convert-side seat (an elementwise op is the other).
         Lowering::Convert { from, to } => {
             return super::lower_ktir_to_superdsc::convert(
-                name, from, to, per_op, sym_id_base, layout,
+                name,
+                from,
+                to,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         // `tile * <constant>`, with the multiplier this op's own — `scalarmul_at` is the shared body
@@ -4638,7 +4633,13 @@ fn emit_one(
         // The program's own gather, threaded for the same reason the mulf arm threads it.
         Lowering::ScalarExtremum { value, max } => {
             return super::lower_ktir_to_superdsc::scalarextremum_at(
-                name, value, max, gather, per_op, sym_id_base, layout,
+                name,
+                value,
+                max,
+                gather,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         // `tile − C` / `C − tile` — the non-commutative member, through the same ONE shared body,
@@ -4647,7 +4648,13 @@ fn emit_one(
         // subtraction are distinguishable all the way into the descriptor.
         Lowering::ScalarSub { value, const_first } => {
             return super::lower_ktir_to_superdsc::scalarsub_at(
-                name, value, const_first, gather, per_op, sym_id_base, layout,
+                name,
+                value,
+                const_first,
+                gather,
+                per_op,
+                sym_id_base,
+                layout,
             );
         }
         // RUNG 3: the same body, with the multiplier's ADDRESS named by binding rather than looked
@@ -4765,7 +4772,7 @@ fn emit_one(
 /// # WHAT THIS FUNCTION DOES
 ///
 /// For a `linalg.matmul` whose B is the program's gathered table (the join `op_gather` already
-/// proved — B's region `tid == g.value_tid`):
+/// proved — B's region `tid == g.source.tid()`):
 ///
 /// 1. checks the program's own arithmetic stays the plain gathered copy the fixtures spell — the
 ///    matmul's SECOND operand resolves to the table's region, and the ONLY other consumer of the
@@ -4910,7 +4917,7 @@ fn gathered_matmul_materializes(
         // slice is a pool, one entry's direct coverage). The values' bound is the reach's
         // ceiling, enforced where the values are born — the staging family's law, not this
         // door's.
-        let table_name = crate::place::act_name(g.value_tid);
+        let table_name = crate::place::act_name(g.source.tid());
         let index_name = crate::place::act_name(g.index_tid);
         let what = format!(
             "{}: the batched gathered dot's copy of '{table_name}'",
@@ -4935,7 +4942,14 @@ fn gathered_matmul_materializes(
             )
             .map_err(|message| Error { message })?;
         layout
-            .check_window(&table_name, src_window(rows), 0, rows, bg.entry_elems(), &what)
+            .check_window(
+                &table_name,
+                src_window(rows),
+                0,
+                rows,
+                bg.entry_elems(),
+                &what,
+            )
             .map_err(|message| Error { message })?;
         // ── THE C-ORDER SCRATCH, minted the way the walk mints its own unstored results: one
         // stick wide, `copy_rows` sub-rows — the contiguous `[batch, k, n]` buffer the reshape
@@ -4979,10 +4993,7 @@ fn gathered_matmul_materializes(
             // which window the leg writes.
             let mut cop = cop;
             let leg_rows = cop.iter.extent("mb");
-            let dest_base = cop
-                .args
-                .last()
-                .map_or(0, |a| a.view().offset_elems) as u64;
+            let dest_base = cop.args.last().map_or(0, |a| a.view().offset_elems) as u64;
             super::mint_full_window(
                 &what,
                 &super::rb(&inter_name, rows, stick),
@@ -5040,7 +5051,8 @@ fn gathered_matmul_materializes(
                 ),
             })?;
         let flat: i64 = dims.iter().product();
-        if flat != i64::from(rows) * i64::from(head) || dims.last().copied() != Some(i64::from(head))
+        if flat != i64::from(rows) * i64::from(head)
+            || dims.last().copied() != Some(i64::from(head))
         {
             return err(format!(
                 "{}: the gathered operand at input {gathered_input} of `{:?}` states a sweep of \
@@ -5075,7 +5087,7 @@ fn gathered_matmul_materializes(
     // that declares an index operand. One input (the table), `identity`, the intermediate as
     // output; `assemble_pointwise_broadcast_gather` owns the one-index-stick ceiling and the
     // per-stick legs, so nothing here counts entries.
-    let table_name = crate::place::act_name(g.value_tid);
+    let table_name = crate::place::act_name(g.source.tid());
     let index_name = crate::place::act_name(g.index_tid);
     let inter_name = r.name();
     // ⭐ TRUE SHAPES, not `rbo`'s `1×64` annotation: the table and the intermediate declare the
@@ -5085,8 +5097,7 @@ fn gathered_matmul_materializes(
     // builder reads name + kind only, so the dims are the mint's bound and nothing else.
     let x_h = super::rb(&table_name, rows, head);
     let inputs = [super::In::full(&x_h).ew()];
-    let tile_op =
-        super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2, Df::Fp16);
+    let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2, Df::Fp16);
     // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
     // ([`StickRun::covering`]). The constructor's start half re-states `gathers_of`'s anchor
     // check at the door that builds the legs, so a mid-stick anchor has no path around it.
@@ -5173,7 +5184,10 @@ fn batched_geometry_of(
         ));
     }
     let entry_elems = u32::try_from(entry_elems).map_err(|_| Error {
-        message: format!("{}: the gathered row width {entry_elems} is not a u32", f.name),
+        message: format!(
+            "{}: the gathered row width {entry_elems} is not a u32",
+            f.name
+        ),
     })?;
     super::batched_gathered::BatchedGathered::of(&a, &b, g.entries, entry_elems)
         .map(Some)
