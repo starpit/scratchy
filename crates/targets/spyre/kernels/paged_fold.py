@@ -35,16 +35,29 @@ launch-side arithmetic is single-sourced there):
   * THE CARRY RIDES THE INTERMEDIATE SEGMENT, UNSHIFTED. A request's pages
     all fold into the SAME rows — that is what makes the online softmax a
     running state — so nothing about the carry may move per pass.
-  * THE CARRY'S DEVICE FRAME IS `[BATCH, MQ]` — the frame the body reads
-    with NO reshape. A flat `[BATCH*MQ]` view is the `[1, 32]` stick frame,
-    and presenting `[B, MQ]` from it is a RE-ROW (rows 1 -> 32), which
-    moves every element past the first stick column to a different byte —
-    the door's re-row law refuses it, correctly. Stating the frame the
-    consumer reads keeps every load and store reshape-free. Each row is
-    padded to WHOLE STICKS — the store's own granularity — so the row
-    stride is `MQ_PAD = ceil(MQ / 64) * 64` lanes: at MQ == 1 one value
-    per stick at lane 0 (strides `[64, 1]`, the pad lanes inert), at any
-    MQ a multiple of 64 a dense row of sticks.
+  * THE CARRY RIDES THE ACCUMULATOR'S OWN FRAME — `[BATCH*MQ, 1]`, ONE
+    VALUE PER STICK AT LANE 0 (`strides [64, 1]`, the pad lanes inert).
+    The walk's reduce family writes that frame and no other: a max or sum
+    over the score tile's last axis lands one value per stick at lane 0
+    (the MEASURED device law, wall 11), and the door's re-row law refuses
+    every bridge to the packed `[BATCH, MQ]` frame — a reshape verdict
+    runs off the SOURCE'S OWN TYPE, so `[B, MQ]` at an `MQ_PAD` row stride
+    is a DIFFERENT BYTE LAYOUT, not a respelling. MEASURED, wall 19,
+    build 10: the fold rung's `Maximum` refused the carried `[32, 256]` m
+    against its `[8192, 1]` output — correctly, packed element (i, j) at
+    byte `(i*MQ_PAD + j)*2` is not stick-per-value at byte `j*128` — and
+    the rung was dropped. So the carry STATES the accumulator frame, and
+    the body SPELLS its softmax chain there: the masked score tile lent
+    once to `[B*MQ, 1, 64]` (the admitted flat identity; the mask add
+    itself stays at `[B, MQ, 64]`, where the `[1, MQ, 64]` mask broadcast
+    is the row-split mode the door admits), every reduce over the last
+    axis landing `[B*MQ, 1]` with no lens, `p` lent back to
+    `[B, MQ, 64]` for the score dot, and `acc` kept FLAT `[B*MQ, HD]`
+    throughout. At MQ == 1 the frame is byte-identical to the b833dd2f2e
+    `[BATCH, MQ]` law (`MQ_PAD` was 64 then, so `[32, 1]` at
+    `strides [64, 1]` either way — the card-proven decode family is
+    untouched); this law lifts that guarantee to every MQ by MOVING the
+    carry to the frame the device writes, never by bridging frames.
 
 The per-trip laws are `batched_prefill_hm`'s own (one full id stick per
 page-window trip, the V block contiguous only at HD 64, the exp2 softmax),
@@ -84,25 +97,22 @@ def paged_fold_seed_hm(desc_m, desc_l, desc_acc,  #
     accumulator at zero. Once per step, before the first pass. The carry's
     memory image is f16 (the module doc's law) and the sentinel is f16-exact."""
     BATCH: tl.constexpr = NKVH * GQA
-    # The row stride the frame law states: each carry row padded to WHOLE
-    # STICKS (64 f16 lanes), the store's own granularity. MQ == 1 keeps the
-    # one-value-per-stick form; an MQ past one stick is a dense row of them.
-    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     # The finite sentinel, not -inf: a masked-everywhere row still
     # normalizes with weight 0, never NaN (torch's own clamp trick).
-    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law: the
-    # shape the body reads, so the store needs no reshape.
+    # [BATCH*MQ, 1] at strides [64, 1] — the module doc's frame law: the
+    # accumulator's own frame, one value per stick at lane 0, the shape
+    # the body's reduce family writes, so no load or store ever re-rows.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
-        block_shape=[BATCH, MQ])
+        desc_m, shape=[BATCH * MQ, 1], strides=[64, 1],
+        block_shape=[BATCH * MQ, 1])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
-        block_shape=[BATCH, MQ])
+        desc_l, shape=[BATCH * MQ, 1], strides=[64, 1],
+        block_shape=[BATCH * MQ, 1])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    m_desc.store([0, 0], tl.full([BATCH, MQ], -65504.0, tl.float16))
-    l_desc.store([0, 0], tl.zeros([BATCH, MQ], tl.float16))
+    m_desc.store([0, 0], tl.full([BATCH * MQ, 1], -65504.0, tl.float16))
+    l_desc.store([0, 0], tl.zeros([BATCH * MQ, 1], tl.float16))
     acc_desc.store([0, 0], tl.zeros([BATCH * MQ, HD], tl.float16))
 
 
@@ -120,9 +130,6 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     W4: tl.constexpr = PAGE_SLOTS // 64
     LOG2E: tl.constexpr = 1.44269504
     ID_STICK: tl.constexpr = 32
-    # The carry's row stride — the frame law: each row padded to WHOLE
-    # STICKS (64 f16 lanes), the store's own granularity.
-    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     tl.static_assert(
         NKVH * GQA == ID_STICK,
         "paged_fold_hm: one full id stick per page-window trip requires NKVH * GQA == 32; other geometries need the PAGES_PER_TRIP generalization (the pending worklist item)")
@@ -143,15 +150,15 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     # The carried online-softmax state, per (kv head, group, query row):
     # torch's carry, at the f16 memory image the module doc's law states
     # (the one-shot's own legalized grading — parity, not degradation).
-    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law: the
-    # carried state loads and stores at the shape the walk computes in, so
-    # no re-row ever presents it.
+    # [BATCH*MQ, 1] at strides [64, 1] — the module doc's frame law: the
+    # accumulator's own frame, one value per stick at lane 0, the shape
+    # the walk's reduce family writes, so the carry never meets a re-row.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
-        block_shape=[BATCH, MQ])
+        desc_m, shape=[BATCH * MQ, 1], strides=[64, 1],
+        block_shape=[BATCH * MQ, 1])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
-        block_shape=[BATCH, MQ])
+        desc_l, shape=[BATCH * MQ, 1], strides=[64, 1],
+        block_shape=[BATCH * MQ, 1])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
@@ -189,9 +196,11 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         strides=[64, 1], block_shape=[MQ, 64])
 
     q = tl.reshape(q_desc.load([0, 0]), [BATCH, MQ, HD])
-    m = m_desc.load([0, 0])
-    l = l_desc.load([0, 0])
-    acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
+    m = m_desc.load([0, 0])                             # [B*MQ, 1]
+    l = l_desc.load([0, 0])                             # [B*MQ, 1]
+    # acc stays FLAT [B*MQ, HD]: the rescale is a per-row scalar now, so
+    # nothing needs the rank-3 spelling and the store needs no reshape.
+    acc = acc_desc.load([0, 0])                         # [B*MQ, HD]
 
     for w in tl.static_range(W4):
         # The block gathers: one stick block per index entry, both planes,
@@ -209,18 +218,29 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         # stride-0 broadcast.
         qk = qk + tl.reshape(mask_desc.load([w * MQ, 0]),
                              [1, MQ, 64])
-        # The online update, folded per trip onto the CARRIED state.
-        m_new = tl.maximum(m, tl.max(qk, 2))             # [B, MQ]
+        # The score tile LENT to the accumulator's own frame — the module
+        # doc's frame law: a flat identity ([B,MQ,64] and [B*MQ,1,64] both
+        # flat to [B*MQ rows, 64]), so the lens is admitted, and the mask
+        # add above stays at [B, MQ, 64] where the [1, MQ, 64] broadcast
+        # is the row-split mode the door admits.
+        qk_f = tl.reshape(qk, [BATCH * MQ, 1, 64])
+        # The online update, folded per trip onto the CARRIED state: every
+        # reduce over the last axis lands [B*MQ, 1] — the accumulator
+        # frame — with no lens anywhere in the carry chain.
+        m_new = tl.maximum(m, tl.max(qk_f, 2))           # [B*MQ, 1]
         rescale = tl.math.exp2(m - m_new).to(tl.float16)
-        p = tl.math.exp2(qk - m_new[:, :, None]).to(tl.float16)
-        l = l * rescale + tl.sum(p, 2)
-        pv = tl.dot(p, v_blk, out_dtype=tl.float16)      # [B, MQ, HD]
-        acc = acc * rescale[:, :, None] + pv
+        p = tl.math.exp2(qk_f - m_new[:, :, None]).to(tl.float16)
+        l = l * rescale + tl.sum(p, 2)                   # [B*MQ, 1]
+        # p lent back to the batched spelling for the score dot (a flat
+        # identity again); pv lent flat on the way out, onto the flat acc.
+        pv = tl.dot(tl.reshape(p, [BATCH, MQ, 64]), v_blk,
+                    out_dtype=tl.float16)                # [B, MQ, HD]
+        acc = acc * rescale + tl.reshape(pv, [BATCH * MQ, HD])
         m = m_new
 
     m_desc.store([0, 0], m)
     l_desc.store([0, 0], l)
-    acc_desc.store([0, 0], tl.reshape(acc, [BATCH * MQ, HD]))
+    acc_desc.store([0, 0], acc)
 
 
 @triton.jit
@@ -231,20 +251,20 @@ def paged_fold_finalize_hm(desc_o, desc_l, desc_acc,  #
     carry's own f16 grading. The max is spent by the last pass — nothing
     reads it here."""
     BATCH: tl.constexpr = NKVH * GQA
-    # The carry's row stride — the frame law: each row padded to WHOLE
-    # STICKS (64 f16 lanes), the store's own granularity.
-    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     o_desc = tl.make_tensor_descriptor(
         desc_o, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law.
+    # [BATCH*MQ, 1] at strides [64, 1] — the module doc's frame law: the
+    # accumulator's own frame, one value per stick at lane 0.
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
-        block_shape=[BATCH, MQ])
+        desc_l, shape=[BATCH * MQ, 1], strides=[64, 1],
+        block_shape=[BATCH * MQ, 1])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    l = l_desc.load([0, 0])                              # [B, MQ]
-    acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
-    o = (acc / l[:, :, None]).to(tl.float16)             # [B, MQ, HD]
-    o_desc.store([0, 0], tl.reshape(o, [BATCH * MQ, HD]))
+    l = l_desc.load([0, 0])                              # [B*MQ, 1]
+    # acc stays FLAT: the division broadcasts the per-row l over the HD
+    # lanes, so the whole normalize runs at the flat frame, no lens.
+    acc = acc_desc.load([0, 0])                          # [B*MQ, HD]
+    o = (acc / l).to(tl.float16)                         # [B*MQ, HD]
+    o_desc.store([0, 0], o)
