@@ -1772,7 +1772,109 @@ pub(crate) fn superdsc_forward_chunk(
     // bundle and the bundle names the tables — the key is complete, and the executor's
     // same-key-different-bytes refusal is the backstop if that ever stops being true.
     let consts_key = BindKey::Consts { cap: b.capacity };
-    for i in 0..n {
+    // ⭐ THE WINDOW-INVARIANT FACTS, HOISTED WITH THE CONSTANTS (#603 L2-2). The causal key,
+    // its head-block form and the fp16-safe "-inf" are the same for every solo step of the
+    // session, and whether this session places a broadcast prefix mask (`pmask_slots`) is a
+    // session-lifetime constant set at construction. Each was rebuilt or re-read inside the
+    // step loop for values that never move within it.
+    // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
+    // spec-derived from `half::f16::MAX`, so `exp(score + mask)` underflows to 0 and stays
+    // finite.
+    let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
+    // The new token's causal block: the one-row, one-real-row prompt-chunk key — row 0 attends
+    // column 0, the same triu law a prompt chunk takes per row. One key for every solo step, so
+    // the mask is bound once per session and never again.
+    let causal = scratchy_subtile::sdsc_abstract::CausalKey::chunk(
+        scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
+        1,
+    )
+    .expect("one real row of a one-row rung");
+    let causal_heads = b.wiring.causal_heads_per_block(causal);
+    let prefix_placed = session.pmask_slots.is_some();
+    // ⭐⭐⭐⭐⭐ THE WINDOW'S STEP SCAFFOLDING, PRECOMPUTED (#603 L2-2). A step's body
+    // selection, forward shape and step list are pure functions of (bundle, step index):
+    // the selector's two inputs are functions of the write slot alone (`step_body`'s own
+    // law), `b` is fixed for the window and the session, and the ahead-filter is fixed by
+    // the committed-token count before the loop runs. Building them per step rebuilt the
+    // same `n` derivations a window never varies. This is the host half of the L2-2
+    // window-resident preamble: the rows these tapes stage are the rows the k-slot route
+    // will later upload as ONE merged H2D at window scope.
+    //
+    // ⛔ THE TAPE ITSELF STAYS PER STEP, DELIBERATELY: `host_tape::Step` borrows its
+    // `Operand` slice, so a struct cannot own both the operands and the tape built over
+    // them. The tape build is a trivial per-step map over the scaffold's own lists — the
+    // derivations (the shape's step enumeration, the operand projection) are what moved.
+    struct WindowStep {
+        /// The body this step runs — `step_body(p)`, the same selection `run_step(1, p, ..)`
+        /// makes (same session, same `p`).
+        step: scratchy_target_spyre::superdsc_exec::StepBody,
+        /// The forward's shape at ONE row — decode is the batched form at `rows == 1`; the
+        /// lemmas in `forward_tape`'s tests are what make that exact rather than approximate.
+        shape: scratchy_target_spyre::forward_tape::ForwardShape,
+        /// The ahead-filtered step list the launcher plays.
+        fsteps: Vec<scratchy_target_spyre::forward_tape::ForwardStep>,
+        /// The operands the tape build borrows.
+        fops: Vec<scratchy_subtile::host_tape::Operand>,
+        /// Whether this step's token exists only on the device (an ahead-step of the window).
+        ahead: bool,
+    }
+    let scaffold: Vec<WindowStep> = (0..n)
+        .map(|i| {
+            let p = start + i;
+            // ⭐ WHETHER THIS STEP'S TOKEN IS HOST-KNOWN — fixed before the loop: step 0 of a
+            // window binds its row from the host (the committed token at `start`), and every
+            // step past the committed count is an ahead-step whose token id exists only on the
+            // device (each is the previous step's argmax answer, read by the window's single
+            // synchronize). The scaffold carries the flag so the tape's EmbedRow filter and
+            // the launcher's empty `tokens` slice are ONE decision, made once.
+            let ahead = window > 0 && i >= toks.len();
+            // The body this launch RUNS: `step_body(p)` is the same selection `run_step(1, p, ..)`
+            // makes (same session, same `p`). ⛔ THE RUNNING BODY'S OWN ANSWER — not "solo decode
+            // never gathers", and not the bundle's. The one-request ladder mixes bodies under one
+            // bundle: the per-page bodies within one page gather nothing, the split-KV chunks past
+            // it gather every page, and the bundle's `KV_BLOCK_INDEX` placement is the chunk
+            // ceiling's. Asked of the bundle, a one-page context demanded a table its body never
+            // reads and the step refused.
+            let step = session.step_body(p).map_err(|e| {
+                werr(format!(
+                    "solo decode: the session could not say which body pos {p} runs: {e}"
+                ))
+            })?;
+            let shape = b.wiring.forward_shape(
+                scratchy_target_spyre::wiring::StagedRows::ONE,
+                prefix_placed,
+                step.gathers(),
+                consts.len(),
+            );
+            // ⭐⭐⭐⭐⭐ AN AHEAD-STEP'S TAPE DROPS THE EmbedRow STEP — the device gather
+            // chained off the previous step's argmax writes that row, and a staged
+            // (zero-filled) row would overwrite it in the preamble H2D. Every other step
+            // stays: the rope tables, the masks, the block index and the constants are all
+            // host-known per position.
+            let fsteps: Vec<_> = {
+                let all = shape.steps();
+                if ahead {
+                    all.into_iter()
+                        .filter(|s| {
+                            s.kernel
+                                != scratchy_target_spyre::forward_tape::ForwardKernel::EmbedRow
+                        })
+                        .collect()
+                } else {
+                    all
+                }
+            };
+            let fops = scratchy_target_spyre::forward_tape::operands(&fsteps);
+            Ok(WindowStep {
+                step,
+                shape,
+                fsteps,
+                fops,
+                ahead,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (i, sc) in scaffold.iter().enumerate() {
         // ⭐ THE TOKEN THIS STEP FEEDS — the committed one at position `start` for step
         // 0, and NOTHING for a window's ahead-steps: their token ids exist only on the
         // device (each is the previous step's argmax answer, read by the window's
@@ -1790,7 +1892,7 @@ pub(crate) fn superdsc_forward_chunk(
         // `start`) — the same bind the k=1 step makes, byte-identical to what the
         // previous step's gather wrote when one did, and REQUIRED when none did (the
         // first window after prefill: the prefill session runs no minted chain).
-        let ahead = window > 0 && i >= toks.len();
+        let ahead = sc.ahead;
         let tok_row = [tok.unwrap_or(0)];
         let p = start + i; // absolute position = valid prefix count this step
 
@@ -1803,9 +1905,9 @@ pub(crate) fn superdsc_forward_chunk(
         //
         // Note what disappeared with the `if let Some(mask_cap)` guard: a bake
         // fact no longer BRANCHES a bind, it decides whether the step exists.
-        // The constants themselves were HOISTED above the loop (#603 L2-1) — they
-        // are the same tables for every step of the window, bound once under
-        // `consts_key`.
+        // The constants, the body selection and the shape itself were HOISTED
+        // (#603 L2-1 / L2-2) — they are pure functions of the bundle and the
+        // step index, fixed before the loop runs.
         // ⛔ BUILT BEFORE THE SHAPE, so the step gate below can BE this value rather than a second
         // spelling of it. See the prefill path's note: a step with no source refuses loudly, but a
         // source with no step is a mask computed and never uploaded — read as all-zero, i.e. every
@@ -1829,38 +1931,6 @@ pub(crate) fn superdsc_forward_chunk(
                 },
             }
         });
-        // The body this launch RUNS: `step_body(p)` is the same selection `run_step(1, p, ..)` makes
-        // (same session, same `p`).
-        let step = session.step_body(p).map_err(|e| {
-            werr(format!(
-                "solo decode: the session could not say which body pos {p} runs: {e}"
-            ))
-        })?;
-        // ⭐ ONE ROW, and the SAME call prefill makes. Decode is the batched form at `rows == 1`;
-        // the lemmas in `forward_tape`'s tests are what make that exact rather than approximate.
-        let shape = b.wiring.forward_shape(
-            scratchy_target_spyre::wiring::StagedRows::ONE,
-            prefix_src.is_some(),
-            // ⛔ THE RUNNING BODY'S OWN ANSWER — not "solo decode never gathers", and not the
-            // bundle's. The one-request ladder mixes bodies under one bundle: the per-page bodies
-            // within one page gather nothing, the split-KV chunks past it gather every page, and
-            // the bundle's `KV_BLOCK_INDEX` placement is the chunk ceiling's. Asked of the bundle,
-            // a one-page context demanded a table its body never reads and the step refused.
-            step.gathers(),
-            consts.len(),
-        );
-        // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
-        // spec-derived from `half::f16::MAX`, so `exp(score + mask)` underflows to 0 and stays
-        // finite.
-        let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
-        // The new token's causal block: the one-row, one-real-row prompt-chunk key — row 0 attends
-        // column 0, the same triu law a prompt chunk takes per row. One key for every solo step, so
-        // the mask is bound once per session and never again.
-        let causal = scratchy_subtile::sdsc_abstract::CausalKey::chunk(
-            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
-            1,
-        )
-        .expect("one real row of a one-row rung");
         // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
         // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
         // token's page too.
