@@ -470,9 +470,13 @@ impl GatheredFold {
     }
 }
 
+/// ⭐ THE KV-HEAD COUNT IS NOT A FIELD. It was `nkvh: u32` — a runtime re-spelling of `NKVH`, the
+/// geometry const this assembler is instantiated at, carried in a struct so the batched arms could
+/// read it back as a local. That is the two-derivations defect: the count the arms classified on
+/// and the count the geometry states could drift apart, or be any model's. The arms now read the
+/// const through `assemble_attn_block`'s const generics, so there is nothing here to disagree with.
 #[derive(Clone, Copy)]
 struct BatchedKv {
-    nkvh: u32,
     /// The score leg batches only when its CONTRACTION is one stick — see [`OneStickContraction`].
     score: Option<OneStickContraction>,
     value: Option<()>,
@@ -567,10 +571,22 @@ impl ScoreArm {
     /// which is the tell: less work, done wrong). So the slab split is REQUIRED, not optional.
     ///
     /// Which leaves `nslab > 1` as a pure COST question: `nkvh*nslab` against `nqh`.
-    fn choose(nqh: u32, nkvh: u32, nslab: u32) -> ScoreArm {
+    ///
+    /// ⭐⭐⭐⭐⭐ THE GEOMETRY'S OWN CONSTS, NOT THREE `u32` ARGUMENTS. `nqh`, `nkvh` and `nslab` are
+    /// all compile-time facts of the lowering's instantiation — the model's head counts and
+    /// `head_dim / lanes` — so the arm is a const fn over the const generics and is chosen AT
+    /// INSTANTIATION. The old signature took `(nqh, nkvh, nslab)` as three bare `u32`s read from
+    /// whatever locals the call site had in scope: the count-transposition slot `AttnGeometry`'s
+    /// own doc names, and the classification-on-raw-head-counts spelling — a descriptor form
+    /// picked from numbers rather than from the geometry the descriptor is minted for. `nslab`
+    /// comes from `Shape::<HD>::slabs`, the const-generic form of the one `hd / lanes` law, so
+    /// this site no longer widens a runtime `hd` through `Shape::<0,0,0,0>::slabs_of` to
+    /// re-derive what the type already states.
+    const fn of_geometry<const NQH: u32, const NKVH: u32, const HD: u32>() -> ScoreArm {
         // The slab split satisfies dxp's one-stick contraction limit and, now that each operand
         // declares its own pitch, both stride relations too — at every head dim. So this is cost only.
-        if nkvh.saturating_mul(nslab) <= nqh {
+        let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16).get();
+        if NKVH.saturating_mul(nslab) <= NQH {
             ScoreArm::SlabSplitBatched
         } else {
             ScoreArm::PerHead
@@ -750,12 +766,18 @@ fn check_internal_buffers_are_read_where_written(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assemble_attn_block(
+fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
     t: u32,
     tag: &str,
-    nqh: u32,
-    hd: u32,
+    // ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE. This assembler takes the
+    // SAME `AttnGeometry` its caller was instantiated at, so `nqh`/`nkvh`/`hd` are CONST GENERICS
+    // here — a block cannot be assembled for a geometry its bundle was not: an nqh/nkvh
+    // transposition, or a head dim paired with another model's head counts, is a type that does
+    // not exist rather than two adjacent `u32` slots in a twenty-six-argument call. The score arm
+    // (`ScoreArm::of_geometry`) and the kernel mints below read the consts; the value the body's
+    // arithmetic uses is destructured ONCE at the door, exactly as `assemble_attn` does.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     // The chunk's REAL query rows and the shared-buffer row extent, typed apart: `mq` and `rows`
     // sat side by side as two `u32`s while `rows == nqh*mq` equals `mq_pad` exactly up to mq=2.
     // `rows` also carries the ROW REGIME (see `BlockRows`): the whole-batch and per-request forms
@@ -824,6 +846,11 @@ fn assemble_attn_block(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<(), SuperDscError> {
+    // Destructured ONCE, at the door — the boundary is where the swap lived (two `u32`s in a run
+    // of twenty-six); the body below is unchanged arithmetic on the same numbers, now each
+    // geometry's own consts. `nkvh` joins them because the batched arms read it where `BatchedKv`
+    // used to carry it as a field.
+    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     // THE MODEL'S QUERY HEADS AS TYPES. `QueryHead::all` is the only door, so a head handed to an
     // off-closure is in range by construction — not by a bounds check, and not by an `expect`.
     let nqh_nz = std::num::NonZeroU32::new(nqh)
@@ -988,7 +1015,7 @@ fn assemble_attn_block(
         // accumulate". The precondition was `PageScratch::of_pass`'s `slabs() != 1` refusal, so the prose
         // was true only while the door was shut — and the whole point of the door coming off is that at
         // hd=128 there ARE two slabs. An UNSPLIT `y`-batched contraction of two sticks is the shape
-        // `ScoreArm::choose` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
+        // `ScoreArm::of_geometry` records as MEASURED-TWICE incoherent inside dxp ("degenerate output at a
         // FASTER ITL, which is the tell: less work, done wrong"), and it is what the 8b's
         // wrong-from-the-first-token runs were emitting.
         //
@@ -1062,7 +1089,7 @@ fn assemble_attn_block(
                         // slab selected purely by OFFSET — the same discipline the ungathered arm uses.
                         // Declaring `stick` rows instead would re-derive the stick-GROUP stride as
                         // `stick*stk` where the tensor's is `hd*stk`.
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
                         &rb(sc, rows_n, width_n),
                         rn.score_rows(h0, width).off(),
@@ -1079,15 +1106,17 @@ fn assemble_attn_block(
         }
     }
     // TWO SEPARATE QUESTIONS, ASKED SEPARATELY: `b.score` is the LEGALITY witness (now unconditional —
-    // the contraction is slab-split), and `ScoreArm::cheaper` is the COST choice on top of it. Folding
-    // the cost into the witness would have made a hd=512 op-count REGRESSION look like a legality fact.
-    else if let Some(nkvh_b) = batched
-        .and_then(|b| b.score.map(|_| b.nkvh))
-        .filter(|&nkvh_b| ScoreArm::choose(nqh, nkvh_b, nslab) == ScoreArm::SlabSplitBatched)
+    // the contraction is slab-split), and `ScoreArm::of_geometry` is the COST choice on top of it.
+    // Folding the cost into the witness would have made a hd=512 op-count REGRESSION look like a
+    // legality fact. The arm reads the block's own const generics — the kv-head count is no longer
+    // a `BatchedKv` field re-spelling `NKVH` at runtime.
+    else if batched
+        .and_then(|b| b.score)
+        .is_some_and(|_| ScoreArm::of_geometry::<NQH, NKVH, HD>() == ScoreArm::SlabSplitBatched)
     {
-        let gqa = nqh / nkvh_b.max(1);
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh_b)
+        let nkvh_nz = std::num::NonZeroU32::new(nkvh)
             .ok_or_else(|| SuperDscError("a batched score needs at least one kv head".into()))?;
+        let gqa = nqh / nkvh_nz.get();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // THE GROUP'S FIRST QUERY HEAD, FROM THE TYPE — not `kvh * gqa` spelled here.
             //
@@ -1180,7 +1209,7 @@ fn assemble_attn_block(
                         bmm_form,
                         &rb(qs, mq_n, hd),
                         nests.token_stream_by_slab(h0, s),
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
                         &rb(sc, rows_n, width_n),
                         nests.score_rows(h0, width).off(),
@@ -1218,7 +1247,7 @@ fn assemble_attn_block(
                         score_form,
                         &rb(qs, mq_n, hd),
                         nests.token_stream_by_slab(h0, s),
-                        &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                        &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
                         &rb(sc, rows_n, width_n),
                         nests.score_rows(h0, width).off(),
@@ -1253,7 +1282,7 @@ fn assemble_attn_block(
                 qs_off,
                 // Slab 0: this arm contracts the WHOLE head dim in one op (`MatY::unbatched()`), so
                 // there is no split and the kernel's base is the head's own feature origin.
-                &Stk::<KernelTag>::kernel(hd as usize, kt_stride.n_out_cols(), kt_kernel),
+                &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                 kt_off_fn(h, 0),
                 &rb(sc, rows_n, width_n),
                 nests.score_rows(hi, width).off(),
@@ -1551,7 +1580,7 @@ fn assemble_attn_block(
                         // row is a byte-for-byte copy of the V page plane, so `v_stride` is the pool's own
                         // `PAGE_SLOTS` on both the gathered and ungathered paths. It used to be ONE
                         // WINDOW, which is what made the gathered geometry differ from the pool's at all.
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
                         &rb(run_o, rows_n, hd),
                         rn.head_major(h0, s),
@@ -1568,12 +1597,13 @@ fn assemble_attn_block(
             }
         }
     }
-    // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared.
-    else if let Some(nkvh_b) = batched.and_then(|b| b.value.map(|_| b.nkvh)) {
-        let gqa = nqh / nkvh_b.max(1);
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh_b).ok_or_else(|| {
+    // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared. The
+    // kv-head count is the geometry's own `NKVH` const, not a `BatchedKv` field.
+    else if batched.and_then(|b| b.value).is_some() {
+        let nkvh_nz = std::num::NonZeroU32::new(nkvh).ok_or_else(|| {
             SuperDscError("a batched value matmul needs at least one kv head".into())
         })?;
+        let gqa = nqh / nkvh_nz.get();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // Same total conversion as the score side above — the two must agree about which query head
             // owns a kv head's kernel, and they agree because there is only one function that says so.
@@ -1638,7 +1668,7 @@ fn assemble_attn_block(
                         // `fold_request_axis_strides.rs` off the emitted per-core addresses.
                         &rb(expb, rows_n, width_n),
                         nests.score_rows(h0, width),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
                         // ⛔ THE SAME PLACEMENT THE PER-HEAD ARM BELOW WRITES. Both arms produce this
                         // buffer, and they used to answer "where does head `h` live" differently — this
@@ -1679,7 +1709,7 @@ fn assemble_attn_block(
                         bmm_form,
                         &rb(expb, rows_n, width_n),
                         nests.score_rows(h0, width).off(),
-                        &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
                         &rb(run_o, rows_n, hd),
                         nests.head_major(h0, s),
@@ -1756,7 +1786,7 @@ fn assemble_attn_block(
                     bmm_form,
                     &rb(expb, rows_n, width_n),
                     nests.score_rows(hi, width).off(),
-                    &Stk::<KernelTag>::kernel(v_stride as usize, hd as usize, v_kernel),
+                    &Stk::<KernelTag>::kernel(v_stride as usize, HD as usize, v_kernel),
                     v_off_fn(h, s),
                     &rb(run_o, rows_n, hd),
                     nests.head_major(hi, s),
@@ -3966,7 +3996,6 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // written, the score leg takes the per-head arm — a gate on "is the contraction one stick", which
     // is the form's REAL precondition, not on the head dim.
     let batched_kv = batched.map(|()| BatchedKv {
-        nkvh,
         // ⭐ UNCONDITIONAL NOW: the score leg contracts ONE SLAB per op, so its contraction is one
         // stick at every head dim and the witness needs no extent to inspect. The head-dim gate this
         // replaces is gone, not widened — `of_contraction` remains for legs that have not been split.
@@ -4093,7 +4122,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     //   forcing `ScoreArm::PerHead` emits 4x the ops (32 of `y=1` instead of 8 of `y=gqa`) at IDENTICAL
     //   launch count (1082), trips and rows, and bs=8 compute went 51.0 → 63.3 ms — +12.3 ms over +8640
     //   op executions = **1.42 µs per op**, against ~28 µs for a fold pass. Op count is ~20x cheaper
-    //   than a pass. (Corollary, unrelated but measured here: `ScoreArm::choose` picks correctly at
+    //   than a pass. (Corollary, unrelated but measured here: `ScoreArm::of_geometry` picks correctly at
     //   hd=64 — the batched arm really is faster on the card, 51.0 vs 63.3, so that cost model needs no
     //   revisit.)
     //
@@ -4249,8 +4278,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     };
                     if per_req { format!("{b}_r{r}") } else { b }
                 },
-                nqh,
-                hd,
+                geom,
                 width.mq(),
                 block_rows,
                 qs,
@@ -4866,8 +4894,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             &mut ops,
             t,
             &format!("p{b}"),
-            nqh,
-            hd,
+            geom,
             width.mq(),
             block_rows,
             qs,
