@@ -1265,9 +1265,6 @@ struct StagedActivations {
 struct DecodeWindow {
     /// k — the number of steps this window runs (`window_begin`'s argument).
     k: usize,
-    /// Steps enqueued so far — also the pool slot index the next step's idx D2H
-    /// targets (slot i is step i's, so the words survive until the one sync).
-    next: usize,
     /// The wiring's idx stick, resolved ONCE at begin from the PlaceId the caller
     /// states: the placement window the per-step D2H reads, its byte length, and
     /// the vocab the sentinel is measured against (the minted chain's own V — the
@@ -1281,6 +1278,36 @@ struct DecodeWindow {
     staged: Vec<Vec<(SegIdx, u64, Vec<u8>)>>,
     /// CBs enqueued so far — the running side of the §4.7 outstanding-CB budget.
     cbs: u64,
+}
+
+/// ⭐⭐⭐⭐⭐ ONE WINDOW STEP'S ANSWER SEAT (#603 L2-1 race fix) — the pool slot
+/// step I's idx readback lands in, AS A TYPE. The slot is a function of the
+/// step index alone and is minted only from a step's [`WindowTurn`], so there
+/// is no bare-usize path from "a step" to "a seat": a slot that aliases
+/// another step's answer does not compile.
+#[derive(Clone, Copy)]
+pub struct AnswerSlot {
+    step: usize,
+}
+
+/// ⭐⭐⭐⭐⭐ THE WINDOW'S TURN — THE READ HANDLE (#603 L2-1 race fix).
+/// `window_begin` mints the step-0 turn; each `window_step` CONSUMES step I's
+/// turn — which exists only because step I's idx readback was already
+/// ENQUEUED, FIFO-behind step I's argmax and FIFO-ahead of step I+1's replay —
+/// and mints step I+1's; `window_finish` consumes the last.
+///
+/// That is the whole fix for the readback race: the stick is ONE device seat
+/// every step's forward overwrites, so a step's read is only safe before the
+/// NEXT step's write. The turn makes that order OWNERSHIP — the enqueue of
+/// step I+1 needs the handle step I's read produced, so a read that would
+/// alias a later step's write has no spelling: the handle is moved into the
+/// next enqueue, and using it after that is a compile error, not a race a
+/// starved enqueue thread can widen. (It replaces `DecodeWindow`'s bare
+/// `next: usize` — a shadow counter the caller's loop discipline had to keep
+/// in step with the executor's, which is exactly the desync shape the typed
+/// rework is deleting everywhere else too.)
+pub struct WindowTurn {
+    slot: AnswerSlot,
 }
 
 /// The per-step DMA CB count the window's begin-time budget check assumes — the
@@ -4844,10 +4871,11 @@ impl Executor {
     // ──────────────────────────────────────────────────────────────────────────────────────────
 
     /// ⭐⭐⭐⭐⭐ OPEN A k-STEP DECODE WINDOW (#603 PR3b) — resolve once what every step
-    /// shares, refuse once what every step would refuse, and set the live
-    /// [`DecodeWindow`]. Between this and [`Self::window_finish`] the caller drives
-    /// exactly k × [`Self::window_step`]; the window's whole point is that no host
-    /// round trip, no tag return, and no synchronize happens in between.
+    /// shares, refuse once what every step would refuse, set the live
+    /// [`DecodeWindow`], and MINT the step-0 [`WindowTurn`]. Between this and
+    /// [`Self::window_finish`] the caller drives exactly k × [`Self::window_step`],
+    /// threading the turn each step hands back; the window's whole point is that
+    /// no host round trip, no tag return, and no synchronize happens in between.
     ///
     /// The refusals mirror the k=1 token step's own, hoisted to once-per-window:
     /// the idx stick must be placed and non-empty — the window's
@@ -4861,7 +4889,12 @@ impl Executor {
     /// slots, rebuilds it here — safe
     /// because the previous window's finish synchronized, retiring every transfer
     /// the old slots served (the pool's own drop law).
-    pub fn window_begin(&mut self, k: usize, stick: bundle::PlaceId, vocab: usize) -> Result<()> {
+    pub fn window_begin(
+        &mut self,
+        k: usize,
+        stick: bundle::PlaceId,
+        vocab: usize,
+    ) -> Result<WindowTurn> {
         if !self.prepared {
             bail!("window_begin before prepare");
         }
@@ -4958,14 +4991,15 @@ impl Executor {
         }
         self.decode_window = Some(DecodeWindow {
             k,
-            next: 0,
             idx_win,
             idx_bytes: len,
             idx_vocab: vocab,
             staged: Vec::with_capacity(k),
             cbs: 0,
         });
-        Ok(())
+        Ok(WindowTurn {
+            slot: AnswerSlot { step: 0 },
+        })
     }
 
     /// ⭐⭐⭐⭐⭐ ENQUEUE ONE STEP OF THE OPEN WINDOW (#603 PR3b). The caller binds this
@@ -4988,17 +5022,22 @@ impl Executor {
     /// draining the empty DMA deques); (3) the forward — the SAME replay-or-walk
     /// decision the k=1 step takes, which is why an instrumented run walks inside
     /// windows (correct, degraded, and the rbgap legs depend on it); (4) the idx D2H
-    /// into this step's pool slot, compute-pipelined FIFO-behind the gather and
-    /// FIFO-ahead of the next step's replay, which overwrites the stick — the
-    /// queue's order is the only thing that lets one stick serve k steps.
+    /// into this step's OWN pool seat ([`AnswerSlot`] — a function of the turn's
+    /// step index), compute-pipelined FIFO-behind the gather and FIFO-ahead of
+    /// the next step's replay, which overwrites the stick — the queue's order is
+    /// the only thing that lets one stick serve k steps, and the TURN this step
+    /// returns is what makes that order the caller's BY TYPE: the next step's
+    /// enqueue consumes it, so a read that would land after a later step's
+    /// stick-write has no spelling.
     ///
     /// No synchronize, no tag return, no host read. An error here abandons the
     /// window WITH its in-flight CBs: the state stays in place (the staged
     /// snapshots must outlive their H2Ds; the teardown drain retires them), the
-    /// error propagates to the request, and §4.8's recovery is the caller's (mark
-    /// errored, discard uncommitted tokens, stop enqueueing) — never a mid-window
-    /// k=1 fallback.
-    pub fn window_step(&mut self, seq_pos: SeqPos) -> Result<()> {
+    /// consumed turn is NOT returned — an abandoned window can be neither
+    /// stepped nor finished, exactly §4.8's "mark errored, stop enqueueing" —
+    /// and the error propagates to the request — never a mid-window k=1
+    /// fallback.
+    pub fn window_step(&mut self, turn: WindowTurn, seq_pos: SeqPos) -> Result<WindowTurn> {
         let d = Diag::get();
         // The state is TAKEN for the body — the body needs `&mut self` throughout
         // (binds, staging, the replay, the pool door) — and goes back on BOTH arms:
@@ -5009,7 +5048,7 @@ impl Executor {
             .decode_window
             .take()
             .ok_or_else(|| anyhow!("window_step: no window is open — window_begin opens one"))?;
-        let step = self.window_step_inner(&mut win, seq_pos, d);
+        let step = self.window_step_inner(&mut win, turn, seq_pos, d);
         self.decode_window = Some(win);
         step
     }
@@ -5017,14 +5056,15 @@ impl Executor {
     fn window_step_inner(
         &mut self,
         win: &mut DecodeWindow,
+        turn: WindowTurn,
         seq_pos: SeqPos,
         d: &Diag,
-    ) -> Result<()> {
-        if win.next >= win.k {
+    ) -> Result<WindowTurn> {
+        if turn.slot.step >= win.k {
             bail!(
                 "window_step: the window is full ({} of {} steps enqueued) — \
                  window_finish retires it",
-                win.next,
+                turn.slot.step,
                 win.k
             );
         }
@@ -5130,35 +5170,48 @@ impl Executor {
             }
         };
 
-        // (4) The idx D2H into this step's pool slot, on the compute pipeline —
-        // #544's junction law once more: FIFO-behind this step's argmax (the slot
+        // (4) The idx D2H into this step's OWN pool seat, on the compute pipeline —
+        // #544's junction law once more: FIFO-behind this step's argmax (the seat
         // gets its word only after the kernel answers), FIFO-ahead of the next
-        // step's replay (which overwrites the stick).
-        let slot = win.next;
+        // step's replay (which overwrites the stick). The seat is the TURN's —
+        // step I's answer lands in step I's seat, and the turn handed to step
+        // I+1's enqueue is the proof this read was already on the queue.
+        let slot = turn.slot;
         self.stream_ref()?
             .pooled_copy_on_compute(
                 self.idx_pool.as_ref().expect("window_begin built the pool"),
-                slot,
+                slot.step,
                 &win.idx_win,
                 false,
             )
             .map_err(|e| {
                 anyhow!(
-                    "window_step (pos {}): idx D2H ({} B) into pool slot {slot}: {e:?}",
+                    "window_step (pos {}): idx D2H ({} B) into pool slot {step}: {e:?}",
                     seq_pos.0,
-                    win.idx_bytes
+                    win.idx_bytes,
+                    step = slot.step
                 )
             })?;
 
-        // The state commit — only now, after every enqueue succeeded.
+        // The state commit — only now, after every enqueue succeeded. The step
+        // counter is NOT executor state anymore: the NEXT turn is the return
+        // value, and the caller cannot enqueue step I+1 without handing over
+        // the turn whose seat this step just filled.
         win.cbs += cbs_this as u64 + (runs.len() + 1) as u64;
         win.staged.push(runs);
-        win.next += 1;
-        Ok(())
+        Ok(WindowTurn {
+            slot: AnswerSlot {
+                step: slot.step + 1,
+            },
+        })
     }
 
     /// ⭐⭐⭐⭐⭐ RETIRE THE OPEN WINDOW (#603 PR3b) — THE ONE SYNCHRONIZE, the k words,
-    /// and the epilogue. Everything the steps enqueued (the per-step preamble H2Ds
+    /// and the epilogue. Consumes the FINAL [`WindowTurn`]: only a turn for step
+    /// k reaches here, because each step's turn was minted by that step's own
+    /// enqueue — a window nobody finished driving cannot be retired, and one
+    /// nobody finished enqueueing refuses by turn count below. Everything the
+    /// steps enqueued (the per-step preamble H2Ds
     /// from their own snapshots, the replays or walks, the idx D2Hs into the pool
     /// slots) retires here; this single host wait is the window itself — the
     /// loop-closure primitive's re-engagement point, one per k steps instead of one
@@ -5175,23 +5228,26 @@ impl Executor {
     /// COMMIT (outside the executor), so a short window here is a wiring bug, not a
     /// schedule. The pool STAYS: later windows reuse its IOVAs; only a larger k
     /// rebuilds it, at the next `window_begin` (between windows, per its drop law).
-    pub fn window_finish(&mut self) -> Result<Vec<u32>> {
+    pub fn window_finish(&mut self, turn: WindowTurn) -> Result<Vec<u32>> {
         let d = Diag::get();
-        let (k, next, idx_vocab) = {
+        let (k, idx_vocab) = {
             let Some(win) = self.decode_window.as_ref() else {
                 bail!("window_finish: no window is open");
             };
-            (win.k, win.next, win.idx_vocab)
+            (win.k, win.idx_vocab)
         };
-        if next != k {
+        // The turn is the count: the LAST turn's step index is how many steps were
+        // enqueued, and a turn for step k only exists because k steps ran.
+        if turn.slot.step != k {
             bail!(
-                "window_finish: {next} of {k} steps enqueued — v1 runs every window step \
+                "window_finish: {} of {k} steps enqueued — v1 runs every window step \
                  before finishing (the engine discards a clipped tail at COMMIT, never \
-                 the executor mid-window); a short window is a wiring bug"
+                 the executor mid-window); a short window is a wiring bug",
+                turn.slot.step
             );
         }
         // ⭐ THE ONE SYNCHRONIZE — the window's only host wait. The staged snapshots'
-        // lifetimes and the pool slots' reads both hang off it.
+        // lifetimes and the pool seats' reads both hang off it.
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("window_finish: sync: {e}"))?;
@@ -5201,8 +5257,13 @@ impl Executor {
             .expect("window_begin built the pool before any window step ran");
         let mut ids = Vec::with_capacity(k);
         for i in 0..k {
-            // Slot i is step i's — `window_step`'s D2H targeted it by construction.
-            let word: [u8; 4] = pool.slot(i).expect("window_begin sized the pool to k")[..4]
+            // Seat i is step i's — the slot is a function of the step index alone,
+            // minted from the turn the step consumed (`AnswerSlot`, never a bare
+            // usize from outside this module).
+            let slot = AnswerSlot { step: i };
+            let word: [u8; 4] = pool
+                .slot(slot.step)
+                .expect("window_begin sized the pool to k")[..4]
                 .try_into()
                 .expect("the slot is the stick's aligned placement, at least one word wide");
             let idx = u32::from_le_bytes(word);

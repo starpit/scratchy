@@ -606,12 +606,14 @@ impl SuperDscSession {
     /// own doc is the contract. `stick` is the argmax rung's idx stick (the wiring's
     /// `argmax_row_feedback` pair names it), `vocab` the sentinel check's own bound —
     /// the same `geometry.vocab` the k=1 token step's `checked_picked_token` reads.
+    /// Returns the step-0 [`WindowTurn`] the caller threads through every step's
+    /// enqueue and hands to the finish.
     pub fn run_window_begin(
         &mut self,
         k: usize,
         stick: crate::bundle_code::PlaceId,
         vocab: usize,
-    ) -> Result<()> {
+    ) -> Result<crate::superdsc_exec::WindowTurn> {
         self.exec.window_begin(k, stick, vocab)
     }
 
@@ -622,27 +624,36 @@ impl SuperDscSession {
     /// exclusion of the ahead-steps' embedding row is the CALLER'S (it filters the
     /// `EmbedRow` step off the tape before playing it — the device gather chained off
     /// the argmax is what writes that row). No synchronize, no readback.
+    ///
+    /// CONSUMES step I's [`WindowTurn`] — proof step I's readback was enqueued
+    /// before this step's forward — and returns step I+1's; see the executor's own
+    /// doc for the race that makes the turn the fix.
     pub fn run_window_step(
         &mut self,
+        turn: crate::superdsc_exec::WindowTurn,
         seq_pos: usize,
         activations: &[crate::wiring::Bind],
         activations_f16: &[(crate::bundle_code::PlaceId, Vec<u8>)],
         activations_i32: &[(crate::bundle_code::PlaceId, Vec<u8>)],
-    ) -> Result<()> {
+    ) -> Result<crate::superdsc_exec::WindowTurn> {
         self.bind_activations(
             activations,
             activations_f16,
             activations_i32,
             step_parity(SeqPos(seq_pos as i64)),
         )?;
-        self.exec.window_step(SeqPos(seq_pos as i64))
+        self.exec.window_step(turn, SeqPos(seq_pos as i64))
     }
 
     /// ⭐⭐⭐⭐⭐ RETIRE THE OPEN WINDOW — the runner door over
     /// [`Executor::window_finish`](crate::superdsc_exec::Executor::window_finish):
-    /// the ONE synchronize, the k sentinel-checked words, the epilogue.
-    pub fn run_window_finish(&mut self) -> Result<Vec<u32>> {
-        self.exec.window_finish()
+    /// the ONE synchronize, the k sentinel-checked words, the epilogue. Consumes
+    /// the final [`WindowTurn`] — the count it checks is the turn's own.
+    pub fn run_window_finish(
+        &mut self,
+        turn: crate::superdsc_exec::WindowTurn,
+    ) -> Result<Vec<u32>> {
+        self.exec.window_finish(turn)
     }
 
     /// The [`BindKey`] this session's staged activation `id` was last bound under, if it was bound

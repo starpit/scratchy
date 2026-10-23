@@ -1430,22 +1430,20 @@ pub fn constant_steps(
 /// The launcher that turns tape steps into the `acts` list a SuperDSC step
 /// binds — spyre's `h2d`, for constants.
 ///
-/// ⛔ IT STAGES, THEN UPLOADS, rather than looking the value up on `h2d`. The
-/// shortcut (have `h2d` find the constant by tid and skip `host_call`) would
-/// work and would be shorter, but it would model a host kernel as doing
-/// nothing, and the whole claim being tested is that a constant IS a kernel
-/// whose output happens to go up. Staging keeps the two halves distinct, and
-/// the tid assertion below then actually checks that the step's kernel and its
-/// operand agree — a check the shortcut cannot make because it has no second
-/// opinion to compare against.
+/// ⭐ THE STAGE IS THE BIND'S TWO HALVES (#603): `host_call` returns the
+/// constant the kernel produced, WITH its tid, and `h2d_staged` consumes that
+/// pair into a bind. There is no launcher state between the two calls, so the
+/// step's kernel and its upload cannot name different tensors — the old
+/// tid-agreement check (staged tid vs the operand's) checked exactly the
+/// disagreement this shape cannot spell, and the nothing-staged refusal
+/// likewise: an upload without a kernel's output has no code path.
 pub struct ActsLauncher<'a> {
     consts: &'a [(u32, ConstValues)],
-    staged: Option<(u32, &'a ConstValues)>,
     /// The binds, in play order — handed to `run_step` verbatim.
     pub acts: Vec<Bind>,
 }
 
-/// A tape step named a kernel and an operand that disagree.
+/// A tape step named a kernel that does not exist.
 #[derive(Debug)]
 pub struct LaunchError(pub String);
 
@@ -1453,41 +1451,39 @@ impl<'a> ActsLauncher<'a> {
     pub fn new(consts: &'a [(u32, ConstValues)]) -> Self {
         Self {
             consts,
-            staged: None,
             acts: Vec::with_capacity(consts.len()),
         }
     }
 }
 
-impl scratchy_subtile::host_tape::Launcher for ActsLauncher<'_> {
+impl<'a> scratchy_subtile::host_tape::Launcher for ActsLauncher<'a> {
     type Error = LaunchError;
 
-    fn host_call(&mut self, k: scratchy_subtile::host_tape::KernelId) -> Result<(), Self::Error> {
+    /// The constant the kernel produced, with its tid.
+    type Stage = (u32, &'a ConstValues);
+
+    fn host_call(
+        &mut self,
+        k: scratchy_subtile::host_tape::KernelId,
+    ) -> Result<Self::Stage, Self::Error> {
         let c = self
             .consts
             .get(k.0 as usize)
             .ok_or_else(|| LaunchError(format!("no constant kernel {}", k.0)))?;
-        self.staged = Some((c.0, &c.1));
+        Ok((c.0, &c.1))
+    }
+
+    fn h2d_staged(&mut self, stage: Self::Stage) -> Result<(), Self::Error> {
+        let (tid, vals) = stage;
+        self.acts.push((bundle::PlaceId::Act(tid), vals.to_cow()));
         Ok(())
     }
 
     fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
-        let (tid, vals) = self
-            .staged
-            .take()
-            .ok_or_else(|| LaunchError(format!("h2d t{} with nothing staged", t.0)))?;
-        // The step's OPERAND and its KERNEL must name the same tensor. They are
-        // built from one list so they agree by construction — which is exactly
-        // why checking is cheap and why a future generated tape, where they
-        // come from different emission sites, gets the check for free.
-        if tid != t.0 {
-            return Err(LaunchError(format!(
-                "step uploads t{} but its kernel produced t{tid}",
-                t.0
-            )));
-        }
-        self.acts.push((bundle::PlaceId::Act(tid), vals.to_cow()));
-        Ok(())
+        Err(LaunchError(format!(
+            "h2d t{} — the constant tape has no input-side uploads",
+            t.0
+        )))
     }
 
     fn d2h(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
@@ -1554,24 +1550,42 @@ mod constant_tape_tests {
 
     use scratchy_subtile::host_tape::{HostTape, KernelId, Launcher, TensorId, play};
 
-    #[derive(Default)]
-    struct Trace(Vec<String>);
+    /// Records what the player asked for, in order. `host_call` returns the
+    /// tid of the constant its kernel produced — the stage carries the bind's
+    /// identity, exactly as `ActsLauncher`'s stage carries the pair.
+    struct Trace {
+        tids: Vec<u32>,
+        log: Vec<String>,
+    }
+    impl Trace {
+        fn new(tids: Vec<u32>) -> Self {
+            Self {
+                tids,
+                log: Vec::new(),
+            }
+        }
+    }
     impl Launcher for Trace {
         type Error = ();
+        type Stage = TensorId;
+        fn host_call(&mut self, k: KernelId) -> Result<TensorId, ()> {
+            self.log.push(format!("host {}", k.0));
+            Ok(TensorId(self.tids[k.0 as usize]))
+        }
+        fn h2d_staged(&mut self, t: TensorId) -> Result<(), ()> {
+            self.log.push(format!("h2d {}", t.0));
+            Ok(())
+        }
         fn h2d(&mut self, t: TensorId) -> Result<(), ()> {
-            self.0.push(format!("h2d {}", t.0));
+            self.log.push(format!("h2d {}", t.0));
             Ok(())
         }
         fn d2h(&mut self, t: TensorId) -> Result<(), ()> {
-            self.0.push(format!("d2h {}", t.0));
+            self.log.push(format!("d2h {}", t.0));
             Ok(())
         }
         fn launch(&mut self, k: KernelId) -> Result<(), ()> {
-            self.0.push(format!("launch {}", k.0));
-            Ok(())
-        }
-        fn host_call(&mut self, k: KernelId) -> Result<(), ()> {
-            self.0.push(format!("host {}", k.0));
+            self.log.push(format!("launch {}", k.0));
             Ok(())
         }
     }
@@ -1610,7 +1624,7 @@ mod constant_tape_tests {
             let ops = constant_operands(&consts);
             let steps = constant_steps(&ops);
 
-            let mut t = Trace::default();
+            let mut t = Trace::new(consts.iter().map(|&(tid, _)| tid).collect());
             play(&HostTape { steps: &steps }, &mut t).expect("plays");
 
             // Every constant is: run its host kernel, then upload it.
@@ -1620,7 +1634,7 @@ mod constant_tape_tests {
                 .flat_map(|(i, (tid, _))| [format!("host {i}"), format!("h2d {tid}")])
                 .collect();
             assert_eq!(
-                t.0, want,
+                t.log, want,
                 "rows={rows}: the tape must visit the same constants, in the same order, \
                  as the list the live binder pushes"
             );

@@ -448,7 +448,6 @@ pub(crate) fn run_prefill_batch(
         shape: &shape,
         steps: &fsteps,
         inputs: &inputs,
-        staged: None,
         acts: Vec::with_capacity(fsteps.len()),
         acts_f16: Vec::new(),
         acts_i32: Vec::new(),
@@ -466,7 +465,6 @@ pub(crate) fn run_prefill_batch(
         index_held: false,
         consts_keyed: Vec::new(),
         index_keyed: None,
-        held_skips: Vec::new(),
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -719,10 +717,6 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     pub(crate) shape: &'a scratchy_target_spyre::forward_tape::ForwardShape,
     pub(crate) steps: &'a [scratchy_target_spyre::forward_tape::ForwardStep],
     pub(crate) inputs: &'a scratchy_target_spyre::forward_tape::ForwardInputs<'a, V>,
-    pub(crate) staged: Option<(
-        scratchy_target_spyre::bundle_code::PlaceId,
-        scratchy_target_spyre::forward_tape::Staged,
-    )>,
     pub(crate) acts: Vec<scratchy_target_spyre::wiring::Bind>,
     /// Binds already in the DEVICE's format — the batched prefix mask, and nothing else today.
     pub(crate) acts_f16: Vec<(scratchy_target_spyre::bundle_code::PlaceId, Vec<u8>)>,
@@ -771,19 +765,41 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
         scratchy_target_spyre::superdsc_exec::BindKey,
         Vec<u8>,
     )>,
-    /// The tensor ids whose `host_call` staged NOTHING because the session holds their key — the
-    /// tids `h2d` must accept with nothing staged. One list for all three held-key skips, so a new
-    /// skip cannot forget its h2d leg.
-    pub(crate) held_skips: Vec<u32>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
+}
+
+/// ⭐ WHAT ONE FORWARD STEP LEFT FOR ITS UPLOAD (#603 L2-1 rework) — the typed
+/// value `host_call` returns and `h2d_staged` consumes. There is no launcher
+/// state between the two calls, so nothing can desync:
+///
+/// - a HELD key is `Held` — the upload is a no-op BY TYPE, not a tid in a skip
+///   list the transfer had to cross-check (the list is gone, and with it the
+///   desync that killed the first L2-1 cell: a `Const` step's operand id is a
+///   PLACEHOLDER (`u32::MAX`), so the cross-check could never see the real
+///   tid the skip list held);
+/// - a produced value carries its own place — the operand's declared tid is
+///   never consulted for routing, on any step.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum StepStage {
+    /// The session already holds this launch's key: nothing to bind.
+    Held,
+    /// The kernel's output, with the place it binds.
+    Values {
+        tensor: scratchy_target_spyre::bundle_code::PlaceId,
+        staged: scratchy_target_spyre::forward_tape::Staged,
+    },
 }
 
 #[cfg(feature = "spyre-hw")]
 impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLauncher<'_, V> {
     type Error = String;
+    type Stage = StepStage;
 
-    fn host_call(&mut self, k: scratchy_subtile::host_tape::KernelId) -> Result<(), Self::Error> {
+    fn host_call(
+        &mut self,
+        k: scratchy_subtile::host_tape::KernelId,
+    ) -> Result<Self::Stage, Self::Error> {
         let step = self
             .steps
             .get(k.0 as usize)
@@ -804,9 +820,9 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
         };
         // ⭐ A HELD KEY BUILDS NOTHING. A keyed tensor's bytes are a function of its key alone, so
         // a session that already holds this launch's key already holds this launch's bytes, and the
-        // step stages nothing for `h2d` to bind. One arm per keyed kind — causal mask, constant
-        // table, gather index — and one place (`held_skips`) that tells `h2d` which tids were
-        // skipped on purpose, so a new skip cannot strand its transfer.
+        // step's stage SAYS SO — `Held`, the typed no-op the upload consumes. One arm per keyed
+        // kind (causal mask, constant table, gather index); there is no skip list for a transfer to
+        // consult and no tid to match, so a new skip cannot strand anything.
         let held_here = match step.kernel {
             scratchy_target_spyre::forward_tape::ForwardKernel::CausalMask => {
                 self.causal_held
@@ -823,55 +839,55 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             _ => false,
         };
         if held_here {
-            self.held_skips.push(tensor.tid());
-            self.staged = None;
-            return Ok(());
+            return Ok(StepStage::Held);
         }
         let staged =
             scratchy_target_spyre::forward_tape::kernel_values(step, self.shape, self.inputs)?;
-        self.staged = Some((tensor, staged));
-        Ok(())
+        Ok(StepStage::Values { tensor, staged })
     }
 
-    fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
-        let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
-        let Some((tensor, staged)) = self.staged.take() else {
-            // The steps that stage nothing: a held-key skip, whose tid `host_call` recorded. A
-            // held-key skip with a tid NOT in that list is a tape/launcher desync and stays a
-            // refusal.
-            return if self.held_skips.contains(&t.0) {
-                Ok(())
-            } else {
-                Err("h2d with nothing staged".to_string())
-            };
+    fn h2d_staged(&mut self, stage: Self::Stage) -> Result<(), Self::Error> {
+        // The KERNEL decided the format; the transfer just honours it. The stage's
+        // own place routes the bind — never the operand's declared tid (a `Const`
+        // step's is a placeholder), never the format.
+        let StepStage::Values { tensor, staged } = stage else {
+            // `Held`: the session keeps this key's bytes — nothing to bind.
+            return Ok(());
         };
-        // The KERNEL decided the format; the transfer just honours it.
+        let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
+        // ⭐ THE KEYED ROUTES, each asked ONCE: the causal tensor by its reserved
+        // tid; a constant table by membership in the consts LIST (only under a
+        // keyed launch, so no prefill table can ride the door); the gather index
+        // by its reserved tid under its key. Everything else is per-step.
+        let consts_keyed = self.consts_key.filter(|_| {
+            self.inputs
+                .consts
+                .iter()
+                .any(|&(tid, _)| tid == tensor.tid())
+        });
+        let index_keyed = self.index_key.filter(|_| {
+            tensor.tid()
+                == scratchy_target_spyre::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID
+        });
         match staged {
-            // A NEW causal key: bound keyed, so it is uploaded once and not re-sent per step.
-            scratchy_target_spyre::forward_tape::Staged::F32(v) if tensor.tid() == causal_tid => {
-                self.causal_keyed = Some((tensor, self.inputs.causal, v));
-            }
-            // ⭐ A CONSTANT TABLE UNDER THE CONSTS KEY (#603 L2-1): routed to the keyed bind, not
-            // [`Self::acts`], so it is uploaded once per key and never re-sent per step. Routed by
-            // the consts LIST — the tids a `Const` step stages — never by format, so no other f32
-            // tensor (the per-step rope tables, the embedding row) can ride the keyed door.
-            scratchy_target_spyre::forward_tape::Staged::F32(v)
-                if self.consts_key.is_some_and(|_| {
-                    self.inputs
-                        .consts
-                        .iter()
-                        .any(|&(tid, _)| tid == tensor.tid())
-                }) =>
-            {
-                let key = self
-                    .consts_key
-                    .expect("the guard above proved the key exists");
-                self.consts_keyed.push((tensor, key, v));
-            }
             scratchy_target_spyre::forward_tape::Staged::F32(v) => {
-                // `Staged::F32` already carries the borrow/own distinction — a computed kernel
-                // output is Owned, a constant table is Borrowed — so it passes straight through.
-                self.acts.push((tensor, v))
+                if tensor.tid() == causal_tid {
+                    // A NEW causal key: bound keyed, so it is uploaded once and not re-sent per
+                    // step.
+                    self.causal_keyed = Some((tensor, self.inputs.causal, v));
+                } else if let Some(key) = consts_keyed {
+                    // ⭐ A CONSTANT TABLE UNDER THE CONSTS KEY (#603 L2-1): routed to the keyed
+                    // bind, not [`Self::acts`], so it is uploaded once per key and never re-sent
+                    // per step. Routed by the consts LIST — the tids a `Const` step stages —
+                    // never by format, so no other f32 tensor (the per-step rope tables, the
+                    // embedding row) can ride the keyed door.
+                    self.consts_keyed.push((tensor, key, v));
+                } else {
+                    // `Staged::F32` already carries the borrow/own distinction — a computed kernel
+                    // output is Owned, a constant table is Borrowed — so it passes straight
+                    // through.
+                    self.acts.push((tensor, v));
+                }
             }
             scratchy_target_spyre::forward_tape::Staged::F16(b) => self.acts_f16.push((tensor, b)),
             // ⛔ ITS OWN LIST, AND ITS OWN BIND CALL. Routing int32 entries through `acts` would
@@ -886,16 +902,10 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                     // is what `as_i32` exists for. Everything upstream of here carries the type.
                     bytes.extend_from_slice(&e.as_i32().to_le_bytes());
                 }
-                // ⭐ THE GATHER INDEX UNDER ITS KEY (#603 L2-1): held once per (swept, pages)
-                // geometry and never re-sent per step — still through the RAW door, because the
-                // entries are absolute block numbers the shadow must copy verbatim.
-                if self.index_key.is_some_and(|_| {
-                    tensor.tid()
-                        == scratchy_target_spyre::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID
-                }) {
-                    let key = self
-                        .index_key
-                        .expect("the guard above proved the key exists");
+                if let Some(key) = index_keyed {
+                    // ⭐ THE GATHER INDEX UNDER ITS KEY (#603 L2-1): held once per (swept, pages)
+                    // geometry and never re-sent per step — still through the RAW door, because the
+                    // entries are absolute block numbers the shadow must copy verbatim.
                     self.index_keyed = Some((tensor, key, bytes));
                 } else {
                     self.acts_i32.push((tensor, bytes));
@@ -903,6 +913,13 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             }
         }
         Ok(())
+    }
+
+    fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
+        Err(format!(
+            "h2d t{} — the forward tape uploads through its stage",
+            t.0
+        ))
     }
 
     fn launch(&mut self, _k: scratchy_subtile::host_tape::KernelId) -> Result<(), Self::Error> {
@@ -1687,7 +1704,21 @@ pub(crate) fn superdsc_forward_chunk(
     // device-fed embedding row and no idx stick to pool-read. The vocab bound is the
     // same `geometry.vocab` the k=1 token step's `checked_picked_token` reads, so the
     // per-step sentinel check inside `window_finish` states the same refusal.
-    if window > 0 {
+    //
+    // ⭐ THE REGIME CARRIES THE TURN (#603 L2-1 race fix). The window's
+    // `WindowTurn` is the READ HANDLE: each step's enqueue CONSUMES the previous
+    // step's turn — which exists only because that step's idx readback was already
+    // on the queue, FIFO-behind its argmax and FIFO-ahead of this step's replay —
+    // and mints the next. Threading it through the loop's regime (rather than a
+    // step counter the executor also keeps) makes the cross-step aliasing of the
+    // one answer stick unrepresentable: the enqueue of step I+1 cannot be spelled
+    // while step I's read is still unqueued, and using a consumed turn is a
+    // compile error, not a race a starved enqueue thread can widen.
+    enum Regime {
+        Window(scratchy_target_spyre::superdsc_exec::WindowTurn),
+        Solo,
+    }
+    let mut regime = if window > 0 {
         let Some(&(_table_tid, stick_tid)) = b.wiring.argmax_row_feedback.as_ref() else {
             return Err(werr(format!(
                 "superdsc window (k={window}): the rung carries no argmax_row_feedback pair — \
@@ -1695,14 +1726,18 @@ pub(crate) fn superdsc_forward_chunk(
                  here without it is a wiring bug, not a schedule decision"
             )));
         };
-        session
-            .run_window_begin(
-                window,
-                scratchy_target_spyre::bundle_code::PlaceId::Act(stick_tid),
-                b.wiring.geometry.vocab as usize,
-            )
-            .map_err(|e| werr(format!("superdsc window_begin (k={window}): {e}")))?;
-    }
+        Regime::Window(
+            session
+                .run_window_begin(
+                    window,
+                    scratchy_target_spyre::bundle_code::PlaceId::Act(stick_tid),
+                    b.wiring.geometry.vocab as usize,
+                )
+                .map_err(|e| werr(format!("superdsc window_begin (k={window}): {e}")))?,
+        )
+    } else {
+        Regime::Solo
+    };
     // ⭐⭐⭐⭐⭐ THE STEP LOOP'S CONSTANTS, HOISTED (#603 L2-1). `synthetic_constants` is a pure
     // function of the bundle (`b.facts` + `b.wiring` at ONE row — see the ⛔ note inside), so
     // rebuilding it inside the loop rebuilt the same tables `n` times per window and re-bound them
@@ -1918,7 +1953,6 @@ pub(crate) fn superdsc_forward_chunk(
             shape: &shape,
             steps: &fsteps,
             inputs: &inputs,
-            staged: None,
             acts: Vec::with_capacity(fsteps.len()),
             acts_f16: Vec::new(),
             acts_i32: Vec::new(),
@@ -1942,7 +1976,6 @@ pub(crate) fn superdsc_forward_chunk(
             index_held,
             consts_keyed: Vec::new(),
             index_keyed: None,
-            held_skips: Vec::new(),
             launched: false,
         };
         scratchy_subtile::host_tape::play(
@@ -1959,7 +1992,6 @@ pub(crate) fn superdsc_forward_chunk(
             shape: _,
             steps: _,
             inputs: _,
-            staged: _,
             acts,
             acts_f16,
             acts_i32,
@@ -1971,7 +2003,6 @@ pub(crate) fn superdsc_forward_chunk(
             index_held: _,
             consts_keyed,
             index_keyed,
-            held_skips: _,
             launched,
         } = launcher;
         debug_assert!(launched, "the tape must reach its device step");
@@ -1999,44 +2030,53 @@ pub(crate) fn superdsc_forward_chunk(
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.
         let _t_fwd = std::time::Instant::now();
         log_binds(&format!("decode pos={p}"), b.wiring, &acts, &acts_f16);
-        if window > 0 {
-            // ⭐⭐⭐⭐⭐ THE WINDOW'S STEP — ENQUEUED, NOT RUN: the same bind set the k=1
-            // step stages (minus the ahead-steps' embedding row), handed to the
-            // executor's window door. No synchronize, no readback, no host round
-            // trip: the step's preamble H2D, its forward, and its idx D2H all queue
-            // on the persistent stream behind the previous step's, and the window's
-            // single `window_finish` synchronize is what makes their answers
-            // exist on the host. An error abandons the window WITH its in-flight
-            // CBs (the executor's own law) and propagates to the request.
-            session
-                .run_window_step(p, &acts, &acts_f16, &acts_i32)
-                .map_err(|e| werr(format!("superdsc window step (pos {p}): {e}")))?;
-            step_timing(p, _t_fwd);
-        } else if b.wiring.result_is_index() {
-            // ⭐ THE DEVICE ALREADY PICKED — this rung's result is an index stick
-            // (the device argmax's, admitted by the mint at bake). The step runs
-            // its suffix and leaves the stick on the device — the ~100 KB logits
-            // row D2H the ReadBack path pays every token is replaced by the
-            // stick's own bytes — then the raw read decodes them at the dtype the
-            // kernel's own signature stated. The row stays placed and readable
-            // by tid; only the ANSWER moved.
-            session
-                .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::LeftOnDevice)
-                .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?;
-            step_timing(p, _t_fwd);
-            picked = Some(read_picked_token(session, b)?);
-        } else {
-            // ⛔ NO READBACK, NO HOST PICK. This arm used to `StepLogits::ReadBack`
-            // the logits row and hand it to the host sampler — the non-hardware
-            // argmax this codebase no longer contains. A rung reaching here is
-            // unminted: an internal defect (every loaded model's decode rung is
-            // minted), stated loudly, never worked around on the host.
-            return Err(werr(format!(
-                "decode pos {p}: the rung's result is a logits row, not a device pick — an \
-                 unminted decode rung on a loaded model is a bake/loader defect, and the host \
-                 may not pick"
-            )));
-        }
+        regime = match regime {
+            Regime::Window(turn) => {
+                // ⭐⭐⭐⭐⭐ THE WINDOW'S STEP — ENQUEUED, NOT RUN: the same bind set the k=1
+                // step stages (minus the ahead-steps' embedding row), handed to the
+                // executor's window door. No synchronize, no readback, no host round
+                // trip: the step's preamble H2D, its forward, and its idx D2H all queue
+                // on the persistent stream behind the previous step's, and the window's
+                // single `window_finish` synchronize is what makes their answers
+                // exist on the host. The TURN moves with it: this call consumed step
+                // I's (whose readback was already enqueued) and mints step I+1's — the
+                // read-before-next-write order is ownership, not queue discipline. An
+                // error abandons the window WITH its in-flight CBs and WITHOUT a turn
+                // (the executor's own law) and propagates to the request.
+                let turn = session
+                    .run_window_step(turn, p, &acts, &acts_f16, &acts_i32)
+                    .map_err(|e| werr(format!("superdsc window step (pos {p}): {e}")))?;
+                step_timing(p, _t_fwd);
+                Regime::Window(turn)
+            }
+            Regime::Solo if b.wiring.result_is_index() => {
+                // ⭐ THE DEVICE ALREADY PICKED — this rung's result is an index stick
+                // (the device argmax's, admitted by the mint at bake). The step runs
+                // its suffix and leaves the stick on the device — the ~100 KB logits
+                // row D2H the ReadBack path pays every token is replaced by the
+                // stick's own bytes — then the raw read decodes them at the dtype the
+                // kernel's own signature stated. The row stays placed and readable
+                // by tid; only the ANSWER moved.
+                session
+                    .run_step_i32(1, p, &acts, &acts_f16, &acts_i32, StepLogits::LeftOnDevice)
+                    .map_err(|e| werr(format!("superdsc run_step (pos {p}): {e}")))?;
+                step_timing(p, _t_fwd);
+                picked = Some(read_picked_token(session, b)?);
+                Regime::Solo
+            }
+            Regime::Solo => {
+                // ⛔ NO READBACK, NO HOST PICK. This arm used to `StepLogits::ReadBack`
+                // the logits row and hand it to the host sampler — the non-hardware
+                // argmax this codebase no longer contains. A rung reaching here is
+                // unminted: an internal defect (every loaded model's decode rung is
+                // minted), stated loudly, never worked around on the host.
+                return Err(werr(format!(
+                    "decode pos {p}: the rung's result is a logits row, not a device pick — an \
+                     unminted decode rung on a loaded model is a bake/loader defect, and the host \
+                     may not pick"
+                )));
+            }
+        };
     }
     // ⭐⭐⭐⭐⭐ RETIRE THE WINDOW — THE ONE SYNCHRONIZE (#603 PR3b). Every step the loop
     // enqueued retires here and the k idx words come back sentinel-checked (the
@@ -2044,14 +2084,13 @@ pub(crate) fn superdsc_forward_chunk(
     // `window_begin` took), so the k tokens this returns are COMMITTED positions in
     // step order: `ids[i]` is the answer of window step `i`, i.e. the token at
     // position `start + i + 1`.
-    let window_ids = if window > 0 {
-        Some(
+    let window_ids = match regime {
+        Regime::Window(turn) => Some(
             session
-                .run_window_finish()
+                .run_window_finish(turn)
                 .map_err(|e| werr(format!("superdsc window_finish (k={window}): {e}")))?,
-        )
-    } else {
-        None
+        ),
+        Regime::Solo => None,
     };
     tokens.set_tokens_in_pool(id, start + n);
     // The solo forward wrote its `n` keys at the slot `bind_request_pages` bound it at — this request's

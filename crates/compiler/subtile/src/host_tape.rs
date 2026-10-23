@@ -130,7 +130,7 @@ pub struct HostTape<'a> {
     pub steps: &'a [Step<'a>],
 }
 
-/// What a target must provide. FOUR primitives, and every tape player in the
+/// What a target must provide. FIVE primitives, and every tape player in the
 /// system is the same loop over them — metal, spyre and cuda differ only here.
 ///
 /// ⛔ A GENERIC BOUND, NOT `dyn`. The player is monomorphised per target; there
@@ -139,14 +139,31 @@ pub struct HostTape<'a> {
 pub trait Launcher {
     type Error: fmt::Debug;
 
-    /// Upload `tensor` to the device.
+    /// What one host kernel left for its upload — the typed value
+    /// [`Launcher::host_call`] returns and [`Launcher::h2d_staged`] consumes.
+    ///
+    /// ⭐ ONE VALUE, NO STATE BETWEEN (#603). The stage is the only thing that
+    /// names what a host step uploads: the kernel produced it, the upload
+    /// takes it, and there is no launcher field holding "what was staged" for
+    /// a later call to consult — so a tape and a launcher cannot disagree
+    /// about it. "h2d with nothing staged" has no code path, and a kernel
+    /// whose value is held elsewhere (already bound under a key the session
+    /// keeps) returns a stage that SAYS so, rather than leaving a tid in a
+    /// skip list the transfer has to cross-check. `()` for a launcher whose
+    /// host kernels stage nothing.
+    type Stage;
+
+    /// Upload an INPUT operand — bytes the launcher already holds.
     fn h2d(&mut self, tensor: TensorId) -> Result<(), Self::Error>;
+    /// Upload a host kernel's output. Consumes the stage: without the value
+    /// the kernel handed over, there is nothing to spell.
+    fn h2d_staged(&mut self, stage: Self::Stage) -> Result<(), Self::Error>;
     /// Read `tensor` back to the host.
     fn d2h(&mut self, tensor: TensorId) -> Result<(), Self::Error>;
     /// Run a baked device program.
     fn launch(&mut self, kernel: KernelId) -> Result<(), Self::Error>;
-    /// Run a CPU kernel.
-    fn host_call(&mut self, kernel: KernelId) -> Result<(), Self::Error>;
+    /// Run a CPU kernel, returning what it staged for its output upload.
+    fn host_call(&mut self, kernel: KernelId) -> Result<Self::Stage, Self::Error>;
 }
 
 /// THE TAPE PLAYER. This is the whole thing.
@@ -161,21 +178,52 @@ pub fn play<L: Launcher>(tape: &HostTape<'_>, l: &mut L) -> Result<(), L::Error>
             }
         }
         match step.site {
-            Site::Host => l.host_call(step.kernel)?,
-            Site::Device => l.launch(step.kernel)?,
-        }
-        // ⛔ OUTPUTS ARE SYMMETRIC WITH INPUTS, and the asymmetry was a bug.
-        // A HOST kernel that fills a buffer the device must then read (a
-        // constant, a gathered row, a loaded weight) declares its output
-        // `ToDevice` — so "run it, then upload the result" is ONE step. Without
-        // this, a weight load could not be a step at all: it would need a host
-        // step plus a separate uploader, which is the ad-hoc shape this type
-        // exists to remove.
-        for op in step.outputs {
-            match op.transfer {
-                Transfer::ToDevice => l.h2d(op.tensor)?,
-                Transfer::ToHost => l.d2h(op.tensor)?,
-                Transfer::None => {}
+            Site::Host => {
+                // ⭐ THE STAGE — one typed value, kernel → upload (#603).
+                // `host_call` returns what the kernel produced (or the typed
+                // fact that it produced nothing because the value is held
+                // elsewhere), and the upload consumes it. There is no
+                // launcher state between the two calls for a tape to disagree
+                // with, so a step's operand id and its kernel's output are
+                // never matched against each other — the desync this replaces
+                // had them differ BY CONSTRUCTION (a `Const` step's operand is
+                // a placeholder id; its kernel's output is the real tensor),
+                // and the match could only ever see one side of it.
+                let stage = l.host_call(step.kernel)?;
+                // ⛔ OUTPUTS ARE SYMMETRIC WITH INPUTS, and the asymmetry was a bug.
+                // A HOST kernel that fills a buffer the device must then read (a
+                // constant, a gathered row, a loaded weight) declares its output
+                // `ToDevice` — so "run it, then upload the result" is ONE step. Without
+                // this, a weight load could not be a step at all: it would need a host
+                // step plus a separate uploader, which is the ad-hoc shape this type
+                // exists to remove.
+                //
+                // The upload is ONE call over the whole stage, not one per
+                // operand: a host kernel's outputs go up as the bundle it
+                // produced, and the stage — not a tid the tape carries
+                // separately — is what names them.
+                if step
+                    .outputs
+                    .iter()
+                    .any(|op| op.transfer == Transfer::ToDevice)
+                {
+                    l.h2d_staged(stage)?;
+                }
+                for op in step.outputs {
+                    if op.transfer == Transfer::ToHost {
+                        l.d2h(op.tensor)?;
+                    }
+                }
+            }
+            Site::Device => {
+                l.launch(step.kernel)?;
+                for op in step.outputs {
+                    match op.transfer {
+                        Transfer::ToDevice => l.h2d(op.tensor)?,
+                        Transfer::ToHost => l.d2h(op.tensor)?,
+                        Transfer::None => {}
+                    }
+                }
             }
         }
     }
@@ -186,26 +234,50 @@ pub fn play<L: Launcher>(tape: &HostTape<'_>, l: &mut L) -> Result<(), L::Error>
 mod tests {
     use super::*;
 
-    /// Records what the player asked for, in order.
-    #[derive(Default)]
-    struct Trace(Vec<String>);
+    /// Records what the player asked for, in order. The kernel → tensor map is
+    /// the staged value's stand-in: `host_call` returns the tensor the kernel
+    /// produced — the real launchers' stages carry their own place the same
+    /// way, which is the whole point of the stage.
+    struct Trace {
+        map: &'static [(u32, u32)],
+        log: Vec<String>,
+    }
+
+    impl Trace {
+        fn new(map: &'static [(u32, u32)]) -> Self {
+            Self {
+                map,
+                log: Vec::new(),
+            }
+        }
+    }
 
     impl Launcher for Trace {
         type Error = ();
+        type Stage = TensorId;
+        fn host_call(&mut self, k: KernelId) -> Result<TensorId, ()> {
+            self.log.push(format!("host {}", k.0));
+            let t = self
+                .map
+                .iter()
+                .find(|&&(kn, _)| kn == k.0)
+                .expect("every traced host kernel stages a known tensor");
+            Ok(TensorId(t.1))
+        }
+        fn h2d_staged(&mut self, t: TensorId) -> Result<(), ()> {
+            self.log.push(format!("h2d {}", t.0));
+            Ok(())
+        }
         fn h2d(&mut self, t: TensorId) -> Result<(), ()> {
-            self.0.push(format!("h2d {}", t.0));
+            self.log.push(format!("h2d {}", t.0));
             Ok(())
         }
         fn d2h(&mut self, t: TensorId) -> Result<(), ()> {
-            self.0.push(format!("d2h {}", t.0));
+            self.log.push(format!("d2h {}", t.0));
             Ok(())
         }
         fn launch(&mut self, k: KernelId) -> Result<(), ()> {
-            self.0.push(format!("launch {}", k.0));
-            Ok(())
-        }
-        fn host_call(&mut self, k: KernelId) -> Result<(), ()> {
-            self.0.push(format!("host {}", k.0));
+            self.log.push(format!("launch {}", k.0));
             Ok(())
         }
     }
@@ -248,10 +320,10 @@ mod tests {
             },
         ];
 
-        let mut t = Trace::default();
+        let mut t = Trace::new(&[(100, 0)]);
         play(&HostTape { steps: STEPS }, &mut t).expect("plays");
         assert_eq!(
-            t.0,
+            t.log,
             vec![
                 "host 100",   // CPU kernel: no h2d, no launch
                 "h2d 0",      // the gathered row goes up
@@ -284,13 +356,13 @@ mod tests {
             outputs: OUT,
         }];
 
-        let mut host = Trace::default();
+        let mut host = Trace::new(&[(42, 3)]);
         play(&HostTape { steps: AS_HOST }, &mut host).unwrap();
-        let mut dev = Trace::default();
+        let mut dev = Trace::new(&[(42, 3)]);
         play(&HostTape { steps: AS_DEVICE }, &mut dev).unwrap();
 
-        assert_eq!(host.0, vec!["host 42"]);
-        assert_eq!(dev.0, vec!["launch 42"]);
+        assert_eq!(host.log, vec!["host 42"]);
+        assert_eq!(dev.log, vec!["launch 42"]);
     }
 
     /// A weight load is a kernel whose launcher does an h2d and NO launch —
@@ -315,10 +387,10 @@ mod tests {
             inputs: &[],
             outputs: W,
         }];
-        let mut t = Trace::default();
+        let mut t = Trace::new(&[(1, 2)]);
         play(&HostTape { steps: STEPS }, &mut t).unwrap();
         assert_eq!(
-            t.0,
+            t.log,
             vec!["host 1", "h2d 2"],
             "read the checkpoint, then upload it — one step, no launch"
         );
@@ -342,8 +414,8 @@ mod tests {
             inputs: &[],
             outputs: C,
         }];
-        let mut t = Trace::default();
+        let mut t = Trace::new(&[(77, 4095)]);
         play(&HostTape { steps: STEPS }, &mut t).unwrap();
-        assert_eq!(t.0, vec!["host 77", "h2d 4095"]);
+        assert_eq!(t.log, vec!["host 77", "h2d 4095"]);
     }
 }
