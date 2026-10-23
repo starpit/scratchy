@@ -239,11 +239,12 @@ pub fn lower(
         // half-lowering it.
         Program::LmLast => lower_function(k, layout, sym_id_base, None),
         Program::Rope => rope(name, &r, sym_id_base, layout, attn_params),
-        // ⭐ THE APPEND FORM — the whole-function walk (the program states its own
-        // rotation, pass-through and plane stores; no hand-built body), PLUS the Kᵀ
-        // re-transpose the pool layout's three-plane law requires. Keyed on the TYPED
-        // contract ([`Program::RopeAppend`] — the arity-6 cache-writing form), never on
-        // recognising a rope's op chain.
+        // ⭐ THE APPEND FORM'S WRITE HALF — the recipe, main's mechanism wholesale
+        // ([`lk::kv_cache_write`], re-homed from `attn_at` to the rope's arm — the node
+        // whose contract carries the cache destinations). Keyed on the TYPED contract
+        // ([`Program::RopeAppend`] — the arity-6 cache-writing carrier), never on
+        // recognising a rope's op chain. The rotation half is the `Program::Rope` arm
+        // above, minted from the same node by the splice.
         Program::RopeAppend => rope_append(name, k, &r, sym_id_base, layout, attn_params),
         // ⭐ THE WHOLE-FUNCTION WALK, NOT A HAND-BUILT DOOR. The card-proven path for the batched
         // attention kernels is the same per-op walk `Program::Matmul`/`Program::Elementwise` take
@@ -397,26 +398,32 @@ fn rope(
     )
 }
 
-/// ⭐⭐⭐ THE APPEND FORM'S DOOR — the whole-function walk, PLUS the Kᵀ re-transpose the
-/// pool layout's three-plane law requires.
+/// ⭐⭐⭐ THE APPEND FORM'S DOOR — the write rides the recipe, main's mechanism wholesale.
 ///
-/// The program (`rope.py`'s `rope_append_fwd`) states its own body — the rotation, the V
-/// pass-through, and the STORES INTO THE POOL PLANES — so the rotation needs no hand-built
-/// arm: [`lower_function`] lowers what the kernel states, op for op, exactly as it lowers
-/// the batched attention kernels. What the program CANNOT state is the pool's third plane:
-/// the `KvCacheLayout`'s law is that a store into the natural-K plane requires the Kᵀ plane
-/// to track (the score gather reads Kᵀ), so THIS arm — keyed on the typed
-/// [`Program::RopeAppend`] contract, never on recognising the rope's chain — appends one
-/// re-transpose per kv head through the same recipe main's `kv_cache_write` tail used
-/// (`assemble_restickify_kt_2d`, the re-homed slab-transpose recipe), in program order
-/// after the stores and before the attention gather.
+/// The ruling (wall 22): the rotation is `Program::Rope`'s own door (`fn rope` → `rope_at`,
+/// the card-proven P-table matmul — minted as the node's FIRST program by the splice), and
+/// THIS arm lowers the node's WRITE half through [`lk::kv_cache_write`] — main's own
+/// recipe, re-homed from the attention's door arm (`attn_at`, deleted when attention became
+/// a kernel) to the rope arm, the node whose contract carries the cache destinations.
 ///
-/// The tail's aiming facts (`kv_request`, `kv_slot_offset`) are DERIVED here from the
-/// program's own row window through the ONE shared law (`PagedKvPool::write_aim`), and the
-/// walk's stamp site CHECKS them against the splice's carrier — a divergence is a build
-/// refusal, never a silently mis-aimed transpose. The tail carries NO slot stride (main's
-/// own law: the whole-page transpose takes no `seq_pos` shift) and states `kv_page_slots`
-/// itself, which is what marks it pre-stamped for the walk's stamp.
+/// ⛔ THE RECIPE CALL LIVES IN THE WALK, NEVER IN THE SPLICE — the wall-21 rejection stands
+/// but narrowed: what it rejected was the splice minting door ops from a registry ROW (the
+/// chain-recognizer shape). The walk's `Program::RopeAppend` arm lowering the node's
+/// contract through the recipe is the primitives' normal path — the same class as `fn rope`
+/// itself.
+///
+/// The program (`rope.py`'s `rope_append_fwd`) states the contract — the six-parameter
+/// shape, the four read-only stream operands, the two stored pool planes — and its body is
+/// NEVER WALKED (rope_fwd's own precedent: the kernel states the contract, the recipe
+/// states the mechanism). The recipe self-stamps every op it mints (`kv_page_slots`,
+/// `kv_request`, `kv_slot_offset`, the slot stride), which is what latches the bundle
+/// paged — the carrier program carries NO stamps.
+///
+/// HONESTY NOTE, the re-home's own: main's call site was `attn_at` (the attention's door
+/// arm); the branch re-homes it here because the rope node is now the only legal owner of
+/// the write — the attention is a kernel and cannot lower another node's cache contract.
+/// `assemble_attn`'s live call stays byte-identical (it passes `row_start: 0`, main's own
+/// whole-plane form).
 fn rope_append(
     name: &str,
     k: &KtirNode,
@@ -425,9 +432,7 @@ fn rope_append(
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use ktir_superdsc::sdsc_abstract::{
-        KvCoord, KvHead, KtTileFeats, KtTileSlots, KvPlane, PagedKvPool,
-    };
+    use ktir_superdsc::sdsc_abstract::PagedKvPool;
     // ⛔ THE CONTRACT, CHECKED BEFORE ANYTHING IS EMITTED: six parameters, the four stream
     // operands unstored, the two pool planes stored, and both planes the pool's own
     // `[heads · PLANE_SLOTS, hd]` shape. A program that is not this shape reaching this
@@ -472,9 +477,32 @@ fn rope_append(
         ));
     }
     let heads = r[4].v_rows / plane_slots;
-    // The part's first row, off the program's own row window (the x view's first access
-    // tile states it) — the ONE input to the shared aiming law.
-    let row0 = r[0].r_start;
+    // ⭐ THE STREAM WIDTH AND THE POOL'S HEAD COUNT ARE THE SAME FACT — the recipe states
+    // its source nests as `[mq, heads, hd]`, so a K stream wider than the pool's planes
+    // would read past its rows. The splice's windowing law holds the four stream views to
+    // whole `total` columns; this re-derives `total` from the planes and refuses a
+    // divergence rather than trusting the producer twice.
+    let total = heads * hd;
+    if r[0].v_cols != total || r[3].v_cols != total {
+        return err(format!(
+            "{name}: the x view states width {} and the v view {} over a pool of {heads} \
+             {hd}-wide heads ({total} cols) — the write's sources and destinations must \
+             state the same head count",
+            r[0].v_cols, r[3].v_cols
+        ));
+    }
+    // ⭐ THE WINDOW, off the program's own x view — the recipe's request geometry, fed from
+    // the ROPE node's rows (the same facts `attn_at` passed main): the cover states the
+    // window the node owns, `(row_start, row_start + mq)`.
+    let (row_start, row_end) = r[0].r_cover;
+    let mq = row_end.saturating_sub(row_start);
+    if mq == 0 || row_end > r[0].v_rows {
+        return err(format!(
+            "{name}: the x view covers rows [{row_start}, {row_end}) of {} — the append's \
+             window must be nonempty and inside its tensor",
+            r[0].v_rows
+        ));
+    }
     // ⛔ THE ROW KIND IS A BUNDLE FACT the program cannot state (the same law `rope`'s
     // arm reads `attn_params` for): a request-major window's page is the request's own
     // block-table entry, a position-major window's is the write cursor's. A bundle with
@@ -488,55 +516,57 @@ fn rope_append(
                  write, and it is a bundle fact the program cannot state"
             ),
         })?;
-    let (request, page_offset) = PagedKvPool::new(heads as usize, hd as usize)
-        .write_aim(row0, rows_are_requests);
-    // ── THE PROGRAM'S OWN BODY: the walk, op for op. ──
-    let mut ops = lower_function(k, layout, sym_id_base, None)?;
-    // ── THE Kᵀ TAIL: one re-transpose per kv head, the pool layout's three-plane law. ──
-    let pool = PagedKvPool::new(heads as usize, hd as usize);
-    let k_id = r[4].tid;
-    let kct_tid = ktir_superdsc::reserved_tids::kct_resident_tid(k_id);
-    let knat_name = ktir_superdsc::place::act_name(k_id);
-    let kct_name = ktir_superdsc::place::act_name(kct_tid);
-    let nkvh = std::num::NonZeroU32::new(heads).ok_or_else(|| Error {
-        message: format!("{name}: the pool states {heads} kv heads — a pool needs at least one"),
+    // ⭐ THE NODE'S OUTPUT TENSOR — the two-halves law ([`KtirNode::node_out_tid`]): the
+    // rotation program writes it, this carrier only names it, and the recipe suffixes every
+    // op it mints with it (`_o{t}`, main's own naming law). A carrier without one is a
+    // producer bug — the splice post-sets it at the mint.
+    let node_out = k.node_out_tid.ok_or_else(|| Error {
+        message: format!(
+            "{name}: the append carrier states no node output tensor — the rotation half \
+             writes the node's output and this half names it, so the producer must state \
+             `node_out_tid` on the carrier (the two-halves law, `KtirNode::node_out_tid`)"
+        ),
     })?;
-    for kvh in 0..heads {
-        let kv_head = KvHead::new(kvh, nkvh).ok_or_else(|| Error {
+    let t = node_out.get();
+    // ⭐ THE IDENTITY CLASS TID — the same registry read `assemble_attn` makes (refusing a
+    // desync by name, its own law): the cachewr copies contract against the `[64, 64]`
+    // identity of this head dim's attention class.
+    let ident = layout
+        .and_then(|l| l.identity_tid_of_class(hd))
+        .ok_or_else(|| Error {
             message: format!(
-                "{name}: kv head {kvh} is past the pool's {heads} head(s) — the re-transpose \
-                 would read another plane's bytes into Kᵀ"
+                "{name}: head_dim {hd} absent from BundleLayout.attn_class_hds {:?} (registry \
+                 desync — the placement pass and this lowering disagree about the tape's \
+                 attention classes, so which identity table this write contracts against is \
+                 not a fact either of them states)",
+                layout.map(|l| l.attn_class_hds.clone()).unwrap_or_default(),
             ),
         })?;
-        ops.push(ktir_superdsc::emit::assemble_restickify_kt_2d(
-            &format!("{name}_kctpost{kvh}"),
-            KtTileSlots::of_page(),
-            KtTileFeats::of_head_dim(hd),
-            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each
-            // plane is its own named tensor), so the bound is the plane's `plane_stride()`.
-            &ktir_superdsc::emit::rb(&knat_name, 1, pool.plane_stride() as u32),
-            ktir_superdsc::addr::DevOff::from_view_step(
-                pool.addr(KvCoord::block(KvPlane::Knat, kv_head)),
-            ),
-            &ktir_superdsc::emit::rb(&kct_name, 1, pool.plane_stride() as u32),
-            ktir_superdsc::addr::DevOff::from_view_step(
-                pool.addr(KvCoord::block(KvPlane::Kt, kv_head)),
-            ),
-            sym_id_base,
-            layout,
-        ));
-        // ⭐ THE TAIL'S OWN STAMPS — main's `attn_kctpost` law: tagged with its row, aimed
-        // at its page part, and NO slot stride (the whole-page transpose takes no
-        // `seq_pos` shift). `kv_page_slots` is stated too — the paged mark that makes the
-        // tail self-identifying for the walk's stamp (pre-stamped ops are CHECKED against
-        // the carrier, never overwritten).
-        if let Some(o) = ops.last_mut() {
-            o.kv_page_slots = PagedKvPool::PAGE_SLOTS as u32;
-            o.kv_request = request;
-            o.kv_slot_offset = page_offset;
-        }
-    }
-    Ok(ops)
+    // ── THE WRITE, main's mechanism wholesale: the copies + stamps (4) and the Kᵀ
+    // re-transpose tail (5), one implementation, self-stamping — which is what latches
+    // this bundle paged.
+    lk::kv_cache_write(
+        lk::KvCacheWrite {
+            t,
+            mq,
+            nkvh: heads,
+            hd,
+            rows_are_requests,
+            row_start,
+            // ⭐ PLAIN rotated K — the fp8 k_proj's scale fold is refused on this path, so
+            // the readers own the scale (the signature's own scale contract).
+            new_k: &ktir_superdsc::place::act_name(t),
+            new_v: &r[3].name(),
+            kc: &r[4].name(),
+            vc: &r[5].name(),
+            kct: &ktir_superdsc::place::act_name(ktir_superdsc::reserved_tids::kct_resident_tid(
+                r[4].tid,
+            )),
+            ident: &ktir_superdsc::place::act_name(ident),
+        },
+        sym_id_base,
+        layout,
+    )
 }
 
 /// What a rope program states about its plane, whichever form stated it: the head dim, and the

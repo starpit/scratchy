@@ -995,10 +995,11 @@ pub(crate) fn lower_one_node<F: RopeForm>(
         }
         // ⭐ THE TWO ROPE FORMS ROUTE SEPARATELY. `RopeRotate` is the q stream's rotation —
         // one op. `RopeAppend` is the K/V stream's WRITE-BEARING form: one node lowers to
-        // ONE OP PER PAGE PART through the splice's own entry (the shared cutting law,
-        // `PagedKvPool::write_parts`), each op carrying the three-fact stamp that latches
-        // the bundle paged and aims its stores — the write the arity-3 port dropped, back
-        // in the kernel where the reference contract states it.
+        // TWO programs through the splice's own entry (the wall-22 ruling) — the rotation
+        // (`Program::Rope`, the door's `rope_at` P-table matmul) and the arity-6 carrier
+        // (`Program::RopeAppend`, whose door arm lowers the write through main's
+        // `kv_cache_write` recipe) — the write the arity-3 port dropped, back through the
+        // mechanism main's own attention path proved on card.
         SubOp::RopeRotate { .. } => {
             match scratchy_triton_splice::lower(node, ir, rows_are_requests) {
                 Ok(e) => Ops(vec![e]),
@@ -1006,7 +1007,7 @@ pub(crate) fn lower_one_node<F: RopeForm>(
             }
         }
         SubOp::RopeAppend { .. } => {
-            match scratchy_triton_splice::lower_rope_append(node, ir, rows_are_requests) {
+            match scratchy_triton_splice::lower_rope_append(node, ir) {
                 Ok(ops) => Ops(ops),
                 Err(reason) => Unhandled(reason),
             }

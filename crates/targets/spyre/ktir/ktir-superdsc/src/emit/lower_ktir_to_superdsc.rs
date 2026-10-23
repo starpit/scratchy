@@ -5481,6 +5481,9 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             nkvh,
             hd,
             rows_are_requests,
+            // main's own call always wrote the window starting at the cursor's row 0; the
+            // rope arm below is the second caller, and it states its node's window.
+            row_start: 0,
             new_k: &new_k_scaled,
             new_v: &new_v_rep,
             kc: &kc,
@@ -5505,7 +5508,17 @@ pub struct KvCacheWrite<'a> {
     pub hd: u32,
     /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
     pub rows_are_requests: bool,
-    /// This step's new K (already √-scaled) and V, `[mq, nkvh·hd]` row-blocked.
+    /// ⭐ THE WINDOW'S FIRST ROW, cursor-relative — main's `attn_at` call site always passed the
+    /// whole activation plane (`0`), and this re-home keeps that byte-identical; the rope
+    /// append arm passes its NODE's window (`row_start > 0` for a per-row node of a batch,
+    /// whose rows share one output tensor and whose request is the row itself).
+    pub row_start: u32,
+    /// This step's new K and V, `[mq, nkvh·hd]` row-blocked. ⭐ THE SCALE CONTRACT, RESTATED AT
+    /// THE SIGNATURE: the SPLICED path passes the rope's PLAIN rotated K — the fp8 k_proj's
+    /// `attn_scale_weight_folds` fold is refused there, so every pool reader states its own
+    /// scale — while main's attention path passes its pre-√-scaled `new_k_scaled` (a folded
+    /// model's K composes at the other end, `√s·√s = s`). The recipe writes whatever it is
+    /// given; the scale law belongs to the caller.
     pub new_k: &'a str,
     pub new_v: &'a str,
     /// The resident natural-K, V and Kᵀ planes.
@@ -5542,6 +5555,7 @@ pub fn kv_cache_write(
         nkvh,
         hd,
         rows_are_requests,
+        row_start,
         new_k: new_k_scaled,
         new_v: new_v_rep,
         kc,
@@ -5591,20 +5605,32 @@ pub fn kv_cache_write(
     // PART-MAJOR, so a part's copies are consecutive and fuse into one launch — the same reason the
     // loop is request-major. A window that fits a page is ONE part with offset 0, and every name, row
     // and op is exactly what it was.
-    let page = crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
-    let parts = if per_request { 1 } else { mq.div_ceil(page) };
-    let part_tag = |p: u32| {
-        if parts > 1 {
+    //
+    // ⭐ THE CUTTING GOES THROUGH THE ONE LAW ([`PagedKvPool::write_parts`]) — the same
+    // function the whole splice/door boundary shares, re-homed here from main's inline
+    // `parts = mq.div_ceil(page)` loop. At `row_start = 0` (main's own call, and a
+    // whole-plane node) the cut is BYTE-IDENTICAL to that loop: request-major one part per
+    // row, position-major one part per page with `p·page` offsets.
+    let parts = pool.write_parts(row_start, mq, rows_are_requests);
+    let part_tag = |p: usize| {
+        if !rows_are_requests && parts.len() > 1 {
             format!("_p{p}")
         } else {
             String::new()
         }
     };
-    for req in 0..if per_request { mq } else { 1 } {
+    for (p, part) in parts.iter().enumerate() {
+        let (row0, part_rows, req) = (part.row0, part.rows, part.request);
         // ⛔ NO REQUEST TERM IN THE ADDRESS. `req` here indexes a ROW OF THE ACTIVATION and nothing more:
         // which page that row's token lands in is the host's page map, applied as a per-launch shift. A page
         // holds slots, not requests, so the address inside it is `(kv head, slot, feature)`.
-        let rq = if per_request {
+        //
+        // ⭐ THE `_r{req}` TAG COVERS THE PER-ROW NODE TOO: a request-major window cut by
+        // `write_parts` is one part per row, and at `mq == 1` (a per-row node of a batch,
+        // whose rows share ONE output tensor) `per_request` is false but the names still
+        // need the row — main's whole-plane call never had two nodes over one tensor, the
+        // splice's per-row decomposition does.
+        let rq = if per_request || (rows_are_requests && row_start > 0) {
             format!("_r{req}")
         } else {
             String::new()
@@ -5622,14 +5648,7 @@ pub fn kv_cache_write(
         // up decodes fluent garbage (`'(\x03d. .exaggeret'` for a prompt whose answer is `Paris`).
         let rows_per_op = if per_request { 1 } else { mq };
         let heads_on_y = rows_per_op == 1;
-        for p in 0..parts {
-            // The part's first source row, and the rows it copies: the whole request row, or the chunk's
-            // rows from `p·PAGE_SLOTS` up to a page of them (the last part takes the remainder).
-            let (row0, part_rows) = if per_request {
-                (req, 1)
-            } else {
-                (p * page, (mq - p * page).min(page))
-            };
+        {
             let pt = part_tag(p);
             for s in 0..slabs.get() {
                 for h in 0..if heads_on_y { 1 } else { nkvh } {
@@ -5715,8 +5734,11 @@ pub fn kv_cache_write(
                             // says which page this row's token lands in is the tag, which `nonfold_page_delta` turns
                             // into that row's page through the host's block table.
                             o.kv_request = req;
-                            // The page part: the runtime aims it `p` pages past the cursor's (see above).
-                            o.kv_slot_offset = p * page;
+                            // ⭐ THE PART'S FIRST ROW PAST THE WRITE CURSOR — main's own `p·page` at
+                            // `row_start = 0` (the part's row0 IS `p·page` there, the same number).
+                            // A request-major part states no offset: its page is the request's own
+                            // block-table entry and its slot the launch's `seq_pos` shift.
+                            o.kv_slot_offset = if rows_are_requests { 0 } else { part.row0 };
                         }
                     }
                 }
@@ -5743,53 +5765,63 @@ pub fn kv_cache_write(
     // just wrote, and its Kᵀ is as stale as the first page's was. A whole-page re-transpose is already
     // the per-page form, so a part is the same op aimed `p` pages on (`kv_slot_offset`), skipped with
     // its cache write when the request holds no such page.
-    let kct_reqs = if per_request { mq } else { 1 };
-    for (p, req, kvh) in (0..parts)
-        .flat_map(|p| (0..kct_reqs).map(move |r| (p, r)))
-        .flat_map(|(p, r)| (0..nkvh).map(move |k| (p, r, k)))
-    {
-        let rq = if per_request {
-            format!("_r{req}")
-        } else {
-            String::new()
-        };
-        let pt = part_tag(p);
-        // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
-        // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
-        // decode. Source and destination take the identical `layer + page` shift, which is why
-        // natural K lives in the page rather than a segment of its own.
-        ops.push(assemble_restickify_kt_2d(
-            &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
-            crate::sdsc_abstract::KtTileSlots::of_page(),
-            crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
-            // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each plane is
-            // its own named tensor; the plane base is implicit in which name an op takes), so the
-            // bound the mint states is the plane's own `plane_stride()` — the one number that sizes
-            // the pool's placement, stated by the same function the offsets come from. The window is
-            // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
-            // for every head the block table can name; a kv head past `nkvh` now refuses HERE
-            // instead of re-transposing another plane's bytes into Kᵀ.
-            &rb(kc, 1, pool.plane_stride() as u32),
-            // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
-            // the same `(kv head)` block of the page the launch was shifted to.
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Knat,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            &rb(kct, 1, pool.plane_stride() as u32),
-            crate::addr::DevOff::from_view_step(pool.addr(crate::sdsc_abstract::KvCoord::block(
-                crate::sdsc_abstract::KvPlane::Kt,
-                kv_head_of(kvh, nkvh)?,
-            ))),
-            sym_id_base,
-            layout,
-        ));
-        // ⭐ TAGGED WITH ITS ROW, for the same reason the cache writes are: this op reads natural K and
-        // writes Kᵀ within ONE row's page, and with no request term left in the address the tag is the only
-        // thing that tells the runtime which page that is.
-        if let Some(o) = ops.last_mut() {
-            o.kv_request = req;
-            o.kv_slot_offset = p * page;
+    //
+    // ⭐ THE PARTS CARRY THE REQUESTS: at `row_start = 0` this is main's own
+    // `(p, req, kvh)` flat loop exactly — request-major parts are one per row (main's
+    // `kct_reqs = mq` at one part), position-major parts are one per page at `req = 0` —
+    // so the op sequence and every name are what they were.
+    for (p, part) in parts.iter().enumerate() {
+        let req = part.request;
+        for kvh in 0..nkvh {
+            let rq = if per_request || (rows_are_requests && row_start > 0) {
+                format!("_r{req}")
+            } else {
+                String::new()
+            };
+            let pt = part_tag(p);
+            // WHOLE-PAGE re-transpose, structurally the proven full-`cap` form with the page (equal to
+            // that cap) substituted — NOT the slab-granular variant, whose on-card attempt regressed
+            // decode. Source and destination take the identical `layer + page` shift, which is why
+            // natural K lives in the page rather than a segment of its own.
+            ops.push(assemble_restickify_kt_2d(
+                &format!("attn_kctpost{kvh}{rq}{pt}_o{t}"),
+                crate::sdsc_abstract::KtTileSlots::of_page(),
+                crate::sdsc_abstract::KtTileFeats::of_head_dim(hd),
+                // ⭐ BOTH HANDLES AT THE PLANE'S OWN LAW — `pool.addr` is PLANE-RELATIVE (each plane is
+                // its own named tensor; the plane base is implicit in which name an op takes), so the
+                // bound the mint states is the plane's own `plane_stride()` — the one number that sizes
+                // the pool's placement, stated by the same function the offsets come from. The window is
+                // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
+                // for every head the block table can name; a kv head past `nkvh` now refuses HERE
+                // instead of re-transposing another plane's bytes into Kᵀ.
+                &rb(kc, 1, pool.plane_stride() as u32),
+                // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
+                // the same `(kv head)` block of the page the launch was shifted to.
+                crate::addr::DevOff::from_view_step(pool.addr(
+                    crate::sdsc_abstract::KvCoord::block(
+                        crate::sdsc_abstract::KvPlane::Knat,
+                        kv_head_of(kvh, nkvh)?,
+                    ),
+                )),
+                &rb(kct, 1, pool.plane_stride() as u32),
+                crate::addr::DevOff::from_view_step(pool.addr(
+                    crate::sdsc_abstract::KvCoord::block(
+                        crate::sdsc_abstract::KvPlane::Kt,
+                        kv_head_of(kvh, nkvh)?,
+                    ),
+                )),
+                sym_id_base,
+                layout,
+            ));
+            // ⭐ TAGGED WITH ITS ROW, for the same reason the cache writes are: this op reads natural K and
+            // writes Kᵀ within ONE row's page, and with no request term left in the address the tag is the only
+            // thing that tells the runtime which page that is.
+            if let Some(o) = ops.last_mut() {
+                o.kv_request = req;
+                // The part's first row past the write cursor — the copies' own law (main's
+                // `p·page` at `row_start = 0`), and no offset on a request-major part.
+                o.kv_slot_offset = if rows_are_requests { 0 } else { part.row0 };
+            }
         }
     }
 

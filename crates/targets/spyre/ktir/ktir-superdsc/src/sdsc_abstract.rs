@@ -5865,11 +5865,11 @@ impl DxGroupCeiling {
 /// ⭐ ONE PART OF A KV WRITE WINDOW — the shape every cache-write lowering cuts a window into, so a
 /// part NEVER crosses a page boundary.
 ///
-/// The splice's append lowering is the producing consumer (one program per part, one
-/// three-fact stamp each) and the door's Kᵀ tail reads the same facts back; both go
-/// through [`PagedKvPool::write_parts`] / [`PagedKvPool::write_aim`], the ONE
-/// implementation of the cutting (re-homed from the KTIR arm's `kv_cache_write`, whose
-/// `parts = mq.div_ceil(page)` loop this replaces for every live path).
+/// The consumer is the recipe ([`crate::emit::kv_cache_write`], re-homed from main's
+/// `attn_at` arm to the rope's own door arm): the walk's `Program::RopeAppend` arm cuts the
+/// node's window through [`PagedKvPool::write_parts`] and emits one copy family per part,
+/// each part self-stamping its request and its first row past the write cursor — the
+/// (b1) discipline's facts, stated by the ONE implementation of the cutting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvWritePart {
     /// The part's first row — the WINDOW-OWN TENSOR's row index (a prefill window's
@@ -5877,28 +5877,9 @@ pub struct KvWritePart {
     pub row0: u32,
     /// Rows this part covers (`>= 1`; `row0 + rows` stays inside one page).
     pub rows: u32,
-    /// The part's first slot WITHIN its page — what the kernel's stores bake; the page
-    /// itself is the runtime's to name (block table), the decode slot the launch's
-    /// `seq_pos` shift.
-    pub slot_start: u32,
-    /// Slots past the write cursor where this part's page starts — a whole number of
-    /// pages, the `kv_slot_offset` stamp.
-    pub page_offset: u32,
     /// The request this part's KV belongs to — the `kv_request` stamp (`0` unless the
     /// window's rows are requests).
     pub request: u32,
-}
-
-impl KvWritePart {
-    /// ⭐ THE KERNEL'S BLOCK HEIGHT — this part's rows rounded up to a power of two
-    /// (a Triton `block_shape` is power-of-two in every dim). The pad lands in the
-    /// page's slots past the part's rows: unwritten, masked out by every reader, and
-    /// re-written by any later chunk that reaches them — inert. [`PagedKvPool::write_parts`]
-    /// caps every part so the pad stays inside its page (`slot_start + block_rows ≤
-    /// PLANE_SLOTS`), which is what keeps it off the NEXT head's plane.
-    pub fn block_rows(&self) -> u32 {
-        self.rows.next_power_of_two()
-    }
 }
 
 impl PagedKvPool {
@@ -6399,20 +6380,18 @@ impl PagedKvPool {
     ///
     /// A request-major window (decode: every row is one request's token) is ONE PART PER
     /// ROW: the request's page comes from ITS block table (`kv_request = row0`) and its
-    /// slot from the launch's `seq_pos` shift, so the kernel bakes slot 0 and the part
-    /// states no offset. A position-major window (prefill: consecutive positions of one
-    /// sequence) is cut at page boundaries, so every part fills its page from its own
-    /// `slot_start` and carries its page as the offset — the `chunk_write_start` law
-    /// (windows wider than a page start at a page boundary) is what makes a multi-page
-    /// window's parts all land at `slot_start == 0`.
+    /// slot from the launch's `seq_pos` shift, so the part states no offset. A
+    /// position-major window (prefill: consecutive positions of one sequence) is cut at
+    /// page boundaries, so every part carries its first row past the write cursor as the
+    /// offset — at a page-aligned window start (`chunk_write_start`'s law for multi-page
+    /// windows) that is exactly main's `p·PAGE_SLOTS`, so a whole-cursor window cuts
+    /// byte-identically to main's `parts = mq.div_ceil(page)` loop.
     pub fn write_parts(&self, start: u32, len: u32, rows_are_requests: bool) -> Vec<KvWritePart> {
         if rows_are_requests {
             return (start..start + len)
                 .map(|row0| KvWritePart {
                     row0,
                     rows: 1,
-                    slot_start: 0,
-                    page_offset: 0,
                     request: row0,
                 })
                 .collect();
@@ -6423,42 +6402,15 @@ impl PagedKvPool {
         while row0 < start + len {
             let slot_start = row0 % page;
             let room = page - slot_start;
-            // ⭐ THE PART'S CAP IS THE LARGEST POWER OF TWO THAT FITS THE PAGE'S REMAINING
-            // ROOM: the kernel's block is the part's rows padded up to a power of two
-            // (`KvWritePart::block_rows`), and the pad must land in THIS page's slots —
-            // past the part's rows, never on the next head's plane. A page-aligned window
-            // (`chunk_write_start`'s law for multi-page windows) gets full-page parts; a
-            // window starting mid-page gets parts capped by the room its own pad fits.
-            let cap = if room.is_power_of_two() {
-                room
-            } else {
-                room.next_power_of_two() / 2
-            };
-            let rows = (start + len - row0).min(cap);
+            let rows = (start + len - row0).min(room);
             parts.push(KvWritePart {
                 row0,
                 rows,
-                slot_start,
-                page_offset: row0 - slot_start,
                 request: 0,
             });
             row0 += rows;
         }
         parts
-    }
-
-    /// ⭐ THE AIMING LAW FOR ONE PART'S FIRST ROW — `(request, page_offset)`, the two facts
-    /// the Kᵀ tail needs. The splice stamps them from the part it cut; the door derives
-    /// them from the program's own row window; BOTH go through this ONE function, and the
-    /// walk's stamp site CHECKS the two readings agree (a divergence is a build refusal,
-    /// never a silently mis-aimed transpose).
-    pub fn write_aim(&self, row0: u32, rows_are_requests: bool) -> (u32, u32) {
-        if rows_are_requests {
-            (row0, 0)
-        } else {
-            let page = Self::PAGE_SLOTS as u32;
-            (0, row0 - row0 % page)
-        }
     }
 
     /// ⭐ THE PHYSICAL EXTENT, TYPED — the only way the address law can obtain it, so the ADDRESSABLE count cannot

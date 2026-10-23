@@ -370,9 +370,10 @@ pub fn row<F: scratchy_subtile::subtile_ir::RopeForm>(op: &SubOp<F>) -> TritonKe
         },
         // ⭐ THE TWO ROPE FORMS ARE TWO CONTRACTS, told apart by the SubOp — never by sniffing a
         // chain. `RopeRotate` is the q stream's rotation (arity 3, no cache); `RopeAppend` is the
-        // front end's arity-6 `[K, cos, sin, V, K_cache, V_cache]` whose STORES ARE THE CACHE
-        // WRITES — its own kernel, its own `Program`, and its own lowering entry
-        // ([`lower_rope_append`]), because one node lowers to one op PER PAGE PART.
+        // front end's arity-6 `[K, cos, sin, V, K_cache, V_cache]` whose WRITE HALF rides the
+        // door's recipe — its own kernel (the never-walked contract statement), its own
+        // `Program`, and its own lowering entry ([`lower_rope_append`]), because one node
+        // lowers to TWO programs (the rotation plus the carrier).
         SubOp::RopeRotate { .. } => TritonKernelRow::Spliced {
             src: include_str!("../../../targets/spyre/kernels/rope.py"),
             file: "rope.py",
@@ -625,35 +626,36 @@ fn node_at_one_row<F: scratchy_subtile::subtile_ir::RopeForm>(
     }
 }
 
-/// ⭐⭐⭐ THE APPEND LOWERING — `RopeAppend`'s own entry, because one node lowers to ONE OP
-/// PER PAGE PART (the shared cutting law, [`PagedKvPool::write_parts`]) and only this entry
-/// knows that.
+/// ⭐⭐⭐ THE APPEND LOWERING — `RopeAppend`'s own entry, because one node lowers to TWO
+/// PROGRAMS (the wall-22 ruling: two card-proven mechanisms, both main's, wired through
+/// the door's own arms):
 ///
-/// The kernel is `rope.py`'s `rope_append_fwd` — the front end's arity-6 contract the
-/// arity-3 port collapsed: `[K, cos, sin, V, K_cache, V_cache]`, the rotated K and the
-/// pass-through V stored STRAIGHT into the pool planes. There is no `desc_o`: nothing on
-/// the device path reads the rotated intermediate (the splice never binds `AttnDecode`'s
-/// `new_k`), so the reference's shape — the outputs ARE the cache stores — wins and the
-/// intermediate stays a dead hole in the graph, placed and never written.
+/// 1. THE ROTATION — `rope.py`'s `rope_fwd` minted as [`Program::Rope`], exactly the
+///    `RopeRotate` row's own op: the door's `fn rope` lowers it through `rope_at` (the
+///    P-table matmul), so no kernel body ever runs and the sub-stick rotation tiles that
+///    wall 22 refused are never walked. The rotation writes the node's output — the
+///    rotated K, PLAIN (the fp8 k_proj's scale fold is refused, so the pool readers own
+///    the scale).
+/// 2. THE CARRIER — `rope.py`'s `rope_append_fwd` minted as [`Program::RopeAppend`], the
+///    arity-6 contract statement `[K, cos, sin, V, K_cache, V_cache]`. Its body is NEVER
+///    WALKED (rope_fwd's own precedent): the door's `Program::RopeAppend` arm lowers the
+///    node's write contract through `kv_cache_write` — main's recipe, re-homed from
+///    `attn_at` to the rope arm — which self-stamps every op it mints (the paged latch's
+///    own source). The carrier carries NO stamps and states its node's output tensor on
+///    [`KtirNode::node_out_tid`] (the two-halves law: the rotation writes it, the carrier
+///    names it).
 ///
-/// THE THREE-FACT STAMP rides each part's [`EmittedOp`] (`kv_page_slots` from
-/// [`PagedKvPool`], `kv_request`, `kv_slot_offset` — plus the decode slot stride), the
-/// (b1) discipline: the splice STATES the facts here, and the walk's stamp site copies
-/// them onto every op the door minted from that program — the second stamping site, the
-/// `PAGED-FOLD STAMP`'s own pattern. The door's Kᵀ tail states its own subset (main's
-/// own stamps), and the stamp site CHECKS the two readings agree.
+/// Program order is the ruling's own: rotate (the P-matmul) → write (the copies + stamps
+/// + the Kᵀ tail) → the attention gather that reads the pool.
 ///
-/// ⭐ THE SCALE LAW: the cached K is the rope's PLAIN output — `attn_scale_weight_folds`
-/// REFUSES the fold for an fp8 k_proj (`GemmWeight::Fp8Dynamic`, arity-3), so no `√scale`
-/// rides the projection and every pool reader states its own scale. A model whose fold
-/// fired composes at the other end (`√s·√s = s` at scale 1.0). Nothing here folds one.
+/// ⛔ THE RECIPE CALL LIVES IN THE WALK, NEVER HERE — the splice mints TYPED programs and
+/// states their bindings; lowering a node's contract through a recipe is the door's own
+/// class of work (the same class as `fn rope` itself), and a splice that minted door ops
+/// from a registry row would be the chain-recognizer shape the wall-21 ruling rejected.
 pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
-    rows_are_requests: bool,
 ) -> Result<Vec<EmittedOp>, String> {
-    use ktir_superdsc::sdsc_abstract::PagedKvPool;
-
     let SubOp::RopeAppend { head_dim, layout, .. } = &node.op else {
         return Err(
             "triton splice: lower_rope_append called on a node that is not a RopeAppend"
@@ -706,8 +708,10 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     // ⛔ THE WINDOWING LAW, the `rope_fwd` arm's own, minus the dead `out`: x, cos, sin
     // and V share ONE row window, take WHOLE columns of `total`, and sit over tensors of
     // ONE height (the head-replicated cos/sin reinterpretation is same-bytes only at that
-    // width). The caches are bound by identity, not by window — the pool planes are the
-    // layout's own tensors.
+    // width). The rotation's own mint re-states the law OVER THE OUTPUT (`kernel_spec`'s
+    // `rope_fwd` arm checks all four regions), so a divergent out refuses there. The
+    // caches are bound by identity, not by window — the pool planes are the layout's own
+    // tensors.
     let x = &node.inputs[0];
     let window = (x.region.rows.start, x.region.rows.len);
     let y_rows = ir.tensors[x.tensor.index()].rows;
@@ -737,109 +741,98 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
             ));
         }
     }
-    // ⭐ THE PARTS — the ONE cutting law, shared with the door's Kᵀ tail. A request-major
-    // window is one part per row (the page is the request's block table's to name, the
-    // slot the launch's `seq_pos` shift); a position-major window is cut at page
-    // boundaries so every part fills its page from its own `slot_start`.
-    let pool = PagedKvPool::new(heads as usize, hd as usize);
-    let parts = pool.write_parts(window.0, window.1, rows_are_requests);
-    debug_assert!(
-        !parts.is_empty() || window.1 == 0,
-        "write_parts cuts at least one part for a nonempty window"
-    );
-
     let src = match row(&node.op) {
         TritonKernelRow::Spliced { src, .. } => src,
         TritonKernelRow::Refused(why) => return Err(why.to_string()),
     };
-    let mut ops: Vec<EmittedOp> = Vec::new();
-    for (p, part) in parts.iter().enumerate() {
-        let mut signature: HashMap<String, ArgSpec> = HashMap::new();
-        let mut constexprs: HashMap<String, Val> = HashMap::new();
-        for param in [
-            "desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc",
-        ] {
-            signature.insert(
-                param.to_string(),
-                ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
-            );
-        }
-        let mut ce = |k: &str, v: Val| -> Result<(), String> {
-            signature.insert(k.to_string(), ArgSpec::Constexpr);
-            constexprs.insert(k.to_string(), v);
-            Ok(())
-        };
-        ce("H", Val::Int(i128::from(heads)))?;
-        ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
-        ce("HALF", Val::Int(i128::from(hd / 2)))?;
-        ce("X_ROWS", Val::Int(i128::from(y_rows)))?;
-        ce("ROW_START", Val::Int(i128::from(part.row0)))?;
-        // ⭐ THE BLOCK HEIGHT IS THE PART'S ROWS PADDED TO A POWER OF TWO — a Triton
-        // `block_shape` is power-of-two in every dim, and the pad lands in the page's
-        // slots past the part's rows (unwritten, reader-masked, re-written by any later
-        // chunk that reaches them — inert). `write_parts` caps every part so the pad
-        // stays inside its page, never on the next head's plane.
-        ce("PART_ROWS", Val::Int(i128::from(part.block_rows())))?;
-        ce("SLOT_START", Val::Int(i128::from(part.slot_start)))?;
-        ce("PLANE_SLOTS", Val::Int(PagedKvPool::PLANE_SLOTS as i128))?;
-        let spec = KernelSpec {
-            file: "rope.py".to_string(),
-            kernel: "rope_append_fwd".to_string(),
-            signature: signature.clone(),
-            constexprs: constexprs.clone(),
-        };
-        let module = compile_kernel(src, &spec, &[1])?;
-        // The bindings in the KERNEL's parameter order: the four stream operands, then the
-        // two pool planes bound from the SAME sealed `KvCacheLayout` witness `mint_attn`
-        // reads (`layout.cache_tensor()` / `v_cache_tensor()` — the pair the contract check
-        // above pinned to the graph edges).
-        let bindings = vec![
+
+    // ── HALF 1: THE ROTATION — `rope_fwd` minted as `Program::Rope`, the `RopeRotate`
+    // row's own op. `kernel_spec`'s rope arm derives the same constexprs off THIS node
+    // (it matches `RopeAppend` too), and the door's `fn rope` lowers the program through
+    // `rope_at` — the card-proven P-table matmul, no kernel body, no halves.
+    let spec = kernel_spec(node, ir, "rope.py", "rope_fwd")?;
+    let module = compile_kernel(src, &spec, &[1])?;
+    let rotation = mint(
+        node,
+        module,
+        &Program::Rope,
+        vec![
             t(&node.inputs[0]),
             t(&node.inputs[1]),
             t(&node.inputs[2]),
-            t(&node.inputs[3]),
-            BufferId::new(kc_tid.index() as u32),
-            BufferId::new(vc_tid.index() as u32),
-        ];
-        let mut k = mint(
-            node,
-            module,
-            &Program::RopeAppend,
-            bindings,
-        )?;
-        // All parts of one node share `mint`'s `rope_s{id}` name; each part is its own
-        // program, so the part and request tags make the names distinct — the door's own
-        // `cachewr_*{rq}{pt}` law.
-        let rq = if rows_are_requests {
-            format!("_r{}", part.request)
-        } else {
-            String::new()
-        };
-        let pt = if !rows_are_requests && parts.len() > 1 {
-            format!("_p{p}")
-        } else {
-            String::new()
-        };
-        let name = format!("rope_s{}{rq}{pt}", node.id.index());
-        k.func.name = Arena::global().str(name.clone());
-        let mut e = EmittedOp::bare(name);
-        e.ktir = Some(k);
-        // ── THE THREE-FACT STAMP (+ the slot stride and the fuse law), main's own cachewr
-        // values, stated at the one door the walk's stamp reads. `slot_stride_bytes` is
-        // `head_dim · 2` — the distance between two slots of one head (the KTIR arm's
-        // card-proven spelling `stick * 2` is the same 128 B at granite's hd 64).
-        e.kv_page_slots = PagedKvPool::PAGE_SLOTS as u32;
-        e.kv_request = part.request;
-        e.kv_slot_offset = part.page_offset;
-        e.slot_stride_bytes = hd * 2;
-        // ⛔ A PART BAKING A NONZERO SLOT IS ITS OWN LAUNCH: one `slot_pos` shift serves a
-        // fused Slot group, so two differently-baked slots would collapse — the per-slot
-        // prefill form's own law. Slot-0 parts (decode rows, page-aligned chunk parts)
-        // keep the fused-`Slot` reduction.
-        e.slot_no_fuse = part.slot_start != 0;
-        ops.push(e);
+            t(&node.output),
+        ],
+    )?;
+    let mut e = EmittedOp::bare(format!("rope_s{}", node.id.index()));
+    e.ktir = Some(rotation);
+
+    // ── HALF 2: THE CARRIER — `rope_append_fwd`, the arity-6 contract statement. Its
+    // body is never walked (the door's `Program::RopeAppend` arm lowers the write through
+    // `kv_cache_write`), so its constexprs state the CONTRACT: the node's window and the
+    // pool's plane law, `SLOT_START = 0` because the runtime aims every slot (the
+    // recipe's `kv_slot_offset` / `slot_stride_bytes` stamps, never a baked corner).
+    let mut signature: HashMap<String, ArgSpec> = HashMap::new();
+    let mut constexprs: HashMap<String, Val> = HashMap::new();
+    for param in ["desc_x", "desc_cos", "desc_sin", "desc_v", "desc_kc", "desc_vc"] {
+        signature.insert(
+            param.to_string(),
+            ArgSpec::parse("*fp16").map_err(|e| e.to_string())?,
+        );
     }
-    Ok(ops)
+    let mut ce = |k: &str, v: Val| -> Result<(), String> {
+        signature.insert(k.to_string(), ArgSpec::Constexpr);
+        constexprs.insert(k.to_string(), v);
+        Ok(())
+    };
+    ce("H", Val::Int(i128::from(heads)))?;
+    ce("HEAD_DIM", Val::Int(i128::from(hd)))?;
+    ce("HALF", Val::Int(i128::from(hd / 2)))?;
+    ce("X_ROWS", Val::Int(i128::from(y_rows)))?;
+    ce("ROW_START", Val::Int(i128::from(window.0)))?;
+    ce("PART_ROWS", Val::Int(i128::from(window.1)))?;
+    ce("SLOT_START", Val::Int(0))?;
+    ce(
+        "PLANE_SLOTS",
+        Val::Int(ktir_superdsc::sdsc_abstract::PagedKvPool::PLANE_SLOTS as i128),
+    )?;
+    let spec = KernelSpec {
+        file: "rope.py".to_string(),
+        kernel: "rope_append_fwd".to_string(),
+        signature,
+        constexprs,
+    };
+    let module = compile_kernel(src, &spec, &[1])?;
+    // The bindings in the KERNEL's parameter order: the four stream operands, then the
+    // two pool planes bound from the SAME sealed `KvCacheLayout` witness `mint_attn`
+    // reads (`layout.cache_tensor()` / `v_cache_tensor()` — the pair the contract check
+    // above pinned to the graph edges).
+    let bindings = vec![
+        t(&node.inputs[0]),
+        t(&node.inputs[1]),
+        t(&node.inputs[2]),
+        t(&node.inputs[3]),
+        BufferId::new(kc_tid.index() as u32),
+        BufferId::new(vc_tid.index() as u32),
+    ];
+    let mut carrier = mint(node, module, &Program::RopeAppend, bindings)?;
+    // ⭐ THE TWO-HALVES LAW, STATED ON THE CARRIER: this program is HALF of the node —
+    // the rotation writes the node's output, the carrier only names it (the recipe
+    // suffixes its ops `_o{t}` after it) — so `node_out_tid` carries the node's output
+    // tensor, exactly `LmLast`'s own precedent for a program that does not write its
+    // node's output itself.
+    carrier.node_out_tid = Some(t(&node.output));
+    // ⭐ AND ITS OWN NAME — `ropewr_s{id}`, never the rotation's `rope_s{id}`: both
+    // halves mint through `program_stem`'s `rope` stem, and two programs of one node
+    // with one name is a collision the emulator's function key would take for one
+    // function.
+    let carrier_name = format!("ropewr_s{}", node.id.index());
+    carrier.func.name = Arena::global().str(carrier_name.clone());
+    let mut w = EmittedOp::bare(carrier_name);
+    w.ktir = Some(carrier);
+    // NO STAMPS ON THE CARRIER: the recipe self-stamps every op it mints (the paged
+    // latch's own source — `latch_paged_geometry` reads the FINAL ops), so a carrier
+    // carrying write facts would be a second stamping site for one fact.
+    Ok(vec![e, w])
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -3308,8 +3301,9 @@ fn default_bindings<F: scratchy_subtile::subtile_ir::RopeForm>(
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
     // ⭐ `RopeAppend` never routes through here — [`lower_rope_append`] states its bindings
     // itself (the four stream operands plus the two pool planes off the sealed
-    // `KvCacheLayout`, no output binding: the stores ARE the writes). Keeping it out of
-    // this match makes a misroute loud at the arity check instead of binding six operands
+    // `KvCacheLayout`, no output binding: the write rides the door's recipe, so the
+    // carrier names its node's output on `node_out_tid` instead). Keeping it out of
+    // this match makes a misroute loud at the arity check instead of binding six
     // as if three were the rotation.
     let n_bound = match &node.op {
         SubOp::RopeRotate { .. } => 3,
@@ -3396,8 +3390,9 @@ fn program_stem<F: scratchy_subtile::subtile_ir::RopeForm>(
         Program::SiluMul => "silumul",
         Program::Matmul => "matmul",
         Program::Rope => "rope",
-        // The append keeps the builder's `rope_s{id}` stem — it IS the rope node; the
-        // part/request tags `lower_rope_append` appends distinguish the programs.
+        // The append keeps the builder's `rope` stem at the mint — it IS the rope node —
+        // and `lower_rope_append` then renames the carrier `ropewr_s{id}` so the node's
+        // two programs (rotation + carrier) never share one name.
         Program::RopeAppend => "rope",
         Program::ScalarMul => "scalarmul",
         // ⭐ THE SANDWICH'S OWN STEM — `rmsnorm_s{split.id}` (the split's id, not the

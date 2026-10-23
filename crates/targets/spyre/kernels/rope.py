@@ -36,10 +36,17 @@ THE ROW ORDER, kept from the fixture (delta 7, measured): row = position * H + h
 TOKEN-MAJOR, which is `addr_eq`'s same-bytes reshape of the worker's `[mq, heads*hd]`
 row-major staging — the arrangement the attention that consumes this tensor reads.
 
-⭐ THE APPEND FORM (`rope_append_fwd`, below) is `RopeAppend`'s OWN contract — the
+⭐ THE APPEND FORM (`rope_append_fwd`, below) is `RopeAppend`'s OWN CONTRACT — the
 front-end arity-6 `[K, cos, sin, V, K_cache, V_cache]` the arity-3 port collapsed.
-It rotates K and writes it, with V, straight into the pool planes; its own doc states
-the store laws. `rope_fwd` above stays `RopeRotate`'s (the q stream's, no cache).
+⭐⭐ ITS BODY IS NEVER WALKED (the wall-22 ruling, rope_fwd's own precedent): the
+node lowers to TWO programs, and the mechanism lives in the door's arms, not in
+this body — the rotation is `rope_fwd` minted as `Program::Rope` (the door's
+`rope_at`, the card-proven P-table matmul), and the write is THIS kernel minted as
+`Program::RopeAppend`, whose door arm lowers the node's contract through
+`kv_cache_write` (main's recipe: the identity copies into the pool planes, the
+three-fact stamps, and the Kᵀ re-transpose tail). The body below therefore STATES
+the contract — the six-parameter shape, the read-only streams, the two stored
+pool planes, the row window — and nothing it computes ever runs on card.
 
 ⭐ THE ROW WINDOW (per-row rope): the real front end's per-position decomposition
 produces rope nodes whose regions are ONE row's `[1, qw]` slice of the shared q
@@ -170,12 +177,15 @@ def rope_append_fwd(desc_x, desc_cos, desc_sin, desc_v, desc_kc, desc_vc,
                     X_ROWS: tl.constexpr, ROW_START: tl.constexpr,
                     PART_ROWS: tl.constexpr, SLOT_START: tl.constexpr,
                     PLANE_SLOTS: tl.constexpr):
-    """THE APPEND FORM — `RopeAppend`'s own contract, the front-end arity-6 shape the
-    arity-3 port dropped: rotate K AND write it, with the un-rotated V, into the paged
-    KV pool. The rotation is `_rope_per_head`'s math; the STORES ARE THE CACHE WRITES —
-    there is no `desc_o`, because nothing on the device path reads the rotated
-    intermediate (the splice never binds `AttnDecode`'s `new_k`), and the reference's
-    shape — the outputs ARE the cache stores — wins.
+    """THE APPEND FORM — `RopeAppend`'s write-half CARRIER, the front-end arity-6 shape
+    the arity-3 port dropped: rotate K AND write it, with the un-rotated V, into the
+    paged KV pool. ⭐⭐ THE BODY IS A CONTRACT STATEMENT AND IS NEVER WALKED (the
+    wall-22 ruling): the door's `Program::RopeAppend` arm lowers this node's write
+    through `kv_cache_write` — main's recipe — and the rotation through the
+    `Program::Rope` half's `rope_at`. What the kernel STATES, and all the door reads
+    off it: the six parameters (four read-only streams, two stored pool planes),
+    the row window (`ROW_START`, `PART_ROWS` over the `[X_ROWS, width]` plane), and
+    the pool's head count and head dim off the plane shapes.
 
     ⭐ THE SCALE LAW, STATED AT THE WRITE. The cached K is the rope's PLAIN output:
     `attn_scale_weight_folds` REFUSES the fold for an fp8 k_proj (the weight is
@@ -185,26 +195,28 @@ def rope_append_fwd(desc_x, desc_cos, desc_sin, desc_v, desc_kc, desc_vc,
     scale into this store.
 
     THE POOL PLANES, at `PagedKvPool`'s own law: one plane per kv head, `[PLANE_SLOTS,
-    HEAD_DIM]` row-major, head `h`'s plane at row `h * PLANE_SLOTS`. A part's rows land
-    at slots `[SLOT_START, SLOT_START + PART_ROWS)` of its page — the part is cut so it
-    stays inside one page (`PagedKvPool::write_parts`, the shared cutting law), the page
-    itself is named by the RUNTIME through the block table (`kv_request` /
-    `kv_slot_offset`), and the decode slot by the launch's `seq_pos` shift
-    (`slot_stride_bytes`). The stores therefore bake `SLOT_START` and nothing else.
+    HEAD_DIM]` row-major, head `h`'s plane at row `h * PLANE_SLOTS`. `SLOT_START` is
+    ALWAYS 0 on this carrier — the recipe aims every slot at runtime (the block table
+    through `kv_request` / `kv_slot_offset`, the decode slot through the launch's
+    `seq_pos` shift), never a baked corner; the constexpr stays because the body's
+    stores state the slot law it is the contract of.
 
     THE ROW WINDOW, per head: the x/cos/sin/v views are the worker-staged plane
-    `[X_ROWS, H * HEAD_DIM]`, and this part's rows are `[ROW_START, ROW_START +
+    `[X_ROWS, H * HEAD_DIM]`, and this node's rows are `[ROW_START, ROW_START +
     PART_ROWS)` — the same window law `rope_fwd`'s tall form states, at the plane view
     where one row IS one position. cos/sin are the head-replicated tables, read at the
-    part's own row base so each head's tiles line up row for row.
+    window's own row base so each head's tiles line up row for row.
     """
     tl.static_assert(HALF + HALF == HEAD_DIM)
     tl.static_assert(
         PART_ROWS >= 1,
-        "rope_append_fwd: a part covers at least one row")
-    tl.static_assert(
-        SLOT_START + PART_ROWS <= PLANE_SLOTS,
-        "rope_append_fwd: a part must stay inside one page of the pool plane")
+        "rope_append_fwd: a node's window covers at least one row")
+    # ⛔ NO PAGE-FIT ASSERT, AND ON PURPOSE: the window may span pages (a prefill
+    # chunk is up to two), and it is the RECIPE that cuts it — `kv_cache_write` runs
+    # the ONE shared cutting law (`PagedKvPool::write_parts`) and aims every part at
+    # its own page at runtime. This body is the never-walked contract statement, so
+    # its stores state the slot law of ONE part; baking the whole window's fit here
+    # would refuse the exact wide-chunk form the recipe exists to cut.
     width = H * HEAD_DIM
     x_desc = tl.make_tensor_descriptor(desc_x, shape=[X_ROWS, width], strides=[width, 1],
                                        block_shape=[PART_ROWS, HALF])
@@ -217,8 +229,8 @@ def rope_append_fwd(desc_x, desc_cos, desc_sin, desc_v, desc_kc, desc_vc,
     v_desc = tl.make_tensor_descriptor(desc_v, shape=[X_ROWS, width], strides=[width, 1],
                                        block_shape=[PART_ROWS, HEAD_DIM])
     # The two pool planes: `[H * PLANE_SLOTS, HEAD_DIM]` — head h's plane is rows
-    # `[h * PLANE_SLOTS, (h + 1) * PLANE_SLOTS)`, and this part writes slots
-    # `[SLOT_START, SLOT_START + PART_ROWS)` of it.
+    # `[h * PLANE_SLOTS, (h + 1) * PLANE_SLOTS)`, and this window's rows land at its
+    # slots (the recipe's own cutting and aiming, never this body's).
     kc_desc = tl.make_tensor_descriptor(desc_kc, shape=[H * PLANE_SLOTS, HEAD_DIM],
                                         strides=[HEAD_DIM, 1],
                                         block_shape=[PART_ROWS, HALF])

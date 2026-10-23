@@ -7433,10 +7433,10 @@ fn ktir_groups_via_superdsc(
             ))
         })?;
         let _pc_cls = crate::pc::Pc::start(crate::pc::mint_class(&e.op_name));
-        let mut lowered = crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params)
-            .map_err(|err| {
-                SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message))
-            })?;
+        let mut lowered =
+            crate::ktir_superdsc_door::lower(k, &mut sym_id_base, layout, attn_params).map_err(
+                |err| SuperDscError(format!("{}: KTIR -> SuperDSC: {}", e.op_name, err.message)),
+            )?;
         drop(_pc_cls);
         crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
         // ⭐ THE PAGED-FOLD STAMP — the CHAIN-OF-CUSTODY step. The splice states the fold on the
@@ -7454,69 +7454,12 @@ fn ktir_groups_via_superdsc(
                 o.kv_page_slots = facts.page_slots;
             }
         }
-        // ⭐ THE WRITE-Facts STAMP — the SECOND chain-of-custody site, the append lowering's
-        // own: the splice states the cache-write facts on the program's EmittedOp
-        // (`lower_rope_append`'s three-fact stamp: `kv_page_slots` from `PagedKvPool`,
-        // `kv_request`, `kv_slot_offset`, plus the decode slot stride), and THIS is where
-        // they reach the descriptors the bake actually groups — copied onto every op the
-        // door minted from that program that does not already state KV facts of its own.
-        //
-        // ⛔ A FOLD AND A WRITE ARE DIFFERENT FAMILIES, never both on one program: a fold's
-        // body gathers the pool and a write's stores populate it, and the two stamp sets
-        // would fight over the same fields. A program stating both is a producer bug.
-        //
-        // ⭐ AN OP THAT ALREADY STATES KV FACTS IS THE DOOR'S OWN Kᵀ TAIL — minted
-        // pre-stamped with main's subset (its page and request, never a slot stride: the
-        // whole-page re-transpose takes no `seq_pos` shift). The walk CHECKS the door's
-        // reading against the splice's carrier here — both run through the ONE shared
-        // aiming law (`PagedKvPool::write_aim`), so a divergence is a build refusal naming
-        // both, never a silently mis-aimed transpose — and never overwrites a fact the
-        // door stated.
-        let write_facts = e.kv_page_slots > 0;
-        if write_facts && e.kv_paged_fold.is_some() {
-            return Err(SuperDscError(format!(
-                "{}: states BOTH a paged fold and a cache write — the fold's body gathers the \
-                 pool and the write's stores populate it; a program carrying both stamps is a \
-                 producer bug",
-                e.op_name
-            )));
-        }
-        if write_facts {
-            for o in &mut lowered {
-                let prestamped = o.kv_page_slots > 0 || o.kv_request > 0 || o.kv_slot_offset > 0;
-                if !prestamped {
-                    o.kv_page_slots = e.kv_page_slots;
-                    o.kv_request = e.kv_request;
-                    o.kv_slot_offset = e.kv_slot_offset;
-                    o.slot_stride_bytes = e.slot_stride_bytes;
-                    o.slot_no_fuse = e.slot_no_fuse;
-                }
-            }
-            // THE CHECK: every pre-stamped op (the Kᵀ tail) must agree with the carrier on
-            // the facts the two derivations share.
-            for o in &lowered {
-                let prestamped = o.kv_page_slots > 0 || o.kv_request > 0 || o.kv_slot_offset > 0;
-                if prestamped
-                    && (o.kv_request != e.kv_request
-                        || o.kv_slot_offset != e.kv_slot_offset
-                        || o.kv_page_slots != e.kv_page_slots)
-                {
-                    return Err(SuperDscError(format!(
-                        "{}: the door's Kᵀ tail aims request {} offset {} (page_slots {}) but \
-                         the splice's carrier states request {} offset {} (page_slots {}) — the \
-                         two readings of the program's row window diverged through the ONE \
-                         shared aiming law, which is a producer bug, not a lowering decision",
-                        e.op_name,
-                        o.kv_request,
-                        o.kv_slot_offset,
-                        o.kv_page_slots,
-                        e.kv_request,
-                        e.kv_slot_offset,
-                        e.kv_page_slots
-                    )));
-                }
-            }
-        }
+        // ⭐ THE CACHE-WRITE FACTS NEED NO STAMP SITE — the append's recipe
+        // (`kv_cache_write`, called from the door's `Program::RopeAppend` arm)
+        // SELF-STAMPS every op it mints (`kv_page_slots`, `kv_request`,
+        // `kv_slot_offset`, the slot stride), which is what `latch_paged_geometry`
+        // reads off the final ops. A carrier-borne stamp copied here would be a second
+        // stamping site for one fact; there is none.
         // ⭐ PER-PROGRAM ATTRIBUTION, because a TRIP IS NOT A DESCRIPTOR. `render_dxp_input`
         // pre-unrolls each op into `concrete_trips(e)` — `EmittedOp::time` trips, set by
         // `WorkPlan::time_tile_for_lx` when a per-core tile does not fit the scratchpad. So a bundle's
