@@ -803,9 +803,11 @@ pub fn lower_rope_append<F: scratchy_subtile::subtile_ir::RopeForm>(
     };
     let module = compile_kernel(src, &spec, &[1])?;
     // The bindings in the KERNEL's parameter order: the four stream operands, then the
-    // two pool planes bound from the SAME sealed `KvCacheLayout` witness `mint_attn`
-    // reads (`layout.cache_tensor()` / `v_cache_tensor()` — the pair the contract check
-    // above pinned to the graph edges).
+    // two pool planes — the pair's OWN tensors, the WRITE's destinations (natural K and V;
+    // the Kᵀ tail re-transposes from the K one into the reserved `kct_resident_tid` plane,
+    // which is what `mint_attn`'s gather reads — the pair's K tid KEYS that plane, and the
+    // carrier never reads it, only fills its source). The pair is the one the contract
+    // check above pinned to the graph edges.
     let bindings = vec![
         t(&node.inputs[0]),
         t(&node.inputs[1]),
@@ -1567,8 +1569,12 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 //    shapes it served are the prefill kernel's to serve, refused by name until that row
 //    lands);
 //  * the DOOR's parameter order is q, out, kt, v, ids, mask — the output is SECOND, the
-//    two pool planes are the node's OWN cache-tensor pair (`KvCacheLayout`, the sealed
-//    witness the producing `RopeAppend` writes), and the id table and the mask are bound
+//    Kᵀ plane is the RESERVED tid keyed on the sealed pair's K tid (the door's own naming
+//    law, `kct_resident_tid` — the same derivation the write's tail fills and main's
+//    card-proven reader reads; the pair's OWN K tensor is the NATURAL plane the write's
+//    cachewr copies fill, and reading it here would misread real K as transposed — same
+//    size, wrong plane, invisible to every extent law), the V plane is the pair's own V
+//    tensor (read natural), and the id table and the mask are bound
 //    synthetic tensors beyond the graph (`k.mask`'s own law), because no graph tensor
 //    names them;
 //  * EVERY CONSTEXPR IS THE NODE'S OWN FACT OR A SHARED LAW — the geometry and scale off
@@ -2141,10 +2147,11 @@ fn paged_fold_finalize_spec(f: &PagedFoldFamilyFacts) -> Result<KernelSpec, Stri
 
 /// THE PAGED-FOLD FAMILY'S MINT — three programs, in PROGRAM ORDER (seed, fold body,
 /// finalize), each re-stated like [`mint_attn`] re-states the one-shot kernels: the bindings
-/// in the KERNEL's parameter order, the pool planes bound to the node's own cache-tensor
-/// pair, the tables and mask as host-staged step inputs past the graph (the SAME slot law
-/// [`mint_attn`] numbers), and the carry bound to its three reserved tids — the placements
-/// the census mints, gated on the ladder's fold statement.
+/// in the KERNEL's parameter order, the Kᵀ plane bound to the RESERVED tid keyed on the
+/// sealed pair's K tid and the V plane to the pair's own V tensor (the same naming law
+/// [`mint_attn`] states), the tables and mask as host-staged step inputs past the graph (the
+/// SAME slot law [`mint_attn`] numbers), and the carry bound to its three reserved tids — the
+/// placements the census mints, gated on the ladder's fold statement.
 ///
 /// ⭐ ONLY THE BODY CARRIES THE FOLD ATTRIBUTE ([`EmittedOp::paged_fold`], the ONE door): the
 /// seed and the finalize launch once per step, not once per page, so stamping a fold onto
@@ -2273,7 +2280,16 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
             m_tid,
             l_tid,
             acc_tid,
-            BufferId::new(layout.cache_tensor().index() as u32),
+            // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `kct_resident_tid` keyed on the
+            // sealed pair's K tid, the SAME expression the door's write tail
+            // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
+            // body-representative table before them: the THIRD sayer of one derivation. The
+            // pair's own K tensor is the NATURAL plane the write's cachewr copies fill; binding
+            // it here misreads real K as transposed — same size, wrong plane, invisible to every
+            // extent law (both planes are `plane_stride` per kv head).
+            BufferId::new(ktir_superdsc::reserved_tids::kct_resident_tid(
+                layout.cache_tensor().index() as u32,
+            )),
             BufferId::new(layout.v_cache_tensor().index() as u32),
             kt_ids_tid,
             v_ids_tid,
@@ -2326,11 +2342,14 @@ fn mint_paged_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 
 /// THE ATTENTION MINT — the adapter's `node_for` compilation ([`attn_positional`]), then the
 /// attention's own re-state: the bindings in the KERNEL's parameter order (q, out, the two
-/// pool planes, the two block-entry tables, the mask), the pool planes bound to the node's
-/// OWN cache-tensor pair (the sealed `KvCacheLayout` witness — the same tensors the producing
-/// `RopeAppend` writes), the two block-entry tables and the mask as host-staged step inputs
-/// past the graph (numbered through the one shared `step_input_tid` law and STATED on the
-/// node, so the producer's placement pass places exactly those tids and the runtime
+/// pool planes, the two block-entry tables, the mask), the Kᵀ plane bound to the RESERVED tid
+/// keyed on the sealed pair's K tid (the door's own naming law, `kct_resident_tid` — the same
+/// derivation the write's tail fills and main's card-proven reader reads; the pair's OWN K
+/// tensor is the NATURAL plane the write's cachewr copies fill, and the score gather must not
+/// read it — same size, wrong plane, invisible to every extent law) and the V plane to the
+/// pair's own V tensor (read natural), the two block-entry tables and the mask as host-staged
+/// step inputs past the graph (numbered through the one shared `step_input_tid` law and STATED
+/// on the node, so the producer's placement pass places exactly those tids and the runtime
 /// discovers them by placement), and the builder's `attn_s{id}` name.
 fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
@@ -2367,7 +2386,16 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let mut bindings = vec![
         t(&node.inputs[0]),
         t(&node.output),
-        BufferId::new(layout.cache_tensor().index() as u32),
+        // ⭐ THE SCORE GATHER READS THE RESERVED Kᵀ PLANE — `kct_resident_tid` keyed on the
+        // sealed pair's K tid, the SAME expression the door's write tail
+        // (ktir_superdsc_door.rs) and main's card-proven reader spell, and the tape layer's
+        // body-representative table before them: the THIRD sayer of one derivation. The pair's
+        // own K tensor is the NATURAL plane the write's cachewr copies fill; binding it here
+        // misreads real K as transposed — same size, wrong plane, invisible to every extent law
+        // (both planes are `plane_stride` per kv head).
+        BufferId::new(ktir_superdsc::reserved_tids::kct_resident_tid(
+            layout.cache_tensor().index() as u32,
+        )),
         BufferId::new(layout.v_cache_tensor().index() as u32),
         kt_ids_tid,
         v_ids_tid,
