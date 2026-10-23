@@ -3230,6 +3230,15 @@ pub fn program_stated_scales(f: &IRFunction<'static>) -> Vec<(f32, Df)> {
         {
             stated.push((sf.value, scale_slot_df(f, sf.splat, sf.value)));
         }
+        // ⭐ A STORED SPLAT IS A STATED VALUE TOO — the fill's own constant rides the SAME
+        // registry the constant-operand ops read ([`scalarfill_at`] resolves it by bits), so a
+        // program whose only constants are stored (the online-softmax carry's seed) completes
+        // the registry exactly like one whose constants multiply tiles.
+        if op.op_type == OpKind::KtdpStore
+            && let Some((v, sp)) = super::whole_function::stored_splat_of(f, op)
+        {
+            stated.push((v, scale_slot_df(f, sp, v)));
+        }
     }
     if let Some((eps, sp)) = program_rmsnorm_eps_splat(f) {
         stated.push((eps, scale_slot_df(f, sp, eps)));
@@ -9152,6 +9161,77 @@ pub fn scalarextremum_at(
         sym_id_base,
         layout,
     )
+}
+
+/// ⭐⭐⭐ THE FILL — a `ktdp.store` of a splatted constant, the store-side member of the
+/// constant-operand pointwise class [`scalarmul_at`] states for multiply, [`scalarsub_at`] for
+/// subtract and [`scalarextremum_at`] for the extrema. Those three read a TILE and combine it
+/// with a bound `[1,1]` const; the fill has no tile — the constant IS the whole payload — so it
+/// is lowered as the IDENTITY broadcast of the value's registry slot over the store's own
+/// window: one pointwise, one `In::scalar` input, the same descriptor shape the scale ops give
+/// their riding const with the tile dropped. The online-softmax carry's seed (max at the finite
+/// −65504 sentinel, sum and accumulator at zero, three stores in one program) is the producing
+/// shape; the statement is general — any program storing a splatted compile-time float fills
+/// its window with it.
+///
+/// The constant is resolved through the SAME value lookup ([`scale_slot`]: exact bits, then the
+/// f16 image), so the registry's completion pass — the program-stated half, which collects
+/// these stores beside the mulf/subf/extrema splats — must carry it, and a program whose
+/// constant the registry lacks is refused as the desync it is.
+///
+/// ⛔ THE WINDOW IS THE STORE'S OWN TILE, resolved by the walk before this door is reached (the
+/// same `region_of_view_operand` + `windowed_region` the compute store arm takes), so the fill
+/// writes exactly the columns the program states — swept at the STICK-PADDED width a pointwise
+/// emission demands (`DeviceWidth::for_pointwise` of the window, floor-dropped to what the
+/// placement holds by [`pointwise_width_the_output_holds`], the same pair the scalar bodies
+/// derive). A carry placement that reserves only the view's own sub-stick bytes is refused
+/// there by name — the pad is the fill's own law, and the placement pass reserves it.
+pub fn scalarfill_at(
+    name: &str,
+    value: f32,
+    out: &Region,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    let idx = scale_slot(layout, value).ok_or_else(|| Error {
+        message: format!(
+            "Fill {name}: constant {value}, read off the program, is absent from \
+             `BundleLayout::scalarmul_scales` — the descriptor broadcasts a bound `[1,1]` const, so \
+             the value the program uses must have a registry slot (registry desync)"
+        ),
+    })?;
+    let scale_tid = scalarmul_scale_tid(idx);
+    let out_name = out.name();
+    let rows = pointwise_rows(name, out)?;
+    // The scalar bodies' own corner law: a column-blocked piece reads and writes ONE window.
+    let corner = chunk_window(name, rows, out)?;
+    let (cols, store_cols) = pointwise_width_the_output_holds(
+        layout,
+        &[&out_name],
+        rows,
+        out.v_cols,
+        DeviceWidth::for_pointwise(out.c_len).get(),
+    )?;
+    let scale_h = rbo(&crate::place::act_name(scale_tid));
+    let out_h = rb_df(&out_name, rows, store_cols, out.df);
+    // `n_operands: 2` is the `_df` funnel's own count for a one-input op (the input plus the
+    // output — what `assemble_pointwise_broadcast_off` states for lmlast's identity copies);
+    // nothing rides in this op, so the count is derived from its shape, not hand-picked.
+    let tile_op = pointwise_tile_op(rows, cols, 1, 2, out.df);
+    let inputs = [In::scalar(&scale_h).ew()];
+    let op_name = format!("fill_o{}", out.tid);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        "identity",
+        rows,
+        cols,
+        &inputs,
+        &out_h,
+        corner,
+        sym_id_base,
+        layout,
+    )])
 }
 
 /// ⭐ THE RUNG-3 BODY: a scalar multiply whose multiplier is a LAUNCH BINDING, not a baked value.

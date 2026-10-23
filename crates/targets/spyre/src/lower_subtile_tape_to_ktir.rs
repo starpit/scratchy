@@ -1929,7 +1929,19 @@ pub fn place_paged_fold_carry(
                             e.op_name
                         ))
                     })?;
-                let size = region.v_rows as u64 * region.v_cols as u64 * df.word_length() as u64;
+                // ⭐ THE STICK PAD — the seed's fill writes this window with a POINTWISE op, and a
+                // pointwise emission sweeps whole sticks of the window's own df (the fill's
+                // `DeviceWidth::for_pointwise` floor, dropped by `pointwise_width_the_output_holds`
+                // to what this placement holds). A half-stick carry ([BATCH*MQ] = 32 f16 at this
+                // geometry) reserved at its raw 64 B would hold 0 whole sticks per row and the
+                // fill's width law would refuse the placement it cannot read a stick from — so
+                // the reservation is the PADDED extent, and the pad columns are inert: nothing
+                // loads them (the body reads the view's own 32), they only complete the stick.
+                let cols = region
+                    .v_cols
+                    .next_multiple_of(df.elems_per_stick())
+                    .max(df.elems_per_stick());
+                let size = region.v_rows as u64 * cols as u64 * df.word_length() as u64;
                 let seg = SegRole::Intermediate.segment();
                 match layout.placements.get(&tid) {
                     // Every layer's fold statement states the same carry: the second sighting

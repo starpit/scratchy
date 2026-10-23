@@ -1680,8 +1680,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 // ceiling) takes its own page count as the region — the fold's plane descriptors
                 // state the region, and a region past the pool's placements sweeps past them
                 // (the splice refuses exactly that).
-                paged_fold_region_pages =
-                    Some(max_pages.min(u64::from(cap)).max(1) as u32);
+                paged_fold_region_pages = Some(max_pages.min(cap).max(1) as u32);
                 // ONE validity row over the max context, or one PER QUERY ROW when the rows are
                 // separate requests and each carries its own history. The multiplier is the op row
                 // count the attention sweeps (`nqh*mq`), which is what the per-row read addresses.

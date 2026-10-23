@@ -1183,6 +1183,52 @@ pub fn splat_scale_of(
     }
 }
 
+/// ⭐⭐⭐ A `ktdp.store` WHOSE VALUE IS A SPLATTED CONSTANT — the FILL's own discriminator, the
+/// store-side twin of [`splat_scale_of`]'s operand test. A store of `tensor.splat` over an
+/// `arith.constant` writes one stated value across its whole window; no load feeds it and no
+/// compute op consumes it, so the walk's compute loop would never reach it and the program it
+/// belongs to would die at "no compute op in the function" — a pure-fill program being the
+/// shape the online-softmax carry's seed states (max at the finite −65504 sentinel, sum and
+/// accumulator at zero).
+///
+/// The constant is resolved through the SAME registry the constant-operand pointwise class uses
+/// ([`program_stated_scales`] collects these stores beside the mulf/subf/extrema splats), so the
+/// fill and the scale ops share one staging channel: a worker-bound `[1,1]` const, broadcast over
+/// the store's own window by the identity pointwise — the same descriptor shape
+/// [`super::lower_ktir_to_superdsc::scalarmul_scaled`] gives a scalar op, with the broadcast
+/// const as the only input.
+///
+/// Returns the VALUE and the splat's own SSA (the seat the value and its element format both
+/// came from — the same provenance [`SplatFact::splat`] carries). `None` when the store's value
+/// is not exactly a splatted compile-time float (a loaded or computed value; those belong to the
+/// compute ops that produce them).
+pub fn stored_splat_of(
+    f: &IRFunction<'static>,
+    op: &ktir_core::ir::Operation<'static>,
+) -> Option<(f32, Ssa)> {
+    let def_of = |s: Ssa| f.operations.iter().find(|o| o.result == Some(s));
+    // The same `arith.constant` → `tensor.splat` spelling [`splat_scale_of`]'s `splat_value`
+    // reads — the only spelling this crate's producers use, read at the store instead of at a
+    // constant-operand op.
+    let v = *op.operands.first()?;
+    let sp = def_of(v)?;
+    if sp.op_type != OpKind::TensorSplat {
+        return None;
+    }
+    let c = def_of(*sp.operands.first()?)?;
+    if c.op_type != OpKind::ArithConstant {
+        return None;
+    }
+    let value = c
+        .attributes
+        .iter()
+        .find_map(|(k, val)| match (k, val) {
+            (AttrKey::Value, Attr::Float(x)) => Some(*x),
+            _ => None,
+        })?;
+    Some((value as f32, v))
+}
+
 /// A rung-3 bound scale: the `[1,1]` parameter a `tensor.splat` reads through its load, and the
 /// tensor operand on the mulf's other side.
 #[derive(Clone, Copy, Debug)]
@@ -3149,6 +3195,48 @@ pub fn lower_function(
                 .find(|s| op.operands.get(1) == Some(&s.tile))
         {
             out.push(lower_indexed_write(k, sc, sym_id_base, layout)?);
+            continue;
+        }
+        // ⭐⭐⭐ A STORE OF A SPLATTED CONSTANT — a FILL, the store-side member of the
+        // constant-operand class the `scalar`/`extremum`/`scalar_sub` tiebreaks above state for
+        // compute ops. A store of `tensor.splat` over an `arith.constant` is lowered HERE, at its
+        // own program position, as the identity broadcast of the value's `[1,1]` registry const
+        // over the store's own window (the window resolved through the store's tile exactly as
+        // the compute store arm below resolves its output — the load-side law "the window is the
+        // tile's own", stated for a store with no compute op to carry it). A program whose stores
+        // are ALL fills is then not the "no compute op" refusal's shape but a legitimate program:
+        // `lowered` counts these, so the online-softmax carry's seed (three constant stores, one
+        // program) lowers as three descriptors instead of dying at the door.
+        if op.op_type == OpKind::KtdpStore
+            && let Some((value, _splat)) = stored_splat_of(f, op)
+        {
+            let out_tile = op.operands.get(1).copied();
+            let tile = f.operations.iter().find(|o| {
+                o.op_type == OpKind::KtdpConstructAccessTile && o.result == out_tile
+            });
+            let Some(tile) = tile else {
+                return err(format!(
+                    "{}: a constant store names no access tile — nothing states the window it fills",
+                    f.name
+                ));
+            };
+            let Some(mut o) = region_of_view_operand(k, tile, 0)? else {
+                return err(format!(
+                    "{}: a constant store names no parameter — a fill with no bound buffer has \
+                     no window to write",
+                    f.name
+                ));
+            };
+            o = windowed_region(k, o, tile)?;
+            o.is_out = true;
+            out.append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
+                f.name,
+                value,
+                &o,
+                sym_id_base,
+                layout,
+            )?);
+            lowered += 1;
             continue;
         }
         if is_plumbing(op.op_type) {
