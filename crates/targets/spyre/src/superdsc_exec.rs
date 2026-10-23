@@ -22,7 +22,8 @@ use std::num::NonZeroU64;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use flex_rs::memory_region::MemoryType;
+use flex_rs::address::RegionId;
+use flex_rs::memory_region::{DomainId, MemoryType};
 use flex_rs::stream::RuntimeStreamError;
 use tracing::{debug, info};
 
@@ -32,8 +33,8 @@ use crate::fold_plan::{
     self, Bytes, OpKv, PerClass, RowCursors, RowIdx, RowPage, SessionKv, SlotPos, fused_rungs,
 };
 use crate::runtime::{
-    BatchedCompute, ByteOffset, ByteSize, ComputeWireBatch, ControlBlockWire, DevAddr, HwError,
-    Stream,
+    BatchedCompute, ByteOffset, ByteSize, Chunk0, ComputeWireBatch, ControlBlockWire, DevAddr,
+    HwError, Stream,
 };
 use crate::sen_convert;
 use crate::stage_weight::{Element, RetileWalk, stage_weight_tiled};
@@ -948,6 +949,9 @@ struct TensorDump {
     op: usize,
     /// Last-seen device bytes per placement (sen format, exactly what D2H brought back).
     snap: std::collections::HashMap<bundle::PlaceId, Vec<u8>>,
+    /// Last-seen bytes per POOL WINDOW (see the LEG-2 watch in [`Executor::tensordump`]), in the
+    /// fixed order the watch builds them: pg1, pg2, baked. `None` until first read.
+    wins: Vec<Option<Vec<u8>>>,
 }
 
 /// The process-global fingerprint → program-index registry for the tensordump, in first-dumped
@@ -4045,6 +4049,7 @@ impl Executor {
                 prog,
                 op: 0,
                 snap: std::collections::HashMap::new(),
+                wins: vec![None; 3],
             });
         }
         let _ = self.stream_ref()?.synchronize();
@@ -4130,6 +4135,88 @@ impl Executor {
             let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
             let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
             let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+        }
+        // ── LEG-2: the pool windows NO PLACEMENT NAMES. The placement watch above covers page 0 of
+        // seg2 only (the one-page host shadow), but the paged KV path lives at page 1 (the
+        // request's block — the gather's read target) and page 2 (the doubled base the LEG-1 aim
+        // line pinned as the cachewr target), and the emitter's own baked plan addresses seg2 at
+        // SEGMENT_OFFSETS[2] — a 16 GiB region NO runtime allocation holds (the runtime's pool is
+        // its own region; whether any op honors the baked absolute is exactly what this settles).
+        // Three fixed 1 MiB windows (layer 0's K/V/Kt planes = 3 × 256 KiB, plus margin), same
+        // first-writer/change detection and file naming as the placements: a window whose content
+        // appears, moves or stays empty is a FACT about where the chunk KV landed, not an
+        // inference from page 0's leftovers.
+        let stride = self.fold.page_stride_bytes.0;
+        if stride > 0 {
+            if let Some(pool) = self.seg_addr[SEG_KV.get()].clone() {
+                const WIN: u64 = 1 << 20;
+                let baked = DevAddr::from_chunk(Chunk0 {
+                    region: RegionId(ktir_superdsc::wire::SEGMENT_OFFSETS[SEG_KV.get()]),
+                    offset: ByteOffset(0),
+                    size: ByteSize(WIN),
+                    domain: DomainId(0),
+                });
+                let wants: [(&str, Option<DevAddr>); 3] = [
+                    ("pg1", pool.window(ByteOffset(stride), ByteSize(WIN))),
+                    ("pg2", pool.window(ByteOffset(2 * stride), ByteSize(WIN))),
+                    ("baked", Some(baked)),
+                ];
+                // Read every window BEFORE touching `dump` (the stream borrow and the dump borrow
+                // are disjoint phases, the same split `d2h_seg_clamped` makes).
+                let mut bufs: [Option<Vec<u8>>; 3] = [None, None, None];
+                for (bi, (_, waddr)) in wants.iter().enumerate() {
+                    let Some(waddr) = waddr else {
+                        continue; // a window past the pool's end — not addressable, nothing to read
+                    };
+                    let mut buf = vec![0u8; WIN as usize];
+                    let stream = self.stream_ref()?;
+                    match stream.d2h(&mut buf, waddr).and_then(|_| stream.synchronize()) {
+                        Ok(()) => bufs[bi] = Some(buf),
+                        Err(e) => {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(dir.join("windows.txt"))
+                            {
+                                let _ = writeln!(
+                                    f,
+                                    "op{opno} prog{prog} {}: window read FAILED: {e}",
+                                    wants[bi].0
+                                );
+                            }
+                        }
+                    }
+                }
+                for (bi, (name, _)) in wants.iter().enumerate() {
+                    let Some(cur) = bufs[bi].as_ref() else {
+                        continue;
+                    };
+                    let dump = self.dump.as_mut().expect("initialized above");
+                    let moved = match dump.wins[bi].as_ref() {
+                        Some(prev) => prev != cur,
+                        None => cur.iter().any(|b| *b != 0),
+                    };
+                    if !moved {
+                        continue;
+                    }
+                    dump.wins[bi] = Some(cur.clone());
+                    let elems = WIN as usize / 2; // the KV planes are SEN169_FP16
+                    let mut vals = Vec::with_capacity(elems);
+                    for c in cur.as_chunks::<2>().0 {
+                        vals.push(sen_convert::sen_to_f32(sen_convert::SenF16(
+                            u16::from_le_bytes(*c),
+                        )));
+                    }
+                    let raw_bytes: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    let stem = format!("prog{prog}_seg2win_{name}");
+                    let tl = format!("op{opno}_prog{prog}_seg2win_{name}");
+                    let _ = std::fs::write(dir.join(format!("{stem}.bin")), &raw_bytes);
+                    let _ = std::fs::write(dir.join(format!("{stem}.n")), format!("{elems}\n"));
+                    let _ = std::fs::write(dir.join(format!("{tl}.bin")), &raw_bytes);
+                    let _ = std::fs::write(dir.join(format!("{tl}.n")), format!("{elems}\n"));
+                }
+            }
         }
         if !skipped.is_empty() {
             use std::io::Write as _;
