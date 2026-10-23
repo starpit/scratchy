@@ -24,6 +24,8 @@ use std::num::NonZeroU32;
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::{StepLogits, SuperDscSession};
+#[cfg(feature = "spyre-hw")]
+use scratchy_target_spyre::superdsc_exec::BindKey;
 
 use crate::error::ExecutorResult;
 #[cfg(feature = "spyre-hw")]
@@ -454,6 +456,17 @@ pub(crate) fn run_prefill_batch(
             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
         )),
         causal_keyed: None,
+        // ⛔ NO KEYED CONSTS OR INDEX HERE (#603 L2-1): a prompt chunk's constant tables are
+        // ROW-DEPENDENT (`StagedRows` varies with the launch), so no bundle-capacity key is
+        // complete for them, and its gather table walks the chunk's own rows — both stay on the
+        // per-step binds this site has always made.
+        consts_key: None,
+        consts_held: Vec::new(),
+        index_key: None,
+        index_held: false,
+        consts_keyed: Vec::new(),
+        index_keyed: None,
+        held_skips: Vec::new(),
         launched: false,
     };
     scratchy_subtile::host_tape::play(
@@ -466,7 +479,7 @@ pub(crate) fn run_prefill_batch(
     acts_f16.extend(launcher.acts_f16);
     acts_i32.extend(launcher.acts_i32);
     if let Some((id, key, vals)) = launcher.causal_keyed {
-        pf.bind_keyed(id, key, &vals)
+        pf.bind_keyed(id, BindKey::Causal(key), &vals)
             .map_err(|e| werr(format!("prefill: keyed causal bind: {e}")))?;
     }
 
@@ -720,7 +733,7 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
     /// ⭐ THE CAUSAL KEY THE SESSION ALREADY HOLDS — `SuperDscSession::keyed_holds`, read before the
     /// tape plays. When it equals `inputs.causal`, the causal step builds nothing and binds nothing:
     /// the device keeps that key's mask.
-    pub(crate) causal_held: Option<scratchy_subtile::sdsc_abstract::CausalKey>,
+    pub(crate) causal_held: Option<scratchy_target_spyre::superdsc_exec::BindKey>,
     /// The causal mask to bind KEYED, when the session did not already hold this launch's key —
     /// bound through `SuperDscSession::bind_keyed`, never through the per-step [`Self::acts`].
     pub(crate) causal_keyed: Option<(
@@ -728,6 +741,40 @@ pub(crate) struct ForwardLauncher<'a, V: Fn(usize) -> bool> {
         scratchy_subtile::sdsc_abstract::CausalKey,
         std::borrow::Cow<'static, [f32]>,
     )>,
+    /// ⭐ THE CONSTS KEY THIS LAUNCH BINDS ITS CONSTANT TABLES UNDER (#603 L2-1) —
+    /// `BindKey::Consts { cap }` at the decode site, where the tables are a pure function of the
+    /// bundle; `None` at the prefill site, where they are ROW-DEPENDENT (`StagedRows` varies with
+    /// the launch), so no capacity-named key is complete and every table stays per-step.
+    pub(crate) consts_key: Option<scratchy_target_spyre::superdsc_exec::BindKey>,
+    /// Per-constant HELD flag, parallel to `inputs.consts`: the session already holds that table
+    /// under `consts_key`, so its step builds nothing. Read per step, never hoisted — the first
+    /// step of a cold session binds and the second must see the hold.
+    pub(crate) consts_held: Vec<bool>,
+    /// ⭐ THE KV GATHER INDEX KEY THIS LAUNCH BINDS ITS TABLE UNDER — `BindKey::KvIndex { swept,
+    /// pages }` at the decode site; `None` at the prefill site (a prompt chunk's table walks its
+    /// own rows, and prefill stays on the per-step raw bind).
+    pub(crate) index_key: Option<scratchy_target_spyre::superdsc_exec::BindKey>,
+    /// Whether the session already holds the gather index under `index_key`.
+    pub(crate) index_held: bool,
+    /// The constant tables staged for a KEYED bind — collected here instead of [`Self::acts`] so
+    /// they are bound once under `consts_key` and never re-sent, exactly like the causal mask.
+    pub(crate) consts_keyed: Vec<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::superdsc_exec::BindKey,
+        std::borrow::Cow<'static, [f32]>,
+    )>,
+    /// The gather index staged for a KEYED RAW bind — LE int32 bytes, so they take
+    /// `SuperDscSession::bind_keyed_raw` (the verbatim-copy law `Executor::raw_ids` records),
+    /// never the f32 or f16 doors.
+    pub(crate) index_keyed: Option<(
+        scratchy_target_spyre::bundle_code::PlaceId,
+        scratchy_target_spyre::superdsc_exec::BindKey,
+        Vec<u8>,
+    )>,
+    /// The tensor ids whose `host_call` staged NOTHING because the session holds their key — the
+    /// tids `h2d` must accept with nothing staged. One list for all three held-key skips, so a new
+    /// skip cannot forget its h2d leg.
+    pub(crate) held_skips: Vec<u32>,
     /// Set when the tape's device step runs; the caller reads the logits from there.
     pub(crate) launched: bool,
 }
@@ -741,17 +788,6 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             .steps
             .get(k.0 as usize)
             .ok_or_else(|| format!("no forward kernel {}", k.0))?;
-        // ⭐ A HELD KEY BUILDS NOTHING. The mask is a function of its key alone, so a session that
-        // already holds this launch's key already holds this launch's mask, and the step stages
-        // nothing for `h2d` to bind.
-        if step.kernel == scratchy_target_spyre::forward_tape::ForwardKernel::CausalMask
-            && self.causal_held == Some(self.inputs.causal)
-        {
-            self.staged = None;
-            return Ok(());
-        }
-        let staged =
-            scratchy_target_spyre::forward_tape::kernel_values(step, self.shape, self.inputs)?;
         // A `Const` step's TENSOR comes from the constant list the kernel index addresses, not
         // from the step (the shape does not repeat it).
         let tensor = match step.kernel {
@@ -766,6 +802,33 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             }
             _ => step.tensor,
         };
+        // ⭐ A HELD KEY BUILDS NOTHING. A keyed tensor's bytes are a function of its key alone, so
+        // a session that already holds this launch's key already holds this launch's bytes, and the
+        // step stages nothing for `h2d` to bind. One arm per keyed kind — causal mask, constant
+        // table, gather index — and one place (`held_skips`) that tells `h2d` which tids were
+        // skipped on purpose, so a new skip cannot strand its transfer.
+        let held_here = match step.kernel {
+            scratchy_target_spyre::forward_tape::ForwardKernel::CausalMask => {
+                self.causal_held
+                    == Some(scratchy_target_spyre::superdsc_exec::BindKey::Causal(
+                        self.inputs.causal,
+                    ))
+            }
+            scratchy_target_spyre::forward_tape::ForwardKernel::Const(i) => self
+                .consts_key
+                .is_some_and(|_| self.consts_held.get(i).copied().unwrap_or(false)),
+            scratchy_target_spyre::forward_tape::ForwardKernel::KvBlockIndex => {
+                self.index_key.is_some_and(|_| self.index_held)
+            }
+            _ => false,
+        };
+        if held_here {
+            self.held_skips.push(tensor.tid());
+            self.staged = None;
+            return Ok(());
+        }
+        let staged =
+            scratchy_target_spyre::forward_tape::kernel_values(step, self.shape, self.inputs)?;
         self.staged = Some((tensor, staged));
         Ok(())
     }
@@ -773,8 +836,10 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
     fn h2d(&mut self, t: scratchy_subtile::host_tape::TensorId) -> Result<(), Self::Error> {
         let causal_tid = scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID;
         let Some((tensor, staged)) = self.staged.take() else {
-            // The one step that stages nothing: the causal mask, when the session holds its key.
-            return if t.0 == causal_tid && self.causal_held == Some(self.inputs.causal) {
+            // The steps that stage nothing: a held-key skip, whose tid `host_call` recorded. A
+            // held-key skip with a tid NOT in that list is a tape/launcher desync and stays a
+            // refusal.
+            return if self.held_skips.contains(&t.0) {
                 Ok(())
             } else {
                 Err("h2d with nothing staged".to_string())
@@ -785,6 +850,23 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
             // A NEW causal key: bound keyed, so it is uploaded once and not re-sent per step.
             scratchy_target_spyre::forward_tape::Staged::F32(v) if tensor.tid() == causal_tid => {
                 self.causal_keyed = Some((tensor, self.inputs.causal, v));
+            }
+            // ⭐ A CONSTANT TABLE UNDER THE CONSTS KEY (#603 L2-1): routed to the keyed bind, not
+            // [`Self::acts`], so it is uploaded once per key and never re-sent per step. Routed by
+            // the consts LIST — the tids a `Const` step stages — never by format, so no other f32
+            // tensor (the per-step rope tables, the embedding row) can ride the keyed door.
+            scratchy_target_spyre::forward_tape::Staged::F32(v)
+                if self.consts_key.is_some_and(|_| {
+                    self.inputs
+                        .consts
+                        .iter()
+                        .any(|&(tid, _)| tid == tensor.tid())
+                }) =>
+            {
+                let key = self
+                    .consts_key
+                    .expect("the guard above proved the key exists");
+                self.consts_keyed.push((tensor, key, v));
             }
             scratchy_target_spyre::forward_tape::Staged::F32(v) => {
                 // `Staged::F32` already carries the borrow/own distinction — a computed kernel
@@ -804,7 +886,20 @@ impl<V: Fn(usize) -> bool> scratchy_subtile::host_tape::Launcher for ForwardLaun
                     // is what `as_i32` exists for. Everything upstream of here carries the type.
                     bytes.extend_from_slice(&e.as_i32().to_le_bytes());
                 }
-                self.acts_i32.push((tensor, bytes));
+                // ⭐ THE GATHER INDEX UNDER ITS KEY (#603 L2-1): held once per (swept, pages)
+                // geometry and never re-sent per step — still through the RAW door, because the
+                // entries are absolute block numbers the shadow must copy verbatim.
+                if self.index_key.is_some_and(|_| {
+                    tensor.tid()
+                        == scratchy_target_spyre::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID
+                }) {
+                    let key = self
+                        .index_key
+                        .expect("the guard above proved the key exists");
+                    self.index_keyed = Some((tensor, key, bytes));
+                } else {
+                    self.acts_i32.push((tensor, bytes));
+                }
             }
         }
         Ok(())
@@ -1608,6 +1703,40 @@ pub(crate) fn superdsc_forward_chunk(
             )
             .map_err(|e| werr(format!("superdsc window_begin (k={window}): {e}")))?;
     }
+    // ⭐⭐⭐⭐⭐ THE STEP LOOP'S CONSTANTS, HOISTED (#603 L2-1). `synthetic_constants` is a pure
+    // function of the bundle (`b.facts` + `b.wiring` at ONE row — see the ⛔ note inside), so
+    // rebuilding it inside the loop rebuilt the same tables `n` times per window and re-bound them
+    // every step. The tables are bound KEYED now (under the bundle's capacity, which names this
+    // bundle — `select_decode` picks the FIRST rung covering the need, so a capacity names at most
+    // one ever-selected bundle per session), uploaded once, and never re-sent: the [sdsc-bind]
+    // per-step note shrinks by exactly these tables.
+    //
+    // ONE FILL SITE, and it is the same call prefill makes. This list used to be written out by
+    // hand in BOTH binders and the two drifted twice — `IDENTITY_TID` and `ATTN_ZERO_TID` were
+    // each placed, gated correctly, and then never filled on the decode path. Both found only on
+    // card.
+    let consts = scratchy_target_spyre::wiring::synthetic_constants(
+        // ⛔⛔⛔ ONE ROW — THE LAUNCH'S, NOT THE BUNDLE'S CAPACITY.
+        //
+        // `synthetic_constants` derives `reductions = rows > 1`, which decides whether
+        // `RMS_INVCOLS` and `ONES_REDUCE` are bound at all. Passing `b.m_cap` passed the
+        // bundle's BAKED row count, and granite's decode bundle is baked at 96 rows (a batched
+        // decode rung) — so `rows > 1` was TRUE on the decode path, and this bound two reduce
+        // constants that the pre-tape decode binder never bound.
+        //
+        // The commit that introduced it argued the row count was the honest replacement for a
+        // hand-passed `reductions: bool` phase flag, and asserted in its own comment that
+        // decode's baked count is "1 here". It is 96. The row count IS the right input; the
+        // bundle's capacity is not the row count. Identical mistake to the one fixed for
+        // `ForwardShape::rows` — made twice, in the same file, from the same wrong assumption.
+        &b.facts
+            .constant_env(b.wiring, 64, scratchy_target_spyre::wiring::StagedRows::ONE),
+    );
+    // ⭐ THE KEY THE CONSTANT TABLES ARE A FUNCTION OF (#603 L2-1). `b` is fixed for the whole
+    // loop and for the session's lifetime (one rung = one session), so the capacity names the
+    // bundle and the bundle names the tables — the key is complete, and the executor's
+    // same-key-different-bytes refusal is the backstop if that ever stops being true.
+    let consts_key = BindKey::Consts { cap: b.capacity };
     for i in 0..n {
         // ⭐ THE TOKEN THIS STEP FEEDS — the committed one at position `start` for step
         // 0, and NOTHING for a window's ahead-steps: their token ids exist only on the
@@ -1639,27 +1768,9 @@ pub(crate) fn superdsc_forward_chunk(
         //
         // Note what disappeared with the `if let Some(mask_cap)` guard: a bake
         // fact no longer BRANCHES a bind, it decides whether the step exists.
-        // ⭐ ONE FILL SITE, and it is the same call prefill makes. This list used to be written
-        // out by hand in BOTH binders and the two drifted twice — `IDENTITY_TID` and
-        // `ATTN_ZERO_TID` were each placed, gated correctly, and then never filled on the decode
-        // path. Both found only on card.
-        let consts = scratchy_target_spyre::wiring::synthetic_constants(
-            // ⛔⛔⛔ ONE ROW — THE LAUNCH'S, NOT THE BUNDLE'S CAPACITY.
-            //
-            // `synthetic_constants` derives `reductions = rows > 1`, which decides whether
-            // `RMS_INVCOLS` and `ONES_REDUCE` are bound at all. Passing `b.m_cap` passed the
-            // bundle's BAKED row count, and granite's decode bundle is baked at 96 rows (a batched
-            // decode rung) — so `rows > 1` was TRUE on the decode path, and this bound two reduce
-            // constants that the pre-tape decode binder never bound.
-            //
-            // The commit that introduced it argued the row count was the honest replacement for a
-            // hand-passed `reductions: bool` phase flag, and asserted in its own comment that
-            // decode's baked count is "1 here". It is 96. The row count IS the right input; the
-            // bundle's capacity is not the row count. Identical mistake to the one fixed for
-            // `ForwardShape::rows` — made twice, in the same file, from the same wrong assumption.
-            &b.facts
-                .constant_env(b.wiring, 64, scratchy_target_spyre::wiring::StagedRows::ONE),
-        );
+        // The constants themselves were HOISTED above the loop (#603 L2-1) — they
+        // are the same tables for every step of the window, bound once under
+        // `consts_key`.
         // ⛔ BUILT BEFORE THE SHAPE, so the step gate below can BE this value rather than a second
         // spelling of it. See the prefill path's note: a step with no source refuses loudly, but a
         // source with no step is a mask computed and never uploaded — read as all-zero, i.e. every
@@ -1718,19 +1829,38 @@ pub(crate) fn superdsc_forward_chunk(
         // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK'S INDEX — the one-request body attends EVERY resident page in one
         // pass (see `chunk_index_table`): positions `0..p` are resident, and the map holds the new
         // token's page too.
-        let kv_blocks = chunk_index_table(
-            "solo decode",
-            pool,
-            session,
-            step,
-            req,
-            ctx,
-            ChunkKeys {
-                resident: p,
-                mapped: p as u32 + 1,
-                rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
-            },
-        )?;
+        //
+        // ⭐ AND NOW A KEYED BIND (#603 L2-1): the table is a function of the body's swept extent
+        // (which fixes the chunk scratch), the page count held, and THIS request's installed page
+        // map. The first two are the key; the third is REQUEST-SCOPED — it is exactly what
+        // `set_block_table`'s hold invalidation covers (every window installs its map before this
+        // loop, and a new request at the same geometry cannot inherit this one's table). Within a
+        // page and a rung the bytes are IDENTICAL step to step, so the held-key skip builds
+        // nothing and the [sdsc-bind] note loses the table's rebuild+convert+upload every step.
+        let index_key = BindKey::KvIndex {
+            swept: step.swept(),
+            pages: scratchy_subtile::sdsc_abstract::RowPages::holding(SlotCount::new(p as u32 + 1)),
+        };
+        let index_held = session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(
+            scratchy_target_spyre::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID,
+        )) == Some(index_key);
+        let kv_blocks = if index_held {
+            None // the device holds this geometry's table — the step stages nothing for it
+        } else {
+            chunk_index_table(
+                "solo decode",
+                pool,
+                session,
+                step,
+                req,
+                ctx,
+                ChunkKeys {
+                    resident: p,
+                    mapped: p as u32 + 1,
+                    rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
+                },
+            )?
+        };
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {
             hidden: h,
             // ⭐⭐⭐⭐⭐ THE BAKED HEAD COUNT — the causal tile is `nqh` rows at mq==1, and
@@ -1796,6 +1926,23 @@ pub(crate) fn superdsc_forward_chunk(
                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ATTN_CAUSAL_TID,
             )),
             causal_keyed: None,
+            // ⭐ THE L2-1 KEYS, ARMED ONLY ON THE DECODE SITE (see the prefill site's ⛔ note
+            // for why its consts and index stay per-step). `consts_held` is read PER STEP,
+            // never hoisted: the first step of a cold session binds the tables and the second
+            // must see the hold.
+            consts_key: Some(consts_key),
+            consts_held: consts
+                .iter()
+                .map(|&(tid, _)| {
+                    session.keyed_holds(scratchy_target_spyre::bundle_code::PlaceId::Act(tid))
+                        == Some(consts_key)
+                })
+                .collect(),
+            index_key: Some(index_key),
+            index_held,
+            consts_keyed: Vec::new(),
+            index_keyed: None,
+            held_skips: Vec::new(),
             launched: false,
         };
         scratchy_subtile::host_tape::play(
@@ -1818,13 +1965,35 @@ pub(crate) fn superdsc_forward_chunk(
             acts_i32,
             causal_held: _,
             causal_keyed,
+            consts_key: _,
+            consts_held: _,
+            index_key: _,
+            index_held: _,
+            consts_keyed,
+            index_keyed,
+            held_skips: _,
             launched,
         } = launcher;
         debug_assert!(launched, "the tape must reach its device step");
         if let Some((id, key, vals)) = causal_keyed {
             session
-                .bind_keyed(id, key, &vals)
+                .bind_keyed(id, BindKey::Causal(key), &vals)
                 .map_err(|e| werr(format!("decode: keyed causal bind: {e}")))?;
+        }
+        // ⭐ THE L2-1 KEYED BINDS (#603): constants through the f16 keyed door (the same
+        // conversion the per-step f32 channel made, one upload per key), the gather index
+        // through the RAW keyed door (int32 entries, verbatim in the shadow). Both take effect
+        // for THIS step's enqueue — the fresh flag sends them once — and every later step at
+        // the same key stages nothing.
+        for (id, key, vals) in consts_keyed {
+            session
+                .bind_keyed(id, key, &vals)
+                .map_err(|e| werr(format!("decode pos {p}: keyed consts bind: {e}")))?;
+        }
+        if let Some((id, key, bytes)) = index_keyed {
+            session
+                .bind_keyed_raw(id, key, bytes)
+                .map_err(|e| werr(format!("decode pos {p}: keyed kv index bind: {e}")))?;
         }
 
         // INCREMENTAL: write 1 new token at absolute slot `p`; KV stays device-resident.

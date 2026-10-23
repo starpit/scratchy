@@ -645,26 +645,49 @@ impl SuperDscSession {
         self.exec.window_finish()
     }
 
-    /// The [`CausalKey`] this session's staged activation `id` was last bound under, if it was
-    /// bound keyed. A forward whose key equals it has nothing to bind for `id`.
-    ///
-    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
+    /// The [`BindKey`] this session's staged activation `id` was last bound under, if it was bound
+    /// keyed. A forward whose key equals it has nothing to bind for `id`.
     pub fn keyed_holds(
         &self,
         id: crate::bundle_code::PlaceId,
-    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
+    ) -> Option<crate::superdsc_exec::BindKey> {
         self.exec.keyed_holds(id)
     }
 
     /// Bind `id` as a function of `key` alone, narrowed to f16 here. The next step uploads it, and
     /// no later step re-uploads it until another key is bound (see `Executor::bind_input_keyed`).
+    ///
+    /// [`BindKey`]: crate::superdsc_exec::BindKey
     pub fn bind_keyed(
         &mut self,
         id: crate::bundle_code::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: crate::superdsc_exec::BindKey,
         vals: &[f32],
     ) -> Result<()> {
         self.exec.bind_input_keyed(id, key, f32_to_f16_le(vals))
+    }
+
+    /// [`Self::bind_keyed`] for RAW LE int32 payload — the KV gather index table. `place_raw` is
+    /// the only constructor of the value `bind_input_keyed_raw` takes (see `bind_activations`'s
+    /// ⛔ note): a non-int32-shaped or unplaced payload is refused HERE, and a same-key re-bind
+    /// with different bytes — the key naming a geometry the bytes' page map isn't part of — is
+    /// refused at the executor door.
+    pub fn bind_keyed_raw(
+        &mut self,
+        id: crate::bundle_code::PlaceId,
+        key: crate::superdsc_exec::BindKey,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let bind = self.exec.place_raw(id, bytes.clone()).ok_or_else(|| {
+            anyhow!(
+                "bind_keyed_raw: raw tensor '{id}' ({} B) has no placement in this bundle, does \
+                 not fit the one it has, or is not a whole number of int32 entries — a partial \
+                 trailing entry is a truncated address and an over-long bind overwrites the next \
+                 tensor",
+                bytes.len()
+            )
+        })?;
+        self.exec.bind_input_keyed_raw(bind, key)
     }
 
     /// Fault the activation segment's host shadow in now, at load, so a request's first bind does
@@ -679,7 +702,7 @@ impl SuperDscSession {
     pub fn stage_keyed(
         &mut self,
         id: crate::bundle_code::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: crate::superdsc_exec::BindKey,
         vals: &[f32],
     ) -> Result<u64> {
         self.exec.stage_keyed(id, key, f32_to_f16_le(vals))

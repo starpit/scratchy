@@ -710,22 +710,151 @@ fn fault_in(buf: &mut [u8]) {
     }
 }
 
-/// One keyed activation's state: the [`CausalKey`] its staged bytes are a function of, and whether
-/// the current step re-bound it (so `refill_activations` converts and uploads it this step, and only
-/// this step). See [`Executor::keyed`].
+/// ⭐⭐⭐ WHAT A KEYED BIND'S BYTES ARE A FUNCTION OF — the one value a bind-once hold is keyed on.
+///
+/// A keyed activation is spared the per-step re-upload because the DEVICE keeps its bytes until a
+/// launch re-binds it ([`Hold::sends_this_step`]). That contract is only as sound as the key: the caller's
+/// skip (a held key equal to this launch's key binds nothing) trusts key equality ⇒ byte equality,
+/// so every fact the bytes depend on must be IN the key, and every fact that can change under a
+/// held key must either be in it or retire the hold (see [`BindKey::request_scoped`]).
+///
+/// * [`CausalKey`] — the new-block causal mask, the original keyed bind (#603 PR3b E);
+/// * `Consts` — a decode bundle's synthetic constants, a pure function of the bundle's own
+///   facts+wiring at [`StagedRows::ONE`](crate::wiring::StagedRows::ONE), identified by the cap
+///   bucket that selected it: `select_decode` picks the FIRST bucket whose capacity covers the
+///   position from an ascending ladder, so within one session's decode ladder a capacity names at
+///   most one ever-selected bundle;
+/// * `KvIndex` — the chunk gather's int32 index table: a function of the body's swept columns
+///   (which fix the chunk scratch), the page count held, and — the request-scoped part — THIS
+///   request's own installed page map, whose entries are ABSOLUTE global stick-block numbers
+///   (see [`crate::fold_plan`]: a gathered fold takes no KV shift because the entries already
+///   carry the page).
 ///
 /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
-#[derive(Clone, Copy, Debug)]
-struct Keyed {
-    key: scratchy_subtile::sdsc_abstract::CausalKey,
-    fresh: bool,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindKey {
+    /// The causal mask's facts.
+    Causal(scratchy_subtile::sdsc_abstract::CausalKey),
+    /// A decode bundle's synthetic constants, keyed by the cap bucket that selected the bundle.
+    /// (`cap` is the `BundleMeta`'s own identity field, not a dimension this code computes with —
+    /// the typed-dimension facts the table DOES depend on, `swept` and `pages`, ride the
+    /// [`BindKey::KvIndex`] arm in their own types.)
+    Consts { cap: usize },
+    /// The chunk gather's index table, keyed by the body's sweep and the page count held.
+    KvIndex {
+        swept: SweptCols,
+        pages: scratchy_subtile::sdsc_abstract::RowPages,
+    },
 }
 
-/// Whether `refill_activations` sends bound activation `id` this step: every unkeyed activation, every
-/// step (today's re-upload, unchanged), and a keyed one only in the step that bound it. The one rule
-/// both refill loops ask, so they cannot disagree about which binds go out.
-fn refill_sends(keyed: &BTreeMap<bundle::PlaceId, Keyed>, id: &bundle::PlaceId) -> bool {
-    keyed.get(id).is_none_or(|k| k.fresh)
+impl BindKey {
+    /// ⭐ WHETHER THE BYTES ARE A FUNCTION OF **THIS REQUEST'S** PAGE MAP — the one fact a page-map
+    /// install can change under a held key. [`Executor::set_block_table`] drops exactly these
+    /// holds: request B at the same `{swept, pages}` geometry as request A would match A's held
+    /// key and silently gather A's pages, because the caller's held-key skip never builds the
+    /// bytes the executor could compare. A new install means a new map, so the hold retires there
+    /// — which is also why the causal mask (a function of the rung's rows alone) must NOT be
+    /// request-scoped: it survives every install.
+    pub fn request_scoped(self) -> bool {
+        matches!(self, BindKey::KvIndex { .. })
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ HOW ONE BOUND INPUT'S HOST BYTES REACH THE DEVICE — chosen at the bind DOOR and riding
+/// the value, so no staging pass can mis-decode an entry.
+///
+/// Before this type the encoding was THREE runtime sets (`raw_ids`, `const_fp32_ids`, and the
+/// fp16 default) consulted by two convert loops, plus a fourth map (`staged`) for bytes already in
+/// the shadow — correct only if every bind door remembered to tag its id into the right one. The
+/// law this type enforces: an int32 index table handed to the fp16 re-encode does not COMPILE, it
+/// is not refused at runtime. `ieee_to_sen_bytes` reads its source as fp16 pairs; for the KV
+/// gather's int32 index entries that rewrites every entry into a different, valid, arbitrary
+/// block number — fluent output from another request's keys, with no fault anywhere.
+#[derive(Clone, Debug)]
+enum HostBytes {
+    /// IEEE-fp16 payload — every staging path re-encodes it (`ieee_to_sen_bytes`).
+    Fp16(Vec<u8>),
+    /// ⭐ RAW LE int32 entries — copied VERBATIM into the shadow. Only [`Executor::place_raw`]
+    /// mints the value a raw door takes, so a byte count that is not whole int32 entries or a
+    /// payload longer than its own placement cannot reach this arm.
+    RawLe(Vec<u8>),
+    /// fp32 bytes that ARE the device encoding (`Df::Fp32` = IEEE_FP32) — copied VERBATIM, at
+    /// load, as a resident weight ([`Executor::bind_const_fp32`]).
+    Fp32(Vec<u8>),
+    /// f32 values [`Executor::bind_input_f32`] already converted STRAIGHT INTO THE SHADOW at
+    /// their placement's slot — no bytes are held here, only the RANGE the refill must send.
+    Shadow { len: u64 },
+}
+
+impl HostBytes {
+    /// The byte range this entry occupies in the shadow (the whole payload, or the
+    /// already-converted length) — what the refill's upload plan is sized by.
+    fn shadow_len(&self) -> u64 {
+        match self {
+            HostBytes::Fp16(b) | HostBytes::RawLe(b) | HostBytes::Fp32(b) => b.len() as u64,
+            HostBytes::Shadow { len } => *len,
+        }
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ WHEN THE DEVICE RE-READS ONE BOUND INPUT — the hold dimension of [`HostBytes`], riding
+/// the same entry so the two cannot disagree.
+///
+/// Folding this into the entry (it was a side map, `keyed`, plus the `weight_ids` set) is what
+/// makes the stale hold UNWRITABLE: an unkeyed re-bind REPLACES the entry, and there is no second
+/// structure whose cleanup a bind door could forget. The refill asks one entry one question
+/// ([`Hold::sends_this_step`]) instead of cross-referencing three.
+#[derive(Clone, Debug)]
+enum Hold {
+    /// Resident weight — bound before prepare, staged once, never re-sent by a predict.
+    Weight,
+    /// A per-step activation — re-uploaded by every predict, exactly as before the keyed binds
+    /// existed. An input someone forgets to re-bind must keep being caught by today's path.
+    PerStep,
+    /// The device KEEPS these bytes between steps: they are a function of `key` alone, so the
+    /// step that binds them (`fresh`) uploads them and no later step does until a different key
+    /// re-binds. Segment 3, where every activation lives, is written by no device op (measured
+    /// over every compute op of the 252 granite-2b bundles), so the device keeps the last bind's
+    /// bytes.
+    Keyed { key: BindKey, fresh: bool },
+}
+
+impl Hold {
+    /// Whether `refill_activations` sends this entry's bytes this step: every per-step activation,
+    /// every step; a keyed one only in the step that bound it; a weight never (it is resident).
+    fn sends_this_step(&self) -> bool {
+        match self {
+            Hold::Weight => false,
+            Hold::PerStep => true,
+            Hold::Keyed { fresh, .. } => *fresh,
+        }
+    }
+}
+
+/// One bound input: its bytes' ENCODING and WHEN the device re-reads them. The two dimensions are
+/// one value, so a door cannot bind bytes under one encoding and a hold keyed to another's laws.
+#[derive(Clone, Debug)]
+struct Input {
+    bytes: HostBytes,
+    hold: Hold,
+}
+
+/// ⭐ THE KEYED RE-BIND LAW, as one pure decision: a re-bind under the SAME key must carry the SAME
+/// bytes. A differing key is a legitimate re-stage (the hold moves to the new key's bytes); a
+/// same-key re-bind with different bytes means the key left a fact out — the caller computed
+/// different bytes for what it told the executor was the same function — and the bind door refuses
+/// rather than serve bytes the held-key skip would otherwise keep off the device forever.
+///
+/// (Runtime, not a type error: the keys are runtime values — a cap read off a manifest, a swept
+/// extent read off a running body — so the session's methods cannot carry them as const generics.)
+fn keyed_rebind_conflicts(held: Option<&Input>, key: &BindKey, bytes: &[u8]) -> bool {
+    held.is_some_and(|e| match e.hold {
+        Hold::Keyed { key: held_key, .. } if held_key == *key => matches!(
+            &e.bytes,
+            HostBytes::Fp16(b) | HostBytes::RawLe(b) | HostBytes::Fp32(b) if b.as_slice() != bytes
+        ),
+        _ => false,
+    })
 }
 
 /// The merged-run half of one dirty segment's upload plan — the sort, the overlap
@@ -965,52 +1094,27 @@ pub struct Executor {
     seg_borrowed: [bool; NUM_SEGMENTS],
 
     // ── Host binds ──
-    /// Bound host inputs. Ids bound BEFORE prepare are resident WEIGHTS (uploaded once); ids
-    /// bound per predict are ACTIVATIONS (uploaded each step).
-    bound: BTreeMap<bundle::PlaceId, Vec<u8>>,
+    /// ⭐⭐⭐⭐⭐ EVERY BOUND INPUT, AS ONE TYPED VALUE — `Input { bytes, hold }`. The encoding
+    /// ([`HostBytes`]: fp16-re-encode / raw-verbatim / fp32-verbatim / already-in-shadow) and the
+    /// hold ([`Hold`]: resident weight / per-step activation / keyed-under-a-`BindKey`) are chosen
+    /// at the bind DOOR and ride the entry, so the two staging passes and the reclaim cannot
+    /// disagree about either dimension: their loops MATCH on the entry, exhaustively, and a new
+    /// way to bind is a compile error at every one of them.
+    ///
+    /// This one map replaces five parallel structures — `bound: BTreeMap<_, Vec<u8>>`, the
+    /// `weight_ids`, `raw_ids` and `const_fp32_ids` sets, the `keyed` map, and the `staged`
+    /// length map — whose cross-structure consistency laws ("an unkeyed re-bind must clear the
+    /// keyed hold", "a raw bind must tag `raw_ids` or the convert loop destroys the index
+    /// table") were runtime invariants a door could forget. With one value, an unkeyed re-bind
+    /// REPLACES the entry (a stale keyed hold is unwritable), and a raw payload physically
+    /// cannot reach the fp16 re-encode (the convert loop's `RawLe` arm is the only routing).
+    bound: BTreeMap<bundle::PlaceId, Input>,
+    /// ⭐ A NAME REGISTRY, NOTHING MORE — the ids this session loaded as weights. It outlives the
+    /// `bound` entries (prepare reclaims their bytes, but `filler_of` and the shadow-reclaim loop
+    /// still ask which ids were weights); it is NEVER consulted for an encoding or a hold — both
+    /// ride the [`Input`] entry, and no staging pass reads this set to decide what to do with
+    /// bytes.
     weight_ids: BTreeSet<bundle::PlaceId>,
-    /// ⭐⭐⭐⭐⭐ IDS WHOSE BYTES ARE **NOT** IEEE-fp16 — copied into the shadow verbatim instead of
-    /// going through [`sen_convert::ieee_to_sen_bytes`].
-    ///
-    /// ⛔ WITHOUT THIS, A GATHER'S INDEX TABLE IS DESTROYED BY THE BIND LOOP. Every staging path in
-    /// this file ends in `ieee_to_sen_bytes(src, dst)` — unconditionally, for weights at prepare and
-    /// for activations at every predict — because until now every bound tensor genuinely WAS a
-    /// magnitude the card holds in SEN169 fp16. The KV block index is int32 addresses-in-waiting
-    /// (`Staged::I32`): running them through an fp16 re-encoding reads each 4-byte entry as two fp16
-    /// values and rewrites both mantissas. Block 37 does not become "roughly 37"; it becomes a
-    /// different, valid, arbitrary block — fluent output from another request's keys, with no fault.
-    ///
-    /// ⛔ NOT A FLAG ON THE BIND CALL, A SET KEYED BY ID, because there are TWO convert loops
-    /// (`stage_weights`, `predict`) and a per-call flag would have to be remembered by both anyway.
-    /// One set, consulted by both, is the only arrangement in which they cannot disagree.
-    raw_ids: BTreeSet<bundle::PlaceId>,
-    /// ⭐ ACTIVATIONS STAGED BY KEY — the key their bytes are a function of, and whether this
-    /// step re-bound them. Today exactly one: the new-block causal mask
-    /// ([`scratchy_subtile::sdsc_abstract::CausalKey`]).
-    ///
-    /// A keyed bind is written to the shadow and uploaded in the step that binds it, and NOT
-    /// re-uploaded by a step that does not: segment 3, where every activation lives, is written by
-    /// no device op (measured over every compute op of the 252 granite-2b bundles), so the device
-    /// keeps the bytes of the last bind. Every UNKEYED activation is re-uploaded every step exactly
-    /// as before. That arrangement is deliberate: an input someone forgets to re-bind must still be
-    /// caught by today's path, not hidden by this one.
-    keyed: BTreeMap<bundle::PlaceId, Keyed>,
-    /// ⭐ ACTIVATIONS ALREADY IN THE SHADOW — the byte length of each f32 activation that
-    /// [`Self::bind_input_f32`] converted straight into its placement's slot of `seg_host`. The
-    /// refill sends that range exactly as it sends a [`Self::bound`] one, without converting it a
-    /// second time: the bytes are already the device's.
-    ///
-    /// Disjoint from `bound` by construction: every bind door removes its id from the other map, so
-    /// one id has one source of bytes.
-    staged: BTreeMap<bundle::PlaceId, u64>,
-    /// ⭐⭐⭐⭐⭐ IDS BOUND THROUGH [`Executor::bind_const_fp32`] — fp32 constants whose LE host
-    /// bytes ARE the device encoding (`Df::Fp32` is IEEE_FP32), so staging copies them VERBATIM:
-    /// no IEEE→SEN re-encode, no tile walk. The spliced argmax kernel's staged f32 constants
-    /// (the one-request rung's exactness island), and nothing else today.
-    ///
-    /// A set for the same reason [`Self::raw_ids`] is one: the staging loop consults it, and a
-    /// flag remembered by the bind call alone is a flag the loop can forget.
-    const_fp32_ids: BTreeSet<bundle::PlaceId>,
 
     // ── KV / fold ──
     kv: KvGeometry,
@@ -1276,10 +1380,6 @@ impl Executor {
             seg_borrowed: [false; NUM_SEGMENTS],
             bound: BTreeMap::new(),
             weight_ids: BTreeSet::new(),
-            raw_ids: BTreeSet::new(),
-            keyed: BTreeMap::new(),
-            staged: BTreeMap::new(),
-            const_fp32_ids: BTreeSet::new(),
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
@@ -1673,12 +1773,12 @@ impl Executor {
         if !self.places.contains_key(id) {
             return SourceFiller::NotPlaced;
         }
-        // ⭐ ORDER IS DELIBERATE: an id can be reachable by more than one mechanism (a weight is in
-        // both `weight_ids` and `bound`), and the FIRST match is the one that actually wrote the
-        // bytes. Any of them ⇒ filled, so the order changes only the label, never the verdict.
+        // ⭐ ORDER IS DELIBERATE: an id can be reachable by more than one mechanism, and the FIRST
+        // match is the one that actually wrote the bytes. Any of them ⇒ filled, so the order
+        // changes only the label, never the verdict.
         if self.weight_ids.contains(id) {
             SourceFiller::WeightLoader
-        } else if self.bound.contains_key(id) || self.staged.contains_key(id) {
+        } else if self.bound.contains_key(id) {
             SourceFiller::TapeStep
         } else if self.resident_sources.contains(&id.tid()) {
             SourceFiller::DeclaredResident
@@ -1721,23 +1821,34 @@ impl Executor {
     /// no lifetime contract to violate.
     pub fn bind_weight(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
         self.weight_ids.insert(id);
-        self.bound.insert(id, bytes);
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::Fp16(bytes),
+                hold: Hold::Weight,
+            },
+        );
     }
 
     /// Bind an ACTIVATION by name (IEEE-fp16 bytes) — re-bound every step. A name bound before
     /// prepare is recorded as a weight instead, matching the C++ contract.
     pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
-        if !self.prepared {
+        let hold = if !self.prepared {
             self.weight_ids.insert(id);
-        }
-        // A previously-raw id re-bound as fp16 must stop being raw, or the shadow would take an
-        // unconverted fp16 buffer. Cleared here rather than left to the caller.
-        self.raw_ids.remove(&id);
-        // An id re-bound UNKEYED goes back to the per-step re-upload, so a keyed bind can never
-        // shadow a later plain one.
-        self.keyed.remove(&id);
-        self.staged.remove(&id);
-        self.bound.insert(id, bytes);
+            Hold::Weight
+        } else {
+            Hold::PerStep
+        };
+        // ⭐ THE ENTRY REPLACES whatever held the id: a previously-raw or keyed bind stops being
+        // one because its encoding and its hold rode the SAME value. There is no second structure
+        // whose cleanup this door could forget — that is the point of [`Input`].
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::Fp16(bytes),
+                hold,
+            },
+        );
     }
 
     /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
@@ -1790,33 +1901,50 @@ impl Executor {
             .get_mut(off as usize..(off + len) as usize)
             .ok_or_else(|| anyhow!("bind: activation '{id}' overflows seg{}", p.segment))?;
         sen_convert::f32_to_sen_bytes(vals, dst);
-        self.raw_ids.remove(&id);
-        self.keyed.remove(&id);
-        self.bound.remove(&id);
-        self.staged.insert(id, len);
+        // The shadow HOLDS the bytes; the entry records only the range to send (and, by replacing
+        // the previous entry, retires any keyed hold on this id — the same law [`Self::bind_input`]
+        // states).
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::Shadow { len },
+                hold: Hold::PerStep,
+            },
+        );
         Ok(())
     }
 
-    /// The key this session's KEYED activation `id` holds — the [`CausalKey`] the bytes on the
+    /// The key this session's KEYED activation `id` holds — the [`BindKey`] the bytes on the
     /// device are a function of — or `None` when `id` was never bound keyed. A launch whose key
     /// equals this binds nothing for `id`.
-    ///
-    /// [`CausalKey`]: scratchy_subtile::sdsc_abstract::CausalKey
-    pub fn keyed_holds(
-        &self,
-        id: bundle::PlaceId,
-    ) -> Option<scratchy_subtile::sdsc_abstract::CausalKey> {
-        self.keyed.get(&id).map(|k| k.key)
+    pub fn keyed_holds(&self, id: bundle::PlaceId) -> Option<BindKey> {
+        match self.bound.get(&id).map(|e| &e.hold) {
+            Some(Hold::Keyed { key, .. }) => Some(*key),
+            _ => None,
+        }
+    }
+
+    /// Retire every REQUEST-SCOPED keyed hold ([`BindKey::request_scoped`]) — the invalidation
+    /// `set_block_table` runs at every page-map install, so a hold whose bytes name THIS request's
+    /// pages cannot outlive the map they were read from.
+    fn keyed_retain_request_scoped(&mut self) {
+        self.bound
+            .retain(|_, e| !matches!(&e.hold, Hold::Keyed { key, .. } if key.request_scoped()));
     }
 
     /// ⭐ Bind an ACTIVATION whose bytes are a function of `key` alone (IEEE-fp16 bytes). It is
     /// converted and uploaded by the NEXT predict and not again: until a launch re-binds it under a
     /// different key, the device keeps these bytes (segment 3 is never written on card). Every
     /// other activation stays on [`Self::bind_input`]'s per-step re-upload.
+    ///
+    /// ⛔ A RE-BIND UNDER THE SAME KEY MUST CARRY THE SAME BYTES ([`keyed_rebind_conflicts`]): the
+    /// caller's held-key skip trusts key equality ⇒ byte equality, so same-key different-bytes is a
+    /// key that left a fact out — refused here, at the one door every keyed re-bind passes, naming
+    /// the id and both lengths. A DIFFERING key re-binds over the hold exactly as a launch would.
     pub fn bind_input_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: BindKey,
         bytes: Vec<u8>,
     ) -> Result<()> {
         if !self.prepared {
@@ -1824,10 +1952,22 @@ impl Executor {
                 "bind_input_keyed('{id}') before prepare — a keyed activation is a per-step bind"
             );
         }
-        self.raw_ids.remove(&id);
-        self.staged.remove(&id);
-        self.keyed.insert(id, Keyed { key, fresh: true });
-        self.bound.insert(id, bytes);
+        if keyed_rebind_conflicts(self.bound.get(&id), &key, &bytes) {
+            bail!(
+                "bind_input_keyed('{id}', {key:?}): re-bound under the SAME key with DIFFERENT \
+                 bytes ({} B held, {} B incoming) — the key left a fact out, and the held-key skip \
+                 would keep these bytes off the device forever. REFUSING",
+                self.bound.get(&id).map_or(0, |e| e.bytes.shadow_len()),
+                bytes.len(),
+            );
+        }
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::Fp16(bytes),
+                hold: Hold::Keyed { key, fresh: true },
+            },
+        );
         Ok(())
     }
 
@@ -1847,7 +1987,7 @@ impl Executor {
     pub fn stage_keyed(
         &mut self,
         id: bundle::PlaceId,
-        key: scratchy_subtile::sdsc_abstract::CausalKey,
+        key: BindKey,
         bytes: Vec<u8>,
     ) -> Result<u64> {
         let placed = self
@@ -1920,27 +2060,82 @@ impl Executor {
             .then_some(RawBind { id, bytes })
     }
 
-    /// ⭐⭐⭐⭐⭐ Bind an ACTIVATION whose bytes are **ALREADY THE DEVICE'S** — copied into the shadow
-    /// verbatim, with no IEEE→SEN conversion. The gather's int32 index table, and nothing else today.
+    /// ⭐ [`Self::bind_input`], RAW: int32 bytes that are **ALREADY THE DEVICE'S** — copied into
+    /// the shadow verbatim, with no IEEE→SEN conversion. The gather's int32 index table, and
+    /// nothing else today.
     ///
     /// ⛔ THIS IS NOT AN OPTIMISATION OF [`Self::bind_input`]. The f16 fast path
     /// (`run_step_no_logits_f16`) also hands over device-format bytes, and it still routes them
     /// through `bind_input` — which is sound only because `ieee_to_sen_bytes` is applied to them
-    /// too, so "already narrowed" means "already f16", not "already staged". An int32 tensor has no
-    /// fp16 encoding to survive that pass: see [`Self::raw_ids`] for what it does to a block number.
+    /// too, so "already narrowed" means "already f16", not "already staged". An int32 tensor has
+    /// no fp16 encoding to survive that pass: see [`HostBytes::RawLe`] for what the re-encode does
+    /// to a block number.
     ///
     /// ⛔⛔⛔ IT TAKES A [`RawBind`], NOT `(id, bytes)`, AND THAT IS THE WHOLE GUARD. The signature
     /// used to be `(PlaceId, Vec<u8>)` — bytes with NO relation to the placement they land in — and
     /// the relation was re-checked, far away and at runtime, by `refill_activations`'s over-bind
     /// `bail!`. A length that exceeds its placement now has no value to arrive in: see
     /// [`Self::place_raw`], the only constructor.
+    ///
+    /// ⭐ THE ENCODING RIDES THE ENTRY ([`HostBytes::RawLe`]): the refill's convert loop matches
+    /// the entry, and its `RawLe` arm — copy verbatim — is the ONLY routing to those bytes, so an
+    /// index table handed to the fp16 re-encode does not compile, it is not a runtime tag this
+    /// door has to remember to set.
     pub fn bind_input_raw(&mut self, b: RawBind) {
-        if !self.prepared {
+        let hold = if !self.prepared {
             self.weight_ids.insert(b.id);
+            Hold::Weight
+        } else {
+            Hold::PerStep
+        };
+        let RawBind { id, bytes } = b;
+        // The entry REPLACES any keyed hold on this id — an unkeyed re-bind goes back to the
+        // per-step re-upload, so a keyed hold can never silently suppress a later plain one.
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::RawLe(bytes),
+                hold,
+            },
+        );
+    }
+
+    /// ⭐ [`Self::bind_input_keyed`], RAW: int32 bytes that are a function of `key` alone and must
+    /// reach the shadow VERBATIM — the chunk gather's index table under a held geometry. The
+    /// fresh/upload law is the f16 door's own (sent by the next predict, never again until a new
+    /// key), and the verbatim law is [`Self::bind_input_raw`]'s own: the encoding rides the entry
+    /// as [`HostBytes::RawLe`], so the refill's convert loop copies these bytes — the f16 door
+    /// stores [`HostBytes::Fp16`] and its bytes are re-encoded; neither door can forget which.
+    ///
+    /// ⛔ TAKES A [`RawBind`], for the same reason [`Self::bind_input_raw`] does: the payload
+    /// arrives already validated against the placement it lands in ([`Self::place_raw`] is the
+    /// only constructor), and the same-key different-bytes refusal applies verbatim.
+    pub fn bind_input_keyed_raw(&mut self, b: RawBind, key: BindKey) -> Result<()> {
+        if !self.prepared {
+            bail!(
+                "bind_input_keyed_raw('{}') before prepare — a keyed activation is a per-step bind",
+                b.id
+            );
         }
-        self.raw_ids.insert(b.id);
-        self.staged.remove(&b.id);
-        self.bound.insert(b.id, b.bytes);
+        let RawBind { id, bytes } = b;
+        if keyed_rebind_conflicts(self.bound.get(&id), &key, &bytes) {
+            bail!(
+                "bind_input_keyed_raw('{id}', {key:?}): re-bound under the SAME key with DIFFERENT \
+                 bytes ({} B held, {} B incoming) — the index entries are absolute block numbers \
+                 from a page map the key does not name, and the held-key skip would keep them off \
+                 the device forever. REFUSING",
+                self.bound.get(&id).map_or(0, |e| e.bytes.shadow_len()),
+                bytes.len(),
+            );
+        }
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::RawLe(bytes),
+                hold: Hold::Keyed { key, fresh: true },
+            },
+        );
+        Ok(())
     }
 
     /// ⭐⭐⭐⭐⭐ Bind a RESIDENT FP32 CONSTANT at load — staged VERBATIM, once, never re-bound.
@@ -1990,8 +2185,13 @@ impl Executor {
             );
         }
         self.weight_ids.insert(id);
-        self.const_fp32_ids.insert(id);
-        self.bound.insert(id, bytes);
+        self.bound.insert(
+            id,
+            Input {
+                bytes: HostBytes::Fp32(bytes),
+                hold: Hold::Weight,
+            },
+        );
         Ok(())
     }
 
@@ -2184,22 +2384,63 @@ impl Executor {
             mode: StageMode<'a>,
         }
         let mut items: Vec<Item<'_>> = Vec::new();
-        for (nm, src) in &self.bound {
+        for (nm, entry) in &self.bound {
             if !self.weight_ids.contains(nm) {
                 continue; // activation
             }
-            // ⛔ A RAW BIND CANNOT BE A WEIGHT. This loop's every destination goes through
-            // `ieee_to_sen_bytes` or the retile walk, neither of which may touch int32 index entries
-            // (see [`Self::raw_ids`]) — and a raw id lands here only by having been bound BEFORE
-            // prepare, which `bind_input_raw` records as a weight like any other. Refuse rather than
-            // stage it through a converter that would rewrite every entry.
-            if self.raw_ids.contains(nm) {
-                bail!(
-                    "stage: '{nm}' was bound RAW but is a WEIGHT (bound before prepare) — raw bytes \
-                     are only honoured on the per-step activation path, and this loop would re-encode \
-                     them as fp16. Bind it after prepare."
-                );
-            }
+            // ⭐ THE ENCODING NAMES THE STAGE MODE — `const_fp32_ids` membership used to decide
+            // this; now the bytes a door stored carry it, and every arm below is unreachable for
+            // the others by construction.
+            let src: &[u8] = match &entry.bytes {
+                HostBytes::Fp32(b) => b,
+                // ⛔ A RAW BIND CANNOT BE A WEIGHT. This loop's every destination goes through
+                // `ieee_to_sen_bytes` or the retile walk, neither of which may touch int32 index
+                // entries (see [`HostBytes::RawLe`]) — and a raw id lands here only by having been
+                // bound BEFORE prepare, which `bind_input_raw` records as a weight like any other.
+                // (Runtime, not a type error: prepared-ness is runtime state the doors cannot
+                // carry in their types.) Refuse rather than stage it through a converter that
+                // would rewrite every entry.
+                HostBytes::RawLe(_) => {
+                    bail!(
+                        "stage: '{nm}' was bound RAW but is a WEIGHT (bound before prepare) — raw \
+                         bytes are only honoured on the per-step activation path, and this loop \
+                         would re-encode them as fp16. Bind it after prepare."
+                    );
+                }
+                // A weight whose bytes were already converted into the shadow, or an activation
+                // riding this map before prepare, has no staging work here.
+                HostBytes::Shadow { .. } => continue,
+                HostBytes::Fp16(b) => b,
+            };
+            let mode = if matches!(entry.bytes, HostBytes::Fp32(_)) {
+                // A resident fp32 const — its LE bytes are the device encoding, so nothing
+                // here may touch them. Checked FIRST so the kernel-weight lookup below can
+                // never hand a const a tile walk (it has no KernelWeight, but the ordering
+                // makes that a structural fact rather than a happy one).
+                StageMode::Verbatim
+            } else {
+                match self.kernel_weights.get(nm) {
+                    Some(&k) => {
+                        let dev_elems: u64 = k.device_size.iter().product();
+                        if dev_elems as usize * k.word_length as usize != src.len() {
+                            bail!(
+                                "stage: kernel weight '{nm}' host size {} B != \
+                                 prod(device_size)*word_length ({} B) — manifest/shape mismatch",
+                                src.len(),
+                                dev_elems as usize * k.word_length as usize
+                            );
+                        }
+                        let Some(elem) = Element::from_word_length(k.word_length) else {
+                            bail!(
+                                "stage: kernel weight '{nm}' word_length {} has no tile walk",
+                                k.word_length
+                            );
+                        };
+                        StageMode::Retile(k, elem)
+                    }
+                    None => StageMode::Convert,
+                }
+            };
             let Some(p) = self.places.get(nm) else {
                 // ⛔ WAS `eprintln!` + `continue` — a weight the bake never placed was SKIPPED, so
                 // the device read whatever the segment happened to hold and the model produced
@@ -2244,35 +2485,6 @@ impl Executor {
                     self.shadow(slot).len()
                 );
             }
-            let mode = if self.const_fp32_ids.contains(nm) {
-                // A resident fp32 const — its LE bytes are the device encoding, so nothing
-                // here may touch them. Checked FIRST so the kernel-weight lookup below can
-                // never hand a const a tile walk (it has no KernelWeight, but the ordering
-                // makes that a structural fact rather than a happy one).
-                StageMode::Verbatim
-            } else {
-                match self.kernel_weights.get(nm) {
-                    Some(&k) => {
-                        let dev_elems: u64 = k.device_size.iter().product();
-                        if dev_elems as usize * k.word_length as usize != src.len() {
-                            bail!(
-                                "stage: kernel weight '{nm}' host size {} B != \
-                                 prod(device_size)*word_length ({} B) — manifest/shape mismatch",
-                                src.len(),
-                                dev_elems as usize * k.word_length as usize
-                            );
-                        }
-                        let Some(elem) = Element::from_word_length(k.word_length) else {
-                            bail!(
-                                "stage: kernel weight '{nm}' word_length {} has no tile walk",
-                                k.word_length
-                            );
-                        };
-                        StageMode::Retile(k, elem)
-                    }
-                    None => StageMode::Convert,
-                }
-            };
             items.push(Item {
                 slot,
                 offset: p.offset as usize,
@@ -2657,6 +2869,10 @@ impl Executor {
         //    segment holding ONLY weights has a dead staging buffer too (predict re-H2Ds only
         //    activation segments). Guarded by !SCRATCHY_SUPERDSC_DBG, whose readback D2Hs arbitrary
         //    segments back into seg_host. ──
+        //
+        // ⭐ THE ENTRIES LEAVE, THE REGISTRY STAYS: `weight_ids` keeps naming these ids (`filler_of`
+        //    and the shadow-reclaim below still ask), while the reclaimed byte payloads leave the
+        //    one bind map.
         for nm in &self.weight_ids {
             self.bound.remove(nm);
         }
@@ -4083,9 +4299,10 @@ impl Executor {
     /// self-describing via `.n`.
     ///
     /// Elements are LE f32 converted from the device's SEN169 fp16 (2 B/elem) — the same
-    /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, in
-    /// `raw_ids`) are dumped as i32→f32 with `.n = size/4` so the file stays comparable; the
-    /// emulator never dumps those (host-bound sources), so they simply have no reference file.
+    /// `sen_to_f32` the optrace's stats use. RAW int32 tensors (the gather index table, a
+    /// [`HostBytes::RawLe`] bind) are dumped as i32→f32 with `.n = size/4` so the file stays
+    /// comparable; the emulator never dumps those (host-bound sources), so they simply have no
+    /// reference file.
     /// Bank ≥ 1 weights and placements past a clamped shadow window are skipped (unreadable), each
     /// with one `skip.txt` line so the gap is visible rather than silent.
     fn tensordump(&mut self, oi: usize, op: &OpProg) -> Result<()> {
@@ -4169,7 +4386,14 @@ impl Executor {
                 continue;
             }
             dump.snap.insert(*id, cur.to_vec());
-            let raw = self.raw_ids.contains(id);
+            // The ENCODING the entry carries names the dump format — the same typing the convert
+            // loop routes by, so a raw-le entry can only be dumped as int32 (the shadow holds the
+            // last staged image, so a weight whose bytes were reclaimed still dumps by its hold's
+            // door; raw ids are activations and always present).
+            let raw = self
+                .bound
+                .get(id)
+                .is_some_and(|e| matches!(e.bytes, HostBytes::RawLe(_)));
             let elems = if raw {
                 p.size as usize / 4
             } else {
@@ -5028,12 +5252,13 @@ impl Executor {
         // narrowed nothing. Keep each tensor's own range and merge only what actually overlaps.
         let mut seg_runs: [Vec<(u64, u64)>; NUM_SEGMENTS] = [const { Vec::new() }; NUM_SEGMENTS];
 
-        for (nm, src) in &self.bound {
-            if self.weight_ids.contains(nm) {
-                continue; // weight, resident
-            }
-            if !refill_sends(&self.keyed, nm) {
-                continue; // keyed, and the device already holds this key's bytes
+        for (nm, entry) in &self.bound {
+            // ⭐ ONE ENTRY, ONE QUESTION — the hold says whether this step sends it: a weight
+            // never (resident), a per-step activation every step, a keyed one only in the step
+            // that bound it. This match IS the old `weight_ids`/`keyed` cross-reference, as one
+            // decision no door can forget half of.
+            if !entry.hold.sends_this_step() {
+                continue;
             }
             let Some(p) = self.places.get(nm) else {
                 continue; // no placement → not a program input, skip
@@ -5041,6 +5266,7 @@ impl Executor {
             let Some(seg) = SegIdx::checked(p.segment as i64) else {
                 continue;
             };
+            let len = entry.bytes.shadow_len();
             // OVER-BIND GUARD: the host must never write more bytes into a tensor than its OWN
             // placement reserves. Checking the SEGMENT bound alone passes happily while silently
             // overwriting the NEXT tensors — which is exactly how a one-stick ATTN_ZERO reservation
@@ -5051,60 +5277,39 @@ impl Executor {
             // the write lands at the parity shift, so the guard bounds the SHIFTED window — the
             // placement's size carries the stride growth for exactly this check.
             let pshift = parity_shift(p);
-            if pshift + src.len() as u64 > p.size {
+            if pshift + len > p.size {
                 bail!(
-                    "predict: activation '{nm}' binds {} B at parity shift {pshift} into a {} B \
+                    "predict: activation '{nm}' binds {len} B at parity shift {pshift} into a {} B \
                      placement (seg{} off {}) — REFUSING, this would corrupt the following tensors",
-                    src.len(),
                     p.size,
                     p.segment,
                     p.offset
                 );
             }
-            if p.offset as usize + pshift as usize + src.len() > self.seg_host[seg.get()].len() {
+            if p.offset as usize + pshift as usize + len as usize > self.seg_host[seg.get()].len() {
                 bail!("predict: activation '{nm}' overflows seg{}", p.segment);
             }
             seg_dirty[seg.get()] = true;
-            seg_runs[seg.get()].push(h2d_run(p.offset + pshift, src.len() as u64));
-            if d.phase_time {
-                eprintln!(
-                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB",
-                    p.segment,
-                    p.offset,
-                    src.len() as f64 / 1048576.0
-                );
-            }
-        }
-        // ⭐ AND EVERY ACTIVATION ALREADY CONVERTED INTO THE SHADOW (`bind_input_f32`): its range
-        // goes out this step exactly as a `bound` one's does — same window law, every step — and
-        // nothing converts it again. Its placement was checked where it was written.
-        for (nm, &len) in &self.staged {
-            let Some(p) = self.places.get(nm) else {
-                continue;
-            };
-            let Some(seg) = SegIdx::checked(p.segment as i64) else {
-                continue;
-            };
-            let pshift = parity_shift(p);
-            seg_dirty[seg.get()] = true;
             seg_runs[seg.get()].push(h2d_run(p.offset + pshift, len));
             if d.phase_time {
+                // ⭐ THE `Shadow` ENCODING IS THE OLD `staged` LOOP, MERGED: an activation
+                // `bind_input_f32` already converted into the shadow goes out this step exactly
+                // as a `bound` one's does — same window law — and nothing converts it again.
+                let at_bind = matches!(entry.bytes, HostBytes::Shadow { .. });
                 eprintln!(
-                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB (converted at bind)",
+                    "[sdsc-bind] '{nm}' -> seg{} off={} inputsize={:.3} MB{}",
                     p.segment,
                     p.offset + pshift,
-                    len as f64 / 1048576.0
+                    len as f64 / 1048576.0,
+                    if at_bind { " (converted at bind)" } else { "" }
                 );
             }
         }
         // The convert cannot borrow `self.bound` and `self.seg_host` at once, so the sources move
         // out for the duration — a `Vec` swap, not a copy of the bytes.
         let bound = std::mem::take(&mut self.bound);
-        for (nm, src) in &bound {
-            if self.weight_ids.contains(nm) {
-                continue;
-            }
-            if !refill_sends(&self.keyed, nm) {
+        for (nm, entry) in &bound {
+            if !entry.hold.sends_this_step() {
                 continue;
             }
             let Some(p) = self.places.get(nm) else {
@@ -5115,11 +5320,19 @@ impl Executor {
             };
             let pshift = parity_shift(p) as usize;
             let off = p.offset as usize + pshift;
+            // ⭐ THE ENCODING ROUTES THE CONVERT — the type-level form of the old `raw_ids`
+            // membership test. `RawLe` is copied VERBATIM (`ieee_to_sen_bytes` treats its source
+            // as fp16 pairs; for the gather's int32 index table that rewrites every entry into a
+            // different valid block number); `Fp16` is re-encoded; `Shadow` is already in the
+            // shadow and `Fp32` never rides the per-step path (it is a weight). An index table
+            // handed to the re-encode does not compile: this match is the only routing.
+            let src: &[u8] = match &entry.bytes {
+                HostBytes::Fp16(b) => b,
+                HostBytes::RawLe(b) => b,
+                HostBytes::Shadow { .. } | HostBytes::Fp32(_) => continue,
+            };
             let dst = &mut self.seg_host[seg.get()][off..][..src.len()];
-            // ⛔ A RAW BIND IS COPIED, NOT RE-ENCODED. `ieee_to_sen_bytes` treats its source as fp16
-            // pairs; for the gather's int32 index table that rewrites every entry into a different
-            // valid block number. See [`Self::raw_ids`].
-            if self.raw_ids.contains(nm) {
+            if matches!(entry.bytes, HostBytes::RawLe(_)) {
                 dst.copy_from_slice(src);
             } else {
                 sen_convert::ieee_to_sen_bytes(src, dst);
@@ -5128,8 +5341,10 @@ impl Executor {
         self.bound = bound;
         // This step's keyed binds are in the shadow and in the runs below; the next step that does
         // not re-bind them sends nothing for them.
-        for k in self.keyed.values_mut() {
-            k.fresh = false;
+        for entry in self.bound.values_mut() {
+            if let Hold::Keyed { fresh, .. } = &mut entry.hold {
+                *fresh = false;
+            }
         }
 
         let mut segs: [Option<SegUpload>; NUM_SEGMENTS] = [const { None }; NUM_SEGMENTS];
@@ -6207,6 +6422,12 @@ impl Executor {
             }
         }
         self.block_table_set = true;
+        // REQUEST-SCOPED HOLDS DROP HERE. A KvIndex hold's bytes are absolute block numbers read
+        // out of the request's page map — the key names (swept, pages) geometry, not the map
+        // itself. A new request can arrive at exactly that geometry and would then silently
+        // gather the PREVIOUS request's pages through the held-key skip. Every
+        // `set_block_table` installs a new map, so every one of them is the invalidation point.
+        self.keyed_retain_request_scoped();
         self.install_page_map(req, pos, pages);
         Ok(())
     }
@@ -6665,33 +6886,161 @@ mod tests {
     /// ⭐ ONLY A KEYED BIND IS SPARED THE PER-STEP RE-UPLOAD, AND ONLY AFTER ITS FIRST STEP. An
     /// unkeyed activation is sent every step (an input someone forgets to re-bind must keep being
     /// caught by today's path); a keyed one is sent in the step that bound it and not again until a
-    /// new key re-binds it.
+    /// new key re-binds it. The decision is [`Hold::sends_this_step`] — one entry, one question —
+    /// so what this pins is the behaviour the refill's single match implements, not a flag
+    /// combination two maps could disagree about.
     #[test]
     fn a_keyed_bind_goes_out_once_and_an_unkeyed_one_every_step() {
         use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
         let key =
             CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512).expect("a key");
         let (mask, rope) = (bundle::PlaceId::Act(7), bundle::PlaceId::Act(8));
-        let mut keyed = BTreeMap::new();
-        assert!(refill_sends(&keyed, &rope), "unkeyed: sent");
-        keyed.insert(mask, Keyed { key, fresh: true });
-        assert!(refill_sends(&keyed, &mask), "keyed, bound this step: sent");
+        let mut bound = BTreeMap::new();
+        let unkeyed = || Input {
+            bytes: HostBytes::Fp16(vec![1, 2]),
+            hold: Hold::PerStep,
+        };
+        bound.insert(rope, unkeyed());
+        assert!(bound[&rope].hold.sends_this_step(), "unkeyed: sent");
+        bound.insert(
+            mask,
+            Input {
+                bytes: HostBytes::Fp16(vec![3, 4]),
+                hold: Hold::Keyed {
+                    key: BindKey::Causal(key),
+                    fresh: true,
+                },
+            },
+        );
         assert!(
-            refill_sends(&keyed, &rope),
+            bound[&mask].hold.sends_this_step(),
+            "keyed, bound this step: sent"
+        );
+        assert!(
+            bound[&rope].hold.sends_this_step(),
             "a keyed neighbour changes nothing for the rest"
         );
-        // What `refill_activations` does after the convert: every keyed bind is now on the device.
-        for k in keyed.values_mut() {
-            k.fresh = false;
+        // What `stage_bound_activations` does after the convert: every keyed bind is now on the
+        // device.
+        for entry in bound.values_mut() {
+            if let Hold::Keyed { fresh, .. } = &mut entry.hold {
+                *fresh = false;
+            }
         }
         assert!(
-            !refill_sends(&keyed, &mask),
+            !bound[&mask].hold.sends_this_step(),
             "keyed, already uploaded: not sent"
         );
         assert!(
-            refill_sends(&keyed, &rope),
+            bound[&rope].hold.sends_this_step(),
             "unkeyed: still sent every step"
         );
+        // ⭐ AND AN UNKEYED RE-BIND OVER A STALE KEYED HOLD RE-SENDS — the entry-replacement
+        // half of the fix. `bind_input` (and `bind_input_raw`) REPLACE the entry with a
+        // `PerStep` one; if the keyed-ness survived that replacement anywhere, the stale-bytes
+        // trap would have moved from the bookkeeping into the refill. It must not: the new
+        // entry's hold says send, every step, from the step that re-bound it.
+        bound.insert(
+            mask,
+            Input {
+                bytes: HostBytes::Fp16(vec![7, 8]),
+                hold: Hold::PerStep,
+            },
+        );
+        assert!(
+            bound[&mask].hold.sends_this_step(),
+            "unkeyed re-bind over a keyed hold: sent again, every step"
+        );
+        // ⭐ AND A WEIGHT IS NEVER SENT — the third hold, in the same decision.
+        bound.insert(
+            rope,
+            Input {
+                bytes: HostBytes::Fp16(vec![5, 6]),
+                hold: Hold::Weight,
+            },
+        );
+        assert!(
+            !bound[&rope].hold.sends_this_step(),
+            "weight: resident, never re-sent"
+        );
+    }
+
+    /// ⭐ THE REBIND REFUSAL FIRES ONLY ON SAME KEY *AND* DIFFERENT BYTES. A different key is a
+    /// legitimate re-bind (the new key owns the id now); different bytes under NO hold is a first
+    /// bind; the same bytes under the same key is the skip doing its job. Anything else would either
+    /// refuse every key change or let a key-naming gap upload silently.
+    #[test]
+    fn the_rebind_refusal_fires_only_on_same_key_and_different_bytes() {
+        let key = BindKey::Consts { cap: 512 };
+        let held = Input {
+            bytes: HostBytes::Fp16(vec![1, 2, 3]),
+            hold: Hold::Keyed { key, fresh: false },
+        };
+        assert!(
+            !keyed_rebind_conflicts(Some(&held), &key, &[1, 2, 3]),
+            "same key, same bytes: no conflict — this is the held-key skip working"
+        );
+        assert!(
+            keyed_rebind_conflicts(Some(&held), &key, &[4, 5, 6]),
+            "same key, different bytes: conflict"
+        );
+        assert!(
+            !keyed_rebind_conflicts(Some(&held), &BindKey::Consts { cap: 1024 }, &[4, 5, 6]),
+            "different key: no conflict — the new key owns the id"
+        );
+        assert!(
+            !keyed_rebind_conflicts(None, &key, &[4, 5, 6]),
+            "no hold: no conflict — a first bind"
+        );
+        // ⭐ THE ENCODING IS PART OF THE COMPARISON: a raw-le hold under the same key compares its
+        // raw bytes, and a shadow hold (no bytes held) cannot conflict — the refusal is the
+        // backstop for bytes that exist.
+        let raw_held = Input {
+            bytes: HostBytes::RawLe(vec![1, 2, 3, 4]),
+            hold: Hold::Keyed { key, fresh: false },
+        };
+        assert!(
+            !keyed_rebind_conflicts(Some(&raw_held), &key, &[1, 2, 3, 4]),
+            "raw hold, same key, same bytes: no conflict"
+        );
+        assert!(
+            keyed_rebind_conflicts(Some(&raw_held), &key, &[9, 9, 9, 9]),
+            "raw hold, same key, different bytes: conflict"
+        );
+        let shadow_held = Input {
+            bytes: HostBytes::Shadow { len: 4 },
+            hold: Hold::Keyed { key, fresh: false },
+        };
+        assert!(
+            !keyed_rebind_conflicts(Some(&shadow_held), &key, &[1, 2, 3]),
+            "shadow hold: no bytes to compare, no conflict"
+        );
+    }
+
+    /// ⭐ ONLY THE KV INDEX KEY IS REQUEST-SCOPED. Its bytes are absolute block numbers out of the
+    /// request's page map, which the key does not name — so only it drops at `set_block_table`.
+    /// A consts hold is a pure function of the bundle, and a causal hold's rows are chunk geometry:
+    /// neither can pick up another request's pages by surviving a page-map install.
+    #[test]
+    fn only_the_kv_index_key_is_request_scoped() {
+        use scratchy_subtile::sdsc_abstract::{RowPages, SlotCount};
+        let kv = BindKey::KvIndex {
+            swept: SweptCols::new(512),
+            pages: RowPages::holding(SlotCount::new(2)),
+        };
+        assert!(kv.request_scoped(), "KvIndex: request-scoped");
+        assert!(
+            !BindKey::Consts { cap: 512 }.request_scoped(),
+            "Consts: bundle-scoped"
+        );
+        let causal = {
+            use scratchy_subtile::sdsc_abstract::{CausalKey, RungWidth};
+            BindKey::Causal(
+                CausalKey::chunk(RungWidth::of_baked_rows(512).expect("a width"), 512)
+                    .expect("a key"),
+            )
+        };
+        assert!(!causal.request_scoped(), "Causal: geometry-scoped");
     }
 
     /// ⭐ A BIND CONVERTED AT BIND GOES OUT EXACTLY AS ONE CONVERTED AT THE REFILL: the same window

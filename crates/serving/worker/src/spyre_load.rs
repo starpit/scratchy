@@ -24,6 +24,8 @@ use scratchy_target_spyre::manifest::SengraphBundle;
 use scratchy_target_spyre::runner::SpyreSession;
 #[cfg(feature = "spyre-hw")]
 use scratchy_target_spyre::sdsc_runner::SuperDscSession;
+#[cfg(feature = "spyre-hw")]
+use scratchy_target_spyre::superdsc_exec::BindKey;
 use scratchy_tensors::DType as SDType;
 use tracing::info;
 // `debug`/`warn` are only reached from the card blocks below.
@@ -115,7 +117,7 @@ fn stage_full_chunk_causal(
         .and_then(scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows)
         .ok_or_else(|| format!("a {rows}-row session has no rung width"))?;
     let (id, key, vals) = scratchy_target_spyre::forward_tape::causal_full_chunk(wiring, width);
-    sess.stage_keyed(id, key, &vals)
+    sess.stage_keyed(id, BindKey::Causal(key), &vals)
         .map_err(|e| format!("the {rows}-row session's full-chunk causal mask: {e}"))
 }
 
