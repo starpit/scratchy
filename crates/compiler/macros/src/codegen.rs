@@ -11055,8 +11055,13 @@ fn dump_wavefront_mega(
                     // ⭐⭐⭐ AND A DECODE BATCH RUNG ATTENDS EVERY REQUEST's CONTEXT IN ONE PASS TOO: one
                     // chunk holding the requests' pages end to end, each row masked to its own run
                     // (`BatchChunk`). Its ladder is `B × J` pages (`ChunkScratch::ladder_for`), so its
-                    // ceiling is the widest `B × J` within `PAGES_MAX` — and past it the per-page fold
-                    // keeps serving, as the fallback proof below requires.
+                    // ceiling is the widest `B × J` within `PAGES_MAX`. ⛔ PAST THAT CEILING NOTHING
+                    // SERVES, AND THE BAKE SAYS SO: a batched rung keeps no paged-fold statement (its
+                    // rows are separate requests — the m>1 fold family the splice refuses), so
+                    // `the_fallback_serves_any_length` finds no FOLDS rung, falls to the ladder's top,
+                    // and REFUSES the bake when that top is a chunk. Loud and pending, by design: the
+                    // batched fold family is the follow-up, and until it lands a batched decode past
+                    // the widest `B × J` chunk is a build failure, never a silent wrong answer.
                     let batch_rows = !is_prefill && decode_rows > 1 && seq_sym.is_none();
                     // The requests a chunk's rows are: the batch width, or ONE for a body whose rows
                     // share a history (the one-request decode, a prompt chunk's positions).
@@ -11112,17 +11117,24 @@ fn dump_wavefront_mega(
                                 superdsc::RungFacts {
                                     one_request,
                                     chunk_pages: chunk_ceiling,
-                                    // ⭐ THE CEILING'S PAGED-FOLD STATEMENT — a chunked ONE-REQUEST
-                                    // decode ladder threads the fold region into every rung's
-                                    // step-input extents (the one-layout guard compares them across
-                                    // rungs), and the ceiling is one of those rungs. The ceiling
-                                    // itself is a CHUNK (its `chunk_pages` is the widest chunk), so
-                                    // it is NOT the fold body: `fold_body: false` states the region
-                                    // without minting a family. The `(FULL, None)` rung below the
-                                    // ceiling is the body.
-                                    paged_fold: (chunk_ceiling.is_some() && one_request).then(|| {
-                                        superdsc::PagedFoldStatement { fold_body: false }
-                                    }),
+                                    // ⭐ THE CEILING'S PAGED-FOLD STATEMENT — a chunked ladder
+                                    // whose rows are ONE REQUEST'S HISTORY (the one-request
+                                    // decode rung, or a prompt chunk's positions — the same
+                                    // fact `chunk_requests` reads below) threads the fold
+                                    // region into every rung's step-input extents (the
+                                    // one-layout guard compares them across rungs), and the
+                                    // ceiling is one of those rungs. The ceiling itself is a
+                                    // CHUNK (its `chunk_pages` is the widest chunk), so it is
+                                    // NOT the fold body: `fold_body: false` states the region
+                                    // without minting a family. The `(FULL, None)` rung below
+                                    // the ceiling is the body. A BATCHED decode rung keeps no
+                                    // statement: its rows are separate requests and the fold
+                                    // family is the m>1 follow-up the splice refuses.
+                                    paged_fold: (chunk_ceiling.is_some()
+                                        && (one_request || prompt_chunk_prefix))
+                                        .then(|| {
+                                            superdsc::PagedFoldStatement { fold_body: false }
+                                        }),
                                 },
                             ) {
                                 Ok(rolled) => {
@@ -11514,16 +11526,21 @@ fn dump_wavefront_mega(
                                                         superdsc::RungFacts {
                                                             one_request,
                                                             chunk_pages: rung_chunk,
-                                                            // ⭐ THE RUNG'S PAGED-FOLD STATEMENT — every rung of the
-                                                            // same chunked one-request ladder states the region
-                                                            // (`fold_body: false`), and exactly the `(FULL, None)`
-                                                            // rung — the per-page body the widest chunk's contexts
-                                                            // fall back to — is the fold itself: its one-shot
-                                                            // attention program is REPLACED by the three-program
-                                                            // family (seed, per-page body, finalize), which the
+                                                            // ⭐ THE RUNG'S PAGED-FOLD STATEMENT — every
+                                                            // rung of a chunked one-request-history
+                                                            // ladder (the one-request decode rung, a
+                                                            // prompt chunk's positions) states the
+                                                            // region (`fold_body: false`), and exactly
+                                                            // the `(FULL, None)` rung — the per-page
+                                                            // body the widest chunk's contexts fall
+                                                            // back to — is the fold itself: its
+                                                            // one-shot attention program is REPLACED
+                                                            // by the three-program family (seed,
+                                                            // per-page body, finalize), which the
                                                             // proof reads off the emitted fold groups.
                                                             paged_fold: (chunk_ceiling.is_some()
-                                                                && one_request)
+                                                                && (one_request
+                                                                    || prompt_chunk_prefix))
                                                                 .then(|| {
                                                                     superdsc::PagedFoldStatement {
                                                                         fold_body: matches!(

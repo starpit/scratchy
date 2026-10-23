@@ -35,20 +35,31 @@ launch-side arithmetic is single-sourced there):
   * THE CARRY RIDES THE INTERMEDIATE SEGMENT, UNSHIFTED. A request's pages
     all fold into the SAME rows — that is what makes the online softmax a
     running state — so nothing about the carry may move per pass.
-  * THE CARRY'S DEVICE FRAME IS `[BATCH, MQ]` — one value per stick, the
-    frame the body reads with NO reshape. A flat `[BATCH*MQ]` view is the
-    `[1, 32]` stick frame, and presenting `[B, MQ]` from it is a RE-ROW
-    (rows 1 -> 32), which moves every element past the first stick column
-    to a different byte — the door's re-row law refuses it, correctly.
-    Stating the frame the consumer reads (strides `[64, 1]`: one f16 stick
-    of lanes per row) keeps every load and store reshape-free.
+  * THE CARRY'S DEVICE FRAME IS `[BATCH, MQ]` — the frame the body reads
+    with NO reshape. A flat `[BATCH*MQ]` view is the `[1, 32]` stick frame,
+    and presenting `[B, MQ]` from it is a RE-ROW (rows 1 -> 32), which
+    moves every element past the first stick column to a different byte —
+    the door's re-row law refuses it, correctly. Stating the frame the
+    consumer reads keeps every load and store reshape-free. Each row is
+    padded to WHOLE STICKS — the store's own granularity — so the row
+    stride is `MQ_PAD = ceil(MQ / 64) * 64` lanes: at MQ == 1 one value
+    per stick at lane 0 (strides `[64, 1]`, the pad lanes inert), at any
+    MQ a multiple of 64 a dense row of sticks.
 
 The per-trip laws are `batched_prefill_hm`'s own (one full id stick per
 page-window trip, the V block contiguous only at HD 64, the exp2 softmax),
-restated at ONE page per launch. `MQ == 1` is this family's own law: the
-mask's per-page block and a table's per-page block step by the same bytes
-only at one query row, and the fold's mask row is one validity row per
-page shared by the whole (single) request.
+restated at ONE page per launch. ⭐ THE TABLES STATE THE MASK'S OWN PITCH:
+the per-pass shift is ONE Activation delta, and a mask page block is
+`W4 * MQ` rows (`512 * MQ` bytes at this geometry) while a table's
+meaningful page block is one stick per window (`512` bytes) — so the
+tables are stated PADDED at the mask's pitch, ONE ID STICK PER MASK ROW
+(`[REGION_PAGES * W4 * MQ * KTB]` entries, the first `W4 * KTB` of each
+page's block meaningful, the tail unread and inert). At MQ == 1 the padded
+form is byte-identical to the natural one (`W4 * KTB == W4 * MQ * KTB`),
+which is why the two pitches used to agree "only at one query row" — the
+padding law is what lifts that to every MQ, and `KTB == 32` (`128 B` of
+entries per `128 B` of mask row) is what makes the two pitches EXACTLY
+equal, asserted below beside the id-stick law that forces it.
 
 ⛔ THE CARRY'S MEMORY IMAGE IS f16 — the SAME grading the one-shot kernel's
 LEGALIZED program carries, so the fold is numerically IDENTICAL to the
@@ -73,15 +84,19 @@ def paged_fold_seed_hm(desc_m, desc_l, desc_acc,  #
     accumulator at zero. Once per step, before the first pass. The carry's
     memory image is f16 (the module doc's law) and the sentinel is f16-exact."""
     BATCH: tl.constexpr = NKVH * GQA
+    # The row stride the frame law states: each carry row padded to WHOLE
+    # STICKS (64 f16 lanes), the store's own granularity. MQ == 1 keeps the
+    # one-value-per-stick form; an MQ past one stick is a dense row of them.
+    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     # The finite sentinel, not -inf: a masked-everywhere row still
     # normalizes with weight 0, never NaN (torch's own clamp trick).
-    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law: one value
-    # per stick, the shape the body reads, so the store needs no reshape.
+    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law: the
+    # shape the body reads, so the store needs no reshape.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH, MQ], strides=[64, 1],
+        desc_m, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
         block_shape=[BATCH, MQ])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
         block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
@@ -105,12 +120,14 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     W4: tl.constexpr = PAGE_SLOTS // 64
     LOG2E: tl.constexpr = 1.44269504
     ID_STICK: tl.constexpr = 32
+    # The carry's row stride — the frame law: each row padded to WHOLE
+    # STICKS (64 f16 lanes), the store's own granularity.
+    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     tl.static_assert(
         NKVH * GQA == ID_STICK,
         "paged_fold_hm: one full id stick per page-window trip requires NKVH * GQA == 32; other geometries need the PAGES_PER_TRIP generalization (the pending worklist item)")
     tl.static_assert(HD == 64, "paged_fold_hm: the V plane's [64, HD] block is one contiguous stick block only at HD 64; a wider head needs the per-(window, slab) V gather this kernel does not state yet")
     tl.static_assert(PAGE_SLOTS % 64 == 0, "paged_fold_hm: a page must be a whole number of 64-slot windows")
-    tl.static_assert(MQ == 1, "paged_fold_hm: the fold's mask row is one validity row per page shared by the whole request — the per-page block strides of the mask and the index tables agree only at one query row")
     # ⛔ THE REGION, NOT THE PAGE: every table below states the WHOLE
     # page-major region the host stages, and every load reads THIS launch's
     # page-window at its own offsets — the runtime's per-pass segment shift
@@ -126,14 +143,14 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     # The carried online-softmax state, per (kv head, group, query row):
     # torch's carry, at the f16 memory image the module doc's law states
     # (the one-shot's own legalized grading — parity, not degradation).
-    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law: the
+    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law: the
     # carried state loads and stores at the shape the walk computes in, so
     # no re-row ever presents it.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH, MQ], strides=[64, 1],
+        desc_m, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
         block_shape=[BATCH, MQ])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
         block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
@@ -147,18 +164,26 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     v_blk_desc = tl.make_tensor_descriptor(
         desc_v, shape=[REGION_PAGES * NKVH * W4, 64 * HD],
         strides=[64 * HD, 1], block_shape=[1, 64 * HD])
-    # The block-entry tables, page-major over the whole region: this
-    # launch's page is the base's own, so the per-window loads read
-    # [w * KTB] — never a page term, which the shift already added.
+    # The block-entry tables, page-major over the whole region at the
+    # MASK'S OWN PITCH — one id stick per mask row (the module doc's pitch
+    # law): this launch's page is the base's own, so the per-window loads
+    # read [w * KTB] — never a page term, which the shift already added.
+    # The entries past each page's first W4 * KTB are PADDING, unread and
+    # inert: the per-pass shift is one Activation delta, and at MQ > 1 a
+    # table's natural page block (512 B) is shorter than a mask page block
+    # (512 * MQ B) — the padding is what makes the two pitches one number.
     KTB: tl.constexpr = NKVH * GQA
+    tl.static_assert(
+        KTB * 4 == 64 * 2,
+        "paged_fold_hm: one id stick per mask row requires KTB * 4 bytes of entries per 64-lane fp16 mask row — the geometry broke the pitch convergence the one per-pass shift needs")
     kt_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_kt, shape=[REGION_PAGES * W4 * KTB], strides=[1],
+        desc_ids_kt, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
         block_shape=[KTB])
     v_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_v, shape=[REGION_PAGES * W4 * KTB], strides=[1],
+        desc_ids_v, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
         block_shape=[KTB])
     # The additive validity mask, window-major within each page, one row
-    # per page over the whole region — the per-pass shift walks it.
+    # per query row over the whole region — the per-pass shift walks it.
     mask_desc = tl.make_tensor_descriptor(
         desc_mask, shape=[REGION_PAGES * W4 * MQ, 64],
         strides=[64, 1], block_shape=[MQ, 64])
@@ -180,7 +205,7 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
                            [BATCH, 64, HD])
         qk = tl.dot(q, kt_blk, out_dtype=tl.float16)     # [B, MQ, 64]
         qk = qk * (SCALE * LOG2E)
-        # The per-page validity row, added at the score tile as a leading
+        # The per-window mask rows, added at the score tile as a leading
         # stride-0 broadcast.
         qk = qk + tl.reshape(mask_desc.load([w * MQ, 0]),
                              [1, MQ, 64])
@@ -206,12 +231,15 @@ def paged_fold_finalize_hm(desc_o, desc_l, desc_acc,  #
     carry's own f16 grading. The max is spent by the last pass — nothing
     reads it here."""
     BATCH: tl.constexpr = NKVH * GQA
+    # The carry's row stride — the frame law: each row padded to WHOLE
+    # STICKS (64 f16 lanes), the store's own granularity.
+    MQ_PAD: tl.constexpr = ((MQ + 63) // 64) * 64
     o_desc = tl.make_tensor_descriptor(
         desc_o, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law.
+    # [BATCH, MQ] at strides [MQ_PAD, 1] — the module doc's frame law.
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        desc_l, shape=[BATCH, MQ], strides=[MQ_PAD, 1],
         block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],

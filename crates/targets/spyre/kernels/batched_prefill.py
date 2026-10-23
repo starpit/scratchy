@@ -64,12 +64,18 @@ Staged by the host, per chunk:
   * `desc_kt`      — the resident K^T plane; this kernel reads it as
                      `[PAGES*NKVH*W4, HD*64]` — one stick block a row.
   * `desc_v`       — the resident V plane; read as `[PAGES*NKVH*W4, 64*HD]`.
-  * `desc_ids_kt`  — the K^T plane's block-entry table, `[REGION_PAGES * W4 *
-                     NKVH*GQA]` i32, page-major, window-major within a page,
-                     (kv head, group)-major within a window — the group
-                     replication rides the values. Every value is a
-                     `GatherEntry` the host minted for the K^T plane's own
-                     block numbering.
+  * `desc_ids_kt`  — the K^T plane's block-entry table, `[REGION_PAGES * W4
+                     * MQ * NKVH*GQA]` i32, page-major at the MASK'S OWN
+                     PITCH (one id stick per mask row: the per-page block
+                     is `W4 * MQ` sticks, the first `W4` meaningful, the
+                     tail padding — the pitch the per-page fold's ONE
+                     per-pass Activation shift walks both tensors by, so
+                     the two must state one number; at MQ == 1 the padded
+                     form is byte-identical to the natural one),
+                     window-major within a page, (kv head, group)-major
+                     within a window — the group replication rides the
+                     values. Every value is a `GatherEntry` the host
+                     minted for the K^T plane's own block numbering.
   * `desc_ids_v`   — the V plane's own block-entry table, same shape and
                      order, the V plane's own block numbering.
   * `desc_mask`    — additive fp16 mask `[REGION_PAGES * W4*MQ, 64]`, window-major:
@@ -148,17 +154,25 @@ def batched_prefill_hm(desc_q, desc_o,  #
         desc_v, shape=[PAGES * NKVH * W4, 64 * HD],
         strides=[64 * HD, 1], block_shape=[1, 64 * HD])
     # The memory-resident block-entry tables (the host's GatherEntry bytes),
-    # one whole stick of ids per (page, window) trip. ⛔ STATED AT THE REGION,
-    # NOT THE WALK: the extent the host stages is the ladder's own region
-    # (every rung of a chunked ladder states the same one, and a fold's
-    # per-pass shift walks it); the loads below stay inside this kernel's own
-    # `PAGES`-page walk.
+    # one whole stick of ids per (page, window) trip. ⛔ STATED AT THE
+    # REGION **AND AT THE MASK'S OWN PITCH**, NOT THE WALK'S: the extent the
+    # host stages is the ladder's own region (every rung of a chunked ladder
+    # states the same one, and a fold's per-pass shift walks it), and the
+    # per-page block is padded to ONE ID STICK PER MASK ROW (`W4 * MQ`
+    # sticks, the first `W4` meaningful, the tail unread) so the table and
+    # the mask state ONE pitch — the fold's per-pass shift is a single
+    # Activation delta and cannot move them by two different numbers. At
+    # MQ == 1 the padded form is byte-identical to the natural one. The
+    # loads below stay inside this kernel's own `PAGES`-page walk.
     KTB: tl.constexpr = NKVH * GQA
+    tl.static_assert(
+        KTB * 4 == 64 * 2,
+        "batched_prefill_hm: one id stick per mask row requires KTB * 4 bytes of entries per 64-lane fp16 mask row — the geometry broke the pitch convergence the fold's one per-pass shift needs")
     kt_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_kt, shape=[REGION_PAGES * W4 * KTB], strides=[1],
+        desc_ids_kt, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
         block_shape=[KTB])
     v_ids_desc = tl.make_tensor_descriptor(
-        desc_ids_v, shape=[REGION_PAGES * W4 * KTB], strides=[1],
+        desc_ids_v, shape=[REGION_PAGES * W4 * MQ * KTB], strides=[1],
         block_shape=[KTB])
     # The causal mask, window-major within each page, added at the score tile
     # as a leading stride-0 broadcast — stated at the same region for the
@@ -185,8 +199,8 @@ def batched_prefill_hm(desc_q, desc_o,  #
             # The block gathers: one stick block per index entry, both
             # planes, this trip's own g-replicated id stick, the ids loaded
             # from the memory-resident tables (never computed in-register).
-            kt_ids = kt_ids_desc.load([(s * W4 + w) * KTB])  # [KTB] i32
-            v_ids = v_ids_desc.load([(s * W4 + w) * KTB])    # [KTB] i32
+            kt_ids = kt_ids_desc.load([(s * W4 * MQ + w) * KTB])  # [KTB] i32
+            v_ids = v_ids_desc.load([(s * W4 * MQ + w) * KTB])    # [KTB] i32
             kt_blk = tl.reshape(kt_blk_desc.gather(kt_ids, 0),
                                 [BATCH, HD, 64])
             v_blk = tl.reshape(v_blk_desc.gather(v_ids, 0),
