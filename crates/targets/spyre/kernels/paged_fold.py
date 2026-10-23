@@ -35,6 +35,13 @@ launch-side arithmetic is single-sourced there):
   * THE CARRY RIDES THE INTERMEDIATE SEGMENT, UNSHIFTED. A request's pages
     all fold into the SAME rows — that is what makes the online softmax a
     running state — so nothing about the carry may move per pass.
+  * THE CARRY'S DEVICE FRAME IS `[BATCH, MQ]` — one value per stick, the
+    frame the body reads with NO reshape. A flat `[BATCH*MQ]` view is the
+    `[1, 32]` stick frame, and presenting `[B, MQ]` from it is a RE-ROW
+    (rows 1 -> 32), which moves every element past the first stick column
+    to a different byte — the door's re-row law refuses it, correctly.
+    Stating the frame the consumer reads (strides `[64, 1]`: one f16 stick
+    of lanes per row) keeps every load and store reshape-free.
 
 The per-trip laws are `batched_prefill_hm`'s own (one full id stick per
 page-window trip, the V block contiguous only at HD 64, the exp2 softmax),
@@ -68,17 +75,19 @@ def paged_fold_seed_hm(desc_m, desc_l, desc_acc,  #
     BATCH: tl.constexpr = NKVH * GQA
     # The finite sentinel, not -inf: a masked-everywhere row still
     # normalizes with weight 0, never NaN (torch's own clamp trick).
+    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law: one value
+    # per stick, the shape the body reads, so the store needs no reshape.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH * MQ], strides=[1],
-        block_shape=[BATCH * MQ])
+        desc_m, shape=[BATCH, MQ], strides=[64, 1],
+        block_shape=[BATCH, MQ])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH * MQ], strides=[1],
-        block_shape=[BATCH * MQ])
+        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    m_desc.store([0], tl.full([BATCH * MQ], -65504.0, tl.float16))
-    l_desc.store([0], tl.zeros([BATCH * MQ], tl.float16))
+    m_desc.store([0, 0], tl.full([BATCH, MQ], -65504.0, tl.float16))
+    l_desc.store([0, 0], tl.zeros([BATCH, MQ], tl.float16))
     acc_desc.store([0, 0], tl.zeros([BATCH * MQ, HD], tl.float16))
 
 
@@ -117,12 +126,15 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     # The carried online-softmax state, per (kv head, group, query row):
     # torch's carry, at the f16 memory image the module doc's law states
     # (the one-shot's own legalized grading — parity, not degradation).
+    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law: the
+    # carried state loads and stores at the shape the walk computes in, so
+    # no re-row ever presents it.
     m_desc = tl.make_tensor_descriptor(
-        desc_m, shape=[BATCH * MQ], strides=[1],
-        block_shape=[BATCH * MQ])
+        desc_m, shape=[BATCH, MQ], strides=[64, 1],
+        block_shape=[BATCH, MQ])
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH * MQ], strides=[1],
-        block_shape=[BATCH * MQ])
+        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
@@ -152,8 +164,8 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         strides=[64, 1], block_shape=[MQ, 64])
 
     q = tl.reshape(q_desc.load([0, 0]), [BATCH, MQ, HD])
-    m = tl.reshape(m_desc.load([0]), [BATCH, MQ])
-    l = tl.reshape(l_desc.load([0]), [BATCH, MQ])
+    m = m_desc.load([0, 0])
+    l = l_desc.load([0, 0])
     acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
 
     for w in tl.static_range(W4):
@@ -181,8 +193,8 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         acc = acc * rescale[:, :, None] + pv
         m = m_new
 
-    m_desc.store([0], tl.reshape(m, [BATCH * MQ]))
-    l_desc.store([0], tl.reshape(l, [BATCH * MQ]))
+    m_desc.store([0, 0], m)
+    l_desc.store([0, 0], l)
     acc_desc.store([0, 0], tl.reshape(acc, [BATCH * MQ, HD]))
 
 
@@ -197,13 +209,14 @@ def paged_fold_finalize_hm(desc_o, desc_l, desc_acc,  #
     o_desc = tl.make_tensor_descriptor(
         desc_o, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
+    # [BATCH, MQ] at strides [64, 1] — the module doc's frame law.
     l_desc = tl.make_tensor_descriptor(
-        desc_l, shape=[BATCH * MQ], strides=[1],
-        block_shape=[BATCH * MQ])
+        desc_l, shape=[BATCH, MQ], strides=[64, 1],
+        block_shape=[BATCH, MQ])
     acc_desc = tl.make_tensor_descriptor(
         desc_acc, shape=[BATCH * MQ, HD], strides=[HD, 1],
         block_shape=[BATCH * MQ, HD])
-    l = tl.reshape(l_desc.load([0]), [BATCH, MQ])        # [B, MQ]
+    l = l_desc.load([0, 0])                              # [B, MQ]
     acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
     o = (acc / l[:, :, None]).to(tl.float16)             # [B, MQ, HD]
     o_desc.store([0, 0], tl.reshape(o, [BATCH * MQ, HD]))
