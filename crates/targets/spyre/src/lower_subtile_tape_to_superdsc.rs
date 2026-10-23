@@ -2032,7 +2032,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
             tids.extend(
                 crate::lower_subtile_tape_to_ktir::argmax_row_feedback_of_ir(ir)?
                     .into_iter()
-                    .flatten(),
+                    .flat_map(|(t, s)| [t, s]),
             );
             tids.sort_unstable();
             tids.dedup();
@@ -8342,7 +8342,9 @@ mod tests {
     #[test]
     fn the_bundle_states_its_own_source_facts_across_the_mint() {
         use scratchy_subtile::lower::{GemmWeight, InputRef, OpDesc};
-        use scratchy_subtile::subtile_ir::{SourceShape, SubOp, TensorId, lower_region, mint_argmax};
+        use scratchy_subtile::subtile_ir::{
+            SourceShape, SubOp, TensorId, lower_region, mint_argmax,
+        };
         // K=1, vocab 5 — the one-request lm-head shape the mint admits, the same fixture
         // `argmax_mint_lower` pins the splice seat with. The third source is the embed row
         // slot the row feedback's gather lands in.
@@ -8367,7 +8369,7 @@ mod tests {
         let weight_ids: std::collections::HashSet<u32> = [1u32].into_iter().collect();
         let plain = lower_region(&input, nz);
         let mut minted = lower_region(&input, nz);
-        mint_argmax(&mut minted, TensorId(2));
+        mint_argmax(&mut minted, TensorId::from_index(2));
         let l_plain =
             compute_bundle_layout(&plain, &weight_ids, false, false, &[]).expect("plain lays out");
         let l_minted = compute_bundle_layout(&minted, &weight_ids, false, false, &[])
@@ -8421,7 +8423,7 @@ mod tests {
             crate::lower_subtile_tape_to_ktir::argmax_row_feedback_of_ir(&minted)
                 .expect("the minted graph's row-feedback pair derives")
                 .into_iter()
-                .flatten(),
+                .flat_map(|(t, s)| [t, s]),
         );
         wiring_tids.sort_unstable();
         wiring_tids.dedup();

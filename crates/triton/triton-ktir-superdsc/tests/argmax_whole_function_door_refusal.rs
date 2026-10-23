@@ -86,7 +86,8 @@ fn the_per_program_door_refuses_while_the_whole_door_emits() {
         ),
     };
     assert!(
-        err.message.contains("fifteen-parameter whole-function body"),
+        err.message
+            .contains("fifteen-parameter whole-function body"),
         "the per-`Program` refusal must name the whole-function door as the body's, got: \
          [{}] {} (door kind: {:?})",
         err.stage,
