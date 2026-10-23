@@ -485,6 +485,16 @@ impl SuperDscSession {
             })
     }
 
+    /// ⭐ THE PLACEMENT EXTENT of step-input `slot`, in bytes — the session's forward of the
+    /// executor's own query ([`Executor::step_input_extent`]). The FILLER's sizing door: the
+    /// caller stages exactly this many bytes, and `fill_step_input`'s `==` law re-measures them
+    /// against the same placement. `None` when this bundle declares no such slot.
+    ///
+    /// [`Executor::step_input_extent`]: crate::superdsc_exec::Executor::step_input_extent
+    pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
+        self.exec.step_input_extent(slot)
+    }
+
     /// ⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT by its SLOT — the session's forward of the executor's
     /// own door ([`Executor::fill_step_input`]). The slot is the caller's whole handle: the
     /// discovery, the extent law and the staging channel are the bundle's own baked answers, and

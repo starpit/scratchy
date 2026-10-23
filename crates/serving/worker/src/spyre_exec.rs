@@ -1470,6 +1470,34 @@ impl Worker for SpyreWorker {
                     Some(bc) => scratchy_subtile::sdsc_abstract::BatchPrefix::Chunk(bc),
                     None => scratchy_subtile::sdsc_abstract::BatchPrefix::Fold(fold),
                 };
+                // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the batched decode kernel's block-entry
+                // tables, repetition table and pre-replicated mask, staged through the ONE fill
+                // helper (the same call the prompt chunk and the solo decode make). The rows are
+                // the LAUNCH's — padding rows replicate live 0's map and history, the same law the
+                // door-era tables stage by — and `write_slot` is the batch's one shared write slot,
+                // where every row's new key lands. The dead `KV_BLOCK_INDEX_TID` tables above stay
+                // on purpose until the card proves the fill; deleting them is the no-host-fallback
+                // proof, its own commit.
+                let attn_rows = rows_in.launch_rows(&toks, seqs).ok_or_else(|| {
+                    werr(format!(
+                        "decode batch: {} live row(s) and {} token(s) do not lay into the \
+                         {}-row rung the spliced step inputs stage for",
+                        rows_in.live(),
+                        toks.len(),
+                        seqs.count()
+                    ))
+                })?;
+                fill_attn_step_inputs(
+                    "decode batch",
+                    sess,
+                    pool,
+                    nqh as u32,
+                    AttnStepRows::Batch {
+                        rows: attn_rows,
+                        maps: &page_maps,
+                        write: write_slot,
+                    },
+                )?;
                 let rows = run_prefill_batch(
                     Some((&rows_in, prefix)),
                     kv_blocks.as_deref(),

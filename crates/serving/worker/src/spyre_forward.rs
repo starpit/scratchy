@@ -925,6 +925,225 @@ fn chunk_index_table(
     })
 }
 
+/// ⭐⭐⭐ WHOSE ROWS THE LAUNCH RUNS — the one fact that picks the staged FORM of the attention
+/// family's step inputs, because the form is the KERNEL's, and `rows_are_requests` (the routing
+/// bit that chose the kernel at the splice) is exactly this. A partial overlap is not
+/// expressible: a chunk's rows are token rows and a batch's are request rows, and staging one
+/// kernel's layout for the other reads real block numbers from the wrong form — silently.
+#[cfg(feature = "spyre-hw")]
+pub(crate) enum AttnStepRows<'a> {
+    /// Consecutive positions of ONE sequence: a prompt chunk (the one-shot kernel, or the
+    /// chunked ladder's fold), or the solo decode's single row (the fold at `mq == 1`). Both
+    /// bodies read the SAME region form — the padded pitch convergence law — so one arm stages
+    /// both. `start`/`real` are the chunk's own facts (`real == 1` is the decode row), and `map`
+    /// is the sequence's logical→physical page map, the very map the launch installed.
+    Chunk {
+        rows: scratchy_subtile::sdsc_abstract::ChunkRows,
+        mq: scratchy_subtile::sdsc_abstract::RungWidth,
+        start: usize,
+        real: usize,
+        map: Vec<i64>,
+    },
+    /// Separate requests: a decode batch (`batched_decode_hm`), whose rows are the rung's launch
+    /// slots — padding rows replicate live 0, maps and histories included. `maps` is the slot map's
+    /// own per-row map list; `write` is the batch's ONE shared write slot, where every row's new
+    /// key lands this step.
+    Batch {
+        rows: scratchy_subtile::sdsc_abstract::LaunchRows<'a>,
+        maps: &'a [Vec<i64>],
+        write: scratchy_subtile::sdsc_abstract::BatchSlot,
+    },
+}
+
+#[cfg(feature = "spyre-hw")]
+/// ⭐⭐⭐⭐⭐ FILL THE ATTENTION FAMILY'S HOST-STAGED STEP INPUTS — the worker's half of the
+/// contract `attn_step_slots` spells. ONE helper, ONE spelling: the prompt chunk, the solo
+/// decode and the decode batch all stage through the session's `fill_step_input` door, slots
+/// named from the contract's table, content computed by the shared builders in the KERNELS'
+/// read orders — never re-laid at a site.
+///
+/// ⭐ QUERY, THEN FILL. The bundle's own baked discovery table says which slots exist; this
+/// asks it (through `step_input_extent`, the artifact's own answer) and fills exactly what it
+/// declares. A bundle that declares NONE is a bundle no spliced program stated inputs for, so
+/// the fill is a quiet no-op — but a PARTIAL declaration is a bake/host disagreement and
+/// refuses, because an unstaged id table reads as block 0 (a REAL address) and an unstaged mask
+/// reads as zero (NO masking), both fluently wrong.
+///
+/// ⛔ THE DEAD `KV_BLOCK_INDEX_TID` BIND IS KEPT ON PURPOSE in this commit: the door-era index
+/// tables still flow to it while the spliced fills prove themselves on card. Deleting that bind
+/// is the no-host-fallback PROOF, and it is its own commit once the card replies coherently.
+pub(crate) fn fill_attn_step_inputs(
+    what: &str,
+    session: &mut SuperDscSession,
+    pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
+    nqh: u32,
+    rows: AttnStepRows<'_>,
+) -> ExecutorResult<()> {
+    use scratchy_subtile::sdsc_abstract::attn_step_slots;
+    let sd = scratchy_subtile::sdsc_abstract;
+    // ⭐ THE GEOMETRY'S ONE DERIVATION ON THIS SIDE: `gqa = nqh / nkvh` — the wiring's head count
+    // over the pool's, the fact `PagedKvPool` cannot state alone. A quotient of zero or a
+    // non-divisor is a wiring/pool disagreement about the model, not a default to spell.
+    let nkvh = pool.nkvh.max(1) as u32;
+    let gqa = std::num::NonZeroU32::new(nqh / nkvh)
+        .filter(|_| nqh % nkvh == 0)
+        .ok_or_else(|| {
+            werr(format!(
+                "{what}: nqh {nqh} does not cover the pool's {nkvh} kv head(s) in whole GQA \
+                 groups — the wiring and the pool disagree about the model's geometry"
+            ))
+        })?;
+    // Query the discovery table first: extents are the artifact's own answers, and the door's
+    // `==` law re-measures every one of them at fill time.
+    let mask_ext = session.step_input_extent(attn_step_slots::MASK);
+    let kt_ext = session.step_input_extent(attn_step_slots::KT_BLOCK_IDS);
+    let v_ext = session.step_input_extent(attn_step_slots::V_BLOCK_IDS);
+    let rep_ext = session.step_input_extent(attn_step_slots::REP_ROW_IDS);
+    let fill = |session: &mut SuperDscSession, slot: u32, bytes: Vec<u8>| {
+        session
+            .fill_step_input(slot, bytes)
+            .map_err(|e| werr(format!("{what}: fill step input slot {slot}: {e}")))
+    };
+    // One id table's bytes, LE u32 per entry — the RawU32 channel's own wire form.
+    let encode = |t: &[sd::GatherEntry]| {
+        t.iter()
+            .flat_map(|e| e.as_i32().to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    match rows {
+        AttnStepRows::Chunk {
+            rows,
+            mq,
+            start,
+            real,
+            map,
+        } => {
+            match (mask_ext, kt_ext, v_ext, rep_ext) {
+                (None, None, None, None) => return Ok(()),
+                (Some(_), Some(_), Some(_), None) => {}
+                (_, _, _, Some(_)) => {
+                    return Err(werr(format!(
+                        "{what}: this bundle declares a REPETITION table (slot {}) but the \
+                         launch's rows are consecutive positions of ONE sequence — the bake and \
+                         the host disagree about which body runs",
+                        attn_step_slots::REP_ROW_IDS
+                    )))
+                }
+                _ => {
+                    return Err(werr(format!(
+                        "{what}: this bundle declares a PARTIAL set of attention step inputs — \
+                         the three-slot form is all-or-nothing, and an unstaged one reads as \
+                         block 0 (ids) or no mask (mask), both fluently wrong"
+                    )))
+                }
+            }
+            let region =
+                sd::SplicedAttnRegion::of_mask_extent(mask_ext.unwrap_or(0), pool, gqa, mq)
+                    .ok_or_else(|| {
+                        werr(format!(
+                            "{what}: the mask slot's placement extent {} B is not a whole number \
+                             of page blocks at this geometry (mq {}, pool nkvh {} hd {}) — the \
+                             bake and the host disagree about the region",
+                            mask_ext.unwrap_or(0),
+                            mq.count(),
+                            pool.nkvh,
+                            pool.hd
+                        ))
+                    })?;
+            let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
+                werr(format!(
+                    "{what}: this bundle's attention gathers, but a physical page is not a whole \
+                     number of STICK BLOCKS — no integer index can name a page boundary"
+                ))
+            })?;
+            let build = |what_plane: &str| {
+                sd::spliced_attn_ids_table(region, &map, ceiling).ok_or_else(|| {
+                    werr(format!(
+                        "{what}: could not build the {what_plane} plane's block-entry table from \
+                         this sequence's page map — an empty map, or an entry past the pool's \
+                         ceiling (never a zero table: zero is block 0, a REAL address)"
+                    ))
+                })
+            };
+            let kt = build("Kᵀ")?;
+            let v = build("V")?;
+            let mask = sd::spliced_attn_mask_f16(region, rows, start, real).ok_or_else(|| {
+                werr(format!(
+                    "{what}: could not build the validity mask — real {real} rows against the \
+                     rung's {} row(s) is not a chunk this region states",
+                    mq.count()
+                ))
+            })?;
+            fill(session, attn_step_slots::KT_BLOCK_IDS, encode(&kt))?;
+            fill(session, attn_step_slots::V_BLOCK_IDS, encode(&v))?;
+            fill(session, attn_step_slots::MASK, mask)?;
+        }
+        AttnStepRows::Batch { rows, maps, write } => {
+            if let (None, None, None, None) = (mask_ext, kt_ext, v_ext, rep_ext) {
+                return Ok(());
+            }
+            if mask_ext.is_none() || kt_ext.is_none() || v_ext.is_none() || rep_ext.is_none() {
+                return Err(werr(format!(
+                    "{what}: this bundle declares a PARTIAL set of attention step inputs — the \
+                     four-slot batch form is all-or-nothing, and an unstaged one reads as block 0 \
+                     (ids), a gathered Q row 0 (repetition), or no mask (mask)"
+                )));
+            }
+            let num_seqs = rows.width().rows();
+            let batch =
+                sd::SplicedDecodeBatch::of_ids_extent(kt_ext.unwrap_or(0), pool, gqa, num_seqs)
+                    .ok_or_else(|| {
+                        werr(format!(
+                            "{what}: the ids slot's placement extent {} B is not a whole number \
+                             of chunk tables at {} launch row(s) — the bake and the host disagree \
+                             about the batch chunking",
+                            kt_ext.unwrap_or(0),
+                            num_seqs.get()
+                        ))
+                    })?;
+            let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
+                werr(format!(
+                    "{what}: this bundle's attention gathers, but a physical page is not a whole \
+                     number of STICK BLOCKS — no integer index can name a page boundary"
+                ))
+            })?;
+            let kt = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
+                werr(format!(
+                    "{what}: could not build the batch's block-entry table from {} installed \
+                     page map(s) — not one map per launch row, an empty map, or an entry past \
+                     int32 (never a zero table: zero is block 0, a REAL address)",
+                    maps.len()
+                ))
+            })?;
+            let v = sd::spliced_decode_ids_table(batch, maps, ceiling).ok_or_else(|| {
+                werr(format!(
+                    "{what}: could not build the batch's V-plane block-entry table — same law, \
+                     same refusal, the V plane's own slot"
+                ))
+            })?;
+            let rep = sd::spliced_decode_rep_ids(batch);
+            let mask = sd::spliced_decode_mask_f16(batch, &rows.mask_histories(), write)
+                .ok_or_else(|| {
+                    werr(format!(
+                        "{what}: could not build the batch's pre-replicated validity mask — not \
+                         one history per launch row"
+                    ))
+                })?;
+            fill(session, attn_step_slots::KT_BLOCK_IDS, encode(&kt))?;
+            fill(session, attn_step_slots::V_BLOCK_IDS, encode(&v))?;
+            fill(
+                session,
+                attn_step_slots::REP_ROW_IDS,
+                rep.iter()
+                    .flat_map(|&r| r.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )?;
+            fill(session, attn_step_slots::MASK, mask)?;
+        }
+    }
+    Ok(())
+}
+
 /// ⭐ WHAT ONE CHUNK'S FORWARD PRODUCED — the per-row logits the host sampler
 /// reads. One enum (not a bare `Vec<Vec<f32>>`) because the shape is a fact of the
 /// step the caller must not be able to confuse with the model's other outs.
@@ -1276,6 +1495,49 @@ pub(crate) fn superdsc_forward_chunk(
                         rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::Prompt,
                     },
                 )?;
+                // The LADDER entry's baked width — hoisted once: the fill below and the launch
+                // below THAT both stage for the same rung, and two constructions of one width is
+                // a second chance to disagree about which body runs.
+                let rung = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
+                    .ok_or_else(|| {
+                        werr("superdsc batched prefill: the selected rung has zero rows".to_string())
+                    })?;
+                // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the block-entry tables and the validity
+                // mask the spliced attention kernel reads, staged through the ONE fill helper in
+                // the kernel's read order. The map is the CHUNK's own (`chunk_page_map`: every
+                // page the write lands in backed, so a window wider than a page reads its own
+                // new keys back through the gather — unlike the door-era chunk, whose own window
+                // rode a segment shift and whose table stopped at the prefix). The dead
+                // `KV_BLOCK_INDEX_TID` bind above stays on purpose until the card proves the
+                // fill; deleting it is the no-host-fallback proof, its own commit.
+                fill_attn_step_inputs(
+                    "prompt chunk",
+                    pf,
+                    pool,
+                    pmeta.wiring.geometry.nqh,
+                    AttnStepRows::Chunk {
+                        rows: scratchy_subtile::sdsc_abstract::ChunkRows::chunk(rung.rows()),
+                        mq: rung,
+                        start: chunk_start,
+                        real: chunk_len,
+                        map: req
+                            .chunk_page_map(
+                                ctx,
+                                placed.wrote(scratchy_subtile::sdsc_abstract::SlotCount::new(
+                                    chunk_len as u32,
+                                )),
+                            )
+                            .ok_or_else(|| {
+                                werr(format!(
+                                    "superdsc batched prefill: cannot map the chunk's pages — \
+                                     the host granted {} block(s) and a page the chunk writes \
+                                     has none",
+                                    ctx.host.len(),
+                                ))
+                            })?
+                            .as_i64(),
+                    },
+                )?;
                 prefill_logits = run_prefill_batch(
                     // A prompt chunk: these rows are consecutive positions of one sequence, so they
                     // share both the causal triangle and one resident-prefix validity row. `None` IS
@@ -1293,13 +1555,7 @@ pub(crate) fn superdsc_forward_chunk(
                     &chunk_toks,
                     // The LADDER entry's baked width — the rung this chunk actually runs on, of
                     // which `chunk_len` rows carry real tokens.
-                    scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
-                        .ok_or_else(|| {
-                            werr(
-                                "superdsc batched prefill: the selected rung has zero rows"
-                                    .to_string(),
-                            )
-                        })?,
+                    rung,
                     // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
                     // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
                     // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
@@ -1575,6 +1831,40 @@ pub(crate) fn superdsc_forward_chunk(
                 resident: p,
                 mapped: p as u32 + 1,
                 rows: scratchy_subtile::sdsc_abstract::ChunkRowKind::OneRequest,
+            },
+        )?;
+        // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the fold body reads its pages through the
+        // block-entry tables and its validity through the mask, both staged per token through
+        // the ONE fill helper (the same call the prompt chunk makes; the fold and the one-shot
+        // kernel read the same region form). The map covers slots `0..=p` — the new token's
+        // page included, because the fold gathers the whole history through the table, its own
+        // new key with it. The dead `KV_BLOCK_INDEX_TID` bind above stays on purpose until the
+        // card proves the fill; deleting it is the no-host-fallback proof, its own commit.
+        fill_attn_step_inputs(
+            "solo decode",
+            session,
+            pool,
+            b.wiring.geometry.nqh,
+            AttnStepRows::Chunk {
+                rows: scratchy_subtile::sdsc_abstract::ChunkRows::single(),
+                mq: scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                    .expect("1 is a width"),
+                start: p,
+                real: 1,
+                map: req
+                    .page_map(
+                        ctx,
+                        scratchy_subtile::sdsc_abstract::RowPages::holding(
+                            scratchy_subtile::sdsc_abstract::SlotCount::new(p as u32 + 1),
+                        ),
+                    )
+                    .ok_or_else(|| {
+                        werr(format!(
+                            "solo decode: cannot map the page holding pos {p} — every page \
+                             holding a key, the new token's included, must be a host block"
+                        ))
+                    })?
+                    .as_i64(),
             },
         )?;
         let inputs = scratchy_target_spyre::forward_tape::ForwardInputs {

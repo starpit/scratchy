@@ -1583,25 +1583,14 @@ fn lower_prefill_lm_head_fold<F: scratchy_subtile::subtile_ir::RopeForm>(
 ///
 /// ⭐ THE SYNTHETIC BINDING SLOTS — the host-staged inputs past the graph's own tensors,
 /// numbered through the ONE shared law (`step_input_tid`) so the producer's placement pass
-/// places exactly these tids and refuses any disagreement. The slot table is THIS crate's own
-/// (the splice is the layer that knows which staging law each slot names; the ladder sees only
-/// the numbering). Slot 0 keeps the mask on the tid the wiring's own one-past-the-graph law
-/// already assigns it, so nothing pre-existing moves. EVERY attention program of a bundle —
-/// the one-shot kernels and the paged-fold family's body — states the SAME slots, so the
-/// placement pass and the runtime's staging treat them alike.
-mod attn_step_slots {
-    /// The additive validity mask at the score tile's own rows.
-    pub const MASK: u32 = 0;
-    /// The Kᵀ plane's block-entry table — one `GatherEntry` per stick block the
-    /// score gather reads, in the Kᵀ plane's own block numbering.
-    pub const KT_BLOCK_IDS: u32 = 1;
-    /// The V plane's block-entry table — the V plane's own block numbering.
-    pub const V_BLOCK_IDS: u32 = 2;
-    /// Q's row-repetition table — torch's `rep_row_ids` values, one Q row index
-    /// per `[BATCH, GQA]` entry of the pre-repeated frame the decode kernel's
-    /// score dot pairs with the gathered blocks.
-    pub const REP_ROW_IDS: u32 = 3;
-}
+/// places exactly these tids and refuses any disagreement. The slot table is the CONTRACT's
+/// own (`ktir_superdsc::sdsc_abstract::attn_step_slots` — the splice is the STATER, the worker
+/// the FILLER, and the table lives in the one vocabulary crate both link; see its doc for why
+/// it is a fixed ABI and not wiring data). Slot 0 keeps the mask on the tid the wiring's own
+/// one-past-the-graph law already assigns it, so nothing pre-existing moves. EVERY attention
+/// program of a bundle — the one-shot kernels and the paged-fold family's body — states the
+/// SAME slots, so the placement pass and the runtime's staging treat them alike.
+use ktir_superdsc::sdsc_abstract::attn_step_slots;
 
 /// `cap` is the resident pool tensor's row extent (`lower_attn_node`'s own read) — for the
 /// paged pool a row IS a page, so it is the decode kernel's `PAGES` constexpr. `_active_cap`
@@ -2365,9 +2354,9 @@ fn mint_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // below refuses the divergence.
     let t =
         |tr: &scratchy_subtile::subtile_ir::TensorRegion| BufferId::new(tr.tensor.index() as u32);
-    // ⭐ THE SYNTHETIC BINDING SLOTS — the crate's own `attn_step_slots` table (hoisted to
-    // file scope: the paged-fold family's body states the same slots), numbered through the
-    // ONE shared law (`step_input_tid`).
+    // ⭐ THE SYNTHETIC BINDING SLOTS — the contract's own `attn_step_slots` table (the
+    // paged-fold family's body states the same slots), numbered through the ONE shared law
+    // (`step_input_tid`).
     let n_tensors = ir.tensors.len() as u32;
     let law = |slot: u32| BufferId::new(ktir_superdsc::ktir_node::step_input_tid(n_tensors, slot));
     let mask_tid = law(attn_step_slots::MASK);

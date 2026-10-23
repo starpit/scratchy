@@ -9592,10 +9592,12 @@ impl GatherScratch {
     /// is why one index serves both copies.
     pub fn block_in_page(self, kvh: u32, window: u32) -> Option<u32> {
         let pool = PagedKvPool::new(self.nkvh() as usize, self.hd as usize);
-        let per_plane =
-            u32::try_from(pool.plane_block_elems() / pool.stick_block_elems().max(1)).ok()?;
-        (kvh < self.nkvh() && window < self.windows && window < per_plane)
-            .then_some(kvh * per_plane + window)
+        // The POOL's own door names the block (one derivation, shared with the spliced fillers);
+        // this adds only the scratch's own window bound — how far THIS pass sweeps, the one fact
+        // the pool cannot state.
+        (kvh < self.nkvh() && window < self.windows)
+            .then(|| pool.block_in_page(kvh, window))
+            .flatten()
     }
 }
 
@@ -11510,6 +11512,428 @@ mod kv_cache_write_pitch_proofs {
             "nslab planes are one head"
         );
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The spliced attention family's step inputs — the two-party contract, and the FILLER's half
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐⭐⭐⭐⭐ THE ATTENTION FAMILY'S HOST-STAGED STEP-INPUT SLOTS — the two-party contract's
+/// spelling, in the one vocabulary crate both parties link.
+///
+/// The triton splice is the STATER: it numbers the synthetic bindings one past the graph's own
+/// tensors through the ONE shared law (`step_input_tid`), states them on the node, and the
+/// producer's placement pass places exactly those tids. The worker is the FILLER: it asks the
+/// bundle's own baked discovery table which of these slots this bundle declared, computes the
+/// content — a page table, a validity mask — in the KERNEL'S read order, and hands the bytes to
+/// the session's fill door by slot. Neither party may spell the other's numbering: the splice
+/// never derives a tid beyond the one law, and the worker never recomputes `tensors.len() + k`.
+/// This table is where the two agree, which is why it lives HERE and not in the splice: a
+/// contract between two crates belongs to the vocabulary crate both link, never to a party.
+///
+/// ⛔ A FIXED TARGET ABI, NOT WIRING DATA. The slot a meaning is pinned to is a constant of the
+/// family — the discovery table deliberately carries no meanings (a format cannot tell the two
+/// `RawU32` id tables apart), so the meanings must live somewhere both parties can name, and a
+/// bake-time table would be a second thing to keep in step with the splice's own constants.
+///
+/// Every attention program of a bundle — the one-shot kernels and the paged-fold family's body —
+/// states the SAME slots, so the placement pass and the runtime's staging treat them alike. Slot
+/// 0 keeps the mask on the tid the wiring's own one-past-the-graph law already assigns it, so
+/// nothing pre-existing moves.
+pub mod attn_step_slots {
+    /// The additive validity mask at the score tile's own rows.
+    pub const MASK: u32 = 0;
+    /// The Kᵀ plane's block-entry table — one `GatherEntry` per stick block the score gather
+    /// reads, in the Kᵀ plane's own block numbering.
+    pub const KT_BLOCK_IDS: u32 = 1;
+    /// The V plane's block-entry table — the V plane's own block numbering.
+    pub const V_BLOCK_IDS: u32 = 2;
+    /// Q's row-repetition table — torch's `rep_row_ids` values, one Q row index per
+    /// `[BATCH, GQA]` entry of the pre-repeated frame the decode kernel's score dot pairs
+    /// with the gathered blocks.
+    pub const REP_ROW_IDS: u32 = 3;
+}
+
+impl PagedKvPool {
+    /// ⭐ THE 64-SLOT WINDOWS ONE KV HEAD'S PAGE HOLDS — the pool's own stick geometry, the `W4`
+    /// every spliced attention kernel's window loop walks. Read off the plane's own two sizes,
+    /// never spelled as 4: the ONE derivation the index entry's block term and the fillers'
+    /// extent arithmetic share.
+    pub fn windows_per_page(&self) -> Option<u32> {
+        u32::try_from(self.plane_block_elems() / self.stick_block_elems().max(1)).ok()
+    }
+
+    /// ⭐ WHICH 64-SLOT STICK BLOCK OF A PAGE'S PLANE a (kv head, window) is — the term that rides
+    /// in the gather INDEX ENTRY rather than in any base offset, because one entry serves every
+    /// head and window of a trip.
+    ///
+    /// Kᵗ and V agree on this number: Kᵗ's window `b` of head `kvh` is at
+    /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block,
+    /// which is why one index value serves both planes' tables. `None` when the head or window is
+    /// outside the page's own geometry — a block the pool does not hold.
+    pub fn block_in_page(&self, kvh: u32, window: u32) -> Option<u32> {
+        let per_plane = self.windows_per_page()?;
+        (kvh < self.nkvh as u32 && window < per_plane).then_some(kvh * per_plane + window)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE REGION THE ONE-SEQUENCE STEP INPUTS STATE — the page-major extent the one-shot
+/// prefill kernel walks and the paged-fold family's per-pass shift crosses, as ONE value minted
+/// from the placement's own byte extent.
+///
+/// The one-shot kernel (`batched_prefill_hm`) and the fold family (`paged_fold`) state the SAME
+/// region and the SAME pitch — one id stick per mask row, the padded form that lets the fold's
+/// single per-pass Activation delta walk the tables and the mask by one number — so ONE staged
+/// buffer serves whichever body the selector runs, and this type IS that agreement. `mq` is the
+/// rung's own query-row width ([`RungWidth`]); `gqa` comes from the wiring's geometry
+/// (`nqh / nkvh`), the one fact [`PagedKvPool`] does not carry.
+///
+/// ⛔ MINTED FROM THE MASK SLOT'S OWN EXTENT, never from a page count a caller computed: the
+/// placement states the ladder's declared region (every rung of a chunked ladder states the same
+/// one), and a region re-derived from the live context is a second derivation of a bake fact. A
+/// non-divisor refuses: a mask extent that is not a whole number of `W4·mq`-row page blocks is a
+/// bake/stage disagreement, not a rounding decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplicedAttnRegion {
+    pages: u32,
+    mq: NonZeroU32,
+    gqa: NonZeroU32,
+    pool: PagedKvPool,
+}
+
+impl SplicedAttnRegion {
+    /// ONE door — the MASK slot's placement extent in bytes, the pool, the GQA group, and the
+    /// rung's query-row width. `None` when the extent is not a whole number of page blocks at
+    /// this geometry, or the pool's stick geometry does not divide.
+    pub fn of_mask_extent(
+        extent_bytes: u64,
+        pool: PagedKvPool,
+        gqa: NonZeroU32,
+        mq: RungWidth,
+    ) -> Option<Self> {
+        let w4 = pool.windows_per_page()?;
+        // One page block of the mask: `W4 * mq` rows of 64 f16 lanes.
+        let block = u64::from(w4) * mq.count() as u64 * 64 * 2;
+        if block == 0 || extent_bytes % block != 0 {
+            return None;
+        }
+        let pages = u32::try_from(extent_bytes / block).ok()?;
+        (pages > 0).then_some(SplicedAttnRegion {
+            pages,
+            mq: mq.rows(),
+            gqa,
+            pool,
+        })
+    }
+
+    /// The region's page count — the extent both id tables and the mask state.
+    pub const fn pages(self) -> u32 {
+        self.pages
+    }
+
+    /// The rung's query-row width the region is padded to.
+    pub const fn mq(self) -> NonZeroU32 {
+        self.mq
+    }
+
+    /// The 64-slot windows one kv head's page holds.
+    pub fn w4(self) -> u32 {
+        self.pool.windows_per_page().unwrap_or(0)
+    }
+
+    /// The id stick's width — every kv head's block in one window, named once per GQA group.
+    pub fn ktb(self) -> Option<u32> {
+        self.pool
+            .nkvh
+            .checked_mul(self.gqa.get() as usize)
+            .and_then(|k| u32::try_from(k).ok())
+    }
+
+    /// The id sticks one page block of the table states — one per mask row, the padded pitch law.
+    pub fn sticks_per_page(self) -> u32 {
+        self.w4() * self.mq.get()
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE BLOCK-ENTRY TABLE — the index values in the KERNEL'S OWN READ
+/// ORDER: page-major over the region at the MASK'S OWN PITCH (one id stick per mask row —
+/// `W4·mq` sticks per page block, the first `W4` meaningful, the tail unread padding),
+/// window-major within a page, (kv head, group)-major within a window, the GQA replication
+/// riding the VALUES. Every value is minted through [`GatherEntry::of_page_block`] with the
+/// block the POOL's own door names — the same composition the door-era tables use, so the bake's
+/// entry ceiling bounds these values too.
+///
+/// `map` is the sequence's logical→physical page map — the very map the launch installed, so the
+/// table the card reads and the map the cache write used are one derivation. A region longer
+/// than the map repeats the map's OWN last page (never 0, which is a real address, and never
+/// another sequence's); the mask silences the repeat. The PAD sticks past each page's first `W4`
+/// carry the page's last window's entries, so every staged entry names a written, in-pool block.
+///
+/// `None` on an empty map (no page to name) or an entry the ceiling refuses — never a zero
+/// table, because zero is block 0, a REAL address.
+pub fn spliced_attn_ids_table(
+    region: SplicedAttnRegion,
+    map: &[i64],
+    ceiling: GatherEntryCeiling,
+) -> Option<Vec<GatherEntry>> {
+    let last = *map.last()?;
+    let ktb = region.ktb()?;
+    let w4 = region.w4();
+    let mut out =
+        Vec::with_capacity(region.pages() as usize * region.sticks_per_page() as usize * ktb as usize);
+    for s in 0..region.pages() {
+        let phys = map.get(s as usize).copied().unwrap_or(last);
+        for k in 0..region.sticks_per_page() {
+            // The first W4 sticks are the page's own windows; the pad tail repeats the last one,
+            // so a pad entry is an in-pool written block rather than a hole the geometry left.
+            let window = k.min(w4 - 1);
+            for b in 0..ktb {
+                let kvh = b / region.gqa.get();
+                let block = region.pool.block_in_page(kvh, window)?;
+                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16,
+/// window-major within each page, row `(s·W4 + w)·mq + t`: `0.0` where slot
+/// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the finite −65504 sentinel (the
+/// format's own max, the kernels' clamp trick — a masked-everywhere row still normalizes with
+/// weight 0, never NaN) where it is not.
+///
+/// The validity law is the CHUNK's own ([`ChunkRows::row_logical_pos`]): row `t` of a chunk whose
+/// `real` genuine tokens sit at absolute positions `[start, start+real)` attends exactly the
+/// slots `≤ start + row_logical_pos(t, real)` — the causal triangle with the pad-row clamp. At
+/// `real == 1` (the fold's single decode row, `start` the write position) that is the decode law
+/// `slot ≤ start`, with the new token's own key VALID: the spliced bodies gather the whole
+/// history through the table, so unlike the door-era chunk there is no separately-read new block.
+pub fn spliced_attn_mask_f16(
+    region: SplicedAttnRegion,
+    rows: ChunkRows,
+    start: usize,
+    real: usize,
+) -> Option<Vec<u8>> {
+    if real == 0 || real > region.mq.get() as usize {
+        return None;
+    }
+    let w4 = region.w4() as usize;
+    if w4 == 0 {
+        return None;
+    }
+    let mq = region.mq.get() as usize;
+    let page_slots = PagedKvPool::PAGE_SLOTS;
+    let total = region.pages() as usize * w4 * mq;
+    let neg = half::f16::MIN.to_le_bytes();
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    let mut m = Vec::with_capacity(total * 64 * 2);
+    for r in 0..total {
+        // Row r is `(s·W4 + w)·mq + t` — the kernel's own load corner, decomposed once here.
+        let s = r / (w4 * mq);
+        let rem = r % (w4 * mq);
+        let (w, t) = (rem / mq, rem % mq);
+        let pos = start + rows.row_logical_pos(t, real);
+        let slot_base = s * page_slots + w * 64;
+        for c in 0..64 {
+            let bytes = if slot_base + c <= pos { &zero } else { &neg };
+            m.extend_from_slice(bytes);
+        }
+    }
+    Some(m)
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE FAMILY'S STEP-INPUT FACTS — what `batched_decode_hm` stated, as
+/// ONE value minted from the placements' own extents. The entry count is the vendor's index
+/// stick ([`CopyDims::ENTRIES_PER_OP`], the SenUint32 law), split into `BLOCKS_PER_CHUNK`
+/// chunk-slots per sequence; the chunk count is the KT ids slot's own extent divided by one
+/// chunk's table, so a bake/host disagreement about the chunking refuses here rather than
+/// staging real block numbers from the wrong layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplicedDecodeBatch {
+    pool: PagedKvPool,
+    gqa: NonZeroU32,
+    num_seqs: NonZeroU32,
+    chunks: u32,
+}
+
+impl SplicedDecodeBatch {
+    /// ONE door — the KT ids slot's placement extent in bytes, the pool, the GQA group, and the
+    /// launch's row count. `None` when the entry stick does not split evenly over the sequences
+    /// (a batch width this family does not state), or the extent is not a whole number of chunk
+    /// tables.
+    pub fn of_ids_extent(
+        extent_bytes: u64,
+        pool: PagedKvPool,
+        gqa: NonZeroU32,
+        num_seqs: NonZeroU32,
+    ) -> Option<Self> {
+        let entries = CopyDims::ENTRIES_PER_OP;
+        if !entries.is_multiple_of(num_seqs.get()) {
+            return None;
+        }
+        let w4 = pool.windows_per_page()?;
+        let ktb = entries.checked_mul(pool.nkvh as u32)?;
+        let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
+        if per_chunk == 0 || extent_bytes % per_chunk != 0 {
+            return None;
+        }
+        let chunks = u32::try_from(extent_bytes / per_chunk).ok()?;
+        (chunks > 0).then_some(SplicedDecodeBatch {
+            pool,
+            gqa,
+            num_seqs,
+            chunks,
+        })
+    }
+
+    /// The chunk count the ids tables state.
+    pub const fn chunks(self) -> u32 {
+        self.chunks
+    }
+
+    /// The launch's row count — every sequence of the rung, padding rows included.
+    pub const fn num_seqs(self) -> NonZeroU32 {
+        self.num_seqs
+    }
+
+    fn entries(self) -> u32 {
+        CopyDims::ENTRIES_PER_OP
+    }
+
+    /// The chunk-slots one sequence holds per chunk — `ENTRIES / num_seqs`.
+    pub fn blocks_per_chunk(self) -> u32 {
+        self.entries() / self.num_seqs.get()
+    }
+
+    fn ktb(self) -> u32 {
+        self.entries() * self.pool.nkvh as u32
+    }
+
+    fn w4(self) -> u32 {
+        self.pool.windows_per_page().unwrap_or(0)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE BLOCK-ENTRY TABLE — the index values in `batched_decode_hm`'s
+/// own read order: `[NUM_CHUNKS·W4·ENTRIES·NKVH]`, chunk-major, window-major within a chunk,
+/// entry-major within a window (entry `j·B + s`, then kv head). Stick `(c·W4 + w)`'s entry
+/// `(e, kvh)` names sequence `s`'s logical page `c·BLOCKS_PER_CHUNK + j` at the kv head's own
+/// block of that window.
+///
+/// `maps` is one page map per LAUNCH ROW in slot order — padding rows carry live 0's, the same
+/// maps the launch installed. A row's map shorter than the chunk count repeats its own last page
+/// (masked; never 0, which is a real address). `None` on a map count that is not the launch's
+/// row count, an empty map, or an entry the ceiling refuses.
+pub fn spliced_decode_ids_table(
+    batch: SplicedDecodeBatch,
+    maps: &[Vec<i64>],
+    ceiling: GatherEntryCeiling,
+) -> Option<Vec<GatherEntry>> {
+    if maps.len() != batch.num_seqs.get() as usize {
+        return None;
+    }
+    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
+    let nkvh = batch.pool.nkvh as u32;
+    let seqs = batch.num_seqs.get();
+    let mut out =
+        Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
+    for c in 0..batch.chunks() {
+        for w in 0..w4 {
+            for b in 0..ktb {
+                // Entry b is (entry e, kv head) — entry-major, then kv head, the stick's own order.
+                let (e, kvh) = (b / nkvh, b % nkvh);
+                let (j, s) = (e / seqs, e % seqs);
+                let map = maps.get(s as usize)?;
+                let phys = map
+                    .get((c * bpc + j) as usize)
+                    .copied()
+                    .or_else(|| map.last().copied())?;
+                let block = batch.pool.block_in_page(kvh, w)?;
+                out.push(GatherEntry::of_page_block(ceiling, phys, block)?);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE REPETITION TABLE — torch's own `rep_row_ids` values at the
+/// kernel's wire width: entry `(b, g)` of the `[BATCH·GQA]` frame names the Q row the
+/// pre-repeated buffer's row held, `(j·B+s)·NKVH·GQA + kvh·GQA + g → s·NKVH·GQA + kvh·GQA + g`.
+/// The entry order is the score tile's own — (chunk slot, sequence, kv head, group) — so the
+/// gather the kernel states pairs each score row with its request's query row.
+pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
+    let (ktb, gqa) = (batch.ktb(), batch.gqa.get());
+    let (nkvh, seqs) = (batch.pool.nkvh as u32, batch.num_seqs.get());
+    let mut out = Vec::with_capacity(ktb as usize * gqa as usize);
+    for b in 0..ktb {
+        let (e, kvh) = (b / nkvh, b % nkvh);
+        let (_, s) = (e / seqs, e % seqs);
+        for g in 0..gqa {
+            let row = (s * nkvh + kvh) * gqa + g;
+            out.push(row as i32);
+        }
+    }
+    out
+}
+
+/// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE ADDITIVE MASK — `[NUM_CHUNKS·W4·BATCH·GQA, 64]` f16,
+/// PRE-REPLICATED xGQA to the score tile's own rows (the kernel adds it as a pure flat reshape,
+/// no broadcast): row `(c·W4 + w)·BATCH·GQA + b·GQA + g`, lane `cc`, is `0.0` where logical slot
+/// `(c·BPC + j)·PAGE_SLOTS + w·64 + cc` holds row `s`'s own key, the −65504 sentinel elsewhere.
+///
+/// `hists` is one history per LAUNCH ROW in slot order (padding rows carry live 0's), and
+/// `write` is the batch's ONE shared write slot — every row's new key lands there this step, in
+/// its own page, so the slot is valid for every row that reads it back. `None` on a history
+/// count that is not the launch's row count.
+pub fn spliced_decode_mask_f16(
+    batch: SplicedDecodeBatch,
+    hists: &[KvHistory],
+    write: BatchSlot,
+) -> Option<Vec<u8>> {
+    if hists.len() != batch.num_seqs.get() as usize {
+        return None;
+    }
+    let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
+    if w4 == 0 {
+        return None;
+    }
+    let (gqa, nkvh, seqs) = (
+        batch.gqa.get(),
+        batch.pool.nkvh as u32,
+        batch.num_seqs.get(),
+    );
+    let page_slots = PagedKvPool::PAGE_SLOTS;
+    let neg = half::f16::MIN.to_le_bytes();
+    let zero = half::f16::from_f32(0.0).to_le_bytes();
+    let rows = batch.chunks() as usize * w4 as usize * ktb as usize * gqa as usize;
+    let mut m = Vec::with_capacity(rows * 64 * 2);
+    for c in 0..batch.chunks() {
+        for w in 0..w4 {
+            for b in 0..ktb {
+                // Entry b is (entry e, kv head); entry e is (chunk slot j, sequence s) — the
+                // stick's own order, decomposed once for the history and the logical page both.
+                let (e, _) = (b / nkvh, b % nkvh);
+                let (j, s) = (e / seqs, e % seqs);
+                let hist = &hists[s as usize];
+                // The g-lanes are pre-replicated — identical bytes per group — so the loop
+                // states the tile's own row count, not new facts.
+                for _g in 0..gqa {
+                    let slot_base = (c * bpc + j) as usize * page_slots + w as usize * 64;
+                    for cc in 0..64 {
+                        let slot = slot_base + cc;
+                        let bytes = if hist.contains(slot) || slot == write.get() as usize {
+                            &zero
+                        } else {
+                            &neg
+                        };
+                        m.extend_from_slice(bytes);
+                    }
+                }
+            }
+        }
+    }
+    Some(m)
 }
 
 #[cfg(kani)]

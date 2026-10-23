@@ -1748,6 +1748,21 @@ impl Executor {
         self.bound.insert(b.id, b.bytes);
     }
 
+    /// ⭐ THE PLACEMENT EXTENT of step-input `slot`, in bytes — the QUERY half of the fill
+    /// contract. The caller sizes its bytes against the artifact's own answer (the discovery
+    /// table's tid, resolved through the placement the placement pass sized from the program's
+    /// own view), and [`Self::fill_step_input`]'s `==` law re-measures the same number at the
+    /// door — so a derivation that disagrees with the bake refuses twice, at both ends.
+    ///
+    /// `None` when this bundle DECLARES no such slot — the caller's query-then-fill gate, so an
+    /// undeclared slot is a quiet skip and not a refusal the caller re-derives around — or when
+    /// the table names a tid this bundle never placed (a bake desync, which the fill would
+    /// refuse anyway; seeing it here names it earlier).
+    pub fn step_input_extent(&self, slot: u32) -> Option<u64> {
+        let si = self.code.layout.step_inputs.iter().find(|s| s.slot == slot)?;
+        Some(self.code.layout.place_of_tid(si.tid)?.size)
+    }
+
     /// ⭐⭐⭐⭐⭐ FILL ONE HOST-STAGED STEP INPUT — the runtime's staging half of the per-step
     /// inputs a spliced program binds past the graph.
     ///
