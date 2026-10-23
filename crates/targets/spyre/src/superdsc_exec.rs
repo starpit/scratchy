@@ -7203,7 +7203,9 @@ mod tests {
     /// Two steps on ONE image key: the first derives, the second hits the cache —
     /// and the hit arm must COUNT it. The cadence line's "% from cached" read 0.0
     /// forever because it didn't: 256 replayed steps off 4 derivations
-    /// printed "0.0% from cached" on a live card.
+    /// printed "0.0% from cached" on a live card. The key's width axis is pinned
+    /// here too: a prefill chunk (width > 1) must never replay a decode image,
+    /// because the canvas renders under live binds that differ by width.
     #[test]
     fn replay_image_cache_counts_its_hits() {
         let (hits, derives) = {
@@ -7232,6 +7234,13 @@ mod tests {
         assert!(
             cache.lookup_cached(&key).is_some(),
             "the second step on the same key must hit the cache"
+        );
+        let mut prefill_key = key.clone();
+        prefill_key.width = 2;
+        assert!(
+            cache.lookup_cached(&prefill_key).is_none(),
+            "a width-2 chunk must not replay the width-1 image: the canvas renders under \
+             live binds, which differ between a 1-row step and an mq-row chunk"
         );
         let t = timers();
         assert_eq!(t.replay_hits, hits + 1, "the hit arm counted it");
