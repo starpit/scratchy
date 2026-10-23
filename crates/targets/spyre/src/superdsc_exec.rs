@@ -919,6 +919,10 @@ pub struct Executor {
     fold: SessionKv,
     /// Has a caller installed a REAL page map (vs the create-time identity default)?
     block_table_set: bool,
+    /// LEG-1(c) under `segaddr`: the last `[cachewr]` line this session printed, as its dedupe
+    /// key (write slot + distinct target pages). The rolled body launches once per LAYER, so an
+    /// undeduped line would print 40× per forward; the page targeting is a per-STEP fact.
+    cachewr_seen: Option<(i64, Vec<i64>)>,
 
     prepared: bool,
     staged_host: bool,
@@ -1104,6 +1108,7 @@ impl Executor {
             kv: KvGeometry::default(),
             fold: SessionKv::default(),
             block_table_set: false,
+            cachewr_seen: None,
             prepared: false,
             staged_host: false,
             n_weights_staged: 0,
@@ -1393,6 +1398,22 @@ impl Executor {
         let ident: Vec<i64> = (0..self.kv.pool_pages.0).collect();
         self.install_page_map(RowIdx::from_launch_row(0), SeqPos(0), &ident);
         self.block_table_set = false;
+        // LEG-1(b) under `segaddr`: this session's POOL placements — every seg2 offset the bundle
+        // baked, one line, one write (the tensordump only watches the ones its one-page shadow
+        // covers, so which page the rest sit on is exactly what this line settles). Once per
+        // session by construction: the identity install above is the create-time path.
+        if Diag::get().segaddr {
+            use std::fmt::Write as _;
+            let mut ps = String::new();
+            let mut n = 0u32;
+            for (id, p) in &self.places {
+                if p.segment as usize == SEG_KV.get() && p.bank == 0 && p.size > 0 {
+                    let _ = write!(ps, " {id}@{}+{}", p.offset, p.size);
+                    n += 1;
+                }
+            }
+            eprintln!("[poolplaces] fp={} n={n} placements:{ps}", self.code.fp);
+        }
         debug!(
             "[sdsc-superdsc] PAGED KV: page={} slots, page_stride={} B, pool={} pages ({:.1} MB) \
              => {} positions of context available to one request",
@@ -3239,6 +3260,68 @@ impl Executor {
         r
     }
 
+    /// LEG-1(c): the `[cachewr]` line — the first slot-write op's aim ingredients plus the
+    /// DISTINCT target pages of every slot-write in the rung, with the write-request's own
+    /// block-table row. `None` when the rung has no cache write or its page sweep is refused
+    /// (the walk's own refusal follows). The aim is the SAME `fold_plan::seg_deltas` the walk
+    /// calls, never a re-derivation.
+    fn cachewr_aim_line(
+        &self,
+        ops: &Ops,
+        where_: &LaunchWhere,
+        byte_off: [u64; NUM_SEGMENTS],
+        n_fold_pages: i64,
+    ) -> Option<((i64, Vec<i64>), String)> {
+        let op0 = ops.iter().find(|o| o.kv.slot_write)?;
+        let per = fold_plan::UniformPages::sweeping(n_fold_pages, &self.fold)?;
+        let launch = SlotPos::of_launch(where_.slot_pos.0);
+        let stride = self.fold.page_stride_bytes.0;
+        let mut pages: Vec<i64> = Vec::new();
+        let mut first = String::new();
+        for op in ops.iter().filter(|o| o.kv.slot_write) {
+            let Some(delta) =
+                fold_plan::seg_deltas(&op.kv, &self.fold, 0, per, launch, where_.kv_page_base)
+                    .deltas()
+            else {
+                continue;
+            };
+            let abs = byte_off[SEG_KV.get()] + where_.kv_page_base.0 + delta.kv.0;
+            let pg = if stride > 0 { (abs / stride) as i64 } else { -1 };
+            if !pages.contains(&pg) {
+                pages.push(pg);
+            }
+            if first.is_empty() {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    first,
+                    "op {} ({}): delta_kv={} byte_off_kv={} abs_in_seg={} page={pg}",
+                    op.index,
+                    op.label(),
+                    delta.kv.0,
+                    byte_off[SEG_KV.get()],
+                    abs
+                );
+            }
+        }
+        if first.is_empty() {
+            return None;
+        }
+        let row = self
+            .fold
+            .block_tables
+            .get(op0.kv.request as usize)
+            .cloned()
+            .unwrap_or_default();
+        let text = format!(
+            "[cachewr] slot_pos={} kv_page_base={} page_stride={} row_pages={row:?} \
+             distinct_target_pages={pages:?} first: {first}",
+            where_.slot_pos.0,
+            where_.kv_page_base.0,
+            stride
+        );
+        Some(((where_.slot_pos.0, pages), text))
+    }
+
     fn launch_ops_inner(&mut self, ops: &Ops, where_: LaunchWhere, d: &Diag) -> Result<()> {
         // `slot_pos`/`kv_page_base`/`weight_bank` are read only inside
         // `cb_plan::launch_site`, through `where_` — nothing else in the walk uses them.
@@ -3247,6 +3330,21 @@ impl Executor {
             n_fold_pages,
             ..
         } = where_;
+        // LEG-1(c) under `segaddr`: where this rung's cache writes AIM — one line per step (the
+        // rolled body re-launches per layer, so the line is keyed on the write slot + the DISTINCT
+        // target pages and only prints when that key moves). The aim is the SAME `seg_deltas` the
+        // walk calls, never a re-derivation: the page each slot-write lands in is
+        // `(byte_off_kv + kv_page_base + delta.kv) / page_stride` — the in-segment offset divided
+        // by the bytes-per-page the session declared.
+        if d.segaddr {
+            if let Some((key, text)) = self.cachewr_aim_line(ops, &where_, byte_off, n_fold_pages)
+            {
+                if self.cachewr_seen.as_ref() != Some(&key) {
+                    self.cachewr_seen = Some(key);
+                    eprintln!("{text}");
+                }
+            }
+        }
         // 🛑 THE DRAIN AT THE START IS WHAT MAKES THE LADDER MEAN ANYTHING. A launch is async and
         // the stream is in-order, so at any moment the device is a whole layer behind the host.
         // Timing from an un-drained start measures `backlog + ops[0..j]`, and the backlog shrinks by
@@ -5569,6 +5667,27 @@ impl Executor {
     /// The RULE (slot 0 retires the last forward's rows, so the inferred fold width is this
     /// forward's and not a high-water mark) lives on [`SessionKv`], which owns the state.
     fn install_page_map(&mut self, req: RowIdx, pos: SeqPos, pages: &[i64]) {
+        // LEG-1(a) under `segaddr`: the page assignment each request actually runs with — one
+        // line, one write. `real` separates a `set_block_table` install from the create-time
+        // identity default (which is every page, so long lists print as a range, not 545 numbers).
+        if Diag::get().segaddr {
+            let shown = if pages.len() > 16 {
+                format!(
+                    "n={} [{:?}..{}]",
+                    pages.len(),
+                    &pages[..4],
+                    pages[pages.len() - 1]
+                )
+            } else {
+                format!("{pages:?}")
+            };
+            eprintln!(
+                "[pageassign] req={} pos={} real={} pages={shown}",
+                req.get(),
+                pos.0,
+                self.block_table_set
+            );
+        }
         self.fold.install_row(req, SlotPos::of_launch(pos.0), pages);
     }
 
