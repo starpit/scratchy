@@ -216,8 +216,8 @@ fn the_all_nan_sentinel_clamps_onto_the_pad_row() {
     // an ordered max nor satisfies an ordered equality -- so the one-hot lands on the pad
     // lanes and the staged sentinel tables answer the two-level PAD_V + 4160.
     let pad_v = f.int("PAD_V").expect("PAD_V is recorded") as usize;
-    let nb = f.int("NB").expect("NB is recorded");
-    let block = f.int("BLOCK").expect("BLOCK is recorded");
+    let nb = f.int("NB").expect("NB is recorded") as usize;
+    let block = f.int("BLOCK").expect("BLOCK is recorded") as usize;
     let v = f.int("V").expect("V is recorded") as usize;
     let logits = bindings
         .iter_mut()
