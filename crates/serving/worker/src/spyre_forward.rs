@@ -980,7 +980,7 @@ pub(crate) fn fill_attn_step_inputs(
     rows: AttnStepRows<'_>,
 ) -> ExecutorResult<()> {
     use scratchy_subtile::sdsc_abstract::attn_step_slots;
-    let sd = scratchy_subtile::sdsc_abstract;
+    use scratchy_subtile::sdsc_abstract as sd;
     // ⭐ THE GEOMETRY'S ONE DERIVATION ON THIS SIDE: `gqa = nqh / nkvh` — the wiring's head count
     // over the pool's, the fact `PagedKvPool` cannot state alone. A quotient of zero or a
     // non-divisor is a wiring/pool disagreement about the model, not a default to spell.
