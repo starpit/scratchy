@@ -1907,7 +1907,8 @@ pub(crate) fn superdsc_forward_chunk(
     }
     match picked {
         Some(tok) => Ok(ChunkOut::Picked(tok)),
-        None => Err(werr(        "decode: the index-result rung ran no step — the n=0 entry refusal was bypassed"
+        None => Err(werr(
+            "decode: the index-result rung ran no step — the n=0 entry refusal was bypassed"
                 .to_string(),
         )),
     }
@@ -2694,11 +2695,16 @@ pub(crate) fn run_request_step(
                                 },
                                 ctx,
                                 pool,
+                                0,
                             )? {
                                 ChunkOut::Picked(tok) => tok,
-                                // The re-pick is itself a solo k=1 step, and a solo
-                                // step now runs as ONE DEVICE WINDOW — the window's
-                                // single committed token is the pick, same contract.
+                                // The re-pick runs window=0, exactly like every solo
+                                // k=1 step — `step_window_for` declines a window at
+                                // n <= 1 (one committed token buys nothing from the
+                                // window machinery), so the pick arrives as `Picked`.
+                                // The `Window` arm is the enum's own: it cannot fire
+                                // at window=0, and if a future windowing ever rides
+                                // the re-pick, ids[0] is still the pick.
                                 ChunkOut::Window(ids) => ids[0],
                                 ChunkOut::Rows(_) => {
                                     return Err(werr(
