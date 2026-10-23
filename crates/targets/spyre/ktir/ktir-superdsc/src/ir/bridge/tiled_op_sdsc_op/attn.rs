@@ -612,6 +612,12 @@ impl ScoreArm {
 /// role type the claim is carried by the call: the fold site passes [`Self::FoldsOntoSeed`] and there is no
 /// way for it to seed by getting a boolean backwards. That matters most for the DEEPEST row, which has the
 /// most passes to lose, and losing them looks exactly like the card's remaining failure.
+///
+/// ⭐⭐ AND SINCE THE DOORS, THE SEQUENCE IS TYPED TOO. The core below is reachable only through
+/// [`assemble_attn_seed_block`] / [`assemble_attn_fold_block`]: the seed door is the only minter of
+/// [`SeededCarry`] and the fold door requires one, so a fold emitted before any seed — the per-CALL
+/// role this enum fixes, silently wrong per-SEQUENCE — does not compile. This enum survives as the
+/// core's private branch selector; the doors own the law.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockSeed {
     /// This block writes `run_m`/`run_l`/`run_o` directly — the batched-decode new-token block, whose
@@ -625,6 +631,52 @@ impl BlockSeed {
     /// The one predicate the emission body asks. Named so `if seed.seeds()` reads as the question it is.
     pub const fn seeds(self) -> bool {
         matches!(self, BlockSeed::SeedsState)
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ PROOF THE ONLINE-SOFTMAX STATE WAS SEEDED — the seed→body→finalize chain's own token,
+/// carrying the two state names the hand-off reads.
+///
+/// The carry round-trips through device memory BETWEEN launches: the new-token block seeds
+/// `run_m`/`run_l`/`run_o`, every prefix/window fold and the chunk body fold onto it, and the finalize
+/// divides by `run_l`. Program order = call order is law, but nothing typed the ORDER — the
+/// producer/consumer lock (`check_internal_buffers_are_read_where_written`) proves every internal
+/// read lies inside some WRITTEN interval over the whole op list, which a seed emitted AFTER the fold
+/// it should precede still passes. This token is that sequence, as a type: [`assemble_attn_seed_block`]
+/// and `assemble_new_block_chunk` are the only minters, [`assemble_attn_fold_block`], the chunk body
+/// and the LX probability walk require the token, and the finalize's `realdiv` reads its operands off
+/// it — a fold or divide emitted before any seed does not compile.
+///
+/// **The max is deliberately absent.** The hand-off reads exactly the denominator and the accumulator;
+/// `m` is the recurrence's own internal, consumed by the folds, never read at the finalize. A finalize
+/// dividing by the running MAX — the same-typed-swap class — has no spelling: the type does not carry
+/// it. (The seed-safety theorem that makes `l` non-zero — the first window's valid-lane count ≥ 1 over
+/// `real: NonZeroU32` — is stated on `ValidityMask` in `sdsc_abstract`.)
+#[derive(Clone, Debug)]
+struct SeededCarry {
+    l: String,
+    o: String,
+}
+
+impl SeededCarry {
+    /// The one mint: the state the hand-off reads, copied from the block's own buffers at the seed
+    /// door. `BlockBufs` is frozen after its construction, so the copy cannot drift from the name the
+    /// seed ops wrote; one derivation (`syn(R::RunL)`/`syn(R::RunO)`), one frozen holder beside it.
+    fn mint(bufs: &BlockBufs) -> SeededCarry {
+        SeededCarry {
+            l: bufs.run_l.clone(),
+            o: bufs.run_o.clone(),
+        }
+    }
+
+    /// The finalize's denominator — the seed-written `l`.
+    fn l(&self) -> &str {
+        &self.l
+    }
+
+    /// The finalize's numerator — the seed-written accumulator.
+    fn o(&self) -> &str {
+        &self.o
     }
 }
 
@@ -825,6 +877,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the failure it produces is not a fault: a fold pass that seeds RESETS `run_m`/`run_l`/`run_o`
     // mid-accumulation, discarding every page folded before it — so the row with the MOST passes loses the
     // most, which is the deepest-row signature the card shows.
+    //
+    // DOOR-PRIVATE: callers reach this core only through `assemble_attn_seed_block` /
+    // `assemble_attn_fold_block`, which fix the role AND carry the sequence proof (`SeededCarry`) — the
+    // role value below is the doors' decision restated for the branch sites, never a caller's choice.
     seed: BlockSeed,
     batched: Option<BatchedKv>,
     // WHICH shared-kernel bmm form this bundle's batched score/value matmuls declare — named ONCE
@@ -1962,6 +2018,134 @@ impl ChunkBufs {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE SEED DOOR — the block emitter's seed role, and the ONLY spelling (with
+/// `assemble_new_block_chunk`) that mints a [`SeededCarry`]. Same parameters as the core, the role
+/// fixed; the mint happens after the core returns, from the same `bufs` the seed ops wrote.
+#[allow(clippy::too_many_arguments)]
+fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ops: &mut Vec<EmittedOp>,
+    t: u32,
+    tag: &str,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    mq: crate::sdsc_abstract::QueryRowCount,
+    rows: BlockRows,
+    qs: &str,
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    kt_kernel: &str,
+    kt_stride: crate::sdsc_abstract::KtKernelPitch,
+    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    v_kernel: &str,
+    v_stride: crate::sdsc_abstract::VKernelRows,
+    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    width: crate::sdsc_abstract::BlockCols,
+    mask: &str,
+    mask_off: crate::addr::DevOff,
+    mask_bcast: bool,
+    batched: Option<BatchedKv>,
+    bmm_form: SharedKernelBmmForm,
+    req: u32,
+    request_axis: Option<GatheredFold>,
+    bufs: &BlockBufs,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<SeededCarry, SuperDscError> {
+    assemble_attn_block(
+        ops,
+        t,
+        tag,
+        geom,
+        mq,
+        rows,
+        qs,
+        score_form,
+        kt_kernel,
+        kt_stride,
+        kt_off_fn,
+        v_kernel,
+        v_stride,
+        v_off_fn,
+        width,
+        mask,
+        mask_off,
+        mask_bcast,
+        BlockSeed::SeedsState,
+        batched,
+        bmm_form,
+        req,
+        request_axis,
+        bufs,
+        sym_id_base,
+        layout,
+    )?;
+    Ok(SeededCarry::mint(bufs))
+}
+
+/// ⭐⭐⭐⭐⭐ THE FOLD DOOR — the block emitter's fold role, REQUIRING the proof the seed door mints.
+/// The `carry` parameter sits exactly where the role `bool` once did: the slot that decides what this
+/// block does to the running state now carries the evidence the state exists. A fold emitted before
+/// any seed does not compile — there is no `SeededCarry` in scope to hand it. The token is returned
+/// unchanged (the names it carries are the buffers' own, reused in place by every fold); the chain
+/// continues to the next fold or the finalize.
+#[allow(clippy::too_many_arguments)]
+fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
+    ops: &mut Vec<EmittedOp>,
+    t: u32,
+    tag: &str,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    mq: crate::sdsc_abstract::QueryRowCount,
+    rows: BlockRows,
+    qs: &str,
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    kt_kernel: &str,
+    kt_stride: crate::sdsc_abstract::KtKernelPitch,
+    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    v_kernel: &str,
+    v_stride: crate::sdsc_abstract::VKernelRows,
+    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    width: crate::sdsc_abstract::BlockCols,
+    mask: &str,
+    mask_off: crate::addr::DevOff,
+    mask_bcast: bool,
+    carry: SeededCarry,
+    batched: Option<BatchedKv>,
+    bmm_form: SharedKernelBmmForm,
+    req: u32,
+    request_axis: Option<GatheredFold>,
+    bufs: &BlockBufs,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<SeededCarry, SuperDscError> {
+    assemble_attn_block(
+        ops,
+        t,
+        tag,
+        geom,
+        mq,
+        rows,
+        qs,
+        score_form,
+        kt_kernel,
+        kt_stride,
+        kt_off_fn,
+        v_kernel,
+        v_stride,
+        v_off_fn,
+        width,
+        mask,
+        mask_off,
+        mask_bcast,
+        BlockSeed::FoldsOntoSeed,
+        batched,
+        bmm_form,
+        req,
+        request_axis,
+        bufs,
+        sym_id_base,
+        layout,
+    )?;
+    Ok(carry)
+}
+
 /// The re-laid query block and the `[hd, hd]` identity its stick copies read.
 struct QGroupBufs {
     block: String,
@@ -2204,7 +2388,7 @@ fn assemble_new_block_chunk(
     a: NewChunkAttn<'_>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+) -> Result<SeededCarry, SuperDscError> {
     let NewChunkAttn {
         t,
         nqh,
@@ -2380,7 +2564,11 @@ fn assemble_new_block_chunk(
             ));
         }
     }
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+    no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+    // The seed mint — one of the two spellings that produce a `SeededCarry`: this function's
+    // `ncbmax`/`ncbsum` and value matmuls wrote the carry on every path (no early return precedes
+    // them), so the folds and the finalize below can require the proof.
+    Ok(SeededCarry::mint(bufs))
 }
 
 /// The per-core LX a prompt chunk's two core-local probability scratches (`cesub`, `cexp`) may pin together:
@@ -2541,9 +2729,12 @@ pub fn chunk_prob_pins(
 fn assemble_attn_chunk(
     ops: &mut Vec<EmittedOp>,
     a: ChunkAttn<'_>,
+    // The proof the new-block chunk seeded the carry this body folds onto — required, returned: the
+    // chain continues to the finalize.
+    carry: SeededCarry,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+) -> Result<SeededCarry, SuperDscError> {
     let ChunkAttn {
         t,
         nqh,
@@ -3010,7 +3201,7 @@ fn assemble_attn_chunk(
     // A prompt chunk keeps its probabilities in LX (the caller pins `cexp` by the same condition); decode —
     // one request, or a batch chunk whose `mq` rows are separate requests — keeps the form below.
     if mq > 1 && matches!(history, ChunkHistory::Shared) {
-        prompt_probabilities_in_lx(
+        let carry = prompt_probabilities_in_lx(
             ops,
             PromptProbs {
                 t,
@@ -3023,10 +3214,12 @@ fn assemble_attn_chunk(
                 bufs,
                 cb,
             },
+            carry,
             sym_id_base,
             layout,
         )?;
-        return no_chunk_op_is_time_tiled(&ops[first_op..], t);
+        no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+        return Ok(carry);
     }
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
     //
@@ -3301,7 +3494,8 @@ fn assemble_attn_chunk(
         sym_id_base,
         layout,
     ));
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)
+    no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+    Ok(carry)
 }
 
 /// A prompt chunk's probability phase's operands — see [`prompt_probabilities_in_lx`].
@@ -3338,9 +3532,12 @@ struct PromptProbs<'a> {
 fn prompt_probabilities_in_lx(
     ops: &mut Vec<EmittedOp>,
     a: PromptProbs<'_>,
+    // The proof the carry is seeded — this walk's `ocorr` reads the PRE-update `run_o`, so it is a
+    // body program of the chain, not a seed.
+    carry: SeededCarry,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<(), SuperDscError> {
+) -> Result<SeededCarry, SuperDscError> {
     let PromptProbs {
         t,
         hd,
@@ -3562,7 +3759,7 @@ fn prompt_probabilities_in_lx(
         sym_id_base,
         layout,
     ));
-    Ok(())
+    Ok(carry)
 }
 
 /// ⛔⛔⛔ NO SPLIT-KV CHUNK OP IS TIME-TILED — a bake refusal naming each op that is, never a card run.
@@ -4217,7 +4414,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // other launch keeps the sub-blocks below, byte for byte. The same law (`NewBlockForm::of`) tells the
     // host how to lay out the causal mask this reads.
     let new_form = crate::sdsc_abstract::NewBlockForm::of(mq, hd, rows_are_requests);
-    if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
+    // ⭐⭐⭐⭐⭐ THE CHAIN'S FIRST LINK, AS A VALUE: whichever form seeds the new-token block mints the
+    // `SeededCarry` every fold below and the finalize at the end require — the chunk form in its own
+    // emitter, the sub-block form at window 0 of each pass. A fold emitted before this line does not
+    // compile; the sequence law this file used to state in prose ("never `first` now") is the
+    // threading.
+    let mut carry: SeededCarry = if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
         let (sc, esub, exp) = (
             syn(R::NewChunkSc),
             syn(R::NewChunkESub),
@@ -4283,42 +4485,27 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             },
             sym_id_base,
             layout,
-        )?;
-    }
-    // The sub-blocked passes: none when the chunk form above emitted the block.
-    let sub_block_passes = if new_form == crate::sdsc_abstract::NewBlockForm::Chunk {
-        0
-    } else if per_req {
-        mq
+        )?
     } else {
-        1
-    };
-    for r in 0..sub_block_passes {
-        for rw in mq_pad_t.row_windows() {
-            let j = rw.index();
-            assemble_attn_block(
-                &mut ops,
-                t,
-                &{
+        // The sub-blocked passes: the chunk form emitted its block (and minted the carry) in the arm
+        // above; every other launch runs one pass per request row, or one, and window 0 of each pass
+        // seeds.
+        let sub_block_passes = if per_req { mq } else { 1 };
+        let mut seeded: Option<SeededCarry> = None;
+        for r in 0..sub_block_passes {
+            for rw in mq_pad_t.row_windows() {
+                let j = rw.index();
+                // The tag, the two off-closures and the mask corner are hoisted so the seed and fold
+                // doors below share them — the same values one statement earlier, no emission change.
+                let tag = {
                     let b = if nsub.is_single() {
                         "n".to_string()
                     } else {
                         format!("n{j}")
                     };
                     if per_req { format!("{b}_r{r}") } else { b }
-                },
-                geom,
-                width.mq(),
-                block_rows,
-                qs,
-                score_form,
-                // Sub-block `j` is the 64-column window at plane `j*hd*stick` — the same read the prefix blocks
-                // do into `kct` (`b*hd*stick`), with the Kᵗ scratch's SLOT extent as the full kernel width: this
-                // slot is the kernel's physical pitch (the resident block's value here is `cap`), a SLOT question
-                // — the row count answered it only through the new-block identity `rows == slots`.
-                &new_kt,
-                mq_pad_t.slots().kernel_row_pitch(),
-                |h, sl| {
+                };
+                let kt_off = |h, sl| {
                     let hi = h.get();
                     // `new_kt` is nkvh separate `[hd, mq_pad]` blocks — a block index over the block's own
                     // footprint, plus this row window's slot-stick plane inside it (the MqPad rows/slots
@@ -4337,23 +4524,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .slab(rw.index())
                         .slab_of::<crate::addr::Feat>(sl)
                         .dev()
-                },
-                // new_v is nkvh-wide now too (dedup, symmetric to new_kt above) — same gqa_kv_head mapping.
-                // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed `mq_pad`
-                // version that regressed decode). Unlike `new_kt` (restickified into a COMPACT
-                // `[nkvh,hd,mq_pad]` layout, where `kvh*hd*mq_pad` IS the right compact per-head base),
-                // `new_v_rep` is never restickified: it keeps the wide `[*, nkvh*hd]` shape whose kv-head
-                // stride RoPE sets to `mq` (`rope_prefill_block_offset`), not `mq_pad`. Decode (mq=1) reduces
-                // to the original `kvh*hd`; prefill (mq=31) gets the `kvh*31*hd` the original bare `kvh*hd`
-                // was missing for kvh>=1.
-                // V rows `[j*stick, (j+1)*stick)` on top of the kv-head base — the prefix side's `b*stick*hd`.
-                new_v,
-                // The wide stream's own per-head slice, declared `HD` rows — the door that names
-                // this fact, where a bare `u32` let the head dim stand in a plane-rows slot. The
-                // const, not the runtime `hd`: this call sits inside `assemble_attn`'s own
-                // geometry threading, so the door takes the same const the ladder carries.
-                crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
-                |h, sl| {
+                };
+                let v_off = |h, sl| {
                     let hi = h.get();
                     // `new_v_rep` keeps the wide `[mq, nkvh*hd]` shape RoPE packed, so the kv head is a
                     // COLUMN there, not a block; the row window `j` rides on top.
@@ -4366,21 +4538,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .at(Idx::<Head>::n(kvh))
                         .slab(sl)
                         .dev()
-                },
-                // This block's score WIDTH: one row window's columns — quantity (3) as columns (each padded
-                // row is one score column), NOT the lane count it shares a value with. The full `mq_pad`
-                // width lives on the kernel's stride, never in this slot.
-                BlockCols::of_row_window(RowWindow::ROWS),
-                // cmask is staged BLOCK-MAJOR: `nsub` blocks of `[rows, stick]`, block `j` holding columns
-                // `[j*stick, (j+1)*stick)`. Required because the mask is read through a FLAT view whose row
-                // stride IS `width` (`In::sliced`), so a `[rows, mq_pad]` row-major staging would step 64 where
-                // the row pitch is `mq_pad`. At nsub==1 this offset is 0 and the staging is unchanged.
-                // cmask is staged BLOCK-MAJOR (see above): `nsub` blocks of `[rows, stick]`. The outer axis
-                // of this nest IS that block index; `feat == stick`, so the corner is `j*rows*stick`.
-                cmask,
+                };
                 // The staging's row axis is the shared-buffer extent — the same MaskRows the ops sweep; its
                 // block width is one row window's SCORE columns, the same quantity the width slot carries.
-                Nest::new(
+                let mask_off = Nest::new(
                     &["row", "head", "feat"],
                     &[
                         rows.get(),
@@ -4391,32 +4552,124 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 )
                 .view()
                 .at(Idx::<Head>::n(j))
-                .dev(),
-                false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
-                // Sub-block 0 SEEDS the online softmax; later sub-blocks fold, exactly like the prefix blocks.
-                // The new-token block SEEDS, but only on its first sub-block: later sub-blocks of the same block
-                // fold onto that seed. `j == 0` was the boolean; the role says which of the two it means.
-                if j == 0 {
-                    BlockSeed::SeedsState
-                } else {
-                    BlockSeed::FoldsOntoSeed
-                },
-                batched_new,
-                bmm_form,
-                r,
+                .dev();
+                // The shared-arg laws, stated once for both doors (the seed arm and the fold arm take
+                // exactly these values):
+                //
+                // new_v is nkvh-wide now too (dedup, symmetric to new_kt above) — same gqa_kv_head mapping.
+                // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed `mq_pad`
+                // version that regressed decode). Unlike `new_kt` (restickified into a COMPACT
+                // `[nkvh,hd,mq_pad]` layout, where `kvh*hd*mq_pad` IS the right compact per-head base),
+                // `new_v_rep` is never restickified: it keeps the wide `[*, nkvh*hd]` shape whose kv-head
+                // stride RoPE sets to `mq` (`rope_prefill_block_offset`), not `mq_pad`. Decode (mq=1) reduces
+                // to the original `kvh*hd`; prefill (mq=31) gets the `kvh*31*hd` the original bare `kvh*hd`
+                // was missing for kvh>=1.
+                // V rows `[j*stick, (j+1)*stick)` on top of the kv-head base — the prefix side's `b*stick*hd`.
+                //
+                // The wide stream's own per-head slice, declared `HD` rows — the door that names
+                // this fact, where a bare `u32` let the head dim stand in a plane-rows slot. The
+                // const, not the runtime `hd`: this call sits inside `assemble_attn`'s own
+                // geometry threading, so the door takes the same const the ladder carries.
+                //
+                // This block's score WIDTH: one row window's columns — quantity (3) as columns (each padded
+                // row is one score column), NOT the lane count it shares a value with. The full `mq_pad`
+                // width lives on the kernel's stride, never in this slot.
+                //
+                // cmask is staged BLOCK-MAJOR: `nsub` blocks of `[rows, stick]`, block `j` holding columns
+                // `[j*stick, (j+1)*stick)`. Required because the mask is read through a FLAT view whose row
+                // stride IS `width` (`In::sliced`), so a `[rows, mq_pad]` row-major staging would step 64 where
+                // the row pitch is `mq_pad`. At nsub==1 this offset is 0 and the staging is unchanged.
+                // cmask is staged BLOCK-MAJOR (see above): `nsub` blocks of `[rows, stick]`. The outer axis
+                // of this nest IS that block index; `feat == stick`, so the corner is `j*rows*stick`.
+                //
                 // THE NEW-TOKEN BLOCK IS NOT FOLDED, so there is nothing to collapse: it runs once inside the
                 // body's own launch and its K/V come from this step's `new_kt`/`new_v`, which are indexed by
                 // row, not by pool block. A request axis here would step a page stride through a buffer that
                 // has none.
-                None,
-                &bufs,
-                sym_id_base,
-                layout,
-            )?;
+                //
+                // ⭐⭐⭐⭐⭐ SUB-BLOCK 0 SEEDS THE ONLINE SOFTMAX; later sub-blocks fold, exactly like the
+                // prefix blocks — and the doors carry that as the chain: the seed door MINTS the
+                // [`SeededCarry`], the fold door REQUIRES it. `j == 0` was once a boolean, then a
+                // `BlockSeed` value the call site chose; now it is WHICH DOOR the call goes through,
+                // and a fold emitted before any seed does not compile. `row_windows()` starts at 0
+                // by its own law, so the seed arm always fires first and the fold arm's refusal is
+                // the desync guard, not a path.
+                let block_carry = if j == 0 {
+                    assemble_attn_seed_block(
+                        &mut ops,
+                        t,
+                        &tag,
+                        geom,
+                        width.mq(),
+                        block_rows,
+                        qs,
+                        score_form,
+                        &new_kt,
+                        mq_pad_t.slots().kernel_row_pitch(),
+                        kt_off,
+                        new_v,
+                        crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
+                        v_off,
+                        BlockCols::of_row_window(RowWindow::ROWS),
+                        cmask,
+                        mask_off,
+                        false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
+                        batched_new,
+                        bmm_form,
+                        r,
+                        None,
+                        &bufs,
+                        sym_id_base,
+                        layout,
+                    )?
+                } else {
+                    assemble_attn_fold_block(
+                        &mut ops,
+                        t,
+                        &tag,
+                        geom,
+                        width.mq(),
+                        block_rows,
+                        qs,
+                        score_form,
+                        &new_kt,
+                        mq_pad_t.slots().kernel_row_pitch(),
+                        kt_off,
+                        new_v,
+                        crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
+                        v_off,
+                        BlockCols::of_row_window(RowWindow::ROWS),
+                        cmask,
+                        mask_off,
+                        false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
+                        seeded.take().ok_or_else(|| {
+                            SuperDscError(format!(
+                                "attention o{t}: sub-block {j} folds before any window seeded the \
+                                 carry — row windows must start at 0"
+                            ))
+                        })?,
+                        batched_new,
+                        bmm_form,
+                        r,
+                        None,
+                        &bufs,
+                        sym_id_base,
+                        layout,
+                    )?
+                };
+                seeded = Some(block_carry);
+            }
         }
-    }
+        seeded.ok_or_else(|| {
+            SuperDscError(format!(
+                "attention o{t}: the new-token block emitted no seed (sub_block_passes=\
+                 {sub_block_passes}) — the finalize would divide by an unwritten l"
+            ))
+        })?
+    };
     // ── PREFIX blocks: nb stick-wide blocks over the resident cache, pmask sliced per block, folded
-    //    on top of the new-block seed above (never `first` now). `vc` read maps query head h to its
+    //    on top of the new-block seed above — through the fold door, which cannot be called without
+    //    the carry that seed minted (the old prose "never `first` now", as the type). `vc` read maps query head h to its
     //    REPRESENTATIVE query head qh=kvh*gqa (V dedup — `vc` stays nqh-SIZED, unlike `kct`'s compact
     //    nkvh storage, so this is qh*cap*hd, NOT the kct-style compact kvh*hd*cap
     //    `gqa_dedup_kv_kernel_base` gives). Matches cachewr_v's own now-representative-slot-only
@@ -4650,7 +4903,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             ChunkHistory::Shared
         };
-        assemble_attn_chunk(
+        // The carry goes IN and comes back: the chunk body folds onto the seed the new-block
+        // half minted, and the chain continues to the finalize.
+        carry = assemble_attn_chunk(
             &mut ops,
             ChunkAttn {
                 t,
@@ -4669,6 +4924,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bufs: &bufs,
                 cb: &cb,
             },
+            carry,
             sym_id_base,
             layout,
         )?;
@@ -4931,7 +5187,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 mask_shape.slab_elems(0, 1).elems(),
             );
         }
-        assemble_attn_block(
+        // ⭐ THE PREFIX FOLD FOLDS THROUGH THE DOOR — the carry the new-block half minted goes in
+        // and comes back, so the sequence law ("never `first` now") is the type, not the prose: a
+        // seeding fold pass would reset the running state mid-accumulation and cost the deepest row
+        // every page it had already folded.
+        carry = assemble_attn_fold_block(
             &mut ops,
             t,
             &format!("p{b}"),
@@ -5048,10 +5308,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .dev()
             },
             !rows_are_requests, // broadcast for a prompt; per-row when the rows are requests
-            // ⭐ THE FOLD NEVER SEEDS — the claim this file made in prose ("never `first` now"), now carried
-            // by the call. A seeding fold pass would reset the running state mid-accumulation and cost the
-            // deepest row every page it had already folded.
-            BlockSeed::FoldsOntoSeed,
+            // The proof the state was seeded — the token the new-block half minted. This call site
+            // no longer chooses a role at all: the door IS the fold.
+            carry,
             batched_prefix,
             bmm_form,
             0,
@@ -5175,9 +5434,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
                     // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
                     // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
-                    // mint's bound is flat).
-                    In::full(&fl(&bufs.run_o, rows.get(), hd)).ew(),
-                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
+                    // mint's bound is flat). ⭐ AND THE OPERANDS COME FROM THE CARRY TOKEN — the
+                    // chain the seed door minted ends here, at the divide it exists for.
+                    In::full(&fl(carry.o(), rows.get(), hd)).ew(),
+                    In::col(&hm_rows(carry.l(), rows.get())).ew(),
                 ],
                 &fl(out, rows.get(), hd),
                 crate::addr::DevOff::ZERO,
@@ -5196,11 +5456,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     BlockCols::of_head_dim(hd),
                     &[
                         In::sliced(
-                            &fl(&bufs.run_o, rows.get(), hd),
+                            &fl(carry.o(), rows.get(), hd),
                             nests.token_stream(hi, 0).off(),
                         )
                         .ew(),
-                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
+                        In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, 0).off(),
@@ -5235,8 +5495,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 RowCount::of_mask_rows(rows),
                 BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                 &[
-                    In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(0, s)).ew(),
-                    In::col(&hm_rows(&bufs.run_l, rows.get())).ew(),
+                    In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(0, s)).ew(),
+                    In::col(&hm_rows(carry.l(), rows.get())).ew(),
                 ],
                 &fl(out, rows.get(), hd),
                 nests.head_major(0, s),
@@ -5298,8 +5558,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     RowCount::of_query_rows(width.mq()),
                     BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                     &[
-                        In::sliced(&fl(&bufs.run_o, rows.get(), hd), nests.head_major(hi, s)).ew(),
-                        In::col_at(&hm_rows(&bufs.run_l, rows.get()), nests.head_major(hi, 0)).ew(),
+                        In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s)).ew(),
+                        In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
                     &rb(out, mq, nqh * hd),
                     nests.token_stream(hi, s).off(),
