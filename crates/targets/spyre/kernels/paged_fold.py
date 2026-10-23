@@ -52,8 +52,16 @@ launch-side arithmetic is single-sourced there):
     itself stays at `[B, MQ, 64]`, where the `[1, MQ, 64]` mask broadcast
     is the row-split mode the door admits), every reduce over the last
     axis landing `[B*MQ, 1]` with no lens, `p` lent back to
-    `[B, MQ, 64]` for the score dot, and `acc` kept FLAT `[B*MQ, HD]`
-    throughout. At MQ == 1 the frame is byte-identical to the b833dd2f2e
+    `[B, MQ, 64]` for the score dot, and the FMA run at the batched
+    spelling with the rescale lent to `[B, MQ, 1]` — the broadcast's
+    own proof: a rank-2 Col spray from a COMPUTED source states no
+    vector fact (the door admits an `expand_shape`'s degenerate dim or
+    a one-column LOAD, and `rescale` is exp2's result), while the
+    rank-3 flat form's count proof — one source element per result
+    row — is exactly the fact the accumulator frame states (MEASURED,
+    wall 20, build 11: the rank-2 spelling was refused at that proof).
+    `acc` lands FLAT `[B*MQ, HD]` at the store (the admitted flat
+    identity). At MQ == 1 the frame is byte-identical to the b833dd2f2e
     `[BATCH, MQ]` law (`MQ_PAD` was 64 then, so `[32, 1]` at
     `strides [64, 1]` either way — the card-proven decode family is
     untouched); this law lifts that guarantee to every MQ by MOVING the
@@ -198,9 +206,10 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
     q = tl.reshape(q_desc.load([0, 0]), [BATCH, MQ, HD])
     m = m_desc.load([0, 0])                             # [B*MQ, 1]
     l = l_desc.load([0, 0])                             # [B*MQ, 1]
-    # acc stays FLAT [B*MQ, HD]: the rescale is a per-row scalar now, so
-    # nothing needs the rank-3 spelling and the store needs no reshape.
-    acc = acc_desc.load([0, 0])                         # [B*MQ, HD]
+    # acc rides the BATCHED spelling inside the loop — the FMA's rescale
+    # broadcast is provable only in the rank-3 frame (the FMA's own
+    # comment states the law) — and lands flat at the store.
+    acc = tl.reshape(acc_desc.load([0, 0]), [BATCH, MQ, HD])
 
     for w in tl.static_range(W4):
         # The block gathers: one stick block per index entry, both planes,
@@ -232,15 +241,23 @@ def paged_fold_hm(desc_q, desc_m, desc_l, desc_acc,  #
         p = tl.math.exp2(qk_f - m_new[:, :, None]).to(tl.float16)
         l = l * rescale + tl.sum(p, 2)                   # [B*MQ, 1]
         # p lent back to the batched spelling for the score dot (a flat
-        # identity again); pv lent flat on the way out, onto the flat acc.
+        # identity again). ⭐ THE FMA'S RESCALE BROADCAST IS PROVABLE ONLY
+        # IN THE RANK-3 FRAME: a rank-2 Col spray ([B*MQ, HD] times
+        # [B*MQ, 1]) from a COMPUTED source states no vector fact — the
+        # door admits an expand_shape's degenerate dim or a one-column
+        # LOAD, and rescale is exp2's result — so the rescale is lent to
+        # [B, MQ, 1], the rank-3 flat form whose count proof (one source
+        # element per result row) is exactly the accumulator frame's own
+        # fact. MEASURED, wall 20, build 11: the rank-2 spelling was
+        # refused at exactly that proof.
         pv = tl.dot(tl.reshape(p, [BATCH, MQ, 64]), v_blk,
                     out_dtype=tl.float16)                # [B, MQ, HD]
-        acc = acc * rescale + tl.reshape(pv, [BATCH * MQ, HD])
+        acc = acc * tl.reshape(rescale, [BATCH, MQ, 1]) + pv
         m = m_new
 
     m_desc.store([0, 0], m)
     l_desc.store([0, 0], l)
-    acc_desc.store([0, 0], acc)
+    acc_desc.store([0, 0], tl.reshape(acc, [BATCH * MQ, HD]))
 
 
 @triton.jit
