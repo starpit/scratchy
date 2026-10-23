@@ -222,6 +222,13 @@ struct StepImage {
 struct StepImageKey {
     sel: BodySel,
     n_fold_pages: i64,
+    /// The launch's new-token count — 1 for a decode step, the rung width
+    /// for a prefill chunk (#603 PR4, the prefill half of the CB replay).
+    /// The canvas is rendered under the LIVE bind state at derivation, and a
+    /// width-`mq` chunk's binds (mq-row activations) are not a width-1
+    /// step's: without this field the first-derived image of a
+    /// (sel, page count, signature) would be replayed for the other shape.
+    width: i64,
     /// The fold state the canvas was rendered under: the geometry and
     /// request count, plus row 0's first `n_fold_pages` page ids. Those ids
     /// are the ONE fold mutation that can invalidate an image: append-only
@@ -1133,10 +1140,11 @@ pub struct Executor {
     dump: Option<TensorDump>,
 
     // ── #603 PR2 2c — the replay player ──
-    /// Cached step images, keyed by (body, resident page count, fold shape) —
-    /// [`StepImageKey`]. EMPTY until the first eligible decode step derives
-    /// one; every batched or instrumented step takes the walk instead, so
-    /// nothing here is consulted (or populated) off the player's own path.
+    /// Cached step images, keyed by (body, resident page count, fold shape,
+    /// launch width) — [`StepImageKey`]. EMPTY until the first eligible step
+    /// derives one — a decode step or a prefill chunk (#603 PR4); every
+    /// batched or instrumented step takes the walk instead, so nothing here
+    /// is consulted (or populated) off the player's own path.
     step_images: StepImageCache,
 
     // ── #603 PR3b — the k-step decode window ──
@@ -4649,17 +4657,20 @@ impl Executor {
         }
         let t1 = Instant::now();
 
-        // ⭐ #603 PR2 2c — a ONE-TOKEN step on a quiet diag replays from a cached image
-        // (canvas copy + patches + ONE doorbell); everything else takes the walk.
-        // `n_new == 1` is the step's own shape, not a toggle: a chunked-prefill step
-        // (n_new > 1) sweeps a fresh page count per chunk and would pay a derivation
-        // per chunk — PR4's rungs, not the player's. `try_replay_forward` states its
-        // own other refusals (batched fold, instruments) and hands back `None` for
-        // the walk.
+        // ⭐ #603 PR2 2c + PR4 — a quiet-diag step replays from a cached image
+        // (canvas copy + patches + ONE doorbell); everything else takes the
+        // walk. The image key carries the launch's WIDTH, so a prefill chunk
+        // (n_new > 1) is the player's too: each (body, page count, fold
+        // shape, width) derives once and every later chunk of that shape —
+        // in this prompt or any later one — replays it. The first chunk of
+        // each shape pays the derivation (the old reason this gate refused
+        // n_new > 1); the cache amortizes it across the process, exactly as
+        // the decode images do across steps. `try_replay_forward` states its
+        // own other refusals (batched fold, instruments, page boundary,
+        // underivable width) and hands back `None` for the walk.
         // The player's images all carry the suffix, so a forward that skips it takes the walk.
-        let replayed = n_new.0 == 1
-            && suffix == SuffixLaunch::Launched
-            && self.try_replay_forward(seq_pos)?.is_some();
+        let replayed =
+            suffix == SuffixLaunch::Launched && self.try_replay_forward(n_new, seq_pos)?.is_some();
         if !replayed {
             self.launch_forward(seq_pos, suffix)?;
         }
@@ -5159,7 +5170,7 @@ impl Executor {
         // (3) The forward — the same replay-or-walk decision the k=1 step takes. A
         // window step is one token by definition (the engine's k positions arrive as
         // k one-token steps), so the replay gate is exactly forward_half's own.
-        let cbs_this = match self.try_replay_forward(seq_pos)? {
+        let cbs_this = match self.try_replay_forward(NewTokens(1), seq_pos)? {
             Some(n) => n,
             None => {
                 // A window step is a decode step by definition — the suffix runs
@@ -5585,15 +5596,18 @@ impl Executor {
     /// fires once per page): a BATCHED step (two or more requests installed —
     /// PR4's images), any Diag instrument on ([`Diag::is_quiet`] — each one
     /// reads walk state), a page boundary (slot 0 of a new page — a
-    /// write-base move, not a patchable one), or a page no canvas slot or
-    /// off-sample room fits. There is no third path and no toggle: the
+    /// write-base move, not a patchable one), a page no canvas slot or
+    /// off-sample room fits, or — prefill only — a width whose image cannot
+    /// be derived (the off-sample proof refused; the prepare gate proves
+    /// width 1, so a wider shape that moves non-affinely walks, loudly on
+    /// the debug line). There is no third path and no toggle: the
     /// production configuration (quiet diag, one request) is the player,
     /// minus one step per page.
     ///
     /// `Ok(Some(n))` carries the image's CB count — the per-step number the
     /// decode window's outstanding-CB budget (#603 PR3b §4.7) is pinned
     /// against; the k=1 path ignores it.
-    fn try_replay_forward(&mut self, seq_pos: SeqPos) -> Result<Option<usize>> {
+    fn try_replay_forward(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<Option<usize>> {
         if !Diag::get().is_quiet() || fold_plan::fold_requests(&self.fold) != 1 {
             return Ok(None);
         }
@@ -5646,13 +5660,32 @@ impl Executor {
         let key = StepImageKey {
             sel,
             n_fold_pages: n,
+            width: n_new.0,
             signature: fold_signature(&self.fold, n),
         };
         let image = match self.step_images.lookup_cached(&key) {
             Some(hit) => hit,
             None => {
                 let t1 = Instant::now();
-                let image = self.derive_step_image(sel, n, pos_c, page_c)?;
+                // A width>1 derivation is NOT prepare-proven — the prepare
+                // gate's synthetic session walks width 1 — so a refusal here
+                // is a REGIME BOUNDARY, not a defect: the chunk takes the
+                // walk, exactly as it did before this rung existed, and the
+                // reason rides the debug line. A width-1 refusal stays
+                // fatal: prepare proved that shape, so a refusal there is a
+                // real drift and must stop the step.
+                let image = match self.derive_step_image(sel, n, pos_c, page_c) {
+                    Ok(img) => img,
+                    Err(e) if n_new.0 > 1 => {
+                        debug!(
+                            "[sdsc-replay] prefill chunk at {} (width {}) walks: no image \
+                             could be derived for this shape — {e:#}",
+                            seq_pos.0, n_new.0
+                        );
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
+                };
                 self.step_images.note_derived(key, image.clone(), t1);
                 image
             }
@@ -7173,6 +7206,7 @@ mod tests {
         let key = StepImageKey {
             sel: BodySel::RungFused(0),
             n_fold_pages: 1,
+            width: 1,
             signature: vec![7],
         };
         let dummy = StepImage {
