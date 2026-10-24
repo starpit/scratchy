@@ -5058,7 +5058,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     t,
                     tag: &tag,
                     geom,
-                    nests: BlockNests::<NQH, HD> { mq: width.mq(), rows: block_rows, req: r },
+                    nests: BlockNests::<NQH, HD> {
+                        mq: width.mq(),
+                        rows: block_rows,
+                        req: r,
+                    },
                     qs,
                     score_form,
                     width: BlockCols::of_row_window(RowWindow::ROWS),
@@ -5675,7 +5679,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 t,
                 tag: &format!("p{b}"),
                 geom,
-                nests: BlockNests::<NQH, HD> { mq: width.mq(), rows: block_rows, req: 0 },
+                nests: BlockNests::<NQH, HD> {
+                    mq: width.mq(),
+                    rows: block_rows,
+                    req: 0,
+                },
                 qs,
                 score_form,
                 // This block's score WIDTH: the slots one fold window holds — quantity (2), the reduce's
@@ -5706,7 +5714,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // closure has no parameter for. A `gather` arm here would be a base no op reads.
                     off_fn: |h, sl| {
                         use crate::sdsc_abstract::{KvCoord, KvPlane};
-                        let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        let kvh =
+                            crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
                         crate::addr::DevOff::from_view_step(
                             pool.addr(
                                 KvCoord::block(KvPlane::Kt, kvh)
@@ -5746,7 +5755,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
                     off_fn: |h, sl| {
                         use crate::sdsc_abstract::{KvCoord, KvPlane};
-                        let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        let kvh =
+                            crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
                         crate::addr::DevOff::from_view_step(
                             pool.addr(
                                 KvCoord::block(KvPlane::V, kvh)
