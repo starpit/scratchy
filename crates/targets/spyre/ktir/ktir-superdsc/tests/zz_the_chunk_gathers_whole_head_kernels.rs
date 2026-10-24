@@ -69,9 +69,8 @@ fn each_kv_head_gathers_whole_chunk_kernels_at_every_admitted_head_dim() {
 /// one-slab form; above it V reads its own run after K's, and the host stages both.
 #[test]
 fn v_reads_its_own_index_run_only_above_one_slab() {
-    let at = |hd: usize| {
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as u32, hd as u32), 4).unwrap()
-    };
+    let at =
+        |hd: usize| ChunkScratch::of_chunk(PagedKvPool::new(NKVH as u32, hd as u32), 4).unwrap();
     let one = at(64);
     assert_eq!(one.value_index_base(), 0);
     assert_eq!(one.table_sticks(), one.index_sticks());

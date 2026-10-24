@@ -65,8 +65,8 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         Rows::Prompt(n) => (attn_bundle_rows(geom, n, false), false),
     };
     let bundle_rows = bundle_rows.unwrap_or_else(|| panic!("{rows:?}: no rung"));
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
-        .expect("a chunk granite admits");
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     assemble_attn(
         0,

@@ -12470,11 +12470,7 @@ pub fn spliced_decode_mask_f16(
     if w4 == 0 {
         return None;
     }
-    let (gqa, nkvh, seqs) = (
-        batch.gqa.get(),
-        batch.pool.nkvh(),
-        batch.num_seqs.get(),
-    );
+    let (gqa, nkvh, seqs) = (batch.gqa.get(), batch.pool.nkvh(), batch.num_seqs.get());
     let page_slots = PagedKvPool::PAGE_SLOTS;
     let neg = ATTN_SEED_FLOOR.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();

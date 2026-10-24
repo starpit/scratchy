@@ -23,8 +23,7 @@ fn part_slots(pages: u32, mq: u32) -> (Vec<u32>, Vec<u32>) {
     } else {
         ChunkRowKind::Prompt
     };
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).unwrap();
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).unwrap();
     let cut = |per: u32| -> Vec<u32> {
         (0..pages.div_ceil(per))
             .map(|i| per.min(pages - i * per) * 256)

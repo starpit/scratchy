@@ -449,8 +449,8 @@ fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, se
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, D), pages)
-        .expect("a chunk granite admits");
+    let chunk =
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, D), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     let ops = assemble_attn(
         0,
