@@ -972,97 +972,172 @@ fn check_internal_buffers_are_read_where_written(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// ⭐⭐⭐⭐⭐ THE SCORE LEG'S Kᵀ OPERAND — kernel, TRUE pitch and per-head offset law as ONE fact,
+/// because the three only ever move together and a run of adjacent parameters is where they drift:
+/// the pitch is the score kernel's declared physical column count (`KtKernelPitch` has exactly two
+/// doors — the new block's slot extent and the pool page's slots — so a row count cannot reach this
+/// slot), the tensor's TRUE row stride, never a block's column `width` (a per-block column slice
+/// must not lie about the tensor's real row stride, or every row past the first addresses the wrong
+/// location once `cap>width`); and the offset law takes (query head, head-dim SLAB) because the
+/// score leg splits its CONTRACTION by slab so that it is one stick at every head dim, the slab a
+/// coordinate on the Kᵀ operand's own nest — applied inside the law, never added to a finished
+/// address by the caller.
+struct KtLeg<'a, F: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff> {
+    kernel: &'a str,
+    stride: crate::sdsc_abstract::KtKernelPitch,
+    off_fn: F,
+}
+
+/// ⭐ THE VALUE LEG'S TWIN — same triple, its own plane law: `VKernelRows` is WHICH plane the value
+/// legs read, with the gathered arm refusing every plane but the page (the K-side twin is a slot
+/// count; this sat as a bare `u32` fed the head dim at the new-block call — a head-dim fact
+/// standing in a plane-rows slot, coincident only where `hd` is one stick). The offset law is
+/// symmetric with the K-side's for the same reason: the slab is a coordinate on the V operand's
+/// own nest, applied INSIDE the law rather than added to a finished address by the caller — that
+/// addition was the last place in this file where a stride was composed by hand.
+struct VLeg<'a, F: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff> {
+    kernel: &'a str,
+    stride: crate::sdsc_abstract::VKernelRows,
+    off_fn: F,
+}
+
+/// ⭐ THE MASK READ'S OWN FACTS — which mask tensor, which corner, whether the row axis is
+/// broadcast — one fact because the three name ONE read: `bcast` is what decides whether the
+/// corner stays UNCHANGED (pmask: head/query-row independent, no per-head shift) or takes the
+/// per-head `nests.score_rows` step added on (cmask: the one-row law that shares `sc`'s own row
+/// addressing 1:1).
+struct MaskFacts<'a> {
+    mask: &'a str,
+    off: crate::addr::DevOff,
+    bcast: bool,
+}
+
+/// ⭐ THE BLOCK'S BATCHED-FORM SET — the three declarations that decide whether this block's
+/// score/value matmuls walk batched, and HOW. All three move together.
+struct BlockForms {
+    batched: Option<BatchedKv>,
+    /// WHICH shared-kernel bmm form this bundle's batched score/value matmuls declare — named ONCE
+    /// at `assemble_attn`'s boundary (`SharedKernelBmmForm::of_attn_rows`) and threaded here, so a
+    /// block cannot pick a walk law its own bundle did not.
+    bmm: SharedKernelBmmForm,
+    /// ⭐⭐⭐⭐⭐ ONE PASS FOR THE WHOLE BATCH: give the score and value legs a REQUEST axis over the
+    /// GATHERED SCRATCH, so row `h*mq+r` reads request `r`'s own page in the same launch. `Some` only for
+    /// the prefix fold of a gathered batched decode; `None` everywhere else, which emits exactly what
+    /// shipped.
+    ///
+    /// This is what turns the fold's `pages × requests` launches into `pages`. The runtime half is gated
+    /// on `OpKv::batched_requests`, and the mask's shape (`MaskBlockForm::PerPage` — one block per page,
+    /// every row valid on its own request's history) is the same decision seen from the host side. All
+    /// three move together, and the gather is the precondition for any of them: without it the axis walks
+    /// an operand with no uniform per-request pitch, which is the fluent-garbage mechanism three earlier
+    /// attempts hit.
+    ///
+    /// ⛔ THE VALUE CARRIES THE STRIDES, NOT A COUNT. It used to be `Option<u32>` — the request count —
+    /// and the strides were left to be derived from whatever extents were in scope. `RequestAxis` carries
+    /// each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
+    /// walk that would step differently.
+    request_axis: Option<GatheredFold>,
+}
+
+/// ⭐⭐⭐⭐⭐ ONE ATTENTION BLOCK'S WHOLE FACT SET — the emission context's single counterpart at the
+/// core the two doors own. Every field is a fact the block's emission reads, grouped exactly as
+/// the doors frame them: the block's identity, its bundle's geometry, its row framing
+/// ([`BlockNests`], minted by the doors), the query operand, the two matmul-leg operands
+/// ([`KtLeg`]/[`VLeg`]), the mask read ([`MaskFacts`]), the seed/fold role, the batched-form set
+/// ([`BlockForms`]), and the recurrence state's names beside the scratch. The doors —
+/// `assemble_attn_seed_block` / `assemble_attn_fold_block` — are the ONLY minters, so a block
+/// cannot be assembled from a partially-matched run of adjacent arguments: the
+/// twenty-five-parameter spelling this type deletes was exactly that hazard.
+struct BlockFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32, FK, FV>
+where
+    FK: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    FV: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+{
+    t: u32,
+    tag: &'a str,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE. This assembler takes the
+    /// SAME `AttnGeometry` its caller was instantiated at, so `nqh`/`nkvh`/`hd` are CONST GENERICS
+    /// here — a block cannot be assembled for a geometry its bundle was not: an nqh/nkvh
+    /// transposition, or a head dim paired with another model's head counts, is a type that does
+    /// not exist rather than two adjacent `u32` slots in a twenty-six-argument call. The score arm
+    /// (`ScoreArm::of_geometry`) and the kernel mints below read the consts; the value the body's
+    /// arithmetic uses is destructured ONCE at the door, exactly as `assemble_attn` does.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// The row framing — `mq`, `rows` and `req` as the one nest the body's own placement laws read
+    /// (see [`BlockNests`]'s field docs for the typed-apart extents and the row regime).
+    nests: BlockNests<NQH, HD>,
+    qs: &'a str,
+    /// ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order, the only
+    /// one whose `y` stride uses the operand's declared pitch. See `of_score_leg`.
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    /// This block's score column count, with its door naming WHICH width (one stick for every live
+    /// caller; `mq_pad` and the head dim are the other 64s it must not silently become).
+    width: crate::sdsc_abstract::BlockCols,
+    kt: KtLeg<'a, FK>,
+    v: VLeg<'a, FV>,
+    mask: MaskFacts<'a>,
+    /// ⛔⛔⛔ A ROLE, NOT A `bool`. See `BlockSeed`: the two states are "this block SEEDS the online
+    /// softmax" and "this block FOLDS onto an existing seed", and they were `true`/`false` on a parameter
+    /// eleven positions into a twenty-argument call. Inverting it does not fail to compile as a bool, and
+    /// the failure it produces is not a fault: a fold pass that seeds RESETS `run_m`/`run_l`/`run_o`
+    /// mid-accumulation, discarding every page folded before it — so the row with the MOST passes loses the
+    /// most, which is the deepest-row signature the card shows.
+    ///
+    /// DOOR-PRIVATE: callers reach this core only through `assemble_attn_seed_block` /
+    /// `assemble_attn_fold_block`, which fix the role AND carry the sequence proof (`SeededCarry`) — the
+    /// role value below is the doors' decision restated for the branch sites, never a caller's choice.
+    seed: BlockSeed,
+    forms: BlockForms,
+    /// The recurrence state's names — the allocation the doors carry (a seed door is handed it, a
+    /// fold door derives it from the proof it requires). `BlockBufs` holds the scratch only; these
+    /// three belong to the carry chain.
+    state: &'a StateNames,
+    bufs: &'a BlockBufs,
+}
+
 fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ctx: &mut EmitCtx<'_>,
-    t: u32,
-    tag: &str,
-    // ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE. This assembler takes the
-    // SAME `AttnGeometry` its caller was instantiated at, so `nqh`/`nkvh`/`hd` are CONST GENERICS
-    // here — a block cannot be assembled for a geometry its bundle was not: an nqh/nkvh
-    // transposition, or a head dim paired with another model's head counts, is a type that does
-    // not exist rather than two adjacent `u32` slots in a twenty-six-argument call. The score arm
-    // (`ScoreArm::of_geometry`) and the kernel mints below read the consts; the value the body's
-    // arithmetic uses is destructured ONCE at the door, exactly as `assemble_attn` does.
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    // The chunk's REAL query rows and the shared-buffer row extent, typed apart: `mq` and `rows`
-    // sat side by side as two `u32`s while `rows == nqh*mq` equals `mq_pad` exactly up to mq=2.
-    // `rows` also carries the ROW REGIME (see `BlockRows`): the whole-batch and per-request forms
-    // demand their own extents, so this one parameter replaces the extent + `per_request` pair that
-    // could be mismatched.
-    mq: crate::sdsc_abstract::QueryRowCount,
-    rows: BlockRows,
-    qs: &str,
-    // ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order, the only
-    // one whose `y` stride uses the operand's declared pitch. See `of_score_leg`.
-    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    kt_kernel: &str,
-    // The score kernel's declared physical column count. `KtKernelPitch` has exactly two doors — the
-    // new block's slot extent and the pool page's slots — so a row count cannot reach this slot.
-    kt_stride: crate::sdsc_abstract::KtKernelPitch,
-    // Takes (query head, head-dim SLAB), symmetric with `v_off_fn` below and for the same reason:
-    // the score leg splits its CONTRACTION by slab so that it is one stick at every head dim, and the
-    // slab is a coordinate on the Kᵀ operand's own nest — applied inside the law, never added to a
-    // finished address by the caller.
-    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    v_kernel: &str,
-    // The V kernel's own row extent — WHICH plane the value legs read, with the gathered arm
-    // refusing every plane but the page. The K-side twin (`kt_stride: KtKernelPitch`) was already
-    // typed; this sat as a bare `u32` fed the head dim at the new-block call — a head-dim fact
-    // standing in a plane-rows slot, coincident only where `hd` is one stick.
-    v_stride: crate::sdsc_abstract::VKernelRows,
-    // Takes (query head, head-dim slab): the slab is a coordinate on the V operand's own nest,
-    // so it is applied INSIDE the law rather than added to a finished address by the caller. That
-    // addition was the last place in this file where a stride was composed by hand.
-    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    // This block's score column count, with its door naming WHICH width (one stick for every live
-    // caller; `mq_pad` and the head dim are the other 64s it must not silently become).
-    width: crate::sdsc_abstract::BlockCols,
-    mask: &str,
-    mask_off: crate::addr::DevOff,
-    mask_bcast: bool,
-    // ⛔⛔⛔ A ROLE, NOT A `bool`. See `BlockSeed`: the two states are "this block SEEDS the online
-    // softmax" and "this block FOLDS onto an existing seed", and they were `true`/`false` on a parameter
-    // eleven positions into a twenty-argument call. Inverting it does not fail to compile as a bool, and
-    // the failure it produces is not a fault: a fold pass that seeds RESETS `run_m`/`run_l`/`run_o`
-    // mid-accumulation, discarding every page folded before it — so the row with the MOST passes loses the
-    // most, which is the deepest-row signature the card shows.
-    //
-    // DOOR-PRIVATE: callers reach this core only through `assemble_attn_seed_block` /
-    // `assemble_attn_fold_block`, which fix the role AND carry the sequence proof (`SeededCarry`) — the
-    // role value below is the doors' decision restated for the branch sites, never a caller's choice.
-    seed: BlockSeed,
-    batched: Option<BatchedKv>,
-    // WHICH shared-kernel bmm form this bundle's batched score/value matmuls declare — named ONCE
-    // at `assemble_attn`'s boundary (`SharedKernelBmmForm::of_attn_rows`) and threaded here, so a
-    // block cannot pick a walk law its own bundle did not.
-    bmm_form: SharedKernelBmmForm,
-    // WHICH request, when the row regime is per-request. 0 for the fold — the runtime rebases each
-    // pass, so naming one here would count it twice. The new-token block passes its own `r`.
-    req: u32,
-    // ⭐⭐⭐⭐⭐ ONE PASS FOR THE WHOLE BATCH: give the score and value legs a REQUEST axis over the
-    // GATHERED SCRATCH, so row `h*mq+r` reads request `r`'s own page in the same launch. `Some` only for
-    // the prefix fold of a gathered batched decode; `None` everywhere else, which emits exactly what
-    // shipped.
-    //
-    // This is what turns the fold's `pages × requests` launches into `pages`. The runtime half is gated
-    // on `OpKv::batched_requests`, and the mask's shape (`MaskBlockForm::PerPage` — one block per page,
-    // every row valid on its own request's history) is the same decision seen from the host side. All
-    // three move together, and the gather is the precondition for any of them: without it the axis walks
-    // an operand with no uniform per-request pitch, which is the fluent-garbage mechanism three earlier
-    // attempts hit.
-    //
-    // ⛔ THE VALUE CARRIES THE STRIDES, NOT A COUNT. It used to be `Option<u32>` — the request count —
-    // and the strides were left to be derived from whatever extents were in scope. `RequestAxis` carries
-    // each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
-    // walk that would step differently.
-    request_axis: Option<GatheredFold>,
-    // The recurrence state's names — the allocation the doors carry (a seed door is handed it, a
-    // fold door derives it from the proof it requires). `BlockBufs` holds the scratch only; these
-    // three belong to the carry chain.
-    state: &StateNames,
-    bufs: &BlockBufs,
+    facts: BlockFacts<'_, NQH, NKVH, HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
 ) -> Result<(), SuperDscError> {
+    // ⭐ THE FACT SET, DESTRUCTURED ONCE AT THE DOOR — every field restates the local the body
+    // below already reads (the same names the parameter list spelled), so the emission is the
+    // same op stream on the same values. `nests` copies out its extents below and stays whole
+    // for the body's own placement-law calls.
+    let BlockFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt: KtLeg {
+            kernel: kt_kernel,
+            stride: kt_stride,
+            off_fn: kt_off_fn,
+        },
+        v: VLeg {
+            kernel: v_kernel,
+            stride: v_stride,
+            off_fn: v_off_fn,
+        },
+        mask: MaskFacts {
+            mask,
+            off: mask_off,
+            bcast: mask_bcast,
+        },
+        seed,
+        forms: BlockForms {
+            batched,
+            bmm: bmm_form,
+            request_axis,
+        },
+        state,
+        bufs,
+    } = facts;
     // Destructured ONCE, at the door — the boundary is where the swap lived (two `u32`s in a run
     // of twenty-six); the body below is unchanged arithmetic on the same numbers, now each
     // geometry's own consts. `nkvh` no longer joins them: its last reads were the seed/fold
@@ -1073,7 +1148,9 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     let nqh_nz = std::num::NonZeroU32::new(nqh)
         .ok_or_else(|| SuperDscError("attention needs at least one query head".into()))?;
 
-    let nests = BlockNests::<NQH, HD> { mq, rows, req };
+    // The nest's extents, copied out for the arithmetic below (the carrier is `Copy` and stays
+    // whole for its own placement-law calls); `req` is read only through `nests` itself.
+    let BlockNests { mq, rows, .. } = nests;
     // The one predicate the two matmul legs branch on — derived FROM the row regime, so the
     // per-request forms and the per-request extent cannot disagree.
     let per_request = rows.per_request();
@@ -2256,30 +2333,38 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 ) -> Result<SeededCarry, SuperDscError> {
     assemble_attn_block(
         ctx,
-        t,
-        tag,
-        geom,
-        mq,
-        rows,
-        qs,
-        score_form,
-        kt_kernel,
-        kt_stride,
-        kt_off_fn,
-        v_kernel,
-        v_stride,
-        v_off_fn,
-        width,
-        mask,
-        mask_off,
-        mask_bcast,
-        BlockSeed::SeedsState,
-        batched,
-        bmm_form,
-        req,
-        request_axis,
-        state,
-        bufs,
+        BlockFacts {
+            t,
+            tag,
+            geom,
+            nests: BlockNests::<NQH, HD> { mq, rows, req },
+            qs,
+            score_form,
+            width,
+            kt: KtLeg {
+                kernel: kt_kernel,
+                stride: kt_stride,
+                off_fn: kt_off_fn,
+            },
+            v: VLeg {
+                kernel: v_kernel,
+                stride: v_stride,
+                off_fn: v_off_fn,
+            },
+            mask: MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
+            seed: BlockSeed::SeedsState,
+            forms: BlockForms {
+                batched,
+                bmm: bmm_form,
+                request_axis,
+            },
+            state,
+            bufs,
+        },
     )?;
     Ok(SeededCarry::mint(state))
 }
@@ -2333,30 +2418,38 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     };
     assemble_attn_block(
         ctx,
-        t,
-        tag,
-        geom,
-        mq,
-        rows,
-        qs,
-        score_form,
-        kt_kernel,
-        kt_stride,
-        kt_off_fn,
-        v_kernel,
-        v_stride,
-        v_off_fn,
-        width,
-        mask,
-        mask_off,
-        mask_bcast,
-        BlockSeed::FoldsOntoSeed,
-        batched,
-        bmm_form,
-        req,
-        request_axis,
-        &carry.state,
-        bufs,
+        BlockFacts {
+            t,
+            tag,
+            geom,
+            nests: BlockNests::<NQH, HD> { mq, rows, req },
+            qs,
+            score_form,
+            width,
+            kt: KtLeg {
+                kernel: kt_kernel,
+                stride: kt_stride,
+                off_fn: kt_off_fn,
+            },
+            v: VLeg {
+                kernel: v_kernel,
+                stride: v_stride,
+                off_fn: v_off_fn,
+            },
+            mask: MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
+            seed: BlockSeed::FoldsOntoSeed,
+            forms: BlockForms {
+                batched,
+                bmm: bmm_form,
+                request_axis,
+            },
+            state: &carry.state,
+            bufs,
+        },
     )?;
     Ok(carry)
 }
