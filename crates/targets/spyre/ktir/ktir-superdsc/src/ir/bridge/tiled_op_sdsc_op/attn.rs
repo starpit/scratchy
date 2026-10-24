@@ -4823,7 +4823,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             }
         }
         assemble_new_block_chunk(
-            ctx,
+            &mut ctx,
             NewChunkAttn {
                 t,
                 geom,
@@ -4957,7 +4957,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // the desync guard, not a path.
                 let block_carry = if j == 0 {
                     assemble_attn_seed_block(
-                        ctx,
+                        &mut ctx,
                         t,
                         &tag,
                         geom,
@@ -4984,7 +4984,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )?
                 } else {
                     assemble_attn_fold_block(
-                        ctx,
+                        &mut ctx,
                         t,
                         &tag,
                         geom,
@@ -5266,7 +5266,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // The carry goes IN and comes back: the chunk body folds onto the seed the new-block
         // half minted, and the chain continues to the finalize.
         carry = assemble_attn_chunk(
-            ctx,
+            &mut ctx,
             ChunkAttn {
                 t,
                 geom,
@@ -5549,7 +5549,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // seeding fold pass would reset the running state mid-accumulation and cost the deepest row
         // every page it had already folded.
         carry = assemble_attn_fold_block(
-            ctx,
+            &mut ctx,
             t,
             &format!("p{b}"),
             geom,
