@@ -1182,6 +1182,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     segment: seg,
                     offset: off,
                     size: sz,
+                    // ⭐ FULL — an identity class is a synthetic constant, bound whole at load
+                    // (`synthetic_constants`); a short bind would leave identity rows the
+                    // class-split copies read as whatever the shadow held.
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[seg] = align128(off + sz);
