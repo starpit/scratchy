@@ -2578,6 +2578,14 @@ struct NewChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     /// [`NewBlockForm::of`]: crate::sdsc_abstract::NewBlockForm::of
     mq: u32,
     cols: BlockCols,
+    /// The new block's own Kᵗ scratch's kernel pitch — minted from the pad's slot extent
+    /// ([`MqPad::slots`]'s [`SlotExtent::kernel_row_pitch`]), the door for exactly the score
+    /// kernel's `n_out` slot below. The value `cols` also carries is the SCORE WIDTH — a different
+    /// question, with no door into the kernel-pitch slot.
+    ///
+    /// [`MqPad::slots`]: crate::sdsc_abstract::MqPad::slots
+    /// [`SlotExtent::kernel_row_pitch`]: crate::sdsc_abstract::SlotExtent::kernel_row_pitch
+    kt_pitch: crate::sdsc_abstract::KtKernelPitch,
     qs: &'a str,
     new_kt: &'a str,
     new_v: &'a str,
@@ -2631,6 +2639,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         blocks,
         mq,
         cols,
+        kt_pitch,
         qs,
         new_kt,
         new_v,
@@ -2679,7 +2688,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             bmm_form,
             &q,
             q_off,
-            &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
+            &Stk::<KernelTag>::kernel(hd as usize, kt_pitch.n_out_cols(), new_kt),
             kt.block(kvh).dev(),
             &rb(sc, grp_rows, cols),
             at_pin,
@@ -2999,7 +3008,9 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     let first_op = ops.len();
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let width = BlockCols::of_chunk(chunk);
-    let slots = width.get();
+    // The gathered Kᵗ scratch's own pitch — the chunk's slots through the scratch's door, spent at
+    // the score kernel's `n_out` slot below (the same quantity `width` carries, as the score width).
+    let kt_pitch = crate::sdsc_abstract::KtKernelPitch::of_chunk_scratch(chunk);
     // ⭐ ROWS, NOT HEADS. A head's rows are `mq` consecutive positions of the head-major token stream
     // (row `h·mq + r`): one at decode, the prompt chunk's width at prefill. So kv head `kvh`'s query rows
     // are the contiguous `[kvh·gqa·mq, (kvh+1)·gqa·mq)`, and every per-head block, base and extent below
@@ -3205,7 +3216,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bmm_form,
                 &a,
                 a_off,
-                &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
+                &Stk::<KernelTag>::kernel(hd as usize, kt_pitch.n_out_cols(), &cb.gkt),
                 kc,
                 &rb(&cb.csc, blk_rows, width),
                 rc,
@@ -3226,6 +3237,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         // in LX only with its witness (`ChunkLx::keys`, a chunk with no Kᵗ tail), so every part is whole.
         for (p, part) in chunk.slot_parts(keys.part_pages()).enumerate() {
             let k_name = kt[keys.tensor(p as u32, kvh) as usize].as_str();
+            // The part's own pitch, through the part's door — the score kernel's `n_out` slot.
+            let part_pitch = crate::sdsc_abstract::KtKernelPitch::of_chunk_part(part);
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
             // The part's columns of the mask. A shared history is one broadcast row, so they start
             // `first_slot` in. A batch's per-row block is RowBlocked `[rows, slots]` like the score block it
@@ -3247,7 +3260,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bmm_form,
                 &a,
                 a_off,
-                &Stk::<KernelTag>::kernel(hd as usize, part.slots() as usize, k_name),
+                &Stk::<KernelTag>::kernel(hd as usize, part_pitch.n_out_cols(), k_name),
                 DevOff::ZERO,
                 &rb(&cb.csc, blk_rows, width),
                 pc,
@@ -4769,6 +4782,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 blocks,
                 mq,
                 cols,
+                // The new block's own Kᵗ scratch's pitch, from the pad's own door — the same mint
+                // the seed/fold emitters below take as their `kt_stride` argument.
+                kt_pitch: mq_pad_t.slots().kernel_row_pitch(),
                 qs,
                 new_kt: &new_kt,
                 new_v,

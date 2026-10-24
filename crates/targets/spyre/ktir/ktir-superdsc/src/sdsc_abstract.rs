@@ -211,11 +211,14 @@ impl SlotExtent {
 /// THE Kᵀ SCORE KERNEL'S DECLARED PHYSICAL COLUMN COUNT (`Stk::kernel`'s `n_out`) — the pitch that
 /// separates one slot-stick group of the kernel from the next.
 ///
-/// Exactly two tensors are ever the score kernel, and each is a door: the NEW block's own Kᵗ scratch
-/// ([`SlotExtent::kernel_row_pitch`] — its slot extent, `mq_pad` by the new-block identity) and the
-/// paged pool's resident Kᵀ plane ([`PagedKvPool::KT_KERNEL_PITCH`] — a page's slots). Both answers
-/// are SLOT quantities; a row count (`mq_pad` as rows, `nqh*mq`, a mask extent) has no door, so it
-/// cannot fill the kernel-pitch slot even where the values coincide.
+/// Every tensor that is ever the score kernel mints its pitch through its own door: the NEW block's
+/// own Kᵗ scratch ([`SlotExtent::kernel_row_pitch`] — its slot extent, `mq_pad` by the new-block
+/// identity), the paged pool's resident Kᵀ plane ([`PagedKvPool::KT_KERNEL_PITCH`] — a page's
+/// slots), the whole-chunk gathered Kᵗ scratch ([`Self::of_chunk_scratch`] — the chunk's slots), a
+/// core-local Kᵗ part ([`Self::of_chunk_part`] — the part's slots), and the gathered window
+/// ([`Self::of_gather_window`] — one 64-slot window). Every answer is a SLOT quantity; a row count
+/// (`mq_pad` as rows, `nqh*mq`, a mask extent) has no door, so it cannot fill the kernel-pitch slot
+/// even where the values coincide.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KtKernelPitch(u32);
 
@@ -230,6 +233,23 @@ impl KtKernelPitch {
     /// values (64, 256, and the new block's padded slots) are all plausible column counts here.
     pub const fn of_gather_window(slots: WindowSlots) -> KtKernelPitch {
         KtKernelPitch(slots.n())
+    }
+
+    /// ⭐ THE WHOLE-CHUNK GATHERED Kᵗ SCRATCH'S PITCH — the chunk's own slots
+    /// ([`ChunkScratch::slots`]), demanded by the scratch itself: the chunk's score reads its
+    /// gathered Kᵗ whole, one row block at a time, so the pitch that separates one slot-stick
+    /// group from the next is the CHUNK's extent — not a page's ([`PagedKvPool::KT_KERNEL_PITCH`])
+    /// and not a window's ([`Self::of_gather_window`]).
+    pub const fn of_chunk_scratch(chunk: ChunkScratch) -> KtKernelPitch {
+        KtKernelPitch(chunk.slots())
+    }
+
+    /// ⭐ A CORE-LOCAL Kᵗ PART'S PITCH — the part's own slots (its contraction extent), demanded
+    /// by the part itself ([`ChunkPart`]): where Kᵗ stays in LX, each part lands in its own
+    /// core-local tensor and the score op that owns it reads it whole, so the part's extent is
+    /// the pitch — never the chunk's and never a page's.
+    pub const fn of_chunk_part(part: ChunkPart) -> KtKernelPitch {
+        KtKernelPitch(part.slots())
     }
 
     /// `Stk::kernel`'s `n_out` slot — the kernel's declared physical column extent.
