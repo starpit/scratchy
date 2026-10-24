@@ -747,6 +747,69 @@ impl FinalizeCarry {
     }
 }
 
+/// The prefix mask's shape, at the constants the bundle's own carrier ([`AttnBundleRows`])
+/// mints it with — the type the sweep-law token holds.
+///
+/// [`AttnBundleRows`]: crate::sdsc_abstract::AttnBundleRows
+type PrefixMaskShapeBaked = crate::sdsc_abstract::PrefixMaskShape<
+    { crate::sdsc_abstract::POOL_STICK },
+    { crate::sdsc_abstract::PAGE_MASK_COLS },
+>;
+
+/// ⭐⭐⭐⭐⭐ THE SWEEP-LAW TOKEN — the mask door's declaration, crossed to the fold emissions as a
+/// TYPE. It carries the prefix mask's validated shape: the shape whose block a pass's sweep was
+/// proved to fit ([`PrefixMaskShape::sweep_fits`], the door's own `Err`), and whose STAGING the
+/// sweep readings guard — every row's whole sweep holds a valid lane or the staging door refuses,
+/// because the fold's rescale expunges an all-masked window only when a later max-rise raises `m`
+/// past the −65504 sentinel, so a row that sweeps nothing normalizes phantom lanes into the `l`
+/// the finalize divides by.
+///
+/// The ONE mint is [`assemble_attn`]'s mask door, immediately after the sweep-fits check. The
+/// token exists so the per-row prefix fold cannot be ADDRESSED without it: the corner that fold
+/// reads at is the token's own door ([`Self::slab_corner`]), never a shape a call site holds —
+/// the mask door consumes the shape's name, and `rows` crosses once, read off the token.
+///
+/// [`PrefixMaskShape::sweep_fits`]: crate::sdsc_abstract::PrefixMaskShape::sweep_fits
+#[derive(Clone, Copy)]
+struct SweepLaw {
+    shape: PrefixMaskShapeBaked,
+}
+
+impl SweepLaw {
+    /// The ONE mint — the mask door, immediately after `sweep_fits` accepts the sweep. Private:
+    /// no other spelling produces a law, so a fold that needs one can only be emitted in a node
+    /// whose mask shape was validated.
+    fn mint(shape: PrefixMaskShapeBaked) -> SweepLaw {
+        SweepLaw { shape }
+    }
+
+    /// The shape's rows — the door's own one read, the shared-buffer extent every op sweeps.
+    fn rows(&self) -> crate::sdsc_abstract::MaskRows {
+        self.shape.rows()
+    }
+
+    /// ⭐ THE PREFIX FOLD'S BAKED MASK CORNER at `slab` — BLOCK 0's, because the runtime's
+    /// `fold_delta` steps the mask one block per pass, so the bake names only where the FIRST
+    /// pass's window reads. The only corner door for this mask.
+    fn slab_corner(&self, slab: u32) -> crate::sdsc_abstract::MaskCorner {
+        self.shape.slab_elems(0, slab)
+    }
+}
+
+/// ⭐⭐⭐ THE FOLD'S MASK READ — which mask a pass silences lanes with, and where its read
+/// starts, as ONE value. The per-row prefix block's corner is not a number a caller composes:
+/// it is the [`SweepLaw`] token's own door, so reading that mask REQUIRES the mask door's
+/// declaration — a fold onto the per-row prefix mask cannot be emitted in a node whose shape
+/// was never validated. The nest arm is the other family — the causal block's own block-major
+/// corner, and the broadcast prefix row — whose seed-safety is the causal diagonal, not the
+/// histories.
+enum FoldMaskRead {
+    /// The per-row prefix mask, at `slab` of the block the pass reads — the corner from the law.
+    PrefixSlab { law: SweepLaw, slab: u32 },
+    /// A corner the mask's own nest states.
+    Nest(crate::addr::DevOff),
+}
+
 /// ⭐⭐⭐⭐⭐ THE PRE-UPDATE READ, AS ONE FACT — not two. `ocorr` (the OLD `run_o` times `corr`,
 /// staged in `otmp`) and the value matmuls' `stridedadd` addend are the SAME decision: a fold
 /// block makes both, a seed block neither. They used to be coupled by two separate
@@ -2202,6 +2265,10 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// unchanged (the names it carries are the buffers' own, reused in place by every fold); the chain
 /// continues to the next fold or the finalize. The core's state names come FROM the proof — a fold
 /// door needs no separate allocation parameter.
+///
+/// ⭐ AND THE MASK READ CROSSES AS ONE VALUE ([`FoldMaskRead`]): the per-row prefix arm's corner is
+/// the sweep-law token's own door, so a fold onto that mask requires the MASK DOOR's declaration
+/// too — the shape was validated, and its staging is the sweep-readings' subject.
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
@@ -2220,7 +2287,7 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
     width: crate::sdsc_abstract::BlockCols,
     mask: &str,
-    mask_off: crate::addr::DevOff,
+    mask_read: FoldMaskRead,
     mask_bcast: bool,
     carry: SeededCarry,
     batched: Option<BatchedKv>,
@@ -2231,6 +2298,15 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
+    // ⭐ THE MASK CORNER, DERIVED FROM THE READ — the per-row prefix arm's corner is the LAW's own
+    // door (that fold cannot be emitted without the mask door's declaration); the nest arm's
+    // corner is the value the mask's own layout already stated.
+    let mask_off = match mask_read {
+        FoldMaskRead::PrefixSlab { law, slab } => {
+            crate::addr::DevOff::of_mask_corner(law.slab_corner(slab))
+        }
+        FoldMaskRead::Nest(off) => off,
+    };
     assemble_attn_block(
         ops,
         t,
@@ -4169,7 +4245,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // the runtime law — this function derives no row extent of its own either way. COLS is a
     // const generic, so a block that is not whole sticks cannot be NAMED; the zero-head and
     // zero-row refusals live at the boundary's mint, not here.
-    let mask_shape = {
+    //
+    // ⭐ AND IT LEAVES THE DOOR AS THE SWEEP-LAW TOKEN ([`SweepLaw`]) — the declaration every
+    // per-row prefix fold's mask corner derives from. The door consumes the shape's name: below
+    // it, `rows` crosses once (read off the token) and no call site holds a shape to derive a
+    // corner from.
+    let law = {
         let shape = bundle_rows.mask_shape();
         let per_page = shape.cols().get();
         if !shape.sweep_fits(active_cap) {
@@ -4180,7 +4261,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 active_cap.get()
             )));
         }
-        shape
+        SweepLaw::mint(shape)
     };
     let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
     // ⭐ ONE LAW FOR THE PRODUCT, AND ONE EXIT FOR ITS VALUE. The shape's `MaskRows` is what the
@@ -4190,7 +4271,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // (`RungRowLaws::MASK_ROWS`), a prefill chunk's was the runtime law's, both upstream.
     // TYPED from here down: the value stays `MaskRows` and only the synth extents (a bare-`u32` API)
     // unwrap it.
-    let rows = mask_shape.rows();
+    let rows = law.rows();
 
     // Every buffer's spelling is a rendering of `out_id.synth(role)` — the SAME value the layout
     // allocator is keyed by, so an op's operand and its reservation have one preimage.
@@ -4790,7 +4871,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         v_off,
                         BlockCols::of_row_window(RowWindow::ROWS),
                         cmask,
-                        mask_off,
+                        // The causal block's own nest corner — this mask's seed-safety is the
+                        // causal diagonal, not the histories, so it is not a sweep-law read.
+                        FoldMaskRead::Nest(mask_off),
                         false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
                         seeded.take().ok_or_else(|| {
                             SuperDscError(format!(
@@ -5333,8 +5416,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 block_rows.extent(),
                 at(w),
                 at(w).wrapping_sub(pool.addr(kt_block)),
-                mask_shape.slab_elems(0, w.mask_slab()).elems(),
-                mask_shape.slab_elems(0, 1).elems(),
+                law.slab_corner(w.mask_slab()).elems(),
+                law.slab_corner(1).elems(),
             );
         }
         // ⭐ THE PREFIX FOLD FOLDS THROUGH THE DOOR — the carry the new-block half minted goes in
@@ -5442,20 +5525,27 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // At a decode batch of 8 it is a few MB, which is affordable — the blow-up is prefill's
             // problem and prefill does not need this.
             if rows_are_requests {
-                // ⭐ FROM THE SHARED SHAPE, not from a nest built here out of `rows` and `cap`. The
-                // worker stages this buffer from the SAME value, so the read and the write cannot
-                // describe different bytes — which they could when each side derived its own extents,
-                // and an additive mask fails silently in the dangerous direction (unstaged bytes read
-                // as 0, and 0 is VALID).
-                // The corner crosses as the typed `MaskCorner` it is, through its own `DevOff`
-                // door — a slab corner is `slab * rows * 64`, a plane term, not the single-stick
-                // view step `from_view_step` is contracted for.
-                crate::addr::DevOff::of_mask_corner(mask_shape.slab_elems(0, w.mask_slab()))
+                // ⭐ FROM THE LAW, not from a shape this call site holds — the sweep-law token is
+                // the mask door's declaration, and the per-row prefix fold's corner is its own
+                // door: this fold cannot be emitted in a node whose mask shape was never
+                // validated. The worker stages this buffer from the SAME shape, so the read and
+                // the write cannot describe different bytes — which they could when each side
+                // derived its own extents, and an additive mask fails silently in the dangerous
+                // direction (unstaged bytes read as 0, and 0 is VALID).
+                FoldMaskRead::PrefixSlab {
+                    law,
+                    slab: w.mask_slab(),
+                }
             } else {
-                Nest::new(&["row", "feat"], &[1, cap.get()], <Fp16 as DataFormat>::DF)
-                    .view()
-                    .slab(w.mask_slab())
-                    .dev()
+                // The broadcast prefix row's own nest corner — the prompt chunk's f32 family,
+                // whose first block is legally all-masked (the causal block beside it carries
+                // the row's lanes), so it is not a sweep-law read.
+                FoldMaskRead::Nest(
+                    Nest::new(&["row", "feat"], &[1, cap.get()], <Fp16 as DataFormat>::DF)
+                        .view()
+                        .slab(w.mask_slab())
+                        .dev(),
+                )
             },
             !rows_are_requests, // broadcast for a prompt; per-row when the rows are requests
             // The proof the state was seeded — the token the new-block half minted. This call site
