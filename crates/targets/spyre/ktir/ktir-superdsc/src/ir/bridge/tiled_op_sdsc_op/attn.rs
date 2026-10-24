@@ -1862,7 +1862,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // rows the match above refused everything else to obtain) is the pool's own
                         // `PAGE_SLOTS`. It used to be ONE WINDOW, which is what made the gathered
                         // geometry differ from the pool's at all.
-                        &Stk::<KernelTag>::kernel(v_rows, HD as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(
+                            v_rows,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
                         &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         rn.head_major(h0, s),
@@ -1950,7 +1954,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // `fold_request_axis_strides.rs` off the emitted per-core addresses.
                         &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width),
-                        &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(
+                            v_stride.rows() as usize,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         v_off_fn(qh0, s),
                         // ⛔ THE SAME PLACEMENT THE PER-HEAD ARM BELOW WRITES. Both arms produce this
                         // buffer, and they used to answer "where does head `h` live" differently — this
@@ -1991,7 +1999,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         bmm_form,
                         &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
-                        &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
+                        &Stk::<KernelTag>::kernel(
+                            v_stride.rows() as usize,
+                            crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                            v_kernel,
+                        ),
                         v_off_fn(qh0, s),
                         &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         nests.head_major(h0, s),
@@ -2068,7 +2080,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(expb, rows.swept(), width),
                     nests.score_rows(hi, width).off(),
-                    &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
+                    &Stk::<KernelTag>::kernel(
+                        v_stride.rows() as usize,
+                        crate::sdsc_abstract::VKernelPitch::of_head_dim(HD).n_out_cols(),
+                        v_kernel,
+                    ),
                     v_off_fn(h, s),
                     &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                     nests.head_major(hi, s),
