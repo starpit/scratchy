@@ -1077,6 +1077,27 @@ pub(crate) fn fill_attn_step_inputs(
                         mq.count()
                     ))
                 })?;
+            // ⭐ THE SEED-SAFETY READING, AT THE DOOR THAT HOLDS THE MINTED COUNTS. The mask's
+            // valid-lane counts were minted by the same loop that wrote the bytes staged below,
+            // and the chunk family's law — window (0, 0) holds a valid lane for every query row,
+            // a theorem of `real ≥ 1` and `start ≥ 0` — is READ here rather than trusted,
+            // because the failure it names is silent and later than any check: an all-masked
+            // first window read while the carry's max still sits at the −65504 seed gives
+            // `p = exp2(0) = 1` per lane — `l += 64`, the mask doing nothing. The refusal is a
+            // desync guard (this chunk's rows/start/real against the region), not a check a
+            // legal launch can trip, and it fires before any slot is staged.
+            inputs
+                .mask()
+                .first_window_valid_keys(mq.rows())
+                .filter(|v| v.get() > 0)
+                .ok_or_else(|| {
+                    werr(format!(
+                        "{what}: the chunk's first window holds no valid lane for every query \
+                         row — the seed-safety theorem (real ≥ 1, start ≥ 0 ⇒ slot 0 valid) is \
+                         broken by this chunk's rows/start/real against the region, and staging \
+                         the mask would let the fold's l count lanes the mask meant to silence"
+                    ))
+                })?;
             fill(
                 session,
                 attn_step_slots::KT_BLOCK_IDS,
@@ -1142,6 +1163,24 @@ pub(crate) fn fill_attn_step_inputs(
                     werr(format!(
                         "{what}: could not build the batch's pre-replicated validity mask — not \
                          one history per launch row"
+                    ))
+                })?;
+            // ⭐ THE SAME READING, IN THE BATCH FAMILY'S OWN SHAPE. The pre-replicated mask's
+            // first `ktb · gqa` rows are chunk 0, window 0 — EVERY sequence's first folded
+            // window — and a decode sequence's history owns its first token at logical slot 0,
+            // so the least count there is ≥ 1 for every legal batch. An empty first window for
+            // ANY sequence is an upstream desync (a request that never prefilled), refused
+            // here before any slot is staged: staged, it would silently add `exp2(0) = 1` per
+            // masked lane of that sequence's rows to their l while the carry's max still sits
+            // at the −65504 seed.
+            mask.first_window_valid_keys(batch.first_window_rows())
+                .filter(|v| v.get() > 0)
+                .ok_or_else(|| {
+                    werr(format!(
+                        "{what}: a sequence of this batch holds no valid lane in its first \
+                         folded window — every decode sequence's history owns logical slot 0, so \
+                         an empty first window is a request that never prefilled, and staging the \
+                         mask would let that sequence's l count lanes the mask meant to silence"
                     ))
                 })?;
             fill(session, attn_step_slots::KT_BLOCK_IDS, encode(&kt))?;

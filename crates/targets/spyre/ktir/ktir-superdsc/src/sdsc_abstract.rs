@@ -12128,6 +12128,21 @@ impl SplicedDecodeBatch {
         self.entries() / self.num_seqs.get()
     }
 
+    /// ⭐ THE FIRST WINDOW'S ROW COUNT, IN THE MASK'S OWN ROW ORDER — `ktb · gqa`, the rows of
+    /// chunk 0, window 0: every (sequence, kv head, group replica) exactly once, contiguous and
+    /// leading, which is what makes [`ValidityMask::first_window_valid_keys`]'s slice this
+    /// family's seed-safety reading. Stated as ONE door because the parts are the batch's own
+    /// private arithmetic — a caller re-deriving `ktb · gqa` from the pool and the group would be
+    /// a second spelling of this fact, free to disagree with the mask's row order. A product of
+    /// two non-zeros (`of_ids_extent` refuses a zero `per_chunk`, so `ktb ≥ 1`; `gqa` is
+    /// `NonZeroU32`), per the `QueryRows::total_rows` precedent.
+    pub fn first_window_rows(self) -> NonZeroU32 {
+        match NonZeroU32::new(self.ktb() * self.gqa.get()) {
+            Some(n) => n,
+            None => self.gqa, // unreachable: a product of two non-zeros
+        }
+    }
+
     fn ktb(self) -> u32 {
         self.entries() * self.pool.nkvh as u32
     }
