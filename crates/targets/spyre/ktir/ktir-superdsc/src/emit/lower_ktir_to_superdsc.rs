@@ -2843,13 +2843,16 @@ pub struct AttnOperands {
     pub new_k_id: u32,
     pub new_v_id: u32,
     /// The resident cache's structural capacity — the prefix K view's OWN row extent, which is
-    /// `ir.tensors[kv.cache_tensor()].rows`, i.e. exactly what main's call site looked up.
-    pub cap: u32,
+    /// `ir.tensors[kv.cache_tensor()].rows`, i.e. exactly what main's call site looked up. A
+    /// [`SlotCount`](crate::sdsc_abstract::SlotCount): the capacity is a number of KV slots, the
+    /// same unit the extent pair below spends it as.
+    pub cap: crate::sdsc_abstract::SlotCount,
     /// Which PARAMETER the resident K is, so the sweep check below reads the rows of that buffer
     /// without searching for it a second time.
     pub k_param: usize,
-    /// The query row count, read off `q`'s own view — not a fact the caller states.
-    pub mq: u32,
+    /// The query row count, read off `q`'s own view — not a fact the caller states. The
+    /// one-mint count the scratch doors take, so it cannot transpose against the tid fields.
+    pub mq: crate::sdsc_abstract::QueryRowCount,
 }
 
 /// [`AttnOperands`], with every position proven against the shape it must have.
@@ -2987,9 +2990,9 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
         v_id: vc.tid,
         new_k_id: new_k.tid,
         new_v_id: new_v.tid,
-        cap: kc.v_rows,
+        cap: crate::sdsc_abstract::SlotCount::new(kc.v_rows),
         k_param,
-        mq,
+        mq: crate::sdsc_abstract::QueryRowCount::of_mq(mq),
     })
 }
 
@@ -4989,11 +4992,11 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // `ir.tensors[..].rows`; the program states every one of them, so this is the same reading through
     // the door this file's header describes — not a record the producer filled in beside it.
     let ops_in = attn_operands(_name, k, r, geom)?;
-    let mq = ops_in.mq;
+    let mq = ops_in.mq.get();
     attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
     let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
-    let cap = ops_in.cap;
+    let cap = ops_in.cap.get();
     let stick = Fp16::ELEMS_PER_STICK; // 64
     // ── PAGED-ATTENTION COMPUTE EXTENT, READ OFF THE PROGRAM ──
     //
@@ -5034,7 +5037,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // name the node in the refusal). `assemble_attn` takes the pair as this carrier, so no call
     // site can hand the storage extent in the sweep slot or the reverse.
     let extent = crate::sdsc_abstract::KvExtent::new(
-        crate::sdsc_abstract::SlotCount::new(cap),
+        ops_in.cap,
         crate::sdsc_abstract::SlotCount::new(prefix_rows),
     );
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, AND IT IS THE ONLY READING OF IT. The attention
@@ -5589,9 +5592,9 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // A batch's rows are requests over their own runs of the chunk (`sdsc_abstract::BatchChunk`), which
     // `assemble_attn` mints from this chunk and the width — so the row kind decides the mask's READ, not
     // whether a chunk is admissible.
-    // The pool, minted ONCE for the two doors below (the chunk's and the index's) — the same pair
-    // through one spelling, in the seam's own width: no `as usize` re-widening here.
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh, hd);
+    // The pool, minted ONCE for the two doors below (the chunk's and the index's) — through the
+    // class-provable door, the same spelling the write below mints its own pool from.
+    let pool = crate::sdsc_abstract::PagedKvPool::of_geometry(geom);
     let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
         assert!(
             gathers_kv,

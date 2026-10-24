@@ -3328,8 +3328,9 @@ impl KvSlot {
     }
 }
 
-/// A NUMBER OF SLOTS — a prefill chunk's width, or 1 for a decode token. Distinct from [`KvSlot`]
-/// because a count added to a count is a count while a slot added to a slot is nothing at all.
+/// A NUMBER OF SLOTS — a prefill chunk's width, 1 for a decode token, or the resident cache's
+/// capacity. Distinct from [`KvSlot`] because a count added to a count is a count while a slot
+/// added to a slot is nothing at all.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct SlotCount(u32);
 
