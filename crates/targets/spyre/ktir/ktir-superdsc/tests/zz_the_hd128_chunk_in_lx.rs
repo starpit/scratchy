@@ -33,7 +33,7 @@ const EXTENT: KvExtent = KvExtent::new(SlotCount::new(CAP), SlotCount::new(CAP))
 const ENTRY_BYTES: u64 = HD as u64 * 64 * 2;
 
 fn pool() -> PagedKvPool {
-    PagedKvPool::new(NKVH as usize, HD as usize)
+    PagedKvPool::new(NKVH, HD)
 }
 
 /// The names-and-placements half of [`emit`]: the layout every hd128 emission in this file

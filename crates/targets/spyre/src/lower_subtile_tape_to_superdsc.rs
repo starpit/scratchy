@@ -1497,8 +1497,12 @@ pub fn compute_bundle_layout<F: RopeForm>(
             // The real ceiling is MEMORY: a page is `nkvh * hd * slots * 2 * layers`, so the pool has
             // to be sized for the batch width actually run. That is the constraint a 4-bit KV cache
             // lifts, by making a page denser instead of bigger.
-            let pool =
-                scratchy_subtile::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+            // The pool from the GEOMETRY itself — the pair at its source, not the u64 memory-math
+            // locals above re-narrowed into the seam.
+            let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+                geom.nkvh().get(),
+                geom.hd().get(),
+            );
             let _ = cap;
             let seg = SegRole::Kv.segment();
             let plane_bytes = pool.plane_stride() as u64 * 2;

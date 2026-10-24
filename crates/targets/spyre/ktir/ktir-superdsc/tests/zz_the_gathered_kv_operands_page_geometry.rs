@@ -451,7 +451,7 @@ fn the_gathered_kv_operand_capacity_divides_the_pool_block() {
     // base EXACTLY: `addr = idx*skip + base`, block `B` sits at `4096*B`, so `skip` must divide 4096.
     // Anything else and no integer index reaches a block boundary — every step lands inside a block,
     // which is a clean bake reading a fraction of another row's keys.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     assert_eq!(
         block, 4096,
         "the pool's uniform block, from the pool itself"
@@ -492,7 +492,7 @@ fn the_score_kernels_walk_has_no_page_axis_today() {
         "the score kernel is a 2-D [feature, slot] operand; a page axis would be a THIRD dim"
     );
     // Every dim is one window's own extent, so the product is one window — not a multi-page span.
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     let window: i64 = cap.dims.iter().map(|(_, e, _)| e).product();
     assert!(
         window <= block,
@@ -509,7 +509,7 @@ fn the_score_kernels_walk_has_no_page_axis_today() {
 /// being expressible and this fails at `cargo test` instead of on the card.
 #[test]
 fn the_pool_is_a_uniform_array_of_stick_blocks() {
-    let p = PagedKvPool::new(NKVH as usize, HD as usize);
+    let p = PagedKvPool::new(NKVH, HD);
     let block = p.stick_block_elems();
     assert!(block > 0, "a zero block makes every index step a no-op");
     // ⛔ THE ONE THAT HAS ALREADY BEEN CONFUSED FOR THE BLOCK: the distance to the next KV head is
@@ -545,7 +545,7 @@ fn the_pool_is_a_uniform_array_of_stick_blocks() {
 /// caller fills in: the row of this table that the KV pool's layout actually supports is the second.
 #[test]
 fn the_axis_and_page_together_decide_the_stride() {
-    let block = PagedKvPool::new(NKVH as usize, HD as usize).stick_block_elems() as i64;
+    let block = PagedKvPool::new(NKVH, HD).stick_block_elems() as i64;
     let mut table = Vec::new();
     // ⛔ `Batch` ("mb") REPLACES `Feature` ("in"): the harness is the KERNEL-less gather-copy op now,
     // whose dims are `[mb, out, y]`. `in` belongs to a matmul, which cannot carry a gather at all, and

@@ -76,7 +76,7 @@ fn emit_rows(
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
@@ -126,7 +126,7 @@ fn part_slots(pages: u32) -> (Vec<u32>, Vec<u32>) {
 /// [`part_slots`] for a chunk whose rows are `rows`.
 fn part_slots_of(pages: u32, rows: ChunkRowKind) -> (Vec<u32>, Vec<u32>) {
     let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages).unwrap();
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).unwrap();
     let cut = |per: u32| -> Vec<u32> {
         (0..pages.div_ceil(per))
             .map(|i| per.min(pages - i * per) * 256)
@@ -316,7 +316,7 @@ fn the_group_form_needs_the_registry_and_a_decode() {
 /// over a contraction wider than one stick.
 #[test]
 fn a_decode_batch_attends_each_kv_heads_whole_group() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for seqs in PagedKvPool::BATCH_RUNGS {
         for t in ChunkScratch::ladder_for(pool, seqs) {
             let ops = emit_batch(t, seqs);
@@ -395,7 +395,7 @@ fn a_decode_batch_attends_each_kv_heads_whole_group() {
 #[test]
 fn the_batch_mask_rows_are_the_relaid_group_rows() {
     use ktir_superdsc::sdsc_abstract::BatchChunk;
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for seqs in PagedKvPool::BATCH_RUNGS {
         let t = ChunkScratch::ladder_for(pool, seqs)[0];
         let bc = BatchChunk::of(ChunkScratch::of_chunk(pool, t).unwrap(), seqs, GQA).unwrap();

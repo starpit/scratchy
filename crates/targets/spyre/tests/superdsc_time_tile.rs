@@ -966,7 +966,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
     let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), 40).expect("a chunk");
+        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 40).expect("a chunk");
     let mut sym = 0i64;
     let attn_ops = assemble_attn(
         0,

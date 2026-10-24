@@ -817,8 +817,8 @@ impl Worker for SpyreWorker {
                 // The pool geometry the entry factor needs. `head_dim` decides the entry SIZE
                 // (`hd * 64` elements), so this is not interchangeable with any other pool value.
                 let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-                    model.kv_dim / model.head_dim,
-                    model.head_dim,
+                    (model.kv_dim / model.head_dim) as u32,
+                    model.head_dim as u32,
                 );
                 // WHICH RUNG IS ACTUALLY RUNNING, and how much of it is padding. A rung that failed
                 // to build at startup is logged and skipped, and the selection then lands on the next
@@ -1118,7 +1118,7 @@ impl Worker for SpyreWorker {
                             // keyed the batch chunk's row blocks on the program's own `nqh / nkvh`,
                             // and `pool` is the one spelling of `nkvh` this function holds (the
                             // model's own two numbers).
-                            (nqh / pool.nkvh.max(1)) as u32,
+                            nqh as u32 / pool.nkvh().max(1),
                         )
                     })
                     .ok_or_else(|| {

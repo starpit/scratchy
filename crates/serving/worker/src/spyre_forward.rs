@@ -987,7 +987,7 @@ pub(crate) fn fill_attn_step_inputs(
     // ⭐ THE GEOMETRY'S ONE DERIVATION ON THIS SIDE: `gqa = nqh / nkvh` — the wiring's head count
     // over the pool's, the fact `PagedKvPool` cannot state alone. A quotient of zero or a
     // non-divisor is a wiring/pool disagreement about the model, not a default to spell.
-    let nkvh = pool.nkvh.max(1) as u32;
+    let nkvh = pool.nkvh().max(1);
     let gqa = std::num::NonZeroU32::new(nqh / nkvh)
         .filter(|_| nqh % nkvh == 0)
         .ok_or_else(|| {
@@ -1049,8 +1049,8 @@ pub(crate) fn fill_attn_step_inputs(
                              bake and the host disagree about the region",
                             mask_ext.unwrap_or(0),
                             mq.count(),
-                            pool.nkvh,
-                            pool.hd
+                            pool.nkvh(),
+                            pool.hd()
                         ))
                     })?;
             let ceiling = session.gather_entry_ceiling(pool).ok_or_else(|| {
@@ -2483,8 +2483,8 @@ pub(crate) fn run_request_step(
     // arch has no single one, and the pool is the one lawful model-wide use (see `Loaded::kv_dim`).
     #[cfg(feature = "spyre-hw")]
     let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-        model.kv_dim / model.head_dim,
-        model.head_dim,
+        (model.kv_dim / model.head_dim) as u32,
+        model.head_dim as u32,
     );
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.

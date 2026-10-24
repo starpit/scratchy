@@ -1165,7 +1165,7 @@ fn a_repeat_gather_over_a_whole_placed_source_admits_under_a_declared_source_ext
 /// At `hd = 1` the pool's stick block IS the fixture's HEAD (64 elements); at `hd = 2` it is
 /// twice that, which is exactly the disagreement the door must refuse.
 fn fixture_reach(hd: usize) -> Option<ktir_superdsc::sdsc_abstract::GatherReach> {
-    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(8, hd);
+    let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(8, hd as u32);
     let page_stride = 128 * pool.stick_block_bytes();
     ktir_superdsc::sdsc_abstract::GatherReach::of_plane(4, page_stride, pool)
 }

@@ -286,7 +286,7 @@ fn the_entry_factor_makes_the_two_addressings_the_same_byte() {
     // BOTH baked head widths: the factor carries `hd` (a stick block is `hd * 64`), so a test at one
     // width would pass on a hardcoded 4096 — which is exactly what every doc comment in the tree says.
     for (nkvh, hd) in [(8usize, 64usize), (8, 128)] {
-        let pool = PagedKvPool::new(nkvh, hd);
+        let pool = PagedKvPool::new(nkvh as u32, hd as u32);
         let layer_page_bytes = pool.layer_stride() as u64 * 2;
         let page_stride = ITERS as u64 * layer_page_bytes;
 

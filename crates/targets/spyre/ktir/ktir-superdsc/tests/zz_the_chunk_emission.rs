@@ -43,7 +43,7 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk granite-2b admits");
     let mut sym = 0i64;
     assemble_attn(
@@ -79,7 +79,7 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
 /// Past 8 pages both legs' parts are the LX gather's (`ChunkLx`): 8 pages each plus a 4-page tail.
 #[test]
 fn the_chunk_op_count_is_independent_of_its_width() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     let value_leg = |n: &str| n.starts_with("attn_cov_") || n.starts_with("attn_covsum_");
     let score = |n: &str| n.starts_with("attn_csc_");
     let counts: Vec<(u32, usize)> = ChunkScratch::LADDER
@@ -236,7 +236,7 @@ fn the_decode_value_leg_divides_its_contraction_across_the_cores() {
 /// stick of its columns, 32 cores per 8-page part: one per Kᵗ copy entry.
 #[test]
 fn the_decode_score_parts_divide_their_columns_alone() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     let keys_in_lx = |j: u32| {
         ChunkScratch::of_chunk(pool, j)
             .unwrap()
@@ -449,7 +449,7 @@ fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, se
     } else {
         attn_bundle_rows(geom, mq, false).expect("a prompt chunk's rows")
     };
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, D as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, D), pages)
         .expect("a chunk granite admits");
     let mut sym = 0i64;
     let ops = assemble_attn(
@@ -712,7 +712,7 @@ fn the_decode_gather_legs_read_each_part_kernel_from_lx() {
             .collect();
         (starts.len() == 1).then(|| starts.into_iter().next().unwrap())
     };
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for mq in [1, PagedKvPool::PREFILL_CHUNK_SLOTS as u32] {
         let rows = if mq == 1 {
             ChunkRowKind::OneRequest
@@ -818,7 +818,7 @@ fn the_decode_gather_legs_read_each_part_kernel_from_lx() {
 /// exactly once. The host's table is this one run, and each copy reads exactly its own stick of it.
 #[test]
 fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for &j in ChunkScratch::LADDER.iter().filter(|&&j| j >= 8) {
         let chunk = ChunkScratch::of_chunk(pool, j).unwrap();
         let vlx = chunk.lx_form(ChunkRowKind::OneRequest, 0, 0).unwrap();
@@ -926,7 +926,7 @@ fn the_lx_form_run_covers_the_chunk_once_in_the_order_each_part_pv_reads() {
 /// gather and score Kᵗ in HBM: no Kᵗ copy writes LX, and the score is one op per kv head.
 #[test]
 fn a_tail_rung_cannot_mint_keys_in_lx() {
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH, HD);
     for &j in &ChunkScratch::LADDER {
         let Some(lx) =
             ChunkScratch::of_chunk(pool, j)

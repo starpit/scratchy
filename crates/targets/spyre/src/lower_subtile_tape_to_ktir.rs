@@ -573,8 +573,8 @@ fn attn_pools<F: RopeForm>(ir: &SubtileIR<F>) -> Vec<ktir_superdsc::sdsc_abstrac
     for n in &ir.nodes {
         if let SubOp::AttnDecode { geom, .. } = &n.op {
             let pool = ktir_superdsc::sdsc_abstract::PagedKvPool::new(
-                geom.nkvh().get() as usize,
-                geom.hd().get() as usize,
+                geom.nkvh().get(),
+                geom.hd().get(),
             );
             if !pools.contains(&pool) {
                 pools.push(pool);

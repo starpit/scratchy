@@ -32,7 +32,7 @@ fn emit_batch<const NQH: u32, const NKVH: u32, const HD: u32>(
 ) -> Vec<ktir_superdsc::emit::EmittedOp> {
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, seqs, true).expect("a decode batch rung");
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk the geometry admits");
     let mut sym = 0i64;
     assemble_attn(

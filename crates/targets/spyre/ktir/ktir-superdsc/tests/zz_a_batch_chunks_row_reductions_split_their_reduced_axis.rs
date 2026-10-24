@@ -59,7 +59,7 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         Rows::Prompt(n) => (attn_bundle_rows(geom, n, false), false),
     };
     let bundle_rows = bundle_rows.unwrap_or_else(|| panic!("{rows:?}: no rung"));
-    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH as usize, HD as usize), pages)
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages)
         .expect("a chunk granite admits");
     let mut sym = 0i64;
     assemble_attn(
@@ -132,7 +132,7 @@ fn most(sticks: u64) -> u64 {
 #[test]
 fn every_batch_rung_splits_its_row_reductions_reduced_axis() {
     fn check<const HD: u32>() {
-        let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+        let pool = PagedKvPool::new(NKVH, HD);
         let mut cases = 0usize;
         for seqs in PagedKvPool::BATCH_RUNGS {
             for pages in ChunkScratch::ladder_for(pool, seqs) {

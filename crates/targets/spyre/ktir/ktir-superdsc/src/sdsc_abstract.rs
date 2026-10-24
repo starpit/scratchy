@@ -690,6 +690,17 @@ impl<const NQH: u32, const NKVH: u32, const HD: u32> AttnGeometry<NQH, NKVH, HD>
         Self::NQH_NZ
     }
 
+    /// The kv-head count as the `NonZeroU32` the head iterators take — nonzero by
+    /// [`GQA`](Self::GQA)'s evaluation, so the `panic!` arm is a compile-time impossibility, not a
+    /// runtime assertion. The mirror of [`nqh_nz`](Self::nqh_nz): a call site iterating kv heads
+    /// holds the geometry, so it has no `NonZeroU32::new(..)` refusal to write.
+    pub const fn nkvh_nz(self) -> NonZeroU32 {
+        match NonZeroU32::new(NKVH) {
+            Some(n) => n,
+            None => panic!("AttnGeometry: NKVH == 0 is already refused by GQA's evaluation"),
+        }
+    }
+
     /// ONE REQUEST'S ROW EXTENT of a per-request attention pass — its `nqh` head rows. The law's
     /// only factor is the query-head count, a const of the geometry, so the extent is the
     /// compiler's: there is no runtime `nqh` for a call site to fetch from somewhere else.
@@ -5880,8 +5891,15 @@ pub struct PhysPage(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PagedKvPool {
     /// DISTINCT kv heads — a query head reads its group's plane via [`gqa_kv_head`].
-    pub nkvh: usize,
-    pub hd: usize,
+    // ⛔ PRIVATE, AND NOT `usize` ANY MORE. The pair was two pub `usize` fields minted through
+    // `new(nkvh: usize, hd: usize)`, so every caller re-widened its `u32`s (or its literals) into
+    // the storage width at the call — seven production spellings of `nkvh as usize, hd as usize`,
+    // each a place a wrong pair could enter unnoticed. The doors are `new` (the seam, `u32` — the
+    // width every geometry's spend doors speak) and `of_geometry` (the class the bundle was
+    // instantiated at, provably); the placement arithmetic below spends the fields as `usize` at
+    // its own unit, explicitly.
+    nkvh: u32,
+    hd: u32,
 }
 
 // ⛔⛔⛔ THE LADDER MUST SERVE EVERY BATCH THE POOL WILL ADMIT — OR THE HOST SILENTLY DECODES GARBAGE.
@@ -6514,8 +6532,27 @@ impl PagedKvPool {
     // a host allocation question and not a baked one — and the depth a row may reach is the
     // artifact-derived pmask ceiling, enforced per launch.
 
-    pub fn new(nkvh: usize, hd: usize) -> PagedKvPool {
+    /// ⭐ THE INTAKE SEAM — `u32`, the width every geometry's spend doors speak, so no caller
+    /// widens into the storage width at its own call site. The pair a pool carries is the model's
+    /// KV geometry as a RUNTIME value: the KTIR side reads it off the program's shapes, the host
+    /// off the baked artifact, so it cannot be a const — but it can refuse to be spelled in two
+    /// widths. The class-provable mint is [`of_geometry`](Self::of_geometry).
+    pub fn new(nkvh: u32, hd: u32) -> PagedKvPool {
         PagedKvPool { nkvh, hd }
+    }
+
+    /// ⭐ THE EMITTER'S DOOR — the pool FOR the class the bundle was instantiated at, the same
+    /// carrier `assemble_attn` and the seed/fold blocks take. A pool minted here cannot disagree
+    /// with the bundle's head counts: the pair comes from the geometry's own consts, spent as
+    /// values — so a scratch, a gather or a chunk minted from THIS pool carries the class's
+    /// `nkvh` by construction, and the emitter's cross-checks against it are provably dead.
+    pub fn of_geometry<const NQH: u32, const NKVH: u32, const HD: u32>(
+        geom: AttnGeometry<NQH, NKVH, HD>,
+    ) -> PagedKvPool {
+        PagedKvPool {
+            nkvh: geom.nkvh(),
+            hd: geom.hd(),
+        }
     }
 
     /// ELEMENTS BETWEEN TWO REQUESTS' KV, in any plane of any page+layer — the stride a batched
@@ -6550,7 +6587,7 @@ impl PagedKvPool {
         // `plane_extent()`, not `PLANE_SLOTS`: this is the PHYSICAL stride, and the addressable count is a
         // different quantity with the same value. The type is what stops the substitution.
         let (stk, pls) = (STK as u32, Self::plane_extent().get());
-        let hd = self.hd as u32;
+        let hd = self.hd;
         // ⚠️ PLANE-RELATIVE, deliberately. The emitter addresses each plane as its OWN NAMED TENSOR
         // (`kc`, `kct`, `vc`), so every offset a caller wants is WITHIN a plane — the plane base is
         // implicit in which tensor it names. An absolute address would be right only for a caller that
@@ -6719,7 +6756,7 @@ impl PagedKvPool {
         // that overrun on top of the next head's keys.
         // Physical, for the same reason: this is the distance to the NEXT KV HEAD, which is exactly what a padded
         // chunk write overruns.
-        self.hd * Self::plane_extent().get() as usize
+        self.hd as usize * Self::plane_extent().get() as usize
     }
 
     /// ⭐ THE BLOCK A `(kv head, request)` PAIR IS — for a caller addressing through a `Nest`'s
@@ -6748,7 +6785,7 @@ impl PagedKvPool {
     /// gather stepping by it would skip three quarters of every head's keys and still bake.
     /// `the_pool_is_a_uniform_array_of_stick_blocks` holds the two apart.
     pub fn stick_block_elems(&self) -> usize {
-        self.hd * STK
+        self.hd as usize * STK
     }
 
     /// ⭐ THE ENTRY IN **BYTES** — what one index step advances the address by. `stick_block_elems`
@@ -6809,7 +6846,7 @@ impl PagedKvPool {
     /// [`layer_stride`](Self::layer_stride), and the runtime's page stride is derived from those same
     /// placement deltas — so this is the one number that sizes the pool.
     pub fn plane_stride(&self) -> usize {
-        self.nkvh * self.plane_block_elems()
+        self.nkvh as usize * self.plane_block_elems()
     }
 
     /// Elements in one page+layer: Kᵀ, then V, then natural K.
@@ -6849,7 +6886,8 @@ impl PagedKvPool {
         // had run. At head_dim 128 block 0 was exact and every later block read one plane too far, so
         // attention was right over the first 64 cached slots and drifted from the 65th. The comment above
         // described this bug; it is now fixed rather than described.
-        (gqa_kv_head(qh, gqa) * Self::PAGE_SLOTS * self.hd) as u32 + b * STK as u32 * self.hd as u32
+        (gqa_kv_head(qh, gqa) * Self::PAGE_SLOTS * self.hd as usize) as u32
+            + b * STK as u32 * self.hd
     }
 
     /// Kᵀ WRITE offset of `K[slot][d]` within a page+layer — the consumer's own read model, so
@@ -6866,8 +6904,8 @@ impl PagedKvPool {
     /// ```
     pub fn kt_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor, because a page holds slots and not requests.
-        kvh * self.hd * Self::PAGE_SLOTS
-            + kcache_kt_write_offset(slot, d, self.hd, Self::PAGE_SLOTS, STK)
+        kvh * self.hd as usize * Self::PAGE_SLOTS
+            + kcache_kt_write_offset(slot, d, self.hd as usize, Self::PAGE_SLOTS, STK)
     }
 
     /// V WRITE offset of `V[slot][d]` within a page+layer. A `[1, hd]` row is CONTIGUOUS here, which
@@ -6882,8 +6920,8 @@ impl PagedKvPool {
     /// ```
     pub fn v_write_off(&self, kvh: usize, slot: usize, d: usize) -> usize {
         // The head's own block — no `ROWS` factor; a page holds slots, not requests.
-        kvh * Self::PAGE_SLOTS * self.hd
-            + vcache_write_offset(slot, d, self.hd, Self::PAGE_SLOTS, STK)
+        kvh * Self::PAGE_SLOTS * self.hd as usize
+            + vcache_write_offset(slot, d, self.hd as usize, Self::PAGE_SLOTS, STK)
     }
 
     /// THE INVARIANTS THE RUNTIME DEPENDS ON: every access of a page+layer stays inside one plane,
@@ -6926,11 +6964,19 @@ impl PagedKvPool {
             // THE PLANE IS ITS HEADS AND NOTHING ELSE. Stated as an equation because the two sides are
             // written in different places (a nest's `.block()` count against a matmul's declared kernel
             // extent) and drifting apart would put one head's slots on top of the next head's.
-            && self.plane_stride() == self.nkvh * self.plane_block_elems()
+            && self.plane_stride() == self.nkvh as usize * self.plane_block_elems()
     }
 
-    /// Head width this pool laid itself out for.
-    pub fn hd(&self) -> usize {
+    /// DISTINCT kv heads, as a value — the same door every pool-carrying sibling exposes
+    /// (`PagePlaneExtent::nkvh`, `PageScratch::nkvh`, `ChunkScratch::nkvh`), so a reader narrows
+    /// nowhere: the `as u32` the pub-`usize` field forced at six read sites is deleted.
+    pub const fn nkvh(self) -> u32 {
+        self.nkvh
+    }
+
+    /// Head width this pool laid itself out for — `u32`, the sibling vocabulary
+    /// (`PagePlaneExtent::hd`, `QGroupBlock::hd`).
+    pub const fn hd(self) -> u32 {
         self.hd
     }
 }
@@ -7583,7 +7629,7 @@ impl PagePlaneExtent {
     /// The extent of one `(request, page)` plane, or `None` on a degenerate geometry or an `hd` that is
     /// not a whole number of sticks (a part-stick head dim has no stick-block entry at all).
     pub const fn of_pool(pool: PagedKvPool) -> Option<Self> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd as u32);
+        let (nkvh, hd) = (pool.nkvh(), pool.hd());
         if nkvh == 0 || hd == 0 || !hd.is_multiple_of(POOL_STICK) {
             return None;
         }
@@ -9658,7 +9704,7 @@ impl GatherScratch {
         windows: WindowCount,
         mq: QueryRowCount,
     ) -> Option<GatherScratch> {
-        let (nkvh, hd) = (pool.nkvh as u32, pool.hd() as u32);
+        let (nkvh, hd) = (pool.nkvh(), pool.hd());
         if nkvh == 0 || hd == 0 || hd > POOL_STICK || windows.get() == 0 || mq.get() == 0 {
             return None;
         }
@@ -9925,7 +9971,7 @@ impl GatherScratch {
     /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block, which
     /// is why one index serves both copies.
     pub fn block_in_page(self, kvh: u32, window: u32) -> Option<u32> {
-        let pool = PagedKvPool::new(self.nkvh() as usize, self.hd as usize);
+        let pool = PagedKvPool::new(self.nkvh(), self.hd as u32);
         // The POOL's own door names the block (one derivation, shared with the spliced fillers);
         // this adds only the scratch's own window bound — how far THIS pass sweeps, the one fact
         // the pool cannot state.
@@ -11907,7 +11953,7 @@ impl PagedKvPool {
     /// outside the page's own geometry — a block the pool does not hold.
     pub fn block_in_page(&self, kvh: u32, window: u32) -> Option<u32> {
         let per_plane = self.windows_per_page()?;
-        (kvh < self.nkvh as u32 && window < per_plane).then_some(kvh * per_plane + window)
+        (kvh < self.nkvh && window < per_plane).then_some(kvh * per_plane + window)
     }
 }
 
@@ -11977,10 +12023,7 @@ impl SplicedAttnRegion {
 
     /// The id stick's width — every kv head's block in one window, named once per GQA group.
     pub fn ktb(self) -> Option<u32> {
-        self.pool
-            .nkvh
-            .checked_mul(self.gqa.get() as usize)
-            .and_then(|k| u32::try_from(k).ok())
+        self.pool.nkvh().checked_mul(self.gqa.get())
     }
 
     /// The id sticks one page block of the table states — one per mask row, the padded pitch law.
@@ -12285,7 +12328,7 @@ impl SplicedDecodeBatch {
             return None;
         }
         let w4 = pool.windows_per_page()?;
-        let ktb = entries.checked_mul(pool.nkvh as u32)?;
+        let ktb = entries.checked_mul(pool.nkvh())?;
         let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
         if per_chunk == 0 || extent_bytes % per_chunk != 0 {
             return None;
@@ -12334,7 +12377,7 @@ impl SplicedDecodeBatch {
     }
 
     fn ktb(self) -> u32 {
-        self.entries() * self.pool.nkvh as u32
+        self.entries() * self.pool.nkvh()
     }
 
     fn w4(self) -> u32 {
@@ -12361,7 +12404,7 @@ pub fn spliced_decode_ids_table(
         return None;
     }
     let (w4, ktb, bpc) = (batch.w4(), batch.ktb(), batch.blocks_per_chunk());
-    let nkvh = batch.pool.nkvh as u32;
+    let nkvh = batch.pool.nkvh();
     let seqs = batch.num_seqs.get();
     let mut out = Vec::with_capacity(batch.chunks() as usize * w4 as usize * ktb as usize);
     for c in 0..batch.chunks() {
@@ -12390,7 +12433,7 @@ pub fn spliced_decode_ids_table(
 /// gather the kernel states pairs each score row with its request's query row.
 pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
     let (ktb, gqa) = (batch.ktb(), batch.gqa.get());
-    let (nkvh, seqs) = (batch.pool.nkvh as u32, batch.num_seqs.get());
+    let (nkvh, seqs) = (batch.pool.nkvh(), batch.num_seqs.get());
     let mut out = Vec::with_capacity(ktb as usize * gqa as usize);
     for b in 0..ktb {
         let (e, kvh) = (b / nkvh, b % nkvh);
@@ -12429,7 +12472,7 @@ pub fn spliced_decode_mask_f16(
     }
     let (gqa, nkvh, seqs) = (
         batch.gqa.get(),
-        batch.pool.nkvh as u32,
+        batch.pool.nkvh(),
         batch.num_seqs.get(),
     );
     let page_slots = PagedKvPool::PAGE_SLOTS;

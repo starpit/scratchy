@@ -135,7 +135,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
     use ktir_superdsc::sdsc_abstract::{
         GatherScratch, PagedKvPool, QueryRowCount, SlotCount, SlotWindow,
     };
-    let pool = PagedKvPool::new(NKVH as usize, HD as usize);
+    let pool = PagedKvPool::new(NKVH as u32, HD as u32);
     for mq in [2u32, 8] {
         for swept in [64u32, 128, 256] {
             let scratch = GatherScratch::of_fold_pass(
@@ -232,7 +232,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
         (16, 128),
         (32, 64),
     ] {
-        let pool = PagedKvPool::new(nkvh as usize, hd as usize);
+        let pool = PagedKvPool::new(nkvh as u32, hd as u32);
         for mq in [2u32, 8] {
             let scratch = PageScratch::of_pass(pool, QueryRowCount::of_mq(mq))
                 .expect("granite's geometry admits the page copy");
@@ -455,7 +455,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
     use ktir_superdsc::superdsc_opspec::{EntryBase, GatherIndex};
 
     const HD_8B: i64 = 128;
-    let pool = PagedKvPool::new(NKVH as usize, HD_8B as usize);
+    let pool = PagedKvPool::new(NKVH as u32, HD_8B as u32);
     // The two strides, from the pool — not spelled as 8192/4096.
     let kt_window = pool.stick_block_elems() as i64;
     let v_window = (POOL_STICK * POOL_STICK) as i64;

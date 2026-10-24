@@ -5589,13 +5589,15 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // A batch's rows are requests over their own runs of the chunk (`sdsc_abstract::BatchChunk`), which
     // `assemble_attn` mints from this chunk and the width — so the row kind decides the mask's READ, not
     // whether a chunk is admissible.
+    // The pool, minted ONCE for the two doors below (the chunk's and the index's) — the same pair
+    // through one spelling, in the seam's own width: no `as usize` re-widening here.
+    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh, hd);
     let chunk: Option<crate::sdsc_abstract::ChunkScratch> = chunk_pages.map(|pages| {
         assert!(
             gathers_kv,
             "attention {_name}: a split-KV chunk of {pages} page(s) is a gathered read — it needs \
              `gathers_kv` (the index placement); rows_are_requests={rows_are_requests}"
         );
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
         crate::sdsc_abstract::ChunkScratch::of_chunk(pool, pages).unwrap_or_else(|| {
             panic!(
                 "attention {_name}: a split-KV chunk of {pages} page(s) at nkvh={nkvh}, hd={hd} is not \
@@ -5607,7 +5609,6 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         })
     });
     let kv_block_index: Option<String> = gathers_kv.then(|| {
-        let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
         // A chunk's own door was asked above; the per-page door is the batched rungs'.
         if chunk.is_some() {
             return crate::place::act_name(crate::reserved_tids::KV_BLOCK_INDEX_TID);
@@ -5842,7 +5843,7 @@ pub fn kv_cache_write(
         ident,
     } = w;
     let stick = Fp16::ELEMS_PER_STICK;
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh, hd);
     let mut ops: Vec<EmittedOp> = Vec::new();
     let per_request = rows_are_requests && mq > 1;
     // ⛔⛔⛔ AND THE SLAB CANNOT JOIN THAT `y` AXIS — MEASURED ON CARD, NOT INFERRED. The pair

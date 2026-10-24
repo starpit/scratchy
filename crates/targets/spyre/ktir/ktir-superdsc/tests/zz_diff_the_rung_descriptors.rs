@@ -775,7 +775,7 @@ fn the_shipped_gathered_fold_carries_the_gather_only_on_the_kernel_less_copies()
     // index stick at any rung the ladder admits, which is why the `rows / 32` split that used to produce
     // 16 ops here is gone rather than merely satisfied. Still derived from the geometry, not written down.
     let scratch = ktir_superdsc::sdsc_abstract::PageScratch::of_pass(
-        ktir_superdsc::sdsc_abstract::PagedKvPool::new(NKVH as usize, HD as usize),
+        ktir_superdsc::sdsc_abstract::PagedKvPool::new(NKVH, HD),
         ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(8),
     )
     .expect("this geometry admits the page gather");

@@ -1231,11 +1231,22 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // whose two components share one differenced step — garbage on the 8b at hd=128, 10/10 runs. Here `y`
     // carries the group ALONE, exactly as it ships, and the request is not on an axis at all.
     if let Some(gf) = request_axis {
-        // THE KV HEADS FROM THE SCRATCH ITSELF — the same count the index table was staged for, so the
-        // kernel row an op reads and the entry the host filled cannot come from two numbers.
-        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
-            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
+        // ⭐ THE SCRATCH'S HEAD COUNT, CROSSED WITH THE CLASS'S. The scratch is staged by the host from
+        // the pool, a runtime value, so its count is a bake fact — but it must BE the class's, or the
+        // kernel row an op reads and the entry the host filled come from two numbers. Refused here
+        // rather than divided against: `gqa` is the geometry's own proof-carrying const, and the old
+        // `nqh / scratch.nkvh()` derivation silently produced a WRONG group size for a disagreeing
+        // scratch instead of refusing.
+        if gf.scratch.nkvh() != geom.nkvh() {
+            return Err(SuperDscError(format!(
+                "attention o{t}: the gathered fold's scratch carries {} kv heads, not the \
+                 class's {}",
+                gf.scratch.nkvh(),
+                geom.nkvh()
+            )));
+        }
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         // ⭐⭐⭐⭐⭐ THE CONTRACTION IS SPLIT BY SLAB — `nslab` ops of ONE STICK each, accumulating in `sc`.
         //
         // ⛔⛔⛔ IT WAS `MatK::of_head_dim(hd)` IN ONE OP, JUSTIFIED BY A COMMENT THAT SAID "the gather's
@@ -1342,9 +1353,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         .and_then(|b| b.score)
         .is_some_and(|_| ScoreArm::of_geometry::<NQH, NKVH, HD>() == ScoreArm::SlabSplitBatched)
     {
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh)
-            .ok_or_else(|| SuperDscError("a batched score needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
+        // The class's own count and group — the geometry's proof-carrying consts, spent as values:
+        // `NKVH >= 1` is proven by `GQA`'s evaluation, so there is no nonzero refusal to write, and
+        // `gqa` is the division performed ONCE at the mint, never re-derived here.
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // THE GROUP'S FIRST QUERY HEAD, FROM THE TYPE — not `kvh * gqa` spelled here.
             //
@@ -1751,9 +1764,18 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // per-kv-head op, one per request, `y` on the GQA group, the V scratch row reached by a baked OFFSET.
     // See the score arm above for why the per-`y` kernel DIM is refuted and what the gather buys instead.
     if let Some(gf) = request_axis {
-        let nkvh_nz = std::num::NonZeroU32::new(gf.scratch.nkvh())
-            .ok_or_else(|| SuperDscError("a gathered fold needs at least one kv head".into()))?;
-        let gqa = nqh / nkvh_nz.get();
+        // The scratch's head count, crossed with the class's — same law as the score arm's door:
+        // refused rather than divided against, and `gqa` is the geometry's own const.
+        if gf.scratch.nkvh() != geom.nkvh() {
+            return Err(SuperDscError(format!(
+                "attention o{t}: the gathered fold's scratch carries {} kv heads, not the \
+                 class's {}",
+                gf.scratch.nkvh(),
+                geom.nkvh()
+            )));
+        }
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         // ⭐ THE GATHERED SCRATCH IS THE PAGE PLANE, BYTE FOR BYTE — so its kernel rows are the
         // pool's own page slots and no other plane's extent. The type refuses the pairing here, at
         // the arm's door, rather than trusting the caller to have passed the page fact: a window
@@ -1850,10 +1872,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The value leg's mirror: plain 2-D, one per (request, query head), nothing declared. The
     // kv-head count is the geometry's own `NKVH` const, not a `BatchedKv` field.
     else if batched.and_then(|b| b.value).is_some() {
-        let nkvh_nz = std::num::NonZeroU32::new(nkvh).ok_or_else(|| {
-            SuperDscError("a batched value matmul needs at least one kv head".into())
-        })?;
-        let gqa = nqh / nkvh_nz.get();
+        // The class's own count and group — the geometry's proof-carrying consts, spent as values,
+        // exactly as the comment above already stated the law.
+        let nkvh_nz = geom.nkvh_nz();
+        let gqa = geom.gqa();
         for kvh in crate::sdsc_abstract::KvHead::all(nkvh_nz) {
             // Same total conversion as the score side above — the two must agree about which query head
             // owns a kv head's kernel, and they agree because there is only one function that says so.
@@ -4313,7 +4335,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         }
         SweepLaw::mint(shape)
     };
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh as usize, hd as usize);
+    let pool = crate::sdsc_abstract::PagedKvPool::of_geometry(geom);
     // ⭐ ONE LAW FOR THE PRODUCT, AND ONE EXIT FOR ITS VALUE. The shape's `MaskRows` is what the
     // HOST stages the mask with, what `PrefixMaskShape` blocks by, and what every reduce and
     // pointwise op here sweeps — read off the boundary's one carrier, so this function holds no
