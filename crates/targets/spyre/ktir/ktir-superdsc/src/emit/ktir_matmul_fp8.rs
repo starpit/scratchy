@@ -15,8 +15,8 @@
 
 use super::{
     EmittedOp, In, PointwiseFacts, assemble_convert, assemble_convert_col,
-    assemble_pointwise_broadcast_off,
-    bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rb_df, rbo,
+    assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
+    rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,

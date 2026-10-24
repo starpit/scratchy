@@ -70,9 +70,8 @@ use super::reduce::{
 };
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
-    EmitCtx, EmittedOp, In, PointwiseDivided, PointwiseFacts,
-    assemble_pointwise_broadcast_divided, assemble_pointwise_broadcast_off,
-    assemble_restickify_kt_2d, fl, rb,
+    EmitCtx, EmittedOp, In, PointwiseDivided, PointwiseFacts, assemble_pointwise_broadcast_divided,
+    assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
 };
 use crate::exp_base::ExpBase;
 use crate::placement::BundleLayout;
@@ -6010,7 +6009,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                                 nests.token_stream(hi, 0).off(),
                             )
                             .ew(),
-                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0))
+                                .ew(),
                         ],
                         o: &rb(
                             out,
@@ -6116,8 +6116,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         rows: RowCount::of_query_rows(width.mq()),
                         cols: BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
                         inputs: &[
-                            In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s)).ew(),
-                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
+                            In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s))
+                                .ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0))
+                                .ew(),
                         ],
                         o: &rb(
                             out,

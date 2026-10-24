@@ -5286,7 +5286,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .view()
                     .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
                     .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                    .dev().into(),
+                    .dev()
+                    .into(),
                 },
                 sym_id_base,
                 layout,
@@ -5316,7 +5317,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .view()
                     .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
                     .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                    .dev().into(),
+                    .dev()
+                    .into(),
                 },
                 sym_id_base,
                 layout,
@@ -6290,7 +6292,9 @@ pub fn lmlast(
                     op_name: &format!("lmlast{j}_o{owner}"),
                     op_func: "identity",
                     rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
-                    cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+                    cols: crate::sdsc_abstract::BlockCols::of_one_stick(
+                        crate::sdsc_abstract::Lanes::FP16,
+                    ),
                     inputs: &[In::sliced(
                         &src_name,
                         // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
@@ -9483,7 +9487,9 @@ pub fn reshape(
                 op_name: &format!("reshape{q}_o{}", out.tid),
                 op_func: "identity",
                 rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
-                cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+                cols: crate::sdsc_abstract::BlockCols::of_one_stick(
+                    crate::sdsc_abstract::Lanes::FP16,
+                ),
                 inputs: &[In::sliced(
                     &src_name,
                     crate::addr::rc_of(
@@ -9502,7 +9508,8 @@ pub fn reshape(
                     (base / u64::from(c_out)) as u32,
                     (base % u64::from(c_out)) as u32,
                     Df::Fp16,
-                ).into(),
+                )
+                .into(),
             },
             sym_id_base,
             layout,
