@@ -2200,7 +2200,11 @@ mod tests {
         let per = UniformPages::of(&s).expect("one row");
         // The parts the ONE cutting law mints for a 512-row window — offsets 0 and 256. Taken from
         // `write_parts`, never spelled as numbers here: a part is what the cut says it is.
-        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(0, 512, false);
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(
+            ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
+            ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(512),
+            false,
+        );
         let part = |p: usize| OpKv {
             slot_write: true,
             page_slots: 256,
@@ -2276,7 +2280,11 @@ mod tests {
             &[3, 7, 9],
         );
         let per = UniformPages::of(&s).expect("one row");
-        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(0, 512, false);
+        let cut = ktir_superdsc::sdsc_abstract::PagedKvPool::new(1, 64).write_parts(
+            ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
+            ktir_superdsc::sdsc_abstract::QueryRowCount::of_mq(512),
+            false,
+        );
         let part1 = OpKv {
             slot_write: true,
             page_slots: 256,

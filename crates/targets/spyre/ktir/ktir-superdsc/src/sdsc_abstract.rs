@@ -6220,8 +6220,8 @@ impl WriteRowStart {
         self.0 > 0
     }
 
-    /// The row itself — [`PagedKvPool::write_parts`]'s `start` slot, whose own typing is that
-    /// law's rung.
+    /// The row itself — the cutting law's own binding ([`PagedKvPool::write_parts`] spends
+    /// it at its door, inside the module).
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -6856,7 +6856,18 @@ impl PagedKvPool {
     /// offset — at a page-aligned window start (`chunk_write_start`'s law for multi-page
     /// windows) that is exactly main's `p·PAGE_SLOTS`, so a whole-cursor window cuts
     /// byte-identically to main's `parts = mq.div_ceil(page)` loop.
-    pub fn write_parts(&self, start: u32, len: u32, rows_are_requests: bool) -> Vec<KvWritePart> {
+    ///
+    /// The window's two facts arrive as their types — where it starts
+    /// ([`WriteRowStart`]) and how many rows it covers ([`QueryRowCount`]) — so the
+    /// cut cannot be handed a slot offset or a feature width where a row count belongs.
+    pub fn write_parts(
+        &self,
+        start: WriteRowStart,
+        len: QueryRowCount,
+        rows_are_requests: bool,
+    ) -> Vec<KvWritePart> {
+        // The cut's arithmetic reads numbers; the doors are spent here, at the binding.
+        let (start, len) = (start.get(), len.get());
         if rows_are_requests {
             return (start..start + len)
                 .map(|row0| KvWritePart {

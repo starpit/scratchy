@@ -5861,6 +5861,9 @@ pub fn kv_cache_write(
     // The identity, rows and geometry, spent through their doors — the values are the ones the
     // caller minted, and the body below reads them exactly as it did.
     let t = t.tid();
+    // The window's row count rides typed to the cutting law below; the number the body
+    // reads is spent here.
+    let mq_rows = mq;
     let mq = mq.get();
     let nkvh = pool.nkvh();
     let hd = pool.hd();
@@ -5910,7 +5913,7 @@ pub fn kv_cache_write(
     // `parts = mq.div_ceil(page)` loop. At `row_start = 0` (main's own call, and a
     // whole-plane node) the cut is BYTE-IDENTICAL to that loop: request-major one part per
     // row, position-major one part per page with `p·page` offsets.
-    let parts = pool.write_parts(row_start.get(), mq, rows_are_requests);
+    let parts = pool.write_parts(row_start, mq_rows, rows_are_requests);
     let part_tag = |p: usize| {
         if !rows_are_requests && parts.len() > 1 {
             format!("_p{p}")

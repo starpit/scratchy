@@ -16,7 +16,7 @@
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
 use ktir_superdsc::page_part::Slots;
 use ktir_superdsc::score_scale::NewK;
-use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount};
+use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount, WriteRowStart};
 
 /// One page, in slots — the cut's own unit.
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
@@ -30,7 +30,11 @@ use scratchy_target_spyre::lower_subtile_tape_to_superdsc::{
 fn no_kind_fuses_across_page_parts() {
     // The parts of a 512-row window, off the ONE cutting law: a part is what the cut says it is,
     // and this test cannot spell one from a number either.
-    let cut = PagedKvPool::new(1, 64).write_parts(0, 512, false);
+    let cut = PagedKvPool::new(1, 64).write_parts(
+        WriteRowStart::at_cursor(),
+        QueryRowCount::of_mq(512),
+        false,
+    );
     for kind in [
         GroupKind::Pure,
         GroupKind::Slot {
