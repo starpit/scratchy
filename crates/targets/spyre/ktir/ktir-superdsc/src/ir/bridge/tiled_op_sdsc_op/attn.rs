@@ -747,6 +747,38 @@ impl FinalizeCarry {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE PRE-UPDATE READ, AS ONE FACT — not two. `ocorr` (the OLD `run_o` times `corr`,
+/// staged in `otmp`) and the value matmuls' `stridedadd` addend are the SAME decision: a fold
+/// block makes both, a seed block neither. They used to be coupled by two separate
+/// `seed.seeds()` tests with a comment between them — either could be flipped alone, silently
+/// dropping the correction (a matmul writing `run_o` with no `ocorr` first) or folding an
+/// unwritten buffer (`otmp` as an addend with no producer). The addend handle's ONLY mint is
+/// the arm that pushes the `ocorr` op, so the ORDER law — every `ocorr` precedes every value
+/// matmul of its block, because the matmul's fused epilogue overwrites `run_o` — is the
+/// token's scope: a value leg that folds through `otmp` cannot be emitted before the op that
+/// wrote `otmp`.
+enum FoldAddend {
+    /// A seed block writes its own result — no pre-update value exists to correct.
+    Seed,
+    /// `otmp` holds `run_o · corr` because the `ocorr` pushed in the minting arm wrote it.
+    PreUpdate(Stk<FlatTag>),
+}
+
+impl FoldAddend {
+    /// The `stridedadd` pair the value arms fold through — `None` on the seed arm, where the
+    /// matmul writes its own result with no epilogue. A projection: reading cannot violate the
+    /// minting law, only minting can.
+    fn stridedadd<'a>(
+        &'a self,
+        at: crate::addr::DevOff,
+    ) -> Option<(&'a Stk<FlatTag>, crate::addr::DevOff)> {
+        match self {
+            FoldAddend::Seed => None,
+            FoldAddend::PreUpdate(a) => Some((a, at)),
+        }
+    }
+}
+
 /// The BYTE INTERVAL one op touches in each operand, as `(buffer, is_input, lo, hi)`.
 ///
 /// `startAddressCoreCorelet_.data_` is the emitter's own output — the byte address core `c` begins at
@@ -1600,10 +1632,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // matmul's destination becomes `run_o` instead of `ov`, and `oadd` disappears — along with the `ov`
     // buffer and its store. `nslab` ops per fold block become zero: 8 at hd=128, 16 at 256, 32 at 512.
     //
-    // ⛔ ORDER IS LOAD-BEARING. `ocorr` reads `run_o` and the fused matmul writes it, so every `ocorr`
-    // must precede every value matmul of this block — which is why they are emitted here rather than
-    // left where `oadd` used to live. The read is of the OLD value by construction, the same dependency
-    // the separate `oadd` already had.
+    // ⛔ ORDER IS LOAD-BEARING, and now typed. `ocorr` reads `run_o` and the fused matmul writes
+    // it, so every `ocorr` must precede every value matmul of this block — the [`FoldAddend`]
+    // mint below is that law: the addend handle exists only on the arm that pushed `ocorr`, so
+    // no value matmul can fold through `otmp` before its producer ran. The read is of the OLD
+    // value by construction, the same dependency the separate `oadd` already had.
     // ⭐⭐⭐ AND IT IS **ONE** OP AT EVERY HEAD DIM — no slab loop, because there is no permutation to
     // undo here. `ocorr` reads head-major `run_o` and writes head-major `otmp`: the SAME shape, so the
     // whole `[nqh*mq, hd]` buffer is one contiguous rectangle and `hd` columns wide is just its width.
@@ -1617,7 +1650,14 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // col-broadcast output is proven emission, not a new shape.
     //
     // The name is unchanged at `nslab == 1`, so granite-3.1-2b's emit does not move.
-    if !seed.seeds() {
+    // `Some(otmp)` = fold this block in via `stridedadd`; `None` = the seed block writes its own
+    // result. The HANDLE and the `ocorr` that produces it are minted in ONE arm — the
+    // [`FoldAddend`] law — so the three value-matmul arms below cannot each decide separately
+    // whether this block folds (nor fold through an `otmp` nothing wrote): they only choose
+    // WHERE in `otmp` their own slab sits.
+    let fold_addend = if seed.seeds() {
+        FoldAddend::Seed
+    } else {
         ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}ocorr_o{t}"),
             "multiply",
@@ -1634,11 +1674,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             sym_id_base,
             layout,
         ));
-    }
-    // `Some(otmp)` = fold this block in via `stridedadd`; `None` = the seed block writes its own
-    // result. The HANDLE is minted once here so the three value-matmul arms below cannot each decide
-    // separately whether this block folds — they only choose WHERE in `otmp` their own slab sits.
-    let fold_addend = (!seed.seeds()).then_some(otmp).map(|b| fl(b, rows_n, hd));
+        FoldAddend::PreUpdate(fl(otmp, rows_n, hd))
+    };
     // KV-head-BATCHED value bmm — the mirror of the score leg above (same y-stride argument:
     // expb's is mb·in = gqa·mq·width, ov's is mb·out = gqa·mq·hd, kernel's is declared).
     // REQUEST-AXIS VALUE — the mirror of the score leg. V is `[PAGE_SLOTS, hd]` per request and this
@@ -1739,7 +1776,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         rn.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
-                        fold_addend.as_ref().map(|a| (a, rn.head_major(h0, s))),
+                        fold_addend.stridedadd(rn.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
@@ -1832,7 +1869,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         nests.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
-                        fold_addend.as_ref().map(|a| (a, nests.head_major(h0, s))),
+                        fold_addend.stridedadd(nests.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
@@ -1866,7 +1903,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         v_off_fn(qh0, s),
                         &rb(run_o, rows_n, hd),
                         nests.head_major(h0, s),
-                        fold_addend.as_ref().map(|a| (a, nests.head_major(h0, s))),
+                        fold_addend.stridedadd(nests.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
@@ -1943,7 +1980,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     v_off_fn(h, s),
                     &rb(run_o, rows_n, hd),
                     nests.head_major(hi, s),
-                    fold_addend.as_ref().map(|a| (a, nests.head_major(hi, s))),
+                    fold_addend.stridedadd(nests.head_major(hi, s)),
                     crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
@@ -3427,22 +3464,10 @@ fn assemble_attn_chunk(
     }
 
     // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
-    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cocorr_o{t}"),
-        "multiply",
-        all_rows,
-        BlockCols::of_head_dim(hd),
-        &[
-            In::full(&fl(carry.o(), q_rows, hd)).ew(),
-            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &fl(&bufs.otmp, q_rows, hd),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
+    // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
+    // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
+    let (otmp_h, run_o_h) =
+        emit_pre_update_correction(ops, t, q_rows, hd, &carry, &bufs, sym_id_base, layout);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3608,6 +3633,39 @@ struct PromptProbs<'a> {
     cb: &'a ChunkBufs,
 }
 
+/// ⭐ THE CHUNK'S PRE-UPDATE CORRECTION, EMITTED — and with it, the ping-pong pair the value
+/// parts fold through. `ocorr` multiplies the PRE-update `run_o` (read off the proof — this is
+/// a body op of the chain, never a seed) by `corr` and stages the product in `otmp`, which
+/// value part 0 then folds on; the odd parts fold the pre-update accumulator back the other
+/// way. The pair's ONLY mint is here, AFTER the push, so a value part's addend cannot exist
+/// without the op that wrote it having been pushed first — the ORDER law (every `ocorr`
+/// precedes every value matmul) is the handles' scope.
+fn emit_pre_update_correction(
+    ops: &mut Vec<EmittedOp>,
+    t: u32,
+    q_rows: u32,
+    hd: u32,
+    carry: &SeededCarry,
+    bufs: &BlockBufs,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> (Stk<FlatTag>, Stk<FlatTag>) {
+    use crate::addr::DevOff;
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
+    ops.push(assemble_pointwise_broadcast_off(
+        &format!("attn_cocorr_o{t}"),
+        "multiply",
+        RowCount::of_head_major_rows(q_rows),
+        BlockCols::of_head_dim(hd),
+        &[In::full(&run_o_h).ew(), In::col(&hm_rows(&bufs.corr, q_rows)).ew()],
+        &otmp_h,
+        DevOff::ZERO,
+        sym_id_base,
+        layout,
+    ));
+    (otmp_h, run_o_h)
+}
+
 /// ⭐⭐⭐ A PROMPT CHUNK'S PROBABILITIES NEVER LEAVE LX — THREE HBM PASSES OVER THE SCORE BLOCK, NOT SIX.
 ///
 /// After the score (written to HBM), its row max (read once) and the online merge, each row block's chunk
@@ -3661,22 +3719,10 @@ fn prompt_probabilities_in_lx(
             ))
         })
     };
-    // `ocorr` reads the PRE-update `run_o`, so it precedes every value matmul (the fold block's order).
-    ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cocorr_o{t}"),
-        "multiply",
-        all_rows,
-        BlockCols::of_head_dim(hd),
-        &[
-            In::full(&fl(carry.o(), q_rows, hd)).ew(),
-            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &fl(&bufs.otmp, q_rows, hd),
-        DevOff::ZERO,
-        sym_id_base,
-        layout,
-    ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
+    // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
+    // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
+    let (otmp_h, run_o_h) =
+        emit_pre_update_correction(ops, t, q_rows, hd, &carry, &bufs, sym_id_base, layout);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
