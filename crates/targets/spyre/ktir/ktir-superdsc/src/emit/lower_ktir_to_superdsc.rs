@@ -39,8 +39,7 @@ use super::{
     pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
-    AttnFacts,
+    AttnFacts, assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
