@@ -5384,6 +5384,49 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     }
 }
 
+/// ⭐⭐⭐ THE FOLD FAMILY'S SWEEP READING, OFF THE MINTED COUNTS — the first row whose WHOLE
+/// sweep (that row's tallies in EVERY block, both grid forms) holds no valid lane, or `None`
+/// when every row sweeps one.
+///
+/// THE INVARIANT IS PER ROW-SWEEP, NOT PER WINDOW, because the carry's rescale is what makes an
+/// all-masked window harmless: a window read while `m` still sits at the −65504 seed gives
+/// `p = e^0 = 1` per lane, and only a LATER max-rise expunges it — the fold scales `l` and `acc`
+/// by `e^(m_old − m_new)`, which underflows to zero once a valid lane raises `m` past the
+/// sentinel. (The base is e — the device's one exponential, `ExpBase::E`; the emitted recurrence
+/// is `expb = exp(sc − run_m)` and `corr = exp(run_m − newm)`, never an exp2.) A row whose
+/// whole sweep is empty never raises `m`, so the phantom `l` survives
+/// into the finalize's division: that row is a request that never prefilled (or histories
+/// staged against another shape), and this reading names it instead of letting the fold
+/// normalize lanes the mask meant to silence.
+///
+/// Row `row` here is [`PrefixMaskShape::row_of`]'s — `head·mq + request` — so the offending
+/// request is `row % mq`. The block grouping is the counts' own mint law
+/// (`(block·rows + row)·slabs`, [`ValidityMask::window_valid`]): summing a row's tallies over
+/// EVERY block is correct under both grid forms, because a block holds another row's lanes only
+/// where that row's own blocks hold them. The mask and the shape are the mint's own pair — the
+/// block count is their quotient, a theorem of "this mask was minted by this shape", not a
+/// check a caller can fail.
+pub fn decode_batch_empty_sweep_row<const COLS: u32>(
+    mask: &ValidityMask,
+    shape: PrefixMaskShape<POOL_STICK, COLS>,
+) -> Option<u32> {
+    let rows = shape.rows().get() as usize;
+    let wpr = mask.windows_per_row().get() as usize;
+    let blocks = mask.rows() / rows;
+    for row in 0..rows {
+        let mut swept = 0u32;
+        for block in 0..blocks {
+            for window in 0..wpr {
+                swept += mask.window_valid(block * rows + row, window).get();
+            }
+        }
+        if swept == 0 {
+            return Some(row as u32);
+        }
+    }
+    None
+}
+
 /// THE PREFILL CAUSAL-MASK EXTENT (mq>1 new-token self-attention block): in a batched prefill of `mq`
 /// new tokens, query row `row` (0-based within the chunk) attends new-token column `col` iff `col <= row`
 /// — the token attends itself + all EARLIER new tokens, never a LATER one. Additive mask: 0 when valid,
@@ -9486,6 +9529,27 @@ pub fn batch_chunk_mask_f16(
     })
 }
 
+/// ⭐⭐⭐ THE BATCH CHUNK'S SWEEP READING, OFF THE MINTED COUNTS — the first row whose whole slab
+/// sweep holds no valid lane, or `None` when every row sweeps one. The same row-sweep invariant
+/// as [`decode_batch_empty_sweep_row`] at this family's own single-block layout: the mask is
+/// ONE block every row block reads, so a row's sweep is its own `slabs` tallies and no block
+/// grouping is needed. Row `i` is request `i % B`'s ([`BatchChunk::row_request`]); an empty
+/// sweep is a request whose history holds none of its own run's slots — the never-prefilled
+/// desync, which the rescale cannot expunge because the row's `m` never rises.
+pub fn batch_chunk_empty_sweep_row(mask: &ValidityMask) -> Option<u32> {
+    let wpr = mask.windows_per_row().get() as usize;
+    for row in 0..mask.rows() {
+        let mut swept = 0u32;
+        for window in 0..wpr {
+            swept += mask.window_valid(row, window).get();
+        }
+        if swept == 0 {
+            return Some(row as u32);
+        }
+    }
+    None
+}
+
 /// ⭐⭐⭐ THE BATCH CHUNK's INDEX TABLE — [`chunk_gather_index_table`] over [`BatchChunk::page_list`],
 /// so the entries the copies read and the runs the mask validates are one layout. `maps` is one page
 /// map per request row (padding rows carry live 0's), in row order. `op_local_bytes` is the same
@@ -11938,16 +12002,19 @@ impl ValidKeys {
 /// `l`-invariant, as a type.
 ///
 /// THE INVARIANT: `l ≡ Σ over windows of Σ over the lanes each row marks valid of
-/// exp2(score − m_final)`. A lane the mask does not validate contributes EXACTLY zero to `l`
+/// e^(score − m_final)` — base e, the device's one exponential (`ExpBase::E`; the emitted
+/// recurrence is `expb = exp(sc − run_m)`, never an exp2). A lane the mask does not validate
+/// contributes EXACTLY zero to `l`
 /// and to `acc` — in the kernel's arithmetic, because a masked lane's score plus the −65504
-/// sentinel underflows `exp2` to zero (the finite-sentinel clamp trick), and in the staging,
-/// because the row's [`ValidKeys`] count is minted by the loop that wrote those very bytes.
+/// sentinel underflows the exponential to zero (the finite-sentinel clamp trick), and in the
+/// staging, because the row's [`ValidKeys`] count is minted by the loop that wrote those very
+/// bytes.
 ///
 /// ⛔ THE SENTINEL PAIR IS LOAD-BEARING, AND ITS EDGE IS THE SEED-SAFETY LAW. The carry's seed
 /// `m` is the SAME finite −65504 the invalid lanes carry, so a masked lane's `p` is exactly
 /// zero only because some VALID lane in the same or an earlier window raised `m` past the
-/// sentinel (`exp2(−65504 − m)` underflows). An ALL-masked window read while `m` still sits at
-/// the seed would give `p = exp2(0) = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
+/// sentinel (`e^(−65504 − m)` underflows). An ALL-masked window read while `m` still sits at
+/// the seed would give `p = e^0 = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
 /// nothing. The chunk family's first window CANNOT be that window: with `real ≥ 1` (the
 /// builder takes [`NonZeroU32`]) and `start ≥ 0` (a `usize`), `row_logical_pos(t, real) ≥ 0`,
 /// so slot 0 is valid for every query row of window (0, 0) and

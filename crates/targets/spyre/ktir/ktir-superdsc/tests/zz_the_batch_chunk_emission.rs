@@ -5,7 +5,7 @@
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
 use ktir_superdsc::sdsc_abstract::{
     AttnGeometry, BatchChunk, ChunkScratch, KvExtent, KvHistory, PagedKvPool, SlotCount,
-    StickLayout, attn_bundle_rows, batch_chunk_mask_f16,
+    StickLayout, attn_bundle_rows, batch_chunk_empty_sweep_row, batch_chunk_mask_f16,
 };
 
 const CAP: u32 = 256;
@@ -384,6 +384,41 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
         );
     }
     assert!(batch_chunk_mask_f16(bc, &hists[..3], -100.0).is_none());
+}
+
+/// ⭐⭐⭐ THE SWEEP READING at the chunk family's own door: a row whose whole slab sweep is empty
+/// is a request that holds none of its own run's slots — the never-prefilled desync the fold's
+/// `l` would normalize, because the row's `m` never rises past the sentinel seed to expunge it.
+/// A healthy batch sweeps one on every row; the named row maps to its request by the chunk's
+/// own law door.
+#[test]
+fn the_chunk_family_names_an_empty_sweep_row() {
+    let (seqs, j) = (4u32, 3u32);
+    let chunk = ChunkScratch::of_chunk(pool_2b(), seqs * j).expect("admitted");
+    let bc = BatchChunk::of(chunk, seqs, 4).expect("a whole number of pages per request");
+    let healthy = vec![
+        KvHistory::contiguous(10),
+        KvHistory::contiguous(256),
+        KvHistory::contiguous(5),
+        KvHistory::contiguous(10),
+    ];
+    let m = batch_chunk_mask_f16(bc, &healthy, -100.0).expect("one history per request row");
+    assert_eq!(
+        batch_chunk_empty_sweep_row(&m),
+        None,
+        "a batch whose every request holds a slot must sweep one on every row"
+    );
+    // Request 1's history is EMPTY — no run, no shared slot — so every row `i % B == 1`
+    // sweeps nothing, and the first of them is named.
+    let starved = vec![
+        KvHistory::contiguous(10),
+        KvHistory::contiguous(0),
+        KvHistory::contiguous(5),
+        KvHistory::contiguous(10),
+    ];
+    let m = batch_chunk_mask_f16(bc, &starved, -100.0).expect("one history per request row");
+    let row = batch_chunk_empty_sweep_row(&m).expect("request 1's rows sweep nothing");
+    assert_eq!(bc.row_request(row), 1, "the named row {row} must be request 1's");
 }
 
 /// ⭐ THE PAGE LIST LAYS EACH REQUEST's OWN MAP AT `J` PAGES, padding a short map with ITS OWN last page

@@ -57,9 +57,19 @@ pub enum Staged {
 /// `cap` columns; a decode BATCH wants one block per fold pass, `[nqh*mq, page_slots]`, because the
 /// fold takes a pass per (request, page) and `fold_delta` steps the mask one block per pass. Same
 /// question, different buffer — which is why this is an enum on the INPUT and not a second tape.
+///
+/// ⭐ AND ON THE BROADCAST SHAPE, TWO SWEEP LAWS. The prefix regime's row may be legally
+/// ALL-MASKED — the FIRST prompt chunk has `start = 0`, no resident prefix, and the causal block
+/// beside it carries the row's valid lanes — so it carries no reading. The held regime's row is a
+/// decode request's own history; a row that holds no slot at all is a request that never
+/// prefilled, and the staging door refuses it off the count minted beside the values.
 pub enum PrefixSource<'a, Valid: Fn(usize) -> bool> {
-    /// `cap` additive entries; `holds(col)` carves validity out of `mask_neg`.
-    Broadcast { cap: usize, holds: Valid },
+    /// A PROMPT CHUNK's broadcast row: `cap` additive entries; `holds(col)` carves validity out
+    /// of `mask_neg` over the chunk's resident prefix (contiguous, from `start`).
+    BroadcastPrefix { cap: usize, holds: Valid },
+    /// A SOLO DECODE ROW's broadcast row: `cap` additive entries; `holds(col)` asks which slots
+    /// the request's own history holds.
+    BroadcastHeld { cap: usize, holds: Valid },
     /// Fold-pass blocks, staged straight to f16 by the layout law itself.
     Blocks {
         shape: scratchy_subtile::sdsc_abstract::PrefixMaskShape<
@@ -155,25 +165,58 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
             .as_ref()
             .ok_or_else(|| "PrefixMask step on a bundle with no mask".to_string())?;
         return Ok(match src {
-            PrefixSource::Broadcast { cap, holds } => Staged::F32(std::borrow::Cow::Owned(
-                broadcast_prefix_mask(*cap, inp.mask_neg, holds),
-            )),
+            PrefixSource::BroadcastPrefix { cap, holds } => {
+                // ⭐ THE COUNT MINTED BESIDE THESE VALUES HAS NO READING ON THIS PATH, SAID HERE:
+                // the FIRST prompt chunk's row is legally ALL-MASKED (`start = 0` leaves no
+                // resident prefix), and the causal block beside it carries the row's valid
+                // lanes — the sweep law does not guard the prefix regime. The count drops at
+                // this door rather than by the minter never holding it.
+                Staged::F32(std::borrow::Cow::Owned(
+                    broadcast_prefix_mask(*cap, inp.mask_neg, holds).into_values(),
+                ))
+            }
+            PrefixSource::BroadcastHeld { cap, holds } => {
+                // ⭐ THE SWEEP LAW AT THE BROADCAST FAMILY'S ONE ROW: a decode row holds its own
+                // history's slots, so a held count of zero is a request that never prefilled —
+                // refused here, off the minted count, before the values stage.
+                let mask = broadcast_prefix_mask(*cap, inp.mask_neg, holds);
+                if mask.held_columns() == 0 {
+                    return Err(
+                        "solo decode prefix mask: the request holds no slot in its whole swept \
+                         extent — a decode row must have prefilled, and an all-masked sweep \
+                         leaves the fold's l counting lanes the mask meant to silence"
+                            .to_string(),
+                    );
+                }
+                Staged::F32(std::borrow::Cow::Owned(mask.into_values()))
+            }
             PrefixSource::Blocks {
                 shape,
                 fold,
                 histories,
             } => {
                 // ⭐ THE MASK LEAVES ITS MINT AS ONE FACT — bytes and tallies — minted by the same
-                // loop ([`decode_batch_prefix_mask_f16`]). The tallies' reader is the emitter-side
-                // boundary type (the next rung of this contract), so this arm hands the BYTES to
-                // the staging through the by-value exit and the tallies drop HERE, at this door —
-                // said so, rather than by the minter never holding them.
+                // loop ([`decode_batch_prefix_mask_f16`]). The tallies' reading is the SWEEP LAW:
+                // a row whose whole sweep is empty never raises the carry's `m` past the −65504
+                // seed, so the fold's `l` would count lanes the mask meant to silence — refused
+                // here, at the door, before the bytes stage. The emitter-side boundary type (the
+                // next rung of this contract) threads the same tallies onward.
                 let mask = scratchy_subtile::sdsc_abstract::decode_batch_prefix_mask_f16(
                     *shape,
                     *fold,
                     histories,
                     inp.mask_neg,
                 );
+                if let Some(row) =
+                    scratchy_subtile::sdsc_abstract::decode_batch_empty_sweep_row(&mask, *shape)
+                {
+                    return Err(format!(
+                        "prefix mask: fold row {row} holds no valid lane in any block of its \
+                         sweep — an empty sweep leaves the carry's m at the sentinel seed, so \
+                         the fold's l counts lanes the mask meant to silence (a request that \
+                         never prefilled, or histories staged against another shape)"
+                    ));
+                }
                 Staged::F16(mask.into_wire_bytes())
             }
             PrefixSource::Chunk { chunk, histories } => {
@@ -189,6 +232,20 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                         chunk.requests()
                     )
                 })?;
+                // ⭐ THE SWEEP READING at this family's own door — the same law as the fold's,
+                // at the single-block layout: a row whose whole slab sweep is empty is a
+                // request that holds none of its own run's slots. Row `i` is request `i % B`'s,
+                // named by the chunk's own law door.
+                if let Some(row) =
+                    scratchy_subtile::sdsc_abstract::batch_chunk_empty_sweep_row(&mask)
+                {
+                    return Err(format!(
+                        "batch chunk mask: row {row} (request {}) holds no valid lane in its \
+                         whole slab sweep — a request that holds none of its own run's slots \
+                         never prefilled, and the fold's l counts lanes the mask meant to silence",
+                        chunk.row_request(row)
+                    ));
+                }
                 Staged::F16(mask.into_wire_bytes())
             }
         });
@@ -313,6 +370,33 @@ pub fn stick_scatter(rows: usize, width: usize, row_major: &[f32]) -> Vec<f32> {
     out
 }
 
+/// ⭐ THE BROADCAST MASK AS ONE FACT — the additive values TOGETHER with the count of columns
+/// the predicate held, minted by the same loop that writes the values (the one-fact law
+/// [`ValidityMask`] states for the f16 families; this family's wire is f32 and its extent is
+/// one row, so its count is a whole-sweep total rather than a per-window tally — a
+/// [`ValidKeys`] would cap it at 64 lanes this row does not have).
+///
+/// [`ValidityMask`]: scratchy_subtile::sdsc_abstract::ValidityMask
+/// [`ValidKeys`]: scratchy_subtile::sdsc_abstract::ValidKeys
+#[derive(Clone, Debug)]
+pub struct BroadcastMask {
+    values: Vec<f32>,
+    held: u32,
+}
+
+impl BroadcastMask {
+    /// The additive values, in staging order.
+    pub fn into_values(self) -> Vec<f32> {
+        self.values
+    }
+
+    /// How many columns the predicate held — the row's whole-sweep valid-lane count, the
+    /// reading the held regime refuses on zero.
+    pub fn held_columns(&self) -> u32 {
+        self.held
+    }
+}
+
 /// The BROADCAST prefix-validity mask: `cap` additive entries, 0 where `valid(col)` and
 /// `mask_neg` elsewhere.
 ///
@@ -326,14 +410,22 @@ pub fn stick_scatter(rows: usize, width: usize, row_major: &[f32]) -> Vec<f32> {
 /// requests' history is `[0, len) ∪ [shared, …)` and the hole between holds another request's
 /// keys. [`a_hole_free_history_is_exactly_the_contiguous_prefix_law`] pins that they agree when
 /// there is no hole, which is why one function serves both.
-pub fn broadcast_prefix_mask(cap: usize, mask_neg: f32, valid: impl Fn(usize) -> bool) -> Vec<f32> {
+///
+/// Returns a [`BroadcastMask`]: the values and their held count, one fact.
+pub fn broadcast_prefix_mask(
+    cap: usize,
+    mask_neg: f32,
+    valid: impl Fn(usize) -> bool,
+) -> BroadcastMask {
     let mut m = vec![mask_neg; cap];
+    let mut held = 0u32;
     for (col, slot) in m.iter_mut().enumerate() {
         if valid(col) {
             *slot = 0.0;
+            held += 1;
         }
     }
-    m
+    BroadcastMask { values: m, held }
 }
 
 /// Tile a `[mq, mq_pad]` causal mask into the BLOCK-MAJOR per-head buffer the emitter reads:
@@ -1010,7 +1102,7 @@ mod tests {
             tokens: &[0],
             positions: &[0],
             causal: one_row_key(),
-            prefix: Some(PrefixSource::Broadcast {
+            prefix: Some(PrefixSource::BroadcastPrefix {
                 cap: 8,
                 holds: |c: usize| c < 3,
             }),
@@ -1028,6 +1120,82 @@ mod tests {
             Staged::I32(_) => panic!("a broadcast row is a MASK, not an index tensor"),
         }
         let _ = sa::POOL_STICK; // the Blocks variant's shape params come from here
+    }
+
+    /// ⭐⭐⭐ THE SWEEP LAW AT THE BROADCAST DOOR, BOTH REGIMES. A held row that holds NO slot is
+    /// a request that never prefilled — the staging refuses it off the minted count, because an
+    /// all-masked sweep leaves the fold's `l` counting lanes the mask meant to silence. The
+    /// PREFIX regime's first chunk is the SAME all-masked row and is LEGAL: `start = 0` leaves
+    /// no resident prefix, and the causal block beside the row carries its lanes.
+    #[test]
+    fn a_held_row_that_holds_nothing_refuses_and_a_first_chunk_stages() {
+        let sh = ForwardShape {
+            rows: 1,
+            ..shape()
+        };
+        let step = sh
+            .steps()
+            .into_iter()
+            .find(|s| s.kernel == ForwardKernel::PrefixMask)
+            .expect("the shape carries a prefix step");
+        fn inputs<V: Fn(usize) -> bool + 'static>(
+            prefix: PrefixSource<'static, V>,
+        ) -> ForwardInputs<'static, V> {
+            ForwardInputs {
+                hidden: 64,
+                num_q_heads: 1,
+                mq_pad: 64,
+                causal_heads_per_block: 1,
+                embed_tokens: &[0.0; 64],
+                tokens: &[0],
+                positions: &[0],
+                causal: one_row_key(),
+                prefix: Some(prefix),
+                consts: &[],
+                mask_neg: -1.0,
+                stick_major: false,
+                kv_blocks: None,
+            }
+        }
+        let err = kernel_values(
+            &step,
+            &sh,
+            &inputs(PrefixSource::BroadcastHeld {
+                cap: 8,
+                holds: |_: usize| false,
+            }),
+        )
+        .expect_err("an all-masked held row refuses at the door");
+        assert!(
+            err.contains("holds no slot"),
+            "the refusal must name the desync: {err}"
+        );
+        match kernel_values(
+            &step,
+            &sh,
+            &inputs(PrefixSource::BroadcastHeld {
+                cap: 8,
+                holds: |c: usize| c < 3,
+            }),
+        )
+        .expect("a held row with its history's slots stages")
+        {
+            Staged::F32(v) => assert_eq!(&v[..4], &[0.0, 0.0, 0.0, -1.0]),
+            _ => panic!("a broadcast row is f32; the bind loop narrows it"),
+        }
+        match kernel_values(
+            &step,
+            &sh,
+            &inputs(PrefixSource::BroadcastPrefix {
+                cap: 8,
+                holds: |_: usize| false,
+            }),
+        )
+        .expect("a first chunk's all-masked prefix row is legal")
+        {
+            Staged::F32(v) => assert_eq!(&v[..], &[-1.0; 8]),
+            _ => panic!("a broadcast row is f32; the bind loop narrows it"),
+        }
     }
 
     /// ⭐ NO TWO STEPS BIND THE SAME TENSOR — which is what makes the play ORDER a free choice.
@@ -1064,7 +1232,11 @@ mod tests {
             let by_law = broadcast_prefix_mask(cap, neg, |c| decode_prefix_col_valid(c, start));
             let held: std::collections::BTreeSet<usize> = (0..start).collect();
             let by_history = broadcast_prefix_mask(cap, neg, |c| held.contains(&c));
-            assert_eq!(by_law, by_history, "cap={cap} start={start}");
+            // The count is the same one fact — INCLUDING ZERO at `start = 0`, the FIRST
+            // chunk's legally all-masked prefix row (the mint itself refuses nothing).
+            assert_eq!(by_law.held_columns(), by_history.held_columns(), "cap={cap} start={start}");
+            assert_eq!(by_law.held_columns(), start as u32, "cap={cap} start={start}");
+            assert_eq!(by_law.into_values(), by_history.into_values(), "cap={cap} start={start}");
         }
     }
 
@@ -1078,6 +1250,11 @@ mod tests {
         let held: std::collections::BTreeSet<usize> = [0, 1, 2, 9].into_iter().collect();
         let by_history = broadcast_prefix_mask(16, neg, |c| held.contains(&c));
         let by_len = broadcast_prefix_mask(16, neg, |c| decode_prefix_col_valid(c, 4));
+        // The count is a COUNT, not a length: the history and the interval hold the same
+        // NUMBER of columns while holding DIFFERENT ones.
+        assert_eq!(by_history.held_columns(), 4);
+        assert_eq!(by_len.held_columns(), 4);
+        let (by_history, by_len) = (by_history.into_values(), by_len.into_values());
         assert_ne!(by_history, by_len, "a hole must not read as valid");
         assert_eq!(by_history[9], 0.0, "the shared slot IS held");
         assert_eq!(by_history[5], neg, "the hole is NOT");

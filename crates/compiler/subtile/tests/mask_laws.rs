@@ -11,8 +11,8 @@ const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS a
 use scratchy_subtile::sdsc_abstract::{
     BatchSlot, DeclaredFold, FoldPages, FoldWalker, HeadRequestRow, KvHistory, KvSlot,
     MaskBlockForm, MaskBlocks, MaskPassGrid, PrefixMaskShape, RungWidth, SlotCount, SlotRun,
-    decode_batch_causal_col_valid, decode_batch_prefix_mask_f16, decode_prefix_col_valid,
-    prefill_causal_col_valid,
+    decode_batch_causal_col_valid, decode_batch_empty_sweep_row, decode_batch_prefix_mask_f16,
+    decode_prefix_col_valid, prefill_causal_col_valid,
 };
 
 /// THE RUNTIME SIDE OF A FOLD DECLARATION, as a test can hold it: it KEEPS what it was told, because the
@@ -445,6 +445,52 @@ fn a_fold_pass_carries_every_request_masked_to_its_own_history() {
             }
         }
     }
+}
+
+/// ⭐⭐⭐ THE SWEEP READING — the seed-safety law's real shape. An all-masked WINDOW is harmless
+/// only because a LATER max-rise expunges it (the fold rescales `l` and `acc` by
+/// `e^(m_old − m_new)` — base e, the device's one exponential — which underflows to zero once
+/// a valid lane raises `m` past the −65504
+/// sentinel); a row whose WHOLE sweep is empty never raises `m`, and its phantom `l` survives
+/// into the finalize's division. The reading names the first such row — a request that never
+/// prefilled — while a healthy batch, even one whose requests carry holes and shared slots,
+/// sweeps one on every row.
+#[test]
+fn an_empty_sweep_is_named_and_a_healthy_batch_sweeps_one_everywhere() {
+    let mask_neg = -(half::f16::MAX.to_f32() / 2.0);
+    const COLS: u32 = 64;
+    let (nqh, cap) = (4usize, 128usize);
+    // Ragged, hole-carrying, shared-slot batch: every request still holds its own slots.
+    let healthy = batch(&[70usize, 5, 0, 64], 3);
+    let sh = shape::<COLS>(nqh, healthy.len());
+    let m = decode_batch_prefix_mask_f16(
+        sh,
+        declared::<COLS>(cap, healthy.len()),
+        &healthy,
+        mask_neg,
+    );
+    assert_eq!(
+        decode_batch_empty_sweep_row(&m, sh),
+        None,
+        "a batch whose every request holds a slot must sweep one on every row"
+    );
+    // The same batch WITHOUT the shared-slot appends: request 2's history is EMPTY — the
+    // never-prefilled desync — and the reading names its first row, `head 0`'s `0·mq + 2`.
+    let starved = batch(&[70usize, 5, 0, 64], 0);
+    let sh = shape::<COLS>(nqh, starved.len());
+    let m = decode_batch_prefix_mask_f16(
+        sh,
+        declared::<COLS>(cap, starved.len()),
+        &starved,
+        mask_neg,
+    );
+    let row =
+        decode_batch_empty_sweep_row(&m, sh).expect("request 2's rows sweep nothing");
+    assert_eq!(
+        row as usize % starved.len(),
+        2,
+        "the named row {row} must be request 2's (row = head·mq + request)"
+    );
 }
 
 /// A prefill chunk's rows are consecutive positions of ONE prompt, so row `r` attends every column

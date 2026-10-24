@@ -359,7 +359,7 @@ pub(crate) fn run_prefill_batch(
         // so every swept column gets an explicit value; WHICH value is the request's business.
         _ => {
             pf.pmask_slots.map(
-                |cap| scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
+                |cap| scratchy_target_spyre::forward_tape::PrefixSource::BroadcastPrefix {
                     cap,
                     holds: |c: usize| decode_prefix_col_valid(c, start),
                 },
@@ -1083,7 +1083,7 @@ pub(crate) fn fill_attn_step_inputs(
             // a theorem of `real ≥ 1` and `start ≥ 0` — is READ here rather than trusted,
             // because the failure it names is silent and later than any check: an all-masked
             // first window read while the carry's max still sits at the −65504 seed gives
-            // `p = exp2(0) = 1` per lane — `l += 64`, the mask doing nothing. The refusal is a
+            // `p = e^0 = 1` per lane — `l += 64`, the mask doing nothing. The refusal is a
             // desync guard (this chunk's rows/start/real against the region), not a check a
             // legal launch can trip, and it fires before any slot is staged.
             inputs
@@ -1170,7 +1170,7 @@ pub(crate) fn fill_attn_step_inputs(
             // window — and a decode sequence's history owns its first token at logical slot 0,
             // so the least count there is ≥ 1 for every legal batch. An empty first window for
             // ANY sequence is an upstream desync (a request that never prefilled), refused
-            // here before any slot is staged: staged, it would silently add `exp2(0) = 1` per
+            // here before any slot is staged: staged, it would silently add `e^0 = 1` per
             // masked lane of that sequence's rows to their l while the carry's max still sits
             // at the −65504 seed.
             mask.first_window_valid_keys(batch.first_window_rows())
@@ -1844,7 +1844,7 @@ pub(crate) fn superdsc_forward_chunk(
         // NOT `0..p`: a request that has shared a batched step carries a HOLE, and calling that
         // hole valid feeds it another request's keys.
         let prefix_src = session.pmask_slots.map(|cap| {
-            scratchy_target_spyre::forward_tape::PrefixSource::Broadcast {
+            scratchy_target_spyre::forward_tape::PrefixSource::BroadcastHeld {
                 cap,
                 holds: |col: usize| req.kv_hist.contains(col),
             }
