@@ -2360,11 +2360,13 @@ enum ChunkHistory {
 
 /// What one layer's split-KV chunk attends with: its geometry, the pool planes and index it gathers
 /// through, the query and mask it scores, and the buffers it writes.
-struct ChunkAttn<'a> {
+struct ChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    nqh: u32,
-    hd: u32,
-    gqa: u32,
+    // ⛔ THE HEAD GEOMETRY IS NOT THREE FIELDS ANY MORE — `nqh`, `hd` and the `gqa` the construction
+    // site spelled as `nqh / nkvh` are the class's consts now, carried by the geometry the bundle was
+    // instantiated at, so a chunk body built for another model's head counts is a type that does not
+    // exist. `gqa` rides the geometry's own proof-carrying const, not a division spelled here.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     // Query rows per head: 1 at decode, the prompt chunk's width at prefill, the batch width for a
     // batched decode.
     mq: u32,
@@ -2386,12 +2388,11 @@ struct ChunkAttn<'a> {
 /// token stream — the fold's per-head score form (`ScoreArm::PerHead`): the WHOLE head dim contracted in
 /// one UNBATCHED op. (A two-stick contraction under a `y`-batch is the measured-incoherent shape;
 /// unbatched it is gemma-4's full-attention score.)
-fn row_block_query(
+fn row_block_query<const NQH: u32, const NKVH: u32, const HD: u32>(
     blocks: crate::sdsc_abstract::ChunkRowBlocks,
     b: u32,
     mq: u32,
-    nqh: u32,
-    hd: u32,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     qs: &str,
 ) -> Result<
     (
@@ -2402,6 +2403,7 @@ fn row_block_query(
     SuperDscError,
 > {
     use crate::sdsc_abstract::{ChunkRowForm, OperandPlacement, QueryRowCount};
+    let (nqh, hd) = (geom.nqh(), geom.hd());
     Ok(match blocks.form() {
         ChunkRowForm::OneSlabGroup => (
             MatM::of_head_major_rows(blocks.rows()),
@@ -2465,8 +2467,12 @@ struct RowBlockValue {
 
 impl RowBlockValue {
     /// The value ops per row block: one at one slab, one per slab above it.
-    fn slabs(blocks: crate::sdsc_abstract::ChunkRowBlocks, hd: u32) -> u32 {
+    fn slabs<const NQH: u32, const NKVH: u32, const HD: u32>(
+        blocks: crate::sdsc_abstract::ChunkRowBlocks,
+        geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    ) -> u32 {
         use crate::sdsc_abstract::ChunkRowForm;
+        let hd = geom.hd();
         match blocks.form() {
             ChunkRowForm::OneSlabGroup => 1,
             ChunkRowForm::QueryHead | ChunkRowForm::QueryGroup(_) => {
@@ -2475,15 +2481,16 @@ impl RowBlockValue {
         }
     }
 
-    fn of(
+    fn of<const NQH: u32, const NKVH: u32, const HD: u32>(
         blocks: crate::sdsc_abstract::ChunkRowBlocks,
         b: u32,
         s: u32,
         mq: u32,
         q_rows: u32,
-        hd: u32,
+        geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     ) -> RowBlockValue {
         use crate::sdsc_abstract::ChunkRowForm;
+        let hd = geom.hd();
         let stick = BlockCols::of_one_stick(Lanes::FP16).get();
         let h0 = blocks.first_head(b) * mq;
         // Slab `s`'s plane of the `[q_rows, hd]` output at the block's first row — every row of a
@@ -2534,11 +2541,12 @@ fn row_block_name(blocks: crate::sdsc_abstract::ChunkRowBlocks, b: u32) -> Strin
 /// [`assemble_new_block_chunk`].
 ///
 /// [`NewBlockForm::Chunk`]: crate::sdsc_abstract::NewBlockForm::Chunk
-struct NewChunkAttn<'a> {
+struct NewChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    nqh: u32,
-    nkvh: u32,
-    hd: u32,
+    // ⛔ THE HEAD GEOMETRY IS NOT THREE FIELDS ANY MORE — the new-token block is emitted for the
+    // class the bundle was instantiated at, the same carrier the seed and fold blocks take, so a
+    // block seeded for another model's head counts is a type that does not exist.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     /// The row blocks the block is cut into ([`ChunkRowBlocks`]): a kv head at one slab, a query head above.
     ///
     /// [`ChunkRowBlocks`]: crate::sdsc_abstract::ChunkRowBlocks
@@ -2589,17 +2597,15 @@ struct NewChunkAttn<'a> {
 /// [`NewBlockForm`]: crate::sdsc_abstract::NewBlockForm
 /// [`NewBlockForm::mask_heads_per_block`]: crate::sdsc_abstract::NewBlockForm::mask_heads_per_block
 /// [`ChunkScratch::rows_corner`]: crate::sdsc_abstract::ChunkScratch::rows_corner
-fn assemble_new_block_chunk(
+fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
-    a: NewChunkAttn<'_>,
+    a: NewChunkAttn<'_, NQH, NKVH, HD>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     let NewChunkAttn {
         t,
-        nqh,
-        nkvh,
-        hd,
+        geom,
         blocks,
         mq,
         cols,
@@ -2613,6 +2619,8 @@ fn assemble_new_block_chunk(
         esub,
         exp,
     } = a;
+    // Destructured ONCE, at the door — the class's consts, spent as values.
+    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     use crate::addr::DevOff;
     use crate::superdsc_opspec::EpilogueOpFunc;
     let stick = BlockCols::of_one_stick(Lanes::FP16);
@@ -2639,7 +2647,7 @@ fn assemble_new_block_chunk(
         // block's ROWS alone, the score too (`MatN::of_new_block_scores`), so core `c` reads exactly the
         // rows core `c` wrote; `emit`'s core-local read law compares each op's slice at build.
         let at_pin = DevOff::ZERO;
-        let (m, q, q_off) = row_block_query(blocks, b, mq, nqh, hd, qs)?;
+        let (m, q, q_off) = row_block_query(blocks, b, mq, geom, qs)?;
         ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_ncsc_{bn}_o{t}"),
             m,
@@ -2739,9 +2747,9 @@ fn assemble_new_block_chunk(
             layout,
         ));
         // The seed: no prior output to fold, so no epilogue. Above one slab, one op per slab of V.
-        let n_slabs = RowBlockValue::slabs(blocks, hd);
+        let n_slabs = RowBlockValue::slabs(blocks, geom);
         for s in 0..n_slabs {
-            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
             let v_off = if n_slabs == 1 {
                 vv.view().at(Idx::<Head>::n(kvh)).dev()
             } else {
@@ -2936,9 +2944,9 @@ pub fn chunk_prob_pins(
 ///
 /// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
 /// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
-fn assemble_attn_chunk(
+fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
-    a: ChunkAttn<'_>,
+    a: ChunkAttn<'_, NQH, NKVH, HD>,
     // The proof the new-block chunk seeded the carry this body folds onto — required, returned: the
     // chain continues to the finalize.
     carry: SeededCarry,
@@ -2947,9 +2955,7 @@ fn assemble_attn_chunk(
 ) -> Result<SeededCarry, SuperDscError> {
     let ChunkAttn {
         t,
-        nqh,
-        hd,
-        gqa,
+        geom,
         mq,
         chunk,
         history,
@@ -2962,6 +2968,10 @@ fn assemble_attn_chunk(
         bufs,
         cb,
     } = a;
+    // Destructured ONCE, at the door — the class's consts, spent as values. `gqa` is the geometry's
+    // own proof-carrying const, so the body below cannot re-derive it from two numbers that might
+    // disagree.
+    let (nqh, hd, gqa) = (geom.nqh(), geom.hd(), geom.gqa());
     use crate::addr::DevOff;
     use crate::superdsc_opspec::{EpilogueOpFunc, Scale};
     let first_op = ops.len();
@@ -2975,10 +2985,14 @@ fn assemble_attn_chunk(
     let q_rows = nqh * mq;
     let all_rows = RowCount::of_head_major_rows(q_rows);
     let nkvh = chunk.nkvh();
-    if nkvh * gqa != nqh {
+    // ⭐ THE ONLY TWO NUMBERS LEFT THAT CAN DISAGREE. `nqh`, `gqa` and `hd` are the class's consts now,
+    // carried by the geometry, so the old `nkvh * gqa != nqh` triple-check is dead by the type — what
+    // remains is the SCRATCH's head count against the class's, a bake fact (the scratch is minted from
+    // the runtime pool), refused here rather than folded wrong.
+    if nkvh != geom.nkvh() {
         return Err(SuperDscError(format!(
-            "attention chunk o{t}: {nkvh} kv heads × {gqa} query heads per group is not the {nqh} \
-             query heads the bundle carries"
+            "attention chunk o{t}: the chunk scratch carries {nkvh} kv heads, not the class's {}",
+            geom.nkvh()
         )));
     }
     // ⭐ THE ROW BLOCKS every wide op below is cut into: one per KV HEAD at one feature slab (a GQA
@@ -3162,7 +3176,7 @@ fn assemble_attn_chunk(
         // logical slots (head-independent, so `mb` collapses), added in the matmul's own epilogue; for a
         // batch chunk, the per-row block (`mask_dims` above). Q is the row block's own operand
         // (`row_block_query`) — the re-laid group block where the query was re-laid above.
-        let (m, a, a_off) = row_block_query(blocks, b, mq, nqh, hd, q_name)?;
+        let (m, a, a_off) = row_block_query(blocks, b, mq, geom, q_name)?;
         let Some((keys, kt)) = cb.lx.as_ref().and_then(|lx| lx.keys.as_ref()) else {
             ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_o{t}", blk_name(b)),
@@ -3435,7 +3449,7 @@ fn assemble_attn_chunk(
             ops,
             PromptProbs {
                 t,
-                hd,
+                geom,
                 mq,
                 blocks,
                 q_rows,
@@ -3564,7 +3578,7 @@ fn assemble_attn_chunk(
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, hd, &carry, &bufs, sym_id_base, layout);
+        emit_pre_update_correction(ops, t, q_rows, geom, &carry, &bufs, sym_id_base, layout);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3592,11 +3606,11 @@ fn assemble_attn_chunk(
     // ⭐ ABOVE ONE SLAB THE VALUE LEG IS ONE OP PER (QUERY HEAD, SLAB) (`RowBlockValue`): each op contracts
     // its head's probabilities against slab `s` of the slab-major V scratch and lands in slab `s`'s plane of
     // `run_o` at the head's rows. At one slab the op is the per-kv-head one, unchanged.
-    let out_slabs = RowBlockValue::slabs(blocks, hd);
+    let out_slabs = RowBlockValue::slabs(blocks, geom);
     for b in 0..blocks.count() {
         let (kvh, bn) = (blocks.kv_head(b), blk_name(b));
         for s in 0..out_slabs {
-            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+            let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
             let o_off = v.out_off;
             for (p, part) in parts.iter().enumerate() {
                 // An LX-resident part is its (part, kv head, slab) core-local tensor, read at its pin (no
@@ -3717,9 +3731,11 @@ fn assemble_attn_chunk(
 }
 
 /// A prompt chunk's probability phase's operands — see [`prompt_probabilities_in_lx`].
-struct PromptProbs<'a> {
+struct PromptProbs<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     t: u32,
-    hd: u32,
+    // ⛔ THE HEAD DIM IS NOT A FIELD ANY MORE — the probability phase runs at the class the bundle
+    // was instantiated at, the same carrier the chunk body and the new-token block take.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     mq: u32,
     /// The chunk's row blocks: a kv head at one slab, a query head above it.
     blocks: crate::sdsc_abstract::ChunkRowBlocks,
@@ -3737,17 +3753,18 @@ struct PromptProbs<'a> {
 /// way. The pair's ONLY mint is here, AFTER the push, so a value part's addend cannot exist
 /// without the op that wrote it having been pushed first — the ORDER law (every `ocorr`
 /// precedes every value matmul) is the handles' scope.
-fn emit_pre_update_correction(
+fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
     t: u32,
     q_rows: u32,
-    hd: u32,
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     carry: &SeededCarry,
     bufs: &BlockBufs,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> (Stk<FlatTag>, Stk<FlatTag>) {
     use crate::addr::DevOff;
+    let hd = geom.hd();
     let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
     ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_cocorr_o{t}"),
@@ -3783,9 +3800,9 @@ fn emit_pre_update_correction(
 /// emitter's core-local read law proves at build that each core reads exactly the slice it wrote. The
 /// partials then add into the denominator. MEASURED before this (granite-2b fp16, 256 rows, ~10k tokens): the
 /// chunk's attention group was 59% of prefill, HBM-bound at ~135 GB/s over six passes.
-fn prompt_probabilities_in_lx(
+fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
-    a: PromptProbs<'_>,
+    a: PromptProbs<'_, NQH, NKVH, HD>,
     // The proof the carry is seeded — this walk's `ocorr` reads the PRE-update `run_o`, so it is a
     // body program of the chain, not a seed.
     carry: SeededCarry,
@@ -3794,7 +3811,7 @@ fn prompt_probabilities_in_lx(
 ) -> Result<SeededCarry, SuperDscError> {
     let PromptProbs {
         t,
-        hd,
+        geom,
         mq,
         blocks,
         q_rows,
@@ -3803,6 +3820,8 @@ fn prompt_probabilities_in_lx(
         bufs,
         cb,
     } = a;
+    // Destructured ONCE, at the door — the class's head dim, spent as a value.
+    let hd = geom.hd();
     use crate::addr::DevOff;
     use crate::superdsc_opspec::EpilogueOpFunc;
     // A row block's rows: a kv head's `gqa·mq` at one slab, a query head's `mq` above it.
@@ -3822,12 +3841,12 @@ fn prompt_probabilities_in_lx(
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, hd, &carry, &bufs, sym_id_base, layout);
+        emit_pre_update_correction(ops, t, q_rows, geom, &carry, &bufs, sym_id_base, layout);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
     let n = parts.len();
-    let n_slabs = RowBlockValue::slabs(blocks, hd);
+    let n_slabs = RowBlockValue::slabs(blocks, geom);
     for b in 0..blocks.count() {
         // Block `b`'s rows are the `first_head(b)·mq`-th on of the head-major stream.
         let (kvh, h0, bn) = (
@@ -3902,7 +3921,7 @@ fn prompt_probabilities_in_lx(
             // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update. One
             // op per slab above one slab, each reading the same core-local `cexp`.
             for s in 0..n_slabs {
-                let v = RowBlockValue::of(blocks, b, s, mq, q_rows, hd);
+                let v = RowBlockValue::of(blocks, b, s, mq, q_rows, geom);
                 let kc = corner(part.value_corner(kvh, s), "a kv head's value part")?;
                 let slab = if n_slabs == 1 {
                     String::new()
@@ -4728,9 +4747,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             &mut ops,
             NewChunkAttn {
                 t,
-                nqh,
-                nkvh,
-                hd,
+                geom,
                 blocks,
                 mq,
                 cols,
@@ -4966,9 +4983,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // `M = B` re-lays each kv head's `gqa·B` rows into one block, rows `g·B + r` — the batch mask's own
         // `row % B` law. A prompt chunk keeps the stream's row blocks.
         let qgroup = if rows_are_requests {
-            crate::sdsc_abstract::QGroupBlock::of_batch(nkvh, nqh / nkvh, hd, mq)
+            crate::sdsc_abstract::QGroupBlock::of_batch(nkvh, geom.gqa(), hd, mq)
         } else {
-            crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, nqh / nkvh, hd, mq)
+            crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, geom.gqa(), hd, mq)
         }
         .zip(layout.and_then(|l| l.identity_tid_of_class(hd)));
         // The row blocks the body cuts every wide op into (`ChunkRowBlocks`): a kv head's `gqa·mq` rows at
@@ -4981,7 +4998,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     chunk.nkvh()
                 ))
             })?,
-            None => chunk.row_blocks(nqh / nkvh, mq),
+            None => chunk.row_blocks(geom.gqa(), mq),
         };
         let b_rows = blocks.rows();
         // A PROMPT chunk keeps its probabilities in LX from `esub` through the PV (the body's step 4′);
@@ -5173,9 +5190,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             &mut ops,
             ChunkAttn {
                 t,
-                nqh,
-                hd,
-                gqa: nqh / nkvh,
+                geom,
                 mq,
                 chunk,
                 history,
