@@ -22,6 +22,7 @@ use scratchy_subtile::host_tape::{KernelId, Operand, Site, Step, TensorId, Trans
 /// quadratic in the request count and was 93% of every element that loop narrowed. That made it
 /// the one bind the worker had to special-case — a second list (`acts_f16`) threaded through the
 /// whole staging path. As a property of the OUTPUT it is just another kernel.
+#[derive(Debug)]
 pub enum Staged {
     /// ⭐ `Cow`, BECAUSE ONE KERNEL PRODUCES NOTHING. Every other host kernel computes its rows
     /// per forward and genuinely owns them; `Const(i)` hands back a table the macro already put
