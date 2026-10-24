@@ -4614,30 +4614,31 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 s,
                 Df::Fp16,
             );
-            ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                &if n_slabs == 1 {
-                    format!("rope_rot_o{t}")
-                } else {
-                    format!("rope_rot_s{s}_o{t}")
-                },
-                crate::sdsc_abstract::MatM::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
-                crate::sdsc_abstract::MatY::of_gqa_group(heads, a_place, o_place),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_head_batched(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &rb(&x, rope_rows, rope_cols),
-                a_place,
-                &Stk::<KernelTag>::head_dim_square(hd, &p),
-                p_off,
-                &rb(&rot, rope_rows, rope_cols),
-                o_place,
-                ctx.sym_id_base,
-                ctx.layout,
-            ));
+            ctx.ops
+                .push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
+                    &if n_slabs == 1 {
+                        format!("rope_rot_o{t}")
+                    } else {
+                        format!("rope_rot_s{s}_o{t}")
+                    },
+                    crate::sdsc_abstract::MatM::of_query_rows(
+                        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                    ),
+                    crate::sdsc_abstract::MatN::one_stick(crate::sdsc_abstract::Lanes::FP16),
+                    crate::sdsc_abstract::MatK::one_stick(crate::sdsc_abstract::Lanes::FP16),
+                    crate::sdsc_abstract::MatY::of_gqa_group(heads, a_place, o_place),
+                    crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_head_batched(
+                        bmm_site::TapeLoweringSite::witness(),
+                    ),
+                    &rb(&x, rope_rows, rope_cols),
+                    a_place,
+                    &Stk::<KernelTag>::head_dim_square(hd, &p),
+                    p_off,
+                    &rb(&rot, rope_rows, rope_cols),
+                    o_place,
+                    ctx.sym_id_base,
+                    ctx.layout,
+                ));
         }
         // PREFILL KEEPS THE PER-HEAD P MATMUL — the form measured coherent on granite-8b (`7d27d734`),
         // one `[mq,hd]` window per head with the whole head dim contracted. `heads` ops instead of
