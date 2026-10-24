@@ -4262,13 +4262,17 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // (rot slab s = ±x slab s±n_slabs/2), which needs half=hd/2 to be a whole number of sticks, i.e.
     // n_slabs even (hd a multiple of 2·stick) — true for every real hd>64 (128/256/512). Guard only the
     // odd-n_slabs case (never a real head_dim) as a build error (not an on-card crash).
-    if hd > Fp16::ELEMS_PER_STICK && !(hd / Fp16::ELEMS_PER_STICK).is_multiple_of(2) {
+    // ASKED OF THE SHAPE, once for this whole emission: the slab count the guard, its refusal and
+    // the slab form below all read, through the ONE law's const-generic form — `HD` is this
+    // function's own const, so the count is compile-time and `hd / stick` is never spelled here.
+    let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16);
+    if hd > Fp16::ELEMS_PER_STICK && !nslab.get().is_multiple_of(2) {
         return err(format!(
             "RoPE prefill (t{t}, mq={mq}): head_dim {hd} > stick {stk} with an ODD stick count \
              ({ns}); the rotate-half slab-swap needs half=hd/2 to be a whole number of sticks (hd a \
              multiple of 2·stick). Real head_dims (128/256/512) satisfy this.",
             stk = Fp16::ELEMS_PER_STICK,
-            ns = hd / Fp16::ELEMS_PER_STICK,
+            ns = nslab.get(),
         ));
     }
     // ⭐ THE CLASS TID, NOT THE BARE SENTINEL — the ONE P this rope's head dim class reads. A uniform
@@ -4473,8 +4477,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // head_dim 64 never reaches here (`hd > stick` is false), so granite-3.1-2b is untouched.
     if hd > Fp16::ELEMS_PER_STICK {
         let stk = Fp16::ELEMS_PER_STICK;
-        let (hd_u, stk_u) = (hd as usize, stk as usize);
-        let n_slabs = hd_u / stk_u;
+        let hd_u = hd as usize;
+        let n_slabs = nslab.get();
         // `dev_off(&[mq,total],1,[r,col])` IS `Nest(["row","feat"],[mq,total])`; going through the
         // nest means this loop names a COORDINATE and never writes a stride.
         let doff =
@@ -4577,8 +4581,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             // reads the identity's diagonal block through, never the product it works out to.
             let p_off = crate::addr::Nest::new(&["row", "feat"], &[hd, hd], Df::Fp16)
                 .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(p_in as u32 * stk))
-                .slab(s as u32)
+                .at(crate::addr::Idx::<crate::addr::Row>::n(p_in * stk))
+                .slab(s)
                 .dev();
             // REQUEST 0, and the op sweeps every row from there: RoPE's rotate covers the whole chunk,
             // so the stream's row axis is swept work rather than a coordinate this site names.
@@ -4588,7 +4592,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 hd,
                 0,
                 0,
-                p_in as u32,
+                p_in,
                 Df::Fp16,
             );
             let o_place = crate::sdsc_abstract::OperandPlacement::of_token_stream_by_slab(
@@ -4597,7 +4601,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 hd,
                 0,
                 0,
-                s as u32,
+                s,
                 Df::Fp16,
             );
             ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
@@ -5354,7 +5358,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     //
     // At nslab == 1 there is one iteration, every slab term is 0, `stick == hd` makes `n`/`k`
     // identical, and the name collapses -- granite-3.1-2b emits exactly what it did before.
-    let krep_nslab = (hd / stick).max(1);
+    let krep_nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(Df::Fp16).get();
     for kvh in 0..nkvh {
         if decode_trim {
             break; // the copies are the identity — `new_k_rep`/`new_v_rep` ARE `new_k`/`new_v`.
