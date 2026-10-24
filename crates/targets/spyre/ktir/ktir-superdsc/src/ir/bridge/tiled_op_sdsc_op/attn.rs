@@ -3152,11 +3152,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                         src,
                         // I[64,64] — the class identity's first diagonal block, for every slab: an
                         // identity copy needs exactly the shared 2-D kernel a `y` batch demands.
-                        &Stk::<KernelTag>::kernel(
-                            stick.get() as usize,
-                            stick.get() as usize,
-                            &qb.ident,
-                        ),
+                        &Stk::<KernelTag>::one_stick_identity(&qb.ident),
                         DevOff::ZERO,
                         &rb(
                             &qb.block,

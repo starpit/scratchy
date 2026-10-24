@@ -3011,6 +3011,35 @@ impl Stk<KernelTag> {
             _p: std::marker::PhantomData,
         }
     }
+
+    /// ⭐ THE SQUARE PER-HEAD KERNEL — the RoPE rotation `P` and the replication identities,
+    /// `[hd, hd]`, minted from ONE argument: the two bare `usize` slots this replaces were
+    /// independent casts, so either could hold any of the coincident 64s (the head dim, one
+    /// fp16 stick, the block's padded rows — [`MqPad`]'s own law) without saying which, and a
+    /// drift between them compiled clean. Where `hd` is one stick this square and
+    /// [`Self::one_stick_identity`] agree; above it they do not, and the mint could not say
+    /// which of the two facts it stated.
+    pub fn head_dim_square(hd: u32, name: impl Into<String>) -> Self {
+        Self::kernel(hd as usize, hd as usize, name)
+    }
+
+    /// ⭐ THE SHARED 2-D KERNEL AN IDENTITY COPY DEMANDS — one fp16 stick in both slots
+    /// (`I[64,64]`), whatever the head dim: a `y`-batched copy shares one kernel across slabs,
+    /// and one slab of an identity is its diagonal stick block. NOT [`Self::head_dim_square`]:
+    /// the two agree exactly while `hd` is one stick and drift apart above it, where this stays
+    /// the stick and that follows the head dim.
+    pub fn one_stick_identity(name: impl Into<String>) -> Self {
+        Self::kernel(POOL_STICK as usize, POOL_STICK as usize, name)
+    }
+
+    /// ⭐ THE RESIDENT PLANE A CACHE WRITE LANDS IN — `[PLANE_SLOTS, hd]`: the PHYSICAL slot
+    /// extent that separates one kv head's block from the next, at the head dim's features. The
+    /// `k_in` slot spends the pool's own [`PagedKvPool::PLANE_SLOTS`] so the page's
+    /// addressable slots — the same number today, a proven head-dim-128 breaker when
+    /// they differed — cannot stand in (see [`PlaneExtent`]).
+    pub fn resident_kv_plane(hd: u32, name: impl Into<String>) -> Self {
+        Self::kernel(PagedKvPool::PLANE_SLOTS, hd as usize, name)
+    }
 }
 
 /// THE K-CACHE PRODUCER OFFSET — the device element offset (WITHIN one head) at which the

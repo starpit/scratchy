@@ -356,10 +356,10 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
     //
     // ⭐ AND ITS EXTENT IS READ, NOT INVENTED, WHICH IS WHY THIS ONE RESERVED CONST CAN BE PLACED
     // HERE AT ALL. P is `[hd, hd]` fp16 — `rope_at` addresses it as
-    // `Stk::<KernelTag>::kernel(hd, hd, &p)` and scratchy places it at `hd * hd * 2` — and `hd` is
-    // stated by the program: `Region`'s own doc says the rope views its plane as `[rows·heads, hd]`,
-    // so the OUTPUT view's column count IS the head dim. Nothing is guessed, so the footprint guard
-    // keeps its teeth for P as well.
+    // `Stk::<KernelTag>::head_dim_square(hd, &p)` and scratchy places it at `hd * hd * 2` — and
+    // `hd` is stated by the program: `Region`'s own doc says the rope views its plane as
+    // `[rows·heads, hd]`, so the OUTPUT view's column count IS the head dim. Nothing is guessed,
+    // so the footprint guard keeps its teeth for P as well.
     //
     // ⛔ IT IS A DEVICE CONSTANT AND NOT A PARAMETER, so it is placed with the per-launch inputs
     // (`SegRole::Activation`) and not in the output segment: scratchy's own comment at this

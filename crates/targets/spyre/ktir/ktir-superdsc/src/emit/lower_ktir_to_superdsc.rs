@@ -4385,7 +4385,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 BlockCols::of_head_dim(hd),
             ),
             crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+            &Stk::<KernelTag>::head_dim_square(hd, &p),
             crate::addr::DevOff::ZERO,
             &rb(
                 &rot,
@@ -4612,7 +4612,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 ),
                 &rb(&x, rope_rows, rope_cols),
                 a_place,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                &Stk::<KernelTag>::head_dim_square(hd, &p),
                 p_off,
                 &rb(&rot, rope_rows, rope_cols),
                 o_place,
@@ -4638,7 +4638,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 ),
                 &rb(&x, rope_rows, rope_cols),
                 off_h,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                &Stk::<KernelTag>::head_dim_square(hd, &p),
                 crate::addr::DevOff::ZERO,
                 &rb(&rot, rope_rows, rope_cols),
                 off_h,
@@ -4824,7 +4824,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 BlockCols::of_head_dim(hd),
             ),
             crate::addr::DevOff::ZERO,
-            &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+            &Stk::<KernelTag>::head_dim_square(hd, &p),
             crate::addr::DevOff::ZERO,
             &rb(
                 &rot,
@@ -4918,7 +4918,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 ),
                 &rb(&x, RowCount::of_token_rows(1), BlockCols::of_head_dim(hd)),
                 off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
+                &Stk::<KernelTag>::head_dim_square(hd, &p),
                 crate::addr::DevOff::ZERO,
                 &rb(&rot, RowCount::of_token_rows(1), BlockCols::of_head_dim(hd)),
                 off,
@@ -5392,7 +5392,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     BlockCols::of_feature_cols(nkvh * hd),
                 ),
                 slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
+                &Stk::<KernelTag>::head_dim_square(hd, &ident),
                 ident_off,
                 &rb(
                     &new_k_rep,
@@ -5418,7 +5418,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                     BlockCols::of_feature_cols(nkvh * hd),
                 ),
                 slab_off,
-                &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
+                &Stk::<KernelTag>::head_dim_square(hd, &ident),
                 ident_off,
                 &rb(
                     &new_v_rep,
@@ -6006,13 +6006,9 @@ pub fn kv_cache_write(
                         a_place,
                         // I[64,64] — the identity for EVERY slab, so the shared 2-D kernel a `y` batch demands is
                         // exactly what an identity copy needs. Offset 0: see the residency argument above.
-                        &Stk::<KernelTag>::kernel(stick as usize, stick as usize, ident),
+                        &Stk::<KernelTag>::one_stick_identity(ident),
                         crate::addr::DevOff::ZERO,
-                        &Stk::<KernelTag>::kernel(
-                            crate::sdsc_abstract::PagedKvPool::PLANE_SLOTS,
-                            hd as usize,
-                            dst,
-                        ),
+                        &Stk::<KernelTag>::resident_kv_plane(hd, dst),
                         o_place,
                         sym_id_base,
                         layout,
