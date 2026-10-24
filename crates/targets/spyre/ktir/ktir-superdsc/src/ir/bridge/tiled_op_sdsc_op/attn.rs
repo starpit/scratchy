@@ -1095,6 +1095,44 @@ where
     bufs: &'a BlockBufs,
 }
 
+/// ⭐⭐⭐⭐⭐ THE FACTS BOTH DOORS FRAME IDENTICALLY — the block's whole fact set minus the three
+/// slots the doors own: the ROLE (the door IS the role — which door a caller names fixes `seed`,
+/// so the carrier does not carry it), the STATE NAMES (the seed door is HANDED them to wrap and
+/// mint; the fold door derives them from the [`SeededCarry`] proof it requires), and the mask
+/// CORNER (the seed door is handed it; the fold door derives it from the [`FoldMaskRead`] it
+/// requires — the derivation is that door's own law). This type deletes the run of adjacent
+/// parameters the two doors each spelled — the SAME run twice, drifting independently, which is
+/// how a door grows a parameter its twin does not: a caller states the run once and hands the
+/// same value to either door, so the doors cannot disagree about what a block is.
+struct DoorFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32, FK, FV>
+where
+    FK: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    FV: Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+{
+    t: u32,
+    tag: &'a str,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE — see the twin law on
+    /// [`BlockFacts`]'s `geom` field: the doors take the SAME `AttnGeometry` their caller was
+    /// instantiated at, so a block cannot be assembled for a geometry its bundle was not.
+    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// The row framing — `mq`, `rows` and `req` as the one nest (see [`BlockNests`]'s field docs).
+    nests: BlockNests<NQH, HD>,
+    qs: &'a str,
+    /// ⭐ THE SCORE LEG'S OWN FORM: its slab-split contraction needs the head-OUTERMOST order — see
+    /// `of_score_leg`.
+    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
+    /// This block's score column count, with its door naming WHICH width.
+    width: crate::sdsc_abstract::BlockCols,
+    kt: KtLeg<'a, FK>,
+    v: VLeg<'a, FV>,
+    /// The mask read's name and row-axis law; the CORNER is door-own (see the type doc) — the
+    /// seed door is handed it, the fold door derives it from the read it requires.
+    mask: &'a str,
+    mask_bcast: bool,
+    forms: BlockForms,
+    bufs: &'a BlockBufs,
+}
+
 fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ctx: &mut EmitCtx<'_>,
     facts: BlockFacts<
@@ -2309,67 +2347,60 @@ impl ChunkBufs {
 }
 
 /// ⭐⭐⭐⭐⭐ THE SEED DOOR — the block emitter's seed role, and the ONLY spelling (with
-/// `assemble_new_block_chunk`) that mints a [`SeededCarry`]. Same parameters as the core, the role
-/// fixed, plus the allocation it wraps: the door is HANDED the state's names (the seed ops write
-/// them), and the mint — a frozen copy of the same names — happens after the core returns.
-#[allow(clippy::too_many_arguments)]
+/// `assemble_new_block_chunk`) that mints a [`SeededCarry`]. The core's fact set arrives as the
+/// ONE [`DoorFacts`] carrier — the role is fixed by the door itself, never a field the caller
+/// picks — plus the two facts this door owns: the allocation it wraps (the door is HANDED the
+/// state's names, the seed ops write them, and the mint — a frozen copy of the same names —
+/// happens after the core returns) and the mask corner, handed as the read's own corner.
 fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ctx: &mut EmitCtx<'_>,
-    t: u32,
-    tag: &str,
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    mq: crate::sdsc_abstract::QueryRowCount,
-    rows: BlockRows,
-    qs: &str,
-    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    kt_kernel: &str,
-    kt_stride: crate::sdsc_abstract::KtKernelPitch,
-    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    v_kernel: &str,
-    v_stride: crate::sdsc_abstract::VKernelRows,
-    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    width: crate::sdsc_abstract::BlockCols,
-    mask: &str,
-    mask_off: crate::addr::DevOff,
-    mask_bcast: bool,
-    batched: Option<BatchedKv>,
-    bmm_form: SharedKernelBmmForm,
-    req: u32,
-    request_axis: Option<GatheredFold>,
     state: &StateNames,
-    bufs: &BlockBufs,
+    mask_off: crate::addr::DevOff,
+    facts: DoorFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
 ) -> Result<SeededCarry, SuperDscError> {
+    // ⭐ THE DOOR'S FACTS, DESTRUCTURED ONCE — every field restates the local the BlockFacts
+    // build below reads, so the emission is the same op stream on the same values.
+    let DoorFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt,
+        v,
+        mask,
+        mask_bcast,
+        forms,
+        bufs,
+    } = facts;
     assemble_attn_block(
         ctx,
         BlockFacts {
             t,
             tag,
             geom,
-            nests: BlockNests::<NQH, HD> { mq, rows, req },
+            nests,
             qs,
             score_form,
             width,
-            kt: KtLeg {
-                kernel: kt_kernel,
-                stride: kt_stride,
-                off_fn: kt_off_fn,
-            },
-            v: VLeg {
-                kernel: v_kernel,
-                stride: v_stride,
-                off_fn: v_off_fn,
-            },
+            kt,
+            v,
             mask: MaskFacts {
                 mask,
                 off: mask_off,
                 bcast: mask_bcast,
             },
             seed: BlockSeed::SeedsState,
-            forms: BlockForms {
-                batched,
-                bmm: bmm_form,
-                request_axis,
-            },
+            forms,
             state,
             bufs,
         },
@@ -2378,42 +2409,29 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 }
 
 /// ⭐⭐⭐⭐⭐ THE FOLD DOOR — the block emitter's fold role, REQUIRING the proof the seed door mints.
-/// The `carry` parameter sits exactly where the role `bool` once did: the slot that decides what this
-/// block does to the running state now carries the evidence the state exists. A fold emitted before
+/// The `carry` parameter is the door's first own fact: the slot that decides what this block does
+/// to the running state carries the evidence the state exists. A fold emitted before
 /// any seed does not compile — there is no `SeededCarry` in scope to hand it. The token is returned
 /// unchanged (the names it carries are the buffers' own, reused in place by every fold); the chain
 /// continues to the next fold or the finalize. The core's state names come FROM the proof — a fold
-/// door needs no separate allocation parameter.
+/// door needs no separate allocation fact — and the core's fact set arrives as the ONE
+/// [`DoorFacts`] carrier, the role fixed by the door itself.
 ///
 /// ⭐ AND THE MASK READ CROSSES AS ONE VALUE ([`FoldMaskRead`]): the per-row prefix arm's corner is
 /// the sweep-law token's own door, so a fold onto that mask requires the MASK DOOR's declaration
 /// too — the shape was validated, and its staging is the sweep-readings' subject.
-#[allow(clippy::too_many_arguments)]
 fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ctx: &mut EmitCtx<'_>,
-    t: u32,
-    tag: &str,
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    mq: crate::sdsc_abstract::QueryRowCount,
-    rows: BlockRows,
-    qs: &str,
-    score_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    kt_kernel: &str,
-    kt_stride: crate::sdsc_abstract::KtKernelPitch,
-    kt_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    v_kernel: &str,
-    v_stride: crate::sdsc_abstract::VKernelRows,
-    v_off_fn: impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
-    width: crate::sdsc_abstract::BlockCols,
-    mask: &str,
-    mask_read: FoldMaskRead,
-    mask_bcast: bool,
     carry: SeededCarry,
-    batched: Option<BatchedKv>,
-    bmm_form: SharedKernelBmmForm,
-    req: u32,
-    request_axis: Option<GatheredFold>,
-    bufs: &BlockBufs,
+    mask_read: FoldMaskRead,
+    facts: DoorFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+        impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
+    >,
 ) -> Result<SeededCarry, SuperDscError> {
     // ⭐ THE MASK CORNER, DERIVED FROM THE READ — the per-row prefix arm's corner is the LAW's own
     // door (that fold cannot be emitted without the mask door's declaration); the nest arm's
@@ -2424,37 +2442,42 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         }
         FoldMaskRead::Nest(off) => off,
     };
+    // ⭐ THE DOOR'S FACTS, DESTRUCTURED ONCE — every field restates the local the BlockFacts
+    // build below reads, so the emission is the same op stream on the same values.
+    let DoorFacts {
+        t,
+        tag,
+        geom,
+        nests,
+        qs,
+        score_form,
+        width,
+        kt,
+        v,
+        mask,
+        mask_bcast,
+        forms,
+        bufs,
+    } = facts;
     assemble_attn_block(
         ctx,
         BlockFacts {
             t,
             tag,
             geom,
-            nests: BlockNests::<NQH, HD> { mq, rows, req },
+            nests,
             qs,
             score_form,
             width,
-            kt: KtLeg {
-                kernel: kt_kernel,
-                stride: kt_stride,
-                off_fn: kt_off_fn,
-            },
-            v: VLeg {
-                kernel: v_kernel,
-                stride: v_stride,
-                off_fn: v_off_fn,
-            },
+            kt,
+            v,
             mask: MaskFacts {
                 mask,
                 off: mask_off,
                 bcast: mask_bcast,
             },
             seed: BlockSeed::FoldsOntoSeed,
-            forms: BlockForms {
-                batched,
-                bmm: bmm_form,
-                request_axis,
-            },
+            forms,
             state: &carry.state,
             bufs,
         },
@@ -5028,66 +5051,52 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // and a fold emitted before any seed does not compile. `row_windows()` starts at 0
                 // by its own law, so the seed arm always fires first and the fold arm's refusal is
                 // the desync guard, not a path.
+                // ⭐ THE DOOR FACTS, STATED ONCE FOR BOTH ARMS — the seed arm and the fold arm take
+                // exactly these values (the law block above); each arm hands the door only the
+                // facts that door owns, so the two doors cannot disagree about what a block is.
+                let facts = DoorFacts {
+                    t,
+                    tag: &tag,
+                    geom,
+                    nests: BlockNests::<NQH, HD> { mq: width.mq(), rows: block_rows, req: r },
+                    qs,
+                    score_form,
+                    width: BlockCols::of_row_window(RowWindow::ROWS),
+                    kt: KtLeg {
+                        kernel: &new_kt,
+                        stride: mq_pad_t.slots().kernel_row_pitch(),
+                        off_fn: kt_off,
+                    },
+                    v: VLeg {
+                        kernel: new_v,
+                        stride: crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
+                        off_fn: v_off,
+                    },
+                    mask: cmask,
+                    // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
+                    mask_bcast: false,
+                    forms: BlockForms {
+                        batched: batched_new,
+                        bmm: bmm_form,
+                        request_axis: None,
+                    },
+                    bufs: &bufs,
+                };
                 let block_carry = if j == 0 {
-                    assemble_attn_seed_block(
-                        &mut ctx,
-                        t,
-                        &tag,
-                        geom,
-                        width.mq(),
-                        block_rows,
-                        qs,
-                        score_form,
-                        &new_kt,
-                        mq_pad_t.slots().kernel_row_pitch(),
-                        kt_off,
-                        new_v,
-                        crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
-                        v_off,
-                        BlockCols::of_row_window(RowWindow::ROWS),
-                        cmask,
-                        mask_off,
-                        false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
-                        batched_new,
-                        bmm_form,
-                        r,
-                        None,
-                        &state,
-                        &bufs,
-                    )?
+                    assemble_attn_seed_block(&mut ctx, &state, mask_off, facts)?
                 } else {
                     assemble_attn_fold_block(
                         &mut ctx,
-                        t,
-                        &tag,
-                        geom,
-                        width.mq(),
-                        block_rows,
-                        qs,
-                        score_form,
-                        &new_kt,
-                        mq_pad_t.slots().kernel_row_pitch(),
-                        kt_off,
-                        new_v,
-                        crate::sdsc_abstract::VKernelRows::of_new_block_stream(HD),
-                        v_off,
-                        BlockCols::of_row_window(RowWindow::ROWS),
-                        cmask,
-                        // The causal block's own nest corner — this mask's seed-safety is the
-                        // causal diagonal, not the histories, so it is not a sweep-law read.
-                        FoldMaskRead::Nest(mask_off),
-                        false, // cmask: varies per query row, needs the real per-row read (worker pre-tiles it)
                         seeded.take().ok_or_else(|| {
                             SuperDscError(format!(
                                 "attention o{t}: sub-block {j} folds before any window seeded the \
                                  carry — row windows must start at 0"
                             ))
                         })?,
-                        batched_new,
-                        bmm_form,
-                        r,
-                        None,
-                        &bufs,
+                        // The causal block's own nest corner — this mask's seed-safety is the
+                        // causal diagonal, not the histories, so it is not a sweep-law read.
+                        FoldMaskRead::Nest(mask_off),
+                        facts,
                     )?
                 };
                 seeded = Some(block_carry);
@@ -5623,91 +5632,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // every page it had already folded.
         carry = assemble_attn_fold_block(
             &mut ctx,
-            t,
-            &format!("p{b}"),
-            geom,
-            width.mq(),
-            block_rows,
-            qs,
-            score_form,
-            // BLOCK STRIDE = `b * hd * stick`, NOT `b * stick` (2026-07-28). `kct` is `[hd, cap]` per
-            // kv-head, STICK-MAJOR on `cap` (the last dim), so slot `s` sits at
-            // `(s/64)*(hd*64) + d*64 + (s%64)` -- one whole `hd*64` PLANE per 64-slot block, not 64
-            // elements. The score matmul reads a `[k=hd, n=stick]` kernel window whose own internal
-            // addressing is `off + d*64 + j`, so `off` must be the block's plane base `b*hd*stick`.
-            // With the old `b*stick`, block 0 was correct (offset 0 either way) but every later block
-            // read `hd`x too low -- i.e. attention was exact for the first 64 KV slots and read garbage
-            // from slot 64 onward. That is precisely the observed decode cliff (coherent to ~64 tokens,
-            // then progressive degradation as more blocks fill) and prefill's immediate garbage (a
-            // multi-block prompt is wrong from the first token). Matches the old proven flash decode
-            // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
-            // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
-            kt_src,
-            kt_pitch,
-            // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
-            // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
-            // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
-            //
-            // ⛔ AND THIS IS THE UNGATHERED READ ONLY. A gathered bundle's score and value legs take the
-            // collapsed per-request arm, whose kernel base is the SCRATCH's own row
-            // (`GatherScratch::kernel_row_off`, reached through `GatheredFold`) — a request coordinate this
-            // closure has no parameter for. A `gather` arm here would be a base no op reads.
-            |h, sl| {
-                use crate::sdsc_abstract::{KvCoord, KvPlane};
-                let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
-                crate::addr::DevOff::from_view_step(
-                    pool.addr(
-                        KvCoord::block(KvPlane::Kt, kvh)
-                            .at_slot(w.first_slot())
-                            // The contraction's head-dim slab, through the pool's OWN model — the same
-                            // `at_feat` door the V plane below uses, so the two planes cannot disagree
-                            // about where a feature slab is.
-                            .at_feat(FeatIdx::of_slab(sl)),
-                    ),
-                )
-            },
-            // The closure takes the head-dim SLAB as well as the head, so the slab rides inside the
-            // pool's own model instead of being added to a finished address. The V operand's row count
-            // is the PAGE, not `cap`, and it reaches the address only through that model — there is no
-            // separate row-count argument to disagree with the kernel's declared `in` extent.
-            v_src,
-            // ⭐ `PAGE_SLOTS`, NOT `hd` — the V plane's ROW axis is SLOTS, symmetric with `kt_stride` above.
-            //
-            // `Stk::kernel(k_in, n_out)` becomes `StickLayout { rows: k_in, cols: n_out }`, and a stick-blocked
-            // kernel addresses `(r, c)` as `(c/stk)*(rows*stk) + r*stk + c%stk`. With `k_in = hd` the
-            // stick-GROUP stride was declared `hd*stk` where this plane's is `PAGE_SLOTS*stk`.
-            //
-            // ⚠️ INERT AT head_dim 64 AND ONLY THERE: one feature stick means `c/stk == 0` always, so the
-            // wrong `rows` factor multiplies zero and NO EXISTING TEST CAN SEE THIS CHANGE. At hd=128 there
-            // are two sticks and the upper one landed at `hd*stk` instead of `PAGE_SLOTS*stk`, i.e. every
-            // feature above 63 read the wrong slot. That is why this is verifiable ONLY on a real hd=128
-            // model through `scr batch` — the emission at hd=64 must be byte-identical, and that is the
-            // safety check for this edit.
-            v_pitch,
-            // NAMED, NOT COMPOSED: `w` is a slot window and `sl` a feature slab, so both are
-            // COORDINATES. The hand-added `sl * PAGE_SLOTS * stick` was the V plane's own feature-stick
-            // stride restated at the call site.
-            //
-            // ⛔ UNGATHERED ONLY, for the same reason as the Kᵗ closure above: a gathered bundle's value
-            // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
-            |h, sl| {
-                use crate::sdsc_abstract::{KvCoord, KvPlane};
-                let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
-                crate::addr::DevOff::from_view_step(
-                    pool.addr(
-                        KvCoord::block(KvPlane::V, kvh)
-                            .at_slot(w.first_slot())
-                            .at_feat(FeatIdx::of_slab(sl)),
-                    ),
-                )
-            },
-            // This block's score WIDTH: the slots one fold window holds — quantity (2), the reduce's
-            // one-stick column budget, NOT the lane count it shares a value with.
-            BlockCols::of_slot_window(SlotWindow::SLOTS),
-            // pmask is read mb-BROADCAST, so it materialises ONE row: block b is the slab-b corner
-            // of a `[1, cap]` nest. Stating the MATERIALISED extent is what keeps the stick-group
-            // term honest for a broadcast operand.
-            pmask,
+            // The proof the state was seeded — the token the new-block half minted. This call site
+            // no longer chooses a role at all: the door IS the fold.
+            carry,
             // ONE VALIDITY ROW, OR ONE PER QUERY ROW.
             //
             // Prefix validity is head-independent, so a single broadcast row is exact while every row
@@ -5744,27 +5671,116 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .dev(),
                 )
             },
-            !rows_are_requests, // broadcast for a prompt; per-row when the rows are requests
-            // The proof the state was seeded — the token the new-block half minted. This call site
-            // no longer chooses a role at all: the door IS the fold.
-            carry,
-            batched_prefix,
-            bmm_form,
-            0,
-            // ⭐ THE PREFIX FOLD GOES PER-REQUEST INSIDE ONE PASS when the bundle gathers. That is what
-            // makes one pass serve the whole batch, so the runtime can drop the `× requests` factor from
-            // `reps` — see `fold_plan::reps`, gated on the `batched_requests` this sets below.
-            //
-            // ⛔ THE **WINDOW** IS PART OF IT, and it is why this value is built here rather than once
-            // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
-            // request), the same window whose mask slab and block name this call already carries. A value
-            // hoisted out of the loop would give every window window 0's kernel rows.
-            gather.map(|(_, scratch)| GatheredFold {
-                scratch,
-                pool,
-                window: w,
-            }),
-            &bufs,
+            DoorFacts {
+                t,
+                tag: &format!("p{b}"),
+                geom,
+                nests: BlockNests::<NQH, HD> { mq: width.mq(), rows: block_rows, req: 0 },
+                qs,
+                score_form,
+                // This block's score WIDTH: the slots one fold window holds — quantity (2), the reduce's
+                // one-stick column budget, NOT the lane count it shares a value with.
+                width: BlockCols::of_slot_window(SlotWindow::SLOTS),
+                kt: KtLeg {
+                    // BLOCK STRIDE = `b * hd * stick`, NOT `b * stick` (2026-07-28). `kct` is `[hd, cap]` per
+                    // kv-head, STICK-MAJOR on `cap` (the last dim), so slot `s` sits at
+                    // `(s/64)*(hd*64) + d*64 + (s%64)` -- one whole `hd*64` PLANE per 64-slot block, not 64
+                    // elements. The score matmul reads a `[k=hd, n=stick]` kernel window whose own internal
+                    // addressing is `off + d*64 + j`, so `off` must be the block's plane base `b*hd*stick`.
+                    // With the old `b*stick`, block 0 was correct (offset 0 either way) but every later block
+                    // read `hd`x too low -- i.e. attention was exact for the first 64 KV slots and read garbage
+                    // from slot 64 onward. That is precisely the observed decode cliff (coherent to ~64 tokens,
+                    // then progressive degradation as more blocks fill) and prefill's immediate garbage (a
+                    // multi-block prompt is wrong from the first token). Matches the old proven flash decode
+                    // verbatim: `let k_blk = b * hd * stick;` (worktree superdsc-batch-perf). The V side below
+                    // is `b*stick*hd`, which is already correct and matches that same reference (`vblk`).
+                    kernel: kt_src,
+                    stride: kt_pitch,
+                    // THE POOL COMPOSES THE REQUEST TERM, not this call site. `kt_block_base_of` is the same
+                    // `block_index(kvh) + r` the cache write bakes, so the fold's kernel and the write that
+                    // fills it cannot disagree about where request `r` lives — and no stride is spelled here.
+                    //
+                    // ⛔ AND THIS IS THE UNGATHERED READ ONLY. A gathered bundle's score and value legs take the
+                    // collapsed per-request arm, whose kernel base is the SCRATCH's own row
+                    // (`GatherScratch::kernel_row_off`, reached through `GatheredFold`) — a request coordinate this
+                    // closure has no parameter for. A `gather` arm here would be a base no op reads.
+                    off_fn: |h, sl| {
+                        use crate::sdsc_abstract::{KvCoord, KvPlane};
+                        let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        crate::addr::DevOff::from_view_step(
+                            pool.addr(
+                                KvCoord::block(KvPlane::Kt, kvh)
+                                    .at_slot(w.first_slot())
+                                    // The contraction's head-dim slab, through the pool's OWN model — the same
+                                    // `at_feat` door the V plane below uses, so the two planes cannot disagree
+                                    // about where a feature slab is.
+                                    .at_feat(FeatIdx::of_slab(sl)),
+                            ),
+                        )
+                    },
+                },
+                v: VLeg {
+                    // The closure takes the head-dim SLAB as well as the head, so the slab rides inside the
+                    // pool's own model instead of being added to a finished address. The V operand's row count
+                    // is the PAGE, not `cap`, and it reaches the address only through that model — there is no
+                    // separate row-count argument to disagree with the kernel's declared `in` extent.
+                    kernel: v_src,
+                    // ⭐ `PAGE_SLOTS`, NOT `hd` — the V plane's ROW axis is SLOTS, symmetric with `kt_stride` above.
+                    //
+                    // `Stk::kernel(k_in, n_out)` becomes `StickLayout { rows: k_in, cols: n_out }`, and a stick-blocked
+                    // kernel addresses `(r, c)` as `(c/stk)*(rows*stk) + r*stk + c%stk`. With `k_in = hd` the
+                    // stick-GROUP stride was declared `hd*stk` where this plane's is `PAGE_SLOTS*stk`.
+                    //
+                    // ⚠️ INERT AT head_dim 64 AND ONLY THERE: one feature stick means `c/stk == 0` always, so the
+                    // wrong `rows` factor multiplies zero and NO EXISTING TEST CAN SEE THIS CHANGE. At hd=128 there
+                    // are two sticks and the upper one landed at `hd*stk` instead of `PAGE_SLOTS*stk`, i.e. every
+                    // feature above 63 read the wrong slot. That is why this is verifiable ONLY on a real hd=128
+                    // model through `scr batch` — the emission at hd=64 must be byte-identical, and that is the
+                    // safety check for this edit.
+                    stride: v_pitch,
+                    // NAMED, NOT COMPOSED: `w` is a slot window and `sl` a feature slab, so both are
+                    // COORDINATES. The hand-added `sl * PAGE_SLOTS * stick` was the V plane's own feature-stick
+                    // stride restated at the call site.
+                    //
+                    // ⛔ UNGATHERED ONLY, for the same reason as the Kᵗ closure above: a gathered bundle's value
+                    // leg reads the V scratch through `GatheredFold::kernel_off`, which needs a request.
+                    off_fn: |h, sl| {
+                        use crate::sdsc_abstract::{KvCoord, KvPlane};
+                        let kvh = crate::sdsc_abstract::KvHead::of_query(h, crate::addr::Gqa::new(gqa));
+                        crate::addr::DevOff::from_view_step(
+                            pool.addr(
+                                KvCoord::block(KvPlane::V, kvh)
+                                    .at_slot(w.first_slot())
+                                    .at_feat(FeatIdx::of_slab(sl)),
+                            ),
+                        )
+                    },
+                },
+                // pmask is read mb-BROADCAST, so it materialises ONE row: block b is the slab-b corner
+                // of a `[1, cap]` nest. Stating the MATERIALISED extent is what keeps the stick-group
+                // term honest for a broadcast operand.
+                mask: pmask,
+                // broadcast for a prompt; per-row when the rows are requests
+                mask_bcast: !rows_are_requests,
+                forms: BlockForms {
+                    batched: batched_prefix,
+                    bmm: bmm_form,
+                    // ⭐ THE PREFIX FOLD GOES PER-REQUEST INSIDE ONE PASS when the bundle gathers. That is what
+                    // makes one pass serve the whole batch, so the runtime can drop the `× requests` factor from
+                    // `reps` — see `fold_plan::reps`, gated on the `batched_requests` this sets below.
+                    //
+                    // ⛔ THE **WINDOW** IS PART OF IT, and it is why this value is built here rather than once
+                    // above the loop: the kernel base an op reads is the scratch row for (kv head, THIS window,
+                    // request), the same window whose mask slab and block name this call already carries. A value
+                    // hoisted out of the loop would give every window window 0's kernel rows.
+                    request_axis: gather.map(|(_, scratch)| GatheredFold {
+                        scratch,
+                        pool,
+                        window: w,
+                    }),
+                },
+                bufs: &bufs,
+            },
         )?;
     }
 
