@@ -814,12 +814,10 @@ impl Worker for SpyreWorker {
                 // live context length. So it is asked BELOW — once, of the session, after the page maps
                 // are installed (the selector reads `fold_requests` off them) and from the same write
                 // slot the launch is given. See `SuperDscSession::step_body`.
-                // The pool geometry the entry factor needs. `head_dim` decides the entry SIZE
-                // (`hd * 64` elements), so this is not interchangeable with any other pool value.
-                let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-                    (model.kv_dim / model.head_dim) as u32,
-                    model.head_dim as u32,
-                );
+                // The pool geometry the entry factor needs — the model's own door (its doc
+                // carries why `head_dim` decides the entry size, `hd * 64` elements, and why
+                // no other pool value can stand in).
+                let pool = model.pool();
                 // WHICH RUNG IS ACTUALLY RUNNING, and how much of it is padding. A rung that failed
                 // to build at startup is logged and skipped, and the selection then lands on the next
                 // WIDER one — 8 live requests running the 16-row bundle is twice the rows for the

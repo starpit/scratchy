@@ -608,6 +608,23 @@ pub(crate) struct Loaded {
     pub(crate) served_context: usize,
 }
 
+impl Loaded {
+    /// ⭐ THE PAGED-KV POOL'S GEOMETRY — the model's own two numbers through ONE door.
+    ///
+    /// The group count (`kv_dim / head_dim`) and the two width casts were spelled at every
+    /// caller — two homes that could disagree about which pool a model runs. The pool is the
+    /// ONE lawful model-wide use of `kv_dim` (see the field: a hybrid-attention arch has no
+    /// single kv width), and `head_dim` decides the pool's entry size (`hd * 64` elements),
+    /// so this is not interchangeable with any other pool value.
+    #[cfg(feature = "spyre-hw")]
+    pub(crate) fn pool(&self) -> scratchy_subtile::sdsc_abstract::PagedKvPool {
+        scratchy_subtile::sdsc_abstract::PagedKvPool::new(
+            (self.kv_dim / self.head_dim) as u32,
+            self.head_dim as u32,
+        )
+    }
+}
+
 /// Per-request generation state: token history + the growing host KV cache.
 pub(crate) struct ReqState {
     // ⛔⛔⛔ THE TOKENS ARE NOT HERE, AND NEITHER IS THE PROMPT LENGTH.

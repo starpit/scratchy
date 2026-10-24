@@ -2477,15 +2477,12 @@ pub(crate) fn run_request_step(
         hidden: model.hidden,
         vocab: model.vocab,
     };
-    // ⭐ THE PAGED-KV POOL'S GEOMETRY, from the model's own two numbers — the same spelling the
-    // batched-decode site reads (`spyre_exec`'s `PagedKvPool::new(model.kv_dim / model.head_dim, …)`),
-    // threaded to the chunk paths because `Shared` deliberately carries no kv width: a hybrid-attention
-    // arch has no single one, and the pool is the one lawful model-wide use (see `Loaded::kv_dim`).
+    // ⭐ THE PAGED-KV POOL'S GEOMETRY — the model's own door (the same one the batched-decode
+    // site reads), threaded to the chunk paths because `Shared` deliberately carries no kv
+    // width: a hybrid-attention arch has no single one, and the pool is the one lawful
+    // model-wide use (see `Loaded::kv_dim`).
     #[cfg(feature = "spyre-hw")]
-    let pool = scratchy_subtile::sdsc_abstract::PagedKvPool::new(
-        (model.kv_dim / model.head_dim) as u32,
-        model.head_dim as u32,
-    );
+    let pool = model.pool();
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.
     // `start + n` (not `pos + 1`) because `b` is fixed for the whole step below.
