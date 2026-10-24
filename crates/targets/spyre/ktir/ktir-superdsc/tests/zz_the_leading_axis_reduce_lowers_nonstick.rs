@@ -239,6 +239,7 @@ fn layout_for(k: &KtirNode, flat_numel: i64) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x100000,
                 size: (flat_numel * 2) as u64,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

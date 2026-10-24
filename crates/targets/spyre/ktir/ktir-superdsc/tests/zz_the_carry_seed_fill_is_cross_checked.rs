@@ -127,6 +127,7 @@ fn layout_for(k: &KtirNode, scales: Vec<f32>) -> BundleLayout {
             bank: 0,
             offset: 0,
             size: 32 * 64 * 2,
+            cover: ktir_superdsc::placement::BindCover::Full,
         },
     );
     l.scalarmul_scales = scales;
@@ -145,6 +146,7 @@ fn layout_for(k: &KtirNode, scales: Vec<f32>) -> BundleLayout {
             bank: 0,
             offset: 0,
             size: 2,
+            cover: ktir_superdsc::placement::BindCover::Full,
         },
     );
     l

@@ -149,6 +149,10 @@ pub use ktir_superdsc::place::{PlaceId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
+/// ⭐ The write-cover law — what a bind may leave unwritten in its placement. Declared beside
+/// [`PlaceId`] for the same reason: the bake mints it where the placement's geometry is computed,
+/// and every runtime bind door reads it. See [`ktir_superdsc::placement::BindCover`] for the law.
+pub use ktir_superdsc::placement::BindCover;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +183,9 @@ pub struct Placement {
     pub offset: u64,
     /// Byte size.
     pub size: u64,
+    /// ⭐ WHAT A BIND MAY LEAVE UNWRITTEN — the write-cover law, minted at the placement's
+    /// construction and consulted by every runtime bind door. See [`BindCover`].
+    pub cover: BindCover,
     /// This is the graph result read back each step (`SegRole::Logits`).
     pub is_logits: bool,
 }
@@ -1031,6 +1038,7 @@ mod tests {
                     bank: 0,
                     offset: 0,
                     size: 98304,
+                    cover: BindCover::Full,
                     is_logits: true,
                 },
                 Placement {
@@ -1039,6 +1047,7 @@ mod tests {
                     bank: 0,
                     offset: 4096,
                     size: 2048,
+                    cover: BindCover::Full,
                     is_logits: false,
                 },
             ]),
@@ -1074,6 +1083,7 @@ mod tests {
                     bank: 0,
                     offset: 0,
                     size: 1024,
+                    cover: BindCover::Full,
                     is_logits: false,
                 },
                 Placement {
@@ -1082,6 +1092,7 @@ mod tests {
                     bank: 0,
                     offset: 1024,
                     size: 128,
+                    cover: BindCover::Full,
                     is_logits: false,
                 },
             ]),
@@ -1178,6 +1189,7 @@ mod tests {
                 bank: 0,
                 offset: 0,
                 size: 128,
+                cover: BindCover::Full,
                 is_logits: false,
             }]),
             step_inputs: Cow::Owned(vec![StepInput {

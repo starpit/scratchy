@@ -209,6 +209,7 @@ fn graph_layout(n: u32) -> BundleLayout {
                 bank: 0,
                 offset: u64::from(tid) * 0x10000,
                 size: 8 * 64 * 2,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

@@ -681,7 +681,7 @@ impl SuperDscSession {
         let mut bind_f16_bytes = 0usize;
         for (id, bytes) in activations_f16 {
             bind_f16_bytes += bytes.len();
-            self.exec.bind_input(*id, bytes.clone());
+            self.exec.bind_input(*id, bytes.clone())?;
         }
         // ⛔ `bind_input_raw`, NOT `bind_input`. See `Executor::raw_ids`: the shadow write applies
         // `ieee_to_sen_bytes` to every ordinary bind, which reads each 4-byte index entry as two fp16
@@ -753,7 +753,7 @@ impl SuperDscSession {
 
     /// Bind an activation source (f32 → f16) before a prefix run.
     pub fn bind(&mut self, id: crate::bundle_code::PlaceId, vals: &[f32]) -> Result<()> {
-        self.exec.bind_input(id, f32_to_f16_le(vals));
+        self.exec.bind_input(id, f32_to_f16_le(vals))?;
         Ok(())
     }
 

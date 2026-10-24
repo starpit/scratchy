@@ -746,6 +746,7 @@ mod tests {
                     bank: 0,
                     offset: off,
                     size,
+                    cover: crate::placement::BindCover::Full,
                 },
             );
             l.segment_bytes[seg] = crate::placement::align128(off + size);

@@ -148,6 +148,68 @@ impl SegRole {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE WRITE-COVER LAW — WHAT A BIND MAY LEAVE UNWRITTEN, AS A TYPE.
+///
+/// A placement's `size` is what the bake RESERVES; a bind's byte count is what
+/// a producer WRITES. Those were two unrelated numbers until now: every bind door
+/// refused only the over-bind (`bytes > size`), and a short bind silently left
+/// the placement's tail holding whatever the shadow had — which the consumers
+/// then read. [`crate::sdsc_abstract`]'s staging docs have named the hazard for
+/// the whole campaign ("an under-bind of an ADDITIVE mask leaves a tail the ops
+/// read as ZERO, i.e. as 'no mask'"); this type is that prose, enforced.
+///
+/// Every placement STATES its cover at construction — there is no default and no
+/// omission: a construction site that cannot name its cover has not finished
+/// stating its placement. Two classes exist because two bind laws exist:
+///
+/// * **`Full`** — every bind fills the placement exactly (`bytes == size`). The
+///   weights, the embeddings, the rotary tables, the causal mask, the constants,
+///   the spliced step inputs (whose fill door already demands `==`), and the
+///   BROADCAST prefix mask of a prompt chunk or solo decode, whose staging law is
+///   "THE EXTENT IS THE BAKE'S RESERVE … every swept column gets an explicit
+///   value" — the one-row form is bound whole.
+/// * **`FoldBlocks`** — the fold's per-pass tensors. A decode-BATCH prefix mask
+///   places `[nqh·mq rows, max_pages blocks]` and the host stages only the LIVE
+///   blocks ("3 blocks instead of 24"); the KV block index rides the mask's own
+///   per-pass shift, so its pitch IS the mask's block stride — one number, both
+///   tensors. A bind is a WHOLE NUMBER of blocks, never a partial one: a partial
+///   block is a truncated row of a `[pass][row][page]` grid, read as mask bytes
+///   nobody staged (which read as ZERO and therefore VALID) or as block numbers
+///   that point somewhere real.
+///
+/// ⛔ THE DOORS ASK, THE BAKE PROVES. `admits` is the one extent law every bind
+/// door consults ([`crate::Executor`]'s `place_raw` / `bind_input` family); the
+/// address audit proves the class's arithmetic against the placement's own size
+/// (`block_bytes` divides `size`, is nonzero, and does not exceed it) at bake,
+/// where those are constants. A new bind law is a new VARIANT, minted where its
+/// geometry is computed, refused by every door until then — never a relaxation
+/// of an existing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BindCover {
+    /// Every bind fills the placement exactly: `bytes == size`.
+    Full,
+    /// Every bind is a whole number of `block_bytes` blocks, at most the
+    /// placement's: the fold's per-pass mask and index tables.
+    FoldBlocks {
+        /// One `[pass][row][page]` block — the mask's own pass stride.
+        block_bytes: u64,
+    },
+}
+
+impl BindCover {
+    /// ⭐ THE ONE EXTENT LAW — does a bind of `bytes` into a `size`-byte
+    /// placement obey this cover? Every bind door asks this and nothing else;
+    /// the over-bind and the silent-short-bind are the same refusal here.
+    pub fn admits(&self, bytes: u64, size: u64) -> bool {
+        match self {
+            BindCover::Full => bytes == size,
+            BindCover::FoldBlocks { block_bytes } => {
+                bytes != 0 && *block_bytes != 0 && bytes % block_bytes == 0 && bytes <= size
+            }
+        }
+    }
+}
+
 /// One tensor's global placement in the packed bundle.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct TensorPlacement {
@@ -162,6 +224,9 @@ pub struct TensorPlacement {
     pub offset: u64,
     /// Byte size (f16 = 2 B/elem, rows*cols*2).
     pub size: u64,
+    /// ⭐ WHAT A BIND MAY LEAVE UNWRITTEN — the write-cover law, stated at
+    /// construction. See [`BindCover`].
+    pub cover: BindCover,
 }
 
 /// The device-tile re-tile spec the executor (C++ shim) consumes to stage a matmul
@@ -234,6 +299,12 @@ pub struct KvBlockIndexReservation {
     /// rides the mask's per-pass shift, so its per-pass pitch is this over the mask's block
     /// count and its reservation is the whole grid. There is no second spelling of this number.
     pub bytes: u64,
+    /// ⭐ THE SAME GRID'S BLOCK STRIDE — `pmbytes / pm_blocks`, the one number the mask's own
+    /// [`BindCover::FoldBlocks`] mint uses. The index's binds are whole blocks of exactly this
+    /// many bytes (the host stages the live passes' entries at the head, one block per live
+    /// page), so this is the cover the placement door mints — a bind that is not a whole
+    /// number of these blocks is a truncated row of the pass grid, read as block numbers.
+    pub block_bytes: u64,
 }
 
 /// The whole-bundle memory plan: every tensor → (segment, offset, size, role),
@@ -1201,6 +1272,13 @@ impl BundleLayout {
                 segment: seg,
                 offset: off,
                 size: res.bytes,
+                // ⭐ THE WRITE-COVER, FROM THE RESERVATION'S OWN PITCH — the mask's block
+                // stride, the one number both tensors derive from. A bind is a whole number
+                // of these blocks: the host stages the live passes' entries, one block per
+                // live page, and a partial block is a truncated pass row.
+                cover: BindCover::FoldBlocks {
+                    block_bytes: res.block_bytes,
+                },
             },
         );
         self.segment_bytes[seg] = align128(off + res.bytes);

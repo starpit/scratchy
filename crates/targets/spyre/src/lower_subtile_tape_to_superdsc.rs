@@ -252,6 +252,9 @@ use ktir_superdsc::emit::EmittedOp;
 ///    other's, which is silent: wrong output, or a fault when the second is a kernel.
 ///  * **Non-empty.** A zero-length field is read by the device as `1 << 27` flits = 16 GiB, in both
 ///    `handleHostDMA` and `handleXLATentry`. Zero does not mean nothing.
+///  * **Cover arithmetic.** A `FoldBlocks` write-cover whose block does not divide the placement's
+///    size describes no legal bind — the doors would refuse every producer forever. See
+///    [`ktir_superdsc::placement::BindCover`].
 ///  * **Allocatable.** A segment is ONE `FlexAllocator` allocation, served from ONE region, so it
 ///    cannot exceed [`bundle::MAX_SEGMENT_BYTES`] — see that constant for the granite-3.1-8b-fp16
 ///    weight segment this catches.
@@ -351,6 +354,39 @@ fn audit_layout_addresses(
                 p.offset + p.size,
                 p.bank,
             ));
+        }
+        // ── COVER: the write-cover class's arithmetic, proven against the placement's own size ──
+        //
+        // The class is a law the bind doors enforce at runtime; here its NUMBERS are constants,
+        // so a class that cannot describe any legal bind of this placement is a `cargo build`
+        // error and not a launch-time refusal. A `FoldBlocks` whose block does not divide the
+        // size leaves a tail no whole number of blocks can ever fill; a block of 0 admits only
+        // 0-byte binds (the device reads a zero length as 16 GiB); a block past the size admits
+        // nothing at all. `Full` states `bytes == size` and needs no arithmetic.
+        if let ktir_superdsc::placement::BindCover::FoldBlocks { block_bytes } = p.cover {
+            if block_bytes == 0 {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover with a 0 B block — no nonzero bind can be a \
+                     whole number of zero-byte blocks",
+                    p.id
+                ));
+            } else if block_bytes > p.size {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover of {block_bytes} B blocks over a {} B \
+                     placement — one block already over-binds it",
+                    p.id,
+                    p.size
+                ));
+            } else if p.size % block_bytes != 0 {
+                fail.push(format!(
+                    "{} declares a FoldBlocks cover of {block_bytes} B blocks over a {} B \
+                     placement, which is not a whole number of blocks — the {} B tail can never \
+                     be filled by any legal bind",
+                    p.id,
+                    p.size,
+                    p.size % block_bytes
+                ));
+            }
         }
     }
 
@@ -863,6 +899,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: sz,
+                // ⭐ FULL — a source's binds are its whole extent: weights stage exactly, and an
+                // activation the host binds short is a tail the consumers read unwritten. The
+                // fold's per-pass tensors are the one family with a block law, and each of those
+                // mints its cover at its own site with its geometry in hand.
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -935,6 +976,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: companion.bank,
                     offset: off,
                     size: companion.size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[seg] = align128(off + companion.size);
@@ -1065,6 +1107,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1215,6 +1258,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: seg,
                 offset: off,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[seg] = align128(off + sz);
@@ -1247,6 +1291,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: hoff,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(hoff + sz);
@@ -1261,6 +1306,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 segment: a,
                 offset: ioff,
                 size: sz,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(ioff + sz);
@@ -1288,6 +1334,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     bank: 0,
                     offset: off,
                     size: sz,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[a] = align128(off + sz);
@@ -1376,6 +1423,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: nbytes(tid),
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -1409,7 +1457,9 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // grid it shares, CARRIED UNPLACED on the layout (see the comment at its hand-off below) and
     // placed by `BundleLayout::place_kv_block_index_last` after the last host-staged activation,
     // so a body whose gathering differs moves nothing the host stages.
-    let mut kv_block_index_bytes: Option<u64> = None;
+    let mut kv_block_index_reservation: Option<
+        ktir_superdsc::placement::KvBlockIndexReservation,
+    > = None;
     // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
     // placements below (the pool those planes' gathers name), consumed by the gather door's
     // entry-unit check.
@@ -1537,6 +1587,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         bank: 0,
                         offset: layer_base + plane_off,
                         size: plane_bytes,
+                        cover: ktir_superdsc::placement::BindCover::Full,
                     },
                 );
             }
@@ -1622,6 +1673,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: seg3i,
                             offset: off,
                             size: pbytes,
+                            cover: ktir_superdsc::placement::BindCover::Full,
                         },
                     );
                     seg_bytes[seg3i] = align128(off + pbytes);
@@ -1726,6 +1778,16 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     * pm_blocks
                     * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64
                     * 2;
+                // ⭐⭐⭐ THE MASK'S WRITE-COVER — the same `rows_are_requests` predicate the
+                // reservation above gates on, because it is the same fact: a PROMPT CHUNK's one
+                // row is bound WHOLE ("the extent is the bake's reserve … every swept column
+                // gets an explicit value" — `Full`), while a decode BATCH's host stages only
+                // the LIVE blocks of the `[pass][row][page]` grid, one `pm_block_bytes` block
+                // per live page. `pm_block_bytes` is `pmbytes / pm_blocks` by construction —
+                // the mask's own pass stride, the ONE number the KV block index's reservation
+                // takes for its pitch too. There is no second spelling of this number.
+                let pm_block_bytes =
+                    pm_rows * scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u64 * 2;
                 placements.insert(
                     ATTN_MASK_TID,
                     TensorPlacement {
@@ -1735,6 +1797,13 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: mseg,
                         offset: pmoff,
                         size: pmbytes,
+                        cover: if rows_are_requests {
+                            ktir_superdsc::placement::BindCover::FoldBlocks {
+                                block_bytes: pm_block_bytes,
+                            }
+                        } else {
+                            ktir_superdsc::placement::BindCover::Full
+                        },
                     },
                 );
                 seg_bytes[mseg] = align128(pmoff + pmbytes);
@@ -1752,6 +1821,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                         segment: a,
                         offset: cmoff,
                         size: cmbytes,
+                        // ⭐ FULL — the causal mask is bound whole, keyed, once per causal
+                        // shape (`CausalKey`); a short bind would leave swept columns
+                        // unmasked, i.e. VALID.
+                        cover: ktir_superdsc::placement::BindCover::Full,
                     },
                 );
                 seg_bytes[a] = align128(cmoff + cmbytes);
@@ -1902,7 +1975,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
                     // would be inert here, but agreeing with the mask's own grid is what keeps the
                     // shift meaningful for both tensors.
-                    kv_block_index_bytes = Some(pmbytes);
+                    kv_block_index_reservation = Some(ktir_superdsc::placement::KvBlockIndexReservation {
+                        bytes: pmbytes,
+                        block_bytes: pm_block_bytes,
+                    });
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split
@@ -1919,6 +1995,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                             segment: a,
                             offset: npoff,
                             size: npbytes,
+                            cover: ktir_superdsc::placement::BindCover::Full,
                         },
                     );
                     seg_bytes[a] = align128(npoff + npbytes);
@@ -1999,6 +2076,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
                 bank: 0,
                 offset: off,
                 size: 2,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         seg_bytes[a] = align128(off + 2);
@@ -2022,8 +2100,7 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // layouts agree on every other tensor by construction, which is what
     // `ladder_stages_one_layout` holds the macro to. A reservation still pending at the bake
     // is a build panic, never a silently unplaced index.
-    let kv_block_index = kv_block_index_bytes
-        .map(|bytes| ktir_superdsc::placement::KvBlockIndexReservation { bytes });
+    let kv_block_index = kv_block_index_reservation;
 
     // Synthetic intermediates (assigned lazily during lowering) start ABOVE the
     // colored intermediates in seg3, so they never overlap a real intermediate.
@@ -2297,6 +2374,7 @@ mod weight_tail_tests {
                     bank: 0,
                     offset,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
             seg_bytes[w] = align128(offset + size);
@@ -6177,6 +6255,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
             offset: p.offset,
             size: p.size,
             is_logits: p.role == SegRole::Logits,
+            // ⭐ THE WRITE-COVER RIDES ALONG — minted at the placement's own construction
+            // site, where its geometry was in hand; the runtime's bind doors read it here.
+            cover: p.cover,
         })
         .collect();
     // SYNTHETIC intermediates are not SubtileIR tensors, so they have no `t{id}` — they are named
@@ -6205,6 +6286,9 @@ fn bake_layout(l: &BundleLayout) -> bundle::BundleLayout<'static> {
                 .get(name)
                 .unwrap_or_else(|| panic!("synthetic '{name}' has an offset but no reserved size")),
             is_logits: false,
+            // ⭐ FULL — a synthetic is device-written by the op that minted it; a host bind
+            // short of its extent would leave the op's readers on unwritten bytes.
+            cover: ktir_superdsc::placement::BindCover::Full,
         }
     }));
 
@@ -9621,6 +9705,7 @@ mod tests {
                     bank: 0,
                     offset: u64::from(tid) * 0x10000,
                     size: 8 * 64 * 2,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         }

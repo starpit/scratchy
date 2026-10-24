@@ -65,6 +65,7 @@ fn hd_layout() -> (BundleLayout, Vec<String>) {
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -344,6 +345,7 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
                     bank: 0,
                     offset: 40 << 30,
                     size,
+                    cover: ktir_superdsc::placement::BindCover::Full,
                 },
             );
         }

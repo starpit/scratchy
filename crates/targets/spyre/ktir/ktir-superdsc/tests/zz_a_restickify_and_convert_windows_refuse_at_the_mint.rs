@@ -61,6 +61,7 @@ fn layout_placing(entries: &[(u32, u64)]) -> BundleLayout {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

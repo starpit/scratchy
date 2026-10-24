@@ -731,6 +731,10 @@ fn pack(
             bank: 0,
             offset,
             size,
+            // ⭐ FULL — a spliced-program parameter is staged through the step-input fill,
+            // whose extent law is `==` exactly; the FoldBlocks family is the paged-fold
+            // pass's own, minted where its grid is computed.
+            cover: ktir_superdsc::placement::BindCover::Full,
         },
     ) {
         // A repeated tid means one buffer reached this walk twice — two parameters bound to it, or a

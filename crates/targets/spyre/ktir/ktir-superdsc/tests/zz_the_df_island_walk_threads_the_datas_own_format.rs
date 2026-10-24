@@ -465,6 +465,7 @@ fn layout_for(k: &KtirNode, numel: i64, bytes_per_elem: u64) -> BundleLayout {
                 bank: 0,
                 offset: (i as u64) * 0x100000,
                 size: (numel as u64) * bytes_per_elem,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

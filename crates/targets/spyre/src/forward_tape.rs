@@ -1021,6 +1021,7 @@ mod tests {
             bank: 0,
             offset: 0,
             size: 64,
+            cover: crate::bundle_code::BindCover::Full,
             is_logits: false,
         };
         // Everything placed ⇒ nothing unplaced.

@@ -1577,7 +1577,29 @@ impl Executor {
 
     /// Bind an ACTIVATION by name (IEEE-fp16 bytes) — re-bound every step. A name bound before
     /// prepare is recorded as a weight instead, matching the C++ contract.
-    pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) {
+    ///
+    /// ⛔ THE BIND COVERS ITS PLACEMENT'S WRITE-COVER OR REFUSES. A `Full` placement demands its
+    /// whole extent; a `FoldBlocks` one admits a whole number of its blocks and nothing else
+    /// ([`bundle::BindCover`], minted where the placement was sized). A short bind against a
+    /// `Full` placement leaves a tail of whatever the device had there — for an ADDITIVE mask
+    /// that tail reads as ZERO, i.e. as "no mask" — and the door is where that stops. A name
+    /// this bundle never placed still binds (the refill skips it, as it always has); the cover
+    /// law speaks only for tensors the bake placed.
+    pub fn bind_input(&mut self, id: bundle::PlaceId, bytes: Vec<u8>) -> Result<()> {
+        if let Some(p) = self.places.get(&id) {
+            let len = bytes.len() as u64;
+            if !p.cover.admits(len, p.size) {
+                bail!(
+                    "bind_input('{id}'): {len} B against a {} B placement (seg{} off {}) whose \
+                     write-cover is {:?} — REFUSING, a bind that misses its cover leaves the \
+                     untaken bytes holding whatever the device had there",
+                    p.size,
+                    p.segment,
+                    p.offset,
+                    p.cover
+                );
+            }
+        }
         if !self.prepared {
             self.weight_ids.insert(id);
         }
@@ -1589,6 +1611,7 @@ impl Executor {
         self.keyed.remove(&id);
         self.staged.remove(&id);
         self.bound.insert(id, bytes);
+        Ok(())
     }
 
     /// ⭐ Bind an f32 ACTIVATION by converting it STRAIGHT INTO ITS SLOT OF THE SHADOW — f32 →
@@ -1600,7 +1623,7 @@ impl Executor {
     ///
     /// The placement checks the refill makes for a `bound` activation are made here instead, where
     /// the write happens: a name this bundle never placed is skipped (as the refill skips it), and a
-    /// bind longer than its own placement, or past its segment's shadow, is refused.
+    /// bind that misses its placement's write-cover, or lands past its segment's shadow, is refused.
     pub fn bind_input_f32(&mut self, id: bundle::PlaceId, vals: &[f32]) -> Result<()> {
         if !self.prepared {
             bail!("bind_input_f32('{id}') before prepare — the shadow is sized at prepare");
@@ -1617,13 +1640,15 @@ impl Executor {
             return Ok(());
         };
         let len = vals.len() as u64 * 2;
-        if len > p.size {
+        if !p.cover.admits(len, p.size) {
             bail!(
-                "bind: activation '{id}' binds {len} B into a {} B placement (seg{} off {}) — \
-                 REFUSING, this would corrupt the following tensors",
+                "bind_input_f32('{id}'): {len} B against a {} B placement (seg{} off {}) whose \
+                 write-cover is {:?} — REFUSING, a bind that misses its cover leaves the untaken \
+                 bytes holding whatever the device had there",
                 p.size,
                 p.segment,
-                p.offset
+                p.offset,
+                p.cover
             );
         }
         let dst = self.seg_host[seg.get()]
@@ -1663,6 +1688,20 @@ impl Executor {
             bail!(
                 "bind_input_keyed('{id}') before prepare — a keyed activation is a per-step bind"
             );
+        }
+        if let Some(p) = self.places.get(&id) {
+            let len = bytes.len() as u64;
+            if !p.cover.admits(len, p.size) {
+                bail!(
+                    "bind_input_keyed('{id}'): {len} B against a {} B placement (seg{} off {}) \
+                     whose write-cover is {:?} — REFUSING, a bind that misses its cover leaves \
+                     the untaken bytes holding whatever the device had there",
+                    p.size,
+                    p.segment,
+                    p.offset,
+                    p.cover
+                );
+            }
         }
         self.raw_ids.remove(&id);
         self.staged.remove(&id);
@@ -1747,13 +1786,16 @@ impl Executor {
     /// bytes are read as block numbers), or a byte count that is not a whole number of int32
     /// entries (a partial trailing entry is a truncated address).
     ///
-    /// ⛔ SHORT IS LEGITIMATE AND LONG IS NOT, which is why this is `>` and not `!=` — several
-    /// activations bind less than their placement on purpose (pmask reserves `[nqh*mq, cap]` and
-    /// binds one broadcast row; the index table's own pass block is the MASK's stride, of which one
-    /// pass fills the head).
+    /// ⛔ SHORT IS LEGAL EXACTLY ON THE CLASSES THE BAKE DECLARED — the write-cover law
+    /// ([`bundle::BindCover`]): a `Full` placement demands its whole extent, and a `FoldBlocks`
+    /// placement admits a whole number of its blocks and nothing else. The short binds the old
+    /// `<=` served are the fold's per-pass family — the index table that rides the mask's shift,
+    /// whose block stride is the one number its mint shares with the mask's own — and those
+    /// mints state `FoldBlocks` where they are sized. A short bind against any other placement
+    /// now has no value to arrive in.
     pub fn place_raw(&self, id: bundle::PlaceId, bytes: Vec<u8>) -> Option<RawBind> {
         let p = self.places.get(&id)?;
-        (bytes.len().is_multiple_of(4) && bytes.len() as u64 <= p.size)
+        (bytes.len().is_multiple_of(4) && p.cover.admits(bytes.len() as u64, p.size))
             .then_some(RawBind { id, bytes })
     }
 
@@ -1834,7 +1876,7 @@ impl Executor {
             .step_input_fill(slot, bytes.len())
             .map_err(|e| anyhow!("{e} (bundle {})", self.code.fp))?;
         match fill.stage {
-            bundle::StepInputStage::IeeeF16 => self.bind_input(fill.place, bytes),
+            bundle::StepInputStage::IeeeF16 => self.bind_input(fill.place, bytes)?,
             bundle::StepInputStage::RawU32 => {
                 // `place_raw` is the ONLY constructor of the value `bind_input_raw` accepts; its
                 // own guards (whole u32 entries, no over-bind) are subsumed by the fill's `==`

@@ -37,6 +37,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+/// The `cover` default speaks ONLY for a placements.json written before the field existed. It
+/// picks the STRICTER class on purpose: a stale row read as `Full` refuses a short bind loudly,
+/// it can never silently admit one. The current bake always writes the field; the default never
+/// speaks for a fresh file.
+fn full_cover() -> crate::bundle_code::BindCover {
+    crate::bundle_code::BindCover::Full
+}
+
 /// One `placements.json` entry.
 #[derive(Debug, serde::Deserialize)]
 struct PlaceRow {
@@ -46,6 +54,8 @@ struct PlaceRow {
     bank: u32,
     offset: u64,
     size: u64,
+    #[serde(default = "full_cover")]
+    cover: crate::bundle_code::BindCover,
 }
 
 /// One `synth` entry: an intermediate the lowering minted, with the segment and offset it was
@@ -398,6 +408,9 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             bank: p.bank,
             offset: p.offset,
             size: p.size,
+            // The bake minted the cover at the placement's own construction site; the door
+            // reads it back here, exactly as it reads the extent.
+            cover: p.cover,
             // ⛔ READ OFF THE PRODUCER'S ROLE, NOT GUESSED FROM THE SEGMENT. The read-back tensor is
             // whichever the producer marked `Logits`; a launcher that picked "the last place" or "the
             // highest segment" would read the wrong buffer on any bundle whose output is not last.
@@ -813,7 +826,7 @@ pub fn run(dir: &Path, input: &[String], output: &[String]) -> Result<()> {
             Some((rows, cols)) => restick(&bytes, rows, cols, true),
             None => bytes,
         };
-        exec.bind_input(ktir_superdsc::place::PlaceId::Act(*tid), bytes);
+        exec.bind_input(ktir_superdsc::place::PlaceId::Act(*tid), bytes)?;
     }
 
     // ⛔ BEFORE `prepare`, AND NOT OPTIONAL EVEN WITH NO WEIGHTS. `stage_weights` is where the HOST

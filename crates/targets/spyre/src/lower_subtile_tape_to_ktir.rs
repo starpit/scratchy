@@ -1800,6 +1800,7 @@ pub fn complete_program_scales(layout: &mut BundleLayout, op_lists: &[&[EmittedO
                 segment: seg,
                 offset: off,
                 size,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
         layout.segment_bytes[seg] = align128(off + size);
@@ -1939,6 +1940,10 @@ pub fn place_step_inputs(
                                 segment: seg,
                                 offset: off,
                                 size,
+                                // ⭐ FULL — a spliced step input is filled through
+                                // `fill_step_input`, whose extent law is `==` exactly; a
+                                // short fill is refused there and would be refused here.
+                                cover: ktir_superdsc::placement::BindCover::Full,
                             },
                         );
                         layout.segment_bytes[seg] = align128(off + size);
@@ -2074,6 +2079,7 @@ pub fn place_paged_fold_carry(
                                 segment: seg,
                                 offset: off,
                                 size,
+                                cover: ktir_superdsc::placement::BindCover::Full,
                             },
                         );
                         layout.segment_bytes[seg] = align128(off + size);

@@ -2590,6 +2590,7 @@ mod pointwise_width_caps {
                 bank: 0,
                 offset: 0,
                 size,
+                cover: crate::placement::BindCover::Full,
             },
         );
         l

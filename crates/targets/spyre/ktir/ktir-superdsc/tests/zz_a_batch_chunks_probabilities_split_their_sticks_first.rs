@@ -55,6 +55,7 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
                 bank: 0,
                 offset: (i as u64) << 30,
                 size: 1 << 30,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

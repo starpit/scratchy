@@ -9896,6 +9896,7 @@ fn placement_tokens(
         bank,
         offset,
         size,
+        cover,
         is_logits,
     } = p;
     let id = place_id_tokens(id);
@@ -9905,10 +9906,34 @@ fn placement_tokens(
         proc_macro2::Literal::u64_unsuffixed(*offset),
         proc_macro2::Literal::u64_unsuffixed(*size),
     );
+    let cover = bind_cover_tokens(cover);
     quote! {
         ::scratchy_target_spyre::bundle_code::Placement {
             id: #id, segment: #segment, bank: #bank, offset: #offset, size: #size,
-            is_logits: #is_logits,
+            cover: #cover, is_logits: #is_logits,
+        }
+    }
+}
+
+/// One [`bundle::BindCover`], spelled for the emitted code. The class is a baked constant of
+/// the placement, so it renders exactly as the bake minted it — `Full` for every whole-bound
+/// tensor, `FoldBlocks { block_bytes }` for the paged-fold pass grid.
+#[cfg(feature = "spyre")]
+fn bind_cover_tokens(
+    c: &scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BindCover,
+) -> proc_macro2::TokenStream {
+    use scratchy_target_spyre::lower_subtile_tape_to_superdsc::bundle::BindCover;
+    match c {
+        BindCover::Full => quote! {
+            ::scratchy_target_spyre::bundle_code::BindCover::Full
+        },
+        BindCover::FoldBlocks { block_bytes } => {
+            let block_bytes = proc_macro2::Literal::u64_unsuffixed(*block_bytes);
+            quote! {
+                ::scratchy_target_spyre::bundle_code::BindCover::FoldBlocks {
+                    block_bytes: #block_bytes,
+                }
+            }
         }
     }
 }

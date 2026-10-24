@@ -360,6 +360,7 @@ fn layout_for(k: &KtirNode, slot: GatheredSlot) -> BundleLayout {
                 // Distinct offsets inside seg3, so no two parameters share a base.
                 offset: (i as u64) * 0x10000,
                 size: bytes,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }
@@ -651,6 +652,7 @@ fn a_gathered_load_with_two_consumers_is_refused_by_name() {
             bank: 0,
             offset: 4 * 0x10000,
             size: (K as u64) * (HEAD as u64) * 2,
+            cover: ktir_superdsc::placement::BindCover::Full,
         },
     );
     let mut sid = 0i64;
@@ -955,6 +957,7 @@ fn both_gathered_layout(k: &KtirNode) -> BundleLayout {
                 bank: 0,
                 offset: ((i + 1) as u64) * 0x10000,
                 size: bytes,
+                cover: ktir_superdsc::placement::BindCover::Full,
             },
         );
     }

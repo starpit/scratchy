@@ -1628,6 +1628,7 @@ mod constant_tape_tests {
             bank: 0,
             offset: 0,
             size: placed_bytes,
+            cover: bundle::BindCover::Full,
             is_logits: false,
         });
         // The BAKED count's staging covers the placement — the pair agrees.
@@ -1635,9 +1636,10 @@ mod constant_tape_tests {
             .verify_causal_placement(&lay, mq, width)
             .expect("the bake's own nqh stages exactly its placement");
         // THE DEFECT'S SHAPE: a staging at the QUOTIENT covers only `2·mq` of the `4·mq` rows.
-        // The quotient staging itself is silent at bind time (under-binding is allowed), so the
-        // CHECK is what must fire — its `want` comes from the bake's `nqh`, never from host
-        // arithmetic, and the two counts disagree on exactly this geometry.
+        // The quotient staging is refused at the bind door since the write-cover law (a `Full`
+        // placement demands its whole extent), but the CHECK still fires first — at bake, from
+        // the bake's own `nqh`, never from host arithmetic, and the two counts disagree on
+        // exactly this geometry.
         let quotient = wiring.geometry.hidden / wiring.geometry.head_dim;
         assert_ne!(
             quotient, wiring.geometry.nqh,
@@ -1660,6 +1662,7 @@ mod constant_tape_tests {
             bank: 0,
             offset: 0,
             size: quotient_bytes,
+            cover: bundle::BindCover::Full,
             is_logits: false,
         });
         let why = wiring
@@ -1775,6 +1778,7 @@ mod constant_tape_tests {
                     bank: 0,
                     offset: 0,
                     size: staged.len() as u64 * 2,
+                    cover: bundle::BindCover::Full,
                     is_logits: false,
                 });
                 w.verify_causal_placement(&lay, rows, mq_pad as u32)
@@ -1845,6 +1849,7 @@ mod constant_tape_tests {
                         bank: 0,
                         offset: 0,
                         size: hd as u64 * hd as u64 * 2,
+                        cover: bundle::BindCover::Full,
                         is_logits: false,
                     })
                     .collect(),
