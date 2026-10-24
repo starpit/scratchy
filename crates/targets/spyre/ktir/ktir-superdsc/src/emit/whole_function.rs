@@ -3267,7 +3267,8 @@ pub fn lower_function(
                 .iter()
                 .find(|s| op.operands.get(1) == Some(&s.tile))
         {
-            ctx.ops.push(lower_indexed_write(k, sc, ctx.sym_id_base, ctx.layout)?);
+            ctx.ops
+                .push(lower_indexed_write(k, sc, ctx.sym_id_base, ctx.layout)?);
             continue;
         }
         // ⭐⭐⭐ A STORE OF A SPLATTED CONSTANT — a FILL, the store-side member of the
@@ -3327,13 +3328,14 @@ pub fn lower_function(
             }
             o = windowed_region(k, o, tile)?;
             o.is_out = true;
-            ctx.ops.append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
-                f.name,
-                value,
-                &o,
-                ctx.sym_id_base,
-                ctx.layout,
-            )?);
+            ctx.ops
+                .append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
+                    f.name,
+                    value,
+                    &o,
+                    ctx.sym_id_base,
+                    ctx.layout,
+                )?);
             lowered += 1;
             continue;
         }
@@ -3378,13 +3380,14 @@ pub fn lower_function(
                 };
                 o = windowed_region(k, o, tile)?;
                 o.is_out = true;
-                ctx.ops.append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
-                    f.name,
-                    &src,
-                    &o,
-                    ctx.sym_id_base,
-                    ctx.layout,
-                )?);
+                ctx.ops
+                    .append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
+                        f.name,
+                        &src,
+                        &o,
+                        ctx.sym_id_base,
+                        ctx.layout,
+                    )?);
                 lowered += 1;
                 continue;
             }
