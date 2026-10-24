@@ -3115,6 +3115,14 @@ pub fn lower_function(
 ) -> Result<Vec<super::EmittedOp>, Error> {
     let f = &k.func;
     let mut out = Vec::new();
+    // ⭐ THE EMITTER CONTEXT, MINTED ONCE AT THIS DOOR — the sink this walk owns, with its own pair
+    // parameters as the counter and the placement authority (the mint-once-at-door pattern). Every
+    // push, sub-door call and materialization below goes through the ONE `&mut ctx`.
+    let mut ctx = super::EmitCtx {
+        ops: &mut out,
+        sym_id_base,
+        layout,
+    };
     let mut lowered = 0usize;
 
     // INTERMEDIATES, BY THE VALUE THAT PRODUCED THEM.
@@ -3161,7 +3169,7 @@ pub fn lower_function(
     // ever writes, and the bundle would read garbage on card — so the walk declares nothing
     // itself. The two honest fixes live at the producer: a graph tensor is placed by the tape
     // walk, and a per-step input needs an Activation placement plus a forward-tape fill step.
-    if let Some(l) = layout {
+    if let Some(l) = ctx.layout {
         for r in regions(k)?.iter() {
             if l.placements.contains_key(&r.tid) || crate::reserved_tids::is_reserved(r.tid) {
                 continue;
@@ -3259,7 +3267,7 @@ pub fn lower_function(
                 .iter()
                 .find(|s| op.operands.get(1) == Some(&s.tile))
         {
-            out.push(lower_indexed_write(k, sc, sym_id_base, layout)?);
+            ctx.ops.push(lower_indexed_write(k, sc, ctx.sym_id_base, ctx.layout)?);
             continue;
         }
         // ⭐⭐⭐ A STORE OF A SPLATTED CONSTANT — a FILL, the store-side member of the
@@ -3319,12 +3327,12 @@ pub fn lower_function(
             }
             o = windowed_region(k, o, tile)?;
             o.is_out = true;
-            out.append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
+            ctx.ops.append(&mut super::lower_ktir_to_superdsc::scalarfill_at(
                 f.name,
                 value,
                 &o,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             )?);
             lowered += 1;
             continue;
@@ -3370,12 +3378,12 @@ pub fn lower_function(
                 };
                 o = windowed_region(k, o, tile)?;
                 o.is_out = true;
-                out.append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
+                ctx.ops.append(&mut super::lower_ktir_to_superdsc::mintcopy_at(
                     f.name,
                     &src,
                     &o,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 )?);
                 lowered += 1;
                 continue;
@@ -3862,10 +3870,8 @@ pub fn lower_function(
                     gi,
                     gathered_matmul_materializes(
                         k,
-                        layout,
-                        &mut GatherEmit {
-                            sym_id_base,
-                            out: &mut out,
+                        GatherEmit {
+                            ctx: &mut ctx,
                             floor,
                             inter: &mut inter,
                         },
@@ -4285,7 +4291,7 @@ pub fn lower_function(
             // `Y` one spray at a per-trip window), so its `r_len` is the source's slice height,
             // never the sweep — [`band_rows_of`]'s own law, with the wall-18 measurement.
             let dims = [band_rows_of(&per_op, &bcast_axes, dims[0]), dims[1]];
-            let Some(layout) = layout else {
+            let Some(layout) = ctx.layout else {
                 return err(format!(
                     "{}: `{:?}`'s result is an intermediate, which needs a `BundleLayout` to hold \
                      its buffer -- `layout: None` is the unit-test arm and cannot place one",
@@ -4367,7 +4373,7 @@ pub fn lower_function(
                 name,
                 program,
                 &per_op,
-                sym_id_base,
+                ctx.sym_id_base,
                 Some(layout),
                 headmajor,
                 WalkProof {
@@ -4377,7 +4383,7 @@ pub fn lower_function(
                     batched: batched_geo,
                 },
             )?;
-            out.append(&mut emitted);
+            ctx.ops.append(&mut emitted);
             lowered += 1;
             continue;
         };
@@ -4414,8 +4420,8 @@ pub fn lower_function(
             f.name,
             program,
             &per_op,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
             headmajor,
             WalkProof {
                 b_orient,
@@ -4424,7 +4430,7 @@ pub fn lower_function(
                 batched: batched_geo,
             },
         )?;
-        out.append(&mut emitted);
+        ctx.ops.append(&mut emitted);
         lowered += 1;
     }
 
@@ -4446,7 +4452,7 @@ pub fn lower_function(
             ));
         }
         let r = regions(k)?;
-        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, sym_id_base, layout);
+        return super::lower_ktir_to_superdsc::lmlast(f.name, k, &r, ctx.sym_id_base, ctx.layout);
     }
     if lowered == 0 {
         return err(format!("{}: no compute op in the function", f.name));
@@ -4819,15 +4825,15 @@ fn emit_one(
 /// `false` is not an error: a matmul whose B is NOT the gathered table still falls to the
 /// fail-closed refusal below, with its own name in the message.
 ///
-/// The emission's mutable scratch (`sym_id_base`, `out`, `inter`) travels in
-/// [`GatherEmit`] rather than as three more arguments — the walk owns one of these, threading it
-/// to every materialization. `floor` is [`lower_function`]'s node-derived tid bound, carried so
-/// this mint honors it like the walk's own does.
-struct GatherEmit<'a> {
-    sym_id_base: &'a mut i64,
-    out: &'a mut Vec<super::EmittedOp>,
+/// The emission context and the walk's own scratch travel in [`GatherEmit`] rather than as more
+/// arguments: the ONE emission context (`super::EmitCtx` — sink, counter, placement authority)
+/// by re-borrow from the door that minted it, beside the two facts only this walk states.
+/// `floor` is [`lower_function`]'s node-derived tid bound, carried so this mint honors it like
+/// the walk's own does; `inter` is the same walk's intermediates.
+struct GatherEmit<'a, 'b> {
+    ctx: &'b mut super::EmitCtx<'a>,
     floor: u32,
-    inter: &'a mut std::collections::HashMap<Ssa, Region>,
+    inter: &'b mut std::collections::HashMap<Ssa, Region>,
 }
 
 /// THE CONSUMER'S OWN ROW IN THE WALK — the two facts the batched form's admission reads that
@@ -4850,19 +4856,13 @@ enum GatheredB {
 
 fn gathered_matmul_materializes(
     k: &KtirNode,
-    layout: Option<&BundleLayout>,
-    emit: &mut GatherEmit<'_>,
+    emit: GatherEmit<'_, '_>,
     g: Gather,
     gathered_input: usize,
     in_values: &[Ssa],
     consumer: GatherConsumer<'_>,
 ) -> Result<GatheredB, Error> {
-    let GatherEmit {
-        sym_id_base,
-        out,
-        floor,
-        inter,
-    } = emit;
+    let GatherEmit { ctx, floor, inter } = emit;
     let f = &k.func;
     // ⛔ THE GATHERED OPERAND MUST BE THE OP'S OWN GATHERED INPUT, proven by identity — the
     // input at `gathered_input` IS the value this tile's load produced. A TID comparison cannot
@@ -4918,7 +4918,7 @@ fn gathered_matmul_materializes(
     }
     // ⛔ A `BundleLayout` IS REQUIRED — the mint is the second party that makes the intermediate's
     // buffer real (`layout: None` is the unit-test arm and cannot place one).
-    let Some(layout) = layout else {
+    let Some(layout) = ctx.layout else {
         return err(format!(
             "{}: a gathered matmul's B needs a `BundleLayout` to hold its materialized \
              intermediate -- `layout: None` is the unit-test arm and cannot place one",
@@ -4983,7 +4983,7 @@ fn gathered_matmul_materializes(
         // and reading it row-major moves every byte past the first stick column.
         let rows = bg.copy_rows();
         let stick = crate::work::FP16_ELEMS_PER_STICK;
-        let tid = mint_inter(k, layout, *floor, gathered_result);
+        let tid = mint_inter(k, layout, floor, gathered_result);
         layout.synth(crate::place::PlaceId::Act(tid), &[rows, stick]);
         let r = Region {
             tid,
@@ -5034,12 +5034,12 @@ fn gathered_matmul_materializes(
             .map_err(|message| Error { message })?;
             super::apply_lx_residency(&mut cop, Some(layout));
             let folds = crate::superdsc_opspec::SdscFoldSet::new(cop.iter.cores_used());
-            out.push(
+            ctx.ops.push(
                 super::emit_sdsc_tiled(
                     &format!("{inter_name}_g{leg}"),
                     &cop,
                     &folds,
-                    sym_id_base,
+                    ctx.sym_id_base,
                     Some(layout),
                 )
                 .map_err(Error::from)?,
@@ -5096,7 +5096,7 @@ fn gathered_matmul_materializes(
             ));
         }
     }
-    let tid = mint_inter(k, layout, *floor, gathered_result);
+    let tid = mint_inter(k, layout, floor, gathered_result);
     layout.synth(crate::place::PlaceId::Act(tid), &[rows, head]);
     let r = Region {
         tid,
@@ -5156,11 +5156,11 @@ fn gathered_matmul_materializes(
                 BlockCols::of_feature_cols(head),
             ),
         },
-        sym_id_base,
+        ctx.sym_id_base,
         Some(layout),
     )
     .map_err(Error::from)?;
-    out.extend(copied);
+    ctx.ops.extend(copied);
     // ── (4) THE MATMUL'S B, REWRITTEN TO THE INTERMEDIATE — recorded under the GATHERED VALUE
     // so the walk's `inter` lookup hands the matmul the intermediate's region for that operand,
     // and the caller REPLACES `per_op`'s B slot with it before `emit_one` runs.

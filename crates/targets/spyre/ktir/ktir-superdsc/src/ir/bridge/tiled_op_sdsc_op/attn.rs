@@ -70,7 +70,7 @@ use super::reduce::{
 };
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
-    EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
+    EmitCtx, EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
     assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
 };
 use crate::exp_base::ExpBase;
@@ -980,25 +980,6 @@ fn check_internal_buffers_are_read_where_written(
         }
     }
     Ok(())
-}
-
-/// ⭐ THE EMITTER CONTEXT — the op sink, the sym-id counter and the placement authority as ONE
-/// value, because they are ONE fact: a single emission whose program order is the call order into
-/// the ONE sink, whose sym ids are minted only through the ONE counter, and whose placement
-/// questions have exactly one authority. Minted once at the door that owns the sink
-/// ([`assemble_attn`]) and threaded as ONE `&mut EmitCtx` through every emitter that pushes into
-/// it — never split into per-field borrows at a call site, which would let two spellings of "the"
-/// emission disagree about order, ids or placement. The one-op assemblers (`matmul`, `reduce`,
-/// `pointwise`) keep their `(sym_id_base, layout)` pair WITHOUT the sink — they RETURN their op
-/// rather than push it, the one-op-descriptor form — and a sink-threader hands them
-/// `ctx.sym_id_base` / `ctx.layout` as plain call arguments.
-struct EmitCtx<'a> {
-    /// The one sink: program order is call order into this Vec.
-    ops: &'a mut Vec<EmittedOp>,
-    /// The one counter: every sym id is minted through this base.
-    sym_id_base: &'a mut i64,
-    /// The one placement authority — absent exactly where the pair's was.
-    layout: Option<&'a BundleLayout>,
 }
 
 #[allow(clippy::too_many_arguments)]

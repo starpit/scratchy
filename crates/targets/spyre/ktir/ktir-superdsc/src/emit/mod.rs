@@ -2595,6 +2595,26 @@ pub fn touched_blocks(v: &crate::superdsc_opspec::ArgView, iter: &WorkPlan) -> T
     }
 }
 
+/// ⭐ THE EMITTER CONTEXT — the op sink, the sym-id counter and the placement authority as ONE
+/// value, because they are ONE fact: a single emission whose program order is the call order into
+/// the ONE sink, whose sym ids are minted only through the ONE counter, and whose placement
+/// questions have exactly one authority. Minted once at the door that owns the sink —
+/// `assemble_attn` for the attention path, `lower_function` for the whole-function walk — and
+/// threaded as ONE `&mut EmitCtx` through every emitter that pushes into it, never split into
+/// per-field borrows at a call site, which would let two spellings of "the" emission disagree
+/// about order, ids or placement. The one-op assemblers (`matmul`, `reduce`, `pointwise`) keep
+/// their `(sym_id_base, layout)` pair WITHOUT the sink — they RETURN their op rather than push it,
+/// the one-op-descriptor form — and a sink-threader hands them `ctx.sym_id_base` / `ctx.layout`
+/// as plain call arguments.
+pub(crate) struct EmitCtx<'a> {
+    /// The one sink: program order is call order into this Vec.
+    pub(crate) ops: &'a mut Vec<EmittedOp>,
+    /// The one counter: every sym id is minted through this base.
+    pub(crate) sym_id_base: &'a mut i64,
+    /// The one placement authority — absent exactly where the pair's was.
+    pub(crate) layout: Option<&'a BundleLayout>,
+}
+
 #[derive(Clone)]
 pub struct EmittedOp {
     pub op_name: String,
