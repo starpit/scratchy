@@ -1791,6 +1791,16 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                      stream of {n} row(s) is not a plane any gathered op addresses"
                 )));
             }
+            // The chunk form's two new planes are refused by the same law: neither a block's
+            // whole contraction extent nor a part's region is a plane this gathered leg addresses.
+            crate::sdsc_abstract::VKernelRows::NewBlockChunk(n)
+            | crate::sdsc_abstract::VKernelRows::ChunkPart(n) => {
+                return Err(SuperDscError(format!(
+                    "the gathered value leg reads the V scratch — a byte-for-byte copy of the \
+                     page plane — so its kernel rows are the pool's own page slots; a block or \
+                     part extent of {n} row(s) is not a plane any gathered op addresses"
+                )));
+            }
         };
         // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
         // the ungathered batched arm below already makes, for the same reason.
@@ -2586,6 +2596,12 @@ struct NewChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
     /// [`MqPad::slots`]: crate::sdsc_abstract::MqPad::slots
     /// [`SlotExtent::kernel_row_pitch`]: crate::sdsc_abstract::SlotExtent::kernel_row_pitch
     kt_pitch: crate::sdsc_abstract::KtKernelPitch,
+    /// The value kernel's rows for the same block — [`VKernelRows::of_new_block_chunk`], the
+    /// chunk form's whole-block contraction of `new_v`'s `[mq_pad, hd]` kv-head blocks. The seed
+    /// and fold emitters take their `v_stride` the same way.
+    ///
+    /// [`VKernelRows::of_new_block_chunk`]: crate::sdsc_abstract::VKernelRows::of_new_block_chunk
+    v_rows: crate::sdsc_abstract::VKernelRows,
     qs: &'a str,
     new_kt: &'a str,
     new_v: &'a str,
@@ -2640,6 +2656,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         mq,
         cols,
         kt_pitch,
+        v_rows,
         qs,
         new_kt,
         new_v,
@@ -2800,7 +2817,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bmm_form,
                 &rb(exp, grp_rows, cols),
                 at_pin,
-                &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
+                &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols as usize, new_v),
                 v_off,
                 &rb(
                     state.o(),
@@ -3686,6 +3703,9 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // `gqa·mq` rows to divide and keeps the planned split. A BATCH chunk's `gqa·B` rows are
                 // still a few dozen, against a contraction `B` requests deep — the decode form.
                 let k_part = BlockCols::of_chunk_part(*part);
+                // The value kernel's rows over the part — the gathered V scratch is read at the
+                // part's own rows, so the kernel's rows are the part's extent.
+                let v_rows = crate::sdsc_abstract::VKernelRows::of_chunk_part(*part);
                 let k = if decode_values {
                     MatK::of_chunk_decode_values(k_part)
                 } else {
@@ -3701,7 +3721,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(&cb.cexp, blk_rows, width),
                     rc,
-                    &Stk::<KernelTag>::kernel(part.slots() as usize, v_cols as usize, v_name),
+                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v_cols as usize, v_name),
                     kc,
                     &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     o_off,
@@ -3887,7 +3907,12 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
         );
         for (p, part) in parts.iter().enumerate() {
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
-            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
+            // The value kernel's rows over the part — the gathered V scratch is read at the part's
+            // own rows (the same door the HBM-gather value leg takes).
+            let (pw, v_rows) = (
+                BlockCols::of_chunk_part(*part),
+                crate::sdsc_abstract::VKernelRows::of_chunk_part(*part),
+            );
             ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_cesub_{bn}_s{p}_o{t}"),
                 "subtract",
@@ -3968,7 +3993,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
-                    &Stk::<KernelTag>::kernel(ps as usize, v.v_cols as usize, &cb.gv),
+                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols as usize, &cb.gv),
                     kc,
                     &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     v.out_off,
@@ -4785,6 +4810,9 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // The new block's own Kᵗ scratch's pitch, from the pad's own door — the same mint
                 // the seed/fold emitters below take as their `kt_stride` argument.
                 kt_pitch: mq_pad_t.slots().kernel_row_pitch(),
+                // The value kernel's rows over the same block — new_v's kv-head blocks are
+                // [mq_pad, hd], so the chunk form contracts the whole block.
+                v_rows: crate::sdsc_abstract::VKernelRows::of_new_block_chunk(mq_pad_t.slots()),
                 qs,
                 new_kt: &new_kt,
                 new_v,

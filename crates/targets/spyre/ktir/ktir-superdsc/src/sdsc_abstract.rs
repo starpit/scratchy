@@ -259,23 +259,26 @@ impl KtKernelPitch {
 }
 
 /// THE V VALUE KERNEL'S DECLARED ROW EXTENT (`Stk::kernel`'s `k_in`) — WHICH V plane the value
-/// leg's shared kernel reads, carried as the type. Exactly two planes are ever that kernel, and
-/// each is a door:
+/// leg's shared kernel reads, carried as the type. Every plane is a door:
 ///
 /// - [`VKernelRows::Page`] — the resident V page plane `[PAGE_SLOTS, hd]`, and the gathered
 ///   scratch's byte-for-byte copy of it (a scratch row IS a page row — the copy is the gather's
 ///   own contract — so the scratch's row extent is the pool's own page slots on both the gathered
 ///   and ungathered paths).
-/// - the NEW block's wide stream ([`VKernelRows::of_new_block_stream`]) — never restickified, so
-///   the sub-block value leg declares its per-head slice `[hd, hd]`.
+/// - the NEW block's wide stream, in both its forms: the sub-block value leg's per-head slice
+///   ([`VKernelRows::of_new_block_stream`] — never restickified, so the slice is declared `hd`
+///   rows) and the chunk form's whole-block contraction ([`VKernelRows::of_new_block_chunk`] —
+///   `new_v`'s kv-head block is `[mq_pad, hd]`, so the value leg contracts it whole).
+/// - a chunk part's V region ([`VKernelRows::of_chunk_part`] — the part's own slots, in the
+///   CHUNK's gathered V scratch — a `[rows, chunk slots]` block, not the page-plane copy above).
 ///
 /// ⭐ THE GATHERED VALUE LEG REFUSES EVERY PLANE BUT THE PAGE. Its scratch rows are page rows, so
-/// a window's or a stream's extent there would declare a stick-group stride the buffer does not
-/// have — the exact defect that once made the gathered geometry differ from the pool's (the
-/// gathered arms "used to declare ONE WINDOW … where the pool declares a whole page"). The
-/// refusal sits at the arm's door; the ungathered arms take either plane. A bare `u32` in that
-/// slot — as this was, fed the head dim at the new-block call — pairs any number with any plane,
-/// and the pairing is invisible exactly where the two agree.
+/// a window's, a stream's, a block's, or a part's extent there would declare a stick-group stride
+/// the buffer does not have — the exact defect that once made the gathered geometry differ from
+/// the pool's (the gathered arms "used to declare ONE WINDOW … where the pool declares a whole
+/// page"). The refusal sits at the arm's door; the ungathered arms take any plane. A bare `u32`
+/// in that slot — as this was, fed the head dim at the new-block call — pairs any number with
+/// any plane, and the pairing is invisible exactly where the two agree.
 /// ```
 /// use ktir_superdsc::sdsc_abstract::{PagedKvPool, VKernelRows};
 /// // The page plane's rows are the pool's own page slots — and nothing else's number.
@@ -290,6 +293,10 @@ pub enum VKernelRows {
     Page,
     /// The new-token block's unrestickified wide stream, its per-head slice declared `hd` rows.
     NewBlockStream(u32),
+    /// The new-token block's CHUNK form — `new_v`'s kv-head block `[mq_pad, hd]`, contracted whole.
+    NewBlockChunk(u32),
+    /// A chunk part's V region in the chunk's gathered V scratch — the part's own slots.
+    ChunkPart(u32),
 }
 
 impl VKernelRows {
@@ -300,11 +307,27 @@ impl VKernelRows {
         VKernelRows::NewBlockStream(hd)
     }
 
+    /// The NEW block's CHUNK-form door: `new_v`'s kv-head block is `[mq_pad, hd]` (RoPE packs it
+    /// `[nkvh][mq][hd]`, and the block's rows ARE its slots — the [`MqPad`] identity), so the
+    /// value leg contracts the whole block. Demands the block's own [`SlotExtent`], minted only
+    /// by [`MqPad::slots`], so no other plane's number can fill the slot.
+    pub const fn of_new_block_chunk(ext: SlotExtent) -> VKernelRows {
+        VKernelRows::NewBlockChunk(ext.slot_axis_extent())
+    }
+
+    /// A chunk part's V region — the part's own slots, demanded by the part itself
+    /// ([`ChunkPart`]): the chunk's gathered V scratch is read at a part's rows, so the
+    /// kernel's rows are the part's extent — never the chunk's and never a page's.
+    pub const fn of_chunk_part(part: ChunkPart) -> VKernelRows {
+        VKernelRows::ChunkPart(part.slots())
+    }
+
     /// The plane's own row extent — `Stk::kernel`'s `k_in` slot.
     pub const fn rows(self) -> u32 {
         match self {
             VKernelRows::Page => PagedKvPool::PAGE_SLOTS as u32,
-            VKernelRows::NewBlockStream(n) => n,
+            VKernelRows::NewBlockStream(n) | VKernelRows::NewBlockChunk(n)
+            | VKernelRows::ChunkPart(n) => n,
         }
     }
 }
