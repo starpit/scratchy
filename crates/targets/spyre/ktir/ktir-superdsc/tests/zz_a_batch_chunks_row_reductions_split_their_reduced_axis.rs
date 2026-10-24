@@ -6,7 +6,7 @@
 //! Emitted from the shipped `assemble_attn` against a real layout, at granite-3.1-2b's geometry (hd 64) and
 //! granite-3.1-8b's (hd 128, the batch's query-group blocks), on every rung of every batch width.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
@@ -63,22 +63,24 @@ fn emit<const HD: u32>(pages: u32, rows: Rows) -> Vec<(String, serde_json::Value
         ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        bundle_rows,
-        EXTENT,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        requests,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: requests,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )

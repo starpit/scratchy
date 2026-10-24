@@ -17,7 +17,7 @@
 
 use ktir_superdsc::emit;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
-    SharedKernelBmmForm, assemble_attn, assemble_matmul_off,
+    AttnFacts, SharedKernelBmmForm, assemble_attn, assemble_matmul_off,
 };
 use scratchy_subtile::addr::DevOff;
 use scratchy_subtile::sdsc_abstract::{
@@ -280,24 +280,26 @@ fn assemble_attn_threads_the_form_to_every_gform_op() {
         let width = scratchy_subtile::sdsc_abstract::attn_bundle_rows(geom, mq, rar)
             .expect("a width the emitter can bake");
         assemble_attn(
-            7,
-            geom,
-            width,
-            // The storage/sweep pair on the boundary's one carrier — the sweep is the full cap
-            // (no rung).
-            KvExtent::new(SlotCount::new(cap), SlotCount::new(cap)),
-            "qs",
-            "nks",
-            "nvr",
-            "kct",
-            "vc",
-            "pmask",
-            "cmask",
-            None,
-            None,
-            scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-            rar,
-            false,
+            AttnFacts {
+                t: 7,
+                geom,
+                bundle_rows: width,
+                // The storage/sweep pair on the boundary's one carrier — the sweep is the full cap
+                // (no rung).
+                extent: KvExtent::new(SlotCount::new(cap), SlotCount::new(cap)),
+                qs: "qs",
+                new_k_scaled: "nks",
+                new_v: "nvr",
+                kct: "kct",
+                vc: "vc",
+                pmask: "pmask",
+                cmask: "cmask",
+                kv_block_index: None,
+                chunk: None,
+                out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+                rows_are_requests: rar,
+                headmajor_handoff: false,
+            },
             &mut sym,
             None,
         )

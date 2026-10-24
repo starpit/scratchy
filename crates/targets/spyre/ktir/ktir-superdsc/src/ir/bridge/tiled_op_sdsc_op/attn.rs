@@ -4207,6 +4207,76 @@ fn no_chunk_op_is_time_tiled(ops: &[EmittedOp], t: u32) -> Result<(), SuperDscEr
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE BUNDLE'S WHOLE FACT SET — the top door's single counterpart to the doors'
+/// [`DoorFacts`]: every field is a fact the bundle's attention emission reads, grouped exactly as
+/// the boundary frames them — the op's identity, the geometry/row/extent carriers their own laws
+/// already type, the eight operand names, the gather's coupling, the split-KV chunk, the output's
+/// placement, and the two regime facts. This deletes the sixteen-parameter positional run every
+/// caller spelled — the arrangement where a name, a mask or a regime flag transposes silently —
+/// and the sink pair (`sym_id_base`/`layout`) stays in the signature BESIDE the carrier, not in
+/// it: the `EmitCtx` mint inside this door owns the sink, and a sink is not a bundle fact.
+pub struct AttnFacts<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
+    pub t: u32,
+    /// ⛔⛔⛔ THE HEAD GEOMETRY IS NOT THREE BARE `u32` PARAMETERS ANY MORE. `nqh`/`nkvh`/`hd` arrive
+    /// as ONE `AttnGeometry`, whose consts the model's parsed `config.json` reached through
+    /// `model_geometry::with_config_attn_geometry` — so an nqh/nkvh transposition, or a head dim paired
+    /// with another model's head counts, is a type that does not exist rather than a slot
+    /// swap. The GQA divisibility proof rides on the type: a non-dividing pair fails the BUILD.
+    pub geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
+    /// ⛔⛔⛔ NEITHER `mq` NOR `mq_pad` IS A BARE `u32` PARAMETER ANY MORE — and neither is the
+    /// shared-buffer row count derived HERE any more. The width, its pad AND the row laws arrive
+    /// FUSED in one `AttnBundleRows<NQH>`, minted at the bundle's parse boundary
+    /// (`attn_bundle_rows`): a decode width is a ladder CONST there (`Rung<MQ>`), so its pad and
+    /// every row extent — `MaskRows = NQH*MQ`, the mask shape's row count — are the COMPILER's
+    /// arithmetic (`RungRowLaws`); a prefill width is the runtime law through the same doors. So
+    /// this fact set has no pair of row-count integers left to swap — the arrangement the `mq_pad`
+    /// parameter swap lived in — no way to pair a width with a pad computed from some other width,
+    /// and no second `nqh * mq` multiplication in this function for the mask staging to drift from.
+    /// The `NQH` on the carrier ties it to THIS geometry: a frame minted for another model's head
+    /// count is a type error at this slot. (Historically: `mq_pad` was a second `u32` two positions
+    /// from `mq` in a run of seven, reconciled only by a `debug_assert_eq!` the release bake
+    /// compiles out; `mq_pad` and `nqh*mq` are EQUAL at nqh=32/mq=2 and diverge from mq=4 up —
+    /// exactly the width boundary where the card's batch decode started failing.)
+    pub bundle_rows: crate::sdsc_abstract::AttnBundleRows<NQH>,
+    /// ⭐ THE STORAGE/SWEEP PAIR, ON ONE CARRIER — `cap` (what the resident cache holds) and the
+    /// sweep this bundle takes of it traveled as two adjacent bare `u32`s, swappable at every call
+    /// site exactly where `ActiveCap`'s own doc says the confusion lives. The carrier fixes the
+    /// order at one mint; the door below reads the fields once, typed.
+    pub extent: crate::sdsc_abstract::KvExtent,
+    pub qs: &'a str,
+    pub new_k_scaled: &'a str,
+    pub new_v: &'a str,
+    pub kct: &'a str,
+    pub vc: &'a str,
+    pub pmask: &'a str,
+    pub cmask: &'a str,
+    /// ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX TENSOR'S NAME — `Some` makes the PREFIX score leg's KV read a
+    /// HARDWARE GATHER; `None` emits exactly what this bundle emitted before the gather existed.
+    ///
+    /// ⛔ THE `Option` IS THE COUPLING, NOT A SWITCH. A gathered read takes its base from this tensor's
+    /// entries, so an emission that gathers without a host staging them addresses block 0 for every
+    /// row — every request reading row 0's keys, fluent and wrong. Making the NAME the condition means
+    /// the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
+    /// must fill it. There is no arrangement in which one is present and the other is not.
+    pub kv_block_index: Option<&'a str>,
+    /// ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — `Some` attends every resident page in ONE pass through a kv-head-major
+    /// gather ([`assemble_attn_chunk`]) instead of the per-page fold; the index tensor above is then the
+    /// CHUNK's table. `None` emits exactly the per-page fold this bundle emitted before.
+    pub chunk: Option<crate::sdsc_abstract::ChunkScratch>,
+    pub out_id: crate::place::PlaceId,
+    /// TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
+    /// one resident history, requests each have their own.
+    pub rows_are_requests: bool,
+    /// ⭐⭐⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj IN THE SLAB-MAJOR ORDER — the caller-side
+    /// statement of the head-major restructure, minted where the bundle's facts are (the spyre door's
+    /// `BundleAttnParams::headmajor_handoff`; a triton producer's caller states its own). TRUE only
+    /// for the single-row (mq == 1) body of a model whose head dim spans more than one feature slab
+    /// and whose o matmul is fp8 W8A8 — the conditions the permuted o_proj copy is staged for. The
+    /// matmul half of the contract (the B-operand swap to that copy) keys on the SAME fact at the
+    /// matmul door, so neither half can be emitted without the other.
+    pub headmajor_handoff: bool,
+}
+
 /// Assemble the full AttnDecode node: ONE algorithm for any `mq`. `qs` is Q ALREADY multiplied by
 /// sqrt_scale (the caller resolves that constant from the BundleLayout registry before calling
 /// this). `new_k_scaled` is this step's roped new-K, ALSO already ·sqrt_scale (torch-spyre's
@@ -4217,70 +4287,33 @@ fn no_chunk_op_is_time_tiled(ops: &[EmittedOp], t: u32) -> Result<(), SuperDscEr
 /// (prefix validity) and `cmask` (new-block causal) are the worker-staged masks (see the module doc's
 /// STAGE 1/2 note — `cmask` is only numerically exact at `mq==1`, STAGE 2 closes the mq>1 gap).
 /// Returns the ops in emission order; the caller still runs the cache-write + post-restickify steps.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
-    t: u32,
-    // ⛔⛔⛔ THE HEAD GEOMETRY IS NOT THREE BARE `u32` PARAMETERS ANY MORE. `nqh`/`nkvh`/`hd` arrive
-    // as ONE `AttnGeometry`, whose consts the model's parsed `config.json` reached through
-    // `model_geometry::with_config_attn_geometry` — so an nqh/nkvh transposition, or a head dim paired
-    // with another model's head counts, is a type that does not exist rather than a signature slot
-    // swap. The GQA divisibility proof rides on the type: a non-dividing pair fails the BUILD.
-    geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
-    // ⛔⛔⛔ NEITHER `mq` NOR `mq_pad` IS A BARE `u32` PARAMETER ANY MORE — and neither is the
-    // shared-buffer row count derived HERE any more. The width, its pad AND the row laws arrive
-    // FUSED in one `AttnBundleRows<NQH>`, minted at the bundle's parse boundary
-    // (`attn_bundle_rows`): a decode width is a ladder CONST there (`Rung<MQ>`), so its pad and
-    // every row extent — `MaskRows = NQH*MQ`, the mask shape's row count — are the COMPILER's
-    // arithmetic (`RungRowLaws`); a prefill width is the runtime law through the same doors. So
-    // this signature has no pair of row-count integers left to swap — the arrangement the `mq_pad`
-    // parameter swap lived in — no way to pair a width with a pad computed from some other width,
-    // and no second `nqh * mq` multiplication in this function for the mask staging to drift from.
-    // The `NQH` on the carrier ties it to THIS geometry: a frame minted for another model's head
-    // count is a type error at this slot. (Historically: `mq_pad` was a second `u32` two positions
-    // from `mq` in a run of seven, reconciled only by a `debug_assert_eq!` the release bake
-    // compiles out; `mq_pad` and `nqh*mq` are EQUAL at nqh=32/mq=2 and diverge from mq=4 up —
-    // exactly the width boundary where the card's batch decode started failing.)
-    bundle_rows: crate::sdsc_abstract::AttnBundleRows<NQH>,
-    // ⭐ THE STORAGE/SWEEP PAIR, ON ONE CARRIER — `cap` (what the resident cache holds) and the
-    // sweep this bundle takes of it traveled as two adjacent bare `u32`s, swappable at every call
-    // site exactly where `ActiveCap`'s own doc says the confusion lives. The carrier fixes the
-    // order at one mint; the door below reads the fields once, typed.
-    extent: crate::sdsc_abstract::KvExtent,
-    qs: &str,
-    new_k_scaled: &str,
-    new_v: &str,
-    kct: &str,
-    vc: &str,
-    pmask: &str,
-    cmask: &str,
-    // ⭐⭐⭐⭐⭐ THE KV BLOCK INDEX TENSOR'S NAME — `Some` makes the PREFIX score leg's KV read a
-    // HARDWARE GATHER; `None` emits exactly what this bundle emitted before the gather existed.
-    //
-    // ⛔ THE `Option` IS THE COUPLING, NOT A SWITCH. A gathered read takes its base from this tensor's
-    // entries, so an emission that gathers without a host staging them addresses block 0 for every
-    // row — every request reading row 0's keys, fluent and wrong. Making the NAME the condition means
-    // the emitter cannot gather unless a caller has a tensor to name, which is the same caller that
-    // must fill it. There is no arrangement in which one is present and the other is not.
-    kv_block_index: Option<&str>,
-    // ⭐⭐⭐⭐⭐ THE SPLIT-KV CHUNK — `Some` attends every resident page in ONE pass through a kv-head-major
-    // gather ([`assemble_attn_chunk`]) instead of the per-page fold; the index tensor above is then the
-    // CHUNK's table. `None` emits exactly the per-page fold this bundle emitted before.
-    chunk: Option<crate::sdsc_abstract::ChunkScratch>,
-    out_id: crate::place::PlaceId,
-    // TRUE when these rows are separate requests. Only the prefix mask cares: a prompt's rows share
-    // one resident history, requests each have their own.
-    rows_are_requests: bool,
-    // ⭐⭐⭐ WHETHER THE FINALIZE HANDS `out` TO o_proj IN THE SLAB-MAJOR ORDER — the caller-side
-    // statement of the head-major restructure, minted where the bundle's facts are (the spyre door's
-    // `BundleAttnParams::headmajor_handoff`; a triton producer's caller states its own). TRUE only
-    // for the single-row (mq == 1) body of a model whose head dim spans more than one feature slab
-    // and whose o matmul is fp8 W8A8 — the conditions the permuted o_proj copy is staged for. The
-    // matmul half of the contract (the B-operand swap to that copy) keys on the SAME fact at the
-    // matmul door, so neither half can be emitted without the other.
-    headmajor_handoff: bool,
+    facts: AttnFacts<'_, NQH, NKVH, HD>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
+    // ⭐ THE BUNDLE'S FACTS, DESTRUCTURED ONCE AT THE DOOR — every field restates the local the
+    // body below already reads (the same names the parameter list spelled), so the emission is
+    // the same op stream on the same values. The sink pair stays in the signature: the EmitCtx
+    // mint below owns it.
+    let AttnFacts {
+        t,
+        geom,
+        bundle_rows,
+        extent,
+        qs,
+        new_k_scaled,
+        new_v,
+        kct,
+        vc,
+        pmask,
+        cmask,
+        kv_block_index,
+        chunk,
+        out_id,
+        rows_are_requests,
+        headmajor_handoff,
+    } = facts;
     // Destructured ONCE, at the door. The boundary is where the swap happened (two `u32`s in a row of
     // seven); the body below is unchanged arithmetic on the same numbers.
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());

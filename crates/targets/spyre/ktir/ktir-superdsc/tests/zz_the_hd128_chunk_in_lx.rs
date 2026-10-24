@@ -15,7 +15,7 @@
 //! frontend's share of LX (`FRONTEND_LX_END`), which refuses the 48-, 56- and 64-page rungs.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_attn, assemble_rmsnorm};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn, assemble_rmsnorm};
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
@@ -83,22 +83,24 @@ fn emit_chunk(
     let chunk = ChunkScratch::of_chunk(pool(), pages).expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        EXTENT,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(layout),
     )

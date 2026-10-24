@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The split-KV chunk body's emission, from the shipped `assemble_attn` at granite-3.1-2b's geometry.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
     AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
@@ -47,22 +47,24 @@ fn emit_chunk_ops_at(pages: u32, mq: u32) -> Vec<ktir_superdsc::emit::EmittedOp>
         .expect("a chunk granite-2b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        EXTENT,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t_kvbi"),
-        Some(chunk),
-        ktir_superdsc::place::PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t_kvbi"),
+            chunk: Some(chunk),
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
@@ -453,22 +455,24 @@ fn emit_chunk_in_layout_at<const D: u32>(pages: u32, mq: u32) -> Vec<(String, se
         ChunkScratch::of_chunk(PagedKvPool::new(NKVH, D), pages).expect("a chunk granite admits");
     let mut sym = 0i64;
     let ops = assemble_attn(
-        0,
-        geom,
-        rows,
-        EXTENT,
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )

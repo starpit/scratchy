@@ -891,7 +891,7 @@ fn the_walk_leaves_a_pin_this_bundle_never_touches_alone() {
 //    `zz_the_hd128_chunk_in_lx.rs` (`a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it`).
 #[test]
 fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
-    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+    use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
     use ktir_superdsc::place::{PlaceId, SynthRole};
     use ktir_superdsc::placement::{SegRole, TensorPlacement};
     use ktir_superdsc::sdsc_abstract::{
@@ -968,24 +968,26 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 40).expect("a chunk");
     let mut sym = 0i64;
     let attn_ops = assemble_attn(
-        0,
-        geom,
-        rows,
-        // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
-        // cap (no rung).
-        KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
-        &names[0],
-        &names[1],
-        &names[2],
-        &names[3],
-        &names[4],
-        &names[5],
-        &names[6],
-        Some(&names[7]),
-        Some(chunk),
-        PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            // The storage/sweep pair on the boundary's one carrier — the sweep is the full 256-slot
+            // cap (no rung).
+            extent: KvExtent::new(SlotCount::new(256), SlotCount::new(256)),
+            qs: &names[0],
+            new_k_scaled: &names[1],
+            new_v: &names[2],
+            kct: &names[3],
+            vc: &names[4],
+            pmask: &names[5],
+            cmask: &names[6],
+            kv_block_index: Some(&names[7]),
+            chunk: Some(chunk),
+            out_id: PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         Some(&layout),
     )

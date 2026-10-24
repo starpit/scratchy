@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The split-KV chunk body at head dim 128 (granite-3.1-8b's geometry), from the shipped `assemble_attn`.
 
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
     AttnGeometry, ChunkRowKind, ChunkScratch, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
@@ -49,22 +49,24 @@ fn emit(pages: u32, mq: u32) -> Vec<(String, serde_json::Value)> {
         .expect("a chunk granite-8b admits");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        EXTENT,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        Some("t_kvbi"),
-        Some(chunk),
-        ktir_superdsc::place::PlaceId::Act(900),
-        false,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index: Some("t_kvbi"),
+            chunk: Some(chunk),
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: false,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )

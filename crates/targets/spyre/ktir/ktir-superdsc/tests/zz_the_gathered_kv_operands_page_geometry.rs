@@ -24,7 +24,7 @@
 //! never asked for.
 
 use ktir_superdsc::emit as superdsc;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::assemble_attn;
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn};
 use ktir_superdsc::sdsc_abstract::{
     AttnGeometry, KvExtent, PagedKvPool, SlotCount, attn_bundle_rows,
 };
@@ -136,22 +136,24 @@ fn prefix_score_op(rung: u32, kv_block_index: Option<&str>) -> serde_json::Value
     let rows = attn_bundle_rows(geom, rung, true).expect("a baked rung");
     let mut sym = 0i64;
     assemble_attn(
-        0,
-        geom,
-        rows,
-        EXTENT,
-        "t_qs",
-        "t_new_k",
-        "t_new_v",
-        "t_kct",
-        "t_vc",
-        "t_pmask",
-        "t_cmask",
-        kv_block_index,
-        None,
-        ktir_superdsc::place::PlaceId::Act(900),
-        true,
-        false,
+        AttnFacts {
+            t: 0,
+            geom,
+            bundle_rows: rows,
+            extent: EXTENT,
+            qs: "t_qs",
+            new_k_scaled: "t_new_k",
+            new_v: "t_new_v",
+            kct: "t_kct",
+            vc: "t_vc",
+            pmask: "t_pmask",
+            cmask: "t_cmask",
+            kv_block_index,
+            chunk: None,
+            out_id: ktir_superdsc::place::PlaceId::Act(900),
+            rows_are_requests: true,
+            headmajor_handoff: false,
+        },
         &mut sym,
         None,
     )
