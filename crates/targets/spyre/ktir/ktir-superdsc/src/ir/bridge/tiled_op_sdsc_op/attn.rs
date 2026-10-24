@@ -2491,8 +2491,9 @@ fn row_block_query<const NQH: u32, const NKVH: u32, const HD: u32>(
 struct RowBlockValue {
     m: MatM,
     n: MatN,
-    /// The V kernel's columns: the whole head dim at one slab, one stick above it.
-    v_cols: u32,
+    /// The V kernel's columns ([`VKernelPitch`](crate::sdsc_abstract::VKernelPitch)): the whole
+    /// head dim at one slab, one stick above it.
+    v_cols: crate::sdsc_abstract::VKernelPitch,
     /// The block's rows of the output, in slab `s`'s plane above one slab.
     out_off: crate::addr::DevOff,
 }
@@ -2537,13 +2538,13 @@ impl RowBlockValue {
             ChunkRowForm::OneSlabGroup => RowBlockValue {
                 m: MatM::of_head_major_rows(blocks.rows()),
                 n: MatN::of_head_dim(hd),
-                v_cols: hd,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_head_dim(hd),
                 out_off: crate::addr::DevOff::from_view_step(h0 * stick),
             },
             ChunkRowForm::QueryHead => RowBlockValue {
                 m: MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                 n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
-                v_cols: stick,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_one_stick(Lanes::FP16),
                 out_off: slab_rows,
             },
             // ⭐ THE GROUP's `gqa` ROWS of slab `s` in ONE op — one stick of `out`, the fold's card-proven
@@ -2551,7 +2552,7 @@ impl RowBlockValue {
             ChunkRowForm::QueryGroup(q) => RowBlockValue {
                 m: MatM::of_head_major_rows(q.rows()),
                 n: MatN::of_head_slab(FeatIdx::SLAB_FEATS),
-                v_cols: stick,
+                v_cols: crate::sdsc_abstract::VKernelPitch::of_one_stick(Lanes::FP16),
                 out_off: slab_rows,
             },
         }
@@ -2817,7 +2818,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 bmm_form,
                 &rb(exp, grp_rows, cols),
                 at_pin,
-                &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols as usize, new_v),
+                &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols.n_out_cols(), new_v),
                 v_off,
                 &rb(
                     state.o(),
@@ -3721,7 +3722,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(&cb.cexp, blk_rows, width),
                     rc,
-                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v_cols as usize, v_name),
+                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v_cols.n_out_cols(), v_name),
                     kc,
                     &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     o_off,
@@ -3993,7 +3994,11 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                     bmm_form,
                     &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
-                    &Stk::<KernelTag>::kernel(v_rows.rows() as usize, v.v_cols as usize, &cb.gv),
+                    &Stk::<KernelTag>::kernel(
+                        v_rows.rows() as usize,
+                        v.v_cols.n_out_cols(),
+                        &cb.gv,
+                    ),
                     kc,
                     &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     v.out_off,

@@ -333,6 +333,37 @@ impl VKernelRows {
     }
 }
 
+/// THE V VALUE KERNEL'S DECLARED PHYSICAL COLUMN COUNT (`Stk::kernel`'s `n_out`) — the feature
+/// width of the V plane the value leg contracts, the twin of [`KtKernelPitch`] on the value side.
+///
+/// Two widths ever fill this slot, and each is a door: the WHOLE head dim (the one-slab form's
+/// single op, `out = hd`) and ONE STICK of features (the per-slab form above one slab, one stick
+/// of `out` each — the fold's card-proven hd=128 width). Every answer is a FEATURE quantity; a
+/// slot count (a page's, a chunk's, a window's 64) has no door, so it cannot fill the value
+/// kernel's column slot even where the values coincide — the pairing that was invisible when
+/// `v_cols` traveled as a bare `u32` beside `n`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VKernelPitch(u32);
+
+impl VKernelPitch {
+    /// The whole-head door — the one-slab value leg's single op contracts the whole head dim.
+    pub const fn of_head_dim(hd: u32) -> VKernelPitch {
+        VKernelPitch(hd)
+    }
+
+    /// The one-stick door — above one slab each op is one stick of `out`, one stick of V above
+    /// it. Demands the lane-count witness ([`Lanes`]), so a row count — or any of the other
+    /// three 64s — cannot stand in for it.
+    pub const fn of_one_stick(lanes: Lanes) -> VKernelPitch {
+        VKernelPitch(lanes.n())
+    }
+
+    /// `Stk::kernel`'s `n_out` slot — the kernel's declared physical column extent.
+    pub const fn n_out_cols(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// THE Kᵀ RESTICKIFY TILE'S SLOT EXTENT — how many slots one `assemble_restickify_kt_2d` tile
 /// re-sticks (the natural `[slots, feats]` rows in, the Kᵀ `[feats, slots]` columns out). Exactly
 /// two tiles exist and each is a door: one row window of the NEW block (whose rows ARE its slots —
