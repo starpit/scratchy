@@ -16,7 +16,7 @@
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins;
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
-    assemble_attn, assemble_rmsnorm, AttnFacts, RmsnormFacts,
+    AttnFacts, RmsnormFacts, assemble_attn, assemble_rmsnorm,
 };
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};

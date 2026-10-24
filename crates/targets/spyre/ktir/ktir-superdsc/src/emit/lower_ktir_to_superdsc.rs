@@ -42,9 +42,9 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
     AttnFacts, assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
-    assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap, RmsnormFacts,
-    RmsnormUnitFacts, TanhsoftcapFacts,
+    RmsnormFacts, RmsnormUnitFacts, TanhsoftcapFacts, assemble_pointwise_broadcast_off_from_tile,
+    assemble_pointwise_seeded_from_tile, assemble_rmsnorm, assemble_rmsnorm_unit,
+    assemble_tanhsoftcap,
 };
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};

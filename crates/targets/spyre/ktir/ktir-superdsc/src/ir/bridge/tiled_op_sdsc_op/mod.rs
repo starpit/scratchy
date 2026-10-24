@@ -53,6 +53,6 @@ pub use reduce::{
     win_reduce_data,
 };
 pub use rmsnorm::{
-    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap, RmsnormFacts,
-    RmsnormUnitFacts, TanhsoftcapFacts,
+    RmsnormFacts, RmsnormUnitFacts, TanhsoftcapFacts, assemble_rmsnorm, assemble_rmsnorm_unit,
+    assemble_tanhsoftcap,
 };

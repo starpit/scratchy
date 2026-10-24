@@ -31,7 +31,9 @@
 //! which do not build on a plain `cargo test` here.
 
 use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm, RmsnormFacts};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    RmsnormFacts, assemble_reduce, assemble_rmsnorm,
+};
 use scratchy_subtile::sdsc_abstract::{BlockCols, KernelTag, RowCount, Stk};
 use scratchy_subtile::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
