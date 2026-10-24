@@ -68,7 +68,7 @@ fn the_new_block_chunk_contracts_the_whole_padded_block() {
     }
     // The impostor seat, the chunk form's own: a block padded to the page's slot count is still
     // not the page plane.
-    let pm = PagedMq::of_bundle(PagedKvPool::PAGE_SLOTS as u32, false)
+    let pm = PaddedMq::of_bundle(PagedKvPool::PAGE_SLOTS as u32, false)
         .expect("a prefill chunk width the law pads");
     assert_ne!(
         VKernelRows::Page,
