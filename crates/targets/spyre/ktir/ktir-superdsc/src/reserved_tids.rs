@@ -709,10 +709,11 @@ pub fn oproj_headmajor_tid(w_id: u32) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagedFoldCarry {
     /// The running max, `[BATCH, MQ]` f16 (one value per stick — the frame the body reads
-    /// with no reshape; `paged_fold.py`'s module doc states the law) — the finite −65504
-    /// sentinel at the seed (f16-exact:
-    /// the format's own max). The carry's memory image is the one-shot kernel's own legalized
-    /// grading — see `paged_fold.py`'s module doc for the law and the f32-graded follow-up.
+    /// with no reshape; `paged_fold.py`'s module doc states the law) — the f16 floor
+    /// [`crate::sdsc_abstract::ATTN_SEED_FLOOR`] at the seed, cross-checked against the
+    /// kernel's stated fill by the whole-function walk's fill arm. The carry's memory image is
+    /// the one-shot kernel's own legalized grading — see `paged_fold.py`'s module doc for the
+    /// law and the f32-graded follow-up.
     Max,
     /// The running softmax denominator, `[BATCH, MQ]` f16.
     Sum,

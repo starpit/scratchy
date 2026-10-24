@@ -3292,6 +3292,30 @@ pub fn lower_function(
                     f.name
                 ));
             };
+            // ⭐⭐⭐ THE CARRY SEED'S CROSS-CHECK — the sentinel pair's own door, fired where the
+            // program's stated fill and the buffer it targets are both in hand. The paged fold's
+            // max carry ([`crate::reserved_tids::PagedFoldCarry::Max`]) is seeded by the kernel's
+            // own `tl.full` constant, and the validity lanes the HOST stages carry
+            // [`crate::sdsc_abstract::ATTN_SEED_FLOOR`] — ONE value by the seed-safety law (a
+            // masked lane's score saturates at the floor, so its `p` is 0 only while `m` sits
+            // above the seed the lanes name). The two spellings are independent producers, and a
+            // drift on one side only changes the expunge margins in the dangerous direction —
+            // fluent output, never a fault — so the walk refuses the desync, naming both values.
+            // The Sum/Acc carries seed at the additive identity 0, a value only the kernel
+            // spells: no second spelling exists to desync from, so no door fires there.
+            if o.tid == crate::reserved_tids::PagedFoldCarry::Max.tid()
+                && value != crate::sdsc_abstract::ATTN_SEED_FLOOR.to_f32_const()
+            {
+                return err(format!(
+                    "{}: the fill of the paged-fold carry's max seeds at {value}, but the \
+                     validity lanes the host stages carry the finite f16 floor {} — the seed and \
+                     the lanes are ONE value (a masked lane's p is 0 only because its score \
+                     saturates at the floor the seed holds). Align the kernel's seed constant \
+                     with ATTN_SEED_FLOOR.",
+                    f.name,
+                    crate::sdsc_abstract::ATTN_SEED_FLOOR.to_f32_const()
+                ));
+            }
             o = windowed_region(k, o, tile)?;
             o.is_out = true;
             out.append(&mut super::lower_ktir_to_superdsc::scalarfill_at(

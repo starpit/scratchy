@@ -5465,6 +5465,36 @@ pub fn decode_batch_causal_col_valid(col: usize, row: usize) -> bool {
 /// come from a caller than its rows can.
 pub const ATTN_MASK_NEG: f32 = -(half::f16::MAX.to_f32_const() / 2.0);
 
+/// ⭐⭐⭐⭐⭐ THE F16 FLOOR THE CARRY SEEDS AT AND THE VALIDITY LANES CARRY — ONE value in two
+/// roles, spelled by TWO independent producers, which is why it is a const and why the walk
+/// cross-checks the pair.
+///
+/// Role one — THE SEED. The paged fold's seed program (`paged_fold.py`'s `paged_fold_seed_hm`)
+/// writes the online-softmax carry's initial max as `tl.full([BATCH * MQ, 1], -65504.0,
+/// tl.float16)`: the FINITE f16 limit, never `-inf` — `float("-inf")` mis-encodes through
+/// `FloatToFp16Bin` as a NaN bit pattern and `max(x, NaN) == NaN` poisons the reduction (the
+/// torch-spyre root-cause this crate's reduce identity shares, `superdsc_opspec`'s SAMV note).
+/// f16-exact — the format's own max — so the narrowing stores it exactly.
+///
+/// Role two — THE LANES. The validity-mask builders' masked-lane bytes ([`spliced_attn_mask_f16`],
+/// [`spliced_decode_mask_f16`]). A masked lane's score is `qk + floor`, which SATURATES at the
+/// floor in f16 (never `-inf`), so a masked lane's `p` is exactly `e^0 = 1` while `m` sits at the
+/// seed and exactly `0` once any valid lane raises `m` past it — the expunge the `l`-invariant
+/// states, whose edge (a row whose whole sweep is empty never raises `m`) is the row-sweep
+/// readings' refusal law.
+///
+/// ⛔ THE PAIR IS LOAD-BEARING. The seed and the lanes are stated by different producers — the
+/// kernel's `tl.full` and these builders — and a value that drifted on one side only would change
+/// the expunge margins in the dangerous direction: fluent output, never a fault. The
+/// whole-function walk therefore cross-checks the program's stated fill of the max carry
+/// ([`crate::reserved_tids::PagedFoldCarry::Max`]) against this const and refuses the desync,
+/// naming both values.
+///
+/// NOT [`ATTN_MASK_NEG`] — that is the OTHER sentinel: the ADDITIVE mask value for masks whose
+/// `score + mask` sum must stay finite (the causal block and the broadcast prefix row). This one
+/// is the floor itself. A mask family carries one of the two, never a caller-stated third value.
+pub const ATTN_SEED_FLOOR: half::f16 = half::f16::MIN;
+
 /// ⭐⭐⭐ EVERY FACT A LAUNCH'S NEW-BLOCK CAUSAL MASK IS A FUNCTION OF, AS ONE VALUE — and
 /// [`Self::mask`] takes nothing else, so the mask cannot depend on a fact this key leaves out.
 ///
@@ -12011,10 +12041,10 @@ impl ValidKeys {
 /// bytes.
 ///
 /// ⛔ THE SENTINEL PAIR IS LOAD-BEARING, AND ITS EDGE IS THE SEED-SAFETY LAW. The carry's seed
-/// `m` is the SAME finite −65504 the invalid lanes carry, so a masked lane's `p` is exactly
-/// zero only because some VALID lane in the same or an earlier window raised `m` past the
-/// sentinel (`e^(−65504 − m)` underflows). An ALL-masked window read while `m` still sits at
-/// the seed would give `p = e^0 = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
+/// `m` is the SAME finite floor ([`ATTN_SEED_FLOOR`]) the invalid lanes carry, so a masked lane's
+/// `p` is exactly zero only because some VALID lane in the same or an earlier window raised `m`
+/// past the sentinel (`e^(floor − m)` underflows). An ALL-masked window read while `m` still sits
+/// at the seed would give `p = e^0 = 1` per lane — `l += 64`, `acc += ΣV`, the mask doing
 /// nothing. The chunk family's first window CANNOT be that window: with `real ≥ 1` (the
 /// builder takes [`NonZeroU32`]) and `start ≥ 0` (a `usize`), `row_logical_pos(t, real) ≥ 0`,
 /// so slot 0 is valid for every query row of window (0, 0) and
@@ -12151,9 +12181,10 @@ pub fn spliced_attn_ids_table(
 
 /// ⭐⭐⭐⭐⭐ THE ONE-SEQUENCE ADDITIVE VALIDITY MASK — `[REGION_PAGES·W4·mq, 64]` f16,
 /// window-major within each page, row `(s·W4 + w)·mq + t`: `0.0` where slot
-/// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the finite −65504 sentinel (the
-/// format's own max, the kernels' clamp trick — a masked-everywhere row still normalizes with
-/// weight 0, never NaN) where it is not.
+/// `s·PAGE_SLOTS + w·64 + c` is visible to query row `t`, and the f16 floor
+/// [`ATTN_SEED_FLOOR`] (the finite sentinel the carry's max seeds at — the format's own max, the
+/// kernels' clamp trick — a masked-everywhere row still normalizes with weight 0, never NaN)
+/// where it is not.
 ///
 /// The validity law is the CHUNK's own ([`ChunkRows::row_logical_pos`]): row `t` of a chunk whose
 /// `real` genuine tokens sit at absolute positions `[start, start+real)` attends exactly the
@@ -12178,7 +12209,7 @@ pub fn spliced_attn_mask_f16(
     let mq = region.mq.get() as usize;
     let page_slots = PagedKvPool::PAGE_SLOTS;
     let total = region.pages() as usize * w4 * mq;
-    let neg = half::f16::MIN.to_le_bytes();
+    let neg = ATTN_SEED_FLOOR.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut m = Vec::with_capacity(total * 64 * 2);
     let mut valid = Vec::with_capacity(total);
@@ -12364,7 +12395,8 @@ pub fn spliced_decode_rep_ids(batch: SplicedDecodeBatch) -> Vec<i32> {
 /// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE ADDITIVE MASK — `[NUM_CHUNKS·W4·BATCH·GQA, 64]` f16,
 /// PRE-REPLICATED xGQA to the score tile's own rows (the kernel adds it as a pure flat reshape,
 /// no broadcast): row `(c·W4 + w)·BATCH·GQA + b·GQA + g`, lane `cc`, is `0.0` where logical slot
-/// `(c·BPC + j)·PAGE_SLOTS + w·64 + cc` holds row `s`'s own key, the −65504 sentinel elsewhere.
+/// `(c·BPC + j)·PAGE_SLOTS + w·64 + cc` holds row `s`'s own key, the f16 floor
+/// [`ATTN_SEED_FLOOR`] elsewhere.
 ///
 /// `hists` is one history per LAUNCH ROW in slot order (padding rows carry live 0's), and
 /// `write` is the batch's ONE shared write slot — every row's new key lands there this step, in
@@ -12390,7 +12422,7 @@ pub fn spliced_decode_mask_f16(
         batch.num_seqs.get(),
     );
     let page_slots = PagedKvPool::PAGE_SLOTS;
-    let neg = half::f16::MIN.to_le_bytes();
+    let neg = ATTN_SEED_FLOOR.to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let rows = batch.chunks() as usize * w4 as usize * ktb as usize * gqa as usize;
     let mut m = Vec::with_capacity(rows * 64 * 2);
