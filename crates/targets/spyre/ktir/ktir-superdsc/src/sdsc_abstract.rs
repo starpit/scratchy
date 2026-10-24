@@ -326,7 +326,8 @@ impl VKernelRows {
     pub const fn rows(self) -> u32 {
         match self {
             VKernelRows::Page => PagedKvPool::PAGE_SLOTS as u32,
-            VKernelRows::NewBlockStream(n) | VKernelRows::NewBlockChunk(n)
+            VKernelRows::NewBlockStream(n)
+            | VKernelRows::NewBlockChunk(n)
             | VKernelRows::ChunkPart(n) => n,
         }
     }

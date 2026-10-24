@@ -12,7 +12,7 @@
 //! there once declared a stick-group stride the buffer does not have. These pins hold the doors
 //! themselves.
 
-use ktir_superdsc::sdsc_abstract::{ChunkScratch, PagedKvPool, PaddedMq, VKernelRows};
+use ktir_superdsc::sdsc_abstract::{ChunkScratch, PaddedMq, PagedKvPool, VKernelRows};
 
 #[test]
 fn the_page_planes_rows_are_the_pools_own_page_slots() {
@@ -82,8 +82,7 @@ fn the_new_block_chunk_contracts_the_whole_padded_block() {
 /// cannot arrive from any other plane's arithmetic.
 #[test]
 fn a_chunk_parts_rows_are_the_parts_own_slots() {
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(8, 64), 2).expect("a chunk granite admits");
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(8, 64), 2).expect("a chunk granite admits");
     let part = chunk.slot_parts(1).next().expect("two pages split");
     assert_eq!(
         VKernelRows::of_chunk_part(part).rows(),
