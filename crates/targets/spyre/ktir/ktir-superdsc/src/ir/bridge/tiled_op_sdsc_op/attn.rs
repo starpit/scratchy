@@ -165,7 +165,6 @@ struct BlockBufs {
 /// `kt_stride` is the tensor's TRUE stride, never `width` (a per-block column slice must not lie about
 /// the tensor's real row stride, or every row past the first addresses the wrong location once
 /// `cap>width`). `kt_off_fn`/`v_off_fn` compute each head's own base offset into that operand.
-#[allow(clippy::too_many_arguments)]
 /// GQA-GROUP batching for a block's two matmul legs: one op per KV-head with `batch=gqa`, instead
 /// of one op per QUERY head. `nqh` ops become `nkvh`.
 ///
@@ -498,23 +497,15 @@ struct BatchedKv {
 ///
 /// `matmul_opspec_off`'s own doc pins the dxp-validated shared-kernel shape as the one where `in`/`out`
 /// ARE the stick, and states the consequence as `y-stride = 64 = hd` — an hd=64 identity written into
-/// the justification of the form. This type is that identity made checkable: the only mint takes the
-/// contraction's [`MatK`], so a leg cannot claim the property without naming the extent it contracts.
+/// the justification of the form. This type is that identity made checkable, and its ONE door claims
+/// it BY CONSTRUCTION ([`Self::by_slab_split`]): a slab-split leg contracts one stick per op at every
+/// head dim, so there is no extent left to inspect and no call site that could hand the witness to a
+/// leg that did not earn it. The extent-inspecting mint this type used to carry is deleted with the
+/// per-head score arm it served — a leg that has not been split has NO witness to claim.
 #[derive(Clone, Copy)]
 struct OneStickContraction(());
 
 impl OneStickContraction {
-    /// The ONE door. `Some` exactly when the contraction is a single stick at this operand format.
-    ///
-    /// ⏭ The score leg's contraction becomes one stick at every head dim once it is SPLIT BY SLAB
-    /// (`nslab` ops of one stick each, accumulating), at which point this witness is always available
-    /// and the per-head score arm can go. It is not a head-dim gate: it is the precondition the split
-    /// would satisfy.
-    #[allow(dead_code)]
-    fn of_contraction(k: MatK, df: Df) -> Option<OneStickContraction> {
-        (k.get() == df.elems_per_stick()).then_some(OneStickContraction(()))
-    }
-
     /// ⭐⭐⭐ THE SPLIT SATISFIES THE PRECONDITION BY CONSTRUCTION, AT EVERY HEAD DIM. A slab IS one
     /// stick ([`MatK::of_head_slab`]), so a leg that contracts one slab per op has a one-stick
     /// contraction whatever `hd` is — there is nothing left to test, which is why this door takes no
@@ -598,7 +589,6 @@ impl ScoreArm {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// ⭐⭐⭐⭐⭐ WHETHER THIS ATTENTION BLOCK **SEEDS** THE ONLINE SOFTMAX OR **FOLDS ONTO** AN EXISTING SEED.
 ///
 /// ⛔ THIS WAS A `bool` NAMED `first`, eleven arguments into a twenty-argument call. The two states are not
@@ -4564,7 +4554,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     let batched_kv = batched.map(|()| BatchedKv {
         // ⭐ UNCONDITIONAL NOW: the score leg contracts ONE SLAB per op, so its contraction is one
         // stick at every head dim and the witness needs no extent to inspect. The head-dim gate this
-        // replaces is gone, not widened — `of_contraction` remains for legs that have not been split.
+        // replaces is gone, not widened — and the extent-inspecting mint is deleted with it, so a leg
+        // that has not been split has no witness to hand.
         score: Some(OneStickContraction::by_slab_split()),
         // The value leg contracts the kv WINDOW, one stick by construction, so it always batches.
         value: Some(()),
