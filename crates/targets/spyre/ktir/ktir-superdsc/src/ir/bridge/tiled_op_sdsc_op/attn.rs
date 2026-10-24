@@ -1080,9 +1080,9 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 ) -> Result<(), SuperDscError> {
     // Destructured ONCE, at the door — the boundary is where the swap lived (two `u32`s in a run
     // of twenty-six); the body below is unchanged arithmetic on the same numbers, now each
-    // geometry's own consts. `nkvh` joins them because the batched arms read it where `BatchedKv`
-    // used to carry it as a field.
-    let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
+    // geometry's own consts. `nkvh` no longer joins them: its last reads were the seed/fold
+    // divisions, which the geometry's own `nkvh_nz()`/`gqa()` replaced.
+    let (nqh, hd) = (geom.nqh(), geom.hd());
     // THE MODEL'S QUERY HEADS AS TYPES. `QueryHead::all` is the only door, so a head handed to an
     // off-closure is in range by construction — not by a bounds check, and not by an `expect`.
     let nqh_nz = std::num::NonZeroU32::new(nqh)
