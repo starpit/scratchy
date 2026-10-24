@@ -4290,7 +4290,18 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
     // the attention matmul's [mq,total] read; per-(r,h) [1,hd] blocks match it exactly (Kani-proven).
     // cos/sin are the worker's [mq,total] per-position head-tiled table, read at row r's head-0 slice.
     let mut ops: Vec<EmittedOp> = Vec::with_capacity(mq as usize * heads as usize * 4);
-    let ew_ph = |ops: &mut Vec<EmittedOp>,
+
+    // ⭐ THE EMITTER CONTEXT, MINTED ONCE AT THIS DOOR — the sink this function owns plus its own
+    // pair parameters as the counter and the placement authority (the mint-once-at-door pattern,
+    // the same mint as `assemble_attn` and `lower_function`). Every emitter below threads the ONE
+    // `&mut ctx` — the three closures take it as their first parameter in place of the split
+    // `ops` + `sib` pair, so the op stream, the ids and the placements are identical.
+    let mut ctx = super::EmitCtx {
+        ops: &mut ops,
+        sym_id_base,
+        layout,
+    };
+    let ew_ph = |ctx: &mut super::EmitCtx<'_>,
                  name: String,
                  f: &'static str,
                  a: &str,
@@ -4298,8 +4309,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                  b: &str,
                  boff: crate::addr::DevOff,
                  o: &str,
-                 ooff: crate::addr::DevOff,
-                 sib: &mut i64|
+                 ooff: crate::addr::DevOff|
      -> Result<(), Error> {
         // MULTI-STICK AT head_dim > 64, AND THAT IS A REAL DIFFERENCE: at rows==1 a `[1,hd]` op is two
         // sticks at head_dim 128, and the work splitter divides a multi-stick `out` ACROSS CORES — 2
@@ -4328,16 +4338,16 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             ooff.into(),
             false, // RoPE per-(row,head) [1,hd] block (rows==1): rank-3 flat
             Df::Fp16,
-            layout,
+            ctx.layout,
             EwDivision::Law,
         )
         .map_err(|e| Error { message: e })?;
-        ops.push(emit_sdsc_tiled(
+        ctx.ops.push(emit_sdsc_tiled(
             &name,
             &op,
             &SdscFoldSet::new(op.iter.cores_used()),
-            sib,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         )?);
         Ok(())
     };
@@ -4374,13 +4384,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // `rot`/`xc`/`rs` without ever declaring them, so they fell to `resolve_seg_base`'s bump —
         // which handed all three the SAME address. Rope is `rot = x·P`, `xc = x·cos`,
         // `rs = rot·sin`, `out = xc + rs`: three of its four intermediates were one buffer.
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             for r in [R::Rot, R::Xc, R::Rs] {
                 l.synth(out_id.synth(r), &[rows, hd]);
             }
         }
         // rot = x[rows,hd] @ P[hd,hd] — the same P kernel for every row (m=rows GEMM, k=n=hd).
-        ops.push(assemble_matmul_off(
+        ctx.ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
             crate::sdsc_abstract::MatM::of_head_major_rows(rows),
             crate::sdsc_abstract::MatN::of_head_dim(hd),
@@ -4403,8 +4413,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 BlockCols::of_head_dim(hd),
             ),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         let hh = |name: &str| fl(name, rows, hd);
         // One row of angles shared by every head at mq==1; per-row above that.
@@ -4423,7 +4433,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // (`heads*mq`, where `heads` may be nqh or nkvh), swept head-dim wide.
         let hm_rows = crate::sdsc_abstract::RowCount::of_head_major_rows(rows);
         let hd_cols = crate::sdsc_abstract::BlockCols::of_head_dim(hd);
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_xc_o{t}"),
             "multiply",
             hm_rows,
@@ -4431,10 +4441,10 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&hh(&x)),
             cos_in,
             &hh(&xc),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
             hm_rows,
@@ -4442,10 +4452,10 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&hh(&rot)),
             sin_in,
             &hh(&rs),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_add_o{t}"),
             "add",
             hm_rows,
@@ -4453,8 +4463,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&hh(&xc)),
             In::full(&hh(&rs)),
             &hh(&out),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         return Ok(ops);
     }
@@ -4484,7 +4494,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // nest means this loop names a COORDINATE and never writes a stride.
         let doff =
             |r: usize, col: usize| crate::addr::rc_of(mq, total, r as u32, col as u32, Df::Fp16);
-        let ew_slab = |ops: &mut Vec<EmittedOp>,
+        let ew_slab = |ctx: &mut super::EmitCtx<'_>,
                        name: String,
                        f: &'static str,
                        a: &str,
@@ -4492,8 +4502,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        b: &str,
                        boff: crate::addr::DevOff,
                        o: &str,
-                       ooff: crate::addr::DevOff,
-                       sib: &mut i64|
+                       ooff: crate::addr::DevOff|
          -> Result<(), Error> {
             // ⭐ TRUE EXTENTS (`[mq, total]`), not `rbo`'s `1×64` annotation — the slab windows are
             // corners of the same `[mq, total]` plane `ew_ph` reads (see its note); the mint reads the
@@ -4512,16 +4521,16 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // is the same rank-3 flat form regardless of the row count.
                 true,
                 Df::Fp16,
-                layout,
+                ctx.layout,
                 EwDivision::Law,
             )
             .map_err(|e| Error { message: e })?;
-            ops.push(emit_sdsc_tiled(
+            ctx.ops.push(emit_sdsc_tiled(
                 &name,
                 &op,
                 &SdscFoldSet::new(op.iter.cores_used()),
-                sib,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             )?);
             Ok(())
         };
@@ -4553,7 +4562,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // Declare the intermediates at their TRUE full extent, for the reason the mq>1 branch below
         // records: sized by whichever access declares first, a per-head matmul window would reserve ONE
         // head and under-reserve by `heads` — the bump-allocator defect `synth` exists to kill.
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             for r in [R::Rot, R::Xc, R::Rs] {
                 l.synth(out_id.synth(r), &[mq, total]);
             }
@@ -4605,7 +4614,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 s,
                 Df::Fp16,
             );
-            ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
+            ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
                 &if n_slabs == 1 {
                     format!("rope_rot_o{t}")
                 } else {
@@ -4626,8 +4635,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 p_off,
                 &rb(&rot, rope_rows, rope_cols),
                 o_place,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
         // PREFILL KEEPS THE PER-HEAD P MATMUL — the form measured coherent on granite-8b (`7d27d734`),
@@ -4635,7 +4644,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // `n_slabs`, and the prompt is right.
         for h in (0..heads as usize).filter(|_| !rot_slab_form) {
             let off_h = doff(0, h * hd_u);
-            ops.push(assemble_matmul_off(
+            ctx.ops.push(assemble_matmul_off(
                 &format!("rope_rot_h{h}_o{t}"),
                 crate::sdsc_abstract::MatM::of_query_rows(
                     crate::sdsc_abstract::QueryRowCount::of_mq(mq),
@@ -4652,8 +4661,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::addr::DevOff::ZERO,
                 &rb(&rot, rope_rows, rope_cols),
                 off_h,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
         // The three elementwise legs, each over the WHOLE tensor: same bytes the per-block ops covered,
@@ -4664,7 +4673,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::sdsc_abstract::QueryRowCount::of_mq(mq),
         );
         let cols_all = crate::sdsc_abstract::BlockCols::of_feature_cols(total);
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_xc_o{t}"),
             "multiply",
             rows_all,
@@ -4672,10 +4681,10 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&rb(&x, rope_rows, rope_cols)),
             In::full(&rb(&cos, rope_rows, rope_cols)),
             &rb(&xc, rope_rows, rope_cols),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_rs_o{t}"),
             "multiply",
             rows_all,
@@ -4683,13 +4692,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&rb(&rot, rope_rows, rope_cols)),
             In::full(&rb(&sin, rope_rows, rope_cols)),
             &rb(&rs, rope_rows, rope_cols),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // ADD, unconditionally: P already carries the rotate's sign, so there is no first-half/
         // second-half split left to make this op two ops (which the stick planes' interleaving would
         // have forced — first-half slabs are every OTHER plane, not a contiguous run).
-        ops.push(pw2(
+        ctx.ops.push(pw2(
             &format!("rope_out_o{t}"),
             "add",
             rows_all,
@@ -4697,8 +4706,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             In::full(&rb(&xc, rope_rows, rope_cols)),
             In::full(&rb(&rs, rope_rows, rope_cols)),
             &rb(&out, rope_rows, rope_cols),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         return Ok(ops);
     }
@@ -4735,12 +4744,12 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // below the ones that speak for the layout, since a per-head access no longer covers the
         // footprint and so no longer declares. Scoped to the mq>1 branch so decode's allocation —
         // and therefore its bundle fingerprint — is untouched.
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             for r in [R::Rot, R::Xc, R::Rs] {
                 l.synth(out_id.synth(r), &[heads * mq, hd]);
             }
         }
-        let ew_rows = |ops: &mut Vec<EmittedOp>,
+        let ew_rows = |ctx: &mut super::EmitCtx<'_>,
                        name: String,
                        f: &'static str,
                        rows: u32,
@@ -4749,8 +4758,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                        b: &str,
                        boff: crate::addr::DevOff,
                        o: &str,
-                       ooff: crate::addr::DevOff,
-                       sib: &mut i64|
+                       ooff: crate::addr::DevOff|
          -> Result<(), Error> {
             // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: this branch reads every buffer as the
             // `[rows, hd]` image — the same elements the `[heads*mq, hd]` synth above reserves (the
@@ -4786,16 +4794,16 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 // the SAME rank-3 flat form the per-row path used — only the row count differs.
                 false,
                 Df::Fp16,
-                layout,
+                ctx.layout,
                 EwDivision::Law,
             )
             .map_err(|e| Error { message: e })?;
-            ops.push(emit_sdsc_tiled(
+            ctx.ops.push(emit_sdsc_tiled(
                 &name,
                 &op,
                 &SdscFoldSet::new(op.iter.cores_used()),
-                sib,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             )?);
             Ok(())
         };
@@ -4819,7 +4827,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         //
         // So the per-head loop was never buying correctness; it was one op per head doing what one op
         // over all rows does, because the row axis already enumerates (head, row) contiguously.
-        ops.push(assemble_matmul_off(
+        ctx.ops.push(assemble_matmul_off(
             &format!("rope_rot_o{t}"),
             crate::sdsc_abstract::MatM::of_token_rows(heads * mq),
             crate::sdsc_abstract::MatN::of_head_dim(hd),
@@ -4842,8 +4850,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 BlockCols::of_head_dim(hd),
             ),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // ── The three POINTWISE legs collapse to ONE op EACH, across all heads. ──────────────────
         // These were `heads` ops apiece (160 of the 402 trips in a granite prefill layer body — the
@@ -4863,7 +4871,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         // per-head. Decode (mq==1) never reaches this branch.
         let all = heads * mq;
         ew_rows(
-            &mut ops,
+            &mut ctx,
             format!("rope_xc_o{t}"),
             "multiply",
             all,
@@ -4873,10 +4881,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::addr::DevOff::ZERO,
             &xc,
             crate::addr::DevOff::ZERO,
-            sym_id_base,
         )?;
         ew_rows(
-            &mut ops,
+            &mut ctx,
             format!("rope_rs_o{t}"),
             "multiply",
             all,
@@ -4886,10 +4893,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::addr::DevOff::ZERO,
             &rs,
             crate::addr::DevOff::ZERO,
-            sym_id_base,
         )?;
         ew_rows(
-            &mut ops,
+            &mut ctx,
             format!("rope_add_o{t}"),
             "add",
             all,
@@ -4899,7 +4905,6 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::addr::DevOff::ZERO,
             &out,
             crate::addr::DevOff::ZERO,
-            sym_id_base,
         )?;
         return Ok(ops);
     }
@@ -4917,7 +4922,7 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 .at(crate::addr::Idx::<crate::addr::Head>::n(h))
                 .dev();
             // rot[r,h] = x[r,h]·P  (per-head [1,hd] @ [hd,hd] kernel; same P kernel, mb=1)
-            ops.push(assemble_matmul_off(
+            ctx.ops.push(assemble_matmul_off(
                 &format!("rope_rot_r{r}_h{h}_o{t}"),
                 crate::sdsc_abstract::MatM::single_row(),
                 crate::sdsc_abstract::MatN::of_head_dim(hd),
@@ -4932,11 +4937,11 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::addr::DevOff::ZERO,
                 &rb(&rot, RowCount::of_token_rows(1), BlockCols::of_head_dim(hd)),
                 off,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             ew_ph(
-                &mut ops,
+                &mut ctx,
                 format!("rope_xc_r{r}_h{h}_o{t}"),
                 "multiply",
                 &x,
@@ -4945,10 +4950,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 coff,
                 &xc,
                 off,
-                sym_id_base,
             )?; // x·cos
             ew_ph(
-                &mut ops,
+                &mut ctx,
                 format!("rope_rs_r{r}_h{h}_o{t}"),
                 "multiply",
                 &rot,
@@ -4957,10 +4961,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 coff,
                 &rs,
                 off,
-                sym_id_base,
             )?; // rot·sin
             ew_ph(
-                &mut ops,
+                &mut ctx,
                 format!("rope_add_r{r}_h{h}_o{t}"),
                 "add",
                 &xc,
@@ -4969,7 +4972,6 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 off,
                 &out,
                 off,
-                sym_id_base,
             )?; // xc+rs
         }
     }
