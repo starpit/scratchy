@@ -374,8 +374,7 @@ fn audit_layout_addresses(
                 fail.push(format!(
                     "{} declares a FoldBlocks cover of {block_bytes} B blocks over a {} B \
                      placement — one block already over-binds it",
-                    p.id,
-                    p.size
+                    p.id, p.size
                 ));
             } else if p.size % block_bytes != 0 {
                 fail.push(format!(
@@ -1457,9 +1456,8 @@ pub fn compute_bundle_layout<F: RopeForm>(
     // grid it shares, CARRIED UNPLACED on the layout (see the comment at its hand-off below) and
     // placed by `BundleLayout::place_kv_block_index_last` after the last host-staged activation,
     // so a body whose gathering differs moves nothing the host stages.
-    let mut kv_block_index_reservation: Option<
-        ktir_superdsc::placement::KvBlockIndexReservation,
-    > = None;
+    let mut kv_block_index_reservation: Option<ktir_superdsc::placement::KvBlockIndexReservation> =
+        None;
     // ⭐ THE GATHER REACH per pooled source tid — stated beside each attention node's KV plane
     // placements below (the pool those planes' gathers name), consumed by the gather door's
     // entry-unit check.
@@ -1975,10 +1973,11 @@ pub fn compute_bundle_layout<F: RopeForm>(
                     // it is: a gathered fold's passes are the pages ONE ROW holds. Over-reserving
                     // would be inert here, but agreeing with the mask's own grid is what keeps the
                     // shift meaningful for both tensors.
-                    kv_block_index_reservation = Some(ktir_superdsc::placement::KvBlockIndexReservation {
-                        bytes: pmbytes,
-                        block_bytes: pm_block_bytes,
-                    });
+                    kv_block_index_reservation =
+                        Some(ktir_superdsc::placement::KvBlockIndexReservation {
+                            bytes: pmbytes,
+                            block_bytes: pm_block_bytes,
+                        });
                 }
                 // DIAGNOSTIC probe (mq>1 only): persistent seg0 buffer for layer-0's pre-selector new_v
                 // [mq_pad, nkvh·hd]. main's `lower_attn_node` copies layer-0 new_v here; the worker reads it to split

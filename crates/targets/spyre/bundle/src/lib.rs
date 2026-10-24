@@ -146,13 +146,13 @@ pub use ktir_superdsc::page_part::{PagePart, Slots};
 /// Recorded rather than reworded: the rule stands as written, and this note is the exception it does
 /// not name.
 pub use ktir_superdsc::place::{PlaceId, SynthRole};
-/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
-/// same reason as [`PlaceId`]: both ends read the one type.
-pub use ktir_superdsc::placement::WeightTail;
 /// ⭐ The write-cover law — what a bind may leave unwritten in its placement. Declared beside
 /// [`PlaceId`] for the same reason: the bake mints it where the placement's geometry is computed,
 /// and every runtime bind door reads it. See [`ktir_superdsc::placement::BindCover`] for the law.
 pub use ktir_superdsc::placement::BindCover;
+/// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
+/// same reason as [`PlaceId`]: both ends read the one type.
+pub use ktir_superdsc::placement::WeightTail;
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]

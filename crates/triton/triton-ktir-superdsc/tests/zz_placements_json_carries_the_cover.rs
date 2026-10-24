@@ -37,7 +37,9 @@ fn the_placements_file_carries_the_bake_s_own_cover() {
     triton_ktir_superdsc::bake::write_placements(&dir, &l).unwrap();
     let text = std::fs::read_to_string(dir.join("placements.json")).unwrap();
     let file: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let places = file["places"].as_array().expect("the file states its places");
+    let places = file["places"]
+        .as_array()
+        .expect("the file states its places");
     assert_eq!(places.len(), 2, "every placed tensor is stated");
     let mut read_back: Vec<(u64, BindCover)> = places
         .iter()
