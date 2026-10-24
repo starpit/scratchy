@@ -111,19 +111,19 @@ pub fn assemble_rmsnorm(
     // rows>1 && cols>64 and walks `x` in the layout it was actually written in. At rows==1 (decode)
     // `stickmajor` is false in the reduce, so the emission is byte-identical to the flat form — decode
     // is provably unaffected.
-    let x = rb(x, rows, cols);
-    let gamma = rb(gamma, 1, cols);
-    let out = rb(out, rows, cols);
-    let mean = rb(&mean, rows, stk);
-    let meps = rb(&meps, rows, stk);
-    let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
-    let xn = rb(&xn, rows, cols);
     // The norm's typed extents: `rows` is the residual stream's token rows, `cols` its feature
     // width, and the per-row mean/rsqrt scalars live in ONE-STICK-wide tensors.
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
+    let x = rb(x, t_rows, f_cols);
+    let gamma = rb(gamma, RowCount::of_broadcast_row(), f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let mean = rb(&mean, t_rows, s_cols);
+    let meps = rb(&meps, t_rows, s_cols);
+    let eps = rb(eps_const, RowCount::of_broadcast_row(), s_cols);
+    let rinv = rb(&rinv, t_rows, s_cols);
+    let xn = rb(&xn, t_rows, f_cols);
     // The `spyre_rms_norm` formula with the vendor's own LAYER-norm head (their
     // `spyre_layer_norm`, decompositions.py:1020, opens with exactly this reduce):
     //   exx2(1/cols)  →  rsqrt(E[x²]+eps)  →  x·r  →  ·γ
@@ -201,7 +201,12 @@ pub fn assemble_rmsnorm(
     //    `Gw` row the gain multiply reads. The stored gamma is never rewritten.
     //    The handles are hoisted OUT of the arm because `In::mb` borrows: the
     //    multiply's operand must outlive the `match` that minted it.
-    let gw_ones_h = ones_const.map(|c| (rb(&gw, 1, cols), rb(c, 1, stk)));
+    let gw_ones_h = ones_const.map(|c| {
+        (
+            rb(&gw, RowCount::of_broadcast_row(), BlockCols::of_feature_cols(cols)),
+            rb(c, RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16)),
+        )
+    });
     let gamma_operand = match &gw_ones_h {
         Some((gw_handle, ones)) => {
             ops.push(pw2(
@@ -279,16 +284,16 @@ pub fn assemble_rmsnorm_unit(
     }
     // Same handle kinds as `assemble_rmsnorm`'s — see its comment for why `x` is
     // RowBlocked, not Flat.
-    let x = rb(x, rows, cols);
-    let out = rb(out, rows, cols);
-    let sq16 = rb(&sq16, rows, cols);
-    let mean = rb(&mean, rows, stk);
-    let meps = rb(&meps, rows, stk);
-    let eps = rb(eps_const, 1, stk);
-    let rinv = rb(&rinv, rows, stk);
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
     let s_cols = BlockCols::of_one_stick(Lanes::FP16);
+    let x = rb(x, t_rows, f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let sq16 = rb(&sq16, t_rows, f_cols);
+    let mean = rb(&mean, t_rows, s_cols);
+    let meps = rb(&meps, t_rows, s_cols);
+    let eps = rb(eps_const, RowCount::of_broadcast_row(), s_cols);
+    let rinv = rb(&rinv, t_rows, s_cols);
     // Steps 1–4 are `assemble_rmsnorm` verbatim — the same formula up to the
     // normalising multiply, because a unit-gain norm is the same norm.
     ops.push(pw2(
@@ -383,12 +388,16 @@ pub fn assemble_tanhsoftcap(
     if let Some(l) = layout {
         l.synth(out_id.synth(R::Tanhc), &[rows, cols]);
     }
-    let x = rb(x, rows, cols);
-    let out = rb(out, rows, cols);
-    let tanhc = rb(&tanhc, rows, cols);
-    let cap = rb(cap_const, 1, Fp16::ELEMS_PER_STICK);
     let t_rows = RowCount::of_token_rows(rows);
     let f_cols = BlockCols::of_feature_cols(cols);
+    let x = rb(x, t_rows, f_cols);
+    let out = rb(out, t_rows, f_cols);
+    let tanhc = rb(&tanhc, t_rows, f_cols);
+    let cap = rb(
+        cap_const,
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     // 1. scaled = x / cap (the cap `[1,1]` const, out-broadcast — the rmsnorm's
     //    `eps` operand mode).
     ops.push(pw2(

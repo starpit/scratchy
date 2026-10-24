@@ -53,6 +53,7 @@ use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceAxes, ReduceKind};
 // parallel one that would have to be mapped across the boundary.
 use super::lower_ktir_to_superdsc::BcastAxis;
 use crate::placement::BundleLayout;
+use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
 use crate::superdsc_opspec::Df;
 use crate::work::DeviceWidth;
 
@@ -5020,7 +5021,11 @@ fn gathered_matmul_materializes(
             let dest_base = cop.args.last().map_or(0, |a| a.view().offset_elems) as u64;
             super::mint_full_window(
                 &what,
-                &super::rb(&inter_name, rows, stick),
+                &super::rb(
+                    &inter_name,
+                    RowCount::of_token_rows(rows),
+                    BlockCols::of_one_stick(Lanes::FP16),
+                ),
                 dest_base,
                 leg_rows,
                 stick,
@@ -5119,7 +5124,11 @@ fn gathered_matmul_materializes(
     // table, so the read window is the bound; the placement door still holds the window against
     // the table's real footprint). The intermediate's `synth` above states the same pair. The
     // builder reads name + kind only, so the dims are the mint's bound and nothing else.
-    let x_h = super::rb(&table_name, rows, head);
+    let x_h = super::rb(
+        &table_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(head),
+    );
     let inputs = [super::In::full(&x_h).ew()];
     let tile_op = super::lower_ktir_to_superdsc::pointwise_tile_op(rows, head, 1, 2, Df::Fp16);
     // ⭐ THE RUN — the program's stick-checked anchor plus the whole sticks these rows span
@@ -5141,7 +5150,11 @@ fn gathered_matmul_materializes(
             gathered_input: 0,
             index_name: &index_name,
             run,
-            o: &super::rb(&inter_name, rows, head),
+            o: &super::rb(
+                &inter_name,
+                RowCount::of_token_rows(rows),
+                BlockCols::of_feature_cols(head),
+            ),
         },
         sym_id_base,
         Some(layout),

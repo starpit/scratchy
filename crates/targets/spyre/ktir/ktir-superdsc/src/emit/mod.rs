@@ -25,7 +25,9 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 };
 use crate::ktir_node::KtirNode;
 use crate::placement::{BundleLayout, SegRole, align128};
-use crate::sdsc_abstract::{FlatTag, KindTag, RowBlockedTag, StickKind, StickLayout, Stk};
+use crate::sdsc_abstract::{
+    BlockCols, FlatTag, KindTag, Lanes, RowCount, RowBlockedTag, StickKind, StickLayout, Stk,
+};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
@@ -1901,7 +1903,13 @@ pub fn assemble_indexed_write(
         page.get(),
     )
     .map_err(|e| SuperDscError(format!("{op_name}: {e}")))?;
-    let src_h = rb(src, rows, cols);
+    // The write's rows are the scatter's entries and its cols the source row's width — the wide
+    // doors, named once at the one `rb` spend.
+    let src_h = rb(
+        src,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     let inputs = [In::full(&src_h).ew()];
     let mut op = pointwise_broadcast_opspec_from_tile(
         &tile_op,
@@ -2288,8 +2296,7 @@ pub fn assemble_broadcast_mul_gate(
     // `[rows, cols]` tensors, and v is the `[rows, one-stick]` column the out-broadcast read sweeps
     // (ONE STICK PER ROW — the RedStick law `EwOperand::swept_extents` states). The probe creates
     // its tensors only in the descriptor (`layout: None`), so the handle IS the statement; the mint
-    // reads the dims as the bound.
-    let (r, c) = (rows.get(), cols.get());
+    // reads the dims as the bound — the typed pair crosses whole, no bare twin.
     // "multiply" is the INTERNAL op_func_from_str key (→ OpFunc::Multiply, whose
     // wire name() is "mul"); passing "mul" would miss the match and default to Add.
     assemble_pointwise_broadcast(
@@ -2298,14 +2305,14 @@ pub fn assemble_broadcast_mul_gate(
         rows,
         cols,
         &[
-            In::full(&rb(x_name, r, c)).ew(),
+            In::full(&rb(x_name, rows, cols)).ew(),
             EwOperand {
                 mb_broadcast: false,
                 out_broadcast: true,
-                ..In::full(&rb(v_name, r, Fp16::ELEMS_PER_STICK)).ew()
+                ..In::full(&rb(v_name, rows, BlockCols::of_one_stick(Lanes::FP16))).ew()
             },
         ],
-        &rb(o_name, r, c),
+        &rb(o_name, rows, cols),
         &mut sym,
         None, // gate probe (not in the walk) → no global layout
     )
@@ -4586,20 +4593,31 @@ fn set_iter_dim(it: &mut IterSpace, name: &str, v: u32) {
 /// kind-boundary (the token stream IS RowBlocked, so this never fails; a genuinely non-RowBlocked tensor
 /// cannot be minted here, which is the point). Named `rb_*` for terse call sites. df is annotation-only
 /// (the emit reads it from the OpSpec), so fp16 is fine for the fp8 activation too.
-pub fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize))
-        .expect("token-stream matmul operand is RowBlocked by construction")
+///
+/// ⭐⭐⭐⭐⭐ THE DIMS CROSS AS THE COUNTS THEY ARE — [`RowCount`] / [`BlockCols`], the same typed
+/// pair the reduce/pointwise mints take, so a wrong-kind count (a slot extent in a row slot, a lane
+/// count in a width slot, or the two positions swapped) is a `cargo build` type error at the call
+/// site, not a silently mis-shaped handle. This mint was the LAST place an attention intermediate's
+/// shape lost its name on its way into the opspec: the counts arrived typed at the assembler doors
+/// and were destructured to bare `u32` "for the `rb` shape slots only" — that exception is closed;
+/// a caller now spends the typed count it holds or crosses through a door that names the quantity.
+pub fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked(rows.get() as usize, cols.get() as usize),
+    )
+    .expect("token-stream matmul operand is RowBlocked by construction")
 }
 
 /// [`rb`] at the operand's OWN df — the fp8 activation's handle. The kind is annotation-only to the
 /// emit (the OpSpec carries the real df), but the WINDOW MINT's placement door prices bytes at the
 /// handle's word length, so a buffer whose elements are 1 byte must not be annotated at 2: every
 /// window over it would be overstated 2× and the last slot's legal convert would refuse. Same
-/// infallibility contract as [`rb`] — only the df reaches the layout.
-pub fn rb_df(name: &str, rows: u32, cols: u32, df: Df) -> Stk<RowBlockedTag> {
+/// infallibility contract and same typed-dims law as [`rb`] — only the df reaches the layout.
+pub fn rb_df(name: &str, rows: RowCount, cols: BlockCols, df: Df) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(
         name,
-        StickLayout::row_blocked_df(rows as usize, cols as usize, df),
+        StickLayout::row_blocked_df(rows.get() as usize, cols.get() as usize, df),
     )
     .expect("token-stream matmul operand is RowBlocked by construction")
 }
@@ -4617,7 +4635,11 @@ pub(crate) fn fl(name: &str, rows: u32, cols: u32) -> Stk<FlatTag> {
 /// `rbo` = RowBlocked (residual token stream), `flo` = Flat (head-major / per-head attention). The KIND
 /// is the whole point: it's what the builder can't be handed wrong, and what drives head_major.
 pub(crate) fn rbo(name: &str) -> Stk<RowBlockedTag> {
-    rb(name, 1, 64)
+    rb(
+        name,
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    )
 }
 
 /// A typed pointwise INPUT operand: a handle whose layout KIND is in its type (`K`), plus its broadcast
@@ -7243,8 +7265,16 @@ mod gather_cut {
         // so the table and output are declared at the node's own `[rows, 4096]` — embedding_granite's
         // extents. The `[1,1]` scale keeps `rbo`: one RedStick IS its whole swept window.
         let scale = rbo("t4294967275");
-        let table = rb("t1", rows, COLS);
-        let out = rb("t2", rows, COLS);
+        let table = rb(
+            "t1",
+            RowCount::of_token_rows(rows),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let out = rb(
+            "t2",
+            RowCount::of_token_rows(rows),
+            BlockCols::of_feature_cols(COLS),
+        );
         let t = tile(rows);
         let mut sid = 0i64;
         assemble_pointwise_broadcast_gather(
@@ -7442,7 +7472,11 @@ mod gather_cut {
         let scale = rbo("t4294967275");
         // TRUE shape (`[cap()*2, 4096]`, covering both legs below): the input mint must not fire
         // before the one-stick ceiling this test exists to pin.
-        let table = rb("t1", cap() * 2, COLS);
+        let table = rb(
+            "t1",
+            RowCount::of_token_rows(cap() * 2),
+            BlockCols::of_feature_cols(COLS),
+        );
         let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
         let two = tile(cap() * 2);
         let mut sid = 0i64;
@@ -7662,9 +7696,21 @@ mod time_tiled_broadcast_operand_is_address_stable {
 
     /// The failing op itself, verbatim: `tscdiv` = realdiv(x, cap), x full, cap `[1,1]` broadcast.
     fn tscdiv() -> EmittedOp {
-        let x = rb("tsc_x", ROWS, COLS);
-        let cap = rb("tsc_cap", 1, Fp16::ELEMS_PER_STICK);
-        let out = rb("tsc_o", ROWS, COLS);
+        let x = rb(
+            "tsc_x",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let cap = rb(
+            "tsc_cap",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let out = rb(
+            "tsc_o",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
         assemble_pointwise_broadcast_off(
             "tscdiv_t2326",
             "realdiv",
@@ -7779,9 +7825,21 @@ mod time_tiled_mb_operand_advances_per_trip {
     /// realdiv(x, gamma): x full `[rows, cols]`, gamma an `In::mb` `[1, cols]` row
     /// vector — broadcast over ROWS, ACTIVE over cols (the rmsnorm-gamma form).
     fn mbdiv() -> EmittedOp {
-        let x = rb("mb_x", ROWS, COLS);
-        let gamma = rb("mb_gamma", 1, COLS);
-        let out = rb("mb_o", ROWS, COLS);
+        let x = rb(
+            "mb_x",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let gamma = rb(
+            "mb_gamma",
+            RowCount::of_broadcast_row(),
+            BlockCols::of_feature_cols(COLS),
+        );
+        let out = rb(
+            "mb_o",
+            RowCount::of_token_rows(ROWS),
+            BlockCols::of_feature_cols(COLS),
+        );
         assemble_pointwise_broadcast_off(
             "mbdiv_t2326",
             "realdiv",

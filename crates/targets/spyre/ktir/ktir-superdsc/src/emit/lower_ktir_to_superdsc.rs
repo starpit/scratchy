@@ -54,7 +54,7 @@ use crate::reserved_tids::{
     scalarmul_scale_tid,
 };
 use crate::score_scale::{NewK, ScoreScaleLaw};
-use crate::sdsc_abstract::{KernelTag, Stk};
+use crate::sdsc_abstract::{BlockCols, KernelTag, Lanes, RowCount, Stk};
 use crate::sdsc_abstract::{MatK, MatM, MatN};
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, ItDim, SdscFoldSet};
 use crate::work::{CoreSplit, DeviceWidth, EwDivision, FP16_ELEMS_PER_STICK, UTIL_FLOOR_CORES};
@@ -1654,10 +1654,22 @@ pub fn elementwise(
     // annotation-only dims the `rbo` comment promises nothing reads but the checks.
     // ⭐ WALL 13 — each handle at its region's OWN df (the mint prices bytes at the handle's word
     // length; `rb` IS `rb_df(Dp16)`, so every f16 op is byte-identical).
-    let out_h = rb_df(&out.name(), out.v_rows, out.v_cols, out.df);
+    let out_h = rb_df(
+        &out.name(),
+        RowCount::of_token_rows(out.v_rows),
+        BlockCols::of_feature_cols(out.v_cols),
+        out.df,
+    );
     let in_handles: Vec<_> = ins
         .iter()
-        .map(|x| rb_df(&x.name(), x.v_rows, x.v_cols, x.df))
+        .map(|x| {
+            rb_df(
+                &x.name(),
+                RowCount::of_token_rows(x.v_rows),
+                BlockCols::of_feature_cols(x.v_cols),
+                x.df,
+            )
+        })
         .collect();
     let ew: Vec<_> = in_handles
         .iter()
@@ -2027,7 +2039,11 @@ fn elementwise_broadcast(
     // annotation-only (`In::ew` keeps the name and the two broadcast flags), and the OUTPUT's are too
     // (the builder reads `o.name()` and `O::kind()`), so the emission cannot depend on them; they are
     // stated at the operand's own shape so a reader is not misled.
-    let out_h = rb(&out.name(), rows, cols);
+    let out_h = rb(
+        &out.name(),
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     let in_names: Vec<String> = ins.iter().map(Region::name).collect();
     let in_handles: Vec<_> = in_names
         .iter()
@@ -2040,7 +2056,11 @@ fn elementwise_broadcast(
             // sweeps ONE STICK PER ROW. The operand mint checks that swept window against the
             // handle's declaration, so the annotation now states the footprint the storage always
             // had — `rb(name, rows, 64)`, the same handle `rmsnorm.rs` mints for `rinv`.
-            Some(BcastAxis::Col) => rb(n, x.v_rows, FP16_ELEMS_PER_STICK),
+            Some(BcastAxis::Col) => rb(
+                n,
+                RowCount::of_token_rows(x.v_rows),
+                BlockCols::of_one_stick(Lanes::FP16),
+            ),
             // ⭐⭐⭐ A CORNERED `Mb` SOURCE IS DECLARED AT THE FULL VIEW, not the window. The
             // operand mint bounds-checks the swept window (one row of `c_len` values) AT the
             // operand's `col_offset` — the corner — against this declaration, so a `[1, c_len]`
@@ -2048,13 +2068,21 @@ fn elementwise_broadcast(
             // states the buffer the window sits in, the same "true shapes" law `scalarmul_scaled`
             // states for its chunked tile (the walk's flat Mb frame presents the parent's whole
             // extent here, window and all).
-            Some(BcastAxis::Mb) if x.c_start != 0 => rb(n, x.v_rows, x.v_cols),
+            Some(BcastAxis::Mb) if x.c_start != 0 => rb(
+                n,
+                RowCount::of_token_rows(x.v_rows),
+                BlockCols::of_feature_cols(x.v_cols),
+            ),
             // ⭐⭐⭐ AND IN THE Y MODE EVERY OPERAND IS STICK-WIDE for the same reason: the op's
             // `out` dim IS the one stick the frame law allows, so the dense operand's storage is
             // `[v_rows, 64]` — the footprint its `(v_rows, c_len < 64)` mint already reserved —
             // and the swept window the mint checks (`rows × stick` dense, `rows/y × stick` for
             // the spray) fits it exactly.
-            _ => rb(n, x.v_rows, if split.is_some() { cols } else { x.c_len }),
+            _ => rb(
+                n,
+                RowCount::of_token_rows(x.v_rows),
+                BlockCols::of_feature_cols(if split.is_some() { cols } else { x.c_len }),
+            ),
         })
         .collect();
     let ew: Vec<_> = in_handles
@@ -2204,10 +2232,26 @@ pub fn silumul(
     // width the corner arithmetic takes, which for a non-final chunk under-states the view). A
     // handle at the chunk's `[rows, cols]` makes chunk 1's own corner past-the-end, which the
     // operand mint refuses — the dims are annotation-only, so this changes no byte.
-    let gate = rb(&gate, rows, gate_r.v_cols);
-    let up = rb(&up, rows, up_r.v_cols);
-    let tmp = rb(&tmp, rows, o.v_cols);
-    let out = rb(&out, rows, o.v_cols);
+    let gate = rb(
+        &gate,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(gate_r.v_cols),
+    );
+    let up = rb(
+        &up,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(up_r.v_cols),
+    );
+    let tmp = rb(
+        &tmp,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(o.v_cols),
+    );
+    let out = rb(
+        &out,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(o.v_cols),
+    );
     Ok(vec![
         assemble_pointwise_broadcast_off(
             &silu_name,
@@ -4189,6 +4233,13 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
         ));
     }
     let heads = total / hd;
+    // The rope plane's own dims, typed once at the door: the chunk's query rows and the whole
+    // `[mq, total]` width every rope buffer declares. The `rb` mints below spend these; the
+    // per-block arms cross their own quantities through the doors they name.
+    let rope_rows = crate::sdsc_abstract::RowCount::of_query_rows(
+        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+    );
+    let rope_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(total);
     // ROW COUNT: 1 = decode, mq>1 = PREFILL (a [mq, total] roped Q/K). The rope emits one mb=1 [1,hd]
     // block per (row r, head h) — the PROVEN mb=1 primitive. Looping ONLY over heads (mq implicitly 1)
     // was THE prefill bug: it wrote row 0 for every head and NEVER rows 1..mq → roped Q/K collapsed to
@@ -4257,8 +4308,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             1,
             hd,
             &[
-                In::sliced(&rb(a, mq, total), aoff).ew(),
-                In::sliced(&rb(b, mq, total), boff).ew(),
+                In::sliced(&rb(a, rope_rows, rope_cols), aoff).ew(),
+                In::sliced(&rb(b, rope_rows, rope_cols), boff).ew(),
             ],
             o,
             ooff.into(),
@@ -4325,11 +4376,19 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &rb(&x, rows, hd),
+            &rb(
+                &x,
+                RowCount::of_head_major_rows(rows),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::ZERO,
             &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
             crate::addr::DevOff::ZERO,
-            &rb(&rot, rows, hd),
+            &rb(
+                &rot,
+                RowCount::of_head_major_rows(rows),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -4431,8 +4490,8 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 mq,
                 stk,
                 &[
-                    In::sliced(&rb(a, mq, total), aoff).ew(),
-                    In::sliced(&rb(b, mq, total), boff).ew(),
+                    In::sliced(&rb(a, rope_rows, rope_cols), aoff).ew(),
+                    In::sliced(&rb(b, rope_rows, rope_cols), boff).ew(),
                 ],
                 o,
                 ooff.into(),
@@ -4548,11 +4607,11 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_head_batched(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, mq, total),
+                &rb(&x, rope_rows, rope_cols),
                 a_place,
                 &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
                 p_off,
-                &rb(&rot, mq, total),
+                &rb(&rot, rope_rows, rope_cols),
                 o_place,
                 sym_id_base,
                 layout,
@@ -4574,11 +4633,11 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, mq, total),
+                &rb(&x, rope_rows, rope_cols),
                 off_h,
                 &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
                 crate::addr::DevOff::ZERO,
-                &rb(&rot, mq, total),
+                &rb(&rot, rope_rows, rope_cols),
                 off_h,
                 sym_id_base,
                 layout,
@@ -4597,9 +4656,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rb(&x, mq, total)),
-            In::full(&rb(&cos, mq, total)),
-            &rb(&xc, mq, total),
+            In::full(&rb(&x, rope_rows, rope_cols)),
+            In::full(&rb(&cos, rope_rows, rope_cols)),
+            &rb(&xc, rope_rows, rope_cols),
             sym_id_base,
             layout,
         ));
@@ -4608,9 +4667,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "multiply",
             rows_all,
             cols_all,
-            In::full(&rb(&rot, mq, total)),
-            In::full(&rb(&sin, mq, total)),
-            &rb(&rs, mq, total),
+            In::full(&rb(&rot, rope_rows, rope_cols)),
+            In::full(&rb(&sin, rope_rows, rope_cols)),
+            &rb(&rs, rope_rows, rope_cols),
             sym_id_base,
             layout,
         ));
@@ -4622,9 +4681,9 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             "add",
             rows_all,
             cols_all,
-            In::full(&rb(&xc, mq, total)),
-            In::full(&rb(&rs, mq, total)),
-            &rb(&out, mq, total),
+            In::full(&rb(&xc, rope_rows, rope_cols)),
+            In::full(&rb(&rs, rope_rows, rope_cols)),
+            &rb(&out, rope_rows, rope_cols),
             sym_id_base,
             layout,
         ));
@@ -4689,8 +4748,24 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 rows,
                 hd,
                 &[
-                    In::sliced(&rb(a, rows, hd), aoff).ew(),
-                    In::sliced(&rb(b, rows, hd), boff).ew(),
+                    In::sliced(
+                        &rb(
+                            a,
+                            RowCount::of_head_major_rows(rows),
+                            BlockCols::of_head_dim(hd),
+                        ),
+                        aoff,
+                    )
+                    .ew(),
+                    In::sliced(
+                        &rb(
+                            b,
+                            RowCount::of_head_major_rows(rows),
+                            BlockCols::of_head_dim(hd),
+                        ),
+                        boff,
+                    )
+                    .ew(),
                 ],
                 o,
                 ooff.into(),
@@ -4740,11 +4815,19 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
             crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                 bmm_site::TapeLoweringSite::witness(),
             ),
-            &rb(&x, heads * mq, hd),
+            &rb(
+                &x,
+                RowCount::of_token_rows(heads * mq),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::ZERO,
             &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
             crate::addr::DevOff::ZERO,
-            &rb(&rot, heads * mq, hd),
+            &rb(
+                &rot,
+                RowCount::of_token_rows(heads * mq),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::ZERO,
             sym_id_base,
             layout,
@@ -4830,11 +4913,11 @@ pub fn rope_at<const HD: u32>(a: RopeAt<'_>) -> Result<Vec<EmittedOp>, Error> {
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&x, 1, hd),
+                &rb(&x, RowCount::of_token_rows(1), BlockCols::of_head_dim(hd)),
                 off,
                 &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &p),
                 crate::addr::DevOff::ZERO,
-                &rb(&rot, 1, hd),
+                &rb(&rot, RowCount::of_token_rows(1), BlockCols::of_head_dim(hd)),
                 off,
                 sym_id_base,
                 layout,
@@ -5154,8 +5237,17 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 "identity",
                 crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
                 crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
+                &[In::full(&rb(
+                    &zero,
+                    RowCount::of_zero_pad_rows(pad_rows),
+                    BlockCols::of_head_dim(hd),
+                ))
+                .ew()],
+                &rb(
+                    &new_k,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 // FLAT, and that is the finding: this lands past the packed data, in a region no
                 // consumer reads (see the note above), so it is placed row-major rather than through
                 // the stick law. Saying `flat` makes which arrangement was meant explicit instead of
@@ -5177,8 +5269,17 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 "identity",
                 crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
                 crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(&zero, pad_rows, hd)).ew()],
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
+                &[In::full(&rb(
+                    &zero,
+                    RowCount::of_zero_pad_rows(pad_rows),
+                    BlockCols::of_head_dim(hd),
+                ))
+                .ew()],
+                &rb(
+                    &new_v,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 crate::addr::Nest::flat(
                     &["row", "feat"],
                     &[mq_pad.row_axis_extent(), nkvh * hd],
@@ -5282,11 +5383,19 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&new_k, mq_pad.row_axis_extent(), nkvh * hd),
+                &rb(
+                    &new_k,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 slab_off,
                 &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
                 ident_off,
-                &rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd),
+                &rb(
+                    &new_k_rep,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 slab_off,
                 sym_id_base,
                 layout,
@@ -5300,11 +5409,19 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
                     bmm_site::TapeLoweringSite::witness(),
                 ),
-                &rb(&new_v, mq_pad.row_axis_extent(), nkvh * hd),
+                &rb(
+                    &new_v,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 slab_off,
                 &Stk::<KernelTag>::kernel(hd as usize, hd as usize, &ident),
                 ident_off,
-                &rb(&new_v_rep, mq_pad.row_axis_extent(), nkvh * hd),
+                &rb(
+                    &new_v_rep,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 slab_off,
                 sym_id_base,
                 layout,
@@ -5384,10 +5501,19 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
                 // swept window.
                 &[
-                    In::full(&rb(&q, mq, nqh * hd)).ew(),
+                    In::full(&rb(
+                        &q,
+                        RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                        BlockCols::of_feature_cols(nqh * hd),
+                    ))
+                    .ew(),
                     In::scalar(&rbo(&sqrt_scale)).ew(),
                 ],
-                &rb(&qs, mq, nqh * hd),
+                &rb(
+                    &qs,
+                    RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                    BlockCols::of_feature_cols(nqh * hd),
+                ),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -5399,10 +5525,19 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
                 crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
                 &[
-                    In::full(&rb(&new_k_rep, mq_pad.row_axis_extent(), nkvh * hd)).ew(),
+                    In::full(&rb(
+                        &new_k_rep,
+                        RowCount::of_padded_chunk_rows(mq_pad),
+                        BlockCols::of_feature_cols(nkvh * hd),
+                    ))
+                    .ew(),
                     In::scalar(&rbo(&sqrt_scale)).ew(),
                 ],
-                &rb(&new_k_scaled, mq_pad.row_axis_extent(), nkvh * hd),
+                &rb(
+                    &new_k_scaled,
+                    RowCount::of_padded_chunk_rows(mq_pad),
+                    BlockCols::of_feature_cols(nkvh * hd),
+                ),
                 crate::addr::DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -5852,7 +5987,13 @@ pub fn kv_cache_write(
                         },
                         crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::of_kv_cache_write(
                         ),
-                        &rb(src, mq, nkvh * hd),
+                        &rb(
+                            src,
+                            RowCount::of_query_rows(
+                                crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                            ),
+                            BlockCols::of_feature_cols(nkvh * hd),
+                        ),
                         a_place,
                         // I[64,64] — the identity for EVERY slab, so the shared 2-D kernel a `y` batch demands is
                         // exactly what an identity copy needs. Offset 0: see the residency argument above.
@@ -5936,7 +6077,11 @@ pub fn kv_cache_write(
                 // ONE block (`[PAGE_SLOTS, hd]`), which the pool's own doctest pins inside the stride
                 // for every head the block table can name; a kv head past `nkvh` now refuses HERE
                 // instead of re-transposing another plane's bytes into Kᵀ.
-                &rb(kc, 1, pool.plane_stride() as u32),
+                &rb(
+                    kc,
+                    RowCount::of_broadcast_row(),
+                    BlockCols::of_feature_cols(pool.plane_stride() as u32),
+                ),
                 // The two planes are the whole content of this op: it reads natural K and writes Kᵀ, both at
                 // the same `(kv head)` block of the page the launch was shifted to.
                 crate::addr::DevOff::from_view_step(pool.addr(
@@ -5945,7 +6090,11 @@ pub fn kv_cache_write(
                         kv_head_of(kvh, nkvh)?,
                     ),
                 )),
-                &rb(kct, 1, pool.plane_stride() as u32),
+                &rb(
+                    kct,
+                    RowCount::of_broadcast_row(),
+                    BlockCols::of_feature_cols(pool.plane_stride() as u32),
+                ),
                 crate::addr::DevOff::from_view_step(pool.addr(
                     crate::sdsc_abstract::KvCoord::block(
                         crate::sdsc_abstract::KvPlane::Kt,
@@ -6078,8 +6227,16 @@ pub fn lmlast(
     // prompt buffer and the destination IS the `[1, hidden]` staging the synth above reserves, so the
     // handles state the buffers the corners below address — the mint's bound. The stick walk's last
     // window ends exactly at `mq*hidden` / `hidden` elements respectively.
-    let src_name = rb(&src.name(), mq, hidden);
-    let dst = rb(&out.name(), 1, hidden);
+    let src_name = rb(
+        &src.name(),
+        RowCount::of_token_rows(mq),
+        BlockCols::of_feature_cols(hidden),
+    );
+    let dst = rb(
+        &out.name(),
+        RowCount::of_token_rows(1),
+        BlockCols::of_feature_cols(hidden),
+    );
     Ok((0..hidden / stk)
         .map(|j| {
             assemble_pointwise_broadcast_off(
@@ -6480,9 +6637,17 @@ pub fn matmul_oriented(
             n_dev,
             k,
             1,
-            &rb(&a.name(), m, k),
+            &rb(
+                &a.name(),
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            ),
             &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
-            &rb(&out.name(), m, n_dev),
+            &rb(
+                &out.name(),
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(n_dev),
+            ),
             sym_id_base,
             layout,
         )
@@ -6516,12 +6681,20 @@ pub fn matmul_oriented(
             MatM::of_token_rows(m),
             MatN::of_out_features(n_dev),
             MatK::of_in_features(k),
-            &rb(&a.name(), m, k),
+            &rb(
+                &a.name(),
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            ),
             a_off,
             &Stk::<KernelTag>::kernel(k as usize, n_dev as usize, &w_name),
             w_off,
             k_full,
-            &rb(&out.name(), m, n_dev),
+            &rb(
+                &out.name(),
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(n_dev),
+            ),
             o_off,
             sym_id_base,
             layout,
@@ -6692,8 +6865,16 @@ pub fn transpose(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
-        &rb(&a.name(), mb, cols),
-        &rb(&out.name(), cols, mb),
+        &rb(
+            &a.name(),
+            RowCount::of_token_rows(mb),
+            BlockCols::of_feature_cols(cols),
+        ),
+        &rb(
+            &out.name(),
+            RowCount::of_token_rows(cols),
+            BlockCols::of_feature_cols(mb),
+        ),
         sym_id_base,
         layout,
     )
@@ -7208,8 +7389,8 @@ mod elementwise_tests {
     #[test]
     fn the_row_split_op_states_the_y_major_frame() {
         use crate::superdsc_opspec::Scale;
-        let dense_h = rb("t5", 256, 64);
-        let merged_h = rb("t6", 64, 64);
+        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_one_stick(Lanes::FP16));
+        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_one_stick(Lanes::FP16));
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -7259,8 +7440,8 @@ mod elementwise_tests {
     /// operands' addressing would read different bytes. Refused by name.
     #[test]
     fn a_tile_that_disagrees_with_the_spray_count_is_refused() {
-        let dense_h = rb("t5", 256, 64);
-        let merged_h = rb("t6", 64, 64);
+        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_one_stick(Lanes::FP16));
+        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_one_stick(Lanes::FP16));
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -7288,8 +7469,8 @@ mod elementwise_tests {
     /// emitting it would address a wide op in a frame built for one stick. Refused by name.
     #[test]
     fn a_row_split_op_wider_than_one_stick_is_refused() {
-        let dense_h = rb("t5", 256, 128);
-        let merged_h = rb("t6", 64, 128);
+        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_feature_cols(128));
+        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_feature_cols(128));
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -8820,25 +9001,26 @@ pub fn windowed_rmsnorm(
     }
     // Handle kinds: `x`/`out`/`sq16`/`xn` are the residual stream's RowBlocked; the
     // reduced scalars are one-stick-wide. `assemble_rmsnorm`'s comment carries the law.
-    let x_h = rb(&x, m, full);
-    let out_h = rb(&out.name(), m, full);
-    let sq16_h = rb(&sq16, m, full);
-    let xn_h = rb(&xn, m, full);
-    let eps_h = rb(&eps_const, 1, stk);
+    let t_rows = RowCount::of_token_rows(m);
+    let full_cols = BlockCols::of_feature_cols(full);
+    let f_cols = BlockCols::of_feature_cols(d);
+    let s_cols = BlockCols::of_one_stick(Lanes::FP16);
+    let x_h = rb(&x, t_rows, full_cols);
+    let out_h = rb(&out.name(), t_rows, full_cols);
+    let sq16_h = rb(&sq16, t_rows, full_cols);
+    let xn_h = rb(&xn, t_rows, full_cols);
+    let eps_h = rb(&eps_const, RowCount::of_broadcast_row(), s_cols);
     let gamma_h = if unit {
         None
     } else {
-        Some(rb(&tensors[1].name(), 1, d))
+        Some(rb(&tensors[1].name(), RowCount::of_broadcast_row(), f_cols))
     };
     // The OnePlusScale gain row: `gw = gamma + 1` filled ONCE, ahead of the head
     // loop — the gamma row is shared by every head, and so is its offset sum. The
     // add reads the `[1,1]`-broadcast offset (the eps operand mode) into the
     // `[1, d]` `Gw` row the per-head gain multiplies read.
-    let gw_h = gw_ones.as_ref().map(|_| rb(&gw, 1, d));
-    let ones_h = gw_ones.as_ref().map(|c| rb(c, 1, stk));
-    let t_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
-    let f_cols = crate::sdsc_abstract::BlockCols::of_feature_cols(d);
-    let s_cols = crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
+    let gw_h = gw_ones.as_ref().map(|_| rb(&gw, RowCount::of_broadcast_row(), f_cols));
+    let ones_h = gw_ones.as_ref().map(|c| rb(c, RowCount::of_broadcast_row(), s_cols));
     let mut ops: Vec<EmittedOp> = Vec::new();
     if let (Some(g), Some(ones), Some(gw)) = (&gamma_h, &ones_h, &gw_h) {
         ops.push(pw2(
@@ -8858,9 +9040,9 @@ pub fn windowed_rmsnorm(
         // this op's own `[m, D]` block (the block-alignment law).
         let win = crate::addr::col_of(m, full, h * d, crate::superdsc_opspec::Df::Fp16);
         // The per-head reduced scalars — their OWN buffers, addressed at ZERO.
-        let mean_h = rb(&syn(R::HeadMean(h)), m, stk);
-        let meps_h = rb(&syn(R::HeadMeps(h)), m, stk);
-        let rinv_h = rb(&syn(R::HeadRinv(h)), m, stk);
+        let mean_h = rb(&syn(R::HeadMean(h)), t_rows, s_cols);
+        let meps_h = rb(&syn(R::HeadMeps(h)), t_rows, s_cols);
+        let rinv_h = rb(&syn(R::HeadRinv(h)), t_rows, s_cols);
         let prefix = format!("wh{h}_o{t}");
         // 1. sq16 = x² over the head window (out at the window — `pw2`'s ZERO would
         //    make every head overwrite head 0's block).
@@ -9053,12 +9235,20 @@ pub fn scalarweightmul(
     // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the op sweeps `[rows, cols]` (the extents the
     // `RowCount`/`BlockCols` slots below state), so x and the output declare exactly that — the
     // mint's bound. The builder reads name + kind only.
-    let x_h = rb(&x, rows, cols);
+    let x_h = rb(
+        &x,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
     // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
     // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
-    let w_h = rb(&w, 1, crate::work::FP16_ELEMS_PER_STICK);
-    let out_h = rb(&out.name(), rows, cols);
+    let w_h = rb(&w, RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16));
+    let out_h = rb(
+        &out.name(),
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     let op_name = format!("scalarmul_o{t}");
     Ok(vec![pw2(
         &op_name,
@@ -9180,8 +9370,8 @@ pub fn reshape(
     // ⭐ TRUE EXTENTS on both sides, not the `[1, stk]`/`rbo` staging annotations: the corners below
     // are `rc_of` corners of each side's OWN `[r, c]` view, so the handles declare those views —
     // the mint's bound. The stick walk's last window ends exactly at `total` elements on each side.
-    let src_name = rb(&src.name(), r_in, c_in);
-    let dst = rb(&out.name(), r_out, c_out);
+    let src_name = rb(&src.name(), RowCount::of_token_rows(r_in), BlockCols::of_feature_cols(c_in));
+    let dst = rb(&out.name(), RowCount::of_token_rows(r_out), BlockCols::of_feature_cols(c_out));
     let n_sticks = total / u64::from(stk);
     let mut ops = Vec::with_capacity(n_sticks as usize);
     for q in 0..n_sticks {
@@ -9430,7 +9620,12 @@ pub fn scalarfill_at(
         DeviceWidth::for_pointwise(out.c_len).get(),
     )?;
     let scale_h = rbo(&crate::place::act_name(scale_tid));
-    let out_h = rb_df(&out_name, rows, store_cols, out.df);
+    let out_h = rb_df(
+        &out_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(store_cols),
+        out.df,
+    );
     // `n_operands: 2` is the `_df` funnel's own count for a one-input op (the input plus the
     // output — what `assemble_pointwise_broadcast_off` states for lmlast's identity copies);
     // nothing rides in this op, so the count is derived from its shape, not hand-picked.
@@ -9496,8 +9691,18 @@ pub fn mintcopy_at(
         out.v_cols,
         DeviceWidth::for_pointwise(out.c_len).get(),
     )?;
-    let src_h = rb_df(&src_name, rows, store_cols, out.df);
-    let out_h = rb_df(&out_name, rows, store_cols, out.df);
+    let src_h = rb_df(
+        &src_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(store_cols),
+        out.df,
+    );
+    let out_h = rb_df(
+        &out_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(store_cols),
+        out.df,
+    );
     // `n_operands: 2` is the `_df` funnel's own count for a one-input op (the input plus the
     // output) — the count the fill and lmlast's identity copies already state.
     let tile_op = pointwise_tile_op(rows, cols, 1, 2, out.df);
@@ -9701,8 +9906,18 @@ fn scalarmul_scaled(
     // ⭐ WALL 13 — the value handles at the op's own df (`rb` IS `rb_df(Fp16)`; an f32 scalar op
     // must not understate its window 2×). The `[1,1]` scale keeps `rbo` — the scale slot's own
     // word is the registry's business, not this handle's.
-    let x_h = rb_df(&x, rows, store_cols, out.df);
-    let out_h = rb_df(&out_name, rows, store_cols, out.df);
+    let x_h = rb_df(
+        &x,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(store_cols),
+        out.df,
+    );
+    let out_h = rb_df(
+        &out_name,
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(store_cols),
+        out.df,
+    );
     let scale_h = rbo(&scale_name);
     // `In::col_window` at corner 0 is field for field `In::full` in what it emits (corner 0 is a whole-block
     // shift, stick-major either way), so a whole-tensor ScalarMul (piece 0, and every node narrower than one
@@ -10170,8 +10385,18 @@ pub fn convert(
     // ⭐ EACH HANDLE AT ITS OWN df — the window mint prices bytes at the handle's word length, so
     // the fp32 side must not be annotated at 2 bytes ([`rb_df`]'s own law, the fp8 activation's).
     // The handles declare each region's OWN view (the storage the base-addressed body sweeps).
-    let in_h = rb_df(&data.name(), data.v_rows, data.v_cols, from);
-    let out_h = rb_df(&out.name(), out.v_rows, out.v_cols, to);
+    let in_h = rb_df(
+        &data.name(),
+        RowCount::of_token_rows(data.v_rows),
+        BlockCols::of_feature_cols(data.v_cols),
+        from,
+    );
+    let out_h = rb_df(
+        &out.name(),
+        RowCount::of_token_rows(out.v_rows),
+        BlockCols::of_feature_cols(out.v_cols),
+        to,
+    );
     Ok(vec![assemble_convert(
         &op_name,
         op_func,
@@ -10243,8 +10468,18 @@ pub fn reduce(
                         // fp16 would UNDERSTATE its access 2× and let a past-the-end read pass
                         // the mint. `rb` IS `rb_df(Df::Fp16)`, so every f16 reduce is
                         // byte-identical.
-                        &rb_df(&data.name(), rows, cols, data.df),
-                        &rb_df(&out.name(), out.r_len, out.c_len, out.df),
+                        &rb_df(
+                            &data.name(),
+                            RowCount::of_token_rows(rows),
+                            BlockCols::of_feature_cols(cols),
+                            data.df,
+                        ),
+                        &rb_df(
+                            &out.name(),
+                            RowCount::of_token_rows(out.r_len),
+                            BlockCols::of_feature_cols(out.c_len),
+                            out.df,
+                        ),
                         sym_id_base,
                         layout,
                     ),
@@ -10316,8 +10551,19 @@ pub fn reduce(
             kind.op_func(),
             rows,
             cols,
-            &rb(&data.name(), rows, cols),
-            &rb(&out.name(), rows, 1),
+            &rb(
+                &data.name(),
+                RowCount::of_token_rows(rows),
+                BlockCols::of_feature_cols(cols),
+            ),
+            // The accumulator's own view frame — `[rows, 1]` by the two checks above (one
+            // value per row the reduce reads), stated by the region the way the nonstick
+            // branch's out handle states its own frame.
+            &rb(
+                &out.name(),
+                RowCount::of_token_rows(out.r_len),
+                BlockCols::of_feature_cols(out.c_len),
+            ),
             sym_id_base,
             layout,
         ),

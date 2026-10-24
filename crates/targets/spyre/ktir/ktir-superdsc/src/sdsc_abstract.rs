@@ -4648,7 +4648,9 @@ impl ElemCount {
     }
 }
 
-/// THE COLUMN EXTENT ONE REDUCE/POINTWISE OP SWEEPS — a score-block width. Constructed only through
+/// THE COLUMN EXTENT AN OP SWEEPS OR AN OPERAND DECLARES — the reduce/pointwise mints and the
+/// RowBlocked matmul-operand mint (`rb`/`rb_df`) both take this type — a score-block width or a
+/// feature extent. Constructed only through
 /// doors that NAME which width it is: one stick ([`Self::of_one_stick`]), one slot window
 /// ([`Self::of_slot_window`]), one row window ([`Self::of_row_window`]), the head dim
 /// ([`Self::of_head_dim`]) / one head slab ([`Self::of_head_slab`]), or a residual feature extent
@@ -4712,8 +4714,10 @@ impl BlockCols {
     }
 }
 
-/// THE ROW EXTENT ONE REDUCE/POINTWISE OP SWEEPS. Constructed only through doors that NAME which
-/// row quantity fills the slot — the batched shared-buffer extent (`nqh*mq`, [`Self::of_mask_rows`]),
+/// THE ROW EXTENT AN OP SWEEPS OR AN OPERAND DECLARES — the reduce/pointwise mints and the
+/// RowBlocked matmul-operand mint (`rb`/`rb_df`) both take this type, so a row count crosses every
+/// emit boundary as the quantity it is. Constructed only through doors that NAME which row
+/// quantity fills the slot — the batched shared-buffer extent (`nqh*mq`, [`Self::of_mask_rows`]),
 /// the real query rows ([`Self::of_query_rows`]), the stick-padded rows ([`Self::of_padded_chunk_rows`]),
 /// the zero-fill remainder ([`Self::of_zero_pad_rows`]) or residual token rows ([`Self::of_token_rows`]).
 /// At nqh=32 the first equals `mq_pad` exactly up to mq=2 and separates at mq=4 — the first broken width.
@@ -4752,6 +4756,13 @@ impl RowCount {
     /// collapse's sweep.
     pub const fn of_head_major_rows(rows: u32) -> RowCount {
         RowCount(rows)
+    }
+    /// The one-row stub a broadcast operand's handle declares — the row axis carries nothing. A
+    /// gamma/eps/cap row vector, a weight-scale row, or a buffer declared flat as one row (the Kᵗ
+    /// scratch's whole extent): the `1` is structural, not a count of anything, which is why this
+    /// is a door of its own rather than [`Self::of_token_rows`]`(1)` misnaming a weight as a token.
+    pub const fn of_broadcast_row() -> RowCount {
+        RowCount(1)
     }
     pub const fn get(self) -> u32 {
         self.0

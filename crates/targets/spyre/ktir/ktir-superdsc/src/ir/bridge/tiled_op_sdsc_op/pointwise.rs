@@ -144,7 +144,12 @@ pub fn gather_copy_opspec(
         } => {
             crate::emit::mint_full_window(
                 &format!("gather_copy_opspec('{src}' -> '{dst}'): the destination"),
-                &crate::emit::rb_df(dst, d_rows, d_cols, df),
+                &crate::emit::rb_df(
+                    dst,
+                    crate::sdsc_abstract::RowCount::of_token_rows(d_rows),
+                    crate::sdsc_abstract::BlockCols::of_feature_cols(d_cols),
+                    df,
+                ),
                 dest_base as u64,
                 rows,
                 cols,
@@ -352,7 +357,12 @@ pub fn assemble_gather_copy(
         } => {
             crate::emit::mint_full_window(
                 &format!("assemble_gather_copy {op_name}: the destination"),
-                &crate::emit::rb_df(dst, d_rows, d_cols, Df::Fp16),
+                &crate::emit::rb_df(
+                    dst,
+                    crate::sdsc_abstract::RowCount::of_token_rows(d_rows),
+                    crate::sdsc_abstract::BlockCols::of_feature_cols(d_cols),
+                    Df::Fp16,
+                ),
                 dest_base,
                 d.mb(),
                 d.out(),

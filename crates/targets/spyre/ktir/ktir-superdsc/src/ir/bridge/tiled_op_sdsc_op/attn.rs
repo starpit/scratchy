@@ -1098,10 +1098,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The one predicate the two matmul legs branch on — derived FROM the row regime, so the
     // per-request forms and the per-request extent cannot disagree.
     let per_request = rows.per_request();
-    // Bare extents for the `rb` shape slots only — `rb` is a name-wrapper whose dims stay `u32`
-    // (outside this lock). The matmul dim run and the reduce/pointwise row-and-width run below take
-    // the TYPED values.
-    let (mq_n, rows_n, width_n) = (mq.get(), rows.extent(), width.get());
+    // Bare extents for the `fl` shape slots only — the Flat mint is the LAST name-wrapper whose
+    // dims stay `u32` (its own rung; the `rb` slots crossed into the typed lock). The matmul dim
+    // run and the reduce/pointwise row-and-width run below take the TYPED values, as do the `rb`
+    // mints.
+    let (rows_n, width_n) = (rows.extent(), width.get());
     let BlockBufs {
         sc,
         bmax,
@@ -1316,7 +1317,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                             rn.score_rows(h0, width),
                         ),
                         score_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         rn.token_stream_by_slab(h0, s),
                         // ⭐ THE GATHERED SCRATCH AS THE KERNEL, AT ITS FULL DECLARED `hd` ROWS with the
                         // slab selected purely by OFFSET — the same discipline the ungathered arm uses.
@@ -1324,7 +1325,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // `stick*stk` where the tensor's is `hd*stk`.
                         &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::Kt, s)?,
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         rn.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
@@ -1440,11 +1441,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                             nests.score_rows(h0, width),
                         ),
                         bmm_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         nests.token_stream_by_slab(h0, s),
                         &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
@@ -1478,11 +1479,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                             nests.score_rows(h0, width),
                         ),
                         score_form,
-                        &rb(qs, mq_n, hd),
+                        &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                         nests.token_stream_by_slab(h0, s),
                         &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                         kt_off_fn(qh0, s),
-                        &rb(sc, rows_n, width_n),
+                        &rb(sc, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
                         epi_h,
                         epi_off,
@@ -1511,13 +1512,13 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                 MatK::of_head_dim(hd),
                 MatY::unbatched(),
                 bmm_form,
-                &rb(qs, mq_n, hd),
+                &rb(qs, RowCount::of_query_rows(mq), BlockCols::of_head_dim(hd)),
                 qs_off,
                 // Slab 0: this arm contracts the WHOLE head dim in one op (`MatY::unbatched()`), so
                 // there is no split and the kernel's base is the head's own feature origin.
                 &Stk::<KernelTag>::kernel(HD as usize, kt_stride.n_out_cols(), kt_kernel),
                 kt_off_fn(h, 0),
-                &rb(sc, rows_n, width_n),
+                &rb(sc, rows.swept(), width),
                 nests.score_rows(hi, width).off(),
                 &mask_h,
                 head_mask_off,
@@ -1826,7 +1827,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                             ),
                         ),
                         bmm_form,
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         rn.score_rows(h0, width),
                         // ⭐ THE V SCRATCH AS THE KERNEL, AND ITS ROW COUNT IS THE PAGE — the scratch
                         // row is a byte-for-byte copy of the V page plane, so `v_rows` (the page
@@ -1835,7 +1836,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // geometry differ from the pool's at all.
                         &Stk::<KernelTag>::kernel(v_rows, HD as usize, v_kernel),
                         gf.kernel_off(kvh, r, crate::sdsc_abstract::KvPlane::V, s)?,
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         rn.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
@@ -1919,7 +1920,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // into `expb` — a pairing the placement leaves nowhere to write, since the
                         // pitch rides the same law that mints the offset. Pinned by
                         // `fold_request_axis_strides.rs` off the emitted per-core addresses.
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width),
                         &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
@@ -1928,7 +1929,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         // one through `token_stream` (`h*mq*hd`), the other through `head_major` (row
                         // `h*mq` of a stick-blocked `[nqh*mq, hd]`, i.e. `h*mq*stick`). Equal iff `hd`
                         // is one stick, which is the only geometry that had ever taken both.
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         nests.head_major(h0, s),
                         // The addend is THIS op's own output slice of `otmp` — same buffer geometry, same
                         // offset, so `attach_fused_epilogue` clones the output's shape onto it verbatim.
@@ -1960,11 +1961,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                             ),
                         ),
                         bmm_form,
-                        &rb(expb, rows_n, width_n),
+                        &rb(expb, rows.swept(), width),
                         nests.score_rows(h0, width).off(),
                         &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                         v_off_fn(qh0, s),
-                        &rb(run_o, rows_n, hd),
+                        &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                         nests.head_major(h0, s),
                         fold_addend.stridedadd(nests.head_major(h0, s)),
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
@@ -2037,11 +2038,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     MatK::of_kv_window(width),
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(expb, rows_n, width_n),
+                    &rb(expb, rows.swept(), width),
                     nests.score_rows(hi, width).off(),
                     &Stk::<KernelTag>::kernel(v_stride.rows() as usize, HD as usize, v_kernel),
                     v_off_fn(h, s),
-                    &rb(run_o, rows_n, hd),
+                    &rb(run_o, rows.swept(), BlockCols::of_head_dim(hd)),
                     nests.head_major(hi, s),
                     fold_addend.stridedadd(nests.head_major(hi, s)),
                     crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
@@ -2408,7 +2409,11 @@ fn row_block_query(
     Ok(match blocks.form() {
         ChunkRowForm::OneSlabGroup => (
             MatM::of_head_major_rows(blocks.rows()),
-            rb(qs, nqh * mq, hd),
+            rb(
+                qs,
+                RowCount::of_head_major_rows(nqh * mq),
+                BlockCols::of_head_dim(hd),
+            ),
             crate::addr::DevOff::from_view_step(
                 blocks.first_head(b) * mq * BlockCols::of_one_stick(Lanes::FP16).get(),
             ),
@@ -2417,7 +2422,7 @@ fn row_block_query(
             let rows = QueryRowCount::of_mq(mq);
             (
                 MatM::of_query_rows(rows),
-                rb(qs, mq, hd),
+                rb(qs, RowCount::of_query_rows(rows), BlockCols::of_head_dim(hd)),
                 OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
             )
         }
@@ -2426,7 +2431,11 @@ fn row_block_query(
         // `qs` here is the re-laid buffer's name (the caller hands it in place of the stream's).
         ChunkRowForm::QueryGroup(q) => (
             MatM::of_head_major_rows(q.rows()),
-            rb(qs, q.rows(), hd),
+            rb(
+                qs,
+                RowCount::of_head_major_rows(q.rows()),
+                BlockCols::of_head_dim(hd),
+            ),
             q.block_off(blocks.kv_head(b)).ok_or_else(|| {
                 SuperDscError(format!(
                     "row block {b}: kv head {} is past the re-laid query's {} groups",
@@ -2642,9 +2651,9 @@ fn assemble_new_block_chunk(
             q_off,
             &Stk::<KernelTag>::kernel(hd as usize, slots as usize, new_kt),
             kt.block(kvh).dev(),
-            &rb(sc, g_rows, slots),
+            &rb(sc, grp_rows, cols),
             at_pin,
-            &rb(cmask, g_rows, slots),
+            &rb(cmask, grp_rows, cols),
             wide.block(b).dev(),
             EpilogueOpFunc::StridedAdd,
             &[],
@@ -2660,7 +2669,7 @@ fn assemble_new_block_chunk(
             cols,
             win_reduce_data(
                 layout,
-                &rb(sc, g_rows, slots),
+                &rb(sc, grp_rows, cols),
                 at_pin,
                 grp_rows,
                 cols,
@@ -2684,10 +2693,10 @@ fn assemble_new_block_chunk(
             grp_rows,
             cols,
             &[
-                In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
+                In::sliced(&rb(sc, grp_rows, cols), at_pin).ew(),
                 In::col_at(&hm_rows(state.m(), q_rows), row_step(h0)).ew(),
             ],
-            &rb(esub, g_rows, slots),
+            &rb(esub, grp_rows, cols),
             at_pin,
             sym_id_base,
             layout,
@@ -2697,8 +2706,8 @@ fn assemble_new_block_chunk(
             ExpBase::E.op_func(),
             grp_rows,
             cols,
-            &[In::sliced(&rb(esub, g_rows, slots), at_pin).ew()],
-            &rb(exp, g_rows, slots),
+            &[In::sliced(&rb(esub, grp_rows, cols), at_pin).ew()],
+            &rb(exp, grp_rows, cols),
             at_pin,
             sym_id_base,
             layout,
@@ -2711,7 +2720,7 @@ fn assemble_new_block_chunk(
             cols,
             win_reduce_data(
                 layout,
-                &rb(exp, g_rows, slots),
+                &rb(exp, grp_rows, cols),
                 at_pin,
                 grp_rows,
                 cols,
@@ -2750,11 +2759,15 @@ fn assemble_new_block_chunk(
                 MatK::of_kv_window(cols),
                 MatY::unbatched(),
                 bmm_form,
-                &rb(exp, g_rows, slots),
+                &rb(exp, grp_rows, cols),
                 at_pin,
                 &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
                 v_off,
-                &rb(state.o(), q_rows, hd),
+                &rb(
+                    state.o(),
+                    RowCount::of_head_major_rows(q_rows),
+                    BlockCols::of_head_dim(hd),
+                ),
                 v.out_off,
                 sym_id_base,
                 layout,
@@ -3095,7 +3108,13 @@ fn assemble_attn_chunk(
                         MatK::one_stick(Lanes::FP16),
                         MatY::of_gqa_group(q.gqa(), src, dst),
                         SharedKernelBmmForm::of_query_group_copy(),
-                        &rb(qs, mq, nqh * hd),
+                        &rb(
+                            qs,
+                            RowCount::of_query_rows(
+                                crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                            ),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
                         src,
                         // I[64,64] — the class identity's first diagonal block, for every slab: an
                         // identity copy needs exactly the shared 2-D kernel a `y` batch demands.
@@ -3105,7 +3124,11 @@ fn assemble_attn_chunk(
                             &qb.ident,
                         ),
                         DevOff::ZERO,
-                        &rb(&qb.block, q.nkvh() * q.rows(), hd),
+                        &rb(
+                            &qb.block,
+                            RowCount::of_head_major_rows(q.nkvh() * q.rows()),
+                            BlockCols::of_head_dim(hd),
+                        ),
                         dst,
                         sym_id_base,
                         layout,
@@ -3154,7 +3177,7 @@ fn assemble_attn_chunk(
                 a_off,
                 &Stk::<KernelTag>::kernel(hd as usize, slots as usize, &cb.gkt),
                 kc,
-                &rb(&cb.csc, b_rows, slots),
+                &rb(&cb.csc, blk_rows, width),
                 rc,
                 &mask_h,
                 DevOff::ZERO,
@@ -3196,7 +3219,7 @@ fn assemble_attn_chunk(
                 a_off,
                 &Stk::<KernelTag>::kernel(hd as usize, part.slots() as usize, k_name),
                 DevOff::ZERO,
-                &rb(&cb.csc, b_rows, slots),
+                &rb(&cb.csc, blk_rows, width),
                 pc,
                 &mask_h,
                 mask_off,
@@ -3257,7 +3280,7 @@ fn assemble_attn_chunk(
                         // the whole buffer (ChunkPart::probs_corner's law), and the block's own
                         // `b_rows` rows are a slice of it, so the part-sized and block-sized
                         // annotations the raw form carried were never the window's bound.
-                        &rb(src, q_rows, slots),
+                        &rb(src, all_rows, width),
                         pc,
                         blk_rows,
                         BlockCols::of_chunk_part(*part),
@@ -3320,7 +3343,7 @@ fn assemble_attn_chunk(
                         // The FULL `[q_rows, slots]` chunk score buffer — the block's `rc` is a
                         // corner in it, so the block-sized `b_rows` annotation the raw form
                         // carried was never the window's bound.
-                        &rb(&cb.csc, q_rows, slots),
+                        &rb(&cb.csc, all_rows, width),
                         rc,
                         blk_rows,
                         width,
@@ -3475,10 +3498,10 @@ fn assemble_attn_chunk(
                     rows: blk_rows,
                     cols: pw,
                     inputs: &[
-                        In::sliced(&rb(&cb.csc, q_rows, slots), pc).ew(),
+                        In::sliced(&rb(&cb.csc, all_rows, width), pc).ew(),
                         In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
                     ],
-                    o: &rb(&cb.cesub, b_rows, ps),
+                    o: &rb(&cb.cesub, blk_rows, pw),
                     out_offset: DevOff::ZERO.into(),
                     division: cb.sm_division,
                 },
@@ -3491,8 +3514,8 @@ fn assemble_attn_chunk(
                     op_func: ExpBase::E.op_func(),
                     rows: blk_rows,
                     cols: pw,
-                    inputs: &[In::sliced(&rb(&cb.cesub, b_rows, ps), DevOff::ZERO).ew()],
-                    o: &rb(&cb.cexp, q_rows, slots),
+                    inputs: &[In::sliced(&rb(&cb.cesub, blk_rows, pw), DevOff::ZERO).ew()],
+                    o: &rb(&cb.cexp, all_rows, width),
                     out_offset: pc.into(),
                     division: cb.sm_division,
                 },
@@ -3513,7 +3536,7 @@ fn assemble_attn_chunk(
                     data: win_reduce_data(
                         layout,
                         // The FULL `[q_rows, slots]` probability buffer (the bsum twin above).
-                        &rb(&cb.cexp, q_rows, slots),
+                        &rb(&cb.cexp, all_rows, width),
                         rc,
                         blk_rows,
                         width,
@@ -3633,11 +3656,11 @@ fn assemble_attn_chunk(
                     k,
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(&cb.cexp, b_rows, slots),
+                    &rb(&cb.cexp, blk_rows, width),
                     rc,
                     &Stk::<KernelTag>::kernel(part.slots() as usize, v_cols as usize, v_name),
                     kc,
-                    &rb(out, q_rows, hd),
+                    &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     o_off,
                     Some((addend, o_off)),
                     EpilogueOpFunc::StridedAdd,
@@ -3823,10 +3846,10 @@ fn prompt_probabilities_in_lx(
                     // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
                     // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
                     // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
-                    In::sliced(&rb(&cb.csc, q_rows, chunk.slots()), pc).ew(),
+                    In::sliced(&rb(&cb.csc, all_rows, BlockCols::of_chunk(chunk)), pc).ew(),
                     In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
                 ],
-                &rb(&cb.cesub, g_rows, ps),
+                &rb(&cb.cesub, grp_rows, pw),
                 DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -3836,8 +3859,8 @@ fn prompt_probabilities_in_lx(
                 ExpBase::E.op_func(),
                 grp_rows,
                 pw,
-                &[In::sliced(&rb(&cb.cesub, g_rows, ps), DevOff::ZERO).ew()],
-                &rb(&cb.cexp, g_rows, ps),
+                &[In::sliced(&rb(&cb.cesub, grp_rows, pw), DevOff::ZERO).ew()],
+                &rb(&cb.cexp, grp_rows, pw),
                 DevOff::ZERO,
                 sym_id_base,
                 layout,
@@ -3852,7 +3875,7 @@ fn prompt_probabilities_in_lx(
                 pw,
                 win_reduce_data(
                     layout,
-                    &rb(&cb.cexp, g_rows, ps),
+                    &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
                     grp_rows,
                     pw,
@@ -3892,11 +3915,11 @@ fn prompt_probabilities_in_lx(
                     MatK::of_kv_window(pw),
                     MatY::unbatched(),
                     bmm_form,
-                    &rb(&cb.cexp, g_rows, ps),
+                    &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
                     &Stk::<KernelTag>::kernel(ps as usize, v.v_cols as usize, &cb.gv),
                     kc,
-                    &rb(out, q_rows, hd),
+                    &rb(out, all_rows, BlockCols::of_head_dim(hd)),
                     v.out_off,
                     Some((addend, v.out_off)),
                     EpilogueOpFunc::StridedAdd,
@@ -4182,7 +4205,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // law, still INSIDE this tensor). The mint bounds every (kvh, slab, sub-block) tile's
                     // flat run against THAT, so a corner arithmetic that walks past the last head's last
                     // slab is a build failure here rather than a clean bake reading the next tensor.
-                    &rb(new_k_scaled, mq_pad_t.rows().row_axis_extent(), nkvh * hd),
+                    &rb(
+                        new_k_scaled,
+                        RowCount::of_padded_chunk_rows(mq_pad_t.rows()),
+                        BlockCols::of_feature_cols(nkvh * hd),
+                    ),
                     // PER-KV-HEAD BASE = `kvh * mq * hd` (2026-07-28, CORRECTED from a briefly-committed
                     // `mq_pad` version that regressed decode). `new_k_scaled` inherits its kv-head stride from
                     // RoPE, this tensor family's producer, which writes head h row r at
@@ -4209,7 +4236,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     // laid end to end (the synth above reserves exactly `[nkvh, hd, mq_pad]`), so the
                     // handle states the whole flat run. The LAST sub-block's tile ends exactly at the
                     // scratch's last element — fits with equality, which is what the mint checks.
-                    &rb(&new_kt, 1, nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
+                    &rb(
+                        &new_kt,
+                        RowCount::of_broadcast_row(),
+                        BlockCols::of_feature_cols(
+                            nkvh * hd * mq_pad_t.slots().slot_axis_extent(),
+                        ),
+                    ),
                     // DEST: `[nkvh, hd, mq_pad]` with the stick on the SLOT axis, so kv head `kvh` and
                     // feature `sl*stick` are coordinates and the `j`-th sub-block is slot window `j*stick`.
                     // The law places the plane; the previous `sl*mq_pad*stick` guessed it and was wrong above
@@ -5706,7 +5739,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         .ew(),
                         In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
-                    &rb(out, mq, nqh * hd),
+                    &rb(
+                        out,
+                        RowCount::of_query_rows(width.mq()),
+                        BlockCols::of_feature_cols(nqh * hd),
+                    ),
                     nests.token_stream(hi, 0).off(),
                     sym_id_base,
                     layout,
@@ -5805,7 +5842,11 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s)).ew(),
                         In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
                     ],
-                    &rb(out, mq, nqh * hd),
+                    &rb(
+                        out,
+                        RowCount::of_query_rows(width.mq()),
+                        BlockCols::of_feature_cols(nqh * hd),
+                    ),
                     nests.token_stream(hi, s).off(),
                     sym_id_base,
                     layout,

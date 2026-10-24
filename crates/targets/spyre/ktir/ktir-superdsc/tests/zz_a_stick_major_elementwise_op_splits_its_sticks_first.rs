@@ -185,8 +185,12 @@ fn the_law_resolves_on_the_layout_and_the_pins() {
     );
 }
 
-fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
-    Stk::<RowBlockedTag>::new(name, StickLayout::row_blocked(rows as usize, cols as usize)).unwrap()
+fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+    Stk::<RowBlockedTag>::new(
+        name,
+        StickLayout::row_blocked(rows.get() as usize, cols.get() as usize),
+    )
+    .unwrap()
 }
 
 /// `(mb, out)` splits of the descriptor the shipped pointwise door emits for a `[rows, cols]` multiply
@@ -198,9 +202,9 @@ fn rb(name: &str, rows: u32, cols: u32) -> Stk<RowBlockedTag> {
 /// operand mint refuses (#731's law: the column-chunk bodies declare the region's storage width
 /// too, never the piece's).
 fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u64) {
-    let a = rb("t_a", rows, full_cols);
-    let b = rb("t_b", rows, full_cols);
-    let o = rb("t_o", rows, full_cols);
+    let a = rb("t_a", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
+    let b = rb("t_b", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
+    let o = rb("t_o", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
         "mul",
@@ -231,9 +235,9 @@ fn emitted_window_split(
     full_cols: u32,
     c_start: u32,
 ) -> ((u64, u64), serde_json::Value) {
-    let a = rb("t_a", rows, full_cols);
-    let b = rb("t_b", rows, full_cols);
-    let o = rb("t_o", rows, full_cols);
+    let a = rb("t_a", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
+    let b = rb("t_b", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
+    let o = rb("t_o", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(full_cols));
     let w = ktir_superdsc::addr::col_window_of(rows, full_cols, c_start, Df::Fp16)
         .expect("a whole-stick corner");
     let mut sid = 0i64;

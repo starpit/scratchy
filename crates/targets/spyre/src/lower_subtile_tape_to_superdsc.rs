@@ -9061,9 +9061,17 @@ mod tests {
             384,
             64,
             16,
-            &rb("act", 384, 64),
+            &rb(
+                "act",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+            ),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
+            &rb(
+                "out",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(384),
+            ),
             None,
         );
         assert_eq!(emitted.time, 1, "bmm must NOT time-tile (fits LX)");
@@ -9105,9 +9113,17 @@ mod tests {
             384,
             64,
             16,
-            &rb("act", 384, 64),
+            &rb(
+                "act",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(64),
+            ),
             &Stk::<KernelTag>::kernel(64, 384, "wt"),
-            &rb("out", 384, 384),
+            &rb(
+                "out",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(384),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(384),
+            ),
             None,
         );
         let via_emitted = emit_bundle_mlir(&[emitted]);
@@ -9134,9 +9150,17 @@ mod tests {
             n,
             k,
             1,
-            &rb("a", m, k),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(k),
+            ),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-            &rb("o", m, n),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(n),
+            ),
             None,
         );
         assert_eq!(whole.time, 1, "an unbatched fp16 matmul is staged by dxp");
@@ -9149,9 +9173,17 @@ mod tests {
             16384,
             2048,
             2,
-            &rb("a", 64, 2048),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(2048),
+            ),
             &Stk::<KernelTag>::kernel(2048, 16384, "w"),
-            &rb("o", 64, 16384),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(64),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(16384),
+            ),
             &mut 0,
             None,
         )
@@ -9169,9 +9201,17 @@ mod tests {
             n,
             k,
             batch,
-            &rb("a", m, k),
+            &rb(
+                "a",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(k),
+            ),
             &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-            &rb("o", m, n),
+            &rb(
+                "o",
+                ktir_superdsc::sdsc_abstract::RowCount::of_token_rows(m),
+                ktir_superdsc::sdsc_abstract::BlockCols::of_feature_cols(n),
+            ),
             None,
         );
         let n = emitted.time;
