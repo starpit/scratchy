@@ -3478,7 +3478,7 @@ fn assemble_attn_chunk(
         let rc = corner(blocks.corner(b), "a row block's score block")?;
         for (p, part) in sm_parts.iter().enumerate() {
             let pc = corner(part.probs_corner(blocks, b), "a row block's score part")?;
-            let (pw, ps) = (BlockCols::of_chunk_part(*part), part.slots());
+            let pw = BlockCols::of_chunk_part(*part);
             let suffix = if sm_parts.len() == 1 {
                 String::new()
             } else {
