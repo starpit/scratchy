@@ -6186,6 +6186,47 @@ impl DxGroupCeiling {
     pub const SPLIT_TARGET: usize = 512;
 }
 
+/// ⭐ THE CACHE WRITE'S WINDOW-FIRST-ROW, cursor-relative — which row of the window-own tensor
+/// the write starts at, carried as the type. Two mints, and each is a door: the WHOLE-PLANE
+/// call ([`Self::at_cursor`] — main's `attn_at` arm always wrote the window starting at the
+/// cursor's row 0) and a PER-ROW NODE's own window ([`Self::of_node_window`] — the rope
+/// append arm, whose rows share one output tensor and whose request is the row itself).
+///
+/// A slot offset ([`KvSlot`]), a page number, or a placed tensor's identity has no door, so
+/// none of them can fill this slot even where the values coincide — the adjacency that made
+/// the field's bare `u32` hazardous: it sat beside a tensor identity ([`PlaceId`]), where a
+/// cursor and a name were interchangeable numbers.
+///
+/// [`PlaceId`]: crate::place::PlaceId
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteRowStart(u32);
+
+impl WriteRowStart {
+    /// The whole-plane call — the window starts at the cursor's row 0, so the write covers the
+    /// activation plane from its first row.
+    pub const fn at_cursor() -> WriteRowStart {
+        WriteRowStart(0)
+    }
+
+    /// A per-row node's own window — the node's `[start, end)` row cover of the tensor its rows
+    /// share, so the write starts at the node's first row past the cursor.
+    pub const fn of_node_window(cover: (u32, u32)) -> WriteRowStart {
+        WriteRowStart(cover.0)
+    }
+
+    /// Whether the window starts past the cursor — a per-row node's window does, the
+    /// whole-plane call does not. The request-tag question the recipe asks of this value.
+    pub const fn starts_past_cursor(self) -> bool {
+        self.0 > 0
+    }
+
+    /// The row itself — [`PagedKvPool::write_parts`]'s `start` slot, whose own typing is that
+    /// law's rung.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// ⭐ ONE PART OF A KV WRITE WINDOW — the shape every cache-write lowering cuts a window into, so a
 /// part NEVER crosses a page boundary.
 ///

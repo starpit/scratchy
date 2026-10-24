@@ -28,7 +28,7 @@ fn write(mq: u32, hd: u32, rows_are_requests: bool) -> Vec<EmittedOp> {
             pool: PagedKvPool::new(NKVH, hd),
             rows_are_requests,
             // The door's own main-call spelling: the window starts at the cursor's row 0.
-            row_start: 0,
+            row_start: ktir_superdsc::sdsc_abstract::WriteRowStart::at_cursor(),
             new_k: NewK::reader_stated("t_newk"),
             new_v: "t_newv",
             kc: "t_kc",

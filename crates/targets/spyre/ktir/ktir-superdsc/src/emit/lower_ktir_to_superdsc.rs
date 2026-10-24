@@ -5741,7 +5741,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             rows_are_requests,
             // main's own call always wrote the window starting at the cursor's row 0; the
             // rope arm below is the second caller, and it states its node's window.
-            row_start: 0,
+            row_start: crate::sdsc_abstract::WriteRowStart::at_cursor(),
             // ⭐ THE WRITE'S K, TYPED BY ITS LAW — minted from the same `scale_law` the score
             // legs above lowered under, so the write and the readers cannot disagree about
             // what the pool carries: the multiply arm's `new_k_scaled` is `qs`'s twin (an
@@ -5796,11 +5796,13 @@ pub struct KvCacheWrite<'a> {
     pub pool: crate::sdsc_abstract::PagedKvPool,
     /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
     pub rows_are_requests: bool,
-    /// ⭐ THE WINDOW'S FIRST ROW, cursor-relative — main's `attn_at` call site always passed the
-    /// whole activation plane (`0`), and this re-home keeps that byte-identical; the rope
-    /// append arm passes its NODE's window (`row_start > 0` for a per-row node of a batch,
-    /// whose rows share one output tensor and whose request is the row itself).
-    pub row_start: u32,
+    /// ⭐ THE WINDOW'S FIRST ROW, cursor-relative — [`WriteRowStart`], minted at the cursor
+    /// (main's `attn_at` call, which always passed the whole activation plane,
+    /// byte-identically) or from a node's own window (the rope append arm, a per-row node of a
+    /// batch, whose rows share one output tensor and whose request is the row itself).
+    ///
+    /// [`WriteRowStart`]: crate::sdsc_abstract::WriteRowStart
+    pub row_start: crate::sdsc_abstract::WriteRowStart,
     /// This step's new K and V, `[mq, nkvh·hd]` row-blocked. ⭐ THE SCALE CONTRACT IS THE TYPE:
     /// `new_k` is [`NewK`], minted by one of three proof-named constructors, so the two callers
     /// with OPPOSITE laws — the spliced append's RAW rotated K (the fp8 k_proj's fold is refused
@@ -5908,7 +5910,7 @@ pub fn kv_cache_write(
     // `parts = mq.div_ceil(page)` loop. At `row_start = 0` (main's own call, and a
     // whole-plane node) the cut is BYTE-IDENTICAL to that loop: request-major one part per
     // row, position-major one part per page with `p·page` offsets.
-    let parts = pool.write_parts(row_start, mq, rows_are_requests);
+    let parts = pool.write_parts(row_start.get(), mq, rows_are_requests);
     let part_tag = |p: usize| {
         if !rows_are_requests && parts.len() > 1 {
             format!("_p{p}")
@@ -5927,7 +5929,7 @@ pub fn kv_cache_write(
         // whose rows share ONE output tensor) `per_request` is false but the names still
         // need the row — main's whole-plane call never had two nodes over one tensor, the
         // splice's per-row decomposition does.
-        let rq = if per_request || (rows_are_requests && row_start > 0) {
+        let rq = if per_request || (rows_are_requests && row_start.starts_past_cursor()) {
             format!("_r{req}")
         } else {
             String::new()
@@ -6071,7 +6073,7 @@ pub fn kv_cache_write(
     for (p, part) in parts.iter().enumerate() {
         let req = part.request;
         for kvh in 0..nkvh {
-            let rq = if per_request || (rows_are_requests && row_start > 0) {
+            let rq = if per_request || (rows_are_requests && row_start.starts_past_cursor()) {
                 format!("_r{req}")
             } else {
                 String::new()

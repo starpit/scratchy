@@ -627,7 +627,9 @@ fn rope_append(
             mq: QueryRowCount::of_mq(mq),
             pool: PagedKvPool::new(heads, hd),
             rows_are_requests,
-            row_start,
+            // The node's own `[start, end)` row cover — the write starts at the node's first
+            // row past the cursor (the window destructured above).
+            row_start: ktir_superdsc::sdsc_abstract::WriteRowStart::of_node_window(r[0].r_cover),
             // ⭐ THE WRITE'S K, TYPED BY ITS SCALE LAW — minted from the bundle's own law through
             // the ONE pool pairing ([`ScoreScaleLaw::pool_k`]), not chosen here. A fold that
             // commuted √s into the k_proj stages K BORN SCALED
