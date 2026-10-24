@@ -982,9 +982,28 @@ fn check_internal_buffers_are_read_where_written(
     Ok(())
 }
 
+/// ⭐ THE EMITTER CONTEXT — the op sink, the sym-id counter and the placement authority as ONE
+/// value, because they are ONE fact: a single emission whose program order is the call order into
+/// the ONE sink, whose sym ids are minted only through the ONE counter, and whose placement
+/// questions have exactly one authority. Minted once at the door that owns the sink
+/// ([`assemble_attn`]) and threaded as ONE `&mut EmitCtx` through every emitter that pushes into
+/// it — never split into per-field borrows at a call site, which would let two spellings of "the"
+/// emission disagree about order, ids or placement. The one-op assemblers (`matmul`, `reduce`,
+/// `pointwise`) keep their `(sym_id_base, layout)` pair WITHOUT the sink — they RETURN their op
+/// rather than push it, the one-op-descriptor form — and a sink-threader hands them
+/// `ctx.sym_id_base` / `ctx.layout` as plain call arguments.
+struct EmitCtx<'a> {
+    /// The one sink: program order is call order into this Vec.
+    ops: &'a mut Vec<EmittedOp>,
+    /// The one counter: every sym id is minted through this base.
+    sym_id_base: &'a mut i64,
+    /// The one placement authority — absent exactly where the pair's was.
+    layout: Option<&'a BundleLayout>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     t: u32,
     tag: &str,
     // ⛔⛔⛔ THE HEAD GEOMETRY IS NOT TWO BARE `u32` PARAMETERS ANY MORE. This assembler takes the
@@ -1072,8 +1091,6 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // three belong to the carry chain.
     state: &StateNames,
     bufs: &BlockBufs,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<(), SuperDscError> {
     // Destructured ONCE, at the door — the boundary is where the swap lived (two `u32`s in a run
     // of twenty-six); the body below is unchanged arithmetic on the same numbers, now each
@@ -1299,7 +1316,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("attn_{tag}sc_g{}s{s}_r{r}_o{t}", kvh.get())
                     };
-                    ops.push(assemble_matmul_off_phys_m_with_epilogue(
+                    ctx.ops.push(assemble_matmul_off_phys_m_with_epilogue(
                         // THE KV HEAD AND THE REQUEST AS SEPARATE NAME SEGMENTS, so the descriptor
                         // projections that collapse `g{n}` / `r{n}` to one reported row keep working.
                         &name,
@@ -1334,8 +1351,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -1430,7 +1447,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                 } else {
                     format!("attn_{tag}sc_g{}s{s}_o{t}", kvh.get())
                 };
-                ops.push(if per_request {
+                ctx.ops.push(if per_request {
                     assemble_matmul_off_phys_m_with_epilogue(
                         &name,
                         MatM::single_row(),
@@ -1456,8 +1473,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         epi_bd,
                         epi_bc,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 } else {
                     // ⛔ THE PITCH-DECLARING FORM, NOT THE PLAIN ONE. A one-stick `in` derives its
@@ -1494,8 +1511,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         epi_bd,
                         epi_bc,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 });
             }
@@ -1509,7 +1526,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             } else {
                 mask_off + nests.score_rows(hi, width).off()
             };
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_{tag}sc_h{hi}_o{t}"),
                 MatM::of_query_rows(mq),
                 MatN::of_kv_window(width),
@@ -1529,8 +1546,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                 broadcast_dims,
                 false,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
@@ -1547,13 +1564,13 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // based on a misapplied reading of that doc and is not needed -- confirmed harmless-but-pointless
     // (real hardware test showed zero behavioral change either way). Restored to the plain batched form.
     let bmax_op = format!("attn_{tag}bmax_o{t}");
-    ops.push(assemble_reduce_off(
+    ctx.ops.push(assemble_reduce_off(
         &bmax_op,
         "max",
         rows.swept(),
         width,
         win_reduce_data(
-            layout,
+            ctx.layout,
             // The score buffer's true `[rows_n, width_n]` — the same dims the score matmul's own
             // output handle declares. `hm(sc)`'s `1×64` annotation was never the buffer's shape.
             &fl(sc, rows_n, width_n),
@@ -1564,20 +1581,20 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         )
         .map_err(SuperDscError)?,
         win_reduce_accum(
-            layout,
+            ctx.layout,
             &hm_rows(if seed.seeds() { run_m } else { bmax }, rows_n),
             crate::addr::DevOff::ZERO,
             rows.swept(),
             &format!("{bmax_op}: accum"),
         )
         .map_err(SuperDscError)?,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     if seed.seeds() {
         // Seed already written directly above — nothing more to do here.
     } else {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}newm_o{t}"),
             "maximum",
             rows.swept(),
@@ -1588,13 +1605,13 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(newm, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // Separate subtract-output (corrsubt) from exp-output (corr) — an exp op must never read
         // and write the SAME buffer (a real hardware in-place-aliasing hazard, not a style choice;
         // see the old proven flash decode's fcsub->fcorr, always two distinct buffers).
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}corrsub_o{t}"),
             "subtract",
             rows.swept(),
@@ -1605,10 +1622,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(corrsubt, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}corre_o{t}"),
             ExpBase::E.op_func(),
             rows.swept(),
@@ -1616,10 +1633,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
             &hm_rows(corr, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}mset_o{t}"),
             "identity",
             rows.swept(),
@@ -1627,13 +1644,13 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::full(&hm_rows(newm, rows_n)).ew()],
             &hm_rows(run_m, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // expb = exp(sc - run_m) (post-update run_m). `esubt`/`expb` are distinct buffers — same
     // in-place-aliasing rule as above.
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_{tag}esub_o{t}"),
         "subtract",
         rows.swept(),
@@ -1646,10 +1663,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &fl(esubt, rows_n, width_n),
         crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_{tag}ee_o{t}"),
         ExpBase::E.op_func(),
         rows.swept(),
@@ -1657,19 +1674,19 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         &[In::full(&fl(esubt, rows_n, width_n)).ew()],
         &fl(expb, rows_n, width_n),
         crate::addr::DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     // FIRST block: write bsum/ov straight into run_l/run_o (no lset/oset copy needed — same reasoning
     // as run_m above). Saves 2 more "identity" ops per attention node.
     let bsum_op = format!("attn_{tag}bsum_o{t}");
-    ops.push(assemble_reduce_off(
+    ctx.ops.push(assemble_reduce_off(
         &bsum_op,
         "sum",
         rows.swept(),
         width,
         win_reduce_data(
-            layout,
+            ctx.layout,
             // `expb` at the same `[rows_n, width_n]` the `exp` pointwise above sweeps it at.
             &fl(expb, rows_n, width_n),
             crate::addr::DevOff::ZERO,
@@ -1679,15 +1696,15 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         )
         .map_err(SuperDscError)?,
         win_reduce_accum(
-            layout,
+            ctx.layout,
             &hm_rows(if seed.seeds() { run_l } else { bsum }, rows_n),
             crate::addr::DevOff::ZERO,
             rows.swept(),
             &format!("{bsum_op}: accum"),
         )
         .map_err(SuperDscError)?,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     // ⭐⭐⭐ THE `oadd` IS THE VALUE MATMUL'S OWN EPILOGUE — `run_o = (expb @ V) + otmp` in ONE launch.
     //
@@ -1726,7 +1743,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     let fold_addend = if seed.seeds() {
         FoldAddend::Seed
     } else {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}ocorr_o{t}"),
             "multiply",
             rows.swept(),
@@ -1739,8 +1756,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &fl(otmp, rows_n, hd),
             nests.head_major(0, 0),
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         FoldAddend::PreUpdate(fl(otmp, rows_n, hd))
     };
@@ -1831,7 +1848,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("attn_{tag}ov_g{}s{s}_r{r}_o{t}", kvh.get())
                     };
-                    ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
+                    ctx.ops.push(assemble_matmul_off_phys_m_maybe_epilogue(
                         &name,
                         MatM::single_row(),
                         n,
@@ -1873,8 +1890,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -1919,7 +1936,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     }
                 };
                 // Same split as the score leg: one request's row per head under `per_request`.
-                ops.push(if per_request {
+                ctx.ops.push(if per_request {
                     assemble_matmul_off_phys_m_maybe_epilogue(
                         &format!("attn_{tag}ov_{}_o{t}", gs(kvh.get())),
                         MatM::single_row(),
@@ -1970,8 +1987,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 } else {
                     assemble_matmul_off_maybe_epilogue(
@@ -2008,8 +2025,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                         crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                         &[],
                         false,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     )
                 });
             }
@@ -2064,7 +2081,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
             let hi = h.get();
             for s in 0..nests.slabs() {
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &if nests.slabs() == 1 {
                         format!("attn_{tag}ov_h{hi}_o{t}")
                     } else {
@@ -2089,8 +2106,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
                     crate::superdsc_opspec::EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -2100,7 +2117,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     } else {
         // run_l = run_l*corr + bsum ; run_o = run_o*corr + ov. `ltmp`/`otmp` break the in-place
         // read/write alias in the multiply (mirrors the old proven flash decode's `fdtmp`).
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}lcorr_o{t}"),
             "multiply",
             rows.swept(),
@@ -2111,10 +2128,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(ltmp, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_{tag}ladd_o{t}"),
             "add",
             rows.swept(),
@@ -2125,8 +2142,8 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(run_l, rows_n),
             crate::addr::DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // ⭐ THE OUTPUT ACCUMULATOR IS DONE ALREADY. `ocorr` ran BEFORE the value leg (it needs the
         // pre-update `run_o`) and `oadd` is now that matmul's own `stridedadd` epilogue, so the
@@ -2241,7 +2258,7 @@ impl ChunkBufs {
 /// them), and the mint — a frozen copy of the same names — happens after the core returns.
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     t: u32,
     tag: &str,
     geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
@@ -2265,11 +2282,9 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     request_axis: Option<GatheredFold>,
     state: &StateNames,
     bufs: &BlockBufs,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     assemble_attn_block(
-        ops,
+        ctx,
         t,
         tag,
         geom,
@@ -2294,8 +2309,6 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         request_axis,
         state,
         bufs,
-        sym_id_base,
-        layout,
     )?;
     Ok(SeededCarry::mint(state))
 }
@@ -2313,7 +2326,7 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// too — the shape was validated, and its staging is the sweep-readings' subject.
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     t: u32,
     tag: &str,
     geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
@@ -2337,8 +2350,6 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     req: u32,
     request_axis: Option<GatheredFold>,
     bufs: &BlockBufs,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     // ⭐ THE MASK CORNER, DERIVED FROM THE READ — the per-row prefix arm's corner is the LAW's own
     // door (that fold cannot be emitted without the mask door's declaration); the nest arm's
@@ -2350,7 +2361,7 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         FoldMaskRead::Nest(off) => off,
     };
     assemble_attn_block(
-        ops,
+        ctx,
         t,
         tag,
         geom,
@@ -2375,8 +2386,6 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         request_axis,
         &carry.state,
         bufs,
-        sym_id_base,
-        layout,
     )?;
     Ok(carry)
 }
@@ -2658,10 +2667,8 @@ struct NewChunkAttn<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
 /// [`NewBlockForm::mask_heads_per_block`]: crate::sdsc_abstract::NewBlockForm::mask_heads_per_block
 /// [`ChunkScratch::rows_corner`]: crate::sdsc_abstract::ChunkScratch::rows_corner
 fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     a: NewChunkAttn<'_, NQH, NKVH, HD>,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     let NewChunkAttn {
         t,
@@ -2696,7 +2703,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     let wide = crate::addr::Nest::new(&["row", "slot"], &[g_rows, slots], Df::Fp16);
     let kt = crate::addr::Nest::new(&["feat", "slot"], &[hd, slots], Df::Fp16);
     let vv = crate::addr::Nest::new(&["row", "head", "feat"], &[mq, nkvh, hd], Df::Fp16);
-    let first_op = ops.len();
+    let first_op = ctx.ops.len();
     for b in 0..blocks.count() {
         let (kvh, h0, bn) = (
             blocks.kv_head(b),
@@ -2710,7 +2717,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         // rows core `c` wrote; `emit`'s core-local read law compares each op's slice at build.
         let at_pin = DevOff::ZERO;
         let (m, q, q_off) = row_block_query(blocks, b, mq, geom, qs)?;
-        ops.push(assemble_matmul_off_with_epilogue(
+        ctx.ops.push(assemble_matmul_off_with_epilogue(
             &format!("attn_ncsc_{bn}_o{t}"),
             m,
             MatN::of_new_block_scores(cols),
@@ -2728,17 +2735,17 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             EpilogueOpFunc::StridedAdd,
             &[],
             false,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         let ncbmax_op = format!("attn_ncbmax_{bn}_o{t}");
-        ops.push(assemble_reduce_off(
+        ctx.ops.push(assemble_reduce_off(
             &ncbmax_op,
             "max",
             grp_rows,
             cols,
             win_reduce_data(
-                layout,
+                ctx.layout,
                 &rb(sc, grp_rows, cols),
                 at_pin,
                 grp_rows,
@@ -2747,17 +2754,17 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             )
             .map_err(SuperDscError)?,
             win_reduce_accum(
-                layout,
+                ctx.layout,
                 &hm_rows(state.m(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbmax_op}: accum"),
             )
             .map_err(SuperDscError)?,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_ncesub_{bn}_o{t}"),
             "subtract",
             grp_rows,
@@ -2768,10 +2775,10 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &rb(esub, grp_rows, cols),
             at_pin,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_ncexp_{bn}_o{t}"),
             ExpBase::E.op_func(),
             grp_rows,
@@ -2779,17 +2786,17 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::sliced(&rb(esub, grp_rows, cols), at_pin).ew()],
             &rb(exp, grp_rows, cols),
             at_pin,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         let ncbsum_op = format!("attn_ncbsum_{bn}_o{t}");
-        ops.push(assemble_reduce_off(
+        ctx.ops.push(assemble_reduce_off(
             &ncbsum_op,
             "sum",
             grp_rows,
             cols,
             win_reduce_data(
-                layout,
+                ctx.layout,
                 &rb(exp, grp_rows, cols),
                 at_pin,
                 grp_rows,
@@ -2798,15 +2805,15 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             )
             .map_err(SuperDscError)?,
             win_reduce_accum(
-                layout,
+                ctx.layout,
                 &hm_rows(state.l(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbsum_op}: accum"),
             )
             .map_err(SuperDscError)?,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         // The seed: no prior output to fold, so no epilogue. Above one slab, one op per slab of V.
         let n_slabs = RowBlockValue::slabs(blocks, geom);
@@ -2822,7 +2829,7 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             } else {
                 format!("s{s}")
             };
-            ops.push(assemble_matmul_off(
+            ctx.ops.push(assemble_matmul_off(
                 &format!("attn_ncov_{bn}{slab}_o{t}"),
                 v.m,
                 v.n,
@@ -2839,12 +2846,12 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     BlockCols::of_head_dim(hd),
                 ),
                 v.out_off,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+    no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
     // The seed mint — one of the two spellings that produce a `SeededCarry`: this function's
     // `ncbmax`/`ncbsum` and value matmuls wrote the carry on every path (no early return precedes
     // them), so the folds and the finalize below can require the proof.
@@ -3007,13 +3014,11 @@ pub fn chunk_prob_pins(
 /// The row max is the stick-major `[gqa, slots]` reduce, the same form as the row sum (see the
 /// `attn_cbmax_g*` ops for why it must be per row and why not a page-axis reduce).
 fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     a: ChunkAttn<'_, NQH, NKVH, HD>,
     // The proof the new-block chunk seeded the carry this body folds onto — required, returned: the
     // chain continues to the finalize.
     carry: SeededCarry,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     let ChunkAttn {
         t,
@@ -3036,7 +3041,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     let (nqh, hd, gqa) = (geom.nqh(), geom.hd(), geom.gqa());
     use crate::addr::DevOff;
     use crate::superdsc_opspec::{EpilogueOpFunc, Scale};
-    let first_op = ops.len();
+    let first_op = ctx.ops.len();
     let stick = BlockCols::of_one_stick(Lanes::FP16);
     let width = BlockCols::of_chunk(chunk);
     // The gathered Kᵗ scratch's own pitch — the chunk's slots through the scratch's door, spent at
@@ -3155,13 +3160,13 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 dst,
                 cp,
                 index,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             );
             // ⭐ DECLARED ON THE COPY ITSELF: it groups as `GroupKind::Gathered`, whose launch takes no
             // KV page shift (the entries are absolute) and whose body the host stages the index for.
             op.kv_gathered = true;
-            ops.push(op);
+            ctx.ops.push(op);
         }
     }
 
@@ -3179,7 +3184,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     };
                     let src = q.copy_src(kvh, s).ok_or_else(missing)?;
                     let dst = q.copy_dest(kvh, s).ok_or_else(missing)?;
-                    ops.push(super::matmul::assemble_matmul_placed(
+                    ctx.ops.push(super::matmul::assemble_matmul_placed(
                         &format!("attn_cqg_g{kvh}s{s}_o{t}"),
                         MatM::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                         MatN::one_stick(Lanes::FP16),
@@ -3202,8 +3207,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                             BlockCols::of_head_dim(hd),
                         ),
                         dst,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -3238,7 +3243,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         // (`row_block_query`) — the re-laid group block where the query was re-laid above.
         let (m, a, a_off) = row_block_query(blocks, b, mq, geom, q_name)?;
         let Some((keys, kt)) = cb.lx.as_ref().and_then(|lx| lx.keys.as_ref()) else {
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_o{t}", blk_name(b)),
                 m,
                 MatN::of_kv_window(width),
@@ -3256,8 +3261,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 EpilogueOpFunc::StridedAdd,
                 mask_dims,
                 true,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             continue;
         };
@@ -3280,7 +3285,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     corner(part.probs_corner(blocks, 0), "the batch mask's score part")?
                 }
             };
-            ops.push(assemble_matmul_off_with_epilogue(
+            ctx.ops.push(assemble_matmul_off_with_epilogue(
                 &format!("attn_csc_{}_k{p}_o{t}", blk_name(b)),
                 m,
                 // Its COLUMNS divided across the cores, rows whole (`OutputSplit` says why): core `c`
@@ -3300,8 +3305,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 EpilogueOpFunc::StridedAdd,
                 mask_dims,
                 true,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
@@ -3328,8 +3333,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     let red_parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(reduction_part_pages(chunk, b_rows))
         .collect();
-    let reduce_in_parts = |ops: &mut Vec<EmittedOp>,
-                           sym_id_base: &mut i64,
+    let reduce_in_parts = |ctx: &mut EmitCtx<'_>,
                            stem: &str,
                            func: &'static str,
                            combine: &'static str,
@@ -3343,13 +3347,13 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             for b in 0..blocks.count() {
                 let pc = corner(part.probs_corner(blocks, b), "a row block's reduction part")?;
                 let part_op = format!("attn_c{stem}_{}_s{p}_o{t}", blk_name(b));
-                ops.push(assemble_reduce_off(
+                ctx.ops.push(assemble_reduce_off(
                     &part_op,
                     func,
                     blk_rows,
                     BlockCols::of_chunk_part(*part),
                     win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` score buffer — `pc` is the part's corner in
                         // the whole buffer (ChunkPart::probs_corner's law), and the block's own
                         // `b_rows` rows are a slice of it, so the part-sized and block-sized
@@ -3362,15 +3366,15 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )
                     .map_err(SuperDscError)?,
                     win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(into, q_rows),
                         row_step(blocks.first_head(b) * mq),
                         blk_rows,
                         &format!("{part_op}: partial"),
                     )
                     .map_err(SuperDscError)?,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
             if p > 0 {
@@ -3381,7 +3385,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 } else {
                     temps[2]
                 };
-                ops.push(assemble_pointwise_broadcast_off(
+                ctx.ops.push(assemble_pointwise_broadcast_off(
                     &format!("attn_c{stem}_k{p}_o{t}"),
                     combine,
                     all_rows,
@@ -3392,8 +3396,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     ],
                     &hm_rows(out, q_rows),
                     DevOff::ZERO,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
                 acc = out;
             }
@@ -3406,14 +3410,14 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             let rc = corner(blocks.corner(b), "a row block's score block")?;
             // The chunk's own division (`ChunkBufs::red_division_of`): the reduced axis across the
             // cores for a decode batch, rows first for every other chunk, byte for byte.
-            ops.push(assemble_reduce_off_divided(
+            ctx.ops.push(assemble_reduce_off_divided(
                 ReduceDivided {
                     op_name: &format!("attn_cbmax_{}_o{t}", blk_name(b)),
                     op_func: "max",
                     rows: blk_rows,
                     cols: width,
                     data: win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` chunk score buffer — the block's `rc` is a
                         // corner in it, so the block-sized `b_rows` annotation the raw form
                         // carried was never the window's bound.
@@ -3425,7 +3429,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )
                     .map_err(SuperDscError)?,
                     accum: win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(&bufs.bmax, q_rows),
                         row_step(h0),
                         blk_rows,
@@ -3434,14 +3438,13 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     } else {
         reduce_in_parts(
-            ops,
-            sym_id_base,
+            ctx,
             "bmax",
             "max",
             "maximum",
@@ -3467,7 +3470,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             bufs.corrsubt.as_str(),
         ),
     ] {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_c{op_name}_o{t}"),
             func,
             all_rows,
@@ -3478,8 +3481,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(out, q_rows),
             DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     for (op_name, func, inp, out) in [
@@ -3491,7 +3494,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         ),
         ("mset", "identity", bufs.newm.as_str(), carry.m()),
     ] {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_c{op_name}_o{t}"),
             func,
             all_rows,
@@ -3499,8 +3502,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::full(&hm_rows(inp, q_rows)).ew()],
             &hm_rows(out, q_rows),
             DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
 
@@ -3508,7 +3511,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     // one request, or a batch chunk whose `mq` rows are separate requests — keeps the form below.
     if mq > 1 && matches!(history, ChunkHistory::Shared) {
         let carry = prompt_probabilities_in_lx(
-            ops,
+            ctx,
             PromptProbs {
                 t,
                 geom,
@@ -3521,10 +3524,8 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                 cb,
             },
             carry,
-            sym_id_base,
-            layout,
         )?;
-        no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+        no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
         return Ok(carry);
     }
     // ── (4) PROBABILITIES and each row's DENOMINATOR, per kv head ──
@@ -3565,7 +3566,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             // probability blocks are read/written at CHUNK-FRAME corners (`pc`), so their handles
             // declare the FULL `[q_rows, slots]` buffers — the block-shaped `b_rows` annotation the
             // raw form carried was never the window's bound.
-            ops.push(assemble_pointwise_broadcast_divided(
+            ctx.ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cesub_{bn}{suffix}_o{t}"),
                     op_func: "subtract",
@@ -3579,10 +3580,10 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     out_offset: DevOff::ZERO.into(),
                     division: cb.sm_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
-            ops.push(assemble_pointwise_broadcast_divided(
+            ctx.ops.push(assemble_pointwise_broadcast_divided(
                 PointwiseDivided {
                     op_name: &format!("attn_cexp_{bn}{suffix}_o{t}"),
                     op_func: ExpBase::E.op_func(),
@@ -3593,22 +3594,22 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     out_offset: pc.into(),
                     division: cb.sm_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
         // ⭐ EACH ROW's SUM OVER THE WHOLE CHUNK, straight into `bsum` — the stick-major `sum` over
         // `rows > 1 × cols > one stick`, the cell `Sum` combines correctly (prefill's RMS sums run it).
         // In parts below instead, after every block's probabilities, when one trip cannot hold it.
         if red_parts.len() == 1 {
-            ops.push(assemble_reduce_off_divided(
+            ctx.ops.push(assemble_reduce_off_divided(
                 ReduceDivided {
                     op_name: &format!("attn_cbsum_{bn}_o{t}"),
                     op_func: "sum",
                     rows: blk_rows,
                     cols: width,
                     data: win_reduce_data(
-                        layout,
+                        ctx.layout,
                         // The FULL `[q_rows, slots]` probability buffer (the bsum twin above).
                         &rb(&cb.cexp, all_rows, width),
                         rc,
@@ -3618,7 +3619,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     )
                     .map_err(SuperDscError)?,
                     accum: win_reduce_accum(
-                        layout,
+                        ctx.layout,
                         &hm_rows(&bufs.bsum, q_rows),
                         row_step(h0),
                         blk_rows,
@@ -3627,20 +3628,20 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .map_err(SuperDscError)?,
                     division: cb.red_division,
                 },
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     }
     if red_parts.len() > 1 {
-        reduce_in_parts(ops, sym_id_base, "bsum", "sum", "add", &cb.cexp, &bufs.bsum)?;
+        reduce_in_parts(ctx, "bsum", "sum", "add", &cb.cexp, &bufs.bsum)?;
     }
 
     // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, geom, &carry, bufs, sym_id_base, layout);
+        emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3726,7 +3727,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     MatK::of_kv_window(k_part)
                 };
                 // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update.
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &name,
                     m,
                     n,
@@ -3743,14 +3744,14 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
     }
     if parts.len().is_multiple_of(2) {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_covsum_o{t}"),
             "identity",
             all_rows,
@@ -3758,12 +3759,12 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::full(&otmp_h).ew()],
             &run_o_h,
             DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_clcorr_o{t}"),
         "multiply",
         all_rows,
@@ -3774,10 +3775,10 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_cladd_o{t}"),
         "add",
         all_rows,
@@ -3788,10 +3789,10 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &hm_rows(carry.l(), q_rows),
         DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    no_chunk_op_is_time_tiled(&ops[first_op..], t)?;
+    no_chunk_op_is_time_tiled(&ctx.ops[first_op..], t)?;
     Ok(carry)
 }
 
@@ -3819,19 +3820,17 @@ struct PromptProbs<'a, const NQH: u32, const NKVH: u32, const HD: u32> {
 /// without the op that wrote it having been pushed first — the ORDER law (every `ocorr`
 /// precedes every value matmul) is the handles' scope.
 fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     t: u32,
     q_rows: u32,
     geom: crate::sdsc_abstract::AttnGeometry<NQH, NKVH, HD>,
     carry: &SeededCarry,
     bufs: &BlockBufs,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> (Stk<FlatTag>, Stk<FlatTag>) {
     use crate::addr::DevOff;
     let hd = geom.hd();
     let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_cocorr_o{t}"),
         "multiply",
         RowCount::of_head_major_rows(q_rows),
@@ -3842,8 +3841,8 @@ fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &otmp_h,
         DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     (otmp_h, run_o_h)
 }
@@ -3866,13 +3865,11 @@ fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// partials then add into the denominator. MEASURED before this (granite-2b fp16, 256 rows, ~10k tokens): the
 /// chunk's attention group was 59% of prefill, HBM-bound at ~135 GB/s over six passes.
 fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
-    ops: &mut Vec<EmittedOp>,
+    ctx: &mut EmitCtx<'_>,
     a: PromptProbs<'_, NQH, NKVH, HD>,
     // The proof the carry is seeded — this walk's `ocorr` reads the PRE-update `run_o`, so it is a
     // body program of the chain, not a seed.
     carry: SeededCarry,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
 ) -> Result<SeededCarry, SuperDscError> {
     let PromptProbs {
         t,
@@ -3906,7 +3903,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, geom, &carry, bufs, sym_id_base, layout);
+        emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
@@ -3927,7 +3924,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 BlockCols::of_chunk_part(*part),
                 crate::sdsc_abstract::VKernelRows::of_chunk_part(*part),
             );
-            ops.push(assemble_pointwise_broadcast_off(
+            ctx.ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_cesub_{bn}_s{p}_o{t}"),
                 "subtract",
                 grp_rows,
@@ -3941,10 +3938,10 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ],
                 &rb(&cb.cesub, grp_rows, pw),
                 DevOff::ZERO,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
-            ops.push(assemble_pointwise_broadcast_off(
+            ctx.ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_cexp_{bn}_s{p}_o{t}"),
                 ExpBase::E.op_func(),
                 grp_rows,
@@ -3952,19 +3949,19 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 &[In::sliced(&rb(&cb.cesub, grp_rows, pw), DevOff::ZERO).ew()],
                 &rb(&cb.cexp, grp_rows, pw),
                 DevOff::ZERO,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             // One part: the whole chunk's sum, straight into the denominator.
             let sum_into = if n == 1 { &bufs.bsum } else { &cb.red[p] };
             let cbsum_op = format!("attn_cbsum_{bn}_s{p}_o{t}");
-            ops.push(assemble_reduce_off(
+            ctx.ops.push(assemble_reduce_off(
                 &cbsum_op,
                 "sum",
                 grp_rows,
                 pw,
                 win_reduce_data(
-                    layout,
+                    ctx.layout,
                     &rb(&cb.cexp, grp_rows, pw),
                     DevOff::ZERO,
                     grp_rows,
@@ -3973,15 +3970,15 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 )
                 .map_err(SuperDscError)?,
                 win_reduce_accum(
-                    layout,
+                    ctx.layout,
                     &hm_rows(sum_into, q_rows),
                     row_step(h0),
                     grp_rows,
                     &format!("{cbsum_op}: denominator"),
                 )
                 .map_err(SuperDscError)?,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
             let (out, addend) = if p % 2 == 0 {
                 (carry.o(), &otmp_h)
@@ -3998,7 +3995,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 } else {
                     format!("s{s}")
                 };
-                ops.push(assemble_matmul_off_maybe_epilogue(
+                ctx.ops.push(assemble_matmul_off_maybe_epilogue(
                     &format!("attn_cov_{bn}{slab}_k{p}_o{t}"),
                     v.m,
                     v.n,
@@ -4019,14 +4016,14 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                     EpilogueOpFunc::StridedAdd,
                     &[],
                     false,
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
     }
     if n.is_multiple_of(2) {
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_covsum_o{t}"),
             "identity",
             all_rows,
@@ -4034,8 +4031,8 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
             &[In::full(&otmp_h).ew()],
             &run_o_h,
             DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
     }
     // The partials add into the denominator, never in place: alternating between the two accumulators
@@ -4049,7 +4046,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             cb.red[n + 1].as_str()
         };
-        ops.push(assemble_pointwise_broadcast_off(
+        ctx.ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_cbsum_k{p}_o{t}"),
             "add",
             all_rows,
@@ -4060,13 +4057,13 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
             ],
             &hm_rows(out, q_rows),
             DevOff::ZERO,
-            sym_id_base,
-            layout,
+            ctx.sym_id_base,
+            ctx.layout,
         ));
         acc = out;
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_clcorr_o{t}"),
         "multiply",
         all_rows,
@@ -4077,10 +4074,10 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &hm_rows(&bufs.ltmp, q_rows),
         DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
-    ops.push(assemble_pointwise_broadcast_off(
+    ctx.ops.push(assemble_pointwise_broadcast_off(
         &format!("attn_cladd_o{t}"),
         "add",
         all_rows,
@@ -4091,8 +4088,8 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
         ],
         &hm_rows(carry.l(), q_rows),
         DevOff::ZERO,
-        sym_id_base,
-        layout,
+        ctx.sym_id_base,
+        ctx.layout,
     ));
     Ok(carry)
 }
@@ -4236,6 +4233,17 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     let nsub = mq_pad_t.sub_blocks();
     let mut ops: Vec<EmittedOp> = Vec::new();
 
+    // ⭐ THE EMITTER CONTEXT, MINTED ONCE AT THIS DOOR — the sink this function owns, with its
+    // pair parameters as the counter and the placement authority (the mint-once-at-door pattern).
+    // Every emitter below threads the ONE `&mut ctx`; the three references inside are the same
+    // three references that traveled as parameters, so the op stream, the ids and the placements
+    // are identical.
+    let mut ctx = EmitCtx {
+        ops: &mut ops,
+        sym_id_base,
+        layout,
+    };
+
     // The group size comes from the geometry's proof-carrying const — there is no `.max(1)` fudge
     // left, because a pair it would have fudged cannot instantiate this function.
     let gqa = geom.gqa();
@@ -4249,8 +4257,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The op's operand SPELLING, rendered from the identity the layout is keyed by.
     let out_s = out_id.to_string();
     let out = out_s.as_str();
-    let new_kt = crate::placement::syn(layout, out_id.synth(R::NewKt));
-    if let Some(l) = layout {
+    let new_kt = crate::placement::syn(ctx.layout, out_id.synth(R::NewKt));
+    if let Some(l) = ctx.layout {
         // `slots()`, not the bare number: this axis is the block's SLOT extent, which happens to equal its
         // padded row count because each new token occupies exactly one slot.
         l.synth(
@@ -4278,7 +4286,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         for rw in mq_pad_t.row_windows() {
             let j = rw.index();
             for sl in 0..nslab {
-                ops.push(assemble_restickify_kt_2d(
+                ctx.ops.push(assemble_restickify_kt_2d(
                     // Keep the pre-sub-blocking name at nsub==1 so those bundles stay BYTE-IDENTICAL (op
                     // names are bundle content): decode and every <=64-row chunk need no re-validation.
                     &if nsub.is_single() && nslab == 1 {
@@ -4350,8 +4358,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     .at(Idx::<crate::addr::Feat>::n(FeatIdx::of_slab(sl).get()))
                     .slab(rw.index())
                     .dev(),
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -4399,7 +4407,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
 
     // Every buffer's spelling is a rendering of `out_id.synth(role)` — the SAME value the layout
     // allocator is keyed by, so an op's operand and its reservation have one preimage.
-    let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
+    //
+    // ⛔ THE CLOSURE TAKES THE LAYOUT BY COPY, not by borrowing `ctx.layout`: `syn` outlives the
+    // emitter calls below that re-borrow the whole `&mut ctx`, and a closure-held shared borrow of
+    // the field would refuse them (the E0502 class). A copy is exact — `Option<&BundleLayout>` is
+    // `Copy`, and this is a read-only view of the one authority.
+    let syn_layout = ctx.layout;
+    let syn = |r: R| crate::placement::syn(syn_layout, out_id.synth(r));
     // ⛔⛔⛔ EVERY BUFFER NAMED HERE — `BlockBufs`'s ten fields and `StateNames`'s three — MUST BE
     // DECLARED TO THE LAYOUT BELOW. A buffer that is NAMED here but never passed to `synth` is
     // not merely undeclared — `resolve_seg_base` bump-allocates it on first reference at THAT
@@ -4429,7 +4443,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         l: syn(R::RunL),
         o: syn(R::RunO),
     };
-    if let Some(l) = layout {
+    if let Some(l) = ctx.layout {
         // The shared buffers' extents: MaskRows rows throughout; the state buffers are ONE STICK
         // wide and the output accumulators HEAD-DIM wide — the same value only at hd == 64.
         for tnm in [
@@ -4753,7 +4767,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // shape declared smaller than the ops write aliases whatever the allocator handed out next.
     let (gkt, gv) = (syn(R::GatherKt), syn(R::GatherV));
     if let Some((_, scratch)) = gather
-        && let Some(l) = layout
+        && let Some(l) = ctx.layout
     {
         for r in [R::GatherKt, R::GatherV] {
             // ⛔ ONE VALUE, NOT A SLICE THE CALLER ASSEMBLES. `&[scratch.rows(), scratch.cols()]` is two
@@ -4790,7 +4804,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             cols.get(),
         );
         let g_rows = blocks.rows();
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             // ⭐⭐ THE WHOLE BLOCK NEVER LEAVES LX — score, `esub` and `exp` are each one core's slice of one
             // row block, reused block after block, exactly as the chunk's `cesub`/`cexp`. Every op over them
             // divides the block's rows alone, so one rows-first slice sizes all three; the read law holds each
@@ -4818,7 +4832,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             }
         }
         assemble_new_block_chunk(
-            &mut ops,
+            ctx,
             NewChunkAttn {
                 t,
                 geom,
@@ -4841,8 +4855,6 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 esub: &esub,
                 exp: &exp,
             },
-            sym_id_base,
-            layout,
         )?
     } else {
         // The sub-blocked passes: the chunk form emitted its block (and minted the carry) in the arm
@@ -4954,7 +4966,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 // the desync guard, not a path.
                 let block_carry = if j == 0 {
                     assemble_attn_seed_block(
-                        &mut ops,
+                        ctx,
                         t,
                         &tag,
                         geom,
@@ -4978,12 +4990,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         None,
                         &state,
                         &bufs,
-                        sym_id_base,
-                        layout,
                     )?
                 } else {
                     assemble_attn_fold_block(
-                        &mut ops,
+                        ctx,
                         t,
                         &tag,
                         geom,
@@ -5014,8 +5024,6 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         r,
                         None,
                         &bufs,
-                        sym_id_base,
-                        layout,
                     )?
                 };
                 seeded = Some(block_carry);
@@ -5067,7 +5075,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         } else {
             crate::sdsc_abstract::QGroupBlock::of_decode(nkvh, geom.gqa(), hd, mq)
         }
-        .zip(layout.and_then(|l| l.identity_tid_of_class(hd)));
+        .zip(ctx.layout.and_then(|l| l.identity_tid_of_class(hd)));
         // The row blocks the body cuts every wide op into (`ChunkRowBlocks`): a kv head's `gqa·mq` rows at
         // one slab, a query head's `mq` above it, a kv head's re-laid group where the query is re-laid.
         let blocks = match qgroup {
@@ -5107,7 +5115,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // pass has already walked prefix, every body and the suffix against THIS layout before any real
         // pass ran, so the slot map is complete — the FINAL sum, never a mid-walk projection. `0` when
         // no layout is in scope (a layout-less emission mints no pins at all).
-        let op_local_bytes = layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
+        let op_local_bytes = ctx.layout.map(|l| l.lx_op_local_slot_bytes()).unwrap_or(0);
         // ⭐ AND THE PROBABILITY-PART TERM, from the ONE enumeration the mint below also declares
         // (`chunk_prob_pins`): the witness's core-local sum is the gathers PLUS these pins — the sum
         // the allocator bumps — so a geometry the window cannot hold falls to HBM HERE instead of
@@ -5122,7 +5130,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             .as_ref()
             .map(|pins| pins.iter().map(|&(_, _, bytes)| bytes).sum())
             .unwrap_or(0);
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             l.note_chunk_prob_pin_bytes(prob_pin_bytes);
         }
         let lx = chunk
@@ -5152,10 +5160,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ident: crate::place::act_name(ident_tid),
             }),
         };
-        if let (Some(l), Some((q, _))) = (layout, qgroup) {
+        if let (Some(l), Some((q, _))) = (ctx.layout, qgroup) {
             l.synth(out_id.synth(R::ChunkQGroup), &q.footprint_dims());
         }
-        if let Some(l) = layout {
+        if let Some(l) = ctx.layout {
             match &cb.lx {
                 None => {
                     for r in [R::GatherKt, R::GatherV] {
@@ -5247,7 +5255,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             // offset 0, so a block past the placement reads the next activation's bytes as validity — an
             // additive mask, where an unstaged zero is VALID. The placement is the bundle's, so this is a
             // bake fact; refused here it is a build failure, never a row attending another's keys.
-            if let Some(l) = layout
+            if let Some(l) = ctx.layout
                 && let Some(crate::place::PlaceId::Act(tid)) = l.id_of(pmask)
                 && let Some(p) = l.placements.get(&tid)
                 && p.size < bc.mask_elems() as u64 * 2
@@ -5267,7 +5275,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // The carry goes IN and comes back: the chunk body folds onto the seed the new-block
         // half minted, and the chain continues to the finalize.
         carry = assemble_attn_chunk(
-            &mut ops,
+            ctx,
             ChunkAttn {
                 t,
                 geom,
@@ -5284,8 +5292,6 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 cb: &cb,
             },
             carry,
-            sym_id_base,
-            layout,
         )?;
     }
     let sweep_cap = if chunk.is_some() {
@@ -5293,7 +5299,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     } else {
         active_cap
     };
-    let fold_from = ops.len();
+    let fold_from = ctx.ops.len();
     // ⭐⭐⭐⭐⭐ THE WINDOW-CHUNK SPLIT — the gathered fold's own answer to the dxp group ceiling.
     //
     // A gathered PageFold run is UNCHUNKABLE by the group walk (`GroupKind::run_may_be_chunked ==
@@ -5417,21 +5423,21 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // unconditionally, before any window existed to interleave them with, so an `active_cap` under
     // one window (nb == 0) keeps its (dead but shipped) copies and the bundle does not move.
     if nb == 0 && gather.is_some() {
-        chunk_starts.push((ops.len() - fold_from, 0));
+        chunk_starts.push((ctx.ops.len() - fold_from, 0));
         if let Some((idx, scratch)) = gather {
             for (name, src, dst) in [
                 (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
                 (format!("attn_gv_o{t}"), vc, gv.as_str()),
             ] {
                 for cp in scratch.copies() {
-                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                    ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
                         &format!("{name}_s{}", cp.stick()),
                         src,
                         dst,
                         cp,
                         idx,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -5483,7 +5489,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         if emitted_chunk_copies != Some(chunk)
             && let Some((idx, scratch)) = gather
         {
-            chunk_starts.push((ops.len() - fold_from, chunk));
+            chunk_starts.push((ctx.ops.len() - fold_from, chunk));
             for (name, src, dst) in [
                 (format!("attn_gkt_o{t}"), kct, gkt.as_str()),
                 (format!("attn_gv_o{t}"), vc, gv.as_str()),
@@ -5504,14 +5510,14 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("{name}_c{chunk}_s{}", cp.stick())
                     };
-                    ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                    ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
                         &op_name,
                         src,
                         dst,
                         cp,
                         idx,
-                        sym_id_base,
-                        layout,
+                        ctx.sym_id_base,
+                        ctx.layout,
                     ));
                 }
             }
@@ -5550,7 +5556,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // seeding fold pass would reset the running state mid-accumulation and cost the deepest row
         // every page it had already folded.
         carry = assemble_attn_fold_block(
-            &mut ops,
+            ctx,
             t,
             &format!("p{b}"),
             geom,
@@ -5693,12 +5699,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 window: w,
             }),
             &bufs,
-            sym_id_base,
-            layout,
         )?;
     }
 
-    for (i, op) in ops[fold_from..].iter_mut().enumerate() {
+    for (i, op) in ctx.ops[fold_from..].iter_mut().enumerate() {
         op.kv_page_fold = true;
         // ⭐⭐⭐⭐⭐ THE CHUNK TAG — the fold's run-break between window chunks, from the chunk_starts
         // the sweep itself recorded. `kv_request` is the ONE field `Trip::fusable_with` already breaks
@@ -5793,7 +5797,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         //
         // Scoped to a decode batch; prefill's bundles are proven on hardware and stay byte-identical.
         if mq == 1 || rows_are_requests {
-            ops.push(assemble_pointwise_broadcast_off(
+            ctx.ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_o_o{t}"),
                 "realdiv",
                 // The batched finalize: ALL `nqh*mq` head-major rows in one op, head-dim wide.
@@ -5810,13 +5814,13 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ],
                 &fl(out, rows.get(), hd),
                 crate::addr::DevOff::ZERO,
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         } else {
             for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
                 let hi = h.get();
-                ops.push(assemble_pointwise_broadcast_off(
+                ctx.ops.push(assemble_pointwise_broadcast_off(
                     &format!("attn_o_h{hi}_o{t}"),
                     "realdiv",
                     // The per-head finalize: ONE head's `mq` rows per op — the rows slot genuinely
@@ -5837,8 +5841,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         BlockCols::of_feature_cols(nqh * hd),
                     ),
                     nests.token_stream(hi, 0).off(),
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -5861,7 +5865,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // same bundle fact swaps in at the matmul door: the copy's staging walk enumerates its
         // k-axis in exactly this order (`s`, then `h`, then `d`).
         for s in 0..nslab {
-            ops.push(assemble_pointwise_broadcast_off(
+            ctx.ops.push(assemble_pointwise_broadcast_off(
                 &format!("attn_o_s{s}_o{t}"),
                 "realdiv",
                 // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
@@ -5873,8 +5877,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 ],
                 &fl(out, rows.get(), hd),
                 nests.head_major(0, s),
-                sym_id_base,
-                layout,
+                ctx.sym_id_base,
+                ctx.layout,
             ));
         }
     } else {
@@ -5924,7 +5928,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
             let hi = h.get();
             for s in 0..nslab {
-                ops.push(assemble_pointwise_broadcast_off(
+                ctx.ops.push(assemble_pointwise_broadcast_off(
                     &format!("attn_o_h{hi}s{s}_o{t}"),
                     "realdiv",
                     // Per (head, slab): one head's `mq` rows, one head-dim SLAB of features.
@@ -5940,8 +5944,8 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         BlockCols::of_feature_cols(nqh * hd),
                     ),
                     nests.token_stream(hi, s).off(),
-                    sym_id_base,
-                    layout,
+                    ctx.sym_id_base,
+                    ctx.layout,
                 ));
             }
         }
@@ -5965,7 +5969,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // producer writing slab 1 where the consumer reads slab 0. Deliberately a SPAN test and not
     // set-equality: producer and consumer legitimately split their work across cores differently, so
     // their per-core bases need not coincide — but a read outside everything written cannot be right.
-    check_internal_buffers_are_read_where_written(&ops, &bufs, &state)?;
+    check_internal_buffers_are_read_where_written(ctx.ops, &bufs, &state)?;
     Ok(ops)
 }
 
