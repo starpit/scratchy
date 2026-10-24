@@ -829,10 +829,10 @@ impl FoldAddend {
     /// The `stridedadd` pair the value arms fold through — `None` on the seed arm, where the
     /// matmul writes its own result with no epilogue. A projection: reading cannot violate the
     /// minting law, only minting can.
-    fn stridedadd<'a>(
-        &'a self,
+    fn stridedadd(
+        &self,
         at: crate::addr::DevOff,
-    ) -> Option<(&'a Stk<FlatTag>, crate::addr::DevOff)> {
+    ) -> Option<(&Stk<FlatTag>, crate::addr::DevOff)> {
         match self {
             FoldAddend::Seed => None,
             FoldAddend::PreUpdate(a) => Some((a, at)),
