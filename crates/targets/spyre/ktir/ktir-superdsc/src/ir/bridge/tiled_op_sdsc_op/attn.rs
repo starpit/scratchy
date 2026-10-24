@@ -141,6 +141,10 @@ pub(crate) const HEAD_WIDE_BUFS: [crate::place::SynthRole; 2] = {
 pub(crate) const LADDER_OPS_PER_WINDOW: usize = 11;
 
 /// The shared, batched-over-heads online-softmax scratch/state buffer NAMES for one AttnDecode node.
+/// The recurrence's OWN three (`run_m`/`run_l`/`run_o`) are NOT here — they live on
+/// [`StateNames`], the one carrier the seed→fold→finalize chain threads; a scratch holder and the
+/// recurrence's state are different facts, and diff 06's two-holders note (one derivation, one
+/// frozen copy) is closed by there being only the carrier.
 struct BlockBufs {
     sc: String,
     bmax: String,
@@ -152,9 +156,6 @@ struct BlockBufs {
     bsum: String,
     otmp: String,
     ltmp: String,
-    run_m: String,
-    run_l: String,
-    run_o: String,
 }
 
 /// One block's contribution, folded into the shared online-softmax state via the correction
@@ -634,8 +635,39 @@ impl BlockSeed {
     }
 }
 
+/// ⭐⭐⭐⭐⭐ THE RECURRENCE STATE'S NAMES — the ALLOCATION, not the proof. The names must exist
+/// before the block that first writes them is emitted (the layout declares them, the seed role
+/// writes them), so they are minted once beside `BlockBufs`'s own fields — the same `syn`, the
+/// same roles — and frozen after, the same one-derivation discipline. [`SeededCarry`] wraps this
+/// as the proof the state was seeded; the two are deliberately different types, because a bare
+/// `StateNames` must not be handable to a fold door.
+#[derive(Clone, Debug)]
+struct StateNames {
+    m: String,
+    l: String,
+    o: String,
+}
+
+impl StateNames {
+    /// The recurrence's running max — the folds' own internal, consumed by the correction
+    /// recurrence, never read at the hand-off.
+    fn m(&self) -> &str {
+        &self.m
+    }
+
+    /// The recurrence's running denominator.
+    fn l(&self) -> &str {
+        &self.l
+    }
+
+    /// The recurrence's running accumulator.
+    fn o(&self) -> &str {
+        &self.o
+    }
+}
+
 /// ⭐⭐⭐⭐⭐ PROOF THE ONLINE-SOFTMAX STATE WAS SEEDED — the seed→body→finalize chain's own token,
-/// carrying the two state names the hand-off reads.
+/// wrapping the state's names (all three: the folds read the max too).
 ///
 /// The carry round-trips through device memory BETWEEN launches: the new-token block seeds
 /// `run_m`/`run_l`/`run_o`, every prefix/window fold and the chunk body fold onto it, and the finalize
@@ -645,30 +677,65 @@ impl BlockSeed {
 /// it should precede still passes. This token is that sequence, as a type: [`assemble_attn_seed_block`]
 /// and `assemble_new_block_chunk` are the only minters, [`assemble_attn_fold_block`], the chunk body
 /// and the LX probability walk require the token, and the finalize's `realdiv` reads its operands off
-/// it — a fold or divide emitted before any seed does not compile.
+/// the [`FinalizeCarry`] the one-way `handoff` below returns — a fold or divide emitted before any
+/// seed does not compile.
 ///
-/// **The max is deliberately absent.** The hand-off reads exactly the denominator and the accumulator;
-/// `m` is the recurrence's own internal, consumed by the folds, never read at the finalize. A finalize
-/// dividing by the running MAX — the same-typed-swap class — has no spelling: the type does not carry
-/// it. (The seed-safety theorem that makes `l` non-zero — the first window's valid-lane count ≥ 1 over
+/// **The max crosses to the folds, and stops there.** The correction recurrence reads `m` at every
+/// fold, so the proof carries it; the finalize does not — `handoff` CONSUMES the proof and returns
+/// exactly the two operands the divide reads, so a finalize dividing by the running MAX (the
+/// same-typed-swap class) has no spelling: [`FinalizeCarry`] does not carry it. (The seed-safety
+/// theorem that makes `l` non-zero — the first window's valid-lane count ≥ 1 over
 /// `real: NonZeroU32` — is stated on `ValidityMask` in `sdsc_abstract`.)
 #[derive(Clone, Debug)]
 struct SeededCarry {
+    state: StateNames,
+}
+
+impl SeededCarry {
+    /// The one mint: a frozen copy of the allocation, taken at a seed door after the seed ops are
+    /// emitted. `StateNames` is frozen after its own mint, so the copy cannot drift from the names
+    /// the seed ops wrote; one derivation, one frozen holder — the two-holders fact diff 06 stated
+    /// openly is closed here, because `BlockBufs` no longer carries these names at all.
+    fn mint(state: &StateNames) -> SeededCarry {
+        SeededCarry {
+            state: state.clone(),
+        }
+    }
+
+    /// The recurrence's running max — the folds' own internal.
+    fn m(&self) -> &str {
+        self.state.m()
+    }
+
+    /// The recurrence's running denominator.
+    fn l(&self) -> &str {
+        self.state.l()
+    }
+
+    /// The recurrence's running accumulator.
+    fn o(&self) -> &str {
+        self.state.o()
+    }
+
+    /// ⭐ THE ONE-WAY DOOR TO THE FINALIZE — consumes the proof and drops the max. The divide's
+    /// operands are exactly the denominator and the accumulator; after this call the recurrence
+    /// carry is gone, and there is no spelling that reads `m` at the hand-off.
+    fn handoff(self) -> FinalizeCarry {
+        FinalizeCarry {
+            l: self.state.l,
+            o: self.state.o,
+        }
+    }
+}
+
+/// The finalize's two operands — what the `realdiv` reads, and nothing else.
+#[derive(Clone, Debug)]
+struct FinalizeCarry {
     l: String,
     o: String,
 }
 
-impl SeededCarry {
-    /// The one mint: the state the hand-off reads, copied from the block's own buffers at the seed
-    /// door. `BlockBufs` is frozen after its construction, so the copy cannot drift from the name the
-    /// seed ops wrote; one derivation (`syn(R::RunL)`/`syn(R::RunO)`), one frozen holder beside it.
-    fn mint(bufs: &BlockBufs) -> SeededCarry {
-        SeededCarry {
-            l: bufs.run_l.clone(),
-            o: bufs.run_o.clone(),
-        }
-    }
-
+impl FinalizeCarry {
     /// The finalize's denominator — the seed-written `l`.
     fn l(&self) -> &str {
         &self.l
@@ -752,6 +819,9 @@ fn per_core_blocks(e: &EmittedOp) -> Vec<(String, bool, u64, u64)> {
 fn check_internal_buffers_are_read_where_written(
     ops: &[EmittedOp],
     bufs: &BlockBufs,
+    // The recurrence's three names — the same strings the carry threads, sourced from the one
+    // allocation so the lock and the emission cannot disagree about what the state is called.
+    state: &StateNames,
 ) -> Result<(), SuperDscError> {
     // The buffers this node both WRITES and READS. `out` is the hand-off (written, never read here) and
     // `qs`/`kct`/`vc`/the masks are inputs (read, never written), so neither has a pairing to check.
@@ -766,9 +836,9 @@ fn check_internal_buffers_are_read_where_written(
         &bufs.bsum,
         &bufs.otmp,
         &bufs.ltmp,
-        &bufs.run_m,
-        &bufs.run_l,
-        &bufs.run_o,
+        state.m(),
+        state.l(),
+        state.o(),
     ];
     // Per buffer: the byte intervals WRITTEN, and each READ interval with the op that made it.
     let mut written: std::collections::BTreeMap<&str, Vec<(u64, u64)>> = Default::default();
@@ -907,6 +977,10 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // each of the three `y` steps differenced out of the buffer that has it, and the builder refuses a
     // walk that would step differently.
     request_axis: Option<GatheredFold>,
+    // The recurrence state's names — the allocation the doors carry (a seed door is handed it, a
+    // fold door derives it from the proof it requires). `BlockBufs` holds the scratch only; these
+    // three belong to the carry chain.
+    state: &StateNames,
     bufs: &BlockBufs,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -944,10 +1018,11 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         bsum,
         otmp,
         ltmp,
-        run_m,
-        run_l,
-        run_o,
     } = bufs;
+    // The recurrence state's names, from the one allocation — the same three strings every fold
+    // reads off the carry and the finalize reads off its hand-off, so the core's own locals are
+    // the carrier's locals.
+    let (run_m, run_l, run_o) = (state.m(), state.l(), state.o());
 
     // Per-head score + value matmuls — unavoidably separate (each head reads its own K/V slice) —
     // each writing its `[mq,*]` block into ROWS `h*mq..h*mq+mq` of the shared buffers.
@@ -2020,7 +2095,8 @@ impl ChunkBufs {
 
 /// ⭐⭐⭐⭐⭐ THE SEED DOOR — the block emitter's seed role, and the ONLY spelling (with
 /// `assemble_new_block_chunk`) that mints a [`SeededCarry`]. Same parameters as the core, the role
-/// fixed; the mint happens after the core returns, from the same `bufs` the seed ops wrote.
+/// fixed, plus the allocation it wraps: the door is HANDED the state's names (the seed ops write
+/// them), and the mint — a frozen copy of the same names — happens after the core returns.
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
@@ -2045,6 +2121,7 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     bmm_form: SharedKernelBmmForm,
     req: u32,
     request_axis: Option<GatheredFold>,
+    state: &StateNames,
     bufs: &BlockBufs,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
@@ -2073,11 +2150,12 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         bmm_form,
         req,
         request_axis,
+        state,
         bufs,
         sym_id_base,
         layout,
     )?;
-    Ok(SeededCarry::mint(bufs))
+    Ok(SeededCarry::mint(state))
 }
 
 /// ⭐⭐⭐⭐⭐ THE FOLD DOOR — the block emitter's fold role, REQUIRING the proof the seed door mints.
@@ -2085,7 +2163,8 @@ fn assemble_attn_seed_block<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// block does to the running state now carries the evidence the state exists. A fold emitted before
 /// any seed does not compile — there is no `SeededCarry` in scope to hand it. The token is returned
 /// unchanged (the names it carries are the buffers' own, reused in place by every fold); the chain
-/// continues to the next fold or the finalize.
+/// continues to the next fold or the finalize. The core's state names come FROM the proof — a fold
+/// door needs no separate allocation parameter.
 #[allow(clippy::too_many_arguments)]
 fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops: &mut Vec<EmittedOp>,
@@ -2139,6 +2218,7 @@ fn assemble_attn_fold_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         bmm_form,
         req,
         request_axis,
+        &carry.state,
         bufs,
         sym_id_base,
         layout,
@@ -2351,7 +2431,11 @@ struct NewChunkAttn<'a> {
     new_v: &'a str,
     cmask: &'a str,
     bmm_form: crate::ir::bridge::tiled_op_sdsc_op::matmul::SharedKernelBmmForm,
-    bufs: &'a BlockBufs,
+    /// The recurrence state's names — this emitter SEEDS, so it is handed the allocation it
+    /// writes and returns it wrapped as the proof. (It reads no other shared buffer: its `sc`/
+    /// `esub`/`exp` scratch rides the dedicated fields above, which is why `BlockBufs` is not
+    /// here at all.)
+    state: &'a StateNames,
     sc: &'a str,
     esub: &'a str,
     exp: &'a str,
@@ -2402,7 +2486,7 @@ fn assemble_new_block_chunk(
         new_v,
         cmask,
         bmm_form,
-        bufs,
+        state,
         sc,
         esub,
         exp,
@@ -2472,7 +2556,7 @@ fn assemble_new_block_chunk(
             .map_err(SuperDscError)?,
             win_reduce_accum(
                 layout,
-                &hm_rows(&bufs.run_m, q_rows),
+                &hm_rows(state.m(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbmax_op}: accum"),
@@ -2488,7 +2572,7 @@ fn assemble_new_block_chunk(
             cols,
             &[
                 In::sliced(&rb(sc, g_rows, slots), at_pin).ew(),
-                In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
+                In::col_at(&hm_rows(state.m(), q_rows), row_step(h0)).ew(),
             ],
             &rb(esub, g_rows, slots),
             at_pin,
@@ -2523,7 +2607,7 @@ fn assemble_new_block_chunk(
             .map_err(SuperDscError)?,
             win_reduce_accum(
                 layout,
-                &hm_rows(&bufs.run_l, q_rows),
+                &hm_rows(state.l(), q_rows),
                 row_step(h0),
                 grp_rows,
                 &format!("{ncbsum_op}: accum"),
@@ -2557,7 +2641,7 @@ fn assemble_new_block_chunk(
                 at_pin,
                 &Stk::<KernelTag>::kernel(slots as usize, v.v_cols as usize, new_v),
                 v_off,
-                &rb(&bufs.run_o, q_rows, hd),
+                &rb(state.o(), q_rows, hd),
                 v.out_off,
                 sym_id_base,
                 layout,
@@ -2568,7 +2652,7 @@ fn assemble_new_block_chunk(
     // The seed mint — one of the two spellings that produce a `SeededCarry`: this function's
     // `ncbmax`/`ncbsum` and value matmuls wrote the carry on every path (no early return precedes
     // them), so the folds and the finalize below can require the proof.
-    Ok(SeededCarry::mint(bufs))
+    Ok(SeededCarry::mint(state))
 }
 
 /// The per-core LX a prompt chunk's two core-local probability scratches (`cesub`, `cexp`) may pin together:
@@ -3157,13 +3241,20 @@ fn assemble_attn_chunk(
     }
 
     // ── (3) THE ONLINE MERGE ONTO THE SEED — the fold block's own four ops, in its order ──
+    // The state's names come off the carry (the proof this body was handed); the scratch stays on
+    // `bufs` — spelled `.as_str()` so the table's rows are one type.
     for (op_name, func, ins, out) in [
-        ("newm", "maximum", [&bufs.run_m, &bufs.bmax], &bufs.newm),
+        (
+            "newm",
+            "maximum",
+            [carry.m(), bufs.bmax.as_str()],
+            bufs.newm.as_str(),
+        ),
         (
             "corrsub",
             "subtract",
-            [&bufs.run_m, &bufs.newm],
-            &bufs.corrsubt,
+            [carry.m(), bufs.newm.as_str()],
+            bufs.corrsubt.as_str(),
         ),
     ] {
         ops.push(assemble_pointwise_broadcast_off(
@@ -3182,8 +3273,13 @@ fn assemble_attn_chunk(
         ));
     }
     for (op_name, func, inp, out) in [
-        ("corre", ExpBase::E.op_func(), &bufs.corrsubt, &bufs.corr),
-        ("mset", "identity", &bufs.newm, &bufs.run_m),
+        (
+            "corre",
+            ExpBase::E.op_func(),
+            bufs.corrsubt.as_str(),
+            bufs.corr.as_str(),
+        ),
+        ("mset", "identity", bufs.newm.as_str(), carry.m()),
     ] {
         ops.push(assemble_pointwise_broadcast_off(
             &format!("attn_c{op_name}_o{t}"),
@@ -3267,7 +3363,7 @@ fn assemble_attn_chunk(
                     cols: pw,
                     inputs: &[
                         In::sliced(&rb(&cb.csc, q_rows, slots), pc).ew(),
-                        In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
+                        In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
                     ],
                     o: &rb(&cb.cesub, b_rows, ps),
                     out_offset: DevOff::ZERO.into(),
@@ -3338,7 +3434,7 @@ fn assemble_attn_chunk(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::full(&fl(carry.o(), q_rows, hd)).ew(),
             In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
         &fl(&bufs.otmp, q_rows, hd),
@@ -3346,7 +3442,7 @@ fn assemble_attn_chunk(
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3402,9 +3498,9 @@ fn assemble_attn_chunk(
                     "a row block's probability block",
                 )?;
                 let (out, addend) = if p % 2 == 0 {
-                    (&bufs.run_o, &otmp_h)
+                    (carry.o(), &otmp_h)
                 } else {
-                    (&bufs.otmp, &run_o_h)
+                    (bufs.otmp.as_str(), &run_o_h)
                 };
                 let slab = if out_slabs == 1 {
                     String::new()
@@ -3472,7 +3568,7 @@ fn assemble_attn_chunk(
         all_rows,
         stick,
         &[
-            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(carry.l(), q_rows)).ew(),
             In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
         &hm_rows(&bufs.ltmp, q_rows),
@@ -3489,7 +3585,7 @@ fn assemble_attn_chunk(
             In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
             In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm_rows(&bufs.run_l, q_rows),
+        &hm_rows(carry.l(), q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -3572,7 +3668,7 @@ fn prompt_probabilities_in_lx(
         all_rows,
         BlockCols::of_head_dim(hd),
         &[
-            In::full(&fl(&bufs.run_o, q_rows, hd)).ew(),
+            In::full(&fl(carry.o(), q_rows, hd)).ew(),
             In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
         &fl(&bufs.otmp, q_rows, hd),
@@ -3580,7 +3676,7 @@ fn prompt_probabilities_in_lx(
         sym_id_base,
         layout,
     ));
-    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(&bufs.run_o, q_rows, hd));
+    let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
@@ -3606,7 +3702,7 @@ fn prompt_probabilities_in_lx(
                     // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
                     // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
                     In::sliced(&rb(&cb.csc, q_rows, chunk.slots()), pc).ew(),
-                    In::col_at(&hm_rows(&bufs.run_m, q_rows), row_step(h0)).ew(),
+                    In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
                 ],
                 &rb(&cb.cesub, g_rows, ps),
                 DevOff::ZERO,
@@ -3653,9 +3749,9 @@ fn prompt_probabilities_in_lx(
                 layout,
             ));
             let (out, addend) = if p % 2 == 0 {
-                (&bufs.run_o, &otmp_h)
+                (carry.o(), &otmp_h)
             } else {
-                (&bufs.otmp, &run_o_h)
+                (bufs.otmp.as_str(), &run_o_h)
             };
             // `run_o_b = P_b · V_kvh + otmp_b` — the `stridedadd` epilogue is the online-softmax update. One
             // op per slab above one slab, each reading the same core-local `cexp`.
@@ -3737,7 +3833,7 @@ fn prompt_probabilities_in_lx(
         all_rows,
         stick,
         &[
-            In::full(&hm_rows(&bufs.run_l, q_rows)).ew(),
+            In::full(&hm_rows(carry.l(), q_rows)).ew(),
             In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
         ],
         &hm_rows(&bufs.ltmp, q_rows),
@@ -3754,7 +3850,7 @@ fn prompt_probabilities_in_lx(
             In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
             In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
         ],
-        &hm_rows(&bufs.run_l, q_rows),
+        &hm_rows(carry.l(), q_rows),
         DevOff::ZERO,
         sym_id_base,
         layout,
@@ -4053,11 +4149,12 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // Every buffer's spelling is a rendering of `out_id.synth(role)` — the SAME value the layout
     // allocator is keyed by, so an op's operand and its reservation have one preimage.
     let syn = |r: R| crate::placement::syn(layout, out_id.synth(r));
-    // ⛔⛔⛔ EVERY FIELD OF `BlockBufs` MUST BE DECLARED TO THE LAYOUT BELOW. A buffer that is
-    // NAMED here but never passed to `synth` is not merely undeclared — `resolve_seg_base`
-    // bump-allocates it on first reference at THAT ACCESS's size, so a per-head window reserves one
-    // head where `heads` are written and the tensor aliases its neighbour. `RunM`/`RunL` were
-    // dropped from that list once, and the symptom was a device that stopped responding.
+    // ⛔⛔⛔ EVERY BUFFER NAMED HERE — `BlockBufs`'s ten fields and `StateNames`'s three — MUST BE
+    // DECLARED TO THE LAYOUT BELOW. A buffer that is NAMED here but never passed to `synth` is
+    // not merely undeclared — `resolve_seg_base` bump-allocates it on first reference at THAT
+    // ACCESS's size, so a per-head window reserves one head where `heads` are written and the
+    // tensor aliases its neighbour. `RunM`/`RunL` were dropped from that list once, and the
+    // symptom was a device that stopped responding.
     let bufs = BlockBufs {
         sc: syn(R::Sc),
         bmax: syn(R::BMax),
@@ -4069,16 +4166,22 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         bsum: syn(R::BSum),
         otmp: syn(R::OTmp),
         ltmp: syn(R::LTmp),
-        run_m: syn(R::RunM),
-        run_l: syn(R::RunL),
-        run_o: syn(R::RunO),
+    };
+    // ⭐ THE RECURRENCE STATE'S NAMES — the ONE allocation (the same `syn`, the same roles the
+    // layout declares through `STICK_WIDE_BUFS`/`HEAD_WIDE_BUFS`), held by the carrier the chain
+    // threads: a seed door wraps it into a [`SeededCarry`], the folds and the chunk body read it
+    // off the proof, the finalize reads the hand-off's two — and `BlockBufs` does not carry these
+    // names at all. `syn` is a pure function of `(layout, out_id, role)`, so the strings are the
+    // same ones the `BlockBufs` literal used to mint inline.
+    let state = StateNames {
+        m: syn(R::RunM),
+        l: syn(R::RunL),
+        o: syn(R::RunO),
     };
     if let Some(l) = layout {
         // The shared buffers' extents: MaskRows rows throughout; the state buffers are ONE STICK
         // wide and the output accumulators HEAD-DIM wide — the same value only at hd == 64.
         for tnm in [
-            &bufs.run_m,
-            &bufs.run_l,
             &bufs.bmax,
             &bufs.newm,
             &bufs.corr,
@@ -4478,7 +4581,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 new_v,
                 cmask,
                 bmm_form,
-                bufs: &bufs,
+                state: &state,
                 sc: &sc,
                 esub: &esub,
                 exp: &exp,
@@ -4618,6 +4721,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                         bmm_form,
                         r,
                         None,
+                        &state,
                         &bufs,
                         sym_id_base,
                         layout,
@@ -5368,6 +5472,10 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // `kv_batched_requests` above — a bake fact the session cannot see, so it rides the manifest.
         op.kv_fold_rows = block_rows.regime();
     }
+    // ⭐ THE CHAIN'S LAST LINK: the proof crosses its one-way door. The recurrence carry (max
+    // included — the folds read it) is CONSUMED here, and what reaches the finalize is exactly
+    // the two operands the divide reads; there is no spelling that reads `m` past this line.
+    let carry = carry.handoff();
     // Finalize: out = run_o / run_l via ONE native `realdiv` op — no separate reciprocal step at all.
     // Earlier this session a single realdiv was reverted for reading-and-WRITING the SAME buffer
     // (run_o) in one op, a real in-place-aliasing hazard; that bug was the aliasing, not `realdiv`
@@ -5588,7 +5696,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // producer writing slab 1 where the consumer reads slab 0. Deliberately a SPAN test and not
     // set-equality: producer and consumer legitimately split their work across cores differently, so
     // their per-core bases need not coincide — but a read outside everything written cannot be right.
-    check_internal_buffers_are_read_where_written(&ops, &bufs)?;
+    check_internal_buffers_are_read_where_written(&ops, &bufs, &state)?;
     Ok(ops)
 }
 
@@ -5628,8 +5736,8 @@ mod buf_decl_tests {
         assert_eq!(HEAD_WIDE_BUFS, [R::RunO, R::OTmp]);
     }
 
-    /// Every role `BlockBufs` names is declared by one of the two lists — none may be minted and
-    /// then left to the lazy allocator.
+    /// Every role `BlockBufs` and `StateNames` name is declared by one of the two lists — none may
+    /// be minted and then left to the lazy allocator.
     #[test]
     fn every_block_buffer_role_is_declared_to_the_layout() {
         let declared: std::collections::BTreeSet<R> = STICK_WIDE_BUFS
