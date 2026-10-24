@@ -789,6 +789,11 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
+                // The pool geometry the entry factor needs — the model's own door (its doc
+                // carries why `head_dim` decides the entry size, `hd * 64` elements, and why
+                // no other pool value can stand in). Minted ABOVE the session's `&mut` below:
+                // the door shares the WHOLE model, a borrow that cannot live under that one.
+                let pool = model.pool();
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
@@ -814,10 +819,6 @@ impl Worker for SpyreWorker {
                 // live context length. So it is asked BELOW — once, of the session, after the page maps
                 // are installed (the selector reads `fold_requests` off them) and from the same write
                 // slot the launch is given. See `SuperDscSession::step_body`.
-                // The pool geometry the entry factor needs — the model's own door (its doc
-                // carries why `head_dim` decides the entry size, `hd * 64` elements, and why
-                // no other pool value can stand in).
-                let pool = model.pool();
                 // WHICH RUNG IS ACTUALLY RUNNING, and how much of it is padding. A rung that failed
                 // to build at startup is logged and skipped, and the selection then lands on the next
                 // WIDER one — 8 live requests running the 16-row bundle is twice the rows for the
