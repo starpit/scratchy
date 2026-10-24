@@ -4055,6 +4055,7 @@ pub fn program_windowed_eps(f: &IRFunction<'static>) -> Option<f32> {
 ///   returned is the product, never the raw config scale, and at a scale of one it is `log2e`
 ///   and not `1.0`. Consumers therefore compare EXISTENCE and LAW, never magnitude against a
 ///   payload — the one fact that stays a value ([`crate::score_scale`]'s module doc).
+///
 /// ⭐ DOES THIS PROGRAM COMPUTE SCORES AT ALL — the paged-fold family's other half. The fold
 /// is THREE programs (seed, body, finalize): the body computes scores (`qk · scale` over the
 /// QK contraction), while the seed initializes the online-softmax carry (`-65504` / `0` /

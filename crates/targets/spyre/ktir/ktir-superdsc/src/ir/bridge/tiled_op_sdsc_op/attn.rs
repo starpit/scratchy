@@ -3643,7 +3643,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, geom, &carry, &bufs, sym_id_base, layout);
+        emit_pre_update_correction(ops, t, q_rows, geom, &carry, bufs, sym_id_base, layout);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3909,7 +3909,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
     let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ops, t, q_rows, geom, &carry, &bufs, sym_id_base, layout);
+        emit_pre_update_correction(ops, t, q_rows, geom, &carry, bufs, sym_id_base, layout);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();

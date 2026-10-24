@@ -12153,7 +12153,7 @@ impl SplicedAttnRegion {
         let w4 = pool.windows_per_page()?;
         // One page block of the mask: `W4 * mq` rows of 64 f16 lanes.
         let block = u64::from(w4) * mq.count() as u64 * 64 * 2;
-        if block == 0 || extent_bytes % block != 0 {
+        if block == 0 || !extent_bytes.is_multiple_of(block) {
             return None;
         }
         let pages = u32::try_from(extent_bytes / block).ok()?;
@@ -12489,7 +12489,7 @@ impl SplicedDecodeBatch {
         let w4 = pool.windows_per_page()?;
         let ktb = entries.checked_mul(pool.nkvh())?;
         let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
-        if per_chunk == 0 || extent_bytes % per_chunk != 0 {
+        if per_chunk == 0 || !extent_bytes.is_multiple_of(per_chunk) {
             return None;
         }
         let chunks = u32::try_from(extent_bytes / per_chunk).ok()?;
