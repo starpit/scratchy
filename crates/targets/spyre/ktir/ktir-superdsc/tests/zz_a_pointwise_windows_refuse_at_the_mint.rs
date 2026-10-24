@@ -22,7 +22,7 @@
 //! the access (refusing a legal lane select) nor hide a scalar past the tensor's end.
 
 use ktir_superdsc::addr::DevOff;
-use ktir_superdsc::emit::{EmittedOp, In, assemble_pointwise_broadcast_off};
+use ktir_superdsc::emit::{EmittedOp, In, PointwiseFacts, assemble_pointwise_broadcast_off};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk};
@@ -47,13 +47,15 @@ fn add(
 ) -> EmittedOp {
     let mut sym = 0i64;
     assemble_pointwise_broadcast_off(
-        "add_test",
-        "add",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[In::full(a).ew(), In::full(b).ew()],
-        o,
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: "add_test",
+            op_func: "add",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &[In::full(a).ew(), In::full(b).ew()],
+            o,
+            out_offset: DevOff::ZERO.into(),
+        },
         &mut sym,
         layout,
     )
@@ -240,13 +242,15 @@ fn a_broadcast_last_row_scalar_past_the_end_refuses() {
     let build = |b: In<'_, RowBlockedTag>| {
         let mut sym = 0i64;
         assemble_pointwise_broadcast_off(
-            "mul_test",
-            "multiply",
-            RowCount::of_token_rows(rows),
-            BlockCols::of_feature_cols(2048),
-            &[In::full(&a).ew(), b.ew()],
-            &o,
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: "mul_test",
+                op_func: "multiply",
+                rows: RowCount::of_token_rows(rows),
+                cols: BlockCols::of_feature_cols(2048),
+                inputs: &[In::full(&a).ew(), b.ew()],
+                o: &o,
+                out_offset: DevOff::ZERO.into(),
+            },
             &mut sym,
             None,
         )
@@ -293,16 +297,18 @@ fn a_sub_stick_lane_select_stays_legal() {
     );
     let mut sym = 0i64;
     let built = assemble_pointwise_broadcast_off(
-        "mul_test",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(2048),
-        &[
-            In::full(&a).ew(),
-            In::col_at(&col, DevOff::from_view_step(8)).ew(),
-        ],
-        &o,
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: "mul_test",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(2048),
+            inputs: &[
+                In::full(&a).ew(),
+                In::col_at(&col, DevOff::from_view_step(8)).ew(),
+            ],
+            o: &o,
+            out_offset: DevOff::ZERO.into(),
+        },
         &mut sym,
         None,
     );
@@ -335,13 +341,15 @@ fn a_wider_per_row_broadcast_refuses() {
     let mut sym = 0i64;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assemble_pointwise_broadcast_off(
-            "mul_test",
-            "multiply",
-            RowCount::of_token_rows(rows),
-            BlockCols::of_feature_cols(2048),
-            &[In::full(&a).ew(), In::col(&wide_col).ew()],
-            &o,
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: "mul_test",
+                op_func: "multiply",
+                rows: RowCount::of_token_rows(rows),
+                cols: BlockCols::of_feature_cols(2048),
+                inputs: &[In::full(&a).ew(), In::col(&wide_col).ew()],
+                o: &o,
+                out_offset: DevOff::ZERO.into(),
+            },
             &mut sym,
             None,
         )

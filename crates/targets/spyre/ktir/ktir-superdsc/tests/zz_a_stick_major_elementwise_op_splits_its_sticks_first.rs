@@ -14,7 +14,7 @@
 //!
 //! [`distribute_cores`]: ktir_superdsc::work::distribute_cores
 
-use ktir_superdsc::emit::{In, assemble_pointwise_broadcast_off};
+use ktir_superdsc::emit::{In, PointwiseFacts, assemble_pointwise_broadcast_off};
 use ktir_superdsc::sdsc_abstract::{BlockCols, RowBlockedTag, RowCount, StickLayout, Stk};
 use ktir_superdsc::superdsc_opspec::{Df, ItDim, MAX_CORES, MaxCores, WorkPlan};
 use ktir_superdsc::work::{
@@ -219,13 +219,15 @@ fn emitted_split(rows: u32, cols: u32, full_cols: u32, c_start: u32) -> (u64, u6
     );
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
-        "mul",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[In::full(&a).ew(), In::full(&b).ew()],
-        &o,
-        ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16),
+        PointwiseFacts {
+            op_name: "mul",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &[In::full(&a).ew(), In::full(&b).ew()],
+            o: &o,
+            out_offset: ktir_superdsc::addr::col_of(rows, full_cols, c_start, Df::Fp16).into(),
+        },
         &mut sid,
         None,
     );
@@ -266,13 +268,15 @@ fn emitted_window_split(
         .expect("a whole-stick corner");
     let mut sid = 0i64;
     let op = assemble_pointwise_broadcast_off(
-        "mul",
-        "multiply",
-        RowCount::of_token_rows(rows),
-        BlockCols::of_feature_cols(cols),
-        &[In::col_window(&a, w).ew(), In::col_window(&b, w).ew()],
-        &o,
-        w,
+        PointwiseFacts {
+            op_name: "mul",
+            op_func: "multiply",
+            rows: RowCount::of_token_rows(rows),
+            cols: BlockCols::of_feature_cols(cols),
+            inputs: &[In::col_window(&a, w).ew(), In::col_window(&b, w).ew()],
+            o: &o,
+            out_offset: w.into(),
+        },
         &mut sid,
         None,
     );

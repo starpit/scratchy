@@ -1149,13 +1149,15 @@ pub fn assemble_pointwise_broadcast(
 ) -> EmittedOp {
     // RowBlocked output ⇒ residual token stream (not head-major). head_major is derived from the type.
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        inputs,
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs,
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym_id_base,
         layout,
     )
@@ -1181,13 +1183,15 @@ pub fn assemble_pointwise_broadcast_hm(
 ) -> EmittedOp {
     // Flat output ⇒ head-major (per-head attention) op; the builder derives head_major from the type.
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        inputs,
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs,
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym_id_base,
         layout,
     )
@@ -2105,30 +2109,52 @@ fn core_local_reads_agree(
 
 /// [`assemble_pointwise_broadcast`] that writes the output to a COLUMN-BLOCK OFFSET
 /// (`out_offset` elements into the output tensor) — see [`pointwise_chunk_out_offset`].
-#[allow(clippy::too_many_arguments)]
+///
+/// ⭐ THE OP'S WHOLE FACT SET, ON ONE CARRIER — [`PointwiseDivided`] minus the `division` field,
+/// because this door's contract is that the LAW states the division; the body below fills it in
+/// when it delegates to [`assemble_pointwise_broadcast_divided`]. This deletes the nine-parameter
+/// positional run every caller spelled (the arrangement where a name, an extent or an offset
+/// transposes silently). The sink pair (`sym_id_base`/`layout`) stays in the signature BESIDE the
+/// carrier, as it does at every door of this family.
+pub struct PointwiseFacts<'a, O: KindTag> {
+    pub op_name: &'a str,
+    pub op_func: &'static str,
+    /// TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
+    /// chunk rows, padded rows, pad remainder, token rows) and WHICH width (`BlockCols`'s doors: one
+    /// stick, the new block's `mq_pad`, the head dim, feature cols) fills the slot — the quantities
+    /// are numerically equal across whole rung families (64 == 64 at mq<=2, hd == stick at hd=64),
+    /// so a bare `u32` could carry any of them without anything noticing.
+    pub rows: crate::sdsc_abstract::RowCount,
+    pub cols: crate::sdsc_abstract::BlockCols,
+    pub inputs: &'a [EwOperand<'a>],
+    pub o: &'a Stk<O>,
+    /// TYPED, like the inputs' `In::sliced`. A write offset is a DEVICE address, so it must come from
+    /// a nest that knows the tensor's extents; the only constructor is `View::dev`. When this was a
+    /// bare `u32` a caller could pass a flat column index, and one did -- the split MLP intermediate
+    /// wrote its second column block at element 8192 instead of `(8192/64)*(rows*64)`, correct at one
+    /// row and wrong at every prefill. The reads were already typed and were already right.
+    /// A [`crate::addr::ColWindow`] (a whole-stick column window, #622) converts too, and carries the fact
+    /// that the window is a stick-major tensor of its own.
+    pub out_offset: crate::addr::OutCorner,
+}
+
 pub fn assemble_pointwise_broadcast_off<O: KindTag>(
-    op_name: &str,
-    op_func: &'static str,
-    // TYPED row/width slots. Every caller states WHICH row quantity (`RowCount`'s doors: mask rows,
-    // chunk rows, padded rows, pad remainder, token rows) and WHICH width (`BlockCols`'s doors: one
-    // stick, the new block's `mq_pad`, the head dim, feature cols) fills the slot — the quantities
-    // are numerically equal across whole rung families (64 == 64 at mq<=2, hd == stick at hd=64),
-    // so a bare `u32` could carry any of them without anything noticing.
-    rows: crate::sdsc_abstract::RowCount,
-    cols: crate::sdsc_abstract::BlockCols,
-    inputs: &[EwOperand<'_>],
-    o: &Stk<O>,
-    // TYPED, like the inputs' `In::sliced`. A write offset is a DEVICE address, so it must come from
-    // a nest that knows the tensor's extents; the only constructor is `View::dev`. When this was a
-    // bare `u32` a caller could pass a flat column index, and one did -- the split MLP intermediate
-    // wrote its second column block at element 8192 instead of `(8192/64)*(rows*64)`, correct at one
-    // row and wrong at every prefill. The reads were already typed and were already right.
-    // A [`crate::addr::ColWindow`] (a whole-stick column window, #622) converts too, and carries the fact
-    // that the window is a stick-major tensor of its own.
-    out_offset: impl Into<crate::addr::OutCorner>,
+    p: PointwiseFacts<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
+    // ⭐ THE OP'S FACTS, DESTRUCTURED ONCE AT THE DOOR — the same names the parameter list
+    // spelled, so the delegation below states the same op on the same values. The LAW division
+    // this door has always implied is filled in here, at the one place that owns it.
+    let PointwiseFacts {
+        op_name,
+        op_func,
+        rows,
+        cols,
+        inputs,
+        o,
+        out_offset,
+    } = p;
     assemble_pointwise_broadcast_divided(
         PointwiseDivided {
             op_name,
@@ -2137,7 +2163,7 @@ pub fn assemble_pointwise_broadcast_off<O: KindTag>(
             cols,
             inputs,
             o,
-            out_offset: out_offset.into(),
+            out_offset,
             division: crate::work::EwDivision::Law,
         },
         sym_id_base,
@@ -4845,13 +4871,15 @@ pub fn pw1<A: KindTag, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        &[a.ew()],
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs: &[a.ew()],
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym,
         layout,
     )
@@ -4872,13 +4900,15 @@ pub fn pw2<A: KindTag, B: KindTag, O: KindTag>(
     layout: Option<&BundleLayout>,
 ) -> EmittedOp {
     assemble_pointwise_broadcast_off(
-        op_name,
-        op_func,
-        rows,
-        cols,
-        &[a.ew(), b.ew()],
-        o,
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name,
+            op_func,
+            rows,
+            cols,
+            inputs: &[a.ew(), b.ew()],
+            o,
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         sym,
         layout,
     )
@@ -7732,13 +7762,15 @@ mod time_tiled_broadcast_operand_is_address_stable {
             BlockCols::of_feature_cols(COLS),
         );
         assemble_pointwise_broadcast_off(
-            "tscdiv_t2326",
-            "realdiv",
-            RowCount::of_token_rows(ROWS),
-            BlockCols::of_feature_cols(COLS),
-            &[In::full(&x).ew(), In::scalar(&cap).ew()],
-            &out,
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: "tscdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+                inputs: &[In::full(&x).ew(), In::scalar(&cap).ew()],
+                o: &out,
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             &mut 0i64,
             None,
         )
@@ -7861,13 +7893,15 @@ mod time_tiled_mb_operand_advances_per_trip {
             BlockCols::of_feature_cols(COLS),
         );
         assemble_pointwise_broadcast_off(
-            "mbdiv_t2326",
-            "realdiv",
-            RowCount::of_token_rows(ROWS),
-            BlockCols::of_feature_cols(COLS),
-            &[In::full(&x).ew(), In::mb(&gamma).ew()],
-            &out,
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: "mbdiv_t2326",
+                op_func: "realdiv",
+                rows: RowCount::of_token_rows(ROWS),
+                cols: BlockCols::of_feature_cols(COLS),
+                inputs: &[In::full(&x).ew(), In::mb(&gamma).ew()],
+                o: &out,
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             &mut 0i64,
             None,
         )

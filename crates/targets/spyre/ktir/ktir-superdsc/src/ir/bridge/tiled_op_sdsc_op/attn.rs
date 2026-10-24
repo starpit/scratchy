@@ -70,8 +70,9 @@ use super::reduce::{
 };
 use crate::addr::{Head, Idx, Nest};
 use crate::emit::{
-    EmitCtx, EmittedOp, In, PointwiseDivided, assemble_pointwise_broadcast_divided,
-    assemble_pointwise_broadcast_off, assemble_restickify_kt_2d, fl, rb,
+    EmitCtx, EmittedOp, In, PointwiseDivided, PointwiseFacts,
+    assemble_pointwise_broadcast_divided, assemble_pointwise_broadcast_off,
+    assemble_restickify_kt_2d, fl, rb,
 };
 use crate::exp_base::ExpBase;
 use crate::placement::BundleLayout;
@@ -1689,16 +1690,18 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         // Seed already written directly above — nothing more to do here.
     } else {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}newm_o{t}"),
-            "maximum",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_m, rows_n)).ew(),
-                In::full(&hm_rows(bmax, rows_n)).ew(),
-            ],
-            &hm_rows(newm, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}newm_o{t}"),
+                op_func: "maximum",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_m, rows_n)).ew(),
+                    In::full(&hm_rows(bmax, rows_n)).ew(),
+                ],
+                o: &hm_rows(newm, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -1706,38 +1709,44 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         // and write the SAME buffer (a real hardware in-place-aliasing hazard, not a style choice;
         // see the old proven flash decode's fcsub->fcorr, always two distinct buffers).
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}corrsub_o{t}"),
-            "subtract",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_m, rows_n)).ew(),
-                In::full(&hm_rows(newm, rows_n)).ew(),
-            ],
-            &hm_rows(corrsubt, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}corrsub_o{t}"),
+                op_func: "subtract",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_m, rows_n)).ew(),
+                    In::full(&hm_rows(newm, rows_n)).ew(),
+                ],
+                o: &hm_rows(corrsubt, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}corre_o{t}"),
-            ExpBase::E.op_func(),
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
-            &hm_rows(corr, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}corre_o{t}"),
+                op_func: ExpBase::E.op_func(),
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[In::full(&hm_rows(corrsubt, rows_n)).ew()],
+                o: &hm_rows(corr, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}mset_o{t}"),
-            "identity",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[In::full(&hm_rows(newm, rows_n)).ew()],
-            &hm_rows(run_m, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}mset_o{t}"),
+                op_func: "identity",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[In::full(&hm_rows(newm, rows_n)).ew()],
+                o: &hm_rows(run_m, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -1745,29 +1754,33 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     // expb = exp(sc - run_m) (post-update run_m). `esubt`/`expb` are distinct buffers — same
     // in-place-aliasing rule as above.
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_{tag}esub_o{t}"),
-        "subtract",
-        rows.swept(),
-        width,
-        &[
-            // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
-            // own output handle declares, not `hm`'s `1×64` annotation.
-            In::full(&fl(sc, rows_n, width_n)).ew(),
-            In::col(&hm_rows(run_m, rows_n)).ew(),
-        ],
-        &fl(esubt, rows_n, width_n),
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_{tag}esub_o{t}"),
+            op_func: "subtract",
+            rows: rows.swept(),
+            cols: width,
+            inputs: &[
+                // `sc`/`esubt` at the swept `[rows_n, width_n]` — the same dims the score matmul's
+                // own output handle declares, not `hm`'s `1×64` annotation.
+                In::full(&fl(sc, rows_n, width_n)).ew(),
+                In::col(&hm_rows(run_m, rows_n)).ew(),
+            ],
+            o: &fl(esubt, rows_n, width_n),
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_{tag}ee_o{t}"),
-        ExpBase::E.op_func(),
-        rows.swept(),
-        width,
-        &[In::full(&fl(esubt, rows_n, width_n)).ew()],
-        &fl(expb, rows_n, width_n),
-        crate::addr::DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_{tag}ee_o{t}"),
+            op_func: ExpBase::E.op_func(),
+            rows: rows.swept(),
+            cols: width,
+            inputs: &[In::full(&fl(esubt, rows_n, width_n)).ew()],
+            o: &fl(expb, rows_n, width_n),
+            out_offset: crate::addr::DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
@@ -1838,18 +1851,20 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         FoldAddend::Seed
     } else {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}ocorr_o{t}"),
-            "multiply",
-            rows.swept(),
-            BlockCols::of_head_dim(hd),
-            &[
-                // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
-                // dimensions, not `hm`'s `1×64` annotation.
-                In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
-                In::col(&hm_rows(corr, rows_n)).ew(),
-            ],
-            &fl(otmp, rows_n, hd),
-            nests.head_major(0, 0),
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}ocorr_o{t}"),
+                op_func: "multiply",
+                rows: rows.swept(),
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[
+                    // `run_o`/`otmp` at their true head-wide `[rows_n, hd]` — the HEAD_WIDE_BUFS synth
+                    // dimensions, not `hm`'s `1×64` annotation.
+                    In::sliced(&fl(run_o, rows_n, hd), nests.head_major(0, 0)).ew(),
+                    In::col(&hm_rows(corr, rows_n)).ew(),
+                ],
+                o: &fl(otmp, rows_n, hd),
+                out_offset: nests.head_major(0, 0).into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -2212,30 +2227,34 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         // run_l = run_l*corr + bsum ; run_o = run_o*corr + ov. `ltmp`/`otmp` break the in-place
         // read/write alias in the multiply (mirrors the old proven flash decode's `fdtmp`).
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}lcorr_o{t}"),
-            "multiply",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(run_l, rows_n)).ew(),
-                In::full(&hm_rows(corr, rows_n)).ew(),
-            ],
-            &hm_rows(ltmp, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}lcorr_o{t}"),
+                op_func: "multiply",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(run_l, rows_n)).ew(),
+                    In::full(&hm_rows(corr, rows_n)).ew(),
+                ],
+                o: &hm_rows(ltmp, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_{tag}ladd_o{t}"),
-            "add",
-            rows.swept(),
-            BlockCols::of_one_stick(Lanes::FP16),
-            &[
-                In::full(&hm_rows(ltmp, rows_n)).ew(),
-                In::full(&hm_rows(bsum, rows_n)).ew(),
-            ],
-            &hm_rows(run_l, rows_n),
-            crate::addr::DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_{tag}ladd_o{t}"),
+                op_func: "add",
+                rows: rows.swept(),
+                cols: BlockCols::of_one_stick(Lanes::FP16),
+                inputs: &[
+                    In::full(&hm_rows(ltmp, rows_n)).ew(),
+                    In::full(&hm_rows(bsum, rows_n)).ew(),
+                ],
+                o: &hm_rows(run_l, rows_n),
+                out_offset: crate::addr::DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -2860,27 +2879,31 @@ fn assemble_new_block_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             ctx.layout,
         ));
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncesub_{bn}_o{t}"),
-            "subtract",
-            grp_rows,
-            cols,
-            &[
-                In::sliced(&rb(sc, grp_rows, cols), at_pin).ew(),
-                In::col_at(&hm_rows(state.m(), q_rows), row_step(h0)).ew(),
-            ],
-            &rb(esub, grp_rows, cols),
-            at_pin,
+            PointwiseFacts {
+                op_name: &format!("attn_ncesub_{bn}_o{t}"),
+                op_func: "subtract",
+                rows: grp_rows,
+                cols,
+                inputs: &[
+                    In::sliced(&rb(sc, grp_rows, cols), at_pin).ew(),
+                    In::col_at(&hm_rows(state.m(), q_rows), row_step(h0)).ew(),
+                ],
+                o: &rb(esub, grp_rows, cols),
+                out_offset: at_pin.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_ncexp_{bn}_o{t}"),
-            ExpBase::E.op_func(),
-            grp_rows,
-            cols,
-            &[In::sliced(&rb(esub, grp_rows, cols), at_pin).ew()],
-            &rb(exp, grp_rows, cols),
-            at_pin,
+            PointwiseFacts {
+                op_name: &format!("attn_ncexp_{bn}_o{t}"),
+                op_func: ExpBase::E.op_func(),
+                rows: grp_rows,
+                cols,
+                inputs: &[In::sliced(&rb(esub, grp_rows, cols), at_pin).ew()],
+                o: &rb(exp, grp_rows, cols),
+                out_offset: at_pin.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -3481,16 +3504,18 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
                     temps[2]
                 };
                 ctx.ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_c{stem}_k{p}_o{t}"),
-                    combine,
-                    all_rows,
-                    stick,
-                    &[
-                        In::full(&hm_rows(acc, q_rows)).ew(),
-                        In::full(&hm_rows(temps[1], q_rows)).ew(),
-                    ],
-                    &hm_rows(out, q_rows),
-                    DevOff::ZERO,
+                    PointwiseFacts {
+                        op_name: &format!("attn_c{stem}_k{p}_o{t}"),
+                        op_func: combine,
+                        rows: all_rows,
+                        cols: stick,
+                        inputs: &[
+                            In::full(&hm_rows(acc, q_rows)).ew(),
+                            In::full(&hm_rows(temps[1], q_rows)).ew(),
+                        ],
+                        o: &hm_rows(out, q_rows),
+                        out_offset: DevOff::ZERO.into(),
+                    },
                     ctx.sym_id_base,
                     ctx.layout,
                 ));
@@ -3559,16 +3584,18 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         ),
     ] {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_c{op_name}_o{t}"),
-            func,
-            all_rows,
-            stick,
-            &[
-                In::full(&hm_rows(ins[0], q_rows)).ew(),
-                In::full(&hm_rows(ins[1], q_rows)).ew(),
-            ],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_c{op_name}_o{t}"),
+                op_func: func,
+                rows: all_rows,
+                cols: stick,
+                inputs: &[
+                    In::full(&hm_rows(ins[0], q_rows)).ew(),
+                    In::full(&hm_rows(ins[1], q_rows)).ew(),
+                ],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -3583,13 +3610,15 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
         ("mset", "identity", bufs.newm.as_str(), carry.m()),
     ] {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_c{op_name}_o{t}"),
-            func,
-            all_rows,
-            stick,
-            &[In::full(&hm_rows(inp, q_rows)).ew()],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_c{op_name}_o{t}"),
+                op_func: func,
+                rows: all_rows,
+                cols: stick,
+                inputs: &[In::full(&hm_rows(inp, q_rows)).ew()],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -3839,43 +3868,49 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     }
     if parts.len().is_multiple_of(2) {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_covsum_o{t}"),
-            "identity",
-            all_rows,
-            BlockCols::of_head_dim(hd),
-            &[In::full(&otmp_h).ew()],
-            &run_o_h,
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_covsum_o{t}"),
+                op_func: "identity",
+                rows: all_rows,
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[In::full(&otmp_h).ew()],
+                o: &run_o_h,
+                out_offset: DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_clcorr_o{t}"),
-        "multiply",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(carry.l(), q_rows)).ew(),
-            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.ltmp, q_rows),
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_clcorr_o{t}"),
+            op_func: "multiply",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(carry.l(), q_rows)).ew(),
+                In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &hm_rows(&bufs.ltmp, q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cladd_o{t}"),
-        "add",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
-        ],
-        &hm_rows(carry.l(), q_rows),
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_cladd_o{t}"),
+            op_func: "add",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+                In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
+            ],
+            o: &hm_rows(carry.l(), q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
@@ -3918,16 +3953,18 @@ fn emit_pre_update_correction<const NQH: u32, const NKVH: u32, const HD: u32>(
     let hd = geom.hd();
     let (otmp_h, run_o_h) = (fl(&bufs.otmp, q_rows, hd), fl(carry.o(), q_rows, hd));
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cocorr_o{t}"),
-        "multiply",
-        RowCount::of_head_major_rows(q_rows),
-        BlockCols::of_head_dim(hd),
-        &[
-            In::full(&run_o_h).ew(),
-            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &otmp_h,
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_cocorr_o{t}"),
+            op_func: "multiply",
+            rows: RowCount::of_head_major_rows(q_rows),
+            cols: BlockCols::of_head_dim(hd),
+            inputs: &[
+                In::full(&run_o_h).ew(),
+                In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &otmp_h,
+            out_offset: DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
@@ -4011,30 +4048,34 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
                 crate::sdsc_abstract::VKernelRows::of_chunk_part(*part),
             );
             ctx.ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cesub_{bn}_s{p}_o{t}"),
-                "subtract",
-                grp_rows,
-                pw,
-                &[
-                    // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
-                    // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
-                    // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
-                    In::sliced(&rb(&cb.csc, all_rows, BlockCols::of_chunk(chunk)), pc).ew(),
-                    In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
-                ],
-                &rb(&cb.cesub, grp_rows, pw),
-                DevOff::ZERO,
+                PointwiseFacts {
+                    op_name: &format!("attn_cesub_{bn}_s{p}_o{t}"),
+                    op_func: "subtract",
+                    rows: grp_rows,
+                    cols: pw,
+                    inputs: &[
+                        // The score block at its CHUNK-FRAME part corner — the FULL `[q_rows, slots]`
+                        // buffer, not the block-shaped `g_rows` annotation. `cesub` below is core-local
+                        // LX, addressed at its pin (offset 0), so ITS handle stays block-shaped.
+                        In::sliced(&rb(&cb.csc, all_rows, BlockCols::of_chunk(chunk)), pc).ew(),
+                        In::col_at(&hm_rows(carry.m(), q_rows), row_step(h0)).ew(),
+                    ],
+                    o: &rb(&cb.cesub, grp_rows, pw),
+                    out_offset: DevOff::ZERO.into(),
+                },
                 ctx.sym_id_base,
                 ctx.layout,
             ));
             ctx.ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_cexp_{bn}_s{p}_o{t}"),
-                ExpBase::E.op_func(),
-                grp_rows,
-                pw,
-                &[In::sliced(&rb(&cb.cesub, grp_rows, pw), DevOff::ZERO).ew()],
-                &rb(&cb.cexp, grp_rows, pw),
-                DevOff::ZERO,
+                PointwiseFacts {
+                    op_name: &format!("attn_cexp_{bn}_s{p}_o{t}"),
+                    op_func: ExpBase::E.op_func(),
+                    rows: grp_rows,
+                    cols: pw,
+                    inputs: &[In::sliced(&rb(&cb.cesub, grp_rows, pw), DevOff::ZERO).ew()],
+                    o: &rb(&cb.cexp, grp_rows, pw),
+                    out_offset: DevOff::ZERO.into(),
+                },
                 ctx.sym_id_base,
                 ctx.layout,
             ));
@@ -4110,13 +4151,15 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     }
     if n.is_multiple_of(2) {
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_covsum_o{t}"),
-            "identity",
-            all_rows,
-            BlockCols::of_head_dim(hd),
-            &[In::full(&otmp_h).ew()],
-            &run_o_h,
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_covsum_o{t}"),
+                op_func: "identity",
+                rows: all_rows,
+                cols: BlockCols::of_head_dim(hd),
+                inputs: &[In::full(&otmp_h).ew()],
+                o: &run_o_h,
+                out_offset: DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -4133,16 +4176,18 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
             cb.red[n + 1].as_str()
         };
         ctx.ops.push(assemble_pointwise_broadcast_off(
-            &format!("attn_cbsum_k{p}_o{t}"),
-            "add",
-            all_rows,
-            stick,
-            &[
-                In::full(&hm_rows(acc, q_rows)).ew(),
-                In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
-            ],
-            &hm_rows(out, q_rows),
-            DevOff::ZERO,
+            PointwiseFacts {
+                op_name: &format!("attn_cbsum_k{p}_o{t}"),
+                op_func: "add",
+                rows: all_rows,
+                cols: stick,
+                inputs: &[
+                    In::full(&hm_rows(acc, q_rows)).ew(),
+                    In::full(&hm_rows(&cb.red[p], q_rows)).ew(),
+                ],
+                o: &hm_rows(out, q_rows),
+                out_offset: DevOff::ZERO.into(),
+            },
             ctx.sym_id_base,
             ctx.layout,
         ));
@@ -4150,30 +4195,34 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     }
     // run_l = run_l*corr + bsum — the fold block's own pair.
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_clcorr_o{t}"),
-        "multiply",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(carry.l(), q_rows)).ew(),
-            In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
-        ],
-        &hm_rows(&bufs.ltmp, q_rows),
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_clcorr_o{t}"),
+            op_func: "multiply",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(carry.l(), q_rows)).ew(),
+                In::full(&hm_rows(&bufs.corr, q_rows)).ew(),
+            ],
+            o: &hm_rows(&bufs.ltmp, q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
     ctx.ops.push(assemble_pointwise_broadcast_off(
-        &format!("attn_cladd_o{t}"),
-        "add",
-        all_rows,
-        stick,
-        &[
-            In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
-            In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
-        ],
-        &hm_rows(carry.l(), q_rows),
-        DevOff::ZERO,
+        PointwiseFacts {
+            op_name: &format!("attn_cladd_o{t}"),
+            op_func: "add",
+            rows: all_rows,
+            cols: stick,
+            inputs: &[
+                In::full(&hm_rows(&bufs.ltmp, q_rows)).ew(),
+                In::full(&hm_rows(&bufs.bsum, q_rows)).ew(),
+            ],
+            o: &hm_rows(carry.l(), q_rows),
+            out_offset: DevOff::ZERO.into(),
+        },
         ctx.sym_id_base,
         ctx.layout,
     ));
@@ -5923,22 +5972,24 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // Scoped to a decode batch; prefill's bundles are proven on hardware and stay byte-identical.
         if mq == 1 || rows_are_requests {
             ctx.ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_o_o{t}"),
-                "realdiv",
-                // The batched finalize: ALL `nqh*mq` head-major rows in one op, head-dim wide.
-                RowCount::of_mask_rows(rows),
-                BlockCols::of_head_dim(hd),
-                &[
-                    // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
-                    // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
-                    // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
-                    // mint's bound is flat). ⭐ AND THE OPERANDS COME FROM THE CARRY TOKEN — the
-                    // chain the seed door minted ends here, at the divide it exists for.
-                    In::full(&fl(carry.o(), rows.get(), hd)).ew(),
-                    In::col(&hm_rows(carry.l(), rows.get())).ew(),
-                ],
-                &fl(out, rows.get(), hd),
-                crate::addr::DevOff::ZERO,
+                PointwiseFacts {
+                    op_name: &format!("attn_o_o{t}"),
+                    op_func: "realdiv",
+                    // The batched finalize: ALL `nqh*mq` head-major rows in one op, head-dim wide.
+                    rows: RowCount::of_mask_rows(rows),
+                    cols: BlockCols::of_head_dim(hd),
+                    inputs: &[
+                        // The accumulators at their true extents — `run_o` head-wide `[rows, hd]`,
+                        // `run_l` one-stick `[rows, 64]` — and `out` at the flat-equal `[rows, hd]`
+                        // view of its `[mq, nqh·hd]` token-stream buffer (same element count; the
+                        // mint's bound is flat). ⭐ AND THE OPERANDS COME FROM THE CARRY TOKEN — the
+                        // chain the seed door minted ends here, at the divide it exists for.
+                        In::full(&fl(carry.o(), rows.get(), hd)).ew(),
+                        In::col(&hm_rows(carry.l(), rows.get())).ew(),
+                    ],
+                    o: &fl(out, rows.get(), hd),
+                    out_offset: crate::addr::DevOff::ZERO.into(),
+                },
                 ctx.sym_id_base,
                 ctx.layout,
             ));
@@ -5946,26 +5997,28 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             for h in crate::sdsc_abstract::QueryHead::all(nqh_nz) {
                 let hi = h.get();
                 ctx.ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_o_h{hi}_o{t}"),
-                    "realdiv",
-                    // The per-head finalize: ONE head's `mq` rows per op — the rows slot genuinely
-                    // carries the chunk's rows here, not the shared-buffer extent.
-                    RowCount::of_query_rows(width.mq()),
-                    BlockCols::of_head_dim(hd),
-                    &[
-                        In::sliced(
-                            &fl(carry.o(), rows.get(), hd),
-                            nests.token_stream(hi, 0).off(),
-                        )
-                        .ew(),
-                        In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
-                    ],
-                    &rb(
-                        out,
-                        RowCount::of_query_rows(width.mq()),
-                        BlockCols::of_feature_cols(nqh * hd),
-                    ),
-                    nests.token_stream(hi, 0).off(),
+                    PointwiseFacts {
+                        op_name: &format!("attn_o_h{hi}_o{t}"),
+                        op_func: "realdiv",
+                        // The per-head finalize: ONE head's `mq` rows per op — the rows slot genuinely
+                        // carries the chunk's rows here, not the shared-buffer extent.
+                        rows: RowCount::of_query_rows(width.mq()),
+                        cols: BlockCols::of_head_dim(hd),
+                        inputs: &[
+                            In::sliced(
+                                &fl(carry.o(), rows.get(), hd),
+                                nests.token_stream(hi, 0).off(),
+                            )
+                            .ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
+                        ],
+                        o: &rb(
+                            out,
+                            RowCount::of_query_rows(width.mq()),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
+                        out_offset: nests.token_stream(hi, 0).off().into(),
+                    },
                     ctx.sym_id_base,
                     ctx.layout,
                 ));
@@ -5991,17 +6044,19 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
         // k-axis in exactly this order (`s`, then `h`, then `d`).
         for s in 0..nslab {
             ctx.ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_o_s{s}_o{t}"),
-                "realdiv",
-                // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
-                RowCount::of_mask_rows(rows),
-                BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
-                &[
-                    In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(0, s)).ew(),
-                    In::col(&hm_rows(carry.l(), rows.get())).ew(),
-                ],
-                &fl(out, rows.get(), hd),
-                nests.head_major(0, s),
+                PointwiseFacts {
+                    op_name: &format!("attn_o_s{s}_o{t}"),
+                    op_func: "realdiv",
+                    // ALL `nqh` head-major rows at once — at `mq == 1` the mask rows ARE the heads.
+                    rows: RowCount::of_mask_rows(rows),
+                    cols: BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
+                    inputs: &[
+                        In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(0, s)).ew(),
+                        In::col(&hm_rows(carry.l(), rows.get())).ew(),
+                    ],
+                    o: &fl(out, rows.get(), hd),
+                    out_offset: nests.head_major(0, s).into(),
+                },
                 ctx.sym_id_base,
                 ctx.layout,
             ));
@@ -6054,21 +6109,23 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
             let hi = h.get();
             for s in 0..nslab {
                 ctx.ops.push(assemble_pointwise_broadcast_off(
-                    &format!("attn_o_h{hi}s{s}_o{t}"),
-                    "realdiv",
-                    // Per (head, slab): one head's `mq` rows, one head-dim SLAB of features.
-                    RowCount::of_query_rows(width.mq()),
-                    BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
-                    &[
-                        In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s)).ew(),
-                        In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
-                    ],
-                    &rb(
-                        out,
-                        RowCount::of_query_rows(width.mq()),
-                        BlockCols::of_feature_cols(nqh * hd),
-                    ),
-                    nests.token_stream(hi, s).off(),
+                    PointwiseFacts {
+                        op_name: &format!("attn_o_h{hi}s{s}_o{t}"),
+                        op_func: "realdiv",
+                        // Per (head, slab): one head's `mq` rows, one head-dim SLAB of features.
+                        rows: RowCount::of_query_rows(width.mq()),
+                        cols: BlockCols::of_head_slab(FeatIdx::SLAB_FEATS),
+                        inputs: &[
+                            In::sliced(&fl(carry.o(), rows.get(), hd), nests.head_major(hi, s)).ew(),
+                            In::col_at(&hm_rows(carry.l(), rows.get()), nests.head_major(hi, 0)).ew(),
+                        ],
+                        o: &rb(
+                            out,
+                            RowCount::of_query_rows(width.mq()),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ),
+                        out_offset: nests.token_stream(hi, s).off().into(),
+                    },
                     ctx.sym_id_base,
                     ctx.layout,
                 ));

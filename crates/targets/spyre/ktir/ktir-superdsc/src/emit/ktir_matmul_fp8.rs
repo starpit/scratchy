@@ -14,7 +14,8 @@
 //! through the KTIR, from facts the KTIR itself states.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_convert_col, assemble_pointwise_broadcast_off,
+    EmittedOp, In, PointwiseFacts, assemble_convert, assemble_convert_col,
+    assemble_pointwise_broadcast_off,
     bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb, rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
@@ -477,21 +478,23 @@ pub(crate) fn fp8_quantize_descriptors(
                     BlockCols::of_feature_cols(cl_reach),
                 );
                 ops.push(assemble_pointwise_broadcast_off(
-                    &opn("fq_zfpad_op"),
-                    "sub",
-                    m_rows,
-                    // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
-                    // pad WINDOW via the output offset, so the op's own width is the window's
-                    // 64 elements — a `[m, cl_reach]` op would rewrite the logical window too
-                    // (reading `sc`'s unpad-ded bytes at the pad position).
-                    crate::sdsc_abstract::BlockCols::of_one_stick(
-                        crate::sdsc_abstract::Lanes::FP16,
-                    ),
-                    &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
-                    &zf_h,
-                    // The RowBlocked stick-group law aims the write at the pad window: stick-
-                    // group `k/64` of every row (whole — see the fill comment above).
-                    crate::addr::col_of(m, cl_reach, k, Df::Fp16),
+                    PointwiseFacts {
+                        op_name: &opn("fq_zfpad_op"),
+                        op_func: "sub",
+                        rows: m_rows,
+                        // ⭐ ONE STICK WIDE (the pad width, not `cl_reach`): the write is aimed at the
+                        // pad WINDOW via the output offset, so the op's own width is the window's
+                        // 64 elements — a `[m, cl_reach]` op would rewrite the logical window too
+                        // (reading `sc`'s unpad-ded bytes at the pad position).
+                        cols: crate::sdsc_abstract::BlockCols::of_one_stick(
+                            crate::sdsc_abstract::Lanes::FP16,
+                        ),
+                        inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
+                        o: &zf_h,
+                        // The RowBlocked stick-group law aims the write at the pad window: stick-
+                        // group `k/64` of every row (whole — see the fill comment above).
+                        out_offset: crate::addr::col_of(m, cl_reach, k, Df::Fp16).into(),
+                    },
                     sym_id_base,
                     layout,
                 ));

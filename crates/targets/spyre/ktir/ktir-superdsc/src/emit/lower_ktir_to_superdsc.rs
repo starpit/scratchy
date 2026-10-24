@@ -34,9 +34,10 @@
 //! branch, unchanged, reached from facts the KTIR states — and the fp8 arm below calls it.
 
 use super::{
-    EmittedOp, In, assemble_convert, assemble_pointwise_broadcast_off, assemble_restickify_kt_2d,
-    bmm_site, check_pointwise_cols, emit_sdsc_tiled, fl, op_func_from_str,
-    pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb, rb_df, rbo,
+    EmittedOp, In, PointwiseFacts, assemble_convert, assemble_pointwise_broadcast_off,
+    assemble_restickify_kt_2d, bmm_site, check_pointwise_cols, emit_sdsc_tiled, fl,
+    op_func_from_str, pointwise_broadcast_opspec_df, pointwise_chunk_out_offset, pw1, pw2, rb,
+    rb_df, rbo,
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     AttnFacts, assemble_attn, assemble_matmul_off, assemble_matmul_seeded, assemble_matmul_windowed,
@@ -2255,31 +2256,35 @@ pub fn silumul(
     );
     Ok(vec![
         assemble_pointwise_broadcast_off(
-            &silu_name,
-            "silu",
-            crate::sdsc_abstract::RowCount::of_token_rows(rows),
-            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
-            &[In::col_window(&gate, gate_w).ew()],
-            &tmp,
-            // The WRITE needs the same nest the READS above go through. A raw `cols_start` is the
-            // flat element index; in the stick-blocked output, column `c` of a `[rows, cols]` tensor
-            // starts at `(c/64)*(rows*64)`. Equal only at rows == 1, so decode was right and prefill
-            // wrote every later column block on top of the first one.
-            out_w,
+            PointwiseFacts {
+                op_name: &silu_name,
+                op_func: "silu",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
+                cols: crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+                inputs: &[In::col_window(&gate, gate_w).ew()],
+                o: &tmp,
+                // The WRITE needs the same nest the READS above go through. A raw `cols_start` is the
+                // flat element index; in the stick-blocked output, column `c` of a `[rows, cols]` tensor
+                // starts at `(c/64)*(rows*64)`. Equal only at rows == 1, so decode was right and prefill
+                // wrote every later column block on top of the first one.
+                out_offset: out_w.into(),
+            },
             sym_id_base,
             layout,
         ),
         assemble_pointwise_broadcast_off(
-            &mul_name,
-            "multiply",
-            crate::sdsc_abstract::RowCount::of_token_rows(rows),
-            crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
-            &[
-                In::col_window(&tmp, out_w).ew(),
-                In::col_window(&up, up_w).ew(),
-            ],
-            &out,
-            out_w,
+            PointwiseFacts {
+                op_name: &mul_name,
+                op_func: "multiply",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
+                cols: crate::sdsc_abstract::BlockCols::of_feature_cols(cols),
+                inputs: &[
+                    In::col_window(&tmp, out_w).ew(),
+                    In::col_window(&up, up_w).ew(),
+                ],
+                o: &out,
+                out_offset: out_w.into(),
+            },
             sym_id_base,
             layout,
         ),
@@ -5253,62 +5258,66 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
         // an emitter one. Until then this stays byte-identical rather than becoming a second convention.
         for kvh in 0..nkvh {
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_kzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(
-                    &zero,
-                    RowCount::of_zero_pad_rows(pad_rows),
-                    BlockCols::of_head_dim(hd),
-                ))
-                .ew()],
-                &rb(
-                    &new_k,
-                    RowCount::of_padded_chunk_rows(mq_pad),
-                    BlockCols::of_feature_cols(nkvh * hd),
-                ),
-                // FLAT, and that is the finding: this lands past the packed data, in a region no
-                // consumer reads (see the note above), so it is placed row-major rather than through
-                // the stick law. Saying `flat` makes which arrangement was meant explicit instead of
-                // leaving `mq*nkvh*hd + kvh*hd` for a reader to infer.
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
+                PointwiseFacts {
+                    op_name: &format!("attn_kzero{kvh}_o{t}"),
+                    op_func: "identity",
+                    rows: crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
+                    cols: crate::sdsc_abstract::BlockCols::of_head_dim(hd),
+                    inputs: &[In::full(&rb(
+                        &zero,
+                        RowCount::of_zero_pad_rows(pad_rows),
+                        BlockCols::of_head_dim(hd),
+                    ))
+                    .ew()],
+                    o: &rb(
+                        &new_k,
+                        RowCount::of_padded_chunk_rows(mq_pad),
+                        BlockCols::of_feature_cols(nkvh * hd),
+                    ),
+                    // FLAT, and that is the finding: this lands past the packed data, in a region no
+                    // consumer reads (see the note above), so it is placed row-major rather than through
+                    // the stick law. Saying `flat` makes which arrangement was meant explicit instead of
+                    // leaving `mq*nkvh*hd + kvh*hd` for a reader to infer.
+                    out_offset: crate::addr::Nest::flat(
+                        &["row", "feat"],
+                        &[mq_pad.row_axis_extent(), nkvh * hd],
+                        Df::Fp16,
+                    )
+                    .view()
+                    .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
+                    .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
+                    .dev().into(),
+                },
                 sym_id_base,
                 layout,
             ));
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_vzero{kvh}_o{t}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
-                crate::sdsc_abstract::BlockCols::of_head_dim(hd),
-                &[In::full(&rb(
-                    &zero,
-                    RowCount::of_zero_pad_rows(pad_rows),
-                    BlockCols::of_head_dim(hd),
-                ))
-                .ew()],
-                &rb(
-                    &new_v,
-                    RowCount::of_padded_chunk_rows(mq_pad),
-                    BlockCols::of_feature_cols(nkvh * hd),
-                ),
-                crate::addr::Nest::flat(
-                    &["row", "feat"],
-                    &[mq_pad.row_axis_extent(), nkvh * hd],
-                    Df::Fp16,
-                )
-                .view()
-                .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
-                .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
-                .dev(),
+                PointwiseFacts {
+                    op_name: &format!("attn_vzero{kvh}_o{t}"),
+                    op_func: "identity",
+                    rows: crate::sdsc_abstract::RowCount::of_zero_pad_rows(pad_rows),
+                    cols: crate::sdsc_abstract::BlockCols::of_head_dim(hd),
+                    inputs: &[In::full(&rb(
+                        &zero,
+                        RowCount::of_zero_pad_rows(pad_rows),
+                        BlockCols::of_head_dim(hd),
+                    ))
+                    .ew()],
+                    o: &rb(
+                        &new_v,
+                        RowCount::of_padded_chunk_rows(mq_pad),
+                        BlockCols::of_feature_cols(nkvh * hd),
+                    ),
+                    out_offset: crate::addr::Nest::flat(
+                        &["row", "feat"],
+                        &[mq_pad.row_axis_extent(), nkvh * hd],
+                        Df::Fp16,
+                    )
+                    .view()
+                    .at(crate::addr::Idx::<crate::addr::Row>::n(mq))
+                    .at(crate::addr::Idx::<crate::addr::Feat>::n(kvh * hd))
+                    .dev().into(),
+                },
                 sym_id_base,
                 layout,
             ));
@@ -5509,56 +5518,60 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                 );
             }
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_qs_o{t}"),
-                "multiply",
-                // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
-                crate::sdsc_abstract::RowCount::of_query_rows(
-                    crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                ),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
-                // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the qs synthetic above reserves
-                // `[mq, nqh*hd]` and Q is the same plane, so both handles state the swept extent —
-                // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
-                // swept window.
-                &[
-                    In::full(&rb(
-                        &q,
+                PointwiseFacts {
+                    op_name: &format!("attn_qs_o{t}"),
+                    op_func: "multiply",
+                    // Q is `[mq, nqh*hd]`: the chunk's REAL rows, the full query feature width.
+                    rows: crate::sdsc_abstract::RowCount::of_query_rows(
+                        crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+                    ),
+                    cols: crate::sdsc_abstract::BlockCols::of_feature_cols(nqh * hd),
+                    // ⭐ TRUE EXTENTS, not `rbo`'s `1×64` annotation: the qs synthetic above reserves
+                    // `[mq, nqh*hd]` and Q is the same plane, so both handles state the swept extent —
+                    // the mint's bound. The `[1,1]` √scale keeps `rbo`: one RedStick IS its whole
+                    // swept window.
+                    inputs: &[
+                        In::full(&rb(
+                            &q,
+                            RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
+                            BlockCols::of_feature_cols(nqh * hd),
+                        ))
+                        .ew(),
+                        In::scalar(&rbo(&sqrt_scale)).ew(),
+                    ],
+                    o: &rb(
+                        &qs,
                         RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                         BlockCols::of_feature_cols(nqh * hd),
-                    ))
-                    .ew(),
-                    In::scalar(&rbo(&sqrt_scale)).ew(),
-                ],
-                &rb(
-                    &qs,
-                    RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
-                    BlockCols::of_feature_cols(nqh * hd),
-                ),
-                crate::addr::DevOff::ZERO,
+                    ),
+                    out_offset: crate::addr::DevOff::ZERO.into(),
+                },
                 sym_id_base,
                 layout,
             ));
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("attn_nks_o{t}"),
-                "multiply",
-                // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
-                crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
-                crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
-                &[
-                    In::full(&rb(
-                        &new_k_rep,
+                PointwiseFacts {
+                    op_name: &format!("attn_nks_o{t}"),
+                    op_func: "multiply",
+                    // new-K is allocated `[mq_pad, nkvh*hd]`: the scale covers the PADDED rows, zeros included.
+                    rows: crate::sdsc_abstract::RowCount::of_padded_chunk_rows(mq_pad),
+                    cols: crate::sdsc_abstract::BlockCols::of_feature_cols(nkvh * hd),
+                    inputs: &[
+                        In::full(&rb(
+                            &new_k_rep,
+                            RowCount::of_padded_chunk_rows(mq_pad),
+                            BlockCols::of_feature_cols(nkvh * hd),
+                        ))
+                        .ew(),
+                        In::scalar(&rbo(&sqrt_scale)).ew(),
+                    ],
+                    o: &rb(
+                        &new_k_scaled,
                         RowCount::of_padded_chunk_rows(mq_pad),
                         BlockCols::of_feature_cols(nkvh * hd),
-                    ))
-                    .ew(),
-                    In::scalar(&rbo(&sqrt_scale)).ew(),
-                ],
-                &rb(
-                    &new_k_scaled,
-                    RowCount::of_padded_chunk_rows(mq_pad),
-                    BlockCols::of_feature_cols(nkvh * hd),
-                ),
-                crate::addr::DevOff::ZERO,
+                    ),
+                    out_offset: crate::addr::DevOff::ZERO.into(),
+                },
                 sym_id_base,
                 layout,
             ));
@@ -6273,22 +6286,24 @@ pub fn lmlast(
     Ok((0..hidden / stk)
         .map(|j| {
             assemble_pointwise_broadcast_off(
-                &format!("lmlast{j}_o{owner}"),
-                "identity",
-                crate::sdsc_abstract::RowCount::of_token_rows(1),
-                crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
-                &[In::sliced(
-                    &src_name,
-                    // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
-                    crate::addr::rc_of((j + 1) * mq + row + 1, stk, j * mq + row, 0, Df::Fp16),
-                )
-                .ew()],
-                &dst,
-                // Column `j*stk` of the single-row `[1, hidden]` last-hidden staging — a corner on
-                // that tensor, not a product. At one row the stick plane term is 0, so this is the
-                // same address either way; saying it as a coordinate keeps the last hand-built offset
-                // in this file from being the one nobody notices.
-                crate::addr::rc_of(1, hidden, 0, j * stk, Df::Fp16),
+                PointwiseFacts {
+                    op_name: &format!("lmlast{j}_o{owner}"),
+                    op_func: "identity",
+                    rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
+                    cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+                    inputs: &[In::sliced(
+                        &src_name,
+                        // row `j*mq + row` of a `[.., stk]` staging — a corner, not a product.
+                        crate::addr::rc_of((j + 1) * mq + row + 1, stk, j * mq + row, 0, Df::Fp16),
+                    )
+                    .ew()],
+                    o: &dst,
+                    // Column `j*stk` of the single-row `[1, hidden]` last-hidden staging — a corner on
+                    // that tensor, not a product. At one row the stick plane term is 0, so this is the
+                    // same address either way; saying it as a coordinate keeps the last hand-built offset
+                    // in this file from being the one nobody notices.
+                    out_offset: crate::addr::rc_of(1, hidden, 0, j * stk, Df::Fp16).into(),
+                },
                 sym_id_base,
                 layout,
             )
@@ -9112,13 +9127,15 @@ pub fn windowed_rmsnorm(
         // 1. sq16 = x² over the head window (out at the window — `pw2`'s ZERO would
         //    make every head overwrite head 0's block).
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("rmsq_{prefix}"),
-            "mul",
-            t_rows,
-            f_cols,
-            &[In::sliced(&x_h, win).ew(), In::sliced(&x_h, win).ew()],
-            &sq16_h,
-            win,
+            PointwiseFacts {
+                op_name: &format!("rmsq_{prefix}"),
+                op_func: "mul",
+                rows: t_rows,
+                cols: f_cols,
+                inputs: &[In::sliced(&x_h, win).ew(), In::sliced(&x_h, win).ew()],
+                o: &sq16_h,
+                out_offset: win.into(),
+            },
             sym_id_base,
             layout,
         ));
@@ -9181,37 +9198,43 @@ pub fn windowed_rmsnorm(
         //    when the convention states an offset, the stored row when it does not.
         if let Some(g) = &gamma_h {
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmxn_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
-                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
-                &xn_h,
-                win,
+                PointwiseFacts {
+                    op_name: &format!("rmxn_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                    inputs: &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                    o: &xn_h,
+                    out_offset: win.into(),
+                },
                 sym_id_base,
                 layout,
             ));
             let gain = gw_h.as_ref().unwrap_or(g);
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmg_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
-                &[In::sliced(&xn_h, win).ew(), In::mb(gain).ew()],
-                &out_h,
-                win,
+                PointwiseFacts {
+                    op_name: &format!("rmg_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                    inputs: &[In::sliced(&xn_h, win).ew(), In::mb(gain).ew()],
+                    o: &out_h,
+                    out_offset: win.into(),
+                },
                 sym_id_base,
                 layout,
             ));
         } else {
             ops.push(assemble_pointwise_broadcast_off(
-                &format!("rmxn_{prefix}"),
-                "multiply",
-                t_rows,
-                f_cols,
-                &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
-                &out_h,
-                win,
+                PointwiseFacts {
+                    op_name: &format!("rmxn_{prefix}"),
+                    op_func: "multiply",
+                    rows: t_rows,
+                    cols: f_cols,
+                    inputs: &[In::sliced(&x_h, win).ew(), In::col(&rinv_h).ew()],
+                    o: &out_h,
+                    out_offset: win.into(),
+                },
                 sym_id_base,
                 layout,
             ));
@@ -9456,29 +9479,31 @@ pub fn reshape(
     for q in 0..n_sticks {
         let base = q * u64::from(stk);
         ops.push(assemble_pointwise_broadcast_off(
-            &format!("reshape{q}_o{}", out.tid),
-            "identity",
-            crate::sdsc_abstract::RowCount::of_token_rows(1),
-            crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
-            &[In::sliced(
-                &src_name,
-                crate::addr::rc_of(
-                    r_in,
-                    c_in,
-                    (base / u64::from(c_in)) as u32,
-                    (base % u64::from(c_in)) as u32,
+            PointwiseFacts {
+                op_name: &format!("reshape{q}_o{}", out.tid),
+                op_func: "identity",
+                rows: crate::sdsc_abstract::RowCount::of_token_rows(1),
+                cols: crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16),
+                inputs: &[In::sliced(
+                    &src_name,
+                    crate::addr::rc_of(
+                        r_in,
+                        c_in,
+                        (base / u64::from(c_in)) as u32,
+                        (base % u64::from(c_in)) as u32,
+                        Df::Fp16,
+                    ),
+                )
+                .ew()],
+                o: &dst,
+                out_offset: crate::addr::rc_of(
+                    r_out,
+                    c_out,
+                    (base / u64::from(c_out)) as u32,
+                    (base % u64::from(c_out)) as u32,
                     Df::Fp16,
-                ),
-            )
-            .ew()],
-            &dst,
-            crate::addr::rc_of(
-                r_out,
-                c_out,
-                (base / u64::from(c_out)) as u32,
-                (base % u64::from(c_out)) as u32,
-                Df::Fp16,
-            ),
+                ).into(),
+            },
             sym_id_base,
             layout,
         ));
