@@ -3443,14 +3443,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
             ));
         }
     } else {
-        reduce_in_parts(
-            ctx,
-            "bmax",
-            "max",
-            "maximum",
-            &cb.csc,
-            &bufs.bmax,
-        )?;
+        reduce_in_parts(ctx, "bmax", "max", "maximum", &cb.csc, &bufs.bmax)?;
     }
 
     // ── (3) THE ONLINE MERGE ONTO THE SEED — the fold block's own four ops, in its order ──
@@ -3640,8 +3633,7 @@ fn assemble_attn_chunk<const NQH: u32, const NKVH: u32, const HD: u32>(
     // ── (5) RESCALE THE SEED'S OUTPUT, THEN THE VALUE LEG FOLDS ONTO IT ──
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
-    let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
+    let (otmp_h, run_o_h) = emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     // ⭐ THE VALUE LEG, IN K-PARTS (`ChunkScratch::value_parts`): ONE part at decode, 16 pages a part
     // for a prompt chunk, whose whole-chunk PV dxp refuses to verify. Each part folds onto the last
     // through the same `stridedadd` epilogue, PING-PONGING between `run_o` and `otmp` so no matmul reads
@@ -3902,8 +3894,7 @@ fn prompt_probabilities_in_lx<const NQH: u32, const NKVH: u32, const HD: u32>(
     };
     // The pre-update correction and the ping-pong pair it hands the value parts, minted by the
     // one emitter that pushes the op ([`emit_pre_update_correction`] — the ORDER law).
-    let (otmp_h, run_o_h) =
-        emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
+    let (otmp_h, run_o_h) = emit_pre_update_correction(ctx, t, q_rows, geom, &carry, bufs);
     let parts: Vec<crate::sdsc_abstract::ChunkPart> = chunk
         .slot_parts(prompt_lx_part_pages(chunk, g_rows))
         .collect();
@@ -5430,15 +5421,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                 (format!("attn_gv_o{t}"), vc, gv.as_str()),
             ] {
                 for cp in scratch.copies() {
-                    ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
-                        &format!("{name}_s{}", cp.stick()),
-                        src,
-                        dst,
-                        cp,
-                        idx,
-                        ctx.sym_id_base,
-                        ctx.layout,
-                    ));
+                    ctx.ops
+                        .push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                            &format!("{name}_s{}", cp.stick()),
+                            src,
+                            dst,
+                            cp,
+                            idx,
+                            ctx.sym_id_base,
+                            ctx.layout,
+                        ));
                 }
             }
         }
@@ -5510,15 +5502,16 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     } else {
                         format!("{name}_c{chunk}_s{}", cp.stick())
                     };
-                    ctx.ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
-                        &op_name,
-                        src,
-                        dst,
-                        cp,
-                        idx,
-                        ctx.sym_id_base,
-                        ctx.layout,
-                    ));
+                    ctx.ops
+                        .push(crate::ir::bridge::tiled_op_sdsc_op::assemble_gather_copy(
+                            &op_name,
+                            src,
+                            dst,
+                            cp,
+                            idx,
+                            ctx.sym_id_base,
+                            ctx.layout,
+                        ));
                 }
             }
             emitted_chunk_copies = Some(chunk);
