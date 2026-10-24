@@ -230,8 +230,8 @@ fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
                          exactly when request {r} holds that slot"
                     );
                     if h.contains(slot) {
-                        tallies[(p as usize * rows + row as usize) * slabs
-                            + (c as usize / 64)] += 1;
+                        tallies[(p as usize * rows + row as usize) * slabs + (c as usize / 64)] +=
+                            1;
                     }
                 }
             }
@@ -463,12 +463,8 @@ fn an_empty_sweep_is_named_and_a_healthy_batch_sweeps_one_everywhere() {
     // Ragged, hole-carrying, shared-slot batch: every request still holds its own slots.
     let healthy = batch(&[70usize, 5, 0, 64], 3);
     let sh = shape::<COLS>(nqh, healthy.len());
-    let m = decode_batch_prefix_mask_f16(
-        sh,
-        declared::<COLS>(cap, healthy.len()),
-        &healthy,
-        mask_neg,
-    );
+    let m =
+        decode_batch_prefix_mask_f16(sh, declared::<COLS>(cap, healthy.len()), &healthy, mask_neg);
     assert_eq!(
         decode_batch_empty_sweep_row(&m, sh),
         None,
@@ -478,14 +474,9 @@ fn an_empty_sweep_is_named_and_a_healthy_batch_sweeps_one_everywhere() {
     // never-prefilled desync — and the reading names its first row, `head 0`'s `0·mq + 2`.
     let starved = batch(&[70usize, 5, 0, 64], 0);
     let sh = shape::<COLS>(nqh, starved.len());
-    let m = decode_batch_prefix_mask_f16(
-        sh,
-        declared::<COLS>(cap, starved.len()),
-        &starved,
-        mask_neg,
-    );
-    let row =
-        decode_batch_empty_sweep_row(&m, sh).expect("request 2's rows sweep nothing");
+    let m =
+        decode_batch_prefix_mask_f16(sh, declared::<COLS>(cap, starved.len()), &starved, mask_neg);
+    let row = decode_batch_empty_sweep_row(&m, sh).expect("request 2's rows sweep nothing");
     assert_eq!(
         row as usize % starved.len(),
         2,
@@ -1027,8 +1018,7 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let fold = from_live
         .declare_to(&mut walker)
         .expect("the walker accepts");
-    let bytes =
-        decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg).into_wire_bytes();
+    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg).into_wire_bytes();
 
     assert_eq!(
         walker.pages(),

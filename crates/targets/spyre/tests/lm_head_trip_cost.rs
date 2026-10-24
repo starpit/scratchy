@@ -24,11 +24,19 @@ fn lm_head_trips(m: u32) -> usize {
         MatY::unbatched(),
         // Token rows, never a request batch: the row-kind boundary yields the proven walk.
         SharedKernelBmmForm::of_attn_rows(false, QueryRowCount::of_mq(1)),
-        &rb("a", RowCount::of_token_rows(m), BlockCols::of_feature_cols(k)),
+        &rb(
+            "a",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k),
+        ),
         scratchy_subtile::addr::DevOff::ZERO,
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
         scratchy_subtile::addr::DevOff::ZERO,
-        &rb("o", RowCount::of_token_rows(m), BlockCols::of_feature_cols(n)),
+        &rb(
+            "o",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(n),
+        ),
         scratchy_subtile::addr::DevOff::ZERO,
         &mut sym,
         None,

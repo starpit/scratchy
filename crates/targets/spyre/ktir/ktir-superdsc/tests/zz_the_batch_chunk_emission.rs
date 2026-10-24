@@ -418,7 +418,11 @@ fn the_chunk_family_names_an_empty_sweep_row() {
     ];
     let m = batch_chunk_mask_f16(bc, &starved, -100.0).expect("one history per request row");
     let row = batch_chunk_empty_sweep_row(&m).expect("request 1's rows sweep nothing");
-    assert_eq!(bc.row_request(row), 1, "the named row {row} must be request 1's");
+    assert_eq!(
+        bc.row_request(row),
+        1,
+        "the named row {row} must be request 1's"
+    );
 }
 
 /// ⭐ THE PAGE LIST LAYS EACH REQUEST's OWN MAP AT `J` PAGES, padding a short map with ITS OWN last page

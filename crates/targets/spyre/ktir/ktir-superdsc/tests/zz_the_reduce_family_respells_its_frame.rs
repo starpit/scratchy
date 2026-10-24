@@ -167,11 +167,7 @@ fn softmax_slice(result: (i64, i64)) -> KtirNode {
         FAMILY.1,
     )
     .with_attr(a, AttrKey::ReduceFn, Attr::Op(OpKind::ArithAddf))
-    .with_attr(
-        a,
-        AttrKey::Dimensions,
-        Attr::IntList(a.ints(vec![2])),
-    );
+    .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(vec![2])));
     reduce.result_type = ty(result.0, result.1);
     ops.push(reduce);
 
@@ -280,7 +276,11 @@ fn the_rank_two_reduce_family_lowers_in_the_accumulator_frame() {
             ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
         );
     };
-    for (op, what) in [(sum, "the reduce"), (exp, "the family exp"), (add, "the family add")] {
+    for (op, what) in [
+        (sum, "the reduce"),
+        (exp, "the family exp"),
+        (add, "the family add"),
+    ] {
         assert_eq!(
             dsc(op).N_.mb_,
             FLAT_ROWS,
@@ -288,7 +288,11 @@ fn the_rank_two_reduce_family_lowers_in_the_accumulator_frame() {
         );
     }
     // The reduce's own width is the stick axis it reduces — one stick, unpadded.
-    assert_eq!(dsc(sum).N_.out_, COLS, "the reduce sweeps the 64-wide stick axis");
+    assert_eq!(
+        dsc(sum).N_.out_,
+        COLS,
+        "the reduce sweeps the 64-wide stick axis"
+    );
 }
 
 /// ⛔ THE DOOR's LAW STANDS: a reduce whose result numel is NOT the data's row sweep keeps
@@ -440,12 +444,7 @@ fn unmatched_exp_family() -> KtirNode {
         32,
         64,
     ));
-    ops.push(Operation::new(
-        a,
-        None,
-        OpKind::KtdpStore,
-        &[exp_res, t_o],
-    ));
+    ops.push(Operation::new(a, None, OpKind::KtdpStore, &[exp_res, t_o]));
     KtirNode {
         func: IRFunction {
             name: "unmatched_exp",

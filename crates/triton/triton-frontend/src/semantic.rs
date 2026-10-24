@@ -1609,7 +1609,11 @@ impl Semantic {
             ));
         }
         let v = self.cast(value, &elem)?;
-        self.emit0("tt.descriptor_scatter", &[desc, v, x_offsets, y_offset], &[]);
+        self.emit0(
+            "tt.descriptor_scatter",
+            &[desc, v, x_offsets, y_offset],
+            &[],
+        );
         Ok(())
     }
 

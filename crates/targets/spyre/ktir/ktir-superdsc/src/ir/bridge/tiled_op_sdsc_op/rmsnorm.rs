@@ -203,8 +203,16 @@ pub fn assemble_rmsnorm(
     //    multiply's operand must outlive the `match` that minted it.
     let gw_ones_h = ones_const.map(|c| {
         (
-            rb(&gw, RowCount::of_broadcast_row(), BlockCols::of_feature_cols(cols)),
-            rb(c, RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16)),
+            rb(
+                &gw,
+                RowCount::of_broadcast_row(),
+                BlockCols::of_feature_cols(cols),
+            ),
+            rb(
+                c,
+                RowCount::of_broadcast_row(),
+                BlockCols::of_one_stick(Lanes::FP16),
+            ),
         )
     });
     let gamma_operand = match &gw_ones_h {

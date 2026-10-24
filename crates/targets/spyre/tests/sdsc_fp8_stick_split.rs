@@ -236,8 +236,16 @@ fn qfp8ch_convert_splits_on_128_fp8_output() {
             "qfp8ch",
             1,
             cols,
-            &rb("act", RowCount::of_token_rows(1), BlockCols::of_feature_cols(cols)),
-            &rb("afp8", RowCount::of_token_rows(1), BlockCols::of_feature_cols(cols)),
+            &rb(
+                "act",
+                RowCount::of_token_rows(1),
+                BlockCols::of_feature_cols(cols),
+            ),
+            &rb(
+                "afp8",
+                RowCount::of_token_rows(1),
+                BlockCols::of_feature_cols(cols),
+            ),
             &mut sym,
             None,
         );

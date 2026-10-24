@@ -23,9 +23,17 @@ fn identical_matmuls(n: usize) -> Vec<ktir_superdsc::emit::EmittedOp> {
                 64,
                 64,
                 1,
-                &emit::rb("rep_a", RowCount::of_token_rows(64), BlockCols::of_feature_cols(64)),
+                &emit::rb(
+                    "rep_a",
+                    RowCount::of_token_rows(64),
+                    BlockCols::of_feature_cols(64),
+                ),
                 &Stk::<KernelTag>::kernel(64_usize, 64_usize, "rep_w"),
-                &emit::rb("rep_o", RowCount::of_token_rows(64), BlockCols::of_feature_cols(64)),
+                &emit::rb(
+                    "rep_o",
+                    RowCount::of_token_rows(64),
+                    BlockCols::of_feature_cols(64),
+                ),
                 None,
             )
         })

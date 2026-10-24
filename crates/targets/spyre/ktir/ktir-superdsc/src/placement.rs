@@ -811,18 +811,13 @@ impl BundleLayout {
         {
             align128(p.size).max(128)
         } else {
-            *self
-                .synth
-                .borrow()
-                .sizes
-                .get(name)
-                .ok_or_else(|| {
-                    format!(
-                        "'{name}' is read through an index but was never declared to the layout \
+            *self.synth.borrow().sizes.get(name).ok_or_else(|| {
+                format!(
+                    "'{name}' is read through an index but was never declared to the layout \
                          — every intermediate is known at bake; declare it (`BundleLayout::synth`) \
                          or bind it before gathering through it"
-                    )
-                })?
+                )
+            })?
         };
         let swept_bytes = u64::from(swept).saturating_mul(row_bytes);
         gathered_window_rows(swept, fp, row_bytes, reach.map(|r| r.max_entry().get() as u64))
@@ -1264,7 +1259,10 @@ pub(crate) fn gathered_window_rows(
         // No whole row of this width to name — the index has no row it could legally address.
         return None;
     }
-    if u64::from(swept).checked_mul(row_bytes).is_some_and(|b| b <= fp) {
+    if u64::from(swept)
+        .checked_mul(row_bytes)
+        .is_some_and(|b| b <= fp)
+    {
         // The sweep fits: byte-identical, no reach needed.
         return Some(swept);
     }
@@ -1285,7 +1283,7 @@ pub(crate) fn gathered_window_rows(
 
 #[cfg(kani)]
 mod proofs {
-    use super::{gathered_window_rows, Df};
+    use super::{Df, gathered_window_rows};
 
     /// LAW (b), pinned at the compiler's own vocabulary. The grind diagnosis first: this
     /// harness's first draft gave `row_bytes`, `swept`, `ceiling` and `fp` to z3 as FREE u64s,

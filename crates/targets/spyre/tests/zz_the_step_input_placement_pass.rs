@@ -265,8 +265,16 @@ fn a_non_attention_program_with_step_inputs_places_them() {
         .unwrap_or_else(|| panic!("the stated step input t6 was placed"));
     assert_eq!(p.role, SegRole::Activation);
     assert_eq!(p.segment, SegRole::Activation.segment());
-    assert_eq!(p.size, 8 * 64 * 2, "the extent and dtype are the view's own");
-    assert_eq!(p.offset, u64::from(n) * 0x10000, "packed at the segment end");
+    assert_eq!(
+        p.size,
+        8 * 64 * 2,
+        "the extent and dtype are the view's own"
+    );
+    assert_eq!(
+        p.offset,
+        u64::from(n) * 0x10000,
+        "packed at the segment end"
+    );
     // The discovery row: tid → (slot, element format) — the slot the runtime addresses the input
     // by, and the format the bake maps to the staging channel. Both are the program's own
     // statements; neither says what the input IS.

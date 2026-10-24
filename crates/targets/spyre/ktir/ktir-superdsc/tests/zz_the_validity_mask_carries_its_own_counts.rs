@@ -19,8 +19,8 @@
 use std::num::NonZeroU32;
 
 use ktir_superdsc::sdsc_abstract::{
-    spliced_attn_mask_f16, spliced_decode_mask_f16, BatchSlot, ChunkRows, CopyDims, KvHistory,
-    PagedKvPool, RungWidth, SplicedAttnRegion, SplicedDecodeBatch, ValidKeys,
+    BatchSlot, ChunkRows, CopyDims, KvHistory, PagedKvPool, RungWidth, SplicedAttnRegion,
+    SplicedDecodeBatch, ValidKeys, spliced_attn_mask_f16, spliced_decode_mask_f16,
 };
 
 /// granite-3.1-2b's pool: 8 kv heads at head dim 64.
@@ -62,7 +62,11 @@ fn a_count_past_the_lanes_of_a_row_refuses_at_the_mint() {
 #[test]
 fn the_chunk_family_first_window_always_holds_a_valid_lane() {
     let mq = NonZeroU32::new(4).expect("4 is nonzero");
-    let rows = ChunkRows::chunk(RungWidth::of_baked_rows(4).expect("a test rung is nonzero").rows());
+    let rows = ChunkRows::chunk(
+        RungWidth::of_baked_rows(4)
+            .expect("a test rung is nonzero")
+            .rows(),
+    );
     // Window boundaries of the sweep: page edges, window edges, and one past them, so the clamp
     // (`min(t, real−1)`) and the `real == mq` identity are both exercised.
     for start in [0usize, 1, 63, 64, 65, 191, 192, 193, 255, 256, 300] {
@@ -90,16 +94,15 @@ fn a_chunk_rows_count_is_its_own_prefix_of_zero_lanes() {
     let mq = 4usize;
     let w4 = region.w4() as usize;
     assert!(w4 >= 2, "this geometry must state a second window to pin");
-    let rows = ChunkRows::chunk(RungWidth::of_baked_rows(4).expect("a test rung is nonzero").rows());
+    let rows = ChunkRows::chunk(
+        RungWidth::of_baked_rows(4)
+            .expect("a test rung is nonzero")
+            .rows(),
+    );
     // start 5, real 3 of a 4-row rung: pos(t) = 5 + min(t, 2) = [5, 6, 7, 7] — the pad-row clamp
     // sends row 3 to the last real token's position.
-    let mask = spliced_attn_mask_f16(
-        region,
-        rows,
-        5,
-        NonZeroU32::new(3).expect("3 is nonzero"),
-    )
-    .expect("real 3 of a 4-row rung is a chunk this region states");
+    let mask = spliced_attn_mask_f16(region, rows, 5, NonZeroU32::new(3).expect("3 is nonzero"))
+        .expect("real 3 of a 4-row rung is a chunk this region states");
     let bytes = mask.wire_bytes();
     assert_eq!(mask.rows(), 2 * w4 * mq);
     assert_eq!(bytes.len(), mask.rows() * 64 * 2);
@@ -144,7 +147,10 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
     let w4 = pool
         .windows_per_page()
         .expect("hd 64 divides a page into whole windows");
-    assert!(w4 >= 4, "this geometry must state the window holding a mid-page write slot");
+    assert!(
+        w4 >= 4,
+        "this geometry must state the window holding a mid-page write slot"
+    );
     let ktb = CopyDims::ENTRIES_PER_OP * nkvh;
     let per_chunk = u64::from(w4) * u64::from(ktb) * 4;
     let batch = SplicedDecodeBatch::of_ids_extent(
@@ -183,7 +189,10 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
         }
         // The count is the row's own zero-lane count — minted by the same loop, agreeing by
         // construction, and NOT a prefix: the write slot lands inside masked runs.
-        let zeros = lanes.iter().filter(|&&v| v == half::f16::from_f32(0.0)).count();
+        let zeros = lanes
+            .iter()
+            .filter(|&&v| v == half::f16::from_f32(0.0))
+            .count();
         assert_eq!(
             zeros,
             mask.window_valid(r, 0).get() as usize,

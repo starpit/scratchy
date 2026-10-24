@@ -357,9 +357,7 @@ impl<const NQH: u32, const HD: u32> BlockNests<NQH, HD> {
     /// plane pitch (`mq` rows) with the offset. Head `h`'s slab `s` is the COLUMN `h*hd + s*stick`,
     /// and the stick plane it lands in is the law's business, not the caller's.
     fn token_stream(&self, h: u32, s: u32) -> crate::sdsc_abstract::OperandPlacement {
-        crate::sdsc_abstract::OperandPlacement::of_token_stream(
-            self.mq, NQH, HD, h, self.req, s,
-        )
+        crate::sdsc_abstract::OperandPlacement::of_token_stream(self.mq, NQH, HD, h, self.req, s)
     }
     /// The same stream, for a walk that contracts ONE STICK per op — see
     /// [`OperandPlacement::of_token_stream_by_slab`]. The pitch differs; the offset and the head
@@ -1090,11 +1088,7 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     let nqh_nz = std::num::NonZeroU32::new(nqh)
         .ok_or_else(|| SuperDscError("attention needs at least one query head".into()))?;
 
-    let nests = BlockNests::<NQH, HD> {
-        mq,
-        rows,
-        req,
-    };
+    let nests = BlockNests::<NQH, HD> { mq, rows, req };
     // The one predicate the two matmul legs branch on — derived FROM the row regime, so the
     // per-request forms and the per-request extent cannot disagree.
     let per_request = rows.per_request();
@@ -1765,13 +1759,15 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         // the arm's door, rather than trusting the caller to have passed the page fact: a window
         // or a stream extent here once declared a stick-group stride the scratch does not have.
         let v_rows = match v_stride {
-            crate::sdsc_abstract::VKernelRows::Page => crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS,
+            crate::sdsc_abstract::VKernelRows::Page => {
+                crate::sdsc_abstract::PagedKvPool::PAGE_SLOTS
+            }
             crate::sdsc_abstract::VKernelRows::NewBlockStream(n) => {
                 return Err(SuperDscError(format!(
                     "the gathered value leg reads the V scratch — a byte-for-byte copy of the \
                      page plane — so its kernel rows are the pool's own page slots; a new-block \
                      stream of {n} row(s) is not a plane any gathered op addresses"
-                )))
+                )));
             }
         };
         // ⭐⭐⭐⭐⭐ ONE STICK OF `out` PER OP, SO ONE OP PER (KV HEAD, REQUEST, **SLAB**) — the same cut
@@ -2422,7 +2418,11 @@ fn row_block_query(
             let rows = QueryRowCount::of_mq(mq);
             (
                 MatM::of_query_rows(rows),
-                rb(qs, RowCount::of_query_rows(rows), BlockCols::of_head_dim(hd)),
+                rb(
+                    qs,
+                    RowCount::of_query_rows(rows),
+                    BlockCols::of_head_dim(hd),
+                ),
                 OperandPlacement::of_token_stream(rows, nqh, hd, blocks.first_head(b), 0, 0).off(),
             )
         }
@@ -3110,9 +3110,7 @@ fn assemble_attn_chunk(
                         SharedKernelBmmForm::of_query_group_copy(),
                         &rb(
                             qs,
-                            RowCount::of_query_rows(
-                                crate::sdsc_abstract::QueryRowCount::of_mq(mq),
-                            ),
+                            RowCount::of_query_rows(crate::sdsc_abstract::QueryRowCount::of_mq(mq)),
                             BlockCols::of_feature_cols(nqh * hd),
                         ),
                         src,
@@ -3756,7 +3754,10 @@ fn emit_pre_update_correction(
         "multiply",
         RowCount::of_head_major_rows(q_rows),
         BlockCols::of_head_dim(hd),
-        &[In::full(&run_o_h).ew(), In::col(&hm_rows(&bufs.corr, q_rows)).ew()],
+        &[
+            In::full(&run_o_h).ew(),
+            In::col(&hm_rows(&bufs.corr, q_rows)).ew(),
+        ],
         &otmp_h,
         DevOff::ZERO,
         sym_id_base,
@@ -4179,8 +4180,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // THE SLAB COUNT IS THE ONLY QUESTION THIS LOOP ASKS, so it is answered by the `hd / lanes` law
     // directly — there is no kv-side `BlockNests` to hold row/width slots the kv stream cannot
     // truthfully fill (its rows are the chunk's `mq`, not the shared-buffer extent a nest frames).
-    let nslab =
-        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
+    let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
     for kvh in 0..nkvh {
         for rw in mq_pad_t.row_windows() {
             let j = rw.index();
@@ -4239,9 +4239,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
                     &rb(
                         &new_kt,
                         RowCount::of_broadcast_row(),
-                        BlockCols::of_feature_cols(
-                            nkvh * hd * mq_pad_t.slots().slot_axis_extent(),
-                        ),
+                        BlockCols::of_feature_cols(nkvh * hd * mq_pad_t.slots().slot_axis_extent()),
                     ),
                     // DEST: `[nkvh, hd, mq_pad]` with the stick on the SLOT axis, so kv head `kvh` and
                     // feature `sl*stick` are coordinates and the `j`-th sub-block is slot window `j*stick`.
@@ -5241,8 +5239,7 @@ pub fn assemble_attn<const NQH: u32, const NKVH: u32, const HD: u32>(
     // (the compile-cost target, ≤ the bake-side guard's `MAX_DESCRIPTORS` ceiling, so a split that
     // fires here always lands under what the guard would refuse): the emitter aims BELOW what the
     // guard forbids, and the two consts cannot disagree about legality.
-    let nslab =
-        crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
+    let nslab = crate::addr::Shape::<HD, 0, 0, 0>::slabs(crate::superdsc_opspec::Df::Fp16).get();
     let nb = SlotWindow::count_in(active_cap).get();
     let chunking = gather.map(|(_, scratch)| {
         // ONE CHUNK'S FIXED COST (its own copies) and PER-WINDOW COST (both legs + the 11-op

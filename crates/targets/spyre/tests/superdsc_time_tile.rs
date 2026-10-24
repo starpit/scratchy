@@ -202,8 +202,16 @@ fn reduce_and_multiop_invariants() {
         "mean",
         64,
         576,
-        &emit::rb("r_x", RowCount::of_token_rows(64), BlockCols::of_feature_cols(576)),
-        &emit::rb("r_acc", RowCount::of_token_rows(64), BlockCols::of_feature_cols(1)),
+        &emit::rb(
+            "r_x",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(576),
+        ),
+        &emit::rb(
+            "r_acc",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(1),
+        ),
         None,
     );
     let j: serde_json::Value =
@@ -1104,9 +1112,17 @@ fn per_core_addresses_use_distinct_segments_and_disjoint_cores() {
         384,
         64,
         16,
-        &emit::rb("a", RowCount::of_token_rows(384), BlockCols::of_feature_cols(64)),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "w"),
-        &emit::rb("o", RowCount::of_token_rows(384), BlockCols::of_feature_cols(384)),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(e.time, 1, "bmm fits LX in one trip");
@@ -1217,9 +1233,17 @@ fn batched_lx_overflowing_matmul() -> emit::EmittedOp {
         n,
         k,
         batch,
-        &emit::rb("a", RowCount::of_token_rows(m), BlockCols::of_feature_cols(k)),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(k),
+        ),
         &Stk::<KernelTag>::kernel(k as usize, n as usize, "w"),
-        &emit::rb("o", RowCount::of_token_rows(m), BlockCols::of_feature_cols(n)),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(m),
+            BlockCols::of_feature_cols(n),
+        ),
         None,
     )
 }
@@ -1234,9 +1258,17 @@ fn assert_the_multi_stick_batched_matmul_is_refused() {
         16384,
         2048,
         2,
-        &emit::rb("a", RowCount::of_token_rows(64), BlockCols::of_feature_cols(2048)),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(2048),
+        ),
         &Stk::<KernelTag>::kernel(2048_usize, 16384_usize, "w"),
-        &emit::rb("o", RowCount::of_token_rows(64), BlockCols::of_feature_cols(16384)),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(16384),
+        ),
         &mut 0,
         None,
     )
@@ -1495,9 +1527,17 @@ fn time1_bundle_mlir_is_byte_identical_to_flat() {
         384,
         64,
         16,
-        &emit::rb("act", RowCount::of_token_rows(384), BlockCols::of_feature_cols(64)),
+        &emit::rb(
+            "act",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 384_usize, "wt"),
-        &emit::rb("out", RowCount::of_token_rows(384), BlockCols::of_feature_cols(384)),
+        &emit::rb(
+            "out",
+            RowCount::of_token_rows(384),
+            BlockCols::of_feature_cols(384),
+        ),
         None,
     );
     assert_eq!(emitted.time, 1, "bmm must NOT time-tile");
@@ -1527,9 +1567,17 @@ fn dump_gate_bundles() {
         64,
         64,
         1,
-        &emit::rb("g1_a", RowCount::of_token_rows(64), BlockCols::of_feature_cols(64)),
+        &emit::rb(
+            "g1_a",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         &Stk::<KernelTag>::kernel(64_usize, 64_usize, "g1_w"),
-        &emit::rb("g1_o", RowCount::of_token_rows(64), BlockCols::of_feature_cols(64)),
+        &emit::rb(
+            "g1_o",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(64),
+        ),
         None,
     );
     assert_eq!(fit.time, 1, "64^3 must fit LX in one trip");
@@ -1562,9 +1610,17 @@ fn dump_gate_bundles() {
                 n,
                 k,
                 b,
-                &emit::rb("gb_a", RowCount::of_token_rows(m), BlockCols::of_feature_cols(k)),
+                &emit::rb(
+                    "gb_a",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(k),
+                ),
                 &Stk::<KernelTag>::kernel(k as usize, n as usize, "gb_w"),
-                &emit::rb("gb_o", RowCount::of_token_rows(m), BlockCols::of_feature_cols(n)),
+                &emit::rb(
+                    "gb_o",
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(n),
+                ),
                 None,
             );
             assert!(ov.time > 1, "{label} must time-tile");

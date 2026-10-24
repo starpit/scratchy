@@ -26,7 +26,7 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 use crate::ktir_node::KtirNode;
 use crate::placement::{BundleLayout, SegRole, align128};
 use crate::sdsc_abstract::{
-    BlockCols, FlatTag, KindTag, Lanes, RowCount, RowBlockedTag, StickKind, StickLayout, Stk,
+    BlockCols, FlatTag, KindTag, Lanes, RowBlockedTag, RowCount, StickKind, StickLayout, Stk,
 };
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
@@ -42,13 +42,6 @@ use crate::wire::{
 use crate::work::{FP16_ELEMS_PER_STICK, core_to_wk_slice, distribute_cores};
 use std::collections::BTreeMap;
 
-/// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
-/// facts the KTIR states. See its own header.
-pub mod ktir_matmul_fp8;
-/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
-/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
-/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
-pub mod lower_ktir_to_superdsc;
 /// THE WHOLE-FUNCTION DOOR — walk a multi-op KTIR program in program order and dispatch each
 /// compute op to the per-kind entry point that already lowers it. A producer that hands over a
 /// whole kernel (a Triton-derived `IRFunction` holding an MLP's two projections and its silu, or a
@@ -57,6 +50,13 @@ pub mod lower_ktir_to_superdsc;
 /// A batched gathered contraction — the gather's entry axis as the dot's batch axis. See the
 /// module doc for the frame law and the honesty row.
 pub mod batched_gathered;
+/// main's `lower_matmul_node` arity-3 branch — the W8A8 fp8 matmul descriptors, reached from the
+/// facts the KTIR states. See its own header.
+pub mod ktir_matmul_fp8;
+/// KTIR → SuperDSC: `ibm/main`'s eight `lower_*_node` bodies with their input door changed. The two
+/// that cross a model-geometry const door ([`lower_ktir_to_superdsc::attn_at`],
+/// [`lower_ktir_to_superdsc::rope_at`]) are public generic entry points the CALLER instantiates.
+pub mod lower_ktir_to_superdsc;
 pub mod whole_function;
 
 /// A per-`layout`-dim field in the order dxp reads it: as stated, or REVERSED for a view that

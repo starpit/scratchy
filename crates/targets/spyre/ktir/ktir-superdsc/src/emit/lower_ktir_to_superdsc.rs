@@ -7389,8 +7389,16 @@ mod elementwise_tests {
     #[test]
     fn the_row_split_op_states_the_y_major_frame() {
         use crate::superdsc_opspec::Scale;
-        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_one_stick(Lanes::FP16));
-        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_one_stick(Lanes::FP16));
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(256),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let merged_h = rb(
+            "t6",
+            RowCount::of_token_rows(64),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -7440,8 +7448,16 @@ mod elementwise_tests {
     /// operands' addressing would read different bytes. Refused by name.
     #[test]
     fn a_tile_that_disagrees_with_the_spray_count_is_refused() {
-        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_one_stick(Lanes::FP16));
-        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_one_stick(Lanes::FP16));
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(256),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let merged_h = rb(
+            "t6",
+            RowCount::of_token_rows(64),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -7469,8 +7485,16 @@ mod elementwise_tests {
     /// emitting it would address a wide op in a frame built for one stick. Refused by name.
     #[test]
     fn a_row_split_op_wider_than_one_stick_is_refused() {
-        let dense_h = rb("t5", RowCount::of_token_rows(256), BlockCols::of_feature_cols(128));
-        let merged_h = rb("t6", RowCount::of_token_rows(64), BlockCols::of_feature_cols(128));
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(256),
+            BlockCols::of_feature_cols(128),
+        );
+        let merged_h = rb(
+            "t6",
+            RowCount::of_token_rows(64),
+            BlockCols::of_feature_cols(128),
+        );
         let dense = In::full(&dense_h).ew();
         let merged = In::y_broadcast(&merged_h, 4).ew();
         let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
@@ -9019,8 +9043,12 @@ pub fn windowed_rmsnorm(
     // loop — the gamma row is shared by every head, and so is its offset sum. The
     // add reads the `[1,1]`-broadcast offset (the eps operand mode) into the
     // `[1, d]` `Gw` row the per-head gain multiplies read.
-    let gw_h = gw_ones.as_ref().map(|_| rb(&gw, RowCount::of_broadcast_row(), f_cols));
-    let ones_h = gw_ones.as_ref().map(|c| rb(c, RowCount::of_broadcast_row(), s_cols));
+    let gw_h = gw_ones
+        .as_ref()
+        .map(|_| rb(&gw, RowCount::of_broadcast_row(), f_cols));
+    let ones_h = gw_ones
+        .as_ref()
+        .map(|c| rb(c, RowCount::of_broadcast_row(), s_cols));
     let mut ops: Vec<EmittedOp> = Vec::new();
     if let (Some(g), Some(ones), Some(gw)) = (&gamma_h, &ones_h, &gw_h) {
         ops.push(pw2(
@@ -9243,7 +9271,11 @@ pub fn scalarweightmul(
     // The weight is `[1]` on disk and `[1, stick]` in its placement — the same
     // one-stick shape the rmsnorm's `[1,1]` epsilon const takes, read in the
     // same `In::scalar` broadcast mode (lane 0 sprayed over rows and cols).
-    let w_h = rb(&w, RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16));
+    let w_h = rb(
+        &w,
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     let out_h = rb(
         &out.name(),
         RowCount::of_token_rows(rows),
@@ -9370,8 +9402,16 @@ pub fn reshape(
     // ⭐ TRUE EXTENTS on both sides, not the `[1, stk]`/`rbo` staging annotations: the corners below
     // are `rc_of` corners of each side's OWN `[r, c]` view, so the handles declare those views —
     // the mint's bound. The stick walk's last window ends exactly at `total` elements on each side.
-    let src_name = rb(&src.name(), RowCount::of_token_rows(r_in), BlockCols::of_feature_cols(c_in));
-    let dst = rb(&out.name(), RowCount::of_token_rows(r_out), BlockCols::of_feature_cols(c_out));
+    let src_name = rb(
+        &src.name(),
+        RowCount::of_token_rows(r_in),
+        BlockCols::of_feature_cols(c_in),
+    );
+    let dst = rb(
+        &out.name(),
+        RowCount::of_token_rows(r_out),
+        BlockCols::of_feature_cols(c_out),
+    );
     let n_sticks = total / u64::from(stk);
     let mut ops = Vec::with_capacity(n_sticks as usize);
     for q in 0..n_sticks {

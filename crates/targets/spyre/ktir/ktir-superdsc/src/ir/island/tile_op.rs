@@ -242,7 +242,7 @@ pub fn nonstick_reduce_lx_resident_generic(plan: &WorkPlan, out_per_time: u32, d
 #[cfg(test)]
 mod matmul_residency_tests {
     use super::matmul_lx_resident_generic;
-    use crate::superdsc_opspec::{Df, Fp16, MaxCores, StickExtent, WorkPlan, MAX_CORES};
+    use crate::superdsc_opspec::{Df, Fp16, MAX_CORES, MaxCores, StickExtent, WorkPlan};
 
     /// The LIVE plan for a batched matmul — the production dim vocabulary and the joint cost
     /// model's own splitter, so the split under test is the one the emitter derives, never a
@@ -272,9 +272,17 @@ mod matmul_residency_tests {
     #[test]
     fn a_batch_split_across_cores_bills_each_core_its_own_planes() {
         let plan = batched_plan(4, 64, 64, 256);
-        assert_eq!(plan.split_of("y"), 8, "the joint cost model splits the batch");
+        assert_eq!(
+            plan.split_of("y"),
+            8,
+            "the joint cost model splits the batch"
+        );
         assert_eq!(plan.split_of("mb"), 4, "and the rows — 32 cores in all");
-        assert_eq!(plan.per_core_extent("y"), 32, "each core holds 32 of the 256 planes");
+        assert_eq!(
+            plan.per_core_extent("y"),
+            32,
+            "each core holds 32 of the 256 planes"
+        );
         assert_eq!(
             matmul_lx_resident_generic(&plan, 64, Df::Fp16),
             270_336,
@@ -296,7 +304,11 @@ mod matmul_residency_tests {
     #[test]
     fn an_unsplit_batch_bills_its_full_extent() {
         let plan = batched_plan(384, 384, 64, 16);
-        assert_eq!(plan.split_of("y"), 1, "the fixture's split divides mb and out only");
+        assert_eq!(
+            plan.split_of("y"),
+            1,
+            "the fixture's split divides mb and out only"
+        );
         assert_eq!(plan.per_core_extent("mb"), 24);
         assert_eq!(
             matmul_lx_resident_generic(&plan, 192, Df::Fp16),
@@ -359,8 +371,7 @@ mod matmul_residency_tests {
                 assert_eq!(plan.per_core_extent("mb"), 4, "the rows are unsplit");
                 assert_eq!(plan.per_core_extent("in"), 64, "the contraction is unsplit");
                 let charge = matmul_lx_resident_generic(&plan, 64, Df::Fp16);
-                let reference =
-                    (4 * 64 + 64 * 64 + 4 * 64) as u64 * (y / y_split) as u64 * 2;
+                let reference = (4 * 64 + 64 * 64 + 4 * 64) as u64 * (y / y_split) as u64 * 2;
                 assert_eq!(
                     charge, reference,
                     "y={y} split {y_split}: the charge bills the per-core batch, not the full extent"

@@ -1911,10 +1911,7 @@ impl OpFunc {
         // is not refused on a false premise; it does not license the split.
         matches!(
             self,
-            OpFunc::Sum
-                | OpFunc::Max
-                | OpFunc::SumNonStick
-                | OpFunc::MaxNonStick
+            OpFunc::Sum | OpFunc::Max | OpFunc::SumNonStick | OpFunc::MaxNonStick
         )
     }
 

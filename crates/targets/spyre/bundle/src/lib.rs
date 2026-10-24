@@ -129,6 +129,12 @@ pub const NUM_SEGMENTS: usize = 7;
 /// `audit_layout_addresses`.
 pub const MAX_SEGMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// ⭐ THE PAGE-PART LAW'S TYPES — which page of a multi-page window a launch group addresses
+/// ([`PagePart`]), and the slot count it carries ([`Slots`], the newtype no raw scalar crosses).
+/// Re-exported here because the proc-macro's generated literal rebuilds a part through
+/// [`PagePart::at_slots`] under this crate's path, and because [`KvShifts::part`] is public in
+/// it: a field's type is part of the crate's surface whether or not it is named.
+pub use ktir_superdsc::page_part::{PagePart, Slots};
 /// ⭐ THE OPERAND IDENTITY — declared in the lowering's own scratchy-free leaf and re-exported here,
 /// so every `bundle::PlaceId` / `bundle::SynthRole` path in the tree resolves unchanged. See
 /// [`ktir_superdsc::place`] for both types and for why a [`SynthRole`] belongs to the lowering that
@@ -143,12 +149,6 @@ pub use ktir_superdsc::place::{PlaceId, SynthRole};
 /// The segment budget's verdict on the weight tail, declared beside the producer's layout for the
 /// same reason as [`PlaceId`]: both ends read the one type.
 pub use ktir_superdsc::placement::WeightTail;
-/// ⭐ THE PAGE-PART LAW'S TYPES — which page of a multi-page window a launch group addresses
-/// ([`PagePart`]), and the slot count it carries ([`Slots`], the newtype no raw scalar crosses).
-/// Re-exported here because the proc-macro's generated literal rebuilds a part through
-/// [`PagePart::at_slots`] under this crate's path, and because [`KvShifts::part`] is public in
-/// it: a field's type is part of the crate's surface whether or not it is named.
-pub use ktir_superdsc::page_part::{PagePart, Slots};
 
 /// One tensor's baked placement inside its segment.
 #[derive(Clone, Debug, PartialEq, Eq)]

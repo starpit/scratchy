@@ -1230,7 +1230,12 @@ fn convert_gathers(module: &mut Module) -> Result<()> {
         .into_iter()
         .filter(|p| {
             walk::at(module, p)
-                .map(|o| matches!(o.kind, OpKind::TtDescriptorGather | OpKind::TtDescriptorScatter))
+                .map(|o| {
+                    matches!(
+                        o.kind,
+                        OpKind::TtDescriptorGather | OpKind::TtDescriptorScatter
+                    )
+                })
                 .unwrap_or(false)
         })
         .collect();

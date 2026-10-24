@@ -132,11 +132,7 @@ fn merge_case(
     load.result_type = ty(flat.0, flat.1);
     ops.push(load);
     let mut reshape_op = Operation::new(a, Some(rs), OpKind::TensorReshape, &[l_q])
-        .with_attr(
-            a,
-            AttrKey::Shape,
-            Attr::IntList(a.ints(reshape.to_vec())),
-        )
+        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(reshape.to_vec())))
         .with_attr(a, AttrKey::Dtype, Attr::Dtype(dt))
         .with_attr(
             a,
@@ -168,11 +164,7 @@ fn merge_case(
         result.1,
     )
     .with_attr(a, AttrKey::ReduceFn, Attr::Op(reduce_fn))
-    .with_attr(
-        a,
-        AttrKey::Dimensions,
-        Attr::IntList(a.ints(dims.to_vec())),
-    );
+    .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(dims.to_vec())));
     reduce.result_type = ty(result.0, result.1);
     ops.push(reduce);
 
@@ -279,12 +271,7 @@ fn unary_case(kind: OpKind, rows: i64, cols: i64, in_dt: DType, out_dt: DType) -
     ops.push(load);
 
     let r = ssa();
-    let mut op = shape(
-        Operation::new(a, Some(r), kind, &[l_x]),
-        rows,
-        cols,
-        out_dt,
-    );
+    let mut op = shape(Operation::new(a, Some(r), kind, &[l_x]), rows, cols, out_dt);
     op.result_type = Some(IrType::Tensor {
         dims: a.ints(vec![rows, cols]),
         elem: out_dt,
@@ -325,7 +312,14 @@ fn unary_case(kind: OpKind, rows: i64, cols: i64, in_dt: DType, out_dt: DType) -
 /// A two-view binary program — `out = kind(load(x), load(y))` — the elementwise and mixed-df
 /// cases' own spelling. `x_dt`/`y_dt`/`out_dt` state each side independently, so the mixed-df
 /// refusal is stated by the PROGRAM, not patched into the walk.
-fn binary_case(kind: OpKind, rows: i64, cols: i64, x_dt: DType, y_dt: DType, out_dt: DType) -> KtirNode {
+fn binary_case(
+    kind: OpKind,
+    rows: i64,
+    cols: i64,
+    x_dt: DType,
+    y_dt: DType,
+    out_dt: DType,
+) -> KtirNode {
     let a: &'static Arena = Arena::global();
     let shape = |op: Operation<'static>, r: i64, c: i64, dt: DType| {
         op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
@@ -509,7 +503,14 @@ fn body(j: &serde_json::Value) -> &serde_json::Value {
 #[test]
 fn the_m_merge_lowers_at_f32_through_the_walk() {
     let ((fr, fc), reshape, dims, result) = MERGE;
-    let k = merge_case((fr, fc), reshape, dims, result, OpKind::ArithAddf, DType::F32);
+    let k = merge_case(
+        (fr, fc),
+        reshape,
+        dims,
+        result,
+        OpKind::ArithAddf,
+        DType::F32,
+    );
     let ops = lowered(&k, fr * fc, F32_BYTES).unwrap_or_else(|e| {
         panic!("the f32 m-merge geometry must lower through the walk, refused: {e}")
     });
@@ -521,12 +522,21 @@ fn the_m_merge_lowers_at_f32_through_the_walk() {
     };
     let j = op_json(red);
     let c = &body(&j)["computeOp_"][0];
-    assert_eq!(c["opFuncName"], "sumnonstick", "the fp32 family's wire name");
-    assert_eq!(c["exUnit"], "sfp", "RCUDD1A has no fp32 PE — fp32 lives on SFP");
+    assert_eq!(
+        c["opFuncName"], "sumnonstick",
+        "the fp32 family's wire name"
+    );
+    assert_eq!(
+        c["exUnit"], "sfp",
+        "RCUDD1A has no fp32 PE — fp32 lives on SFP"
+    );
     // 32 survivor lanes = EXACTLY one whole fp32 stick.
     assert_eq!(body(&j)["N_"]["y_"].as_u64(), Some(32));
     // Every operand states the data's own format — the walk threaded it from the VIEW's Dtype.
-    for lds in body(&j)["labeledDs_"].as_array().expect("the labeledDs list") {
+    for lds in body(&j)["labeledDs_"]
+        .as_array()
+        .expect("the labeledDs list")
+    {
         assert_eq!(
             lds["dataFormat_"], "IEEE_FP32",
             "an f32 merge operand's dataFormat, walked off its own view"
@@ -557,7 +567,9 @@ fn an_extf_lowers_as_a_first_class_convert() {
     let c = &body(&j)["computeOp_"][0];
     assert_eq!(c["opFuncName"], "dl16tofp32", "the vendor's widening bind");
     // Each side at its OWN stick: the input a 64-lane SEN169 word, the output a 32-lane IEEE one.
-    let lds = body(&j)["labeledDs_"].as_array().expect("the labeledDs list");
+    let lds = body(&j)["labeledDs_"]
+        .as_array()
+        .expect("the labeledDs list");
     let formats: Vec<&str> = lds
         .iter()
         .map(|e| e["dataFormat_"].as_str().expect("a format"))
@@ -572,7 +584,10 @@ fn an_extf_lowers_as_a_first_class_convert() {
     );
     for e in lds {
         let wl = e["wordLength"].as_u64().expect("a word length");
-        assert!(wl == 2 || wl == 4, "each side at its own word length, got {wl}");
+        assert!(
+            wl == 2 || wl == 4,
+            "each side at its own word length, got {wl}"
+        );
     }
 }
 
@@ -630,10 +645,7 @@ fn a_mistyped_extf_refuses_by_name() {
     let k = unary_case(OpKind::ArithExtf, 8, 64, DType::F32, DType::F16);
     let e = match lowered(&k, 512, F32_BYTES) {
         Err(e) => e,
-        Ok(ops) => panic!(
-            "a mistyped extf must refuse, not lower {} op(s)",
-            ops.len()
-        ),
+        Ok(ops) => panic!("a mistyped extf must refuse, not lower {} op(s)", ops.len()),
     };
     assert!(
         e.contains("WIDENING"),
@@ -646,13 +658,7 @@ fn a_mistyped_extf_refuses_by_name() {
 /// nearest-neighbor opfunc would silently re-interpret the bytes.
 #[test]
 fn a_foreign_pair_convert_refuses_by_name() {
-    let k = unary_case(
-        OpKind::ArithConvertf,
-        8,
-        64,
-        DType::F16,
-        DType::Fp8E4m3,
-    );
+    let k = unary_case(OpKind::ArithConvertf, 8, 64, DType::F16, DType::Fp8E4m3);
     let e = match lowered(&k, 512, 2) {
         Err(e) => e,
         Ok(ops) => panic!(
@@ -891,8 +897,7 @@ fn an_f32_intermediate_is_reserved_at_four_bytes_per_element() {
     // access would alias the next intermediate.
     let sizes = layout.synth.borrow();
     let want = (rows as u64) * (cols as u64) * F32_BYTES;
-    let f32_mints: Vec<(&String, &u64)> =
-        sizes.sizes.iter().filter(|&(_, &b)| b == want).collect();
+    let f32_mints: Vec<(&String, &u64)> = sizes.sizes.iter().filter(|&(_, &b)| b == want).collect();
     assert!(
         !f32_mints.is_empty(),
         "an [8, 64] f32 intermediate reserved {want} B (4 B/elem) — got {:?}",

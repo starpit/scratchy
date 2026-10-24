@@ -132,9 +132,10 @@ fn layout_for(k: &KtirNode, scales: Vec<f32>) -> BundleLayout {
     l.scalarmul_scales = scales;
     l.scalarmul_scales_df = vec![Df::Fp16];
     let slot_tid = scalarmul_scale_tid(0);
-    l.ids
-        .borrow_mut()
-        .insert(act_name(slot_tid), ktir_superdsc::place::PlaceId::Act(slot_tid));
+    l.ids.borrow_mut().insert(
+        act_name(slot_tid),
+        ktir_superdsc::place::PlaceId::Act(slot_tid),
+    );
     l.placements.insert(
         slot_tid,
         TensorPlacement {
@@ -197,13 +198,8 @@ fn the_floor_seed_lowers_through_the_fill_arm() {
 fn the_door_is_the_max_carrys_alone() {
     let k = seed_program(-60000.0, PagedFoldCarry::Sum.tid());
     let mut sid = 0i64;
-    let ops = lower_function(
-        &k,
-        Some(&layout_for(&k, vec![-60000.0])),
-        &mut sid,
-        None,
-    )
-    .expect("a non-Max carry's fill is not the seed door's business");
+    let ops = lower_function(&k, Some(&layout_for(&k, vec![-60000.0])), &mut sid, None)
+        .expect("a non-Max carry's fill is not the seed door's business");
     assert!(
         !ops.is_empty(),
         "the Sum carry's fill still lowers — the door did not fire"

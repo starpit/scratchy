@@ -43,9 +43,9 @@ use ktir_superdsc::emit::lower_ktir_to_superdsc::{
     Error, Region, err, regions, rope_at, split_out,
 };
 use ktir_superdsc::emit::whole_function::lower_function;
+use ktir_superdsc::exp_base::ExpBase;
 use ktir_superdsc::ktir_node::{KtirNode, Program};
 use ktir_superdsc::placement::BundleLayout;
-use ktir_superdsc::exp_base::ExpBase;
 use ktir_superdsc::score_scale::{NewK, PoolKLaw, ScoreScaleLaw};
 
 /// ⭐⭐⭐ THE FOUR THINGS THE PROGRAM CANNOT STATE — `ibm/main`'s `lower_one_node` PARAMETERS, at the
@@ -302,8 +302,7 @@ pub fn lower(
                         Some(v),
                         law @ (ScoreScaleLaw::CommutedIntoWeights | ScoreScaleLaw::UnitByModel),
                     ) if v != 1.0
-                        && half::f16::from_f32(v)
-                            != half::f16::from_f32(ExpBase::LOG2E) =>
+                        && half::f16::from_f32(v) != half::f16::from_f32(ExpBase::LOG2E) =>
                     {
                         return err(format!(
                             "{name}: the bundle's attention scale is {law:?}, but the program \

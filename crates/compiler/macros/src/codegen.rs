@@ -9125,7 +9125,9 @@ fn emit_superdsc_wiring(
                 .args
                 .iter()
                 .filter_map(|a| {
-                    scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(*a as u32)
+                    scratchy_target_spyre::ktir_superdsc::reserved_tids::KctResident::of_wire(
+                        *a as u32,
+                    )
                 })
                 .next()
             else {
@@ -9166,8 +9168,7 @@ fn emit_superdsc_wiring(
                     "[superdsc-wiring] {}: layer {layer}'s attention program binds its Kᵀ plane \
                      but not the sealed pair's V tensor t{} — the program and the node's \
                      KvCacheLayout disagree about the pairing",
-                    model.source_stem,
-                    row.prefix_v
+                    model.source_stem, row.prefix_v
                 );
             }
             layers.push((layer, row));

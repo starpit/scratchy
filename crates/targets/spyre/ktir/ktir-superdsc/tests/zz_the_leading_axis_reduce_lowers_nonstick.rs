@@ -153,11 +153,7 @@ fn leading_axis_case(
     load.result_type = ty(flat.0, flat.1);
     ops.push(load);
     let mut reshape_op = Operation::new(a, Some(rs), OpKind::TensorReshape, &[l_q])
-        .with_attr(
-            a,
-            AttrKey::Shape,
-            Attr::IntList(a.ints(reshape.to_vec())),
-        )
+        .with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(reshape.to_vec())))
         .with_attr(a, AttrKey::Dtype, Attr::Dtype(DType::F16))
         .with_attr(
             a,
@@ -190,11 +186,7 @@ fn leading_axis_case(
         result.1,
     )
     .with_attr(a, AttrKey::ReduceFn, Attr::Op(reduce_fn))
-    .with_attr(
-        a,
-        AttrKey::Dimensions,
-        Attr::IntList(a.ints(dims.to_vec())),
-    );
+    .with_attr(a, AttrKey::Dimensions, Attr::IntList(a.ints(dims.to_vec())));
     reduce.result_type = ty(result.0, result.1);
     ops.push(reduce);
 
@@ -253,10 +245,7 @@ fn layout_for(k: &KtirNode, flat_numel: i64) -> BundleLayout {
     l
 }
 
-fn lowered(
-    k: &KtirNode,
-    flat_numel: i64,
-) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn lowered(k: &KtirNode, flat_numel: i64) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let layout = layout_for(k, flat_numel);
     let mut sid = 0i64;
     lower_function(k, Some(&layout), &mut sid, None).map_err(|e| e.message)
@@ -301,13 +290,7 @@ const POS: Pos = ((1024, 64), &[32, 32, 64], &[0], (32, 64));
 #[test]
 fn the_leading_axis_sum_lowers_nonstick() {
     let ((fr, fc), reshape, dims, result) = POS;
-    let k = leading_axis_case(
-        (fr, fc),
-        reshape,
-        dims,
-        result,
-        OpKind::ArithAddf,
-    );
+    let k = leading_axis_case((fr, fc), reshape, dims, result, OpKind::ArithAddf);
     let ops = lowered(&k, fr * fc).unwrap_or_else(|e| {
         panic!("the leading-axis sum must lower through the door, refused: {e}")
     });
@@ -348,9 +331,12 @@ fn the_leading_axis_sum_lowers_nonstick() {
         j["numWkSlicesPerDim_"]["out"], 1,
         "the reduced dim stays whole per core"
     );
-    let y_split = j["numWkSlicesPerDim_"]["y"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("the survivor split is stated, got {}", j["numWkSlicesPerDim_"]["y"]));
+    let y_split = j["numWkSlicesPerDim_"]["y"].as_u64().unwrap_or_else(|| {
+        panic!(
+            "the survivor split is stated, got {}",
+            j["numWkSlicesPerDim_"]["y"]
+        )
+    });
     assert!(y_split >= 1, "the survivor split is at least one");
     // The scales — the fixture's own law: data all-Active, the accum −1 (RedNonStick) on the
     // REDUCED dim with the survivor stick Active. Read off the labeledDs entries.
@@ -389,13 +375,7 @@ fn the_leading_axis_sum_lowers_nonstick() {
 #[test]
 fn the_leading_axis_max_lowers_nonstick() {
     let ((fr, fc), reshape, dims, result) = POS;
-    let k = leading_axis_case(
-        (fr, fc),
-        reshape,
-        dims,
-        result,
-        OpKind::ArithMaxnumf,
-    );
+    let k = leading_axis_case((fr, fc), reshape, dims, result, OpKind::ArithMaxnumf);
     let ops = lowered(&k, fr * fc)
         .unwrap_or_else(|e| panic!("the leading-axis max must lower, refused: {e}"));
     let [red] = &ops[..] else {

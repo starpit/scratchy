@@ -557,10 +557,7 @@ fn row_blocks_of_a_bare_silu_fold_into_one_whole_view_descriptor() {
 /// input the one shared splatted constant occupies in that block's `arith.subf` — the ORDER
 /// fact, non-commutative, carried per block so the mixing test can state two functions under
 /// one family's stores.
-fn sub_family(
-    view: (i64, i64),
-    blocks: &[(i64, i64, i64, i64, bool)],
-) -> KtirNode {
+fn sub_family(view: (i64, i64), blocks: &[(i64, i64, i64, i64, bool)]) -> KtirNode {
     let a: &'static Arena = Arena::global();
     let shape = |op: Operation<'static>, r: i64, c: i64| {
         op.with_attr(a, AttrKey::Shape, Attr::IntList(a.ints(vec![r, c])))
@@ -638,7 +635,11 @@ fn sub_family(
             c_len,
         ));
         let sub = ssa();
-        let operands = if const_first { &[splat, l_a] } else { &[l_a, splat] };
+        let operands = if const_first {
+            &[splat, l_a]
+        } else {
+            &[l_a, splat]
+        };
         ops.push(shape(
             Operation::new(a, Some(sub), OpKind::ArithSubf, operands),
             r_len,
@@ -685,9 +686,7 @@ fn sub_lowered(
     let mut layout = layout_for(k, view);
     layout.scalarmul_scales = vec![-65504.0];
     layout.synth(
-        ktir_superdsc::place::PlaceId::Act(
-            ktir_superdsc::reserved_tids::scalarmul_scale_tid(0),
-        ),
+        ktir_superdsc::place::PlaceId::Act(ktir_superdsc::reserved_tids::scalarmul_scale_tid(0)),
         &[1, 1],
     );
     let mut sid = 0i64;

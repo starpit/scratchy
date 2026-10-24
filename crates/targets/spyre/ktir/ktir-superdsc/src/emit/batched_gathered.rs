@@ -66,8 +66,8 @@
 use crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_batched_off;
 use crate::sdsc_abstract::{CopyDims, MatK, MatM, MatN, MatY, QueryRowCount};
 use crate::superdsc_opspec::{
-    DestEntry, EpilogueOpFunc, EpilogueSpec, EpilogueSpecs, GatherIndex, GatherRun,
-    OpSpec, PageExtent,
+    DestEntry, EpilogueOpFunc, EpilogueSpec, EpilogueSpecs, GatherIndex, GatherRun, OpSpec,
+    PageExtent,
 };
 use crate::work::FP16_ELEMS_PER_STICK;
 
@@ -131,7 +131,8 @@ impl BatchedGathered {
             ));
         }
         let to_u32 = |v: i64, what: &str| {
-            u32::try_from(v).map_err(|_| format!("the batched gathered dot's {what} {v} is not a u32"))
+            u32::try_from(v)
+                .map_err(|_| format!("the batched gathered dot's {what} {v} is not a u32"))
         };
         let (batch, m, k, n) = (
             to_u32(ab, "batch")?,
@@ -349,10 +350,9 @@ pub fn emit_dot(
             "{name}: the batched gathered dot's regions are not [input, input, output]"
         ));
     }
-    let whole =
-        |r: &crate::emit::lower_ktir_to_superdsc::Region| {
-            r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols
-        };
+    let whole = |r: &crate::emit::lower_ktir_to_superdsc::Region| {
+        r.r_start == 0 && r.c_start == 0 && r.r_len == r.v_rows && r.c_len == r.v_cols
+    };
     for (what, r, cols) in [("A", a, bg.k), ("OUT", o, bg.n)] {
         if !whole(&r) || r.c_len != cols {
             return err(format!(
@@ -368,14 +368,22 @@ pub fn emit_dot(
             "{name}: the batched gathered dot's B t{} is the window [{}, {}] at ({}, {}) of a \
              [{}, {}] buffer, not the whole [{}, {STK}] C-order scratch the copy wrote — the \
              door's region and the stated geometry disagree about the buffer the dot reads",
-            w.tid, w.r_len, w.c_len, w.r_start, w.c_start, w.v_rows, w.v_cols, bg.copy_rows()
+            w.tid,
+            w.r_len,
+            w.c_len,
+            w.r_start,
+            w.c_start,
+            w.v_rows,
+            w.v_cols,
+            bg.copy_rows()
         ));
     }
-    let ops = dot_opspecs(bg, &a.name(), a.v_rows, &w.name(), &o.name(), o.v_rows).map_err(
-        |msg| Error {
-            message: format!("{name}: {msg}"),
-        },
-    )?;
+    let ops =
+        dot_opspecs(bg, &a.name(), a.v_rows, &w.name(), &o.name(), o.v_rows).map_err(|msg| {
+            Error {
+                message: format!("{name}: {msg}"),
+            }
+        })?;
     let ks_count = bg.k / STK;
     let mut out = Vec::with_capacity(ops.len());
     for (i, mut op) in ops.into_iter().enumerate() {
@@ -515,8 +523,14 @@ mod byte_gate {
     #[test]
     fn the_dot_reads_every_kernel_element_where_the_copy_wrote_it() {
         for bg in [pooled(), grouped(), moe_per_token(), wide_k()] {
-            let copies = copy_opspecs(&bg, "tbl", "ids", "w", crate::superdsc_opspec::EntryBase::ZERO)
-                .unwrap();
+            let copies = copy_opspecs(
+                &bg,
+                "tbl",
+                "ids",
+                "w",
+                crate::superdsc_opspec::EntryBase::ZERO,
+            )
+            .unwrap();
             let rows = bg.batch * bg.m;
             let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
             let mut checked = 0u64;
@@ -621,12 +635,7 @@ mod byte_gate {
                         let e = &op.args[*arg_idx];
                         assert_eq!(e.view().name, "o");
                         assert_eq!(e.view().offset_elems, o.view().offset_elems);
-                        assert!(
-                            e.view()
-                                .scale
-                                .iter()
-                                .all(|s| matches!(s, Scale::Active))
-                        );
+                        assert!(e.view().scale.iter().all(|s| matches!(s, Scale::Active)));
                     }
                     (ks, info) => panic!("{bg:?} op {i} (ks={ks}) has op_info {info:?}"),
                 }
@@ -642,12 +651,23 @@ mod byte_gate {
     #[test]
     fn the_kernel_without_its_physical_extents_reads_the_wrong_bytes() {
         let bg = moe_per_token();
-        let copies =
-            copy_opspecs(&bg, "tbl", "ids", "w", crate::superdsc_opspec::EntryBase::ZERO).unwrap();
+        let copies = copy_opspecs(
+            &bg,
+            "tbl",
+            "ids",
+            "w",
+            crate::superdsc_opspec::EntryBase::ZERO,
+        )
+        .unwrap();
         // W(b=1, k=1, n=0): page = 1, so batch row 1 is entry 1, within-entry element
         // (pos·K + k)·N + n.
         let (b, kk, nn) = (1u32, 1u32, 0u32);
-        let wrote = copy_write(&copies, &bg, b / bg.page, (b % bg.page * bg.k + kk) * bg.n + nn);
+        let wrote = copy_write(
+            &copies,
+            &bg,
+            b / bg.page,
+            (b % bg.page * bg.k + kk) * bg.n + nn,
+        );
         // The emitted (ks=0, ns=0) dot op — WITH its physical extents — reads it there.
         let dots = dot_opspecs(&bg, "a", bg.batch * bg.m, "w", "o", bg.batch * bg.m).unwrap();
         let op = &dots[0];
@@ -655,7 +675,10 @@ mod byte_gate {
         let read = fold(
             op,
             w,
-            &at(w, &[("y", b as usize), ("in", kk as usize), ("out", nn as usize)]),
+            &at(
+                w,
+                &[("y", b as usize), ("in", kk as usize), ("out", nn as usize)],
+            ),
         );
         assert_eq!(read, wrote, "the emitted op agrees with the copy");
         // The control: the same stick op built WITHOUT the declared extents.
@@ -677,7 +700,10 @@ mod byte_gate {
         let tile_read = fold(
             &plain,
             pw,
-            &at(pw, &[("y", b as usize), ("in", kk as usize), ("out", nn as usize)]),
+            &at(
+                pw,
+                &[("y", b as usize), ("in", kk as usize), ("out", nn as usize)],
+            ),
         );
         assert_ne!(
             tile_read, wrote,
@@ -699,9 +725,14 @@ mod byte_gate {
             let dots = dot_opspecs(&bg, "a", rows, "w", "o", rows).unwrap();
             assert_eq!(dots.len(), want, "{bg:?}");
             assert_eq!(bg.dot_ops() as usize, want);
-            let copies =
-                copy_opspecs(&bg, "tbl", "ids", "w", crate::superdsc_opspec::EntryBase::ZERO)
-                    .unwrap();
+            let copies = copy_opspecs(
+                &bg,
+                "tbl",
+                "ids",
+                "w",
+                crate::superdsc_opspec::EntryBase::ZERO,
+            )
+            .unwrap();
             assert_eq!(
                 copies.len(),
                 bg.entries.div_ceil(CopyDims::ENTRIES_PER_OP) as usize,
@@ -728,12 +759,10 @@ mod byte_gate {
             // The KERNEL's back gaps are its two physical extents minus the tile's sweeps.
             let kernel = &op.args[1];
             let kv = kernel.view();
-            let in_gap = kv.device_extent
-                [kv.layout.iter().position(|&d| d == "in").unwrap()]
+            let in_gap = kv.device_extent[kv.layout.iter().position(|&d| d == "in").unwrap()]
                 .unwrap()
                 - op.iter.extent("in");
-            let out_gap = kv.device_extent
-                [kv.layout.iter().position(|&d| d == "out").unwrap()]
+            let out_gap = kv.device_extent[kv.layout.iter().position(|&d| d == "out").unwrap()]
                 .unwrap()
                 - op.iter.extent("out");
             assert_eq!(in_gap, bg.k - STK, "the in gap is phys − swept");

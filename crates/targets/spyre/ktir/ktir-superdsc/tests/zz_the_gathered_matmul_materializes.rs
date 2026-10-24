@@ -568,7 +568,8 @@ fn an_a_side_gathered_operand_materializes_and_the_matmul_reads_the_copy() {
         .and_then(|m| m.values().next())
         .expect("the matmul has a descriptor");
     assert!(
-        mm_dsc.computeOp_
+        mm_dsc
+            .computeOp_
             .iter()
             .any(|c| c.opFuncName == "batchmatmul"),
         "the last op is the contraction: {:?}",
@@ -624,7 +625,12 @@ fn a_gathered_load_with_two_consumers_is_refused_by_name() {
             HEAD,
         ),
         shape(
-            Operation::new(a, Some(t_g), OpKind::KtdpConstructAccessTile, &[v_g, zero, zero]),
+            Operation::new(
+                a,
+                Some(t_g),
+                OpKind::KtdpConstructAccessTile,
+                &[v_g, zero, zero],
+            ),
             K,
             HEAD,
         ),
@@ -692,11 +698,27 @@ fn both_gathered_program() -> KtirNode {
     let zero = Ssa(5);
     // The A chain: table_a's plain view/tile/load, ids_a's view/tile/load, the indirect tile
     // [M, K] and its gathered load.
-    let (v_ta, t_ta, val_ta, v_ia, t_ia, val_ia, ind_a, load_a) =
-        (Ssa(6), Ssa(7), Ssa(8), Ssa(9), Ssa(10), Ssa(11), Ssa(12), Ssa(13));
+    let (v_ta, t_ta, val_ta, v_ia, t_ia, val_ia, ind_a, load_a) = (
+        Ssa(6),
+        Ssa(7),
+        Ssa(8),
+        Ssa(9),
+        Ssa(10),
+        Ssa(11),
+        Ssa(12),
+        Ssa(13),
+    );
     // The B chain: the same five-op shape over table_b/ids_b, sweeping [K, HEAD].
-    let (v_tb, t_tb, val_tb, v_ib, t_ib, val_ib, ind_b, load_b) =
-        (Ssa(14), Ssa(15), Ssa(16), Ssa(17), Ssa(18), Ssa(19), Ssa(20), Ssa(21));
+    let (v_tb, t_tb, val_tb, v_ib, t_ib, val_ib, ind_b, load_b) = (
+        Ssa(14),
+        Ssa(15),
+        Ssa(16),
+        Ssa(17),
+        Ssa(18),
+        Ssa(19),
+        Ssa(20),
+        Ssa(21),
+    );
     // The output view/tile, the zero outs, and the contraction.
     let (v_o, t_o, outs, matmul) = (Ssa(22), Ssa(23), Ssa(24), Ssa(25));
 
@@ -807,7 +829,11 @@ fn both_gathered_program() -> KtirNode {
             ),
         );
         // The gathered load — its OWN type stated, the flat-law check's second authority.
-        let mut op = shape(Operation::new(a, Some(load), OpKind::KtdpLoad, &[ind]), rows, width);
+        let mut op = shape(
+            Operation::new(a, Some(load), OpKind::KtdpLoad, &[ind]),
+            rows,
+            width,
+        );
         op.result_type = Some(IrType::Tensor {
             dims: a.ints(vec![rows, width]),
             elem: DType::F16,
@@ -815,11 +841,13 @@ fn both_gathered_program() -> KtirNode {
         ops.push(op);
     };
 
-    let mut ops = vec![Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
-        a,
-        AttrKey::Value,
-        Attr::Int(0),
-    )];
+    let mut ops = vec![
+        Operation::new(a, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+            a,
+            AttrKey::Value,
+            Attr::Int(0),
+        ),
+    ];
     gather_chain(
         p_ta,
         p_ia,
@@ -1052,7 +1080,10 @@ fn a_repeat_gather_over_a_whole_placed_source_admits_under_a_declared_source_ext
     // The table placed at 16 rows — every 32-row leg over-sweeps it.
     let shrink = |l: &mut BundleLayout| {
         let tid = k.bindings[1].get();
-        l.placements.get_mut(&tid).expect("the table is placed").size = 16 * HEAD as u64 * 2;
+        l.placements
+            .get_mut(&tid)
+            .expect("the table is placed")
+            .size = 16 * HEAD as u64 * 2;
     };
     // ⛔ FAIL-CLOSED FIRST — the same placement with NO reach refuses, naming the sweep, the
     // placement and the missing declaration.
@@ -1148,14 +1179,20 @@ fn pooled_layout_for(
 ) -> BundleLayout {
     let mut l = layout_for(k, GatheredSlot::B);
     let tid = k.bindings[1].get();
-    l.placements.get_mut(&tid).expect("the table is placed").size = HEAD as u64 * 2;
+    l.placements
+        .get_mut(&tid)
+        .expect("the table is placed")
+        .size = HEAD as u64 * 2;
     l.gather_reach.insert(tid, reach);
     l
 }
 
 /// [`emitted`] under a caller-built layout — the pooled cases' door, so the reach and the
 /// placement it bounds are stated by the test and not re-derived.
-fn emitted_with(k: &KtirNode, layout: &BundleLayout) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
+fn emitted_with(
+    k: &KtirNode,
+    layout: &BundleLayout,
+) -> Result<Vec<ktir_superdsc::emit::EmittedOp>, String> {
     let mut sid = 0i64;
     lower_function(k, Some(layout), &mut sid, None).map_err(|e| e.message)
 }

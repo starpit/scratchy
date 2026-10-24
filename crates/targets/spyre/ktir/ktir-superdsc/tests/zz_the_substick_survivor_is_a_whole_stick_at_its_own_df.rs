@@ -100,10 +100,20 @@ fn the_m_merge_lowers_at_the_datas_own_fp32_stick() {
         "sumnonstick_o8",
     );
     let c = &v["computeOp_"][0];
-    assert_eq!(c["opFuncName"], "sumnonstick", "the fp32 family's wire name");
-    assert_eq!(c["exUnit"], "sfp", "RCUDD1A has no fp32 PE — fp32 lives on SFP");
+    assert_eq!(
+        c["opFuncName"], "sumnonstick",
+        "the fp32 family's wire name"
+    );
+    assert_eq!(
+        c["exUnit"], "sfp",
+        "RCUDD1A has no fp32 PE — fp32 lives on SFP"
+    );
     // The geometry: J reduced, 32 survivor lanes = ONE whole fp32 stick.
-    assert_eq!(v["N_"]["out_"].as_u64(), Some(J as u64), "the reduced extent");
+    assert_eq!(
+        v["N_"]["out_"].as_u64(),
+        Some(J as u64),
+        "the reduced extent"
+    );
     assert_eq!(
         v["N_"]["y_"].as_u64(),
         Some(SURVIVORS as u64),
@@ -116,13 +126,20 @@ fn the_m_merge_lowers_at_the_datas_own_fp32_stick() {
             lds["dataFormat_"], "IEEE_FP32",
             "a nonstick f32 operand's dataFormat"
         );
-        assert_eq!(lds["wordLength"].as_u64(), Some(4), "4 bytes per f32 element");
+        assert_eq!(
+            lds["wordLength"].as_u64(),
+            Some(4),
+            "4 bytes per f32 element"
+        );
     }
     // The scaling const at RAW IEEE_FP32 bits (1.0f32 = 0x3F800000) — the reduce.rs
     // mixed-const law: the const's element type MUST match the op's data_format.
     let scale = &v["constantInfo_"]["0"];
     assert_eq!(scale["name_"], "scaling_factor", "the family's own const");
-    assert_eq!(scale["dataFormat_"], "IEEE_FP32", "the const is an fp32 word");
+    assert_eq!(
+        scale["dataFormat_"], "IEEE_FP32",
+        "the const is an fp32 word"
+    );
     assert_eq!(
         scale["data_"]["data_"]["[0, 0, 0]"][0], "1065353216",
         "raw f32 bits of 1.0 (0x3F800000), never a SEN169 encoding"
@@ -184,8 +201,15 @@ fn the_f16_control_keeps_the_f16_emission() {
     );
     assert_eq!(v["N_"]["y_"].as_u64(), Some(64), "one whole fp16 stick");
     for lds in v["labeledDs_"].as_array().expect("the labeledDs list") {
-        assert_eq!(lds["dataFormat_"], "SEN169_FP16", "the f16 control's format");
-        assert_eq!(lds["wordLength"].as_u64(), Some(2), "2 bytes per f16 element");
+        assert_eq!(
+            lds["dataFormat_"], "SEN169_FP16",
+            "the f16 control's format"
+        );
+        assert_eq!(
+            lds["wordLength"].as_u64(),
+            Some(2),
+            "2 bytes per f16 element"
+        );
     }
     assert_eq!(
         v["constantInfo_"]["0"]["dataFormat_"], "SEN169_FP16",

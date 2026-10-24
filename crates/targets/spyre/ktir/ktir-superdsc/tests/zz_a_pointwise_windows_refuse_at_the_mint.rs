@@ -25,9 +25,7 @@ use ktir_superdsc::addr::DevOff;
 use ktir_superdsc::emit::{EmittedOp, In, assemble_pointwise_broadcast_off};
 use ktir_superdsc::place::PlaceId;
 use ktir_superdsc::placement::{BundleLayout, SegRole, TensorPlacement};
-use ktir_superdsc::sdsc_abstract::{
-    BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk,
-};
+use ktir_superdsc::sdsc_abstract::{BlockCols, Lanes, RowBlockedTag, RowCount, StickLayout, Stk};
 
 fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
     Stk::<RowBlockedTag>::new(
@@ -105,8 +103,16 @@ fn refused(r: Result<EmittedOp, Box<dyn std::any::Any + Send>>) -> String {
 /// The control is the same op over the TRUE `[31, 2048]` handle: it builds.
 #[test]
 fn an_operand_window_past_its_handle_refuses() {
-    let true_h = rb("t_true", RowCount::of_token_rows(31), BlockCols::of_feature_cols(2048));
-    let o = rb("t_o", RowCount::of_token_rows(31), BlockCols::of_feature_cols(2048));
+    let true_h = rb(
+        "t_true",
+        RowCount::of_token_rows(31),
+        BlockCols::of_feature_cols(2048),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(31),
+        BlockCols::of_feature_cols(2048),
+    );
     let built = add(
         31,
         2048,
@@ -121,7 +127,11 @@ fn an_operand_window_past_its_handle_refuses() {
     );
     assert!(built.op.is_some(), "the true handle builds — the control");
 
-    let lie = rb("t_lie", RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16));
+    let lie = rb(
+        "t_lie",
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         add(31, 2048, &lie, &true_h, &o, None)
     }));
@@ -138,9 +148,21 @@ fn an_operand_window_past_its_handle_refuses() {
 /// mint runs FIRST in the assembler, so a lying output refuses even with true inputs).
 #[test]
 fn an_output_window_past_its_handle_refuses() {
-    let a = rb("t_a", RowCount::of_token_rows(31), BlockCols::of_feature_cols(2048));
-    let b = rb("t_b", RowCount::of_token_rows(31), BlockCols::of_feature_cols(2048));
-    let small = rb("t_small", RowCount::of_broadcast_row(), BlockCols::of_one_stick(Lanes::FP16));
+    let a = rb(
+        "t_a",
+        RowCount::of_token_rows(31),
+        BlockCols::of_feature_cols(2048),
+    );
+    let b = rb(
+        "t_b",
+        RowCount::of_token_rows(31),
+        BlockCols::of_feature_cols(2048),
+    );
+    let small = rb(
+        "t_small",
+        RowCount::of_broadcast_row(),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         add(31, 2048, &a, &b, &small, None)
     }));
@@ -159,9 +181,21 @@ fn an_output_window_past_its_handle_refuses() {
 #[test]
 fn an_operand_window_past_its_placement_refuses() {
     let (rows, cols) = (512u32, 768u32);
-    let mask = rb("t1131", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
-    let a = rb("t8", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
-    let o = rb("t9", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
+    let mask = rb(
+        "t1131",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
+    let a = rb(
+        "t8",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
+    let o = rb(
+        "t9",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     let small = layout_placing(&[(1131, 279552), (8, 786432), (9, 786432)]);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         add(rows, cols, &mask, &a, &o, Some(&small))
@@ -188,9 +222,21 @@ fn an_operand_window_past_its_placement_refuses() {
 #[test]
 fn a_broadcast_last_row_scalar_past_the_end_refuses() {
     let rows = 31u32;
-    let col = rb("t_col", RowCount::of_token_rows(rows), BlockCols::of_one_stick(Lanes::FP16));
-    let a = rb("t_a", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
-    let o = rb("t_o", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
+    let col = rb(
+        "t_col",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
+    let a = rb(
+        "t_a",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
     let build = |b: In<'_, RowBlockedTag>| {
         let mut sym = 0i64;
         assemble_pointwise_broadcast_off(
@@ -230,9 +276,21 @@ fn a_broadcast_last_row_scalar_past_the_end_refuses() {
 #[test]
 fn a_sub_stick_lane_select_stays_legal() {
     let rows = 31u32;
-    let col = rb("t_rinv", RowCount::of_token_rows(rows), BlockCols::of_one_stick(Lanes::FP16));
-    let a = rb("t_x", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
-    let o = rb("t_o", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
+    let col = rb(
+        "t_rinv",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
+    let a = rb(
+        "t_x",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
     let mut sym = 0i64;
     let built = assemble_pointwise_broadcast_off(
         "mul_test",
@@ -259,9 +317,21 @@ fn a_sub_stick_lane_select_stays_legal() {
 #[test]
 fn a_wider_per_row_broadcast_refuses() {
     let rows = 31u32;
-    let wide_col = rb("t_widecol", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(128));
-    let a = rb("t_a", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
-    let o = rb("t_o", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(2048));
+    let wide_col = rb(
+        "t_widecol",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(128),
+    );
+    let a = rb(
+        "t_a",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
+    let o = rb(
+        "t_o",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(2048),
+    );
     let mut sym = 0i64;
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         assemble_pointwise_broadcast_off(
@@ -289,9 +359,21 @@ fn a_wider_per_row_broadcast_refuses() {
 #[test]
 fn an_undeclared_name_refuses_rather_than_bumps() {
     let (rows, cols) = (31u32, 2048u32);
-    let ghost = rb("t4104", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
-    let a = rb("t8", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
-    let o = rb("t9", RowCount::of_token_rows(rows), BlockCols::of_feature_cols(cols));
+    let ghost = rb(
+        "t4104",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
+    let a = rb(
+        "t8",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
+    let o = rb(
+        "t9",
+        RowCount::of_token_rows(rows),
+        BlockCols::of_feature_cols(cols),
+    );
     let layout = layout_placing(&[(8, 126976), (9, 126976)]);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         add(rows, cols, &ghost, &a, &o, Some(&layout))

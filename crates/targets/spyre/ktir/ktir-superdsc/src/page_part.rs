@@ -77,9 +77,7 @@ impl PagePart {
     /// THE LAUNCH'S OWN CURSOR PAGE — the empty part. Every op that is not a cut part: a window
     /// that fits one page, every request-major part, every ordinary op of the body.
     pub const fn at_cursor() -> PagePart {
-        PagePart {
-            slots: Slots::ZERO,
-        }
+        PagePart { slots: Slots::ZERO }
     }
 
     /// THE RELAY MINT — rebuild a part the bake already cut, from its slot count. The

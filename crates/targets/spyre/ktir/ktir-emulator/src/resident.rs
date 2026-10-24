@@ -306,7 +306,7 @@ impl ResidentExecutor {
     ///   weights byte-for-byte lands the f32 word;
     /// * the tid is recorded in the staged map the runner's source dispatch asks
     ///   ([`Self::scale_stage_dtype`]), so a slot the bundle states at f32 is staged as
-      ///   `Arg::TensorBytes` (raw IEEE bits) while every unlisted source keeps the incumbent
+    ///   `Arg::TensorBytes` (raw IEEE bits) while every unlisted source keeps the incumbent
     ///   `Arg::Tensor` f16 fill — byte-identical for every model whose slots are all f16.
     ///
     /// ⛔ THE COLLISION GUARD IS THE POINT, not a nicety. A reserved scale tid that ALSO carries

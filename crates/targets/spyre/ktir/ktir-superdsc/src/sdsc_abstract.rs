@@ -9552,8 +9552,8 @@ pub fn batch_chunk_mask_f16(
             for local in lo..hi {
                 let e = bc.mask_elem(row, r * per + local)?;
                 m[e * 2..e * 2 + 2].copy_from_slice(&zero);
-                lanes[row as usize * slabs
-                    + ((r * per + local) as usize / POOL_STICK as usize)] += 1;
+                lanes[row as usize * slabs + ((r * per + local) as usize / POOL_STICK as usize)] +=
+                    1;
             }
         }
     }

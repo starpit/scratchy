@@ -230,7 +230,11 @@ pub(crate) fn fp8_quantize_descriptors(
                 RowCount::of_token_rows(m),
                 BlockCols::of_one_stick(Lanes::FP16),
             );
-            let a_h = rb(&a_name, RowCount::of_token_rows(m), BlockCols::of_feature_cols(k));
+            let a_h = rb(
+                &a_name,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            );
             // ⛔ ASK THE TILER FIRST — the SAME `reduce_opspec` the emission below builds, never a
             // second LX formula. A time-tiled reduce is UNEMITTABLE for this op class: the DDL's
             // accumulator has OVERWRITE semantics while `rewrite_op_for_time_tile`'s tiled predicate
@@ -401,13 +405,21 @@ pub(crate) fn fp8_quantize_descriptors(
                 layout,
             ));
             // scaled = act·invs; clamp to [-448,448] (torch-spyre's `quantize_fp8_with_scale` ALWAYS clamps).
-            let sc_h = rb(&sc, RowCount::of_token_rows(m), BlockCols::of_feature_cols(k));
+            let sc_h = rb(
+                &sc,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(k),
+            );
             ops.push(pw2(
                 &opn("fq_sc_op"),
                 "mul",
                 m_rows,
                 k_cols,
-                In::full(&rb(&a_name, RowCount::of_token_rows(m), BlockCols::of_feature_cols(k))),
+                In::full(&rb(
+                    &a_name,
+                    RowCount::of_token_rows(m),
+                    BlockCols::of_feature_cols(k),
+                )),
                 In::col(&invs_h),
                 &sc_h,
                 sym_id_base,
@@ -429,7 +441,11 @@ pub(crate) fn fp8_quantize_descriptors(
             // `absx`/`amax`/`amaxfl`'s do above: `BundleLayout::synth` is a bump allocator, so
             // dropping entries would shift every later tensor and confound a coherence comparison
             // with the baseline.
-            let cl_h = rb(&cl, RowCount::of_token_rows(m), BlockCols::of_feature_cols(cl_reach));
+            let cl_h = rb(
+                &cl,
+                RowCount::of_token_rows(m),
+                BlockCols::of_feature_cols(cl_reach),
+            );
             ops.push(pw1(
                 &opn("fq_clip_op"),
                 "clip",
@@ -495,7 +511,11 @@ pub(crate) fn fp8_quantize_descriptors(
                     "qfp8ch",
                     m,
                     k_pad,
-                    &rb(&cl, RowCount::of_token_rows(m), BlockCols::of_feature_cols(k_pad)),
+                    &rb(
+                        &cl,
+                        RowCount::of_token_rows(m),
+                        BlockCols::of_feature_cols(k_pad),
+                    ),
                     &rb_df(
                         &afp8,
                         RowCount::of_token_rows(m),
@@ -545,7 +565,11 @@ pub(crate) fn fp8_quantize_descriptors(
                         "qfp8ch",
                         m,
                         inn_pad,
-                        &rb(&cl, RowCount::of_token_rows(m), BlockCols::of_feature_cols(cl_reach)),
+                        &rb(
+                            &cl,
+                            RowCount::of_token_rows(m),
+                            BlockCols::of_feature_cols(cl_reach),
+                        ),
                         crate::addr::col_of(m, cl_reach, s * inn, Df::Fp16),
                         &rb_df(
                             &afp8,
@@ -653,7 +677,11 @@ pub(crate) fn matmul_fp8_descriptors(
     // byte-identical at decode m=1. `w_scale` is [1,n] per-CHANNEL; for m>1 it broadcasts over the m
     // query rows (`mb`, mirroring rmsnorm's gamma multiply) — a plain `full` would demand m distinct
     // rows from the 1-row w_scale.
-    let ascale_h = rb(&ascale, RowCount::of_token_rows(m), BlockCols::of_one_stick(Lanes::FP16));
+    let ascale_h = rb(
+        &ascale,
+        RowCount::of_token_rows(m),
+        BlockCols::of_one_stick(Lanes::FP16),
+    );
     let raw_h = rb(&raw, m_rows, n_cols);
     let dqa_h = rb(&dqa, m_rows, n_cols);
     ops.push(pw2(

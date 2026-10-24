@@ -1130,10 +1130,7 @@ mod tests {
     /// no resident prefix, and the causal block beside the row carries its lanes.
     #[test]
     fn a_held_row_that_holds_nothing_refuses_and_a_first_chunk_stages() {
-        let sh = ForwardShape {
-            rows: 1,
-            ..shape()
-        };
+        let sh = ForwardShape { rows: 1, ..shape() };
         let step = sh
             .steps()
             .into_iter()
@@ -1235,9 +1232,21 @@ mod tests {
             let by_history = broadcast_prefix_mask(cap, neg, |c| held.contains(&c));
             // The count is the same one fact — INCLUDING ZERO at `start = 0`, the FIRST
             // chunk's legally all-masked prefix row (the mint itself refuses nothing).
-            assert_eq!(by_law.held_columns(), by_history.held_columns(), "cap={cap} start={start}");
-            assert_eq!(by_law.held_columns(), start as u32, "cap={cap} start={start}");
-            assert_eq!(by_law.into_values(), by_history.into_values(), "cap={cap} start={start}");
+            assert_eq!(
+                by_law.held_columns(),
+                by_history.held_columns(),
+                "cap={cap} start={start}"
+            );
+            assert_eq!(
+                by_law.held_columns(),
+                start as u32,
+                "cap={cap} start={start}"
+            );
+            assert_eq!(
+                by_law.into_values(),
+                by_history.into_values(),
+                "cap={cap} start={start}"
+            );
         }
     }
 

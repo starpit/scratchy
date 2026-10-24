@@ -357,14 +357,12 @@ pub(crate) fn run_prefill_batch(
         // ⛔ THE EXTENT IS THE BAKE'S RESERVE, NEVER THE SESSION'S `cap`. The ops sweep the
         // placement's whole width and an additive byte the host never wrote reads as ZERO = VALID,
         // so every swept column gets an explicit value; WHICH value is the request's business.
-        _ => {
-            pf.pmask_slots.map(
-                |cap| scratchy_target_spyre::forward_tape::PrefixSource::BroadcastPrefix {
-                    cap,
-                    holds: |c: usize| decode_prefix_col_valid(c, start),
-                },
-            )
-        }
+        _ => pf.pmask_slots.map(|cap| {
+            scratchy_target_spyre::forward_tape::PrefixSource::BroadcastPrefix {
+                cap,
+                holds: |c: usize| decode_prefix_col_valid(c, start),
+            }
+        }),
     };
     // ⛔ THE STEP EXISTS IFF THE SOURCE DOES, AND THAT IS ONE EXPRESSION, NOT TWO. This was a
     // separately-computed `pmask_slots.is_some() || per_request.is_some()` — the same disjunction
@@ -984,8 +982,8 @@ pub(crate) fn fill_attn_step_inputs(
     nqh: u32,
     rows: AttnStepRows<'_>,
 ) -> ExecutorResult<()> {
-    use scratchy_subtile::sdsc_abstract::attn_step_slots;
     use scratchy_subtile::sdsc_abstract as sd;
+    use scratchy_subtile::sdsc_abstract::attn_step_slots;
     // ⭐ THE GEOMETRY'S ONE DERIVATION ON THIS SIDE: `gqa = nqh / nkvh` — the wiring's head count
     // over the pool's, the fact `PagedKvPool` cannot state alone. A quotient of zero or a
     // non-divisor is a wiring/pool disagreement about the model, not a default to spell.
@@ -1032,14 +1030,14 @@ pub(crate) fn fill_attn_step_inputs(
                          launch's rows are consecutive positions of ONE sequence — the bake and \
                          the host disagree about which body runs",
                         attn_step_slots::REP_ROW_IDS
-                    )))
+                    )));
                 }
                 _ => {
                     return Err(werr(format!(
                         "{what}: this bundle declares a PARTIAL set of attention step inputs — \
                          the three-slot form is all-or-nothing, and an unstaged one reads as \
                          block 0 (ids) or no mask (mask), both fluently wrong"
-                    )))
+                    )));
                 }
             }
             let region =
@@ -1192,11 +1190,7 @@ pub(crate) fn fill_attn_step_inputs(
                     .flat_map(|&r| r.to_le_bytes())
                     .collect::<Vec<u8>>(),
             )?;
-            fill(
-                session,
-                attn_step_slots::MASK,
-                mask.wire_bytes().to_vec(),
-            )?;
+            fill(session, attn_step_slots::MASK, mask.wire_bytes().to_vec())?;
         }
     }
     Ok(())
@@ -1558,7 +1552,9 @@ pub(crate) fn superdsc_forward_chunk(
                 // a second chance to disagree about which body runs.
                 let rung = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(rung_m as u32)
                     .ok_or_else(|| {
-                        werr("superdsc batched prefill: the selected rung has zero rows".to_string())
+                        werr(
+                            "superdsc batched prefill: the selected rung has zero rows".to_string(),
+                        )
                     })?;
                 // ⭐⭐⭐⭐⭐ THE SPLICE'S OWN STEP INPUTS — the block-entry tables and the validity
                 // mask the spliced attention kernel reads, staged through the ONE fill helper in

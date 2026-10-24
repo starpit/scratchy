@@ -35,9 +35,17 @@ fn dense_matmul() -> emit::EmittedOp {
         2048,
         2048,
         1,
-        &emit::rb("a", RowCount::of_token_rows(256), BlockCols::of_feature_cols(2048)),
+        &emit::rb(
+            "a",
+            RowCount::of_token_rows(256),
+            BlockCols::of_feature_cols(2048),
+        ),
         &Stk::<KernelTag>::kernel(2048_usize, 2048_usize, "w"),
-        &emit::rb("o", RowCount::of_token_rows(256), BlockCols::of_feature_cols(2048)),
+        &emit::rb(
+            "o",
+            RowCount::of_token_rows(256),
+            BlockCols::of_feature_cols(2048),
+        ),
         None,
     )
 }
