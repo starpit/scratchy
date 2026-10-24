@@ -43,7 +43,8 @@ use crate::ir::bridge::tiled_op_sdsc_op::{
 };
 use crate::ir::bridge::tiled_op_sdsc_op::{
     assemble_pointwise_broadcast_off_from_tile, assemble_pointwise_seeded_from_tile,
-    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap,
+    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap, RmsnormFacts,
+    RmsnormUnitFacts, TanhsoftcapFacts,
 };
 use crate::ir::island::tile_op::{TileOp, TileOpKind};
 use crate::ktir_node::{Elementwise, KtirNode};
@@ -2371,14 +2372,16 @@ pub fn rmsnorm(
     let gamma = tensors[1].name();
     let t = out.tid;
     Ok(assemble_rmsnorm(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        &gamma,
-        PlaceId::Act(t),
-        &eps_const,
-        ones_const.as_deref(),
+        RmsnormFacts {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            gamma: &gamma,
+            out_id: PlaceId::Act(t),
+            eps_const: &eps_const,
+            ones_const: ones_const.as_deref(),
+        },
         sym_id_base,
         layout,
     ))
@@ -8845,14 +8848,16 @@ pub fn rmsnorm_at(
     let gamma = tensors[1].name();
     let t = out.tid;
     Ok(assemble_rmsnorm(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        &gamma,
-        PlaceId::Act(t),
-        &eps_const,
-        ones_const.as_deref(),
+        RmsnormFacts {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            gamma: &gamma,
+            out_id: PlaceId::Act(t),
+            eps_const: &eps_const,
+            ones_const: ones_const.as_deref(),
+        },
         sym_id_base,
         layout,
     ))
@@ -8896,12 +8901,14 @@ pub fn rmsnorm_unit(
     let x = tensors[0].name();
     let t = out.tid;
     Ok(assemble_rmsnorm_unit(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        PlaceId::Act(t),
-        &eps_const,
+        RmsnormUnitFacts {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: PlaceId::Act(t),
+            eps_const: &eps_const,
+        },
         sym_id_base,
         layout,
     ))
@@ -9253,12 +9260,14 @@ pub fn tanhsoftcap(
     let x = tensors[0].name();
     let t = out.tid;
     Ok(assemble_tanhsoftcap(
-        &format!("o{t}"),
-        rows,
-        cols,
-        &x,
-        PlaceId::Act(t),
-        &cap_const,
+        TanhsoftcapFacts {
+            prefix: &format!("o{t}"),
+            rows,
+            cols,
+            x: &x,
+            out_id: PlaceId::Act(t),
+            cap_const: &cap_const,
+        },
         sym_id_base,
         layout,
     ))

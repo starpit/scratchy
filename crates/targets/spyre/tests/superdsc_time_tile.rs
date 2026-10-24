@@ -31,7 +31,7 @@
 //! which do not build on a plain `cargo test` here.
 
 use ktir_superdsc::emit;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{assemble_reduce, assemble_rmsnorm, RmsnormFacts};
 use scratchy_subtile::sdsc_abstract::{BlockCols, KernelTag, RowCount, Stk};
 use scratchy_subtile::superdsc_opspec::{
     Allocation, DataFormat, Df, FP16_BYTES, Fp16, ItDim, MAX_CORES, MaxCores, OpFunc, Role, Scale,
@@ -253,14 +253,16 @@ fn reduce_and_multiop_invariants() {
     // rmsnorm.rs's module doc): the former `rmsq`+`rmmean` pair is ONE op, 6 → 5.
     let mut sym = 0i64;
     let ops = assemble_rmsnorm(
-        "g",
-        64,
-        576,
-        "x",
-        "w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "g",
+            rows: 64,
+            cols: 576,
+            x: "x",
+            gamma: "w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );
@@ -395,17 +397,19 @@ fn rmsnorm_rinv_is_pinned_lx() {
         let l = layout_for(rows, 576);
         let mut sym = 0i64;
         assemble_rmsnorm(
-            "g",
-            rows,
-            576,
-            "t1",
-            "t2",
-            PlaceId::Act(7),
-            "t3",
-            // The Scale convention — no `γ+1` row, byte-identical to the emission before
-            // the OnePlusScale row existed. The oneplus law has its own golden
-            // (triton-numeric's `rmsnorm_oneplus`).
-            None,
+            RmsnormFacts {
+                prefix: "g",
+                rows,
+                cols: 576,
+                x: "t1",
+                gamma: "t2",
+                out_id: PlaceId::Act(7),
+                eps_const: "t3",
+                // The Scale convention — no `γ+1` row, byte-identical to the emission before
+                // the OnePlusScale row existed. The oneplus law has its own golden
+                // (triton-numeric's `rmsnorm_oneplus`).
+                ones_const: None,
+            },
             &mut sym,
             Some(&l),
         )
@@ -571,14 +575,16 @@ fn norm(
     sym: &mut i64,
 ) -> Vec<emit::EmittedOp> {
     assemble_rmsnorm(
-        prefix,
-        64,
-        576,
-        "t1",
-        "t2",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(out),
-        "t3",
-        None,
+        RmsnormFacts {
+            prefix,
+            rows: 64,
+            cols: 576,
+            x: "t1",
+            gamma: "t2",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(out),
+            eps_const: "t3",
+            ones_const: None,
+        },
         sym,
         Some(l),
     )
@@ -951,14 +957,16 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     //    so its rinv pin is in the table before the chunk's admission consults the slot sum.
     let mut declare_syms = 0i64;
     let _ = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 64,
+            cols: 576,
+            x: &names[0],
+            gamma: &names[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut declare_syms,
         Some(&layout),
     );
@@ -998,14 +1006,16 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     );
     // The trailing norm's REAL pass: the same public lowering, its pin already declared.
     let tail = assemble_rmsnorm(
-        "tail",
-        64,
-        576,
-        &names[0],
-        &names[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 64,
+            cols: 576,
+            x: &names[0],
+            gamma: &names[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut sym,
         Some(&layout),
     );
@@ -1654,14 +1664,16 @@ fn dump_gate_bundles() {
     //     multi-op + broadcast chain (exx2-reduce→add(eps)→rsqrt→broadcast-mul) on-card.
     let mut sym = 0i64;
     let rms = assemble_rmsnorm(
-        "gate",
-        64,
-        576,
-        "rms_x",
-        "rms_w",
-        scratchy_target_spyre::bundle_code::PlaceId::Act(7),
-        "eps",
-        None,
+        RmsnormFacts {
+            prefix: "gate",
+            rows: 64,
+            cols: 576,
+            x: "rms_x",
+            gamma: "rms_w",
+            out_id: scratchy_target_spyre::bundle_code::PlaceId::Act(7),
+            eps_const: "eps",
+            ones_const: None,
+        },
         &mut sym,
         None,
     );

@@ -15,7 +15,9 @@
 //! frontend's share of LX (`FRONTEND_LX_END`), which refuses the 48-, 56- and 64-page rungs.
 
 use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::attn::chunk_prob_pins;
-use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{AttnFacts, assemble_attn, assemble_rmsnorm};
+use ktir_superdsc::ir::bridge::tiled_op_sdsc_op::{
+    assemble_attn, assemble_rmsnorm, AttnFacts, RmsnormFacts,
+};
 use ktir_superdsc::place::{PlaceId, SynthRole};
 use ktir_superdsc::placement::{BundleLayout, LX_PIN_BASE, LX_PIN_END, SegRole, TensorPlacement};
 use ktir_superdsc::sdsc_abstract::{
@@ -347,14 +349,16 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
         }
         let mut declare_syms = 0i64;
         let _ = assemble_rmsnorm(
-            "tail",
-            rows,
-            576,
-            &names[0],
-            &names[1],
-            PlaceId::Act(901),
-            "t902",
-            None,
+            RmsnormFacts {
+                prefix: "tail",
+                rows,
+                cols: 576,
+                x: &names[0],
+                gamma: &names[1],
+                out_id: PlaceId::Act(901),
+                eps_const: "t902",
+                ones_const: None,
+            },
             &mut declare_syms,
             Some(&l),
         );
@@ -383,14 +387,16 @@ fn a_trailing_norms_slot_still_bounds_the_chunk_that_precedes_it() {
     let pins_before = l_at.lx_op_local_pins();
     let mut real_syms = 0i64;
     let tail = assemble_rmsnorm(
-        "tail",
-        2438,
-        576,
-        &names_at[0],
-        &names_at[1],
-        PlaceId::Act(901),
-        "t902",
-        None,
+        RmsnormFacts {
+            prefix: "tail",
+            rows: 2438,
+            cols: 576,
+            x: &names_at[0],
+            gamma: &names_at[1],
+            out_id: PlaceId::Act(901),
+            eps_const: "t902",
+            ones_const: None,
+        },
         &mut real_syms,
         Some(&l_at),
     );

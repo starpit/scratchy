@@ -52,4 +52,7 @@ pub use reduce::{
     reduce_opspec_df, reduce_opspec_off, reduce_opspec_off_divided, win_reduce_accum,
     win_reduce_data,
 };
-pub use rmsnorm::{assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap};
+pub use rmsnorm::{
+    assemble_rmsnorm, assemble_rmsnorm_unit, assemble_tanhsoftcap, RmsnormFacts,
+    RmsnormUnitFacts, TanhsoftcapFacts,
+};
