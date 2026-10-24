@@ -107,7 +107,7 @@ fn a_chunk_rows_count_is_its_own_prefix_of_zero_lanes() {
     // (lane 0 is valid; the count is not the difference but the difference plus one).
     for (t, want) in [6u32, 7, 8, 8].into_iter().enumerate() {
         assert_eq!(
-            mask.row_valid(t).get(),
+            mask.window_valid(t, 0).get(),
             want,
             "window (0,0) row {t}: the causal count is pos+1, clamped to the row's lanes"
         );
@@ -116,7 +116,7 @@ fn a_chunk_rows_count_is_its_own_prefix_of_zero_lanes() {
     // first (the carry's m has been raised by then), and its count is ZERO.
     for t in 0..mq {
         assert_eq!(
-            mask.row_valid(mq + t).get(),
+            mask.window_valid(mq + t, 0).get(),
             0,
             "window (0,1) row {t}: a window past every position counts zero valid lanes"
         );
@@ -124,7 +124,7 @@ fn a_chunk_rows_count_is_its_own_prefix_of_zero_lanes() {
     // EVERY row: its bytes are its count's own prefix — `count` zero lanes, then −65504 to the
     // end. The count and the bytes are one fact; this is the byte-side half of that statement.
     for r in 0..mask.rows() {
-        let k = mask.row_valid(r).get() as usize;
+        let k = mask.window_valid(r, 0).get() as usize;
         let lanes = row_lanes(bytes, r);
         for (c, v) in lanes.iter().enumerate() {
             let want = if c < k {
@@ -176,8 +176,8 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
         // validity stated `gqa` times, so their counts are equal.
         if r % gqa as usize != 0 {
             assert_eq!(
-                mask.row_valid(r).get(),
-                mask.row_valid(r - r % gqa as usize).get(),
+                mask.window_valid(r, 0).get(),
+                mask.window_valid(r - r % gqa as usize, 0).get(),
                 "row {r}: a pre-replicated g-lane must carry its group's own count"
             );
         }
@@ -186,10 +186,10 @@ fn the_batch_family_counts_its_pre_replicated_rows() {
         let zeros = lanes.iter().filter(|&&v| v == half::f16::from_f32(0.0)).count();
         assert_eq!(
             zeros,
-            mask.row_valid(r).get() as usize,
+            mask.window_valid(r, 0).get() as usize,
             "row {r}: bytes and count disagree"
         );
-        let k = mask.row_valid(r).get() as usize;
+        let k = mask.window_valid(r, 0).get() as usize;
         let prefix = lanes.iter().take(k).all(|&v| v == half::f16::from_f32(0.0));
         if k > 0 && !prefix {
             non_prefix += 1;

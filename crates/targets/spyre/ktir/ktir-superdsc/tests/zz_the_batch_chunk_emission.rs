@@ -347,13 +347,18 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
         },
         KvHistory::contiguous(10),
     ];
-    let m = batch_chunk_mask_f16(bc, &hists, -100.0).expect("one history per request row");
+    let mask = batch_chunk_mask_f16(bc, &hists, -100.0).expect("one history per request row");
+    let m = mask.wire_bytes();
     assert_eq!(m.len(), bc.mask_elems() * 2);
     let valid = |row: u32, slot: u32| {
         let e = bc.mask_elem(row, slot).expect("in the block");
         half::f16::from_le_bytes([m[e * 2], m[e * 2 + 1]]).to_f32() == 0.0
     };
     let per = j * 256;
+    // ⭐ THE TALLIES ARE THE BYTES' OWN VALIDITY — derived independently of the minter's runs
+    // walk, at the minter's own (row, 64-lane slab) pitch; every count must agree.
+    let slabs = bc.mask_cols() as usize / 64;
+    let mut tallies = vec![0u32; bc.mask_rows() as usize * slabs];
     for row in 0..bc.mask_rows() {
         let r = row % seqs;
         for slot in 0..bc.mask_cols() {
@@ -365,7 +370,18 @@ fn the_batch_mask_validates_each_row_on_its_own_requests_history_alone() {
                 "row {row} (request {r}) at slot {slot} (request {owner}, local {local})"
             );
             assert!(local < per);
+            if want {
+                tallies[row as usize * slabs + slot as usize / 64] += 1;
+            }
         }
+    }
+    for (flat, &t) in tallies.iter().enumerate() {
+        assert_eq!(
+            mask.window_valid(flat / slabs, flat % slabs).get(),
+            t,
+            "flat window-row {flat}: the count must be the bytes' own validity, minted by the \
+             same runs walk that wrote them"
+        );
     }
     assert!(batch_chunk_mask_f16(bc, &hists[..3], -100.0).is_none());
 }

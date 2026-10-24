@@ -162,16 +162,22 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                 shape,
                 fold,
                 histories,
-            } => Staged::F16(
-                scratchy_subtile::sdsc_abstract::decode_batch_prefix_mask_f16(
+            } => {
+                // ⭐ THE MASK LEAVES ITS MINT AS ONE FACT — bytes and tallies — minted by the same
+                // loop ([`decode_batch_prefix_mask_f16`]). The tallies' reader is the emitter-side
+                // boundary type (the next rung of this contract), so this arm hands the BYTES to
+                // the staging through the by-value exit and the tallies drop HERE, at this door —
+                // said so, rather than by the minter never holding them.
+                let mask = scratchy_subtile::sdsc_abstract::decode_batch_prefix_mask_f16(
                     *shape,
                     *fold,
                     histories,
                     inp.mask_neg,
-                ),
-            ),
-            PrefixSource::Chunk { chunk, histories } => Staged::F16(
-                scratchy_subtile::sdsc_abstract::batch_chunk_mask_f16(
+                );
+                Staged::F16(mask.into_wire_bytes())
+            }
+            PrefixSource::Chunk { chunk, histories } => {
+                let mask = scratchy_subtile::sdsc_abstract::batch_chunk_mask_f16(
                     *chunk,
                     histories,
                     inp.mask_neg,
@@ -182,8 +188,9 @@ pub fn kernel_values<Valid: Fn(usize) -> bool>(
                         histories.len(),
                         chunk.requests()
                     )
-                })?,
-            ),
+                })?;
+                Staged::F16(mask.into_wire_bytes())
+            }
         });
     }
     // ⭐⭐⭐ THE KV BLOCK INDEX, SERVED BEFORE THE f32 TAIL because it is not a float at all: the

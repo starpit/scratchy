@@ -202,13 +202,18 @@ fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
     let declared = per_page
         .declare_to(&mut Walker::default())
         .expect("a test walker never refuses a declaration");
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, declared, &hs, f32::NEG_INFINITY);
+    let mask = decode_batch_prefix_mask_f16::<COLS>(sh, declared, &hs, f32::NEG_INFINITY);
+    let bytes = mask.wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     assert_eq!(
         bytes.len(),
         sh.elems(MaskBlocks::of(per_page)) * 2,
         "the buffer is exactly the collapsed block count"
     );
+    // ⭐ THE TALLIES ARE THE BYTES' OWN VALIDITY — this test derives them independently of the
+    // minter's loop and every (block, row, slab) count must agree, at the minter's own pitch.
+    let (rows, slabs) = (sh.rows().get() as usize, sh.slabs_per_block() as usize);
+    let mut tallies = vec![0u32; MaskBlocks::of(per_page).get() as usize * rows * slabs];
     for (r, h) in hs.iter().enumerate() {
         for p in 0..pages {
             for head in 0..nqh as u32 {
@@ -224,9 +229,21 @@ fn the_collapsed_form_blocks_by_page_and_holds_every_rows_own_history() {
                          a PerPage block must hold EVERY row's own history, so this cell is valid \
                          exactly when request {r} holds that slot"
                     );
+                    if h.contains(slot) {
+                        tallies[(p as usize * rows + row as usize) * slabs
+                            + (c as usize / 64)] += 1;
+                    }
                 }
             }
         }
+    }
+    for (flat, &t) in tallies.iter().enumerate() {
+        assert_eq!(
+            mask.window_valid(flat / slabs, flat % slabs).get(),
+            t,
+            "flat window-row {flat}: the count must be the bytes' own validity, minted by the \
+             same loop that wrote them"
+        );
     }
 }
 
@@ -288,7 +305,8 @@ fn identical<const COLS: u32>(cases: &[(usize, usize, Vec<usize>, usize)]) {
                 declared::<COLS>(cap, hists.len()),
                 &hists,
                 mask_neg
-            ),
+            )
+            .into_wire_bytes(),
             reference_f32_then_narrow::<COLS>(nqh, cap, &hists, mask_neg),
             "nqh={nqh} COLS={COLS} cap={cap} lens={lens:?} steps={steps}"
         );
@@ -336,7 +354,8 @@ fn a_length_would_mark_the_shared_slot_hole_valid() {
         declared::<COLS>(cap, hists.len()),
         &hists,
         mask_neg,
-    );
+    )
+    .into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let (mq, rows) = (hists.len(), nqh * hists.len());
     // ⭐ THE BLOCK IS THE PASS: `(row, page)`, index `r * pages + p`. Request 1's page 0 is block
@@ -394,7 +413,8 @@ fn a_fold_pass_carries_every_request_masked_to_its_own_history() {
         declared::<COLS>(cap, hists.len()),
         &hists,
         mask_neg,
-    );
+    )
+    .into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     // ONE BLOCK PER PASS: `pages * mq` of them, each `(nqh*mq)` rows deep.
     assert_eq!(
@@ -629,7 +649,8 @@ fn padding_row_replicates_live_0(real: usize) {
     // entries in block `(r, p)` against live 0's in block `(0, p)`, over every head and column.
     let sh = shape::<COLS>(nqh, mq);
     let gr = declared::<COLS>(cap, mq);
-    let m = decode_batch_prefix_mask_f16(sh, gr, &rows.mask_histories(), mask_neg);
+    let m =
+        decode_batch_prefix_mask_f16(sh, gr, &rows.mask_histories(), mask_neg).into_wire_bytes();
     let pages = (cap as u32).div_ceil(COLS);
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut valid_seen = 0usize;
@@ -731,7 +752,8 @@ fn report_fully_masked_rows_per_block() {
     let sh = shape::<COLS>(nqh, hs.len());
     let deepest = hs.iter().map(|h| h.end().get()).max().unwrap_or(0) as usize;
     let g = declared::<COLS>(deepest + 1, hs.len());
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, g, &hs, f32::NEG_INFINITY);
+    let bytes =
+        decode_batch_prefix_mask_f16::<COLS>(sh, g, &hs, f32::NEG_INFINITY).into_wire_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let rows = sh.nqh() * sh.mq();
     let blocks = MaskBlocks::of(g.grid()).get();
@@ -959,7 +981,8 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let fold = from_live
         .declare_to(&mut walker)
         .expect("the walker accepts");
-    let bytes = decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg);
+    let bytes =
+        decode_batch_prefix_mask_f16::<COLS>(sh, fold, &rows, mask_neg).into_wire_bytes();
 
     assert_eq!(
         walker.pages(),
@@ -1011,7 +1034,8 @@ fn the_mask_is_blocked_by_the_passes_the_fold_was_declared_to_walk() {
     let mismatched = from_rows
         .declare_to(&mut elsewhere)
         .expect("the walker accepts");
-    let short = decode_batch_prefix_mask_f16::<COLS>(sh, mismatched, &rows, mask_neg);
+    let short =
+        decode_batch_prefix_mask_f16::<COLS>(sh, mismatched, &rows, mask_neg).into_wire_bytes();
     assert!(
         short.len() < bytes.len(),
         "the smaller population stages fewer blocks than the fold steps — the tail passes read bytes \

@@ -5292,7 +5292,8 @@ impl SeqPos {
 ///
 /// Lives here, beside [`decode_prefix_col_valid`], because it is a LAYOUT LAW the emitter and the
 /// worker must agree on, not worker bookkeeping — and because the worker crate has no test target to
-/// pin it from.
+/// pin it from. Returns a [`ValidityMask`]: the bytes TOGETHER with one [`ValidKeys`] tally per
+/// (block, row, 64-lane slab), minted by the same loop, at the slab pitch the fold's `l` sums over.
 pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     // THE SHAPE THE EMITTER WILL READ, not a set of loose extents to re-derive. This is the whole
     // point of `PrefixMaskShape`: the buffer's size, its block stride and its element law all come
@@ -5309,7 +5310,7 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     // said. `len()` is the batch's row count `mq`.
     hists: &[KvHistory],
     mask_neg: f32,
-) -> Vec<u8> {
+) -> ValidityMask {
     // FROM THE SHAPE, not re-derived: `rows / hists.len()` was a third derivation of `nqh`, and it is
     // silently wrong whenever the histories and the shape were built with different `mq`.
     let grid = fold.grid();
@@ -5318,7 +5319,19 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
     let per_page = shape.cols().get();
     let neg = half::f16::from_f32(mask_neg).to_le_bytes();
     let zero = half::f16::from_f32(0.0).to_le_bytes();
-    let mut m: Vec<u8> = neg.repeat(shape.elems(MaskBlocks::of(grid)));
+    let blocks = MaskBlocks::of(grid);
+    let mut m: Vec<u8> = neg.repeat(shape.elems(blocks));
+    // ⭐ THE COUNTS, AT THE SLAB PITCH THE FOLD READS — one lane tally per (block, row, 64-lane
+    // slab) of the buffer, minted by the same loop and the same `contains` test that write the
+    // bytes below: a tally a second derivation produced could disagree with the bytes it claims
+    // to count, which is the one-fact law [`ValidityMask`] exists to state. The tallies' index
+    // law is their OWN — `(block·rows + row)·slabs + col/STICK`, block-major, then row, then the
+    // slab the column reads in — deliberately NOT the bytes' stick-blocked [`PrefixMaskShape::elem`]
+    // flat order (whose `/STICK` projection counts slabs outermost); the counts' order is the one
+    // [`ValidityMask::window_valid`] states.
+    let rows = shape.rows().get() as usize;
+    let slabs = shape.slabs_per_block() as usize;
+    let mut lanes = vec![0u32; blocks.get() as usize * rows * slabs];
     // ⭐ ONE BLOCK PER FOLD PASS, IN THE PASS'S OWN ORDER — and that order is ROW-MAJOR.
     //
     // `fold_plan::fold_pass` maps pass `rep` to `(row, page)` as `rep = r * pages + p`, and
@@ -5351,12 +5364,24 @@ pub fn decode_batch_prefix_mask_f16<const COLS: u32>(
                     if h_r.contains((p * per_page + col) as usize) {
                         let e = shape.elem(block, row, col);
                         m[e * 2..e * 2 + 2].copy_from_slice(&zero);
+                        lanes[(block as usize * rows + row as usize) * slabs
+                            + (col as usize / POOL_STICK as usize)] += 1;
                     }
                 }
             }
         }
     }
-    m
+    let valid = lanes
+        .into_iter()
+        .map(ValidKeys::of)
+        .collect::<Option<Vec<_>>>()
+        .expect("a slab is 64 lanes, so a tally cannot exceed 64");
+    ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::new(slabs as u32)
+            .expect("COLS is a whole number of sticks, so a row spans at least one slab"),
+    }
 }
 
 /// THE PREFILL CAUSAL-MASK EXTENT (mq>1 new-token self-attention block): in a batched prefill of `mq`
@@ -9411,8 +9436,14 @@ pub enum BatchPrefix {
 /// whose request-local slot its history holds, and `mask_neg` everywhere else — every other request's
 /// run, the request's own padded tail, and the hole a shared write slot leaves. `hists` is one history
 /// per request row (padding rows carry live 0's, from the launch's own rows) in row order. `None` on a
-/// history count that is not the batch width.
-pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) -> Option<Vec<u8>> {
+/// history count that is not the batch width. Returns a [`ValidityMask`]: the bytes TOGETHER with one
+/// [`ValidKeys`] tally per (row, 64-lane slab), minted by the same runs walk, at the slab pitch the
+/// body's `l` sums over.
+pub fn batch_chunk_mask_f16(
+    bc: BatchChunk,
+    hists: &[KvHistory],
+    mask_neg: f32,
+) -> Option<ValidityMask> {
     if hists.len() != bc.requests() as usize {
         return None;
     }
@@ -9420,6 +9451,15 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
     let zero = half::f16::from_f32(0.0).to_le_bytes();
     let mut m: Vec<u8> = neg.repeat(bc.mask_elems());
     let per = bc.slots_per_request();
+    // ⭐ THE COUNTS, AT THE SLAB PITCH THE BODY READS — one lane tally per (row, 64-lane slab)
+    // of the ONE block, minted by the same runs walk that writes the bytes below (the one-fact
+    // law: a tally a second derivation produced could disagree with the bytes it counts). The
+    // tallies' index law is their OWN — `row·slabs + slot/STICK`, row-major then the slab (NOT
+    // the bytes' stick-blocked [`BatchChunk::mask_elem`] flat order; [`ValidityMask::window_valid`]
+    // states the counts' order) — and it is per SLAB, not per run, because a run can straddle a
+    // slab boundary, which is exactly the straddle the count must not lose.
+    let slabs = bc.mask_cols() as usize / POOL_STICK as usize;
+    let mut lanes = vec![0u32; bc.mask_rows() as usize * slabs];
     for row in 0..bc.mask_rows() {
         let r = bc.row_request(row);
         let hist = &hists[r as usize];
@@ -9428,10 +9468,22 @@ pub fn batch_chunk_mask_f16(bc: BatchChunk, hists: &[KvHistory], mask_neg: f32) 
             for local in lo..hi {
                 let e = bc.mask_elem(row, r * per + local)?;
                 m[e * 2..e * 2 + 2].copy_from_slice(&zero);
+                lanes[row as usize * slabs
+                    + ((r * per + local) as usize / POOL_STICK as usize)] += 1;
             }
         }
     }
-    Some(m)
+    let valid = lanes
+        .into_iter()
+        .map(ValidKeys::of)
+        .collect::<Option<Vec<_>>>()
+        .expect("a slab is 64 lanes, so a tally cannot exceed 64");
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::new(slabs as u32)
+            .expect("the chunk's slots are whole pages, so a row spans at least one slab"),
+    })
 }
 
 /// ⭐⭐⭐ THE BATCH CHUNK's INDEX TABLE — [`chunk_gather_index_table`] over [`BatchChunk::page_list`],
@@ -11905,6 +11957,13 @@ impl ValidKeys {
 pub struct ValidityMask {
     bytes: Vec<u8>,
     valid: Vec<ValidKeys>,
+    /// ⭐ THE COUNT'S OWN ROW PITCH — how many 64-lane windows one mask row spans. `1` for the
+    /// families whose rows ARE one 64-lane window (the spliced chunk and batch masks); the
+    /// block's slab count for the fold families, whose rows span whole pages. The counts are
+    /// minted at this pitch because it is the pitch the fold's `l` sums over: the emitter reads
+    /// the mask one 64-lane slab at a time, so a count wider than a slab would be a number the
+    /// softmax never adds, and a count narrower would split one reading's lanes across counts.
+    windows_per_row: NonZeroU32,
 }
 
 impl ValidityMask {
@@ -11913,15 +11972,30 @@ impl ValidityMask {
         &self.bytes
     }
 
-    /// How many rows the mask states — `pages·W4·mq` for the chunk family, the pre-replicated
-    /// score-tile row count for the batch family.
-    pub fn rows(&self) -> usize {
-        self.valid.len()
+    /// The same bytes, BY VALUE — the staging exit for a mask whose counts will not be read
+    /// again on this path. The counts drop with the value, so a staging that consumes the bytes
+    /// through this door says so at the call site rather than silently discarding counts a
+    /// later rung of this contract threads onward.
+    pub fn into_wire_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
-    /// One row's valid-lane count.
-    pub fn row_valid(&self, row: usize) -> ValidKeys {
-        self.valid[row]
+    /// The count's row pitch — the 64-lane windows one mask row spans.
+    pub fn windows_per_row(&self) -> NonZeroU32 {
+        self.windows_per_row
+    }
+
+    /// How many rows the mask states — `pages·W4·mq` for the chunk family, the pre-replicated
+    /// score-tile row count for the batch family — blocks folded in, at the family's own row
+    /// order, each row spanning [`Self::windows_per_row`] counts.
+    pub fn rows(&self) -> usize {
+        self.valid.len() / self.windows_per_row.get() as usize
+    }
+
+    /// One (row, 64-lane window) pair's valid-lane count — the counts' own index law,
+    /// `valid[row · windows_per_row + window]`, in the same row order [`Self::rows`] counts.
+    pub fn window_valid(&self, row: usize, window: usize) -> ValidKeys {
+        self.valid[row * self.windows_per_row.get() as usize + window]
     }
 
     /// ⭐ THE SEED-SAFETY LAW, READ OFF THE MINTED COUNTS: the least valid-lane count over the
@@ -11929,8 +12003,9 @@ impl ValidityMask {
     /// chunk family's builder mints, by the theorem its input types state. The batch family's
     /// rows carry their counts so the same reading answers for them too.
     pub fn first_window_valid_keys(&self, mq: NonZeroU32) -> Option<ValidKeys> {
-        let mq = (mq.get() as usize).min(self.valid.len());
-        self.valid[..mq].iter().copied().min()
+        let wpr = self.windows_per_row.get() as usize;
+        let mq = (mq.get() as usize).min(self.valid.len() / wpr);
+        (0..mq).map(|r| self.valid[r * wpr]).min()
     }
 }
 
@@ -12062,7 +12137,13 @@ pub fn spliced_attn_mask_f16(
             m.extend_from_slice(bytes);
         }
     }
-    Some(ValidityMask { bytes: m, valid })
+    // One 64-lane window per row — this family's rows ARE windows, the pitch the counts above
+    // were minted at.
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::MIN,
+    })
 }
 
 /// ⭐⭐⭐⭐⭐ THE BATCHED-DECODE FAMILY'S STEP-INPUT FACTS — what `batched_decode_hm` stated, as
@@ -12274,7 +12355,13 @@ pub fn spliced_decode_mask_f16(
             }
         }
     }
-    Some(ValidityMask { bytes: m, valid })
+    // One 64-lane window per row — the pre-replicated rows ARE windows, the pitch the counts
+    // above were minted at.
+    Some(ValidityMask {
+        bytes: m,
+        valid,
+        windows_per_row: NonZeroU32::MIN,
+    })
 }
 
 #[cfg(kani)]
