@@ -623,7 +623,7 @@ fn rope_append(
     // this bundle paged.
     lk::kv_cache_write(
         lk::KvCacheWrite {
-            t,
+            t: ktir_superdsc::place::PlaceId::Act(t),
             mq: QueryRowCount::of_mq(mq),
             pool: PagedKvPool::new(heads, hd),
             rows_are_requests,

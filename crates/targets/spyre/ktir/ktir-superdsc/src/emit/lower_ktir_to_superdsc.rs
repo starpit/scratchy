@@ -2825,6 +2825,11 @@ pub struct AttnAt<'a> {
 /// by EVERY segment's V view — and `crate::place::act_name(tid)` is the operand spelling every proven
 /// builder agrees on.
 ///
+/// ⭐ THE SIX IDENTITIES ARE [`PlaceId`](crate::place::PlaceId)S, the bake↔host join key — not bare
+/// `u32`s. A number that is NOT a placed tensor's identity (a slot offset, a row index, a cursor)
+/// cannot be handed where one is expected, and the number exits only through `.tid()` at the
+/// binding that spends it.
+///
 /// ⛔ AND THE POSITIONS ARE CROSS-CHECKED AGAINST THE SHAPES THEY MUST HAVE, because a silent
 /// positional slip REPOINTS A TENSOR: `q`/`out` are `[mq, nqh·hd]` and every K/V view is `[·, nkvh·hd]`,
 /// so a q↔kv swap is caught; the two views of one SEGMENT share a row extent while a segment's K and
@@ -2833,15 +2838,15 @@ pub struct AttnAt<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct AttnOperands {
     /// main's `inputs[0]` — the rotated Q.
-    pub q_id: u32,
+    pub q_id: crate::place::PlaceId,
     /// main's `output`.
-    pub out_id: u32,
+    pub out_id: crate::place::PlaceId,
     /// main's `kv.cache_tensor()` / `kv.v_cache_tensor()` — the resident prefix cache, segment 0.
-    pub k_id: u32,
-    pub v_id: u32,
+    pub k_id: crate::place::PlaceId,
+    pub v_id: crate::place::PlaceId,
     /// main's `inputs[3]` / `inputs[4]` — this step's new K and V, the last segment.
-    pub new_k_id: u32,
-    pub new_v_id: u32,
+    pub new_k_id: crate::place::PlaceId,
+    pub new_v_id: crate::place::PlaceId,
     /// The resident cache's structural capacity — the prefix K view's OWN row extent, which is
     /// `ir.tensors[kv.cache_tensor()].rows`, i.e. exactly what main's call site looked up. A
     /// [`SlotCount`](crate::sdsc_abstract::SlotCount): the capacity is a number of KV slots, the
@@ -2984,12 +2989,12 @@ pub fn attn_operands<const NQH: u32, const NKVH: u32, const HD: u32>(
         ));
     }
     Ok(AttnOperands {
-        q_id: q.tid,
-        out_id: out.tid,
-        k_id: kc.tid,
-        v_id: vc.tid,
-        new_k_id: new_k.tid,
-        new_v_id: new_v.tid,
+        q_id: crate::place::PlaceId::Act(q.tid),
+        out_id: crate::place::PlaceId::Act(out.tid),
+        k_id: crate::place::PlaceId::Act(kc.tid),
+        v_id: crate::place::PlaceId::Act(vc.tid),
+        new_k_id: crate::place::PlaceId::Act(new_k.tid),
+        new_v_id: crate::place::PlaceId::Act(new_v.tid),
         cap: crate::sdsc_abstract::SlotCount::new(kc.v_rows),
         k_param,
         mq: crate::sdsc_abstract::QueryRowCount::of_mq(mq),
@@ -4994,7 +4999,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     let ops_in = attn_operands(_name, k, r, geom)?;
     let mq = ops_in.mq.get();
     attn_program_is_flat_in_rows(_name, &k.func, mq, geom.nqh())?;
-    let (k_id, v_id) = (ops_in.k_id, ops_in.v_id);
+    let (k_id, v_id) = (ops_in.k_id.tid(), ops_in.v_id.tid());
     let (nqh, nkvh, hd) = (geom.nqh(), geom.nkvh(), geom.hd());
     let cap = ops_in.cap.get();
     let stick = Fp16::ELEMS_PER_STICK; // 64
@@ -5029,7 +5034,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             "AttnDecode t{}: the program reads {prefix_rows} row(s) of the resident cache t{k_id} \
              whose own view states only {cap} — the capacity read off that view is not the buffer \
              this program addresses.",
-            ops_in.out_id,
+            ops_in.out_id.tid(),
         ));
     }
     // ⭐ THE EXTENT PAIR, MINTED ONCE — storage from the cache's own view, sweep from the
@@ -5082,7 +5087,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                      without one cannot be lowered — unless the bundle's score scale is already \
                      carried by its staged weights (folded into W_q/W_k, or a unit attention \
                      scale), which the caller must then state in `BundleAttnParams::scale_law`.",
-                    ops_in.out_id,
+                    ops_in.out_id.tid(),
                 ),
             });
         }
@@ -5100,7 +5105,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                      that carry the scale (the fold, a unit multiplier) mint the program at 1.0, so \
                      a real multiplier here means the graph and the splice disagreed — emitting the \
                      multiplies would scale weights that already carry the scale.",
-                    ops_in.out_id,
+                    ops_in.out_id.tid(),
                 ),
             });
         }
@@ -5143,7 +5148,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
             return err(format!(
                 "AttnDecode t{}: resident K/V cache [cap={cap}, hd={hd}] physical span {span} B \
                  exceeds the {MAX_SPAN_BYTES} B hardware addressing limit. {split_report}.",
-                ops_in.out_id,
+                ops_in.out_id.tid(),
             ));
         }
     }
@@ -5162,15 +5167,16 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
                      ladder bakes (1, or PagedKvPool::BATCH_RUNGS). The decode width is a const of \
                      the bundle (`Rung<MQ>`); bake a listed rung, or grow the ladder and its \
                      dispatch together.",
-                ops_in.out_id
+                ops_in.out_id.tid()
             ),
         })?;
     let width = bundle_rows.width();
     let mq_pad = width.pad().rows();
-    let t = ops_in.out_id;
-    let q = crate::place::act_name(ops_in.q_id); // roped Q [mq, nqh·hd]
-    let new_k = crate::place::act_name(ops_in.new_k_id); // roped new-K [mq_pad, nkvh·hd] (worker zero-pads rows)
-    let new_v = crate::place::act_name(ops_in.new_v_id); // new-V       [mq_pad, nkvh·hd]
+    let t = ops_in.out_id.tid();
+    let q = crate::place::act_name(ops_in.q_id.tid()); // roped Q [mq, nqh·hd]
+    // roped new-K [mq_pad, nkvh·hd] (worker zero-pads rows)
+    let new_k = crate::place::act_name(ops_in.new_k_id.tid());
+    let new_v = crate::place::act_name(ops_in.new_v_id.tid()); // new-V       [mq_pad, nkvh·hd]
     let kc = crate::place::act_name(k_id); // natural K cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     let vc = crate::place::act_name(v_id); // natural V cache [nqh, cap, hd] (seg2, GQA-replicated, slab-major)
     // ⭐ THE Kᵀ PLANE'S NAME — minted through the reserved binding's own type, so the only tid
@@ -5729,7 +5735,7 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     // ── (4) + (5): the KV cache write and the Kᵀ re-transpose — see [`kv_cache_write`].
     ops.extend(kv_cache_write(
         KvCacheWrite {
-            t,
+            t: ops_in.out_id,
             mq: crate::sdsc_abstract::QueryRowCount::of_mq(mq),
             pool: crate::sdsc_abstract::PagedKvPool::of_geometry(geom),
             rows_are_requests,
@@ -5776,8 +5782,11 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
 /// What one step's KV cache write moves, and between which buffers — everything [`kv_cache_write`]
 /// reads off the attention it closes.
 pub struct KvCacheWrite<'a> {
-    /// The attention's output tensor, which every op's name is suffixed with.
-    pub t: u32,
+    /// The attention's output tensor, which every op's name is suffixed with. ⭐ ITS IDENTITY IS
+    /// [`PlaceId`](crate::place::PlaceId), the bake↔host join key — so this field cannot be handed
+    /// the row index beside it (`row_start`): a cursor or a slot offset does not name a placed
+    /// tensor, and the number exits only through `.tid()`.
+    pub t: crate::place::PlaceId,
     /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's
     /// positions — the one-mint count the scratch doors take, so it cannot be reordered
     /// against the geometry below.
@@ -5847,8 +5856,9 @@ pub fn kv_cache_write(
         ident,
     } = w;
     let stick = Fp16::ELEMS_PER_STICK;
-    // The rows and the geometry, spent through their doors — the values are the ones the
+    // The identity, rows and geometry, spent through their doors — the values are the ones the
     // caller minted, and the body below reads them exactly as it did.
+    let t = t.tid();
     let mq = mq.get();
     let nkvh = pool.nkvh();
     let hd = pool.hd();

@@ -23,7 +23,7 @@ fn write(mq: u32, hd: u32, rows_are_requests: bool) -> Vec<EmittedOp> {
     let mut sym = 0i64;
     kv_cache_write(
         KvCacheWrite {
-            t: 7,
+            t: ktir_superdsc::place::PlaceId::Act(7),
             mq: QueryRowCount::of_mq(mq),
             pool: PagedKvPool::new(NKVH, hd),
             rows_are_requests,

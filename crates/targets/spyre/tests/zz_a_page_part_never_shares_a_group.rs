@@ -69,7 +69,7 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
         let mut sym = 0i64;
         let ops = kv_cache_write(
             KvCacheWrite {
-                t: 7,
+                t: ktir_superdsc::place::PlaceId::Act(7),
                 mq: QueryRowCount::of_mq(512),
                 pool: PagedKvPool::new(8, hd),
                 rows_are_requests: false,
@@ -104,7 +104,7 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
         // And a one-page chunk keeps the launches it always had: no part-1 group at all.
         let one = kv_cache_write(
             KvCacheWrite {
-                t: 7,
+                t: ktir_superdsc::place::PlaceId::Act(7),
                 mq: QueryRowCount::of_mq(256),
                 pool: PagedKvPool::new(8, hd),
                 rows_are_requests: false,
