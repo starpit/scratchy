@@ -852,7 +852,7 @@ fn chunk_index_table(
     what: &str,
     // ⭐ THE POOL'S GEOMETRY, threaded from `Loaded` — `Shared` carries no kv width BY DESIGN (a
     // hybrid-attention arch has no single one), and the pool is the one lawful model-wide use (see
-    // `Loaded::kv_dim`). The same two numbers the batched-decode site reads off the model.
+    // `Loaded::pool`). The same stored pool the batched-decode site reads off the model.
     pool: scratchy_subtile::sdsc_abstract::PagedKvPool,
     session: &SuperDscSession,
     step: scratchy_target_spyre::superdsc_exec::StepBody,
@@ -2477,12 +2477,12 @@ pub(crate) fn run_request_step(
         hidden: model.hidden,
         vocab: model.vocab,
     };
-    // ⭐ THE PAGED-KV POOL'S GEOMETRY — the model's own door (the same one the batched-decode
-    // site reads), threaded to the chunk paths because `Shared` deliberately carries no kv
-    // width: a hybrid-attention arch has no single one, and the pool is the one lawful
-    // model-wide use (see `Loaded::kv_dim`).
+    // ⭐ THE PAGED-KV POOL'S GEOMETRY — the model's own stored pool (the same one the
+    // batched-decode site reads), threaded to the chunk paths because `Shared`
+    // deliberately carries no kv width: a hybrid-attention arch has no single one, and
+    // the pool is the one lawful model-wide use (see `Loaded::pool`).
     #[cfg(feature = "spyre-hw")]
-    let pool = model.pool();
+    let pool = model.pool;
     // A decode step runs on the smallest cap bucket whose capacity covers the last position
     // this step reaches, so a short context pays cap-256 decode cost rather than max-cap.
     // `start + n` (not `pos + 1`) because `b` is fixed for the whole step below.

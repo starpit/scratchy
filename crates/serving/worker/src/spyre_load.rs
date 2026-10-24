@@ -2742,7 +2742,7 @@ impl SpyreWorker {
         let head_dim = hf_config
             .head_dim()
             .ok_or_else(|| werr("config missing head_dim / num_attention_heads"))?;
-        let kv_dim = dparsed.kv_dim; // the info! below prints it on BOTH paths; the Loaded field is spyre-hw-only
+        let kv_dim = dparsed.kv_dim; // the pool mint (spyre-hw) + the info! below (both paths)
         let vocab = dparsed.vocab;
         // ⭐ ROPE θ FROM THE BAKE.
         //
@@ -2815,10 +2815,13 @@ impl SpyreWorker {
             hf_config,
             embed_tokens,
             hidden,
+            // ⭐ THE POOL MINTED ONCE, at the only site the model's own two numbers
+            // arrive — the sanctioned seam (`PagedKvPool::new`, "the seam, u32"):
+            // the per-head group count and the head dim that sizes each entry.
+            // Stored as the pool; the raw pair has no other lawful reader (see
+            // the field).
             #[cfg(feature = "spyre-hw")]
-            head_dim,
-            #[cfg(feature = "spyre-hw")]
-            kv_dim,
+            pool: PagedKvPool::new((kv_dim / head_dim) as u32, head_dim as u32),
             vocab,
             session,
             decode,

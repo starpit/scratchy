@@ -789,11 +789,11 @@ impl Worker for SpyreWorker {
                     hidden: model.hidden,
                     vocab: model.vocab,
                 };
-                // The pool geometry the entry factor needs — the model's own door (its doc
-                // carries why `head_dim` decides the entry size, `hd * 64` elements, and why
-                // no other pool value can stand in). Minted ABOVE the session's `&mut` below:
-                // the door shares the WHOLE model, a borrow that cannot live under that one.
-                let pool = model.pool();
+                // The pool geometry the entry factor needs — the model's own stored pool
+                // (its field doc carries why no other pool value can stand in). A FIELD
+                // read, a disjoint path from the session's `&mut` below — the `&self` door
+                // this replaced shared the whole model and could not live under it.
+                let pool = model.pool;
                 let SendnnSession::SuperDsc(sb) = &mut model.session;
                 // The pool's owner split, once for this launch — the same derivation the host's block
                 // count came from, so a derived page map cannot name a block the host may also hand out.
