@@ -965,8 +965,7 @@ fn the_walk_accepts_a_chunk_program_followed_by_its_trailing_norm() {
     // The chunk: 40 pages, the widest rung the hd128 one-request form admits.
     let geom = AttnGeometry::<NQH, NKVH, HD>::minted();
     let rows = attn_bundle_rows(geom, 1, true).expect("the one-request decode rung");
-    let chunk =
-        ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 40).expect("a chunk");
+    let chunk = ChunkScratch::of_chunk(PagedKvPool::new(NKVH, HD), 40).expect("a chunk");
     let mut sym = 0i64;
     let attn_ops = assemble_attn(
         0,
