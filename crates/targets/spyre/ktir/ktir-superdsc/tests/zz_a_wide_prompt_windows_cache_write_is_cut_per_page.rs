@@ -13,7 +13,7 @@ use ktir_superdsc::emit::EmittedOp;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
 use ktir_superdsc::page_part::Slots;
 use ktir_superdsc::score_scale::NewK;
-use ktir_superdsc::sdsc_abstract::PagedKvPool;
+use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount};
 
 const NKVH: u32 = 8;
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
@@ -24,9 +24,8 @@ fn write(mq: u32, hd: u32, rows_are_requests: bool) -> Vec<EmittedOp> {
     kv_cache_write(
         KvCacheWrite {
             t: 7,
-            mq,
-            nkvh: NKVH,
-            hd,
+            mq: QueryRowCount::of_mq(mq),
+            pool: PagedKvPool::new(NKVH, hd),
             rows_are_requests,
             // The door's own main-call spelling: the window starts at the cursor's row 0.
             row_start: 0,

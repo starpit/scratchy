@@ -505,7 +505,7 @@ fn rope_append(
     layout: Option<&BundleLayout>,
     attn_params: Option<BundleAttnParams>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    use ktir_superdsc::sdsc_abstract::PagedKvPool;
+    use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount};
     // ⛔ THE CONTRACT, CHECKED BEFORE ANYTHING IS EMITTED: six parameters, the four stream
     // operands unstored, the two pool planes stored, and both planes the pool's own
     // `[heads · PLANE_SLOTS, hd]` shape. A program that is not this shape reaching this
@@ -624,9 +624,8 @@ fn rope_append(
     lk::kv_cache_write(
         lk::KvCacheWrite {
             t,
-            mq,
-            nkvh: heads,
-            hd,
+            mq: QueryRowCount::of_mq(mq),
+            pool: PagedKvPool::new(heads, hd),
             rows_are_requests,
             row_start,
             // ⭐ THE WRITE'S K, TYPED BY ITS SCALE LAW — minted from the bundle's own law through

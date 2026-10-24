@@ -5727,9 +5727,8 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
     ops.extend(kv_cache_write(
         KvCacheWrite {
             t,
-            mq,
-            nkvh,
-            hd,
+            mq: crate::sdsc_abstract::QueryRowCount::of_mq(mq),
+            pool: crate::sdsc_abstract::PagedKvPool::of_geometry(geom),
             rows_are_requests,
             // main's own call always wrote the window starting at the cursor's row 0; the
             // rope arm below is the second caller, and it states its node's window.
@@ -5776,10 +5775,13 @@ pub fn attn_at<const NQH: u32, const NKVH: u32, const HD: u32>(
 pub struct KvCacheWrite<'a> {
     /// The attention's output tensor, which every op's name is suffixed with.
     pub t: u32,
-    /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's positions.
-    pub mq: u32,
-    pub nkvh: u32,
-    pub hd: u32,
+    /// The step's query rows: one decode token, a batch's requests, or a prompt chunk's
+    /// positions — the one-mint count the scratch doors take, so it cannot be reordered
+    /// against the geometry below.
+    pub mq: crate::sdsc_abstract::QueryRowCount,
+    /// The pool this write lands in — the geometry as the seam's minted type, not two
+    /// integers this call could reorder against each other or against the rows.
+    pub pool: crate::sdsc_abstract::PagedKvPool,
     /// The rows are a decode batch's requests (one op per request), not one sequence's positions.
     pub rows_are_requests: bool,
     /// ⭐ THE WINDOW'S FIRST ROW, cursor-relative — main's `attn_at` call site always passed the
@@ -5831,8 +5833,7 @@ pub fn kv_cache_write(
     let KvCacheWrite {
         t,
         mq,
-        nkvh,
-        hd,
+        pool,
         rows_are_requests,
         row_start,
         new_k,
@@ -5843,7 +5844,11 @@ pub fn kv_cache_write(
         ident,
     } = w;
     let stick = Fp16::ELEMS_PER_STICK;
-    let pool = crate::sdsc_abstract::PagedKvPool::new(nkvh, hd);
+    // The rows and the geometry, spent through their doors — the values are the ones the
+    // caller minted, and the body below reads them exactly as it did.
+    let mq = mq.get();
+    let nkvh = pool.nkvh();
+    let hd = pool.hd();
     let mut ops: Vec<EmittedOp> = Vec::new();
     let per_request = rows_are_requests && mq > 1;
     // ⛔⛔⛔ AND THE SLAB CANNOT JOIN THAT `y` AXIS — MEASURED ON CARD, NOT INFERRED. The pair

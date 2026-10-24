@@ -16,7 +16,7 @@
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{KvCacheWrite, kv_cache_write};
 use ktir_superdsc::page_part::Slots;
 use ktir_superdsc::score_scale::NewK;
-use ktir_superdsc::sdsc_abstract::PagedKvPool;
+use ktir_superdsc::sdsc_abstract::{PagedKvPool, QueryRowCount};
 
 /// One page, in slots — the cut's own unit.
 const PAGE: u32 = PagedKvPool::PAGE_SLOTS as u32;
@@ -70,9 +70,8 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
         let ops = kv_cache_write(
             KvCacheWrite {
                 t: 7,
-                mq: 512,
-                nkvh: 8,
-                hd,
+                mq: QueryRowCount::of_mq(512),
+                pool: PagedKvPool::new(8, hd),
                 rows_are_requests: false,
                 // The door's own main-call spelling: the window starts at the cursor's row 0.
                 row_start: 0,
@@ -106,9 +105,8 @@ fn a_two_page_chunks_write_is_one_launch_per_part() {
         let one = kv_cache_write(
             KvCacheWrite {
                 t: 7,
-                mq: 256,
-                nkvh: 8,
-                hd,
+                mq: QueryRowCount::of_mq(256),
+                pool: PagedKvPool::new(8, hd),
                 rows_are_requests: false,
                 // The door's own main-call spelling: the window starts at the cursor's row 0.
                 row_start: 0,
