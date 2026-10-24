@@ -1097,7 +1097,11 @@ where
 
 fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
     ctx: &mut EmitCtx<'_>,
-    facts: BlockFacts<'_, NQH, NKVH, HD,
+    facts: BlockFacts<
+        '_,
+        NQH,
+        NKVH,
+        HD,
         impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
         impl Fn(crate::sdsc_abstract::QueryHead, u32) -> crate::addr::DevOff,
     >,
@@ -1114,27 +1118,31 @@ fn assemble_attn_block<const NQH: u32, const NKVH: u32, const HD: u32>(
         qs,
         score_form,
         width,
-        kt: KtLeg {
-            kernel: kt_kernel,
-            stride: kt_stride,
-            off_fn: kt_off_fn,
-        },
-        v: VLeg {
-            kernel: v_kernel,
-            stride: v_stride,
-            off_fn: v_off_fn,
-        },
-        mask: MaskFacts {
-            mask,
-            off: mask_off,
-            bcast: mask_bcast,
-        },
+        kt:
+            KtLeg {
+                kernel: kt_kernel,
+                stride: kt_stride,
+                off_fn: kt_off_fn,
+            },
+        v:
+            VLeg {
+                kernel: v_kernel,
+                stride: v_stride,
+                off_fn: v_off_fn,
+            },
+        mask:
+            MaskFacts {
+                mask,
+                off: mask_off,
+                bcast: mask_bcast,
+            },
         seed,
-        forms: BlockForms {
-            batched,
-            bmm: bmm_form,
-            request_axis,
-        },
+        forms:
+            BlockForms {
+                batched,
+                bmm: bmm_form,
+                request_axis,
+            },
         state,
         bufs,
     } = facts;
