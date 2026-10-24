@@ -9847,7 +9847,10 @@ pub struct GatherScratch {
     /// The row law — see [`GatherRows`] for why the window count is not part of it.
     rows: GatherRows,
     windows: u32,
-    hd: u32,
+    /// ⭐ THE POOL THE SCRATCH WAS MINTED FROM — the geometry every door below reads through the
+    /// pool's own doors (the head dim through [`PagedKvPool::hd`], the block numbering through
+    /// [`PagedKvPool::block_in_page`]), never re-minted from destructured numbers.
+    pool: PagedKvPool,
 }
 
 impl GatherScratch {
@@ -9868,7 +9871,7 @@ impl GatherScratch {
         Some(GatherScratch {
             rows: GatherRows { nkvh, mq: mq.get() },
             windows: windows.get(),
-            hd,
+            pool,
         })
     }
 
@@ -9934,7 +9937,7 @@ impl GatherScratch {
     /// `mb` contributes 1 and `out` the whole row), the copy's `cols`, and the matmuls' `y` step, and
     /// those being one value is what makes the entry a plain global block number.
     pub const fn cols(self) -> u32 {
-        self.hd * POOL_STICK
+        self.pool.hd() * POOL_STICK
     }
 
     /// The whole footprint, in elements — what the synthetic allocator reserves.
@@ -10128,12 +10131,11 @@ impl GatherScratch {
     /// `kvh*hd*PLANE_SLOTS + b*hd*64` and V's at `kvh*hd*PLANE_SLOTS + b*64*hd` — the same block, which
     /// is why one index serves both copies.
     pub fn block_in_page(self, kvh: u32, window: u32) -> Option<u32> {
-        let pool = PagedKvPool::new(self.nkvh(), self.hd as u32);
         // The POOL's own door names the block (one derivation, shared with the spliced fillers);
         // this adds only the scratch's own window bound — how far THIS pass sweeps, the one fact
         // the pool cannot state.
         (kvh < self.nkvh() && window < self.windows)
-            .then(|| pool.block_in_page(kvh, window))
+            .then(|| self.pool.block_in_page(kvh, window))
             .flatten()
     }
 }
