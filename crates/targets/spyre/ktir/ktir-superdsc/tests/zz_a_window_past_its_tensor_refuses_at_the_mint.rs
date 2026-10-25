@@ -179,6 +179,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
     let id = PlaceId::Synth {
         of: 7,
         role: SynthRole::Silu,
+        tile: None,
     };
     layout.synth(id, &[ROWS, COLS]);
     let stk = Stk::<RowBlockedTag>::new(
@@ -195,6 +196,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
     let short = PlaceId::Synth {
         of: 7,
         role: SynthRole::Xc,
+        tile: None,
     };
     layout.synth(short, &[ROWS, COLS / 2]);
     let big_stk = Stk::<RowBlockedTag>::new(
@@ -225,6 +227,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     let core_id = PlaceId::Synth {
         of: 7,
         role: SynthRole::Qs,
+        tile: None,
     };
     layout.synth_lx_core_local(core_id, 256);
     let core_stk =
@@ -247,6 +250,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
     let op_id = PlaceId::Synth {
         of: 7,
         role: SynthRole::KRep,
+        tile: None,
     };
     layout.synth_lx_op_local(op_id, &[1, 128]);
     let op_stk =

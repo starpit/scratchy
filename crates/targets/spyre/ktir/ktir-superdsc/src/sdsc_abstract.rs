@@ -3074,6 +3074,120 @@ impl<K: KindTag> Stk<K> {
     }
 }
 
+/// ⭐ THE PER-TILE fp8 STAGING, CONST-GENERIC ON ITS ROW CLASS — the staging seam's ONE MINT,
+/// as a type. The fp8 GEMM target-ABI row tiling (`work::Fp8GemmRowTiles`, the copied
+/// `_m_tiles` law) quantizes each row tile over its own fresh buffer and the consuming GEMM
+/// reads that same buffer, so the two ends of the seam must agree on the staging's row class.
+/// `R` is a COMPILE-TIME constant of the emission — the ABI's own 1 (decode) or 128 (the
+/// wide tile, `work::FP8_GEMM_WIDE_M`) — so a consumer minted against a different class (a
+/// quant at `Fp8TileStaging<128>` feeding a GEMM door that wants `<1>`, or any future
+/// second spelling of the row count) is a
+/// `cargo build` type error, never a checked equality at bake. This is the typed form of the
+/// reference's layout propagation (`torch_spyre/_inductor/propagate_layouts.py:408`,
+/// `_qfp8ch_stl`: the quant output's layout is inherited by the mm's A, never re-derived).
+///
+/// The handles are the ones the quantize chain minted — names AND `StickLayout`s — so the
+/// consumer's A view is the producer's own, and the dequant's per-row scale read rides the
+/// same mint. Constructed only by this crate's fp8 emission (the writer of the buffers).
+pub struct Fp8TileStaging<const R: u32> {
+    afp8: Stk<RowBlockedTag>,
+    ascale: Stk<RowBlockedTag>,
+}
+
+impl<const R: u32> Fp8TileStaging<R> {
+    /// The staging's row class — the ABI tile width the quant wrote and every consumer must
+    /// read. A const, not an accessor: it is a fact of the type.
+    pub const ROWS: u32 = R;
+
+    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
+    /// wrote it (`row_blocked_df(R, k_pad, Fp8)`).
+    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
+        &self.afp8
+    }
+
+    /// The per-token scale handle — the dequant's row input (`[R, one stick]`).
+    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
+        &self.ascale
+    }
+
+    /// The one constructor — the quantize emission's output mint. Same-crate private by
+    /// design: only this crate's fp8 emission (the writer of the buffers) can state them.
+    ///
+    /// REFUSES a handle whose row count is not `R`: the type's whole claim is that the
+    /// staging's row class is `R`, so a handle minted at another count is the two-ended
+    /// spelling the type exists to make unconstructable — rejected at emission (a `cargo
+    /// build` failure), never a buffer walked at two row classes.
+    pub(crate) fn staged(
+        afp8: Stk<RowBlockedTag>,
+        ascale: Stk<RowBlockedTag>,
+    ) -> Result<Self, String> {
+        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
+            if h.layout().rows as u32 != R {
+                return Err(format!(
+                    "Fp8TileStaging::<{R}>::staged: the {what} handle carries {} rows — the \
+                     staging's row class is {R}, and a handle at another class is exactly the \
+                     writer/reader drift this type refuses",
+                    h.layout().rows
+                ));
+            }
+        }
+        Ok(Self { afp8, ascale })
+    }
+}
+
+/// ⭐ THE NARROW fp8 STAGING — [`Fp8TileStaging`]'s runtime-rows twin, for the narrow
+/// law's ONE part at the padded 128-multiple (S3, `fp8_linear_kernel.py:343-346`): the
+/// extent is a fact of the INPUT (21→128, 192→256 — any 128-multiple), so it is carried
+/// as a [`RowCount`] the constructor pins, not a const generic. Same seam law as the tile
+/// staging: the handles are the quantize chain's own mints, and a handle whose row count
+/// is not the stated extent is exactly the writer/reader drift the type refuses.
+pub struct Fp8NarrowStaging {
+    rows: RowCount,
+    afp8: Stk<RowBlockedTag>,
+    ascale: Stk<RowBlockedTag>,
+}
+
+impl Fp8NarrowStaging {
+    /// The staging's row extent — the padded 128-multiple the quant wrote and every
+    /// consumer must read.
+    pub fn rows(&self) -> RowCount {
+        self.rows
+    }
+
+    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
+    /// wrote it (`row_blocked_df(rows, k_pad, Fp8)`).
+    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
+        &self.afp8
+    }
+
+    /// The per-token scale handle — the dequant's row input (`[rows, one stick]`).
+    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
+        &self.ascale
+    }
+
+    /// The one constructor — the quantize emission's output mint, at the part's stated
+    /// extent. REFUSES a handle whose row count is not that extent, for the same reason
+    /// [`Fp8TileStaging::staged`] refuses one at another class.
+    pub(crate) fn staged(
+        rows: RowCount,
+        afp8: Stk<RowBlockedTag>,
+        ascale: Stk<RowBlockedTag>,
+    ) -> Result<Self, String> {
+        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
+            if h.layout().rows as u32 != rows.get() {
+                return Err(format!(
+                    "Fp8NarrowStaging::staged: the {what} handle carries {} rows — the \
+                     staging's extent is {}, and a handle at another extent is exactly the \
+                     writer/reader drift this type refuses",
+                    h.layout().rows,
+                    rows.get()
+                ));
+            }
+        }
+        Ok(Self { rows, afp8, ascale })
+    }
+}
+
 impl Stk<KernelTag> {
     /// A `Kernel` handle `[in(K), out(N)]` stick-blocked on `out` — INFALLIBLE (the kind is `Kernel`
     /// by construction, so no runtime check / `Result` / unwrap). The compile-time `KernelTag` then
@@ -7089,7 +7203,7 @@ impl PagedKvPool {
     /// use ktir_superdsc::addr::Gqa;
     /// use std::num::NonZeroU32;
     /// for &(nkvh, hd, gqa) in &[(8usize, 64usize, 4usize), (8, 128, 3), (1, 256, 1)] {
-    ///     let p = PagedKvPool::new(nkvh, hd);
+    ///     let p = PagedKvPool::new(nkvh as u32, hd as u32);
     ///     let plane = hd * PagedKvPool::PAGE_SLOTS;
     ///     for qh in 0..nkvh * gqa {
     ///         let head = QueryHead::all(NonZeroU32::new((nkvh * gqa) as u32).unwrap()).nth(qh).unwrap();
@@ -7111,7 +7225,7 @@ impl PagedKvPool {
     ///     // THE HEADS TILE THE PLANE EXACTLY. One head's block is its whole page — `hd * PAGE_SLOTS`
     ///     // — so head `k` ends precisely where head `k+1` begins and there is no request axis in
     ///     // between for a launch to step off the end of.
-    ///     assert_eq!(p.plane_block_elems(), p.hd() * PagedKvPool::PAGE_SLOTS);
+    ///     assert_eq!(p.plane_block_elems(), p.hd() as usize * PagedKvPool::PAGE_SLOTS);
     ///     assert_eq!(nkvh * p.plane_block_elems(), p.plane_stride());
     /// }
     /// ```

@@ -1,0 +1,95 @@
+# PROPOSAL — THE THREE PRE-RSYNC FIXES (ruled 2026-10-25, defect-3 verdict rider)
+
+Bring-for-ruling. NOTHING in this file is landed. Old-text → new-text
+against the tree as it stands (kill r2 landed, all else unchanged). Line
+numbers cite the current file. One cite note: your doctest line numbers
+are off by one from the live tree — `PagedKvPool::new(nkvh, hd)` is at
+`:7205` (not :7206) and the `p.hd()` assertion at `:7227` (not :7228);
+the content each names is unambiguous.
+
+## FIX 1 — drop the unused `Fp8GemmRowTiles` from gather_split_tests' use list
+
+Nothing in the mod names the type (every test goes through the named
+geometries' `plan()`); it fails `-D warnings` (confirmed live by your
+clippy run).
+
+OLD (`work.rs:964-969`):
+```rust
+    use super::{
+        CoreDivision, Fp8GemmRowTiles, Fp8GemmStickGroups, Fp8GemmTileCount, Fp8GemmTileIdx,
+        Fp8RowClass, GatherSplit, Gemma26bGateDecode, Gemma26bGatePrefill, Granite2bOProjPrefill,
+        Granite2bQkvDecode, Granite2bQkvPrefill, InexpressibleNTail, ItDim, NarrowHighUnaligned,
+        NarrowPadded, NarrowSmallM, SubStickContraction,
+    };
+```
+
+NEW:
+```rust
+    use super::{
+        CoreDivision, Fp8GemmStickGroups, Fp8GemmTileCount, Fp8GemmTileIdx, Fp8RowClass,
+        GatherSplit, Gemma26bGateDecode, Gemma26bGatePrefill, Granite2bOProjPrefill,
+        Granite2bQkvDecode, Granite2bQkvPrefill, InexpressibleNTail, ItDim, NarrowHighUnaligned,
+        NarrowPadded, NarrowSmallM, SubStickContraction,
+    };
+```
+
+(rustfmt settles the rewrap of the list.)
+
+## FIX 2 — the stale `planes_tile_the_layer` doctest (pre-existing at HEAD
+since diff 15's u32 intake; confirmed failing: 5 errors, E0308×3 + E0277×2)
+
+Two lines only; every law comment and assertion stays as it stands.
+
+OLD (`sdsc_abstract.rs:7205`):
+```rust
+    ///     let p = PagedKvPool::new(nkvh, hd);
+```
+
+NEW:
+```rust
+    ///     let p = PagedKvPool::new(nkvh as u32, hd as u32);
+```
+
+OLD (`sdsc_abstract.rs:7227`):
+```rust
+    ///     assert_eq!(p.plane_block_elems(), p.hd() * PagedKvPool::PAGE_SLOTS);
+```
+
+NEW:
+```rust
+    ///     assert_eq!(p.plane_block_elems(), p.hd() as usize * PagedKvPool::PAGE_SLOTS);
+```
+
+(If the five errors name any further line beyond these two — e.g. a
+`kt_write_off`/`v_write_off` arg at :7216-7217 — I bring that line too
+rather than widen on my own; your compile leg is the arbiter.)
+
+## FIX 3 — remove `PartialOrd, Ord` from BindCover's derives
+
+Nothing orders BindCover (the three constructing sites pass `Full`;
+`covers()` is the only consumer — your verification). Unconsumed surface
+comes out; a future round that needs ordering re-adds the derive WITH its
+consumer.
+
+OLD (`placement.rs:187-189`):
+```rust
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+```
+
+NEW:
+```rust
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+```
+
+(rustfmt collapses this to the single-line derive — 78 chars, fits.)
+
+## Behavior delta
+
+None on any build path: FIX 1 and FIX 3 remove dead surface (`-D
+warnings` clean, unconsumed derives out); FIX 2 repairs a doctest that
+cannot compile at HEAD, changing no production code. After these land,
+the tree is the clean ruled surface for the ONE rsync → run-48.

@@ -1,0 +1,2845 @@
+diff --git a/crates/compiler/macros/src/ktir_tokens.rs b/crates/compiler/macros/src/ktir_tokens.rs
+index e35c9af05a..45f66f491b 100644
+--- a/crates/compiler/macros/src/ktir_tokens.rs
++++ b/crates/compiler/macros/src/ktir_tokens.rs
+@@ -409,10 +409,17 @@ fn place_id_tokens(
+             let t = proc_macro2::Literal::u32_unsuffixed(t);
+             quote! { __KPlace::Act(#t) }
+         }
+-        PlaceId::Synth { of, role } => {
++        PlaceId::Synth { of, role, tile } => {
+             let of = proc_macro2::Literal::u32_unsuffixed(of);
+             let r = synth_role_tokens(role);
+-            quote! { __KPlace::Synth { of: #of, role: #r } }
++            let tile = match tile {
++                Some(t) => {
++                    let t = proc_macro2::Literal::u32_unsuffixed(t);
++                    quote! { ::core::option::Option::Some(#t) }
++                }
++                None => quote! { ::core::option::Option::None },
++            };
++            quote! { __KPlace::Synth { of: #of, role: #r, tile: #tile } }
+         }
+     }
+ }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/ktir_matmul_fp8.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/ktir_matmul_fp8.rs
+index 378a8655f4..b93ca80788 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/ktir_matmul_fp8.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/ktir_matmul_fp8.rs
+@@ -18,15 +18,19 @@ use super::{
+     assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
+     rb_df, rbo,
+ };
++use crate::addr::{DevOff, Idx, Nest, Row, Slabs};
+ use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
+     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
+ };
+ use crate::place::{PlaceId, SynthRole};
+ use crate::placement::{BundleLayout, syn};
+ use crate::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
+-use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
++use crate::sdsc_abstract::{
++    BlockCols, Fp8NarrowStaging, Fp8TileStaging, KernelTag, Lanes, OperandPlacement, RowCount, Stk,
++};
+ use crate::superdsc_error::SuperDscError;
+ use crate::superdsc_opspec::{DataFormat, Df, Fp16, Role, SdscFoldSet};
++use std::collections::BTreeMap;
+ 
+ /// What the KTIR states about one fp8 W8A8 contraction, recovered from its shapes and parameters.
+ ///
+@@ -48,11 +52,48 @@ pub(crate) struct Fp8Facts {
+     pub out_tid: u32,
+ }
+ 
++/// ⭐ THE QUANT CHAIN'S SOURCE — the activation whole (the dense law) or ONE target-ABI row
++/// tile's fresh clone (the row-tiled law, [`crate::work::Fp8GemmRowTiles`]). The chain is a
++/// pure function of its source's `[rows, k]` window, so ONE body serves both laws; what
++/// changes is WHERE it reads and WHAT its tensors are named — a tile's quant tensors carry
++/// their tile index ([`PlaceId::synth_tiled`]), keyed off the ACTIVATION's id either way
++/// because a tile's staging is a fact of the activation that tiled, and its ops carry the
++/// index in their names. The `quantized` sharing key is the source's own name, so a second
++/// GEMM over the same activation at the same plan reuses one staging instead of
++/// re-quantizing per matmul.
++pub(crate) struct Fp8QuantSource {
++    /// The tensor the chain reads — the activation, or the tile's fp16 clone.
++    pub name: String,
++    /// The id every chain synth derives from — the ACTIVATION's, either way.
++    pub id: PlaceId,
++    /// The rows the source carries — `m`, or the tile's ABI row class.
++    pub rows: u32,
++    /// The tile index when this source is one tile of the row-tiled law (`None` = dense).
++    pub tile: Option<u32>,
++    /// The output tensor's id — the op-name namespace, shared by both laws.
++    pub out_tid: u32,
++}
++
++impl Fp8QuantSource {
++    /// The DENSE law's source — the activation whole, at its own row count.
++    pub(crate) fn activation(facts: &Fp8Facts, m: u32) -> Self {
++        Self {
++            name: facts.a_name.clone(),
++            id: PlaceId::Act(facts.a_tid),
++            rows: m,
++            tile: None,
++            out_tid: facts.out_tid,
++        }
++    }
++}
++
+ /// ⭐⭐⭐ THE SHARED W8A8 ACTIVATION QUANTIZE — the first half of every fp8 matmul door
+ /// (`matmul_fp8_descriptors`'s own body, extracted): `abs → amax → floor → scale → clamp →
+-/// zero-pad → qfp8ch`, over the `[m, k]` activation, ONE scale per token row. The EXPERT door
+-/// calls this DIRECTLY (its per-pair matmuls and flat dequant legs replace the dense body), so
+-/// the two doors share one chain and no op is emitted only to be spliced out — the dense body's
++/// zero-pad → qfp8ch`, over the source's `[rows, k]` window, ONE scale per token row. The EXPERT
++/// door calls this DIRECTLY (its per-pair matmuls and flat dequant legs replace the dense body),
++/// and so does the row-tiled arm — once per tile over the tile's fresh clone (the reference
++/// quantizes AFTER the clone, `fp8_linear_kernel.py:351` then `:33`) — so every door shares one
++/// chain and no op is emitted only to be spliced out — the dense body's
+ /// own `matmulfp8` binds its W as a whole-tensor `[k_pad, n]` view, which against the expert
+ /// door's chunk scratch the synth footprint guard refuses at bake.
+ ///
+@@ -68,14 +109,14 @@ pub(crate) struct Fp8Facts {
+ /// convert stands (byte-identical to the pre-pair emission), and at `pairs == 1` this is the
+ /// dense law verbatim (`cl_reach = k_pad = fp8_k_pad(k)`, one tail window, one convert).
+ pub(crate) fn fp8_quantize_descriptors(
+-    facts: &Fp8Facts,
+-    m: u32,
++    src: &Fp8QuantSource,
+     k: u32,
+     pairs: u32,
+     sym_id_base: &mut i64,
+     layout: Option<&BundleLayout>,
+     quantized: &mut std::collections::HashSet<String>,
+ ) -> Result<Vec<EmittedOp>, SuperDscError> {
++    let m = src.rows;
+     // fp8 W8A8 PREFILL (m>1). torch-spyre's `quantize_fp8_with_scale`
+     // (decompositions.py:966) takes `scale` as an input computed by the CALLER via native `torch.abs` +
+     // `torch.ops.aten.amax` (confirmed via grep — no L2-norm substitute anywhere in torch-spyre); the
+@@ -87,7 +128,7 @@ pub(crate) fn fp8_quantize_descriptors(
+         return Err(SuperDscError(format!(
+             "fp8 quantize t{}: the K axis is {k} lanes over {pairs} pairs — the per-pair tail law \
+              needs a whole lane count per pair",
+-            facts.a_tid
++            src.id.tid()
+         )));
+     }
+     let inn = k / pairs;
+@@ -122,8 +163,8 @@ pub(crate) fn fp8_quantize_descriptors(
+             crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
+         // ⭐ THE NAMES COME FROM THE KTIR'S OWN PARAMETERS — `args[i]` → `wiring::act_name(tid)`, the
+         // same spelling `ds_name` produced for the SubtileIR path.
+-        let a_name = facts.a_name.clone();
+-        let out = crate::place::act_name(facts.out_tid);
++        let a_name = src.name.clone();
++        let out = crate::place::act_name(src.out_tid);
+         use SynthRole as R;
+         // SHARED quant tensors are a pure function of the ACTIVATION (abs→amax→scale→clamp→fp8) — derive
+         // them from the ACTIVATION's id so a second matmul on the same activation resolves the IDENTICAL
+@@ -131,15 +172,26 @@ pub(crate) fn fp8_quantize_descriptors(
+         // tensors (the matmul output `raw` and its dequant `dqa`) derive from the OUTPUT's id — those
+         // belong to the dense body, not this half.
+         // ⭐ THE DOOR: the ids come from the KTIR-recovered facts, not from a `&SubtileNode`. They are
+-        // the same tensor ids either way — `Fp8Facts::a_tid`/`out_tid` are recorded off the program's
++        // the same tensor ids either way — `Fp8QuantSource::id` is recorded off the program's
+         // own views — so the placements these mint are the ones the proven path minted.
+-        let a_id = PlaceId::Act(facts.a_tid);
+-        // The operand SPELLING is a rendering of the id the layout is keyed by, so the op's name and
+-        // the allocator's key cannot drift — they have one preimage.
+-        let qn = |r: R| syn(layout, a_id.synth(r));
++        let a_id = src.id;
++        // ⭐ THE TILE ID MAP — a tiled source wraps EVERY role's id in its tile index
++        // (`synth_tiled`), so a tile's staging tensors are named apart from the activation's
++        // own and from every other tile's; the dense source maps every role to itself
++        // (byte-identical names).
++        let st = |r: R| match src.tile {
++            Some(t) => a_id.synth_tiled(r, t),
++            None => a_id.synth(r),
++        };
++        let qn = |r: R| syn(layout, st(r));
+         // OP names — a DIFFERENT namespace from tensor names (a program's ops are not placed), so
+-        // they stay strings and take no `PlaceId`.
+-        let opn = |s: &str| format!("{out}_{s}");
++        // they stay strings and take no `PlaceId`. A tiled source carries its tile index here too,
++        // BEFORE the trailing `_op` — the tiled arm's one naming law (`fq_tz{t}_op`,
++        // `fq_mm_t{t}_op`) — so a tile's ops are named apart from every other tile's.
++        let opn = |s: &str| match src.tile {
++            Some(t) => format!("{out}_{}_t{t}_op", s.strip_suffix("_op").unwrap_or(s)),
++            None => format!("{out}_{s}"),
++        };
+         let (absx, amax, amaxfl, ascale, invs, sc, chi, cl) = (
+             qn(R::FqAbsX),
+             qn(R::FqAmax),
+@@ -155,17 +207,17 @@ pub(crate) fn fp8_quantize_descriptors(
+             // Footprints are `m` query rows (decode m=1 ⇒ byte-identical to the old `[1,·]`; prefill m>1
+             // reserves the real multi-row extent so a per-row write can't clobber a neighbor row).
+             for r in [R::FqAbsX, R::FqSc, R::FqChi] {
+-                l.synth(a_id.synth(r), &[m, k]);
++                l.synth(st(r), &[m, k]);
+             }
+             // The chain's tail widens to the PAD: `cl` feeds the convert (whose 128-elem stick law
+             // is the reason the pad exists) and `afp8` is the fp8 contraction operand — both are
+             // reserved at the PER-PAIR PADDED width, the one layout the convert, the per-pair
+             // matmul A windows, and the packed weight's K rows all share (`cl` only to its last
+             // convert's REACH — the one-stick overhang the fill below covers).
+-            l.synth(a_id.synth(R::FqCl), &[m, cl_reach]);
+-            l.synth_df(a_id.synth(R::FqAfp8), &[m, k_pad], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
++            l.synth(st(R::FqCl), &[m, cl_reach]);
++            l.synth_df(st(R::FqAfp8), &[m, k_pad], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
+             for r in [R::FqAmax, R::FqAmaxFl, R::FqAscale, R::FqInvS] {
+-                l.synth(a_id.synth(r), &[m, stk]);
++                l.synth(st(r), &[m, stk]);
+             }
+         }
+         let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
+@@ -297,11 +349,11 @@ pub(crate) fn fp8_quantize_descriptors(
+                 // floor, and the max of identical floors is that floor.
+                 let k_part = k / qspt_time;
+                 let partials: Vec<String> = (1..qspt_time)
+-                    .map(|j| syn(layout, a_id.synth(R::FqAmaxP(j))))
++                    .map(|j| syn(layout, st(R::FqAmaxP(j))))
+                     .collect();
+                 if let Some(l) = layout {
+                     for j in 1..qspt_time {
+-                        l.synth(a_id.synth(R::FqAmaxP(j)), &[m, stk]);
++                        l.synth(st(R::FqAmaxP(j)), &[m, stk]);
+                     }
+                 }
+                 for j in 0..qspt_time {
+@@ -595,8 +647,11 @@ pub(crate) fn fp8_quantize_descriptors(
+ /// ⭐⭐⭐ THE PROVEN fp8 W8A8 MATMUL DESCRIPTORS, dense form — the quantize chain (via
+ /// [`fp8_quantize_descriptors`] at `pairs == 1`, the dense law verbatim) plus the dense
+ /// body: `matmulfp8` binding the WHOLE packed weight as one `[k_pad, n]` view, then the
+-/// two dequant legs. The signature is the pre-split one — every caller and test stands.
+-pub(crate) fn matmul_fp8_descriptors(
++/// two dequant legs. This is the single-tile arm of [`matmul_fp8_descriptors`] — the plan's
++/// `tile_count() == 1 ∧ total_rows() == m`, i.e. every decode (m=1) and every narrow
++/// single-tile prefill — byte-identical to the pre-split emission (same ops, same names,
++/// same reservations).
++pub(crate) fn matmul_fp8_dense_descriptors(
+     facts: &Fp8Facts,
+     m: u32,
+     k: u32,
+@@ -605,7 +660,14 @@ pub(crate) fn matmul_fp8_descriptors(
+     layout: Option<&BundleLayout>,
+     quantized: &mut std::collections::HashSet<String>,
+ ) -> Result<Vec<EmittedOp>, SuperDscError> {
+-    let mut ops = fp8_quantize_descriptors(facts, m, k, 1, sym_id_base, layout, quantized)?;
++    let mut ops = fp8_quantize_descriptors(
++        &Fp8QuantSource::activation(facts, m),
++        k,
++        1,
++        sym_id_base,
++        layout,
++        quantized,
++    )?;
+     // ⭐ THE 26b K-PAD (dense form) — the contraction width the packed weight was staged at.
+     let k_pad = crate::work::fp8_k_pad(k);
+     let m_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
+@@ -719,6 +781,798 @@ pub(crate) fn matmul_fp8_descriptors(
+     Ok(ops)
+ }
+ 
++/// ⭐⭐⭐ THE fp8 MATMUL DOOR — ONE entry, TWO laws, and the PLAN picks. `work::Fp8GemmRowTiles`
++/// is the copied `_m_tiles` law (`fp8_linear_kernel.py:70`): a WIDE geometry (max(k,n) ≥ 4096 or
++/// an N the target-ABI set decomposes into more than one tile) rows-tiles the prefill into
++/// target-ABI tiles PADDED UP with zero rows, M=1 stays whole at decode, and a narrow geometry
++/// runs its rows whole. This door is the ONLY spelling of that choice — the dense arm
++/// ([`matmul_fp8_dense_descriptors`], byte-identical to the pre-split emission at every
++/// single-tile geometry) and the row-tiled arm ([`matmul_fp8_row_tiled_descriptors`], the
++/// reference's clone-then-quantize-per-tile) are both behind it, so no caller can reach one
++/// by a second route and the two can never disagree about which law a geometry takes.
++///
++/// ⛔ THE TILED ARM IS THE DEFECT-3 FIX. The dense arm's shared quant staging writes the
++/// activation's fp8 at one walk ({mb:21} — the whole tensor) while its mm read the SAME bytes
++/// at another ({in:4|8, mb:1, out:8|4} — the packed-kernel walk), and at m>1 those two
++/// spellings of the mb axis tear the rows. The tiled arm never shares that staging: each tile
++/// quantizes its OWN fresh `[ROWS, k]` clone, and the mm reads that clone through
++/// [`Fp8TileStaging::<ROWS>`] — the row class is a const generic on the type, so a
++/// writer/reader disagreement is a `cargo build` type error, never a torn read on card.
++pub(crate) fn matmul_fp8_descriptors(
++    facts: &Fp8Facts,
++    m: u32,
++    k: u32,
++    n: u32,
++    sym_id_base: &mut i64,
++    layout: Option<&BundleLayout>,
++    quantized: &mut std::collections::HashSet<String>,
++) -> Result<Vec<EmittedOp>, SuperDscError> {
++    let plan = crate::work::Fp8GemmRowTiles::of(
++        RowCount::of_token_rows(m),
++        BlockCols::of_feature_cols(k),
++        BlockCols::of_feature_cols(n),
++    )
++    .map_err(SuperDscError)?;
++    if plan.tile_count() == crate::work::Fp8GemmTileCount::new(1)
++        && plan.total_rows() == RowCount::of_token_rows(m)
++    {
++        return matmul_fp8_dense_descriptors(facts, m, k, n, sym_id_base, layout, quantized);
++    }
++    // ⭐ THE DISPATCH IS EXHAUSTIVE OVER THE CLASS — exactly two tiled row classes exist,
++    // the enum says so, and a third is a COMPILE ERROR at this match (no catch-all arm, no
++    // dead-looking runtime refusal). Each arm states its own row extent: the wide tile's 4
++    // is a const of the reference's ABI (`_m_tiles`, fp8_linear_kernel.py:76-77), and the
++    // narrow part's padded 128-multiple is a fact of the input carried as a `RowCount`
++    // (S3, :343-346 — one part at ANY multiple, no refusal on M).
++    match plan.row_class() {
++        crate::work::Fp8RowClass::Wide => Fp8TileEmit::<{ crate::work::FP8_GEMM_WIDE_M }>::new(
++            facts,
++            &plan,
++            sym_id_base,
++            layout,
++            quantized,
++        )
++        .emit(),
++        crate::work::Fp8RowClass::Narrow(padded) => {
++            Fp8NarrowEmit::new(facts, &plan, padded, sym_id_base, layout, quantized).emit()
++        }
++    }
++}
++
++/// One stick-group's byte advance in a `[rows, groups, 64]` fp16 nest — the group law
++/// (`g·rows·64` elems) as bytes: the per-trip stride a time-folded fan op carries, minted
++/// from the same footprint law the geometry guard compares against (`synth_footprint_bytes`).
++fn nest_group_stride_bytes(rows: u32, stk: u32) -> i64 {
++    crate::placement::synth_footprint_bytes(&[rows, stk], Df::Fp16) as i64
++}
++
++/// ⭐ ONE TILE'S `matmulfp8` — the dense body's own mm leg at the tile's row class: the SAME
++/// `matmul_opspec_off_operands::<Fp16>` + fp8 `set_df` stamp + `emit_sdsc_tiled`, differing only
++/// in that the A operand name comes from the TYPED staging (so the mm reads exactly the buffer
++/// the tile's quant wrote, at the row class the type states) and the output lands in the tile's
++/// own `[ROWS, n]` raw synth. `ROWS`-wide on purpose: the pad rows quantize to zero (the clone's
++/// zero fill), so their raw rows are written zero — deterministic — and the out-splice copies
++/// only the real rows anyway.
++fn fp8_tile_mm_op<const ROWS: u32>(
++    staging: &Fp8TileStaging<ROWS>,
++    facts: &Fp8Facts,
++    n: u32,
++    k_pad: u32,
++    t: u32,
++    sym_id_base: &mut i64,
++    layout: Option<&BundleLayout>,
++) -> Result<EmittedOp, SuperDscError> {
++    let out = crate::place::act_name(facts.out_tid);
++    let out_id = PlaceId::Act(facts.out_tid);
++    let raw = syn(layout, out_id.synth_tiled(SynthRole::FqRaw, t));
++    if let Some(l) = layout {
++        l.synth(out_id.synth_tiled(SynthRole::FqRaw, t), &[ROWS, n]);
++    }
++    let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
++        // ⭐ M FROM THE TYPE — `Fp8TileStaging::<ROWS>::ROWS`, never a second spelling of the
++        // row count: the staging's class and the mm's M are one fact because they are one type.
++        crate::sdsc_abstract::MatM::of_token_rows(Fp8TileStaging::<ROWS>::ROWS),
++        crate::sdsc_abstract::MatN::of_out_features(n),
++        crate::sdsc_abstract::MatK::of_in_features(k_pad),
++        crate::sdsc_abstract::MatY::unbatched(),
++        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++            bmm_site::TapeLoweringSite::witness(),
++        ),
++        staging.afp8().name(),
++        &facts.w_name,
++        &raw,
++        0,
++        0,
++        0,
++        Df::Fp8,
++    )
++    .map_err(SuperDscError)?;
++    for arg in &mut spec.args {
++        if !matches!(arg.view().role, Role::Output) {
++            arg.set_df(Df::Fp8);
++        }
++    }
++    let folds = SdscFoldSet::new(spec.iter.cores_used());
++    emit_sdsc_tiled(
++        &format!("{out}_fq_mm_t{t}_op"),
++        &spec,
++        &folds,
++        sym_id_base,
++        layout,
++    )
++}
++
++/// ⭐ THE NARROW PART'S `matmulfp8` — `fp8_tile_mm_op`'s runtime-rows twin: the SAME
++/// `matmul_opspec_off_operands::<Fp16>` + fp8 `set_df` stamp + `emit_sdsc_tiled`, with
++/// the A operand name from the narrow staging and M from the staging's OWN extent — the
++/// padded 128-multiple is a fact of the input (S3, `fp8_linear_kernel.py:343-346`), a
++/// `RowCount` on the staging, never a const generic and never re-derived here.
++fn fp8_narrow_mm_op(
++    staging: &Fp8NarrowStaging,
++    facts: &Fp8Facts,
++    n: u32,
++    k_pad: u32,
++    sym_id_base: &mut i64,
++    layout: Option<&BundleLayout>,
++) -> Result<EmittedOp, SuperDscError> {
++    let rows = staging.rows().get();
++    let out = crate::place::act_name(facts.out_tid);
++    let out_id = PlaceId::Act(facts.out_tid);
++    let raw = syn(layout, out_id.synth_tiled(SynthRole::FqRaw, 0));
++    if let Some(l) = layout {
++        l.synth(out_id.synth_tiled(SynthRole::FqRaw, 0), &[rows, n]);
++    }
++    let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
++        // ⭐ M FROM THE STAGING'S OWN EXTENT — the narrow law's padded 128-multiple,
++        // carried by the staging type so the mm's M and the quant's row count are one
++        // fact (the wide twin's `Fp8TileStaging::<ROWS>::ROWS`, at a runtime extent).
++        crate::sdsc_abstract::MatM::of_token_rows(rows),
++        crate::sdsc_abstract::MatN::of_out_features(n),
++        crate::sdsc_abstract::MatK::of_in_features(k_pad),
++        crate::sdsc_abstract::MatY::unbatched(),
++        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++            bmm_site::TapeLoweringSite::witness(),
++        ),
++        staging.afp8().name(),
++        &facts.w_name,
++        &raw,
++        0,
++        0,
++        0,
++        Df::Fp8,
++    )
++    .map_err(SuperDscError)?;
++    for arg in &mut spec.args {
++        if !matches!(arg.view().role, Role::Output) {
++            arg.set_df(Df::Fp8);
++        }
++    }
++    let folds = SdscFoldSet::new(spec.iter.cores_used());
++    emit_sdsc_tiled(
++        &format!("{out}_fq_mm_narrow_op"),
++        &spec,
++        &folds,
++        sym_id_base,
++        layout,
++    )
++}
++
++/// ⭐⭐⭐ THE ROW-TILED LAW'S EMISSION CONTEXT — every fact the tiled arm reads, in ONE
++/// typed argument, with the row class as the const generic: the mm's M, the staging's row
++/// count, and the tile buffers' row extent are ONE fact by type (`Fp8TileStaging::<ROWS>`
++/// refuses any other). Built by the door at the dispatch arm from the PLAN itself (m/k/n
++/// are the plan's own facts; `k_pad` is minted HERE, once, as typed feature-cols — the
++/// single spelling the tile mm and the staging handles consume), so no shape is passed
++/// twice or spelled twice. What the context carries, in order: the KTIR-recovered
++/// contraction facts; the row-tiling plan (the one source of tile windows and stick-group
++/// extents); the activation's real row count; the contraction and output widths; the
++/// contraction width at the packed-kernel pad; and the three emission threads.
++///
++/// ⭐ THE CLONES ARE IDENTITY MATMULS — the card-proven KV-cache-write form
++/// (`assemble_matmul_placed`, `at_head` + `MatY::unbatched()`): one op per stick group,
++/// `N = K = one stick` so the walk never crosses a group boundary, reading the
++/// `[64,64]` identity table the tape's placement pass registers (`identity_tid_of_class`).
++/// Pointwise outputs are column-windowed only (`OutCorner`), which is why the out-splice is
++/// this form too: a matmul output is placed by a LAW (`OperandPlacement`), so the row window
++/// a tile's real rows occupy is expressible here and nowhere else.
++///
++/// ⭐ SHARING: the tile clone/zero/quant legs are keyed by the TILE's own name in `quantized`,
++/// so a second GEMM over the same activation at the same plan (K/V after Q, Up after Gate)
++/// reuses one staging instead of re-quantizing per matmul — the dense law's own sharing,
++/// at tile grain. The reservation carries a GEOMETRY GUARD: `synth` is idempotent per name,
++/// so a second GEMM that re-tiles the same activation at a DIFFERENT row class would
++/// silently reuse the wrong-shaped buffer — the guard compares the reserved footprint
++/// against this plan's and refuses loudly instead.
++struct Fp8TileEmit<'a, const ROWS: u32> {
++    /// The KTIR-recovered contraction facts.
++    facts: &'a Fp8Facts,
++    /// The row-tiling plan — the one source of tile windows and stick-group extents.
++    plan: &'a crate::work::Fp8GemmRowTiles,
++    /// The activation's real row count (the source nest's rows).
++    m: RowCount,
++    /// The contraction width.
++    k: BlockCols,
++    /// The output width.
++    n: BlockCols,
++    /// The contraction width at the packed-kernel pad — minted ONCE, here.
++    k_pad: BlockCols,
++    sym_id_base: &'a mut i64,
++    layout: Option<&'a BundleLayout>,
++    quantized: &'a mut std::collections::HashSet<String>,
++}
++
++impl<'a, const ROWS: u32> Fp8TileEmit<'a, ROWS> {
++    /// The door's arm mints the context from the plan itself — no shape argument exists to
++    /// disagree with the plan, and the row class is the const generic on the type.
++    fn new(
++        facts: &'a Fp8Facts,
++        plan: &'a crate::work::Fp8GemmRowTiles,
++        sym_id_base: &'a mut i64,
++        layout: Option<&'a BundleLayout>,
++        quantized: &'a mut std::collections::HashSet<String>,
++    ) -> Self {
++        Self {
++            facts,
++            plan,
++            m: plan.real_rows(),
++            k: plan.contraction_width(),
++            n: plan.out_width(),
++            k_pad: BlockCols::of_feature_cols(crate::work::fp8_k_pad(
++                plan.contraction_width().get(),
++            )),
++            sym_id_base,
++            layout,
++            quantized,
++        }
++    }
++
++    /// The whole tiled arm — the reference's wide-GEMM form, copied not invented
++    /// (`fp8_linear_kernel.py`): per tile, zero-fill the pad rows (:32), `clone()` the real
++    /// rows into the fresh `[ROWS, k]` buffer (:351), quantize THE CLONE (:33), contract at
++    /// the tile's row class, dequant into a tile-local landing, splice the REAL rows back.
++    fn emit(self) -> Result<Vec<EmittedOp>, SuperDscError> {
++        use SynthRole as R;
++        let Self {
++            facts,
++            plan,
++            m,
++            k,
++            n,
++            k_pad,
++            sym_id_base,
++            layout,
++            quantized,
++        } = self;
++        // ⚠ F2/F3/F4 ROUND re-types these seams (source struct carries the minted tile;
++        // MatM takes RowCount; tiles()/stick-group windows iterate minted values).
++        let (m, k, n, k_pad) = (m.get(), k.get(), n.get(), k_pad.get());
++        let stk = Fp16::ELEMS_PER_STICK; // 64
++        let out = crate::place::act_name(facts.out_tid);
++        let a_id = PlaceId::Act(facts.a_tid);
++        let out_id = PlaceId::Act(facts.out_tid);
++        let r_rows = RowCount::of_token_rows(ROWS);
++        let k_cols = BlockCols::of_feature_cols(k);
++        let n_cols = BlockCols::of_feature_cols(n);
++        let slabs = Slabs::new(1);
++        // ⭐ THE IDENTITY TABLE — the same [`stk`,`stk`] registry entry the card-proven KV-cache
++        // write's clone reads. A tape that registers no hd-`stk` class cannot tile rows: the
++        // refusal names the table, never a fallback copy form (there is none — pointwise outputs
++        // are column-windowed, so the identity matmul is the only placed-row copy this compiler
++        // has).
++        let ident = layout
++            .and_then(|l| l.identity_tid_of_class(stk))
++            .ok_or_else(|| {
++                SuperDscError(format!(
++                    "fp8 matmul {out}: the row-tiled law's clone reads the [{stk},{stk}] identity \
++                 table, and this tape registers no hd-{stk} class — a tape without the table \
++                 cannot tile rows"
++                ))
++            })?;
++        let ident_h = Stk::<KernelTag>::one_stick_identity(crate::place::act_name(ident));
++        let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
++        // ⭐ THE NESTS SPELL THE ROWBLOCKED STICK-GROUP LAW — stick group `g` of every row of a
++        // `[rows, cols]` buffer sits at `g·rows·64`, rows 64 apart within the group. A rank-3
++        // `[row, head, feat]` nest over `[rows, groups, 64]` reproduces it exactly
++        // (`off([r,g,f]) = g·(rows·64) + r·64 + f`), which is what lets ONE `at_head` placement
++        // aim a clone at (row, group) on both sides without any raw address arithmetic.
++        let k_groups = plan.k_stick_groups().get();
++        let n_groups = plan.n_stick_groups().get();
++        let src_nest = Nest::new(&["row", "head", "feat"], &[m, k_groups, stk], Df::Fp16);
++        let tile_nest = Nest::new(&["row", "head", "feat"], &[ROWS, k_groups, stk], Df::Fp16);
++        let landing_nest = Nest::new(&["row", "head", "feat"], &[ROWS, n_groups, stk], Df::Fp16);
++        let out_nest = Nest::new(&["row", "head", "feat"], &[m, n_groups, stk], Df::Fp16);
++        let a_h = rb(&facts.a_name, RowCount::of_token_rows(m), k_cols);
++        let out_h = rb(&out, RowCount::of_token_rows(m), n_cols);
++        let ws_h = rb(&facts.ws_name, RowCount::of_broadcast_row(), n_cols);
++        let mut ops: Vec<EmittedOp> = Vec::new();
++        for t in 0..plan.tile_count().get() {
++            let tile = plan.tile(crate::work::Fp8GemmTileIdx::new(t));
++            let real = tile.real_rows.get();
++            let tile_id = a_id.synth_tiled(R::FqTileRow, t);
++            let tile_name = syn(layout, tile_id);
++            // ⭐ THE GEOMETRY GUARD — `synth` is idempotent per name, so a second GEMM over the
++            // same activation re-resolves the SAME tile names; if it does so at a different row
++            // class (a different plan for the same activation), the footprints disagree and the
++            // reuse is refused here, at bake, rather than silently reading the wrong-shaped clone.
++            if let Some(l) = layout {
++                let want = crate::placement::synth_footprint_bytes(&[ROWS, k], Df::Fp16);
++                if let Some(have) = l.synth.borrow().sizes.get(&tile_name).copied()
++                    && have != want
++                {
++                    return Err(SuperDscError(format!(
++                        "fp8 matmul {out}: tile {t} of activation t{} was already reserved at {have} bytes but \
++                         this plan needs {want} — two GEMMs over one activation at different row \
++                         classes is a plan disagreement; it is not a resize",
++                        facts.a_tid
++                    )));
++                }
++                l.synth(tile_id, &[ROWS, k]);
++            }
++            let tile_h = rb(&tile_name, r_rows, k_cols);
++            if !quantized.contains(&tile_name) {
++                // (1) THE PAD ROWS' ZERO FILL — a broadcast zero (`sub(448,448)`, the quant chain's
++                // own pad-window law) over the WHOLE tile buffer, so the rows the clone below does
++                // not reach (the pad rows, `ROWS − real` of them on the last tile) are written zero
++                // exactly as the reference's zero-padded staging writes them — never-written bytes
++                // are card nondeterminism, and a quantized zero row is the clipMin-floor scale over
++                // a zero activation, the value the reference's own pad rows carry.
++                ops.push(assemble_pointwise_broadcast_off(
++                    PointwiseFacts {
++                        op_name: &format!("{out}_fq_tz{t}_op"),
++                        op_func: "sub",
++                        rows: r_rows,
++                        cols: k_cols,
++                        inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
++                        o: &tile_h,
++                        out_offset: crate::addr::OutCorner::ZERO,
++                    },
++                    sym_id_base,
++                    layout,
++                ));
++                // (2) THE CLONE — ONE identity matmul, TIME-FOLDED over the K stick groups: the
++                // g=0 op at full shape, `time = k_groups`, each fan tensor stepping by its nest's
++                // head stride (`g·rows·64` elems — the group law the nests spell), the identity
++                // table FIXED across trips (empty stride map — `concrete_trips`' no-bump path).
++                // `concrete_trips` lands each trip at exactly the address the per-g ops
++                // carried, so the render's trips are the same ops at the same windows: the fan
++                // is the fold, not new work. (`M = real`; the source has no rows past `m`, so a
++                // full-`ROWS` read would sweep out of footprint. The pad rows keep the zero
++                // fill.)
++                let mut tc = crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
++                    &format!("{out}_fq_tc{t}_op"),
++                    crate::sdsc_abstract::MatM::of_token_rows(real),
++                    crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
++                    crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
++                    crate::sdsc_abstract::MatY::unbatched(),
++                    crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++                        bmm_site::TapeLoweringSite::witness(),
++                    ),
++                    &a_h,
++                    OperandPlacement::at_head(&src_nest, tile.row, 0, 0, slabs),
++                    &ident_h,
++                    DevOff::ZERO,
++                    &tile_h,
++                    OperandPlacement::at_head(&tile_nest, Idx::<Row>::n(0), 0, 0, slabs),
++                    sym_id_base,
++                    layout,
++                );
++                tc.time = k_groups;
++                tc.affine_strides = vec![
++                    BTreeMap::from([("out", nest_group_stride_bytes(m, stk))]),
++                    BTreeMap::new(),
++                    BTreeMap::from([("out", nest_group_stride_bytes(ROWS, stk))]),
++                ];
++                ops.push(tc);
++                // (3) THE QUANT, OVER THE CLONE — the reference quantizes AFTER the clone
++                // (:351 then :33), and so does the law: the chain's source is the tile's fresh
++                // buffer, its tensors carry the tile index, and its ops carry it in their names.
++                ops.extend(fp8_quantize_descriptors(
++                    &Fp8QuantSource {
++                        name: tile_name.clone(),
++                        id: a_id,
++                        rows: ROWS,
++                        tile: Some(t),
++                        out_tid: facts.out_tid,
++                    },
++                    k,
++                    1,
++                    sym_id_base,
++                    layout,
++                    quantized,
++                )?);
++            }
++            // (4) THE TILE'S mm — A comes from the TYPED staging: the row class is on the type, so
++            // the mm's M and the quant's row count are one fact, and a handle at another class is
++            // refused at `staged`.
++            let staging = Fp8TileStaging::<ROWS>::staged(
++                rb_df(
++                    &syn(layout, a_id.synth_tiled(R::FqAfp8, t)),
++                    r_rows,
++                    BlockCols::of_feature_cols(k_pad),
++                    Df::Fp8,
++                ),
++                rb(
++                    &syn(layout, a_id.synth_tiled(R::FqAscale, t)),
++                    r_rows,
++                    BlockCols::of_one_stick(Lanes::FP16),
++                ),
++            )
++            .map_err(SuperDscError)?;
++            ops.push(fp8_tile_mm_op::<ROWS>(
++                &staging,
++                facts,
++                n,
++                k_pad,
++                t,
++                sym_id_base,
++                layout,
++            )?);
++            // (5) THE DEQUANT LEGS — into a TILE-LOCAL landing buffer, not the output: pointwise
++            // outputs are column-windowed only, so a tile's `[ROWS, n]` rows cannot land directly
++            // at `tile.row` of the output; they land in their own buffer and the out-splice below
++            // copies the real rows over. `ROWS`-wide (the mm wrote every row; the pad rows are
++            // zero through the zero scale path), and `In::mb` for the w_scale broadcast — `ROWS >
++            // 1` by this arm's own law (the plan only tiles at multi-row prefill).
++            let raw = syn(layout, out_id.synth_tiled(R::FqRaw, t));
++            let dqa = syn(layout, out_id.synth_tiled(R::FqDqA, t));
++            let landing = syn(layout, out_id.synth_tiled(R::FqTileRow, t));
++            if let Some(l) = layout {
++                l.synth(out_id.synth_tiled(R::FqDqA, t), &[ROWS, n]);
++                l.synth(out_id.synth_tiled(R::FqTileRow, t), &[ROWS, n]);
++            }
++            let raw_h = rb(&raw, r_rows, n_cols);
++            let dqa_h = rb(&dqa, r_rows, n_cols);
++            let landing_h = rb(&landing, r_rows, n_cols);
++            ops.push(pw2(
++                &format!("{out}_fq_dqa_t{t}_op"),
++                "mul",
++                r_rows,
++                n_cols,
++                In::full(&raw_h),
++                In::col(staging.ascale()),
++                &dqa_h,
++                sym_id_base,
++                layout,
++            ));
++            ops.push(pw2(
++                &format!("{out}_fq_dqw_t{t}_op"),
++                "mul",
++                r_rows,
++                n_cols,
++                In::full(&dqa_h),
++                In::mb(&ws_h),
++                &landing_h,
++                sym_id_base,
++                layout,
++            ));
++            // (6) THE OUT-SPLICE — the clone form again, N-side, TIME-FOLDED over the output
++            // stick groups: the c=0 op, `time = n_groups`, the landing side stepping by its
++            // ROWS-row group stride and the output side by its m-row one — the tile's real rows
++            // of each output stick group land at `tile.row` of the output. The union of the
++            // tiles' real rows covers `[0, m)` exactly (the plan's own law), so every output
++            // byte is written — one (tile, stick) trip at a time, as before.
++            let mut to = crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
++                &format!("{out}_fq_to{t}_op"),
++                crate::sdsc_abstract::MatM::of_token_rows(real),
++                crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
++                crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
++                crate::sdsc_abstract::MatY::unbatched(),
++                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++                    bmm_site::TapeLoweringSite::witness(),
++                ),
++                &landing_h,
++                OperandPlacement::at_head(&landing_nest, Idx::<Row>::n(0), 0, 0, slabs),
++                &ident_h,
++                DevOff::ZERO,
++                &out_h,
++                OperandPlacement::at_head(&out_nest, tile.row, 0, 0, slabs),
++                sym_id_base,
++                layout,
++            );
++            to.time = n_groups;
++            to.affine_strides = vec![
++                BTreeMap::from([("out", nest_group_stride_bytes(ROWS, stk))]),
++                BTreeMap::new(),
++                BTreeMap::from([("out", nest_group_stride_bytes(m, stk))]),
++            ];
++            ops.push(to);
++        }
++        Ok(ops)
++    }
++}
++
++/// ⭐⭐⭐ THE NARROW ARM'S EMISSION CONTEXT — `Fp8TileEmit`'s runtime-rows twin, for the
++/// reference's narrow law (S3, `fp8_linear_kernel.py:343-346`): ONE part at the FULL
++/// padded 128-multiple, ANY multiple (21→128, 192→256), no upper bound. The extent is a
++/// runtime `RowCount` — a fact of the input, not of the ABI — so the context carries it
++/// where the wide context carries a const generic (`Fp8TileStaging::<ROWS>` cannot state
++/// it). Every leg is the wide context's own law at the part's extent: zero-fill the pad
++/// rows, clone the real rows, quantize the clone, contract at the staged extent, dequant
++/// into a local landing, splice the REAL rows back — S5's `out[:orig_m]` (`:362-367`).
++/// Sharing and the geometry guard are the wide context's, unchanged: keyed by the part's
++/// own name in `quantized`, footprint-compared at `synth`.
++struct Fp8NarrowEmit<'a> {
++    /// The KTIR-recovered contraction facts.
++    facts: &'a Fp8Facts,
++    /// The row-tiling plan — the one source of stick-group extents.
++    plan: &'a crate::work::Fp8GemmRowTiles,
++    /// The ONE part's row extent — the padded 128-multiple (S3).
++    rows: RowCount,
++    /// The activation's real row count (the source nest's rows, the splice's extent).
++    m: RowCount,
++    /// The contraction width.
++    k: BlockCols,
++    /// The output width.
++    n: BlockCols,
++    /// The contraction width at the packed-kernel pad — minted ONCE, here.
++    k_pad: BlockCols,
++    sym_id_base: &'a mut i64,
++    layout: Option<&'a BundleLayout>,
++    quantized: &'a mut std::collections::HashSet<String>,
++}
++
++impl<'a> Fp8NarrowEmit<'a> {
++    /// The door's arm mints the context from the plan and the class's own extent — no
++    /// shape argument exists to disagree with the plan.
++    fn new(
++        facts: &'a Fp8Facts,
++        plan: &'a crate::work::Fp8GemmRowTiles,
++        rows: RowCount,
++        sym_id_base: &'a mut i64,
++        layout: Option<&'a BundleLayout>,
++        quantized: &'a mut std::collections::HashSet<String>,
++    ) -> Self {
++        Self {
++            facts,
++            plan,
++            rows,
++            m: plan.real_rows(),
++            k: plan.contraction_width(),
++            n: plan.out_width(),
++            k_pad: BlockCols::of_feature_cols(crate::work::fp8_k_pad(
++                plan.contraction_width().get(),
++            )),
++            sym_id_base,
++            layout,
++            quantized,
++        }
++    }
++
++    /// The whole narrow arm — the reference's narrow form, copied not invented: pad the
++    /// rows UP to the 128-multiple with zeros (`:344-345` + `_pad_m`'s materialized zero
++    /// rows, `:266-271`), ONE part (`:346`), quantize the part, contract at its extent,
++    /// dequant, splice the real rows back (`:362-367`).
++    fn emit(self) -> Result<Vec<EmittedOp>, SuperDscError> {
++        use SynthRole as R;
++        let Self {
++            facts,
++            plan,
++            m,
++            rows,
++            k,
++            n,
++            k_pad,
++            sym_id_base,
++            layout,
++            quantized,
++        } = self;
++        let (m, rows, k, n, k_pad) = (m.get(), rows.get(), k.get(), n.get(), k_pad.get());
++        let stk = Fp16::ELEMS_PER_STICK; // 64
++        let out = crate::place::act_name(facts.out_tid);
++        let a_id = PlaceId::Act(facts.a_tid);
++        let out_id = PlaceId::Act(facts.out_tid);
++        let r_rows = RowCount::of_token_rows(rows);
++        let k_cols = BlockCols::of_feature_cols(k);
++        let n_cols = BlockCols::of_feature_cols(n);
++        let slabs = Slabs::new(1);
++        // ⭐ THE IDENTITY TABLE — the same [`stk`,`stk`] registry entry the card-proven KV-cache
++        // write's clone reads. A tape that registers no hd-`stk` class cannot tile rows: the
++        // refusal names the table, never a fallback copy form (there is none — pointwise outputs
++        // are column-windowed, so the identity matmul is the only placed-row copy this compiler
++        // has).
++        let ident = layout
++            .and_then(|l| l.identity_tid_of_class(stk))
++            .ok_or_else(|| {
++                SuperDscError(format!(
++                    "fp8 matmul {out}: the narrow law's clone reads the [{stk},{stk}] identity \
++                 table, and this tape registers no hd-{stk} class — a tape without the table \
++                 cannot run a padded part"
++                ))
++            })?;
++        let ident_h = Stk::<KernelTag>::one_stick_identity(crate::place::act_name(ident));
++        let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
++        // ⭐ THE NESTS SPELL THE ROWBLOCKED STICK-GROUP LAW — stick group `g` of every row of a
++        // `[rows, cols]` buffer sits at `g·rows·64`, rows 64 apart within the group. A rank-3
++        // `[row, head, feat]` nest over `[rows, groups, 64]` reproduces it exactly
++        // (`off([r,g,f]) = g·(rows·64) + r·64 + f`), which is what lets ONE `at_head` placement
++        // aim a clone at (row, group) on both sides without any raw address arithmetic.
++        let k_groups = plan.k_stick_groups().get();
++        let n_groups = plan.n_stick_groups().get();
++        let src_nest = Nest::new(&["row", "head", "feat"], &[m, k_groups, stk], Df::Fp16);
++        let part_nest = Nest::new(&["row", "head", "feat"], &[rows, k_groups, stk], Df::Fp16);
++        let landing_nest = Nest::new(&["row", "head", "feat"], &[rows, n_groups, stk], Df::Fp16);
++        let out_nest = Nest::new(&["row", "head", "feat"], &[m, n_groups, stk], Df::Fp16);
++        let a_h = rb(&facts.a_name, RowCount::of_token_rows(m), k_cols);
++        let out_h = rb(&out, RowCount::of_token_rows(m), n_cols);
++        let ws_h = rb(&facts.ws_name, RowCount::of_broadcast_row(), n_cols);
++        let mut ops: Vec<EmittedOp> = Vec::new();
++        // THE ONE PART — tile index 0: the narrow law has exactly one row part (`:346`,
++        // `m_parts = [padded]`), so the staging names carry t0 and the geometry guard pins
++        // the part's footprint exactly as a wide tile's.
++        let t = 0u32;
++        let tile_id = a_id.synth_tiled(R::FqTileRow, t);
++        let tile_name = syn(layout, tile_id);
++        // ⭐ THE GEOMETRY GUARD — `synth` is idempotent per name, so a second GEMM over the
++        // same activation re-resolves the SAME part names; if it does so at a different row
++        // class (a different plan for the same activation), the footprints disagree and the
++        // reuse is refused here, at bake, rather than silently reading the wrong-shaped part.
++        if let Some(l) = layout {
++            let want = crate::placement::synth_footprint_bytes(&[rows, k], Df::Fp16);
++            if let Some(have) = l.synth.borrow().sizes.get(&tile_name).copied()
++                && have != want
++            {
++                return Err(SuperDscError(format!(
++                    "fp8 matmul {out}: part t{t} of activation t{} was already reserved at {have} bytes but \
++                     this plan needs {want} — two GEMMs over one activation at different row \
++                     classes is a plan disagreement; it is not a resize",
++                    facts.a_tid
++                )));
++            }
++            l.synth(tile_id, &[rows, k]);
++        }
++        let tile_h = rb(&tile_name, r_rows, k_cols);
++        if !quantized.contains(&tile_name) {
++            // (1) THE PAD ROWS' ZERO FILL — a broadcast zero (`sub(448,448)`, the quant chain's
++            // own pad-window law) over the WHOLE part buffer, so the rows the clone below does
++            // not reach (the pad rows, `rows − m` of them) are written zero exactly as the
++            // reference's `_pad_m` materializes them (`:266-271`, `:344-345`) — never-written
++            // bytes are card nondeterminism, and a quantized zero row is the clipMin-floor
++            // scale over a zero activation, the value the reference's own pad rows carry.
++            ops.push(assemble_pointwise_broadcast_off(
++                PointwiseFacts {
++                    op_name: &format!("{out}_fq_tz{t}_op"),
++                    op_func: "sub",
++                    rows: r_rows,
++                    cols: k_cols,
++                    inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
++                    o: &tile_h,
++                    out_offset: crate::addr::OutCorner::ZERO,
++                },
++                sym_id_base,
++                layout,
++            ));
++            // (2) THE CLONE — one identity matmul per stick group, copying the part's REAL rows
++            // (`M = m`; the source has no rows past `m`, so a full-`rows` read would sweep out
++            // of footprint). The pad rows keep the zero fill.
++            for g in 0..k_groups {
++                ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
++                    &format!("{out}_fq_tc{t}g{g}_op"),
++                    crate::sdsc_abstract::MatM::of_token_rows(m),
++                    crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
++                    crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
++                    crate::sdsc_abstract::MatY::unbatched(),
++                    crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++                        bmm_site::TapeLoweringSite::witness(),
++                    ),
++                    &a_h,
++                    OperandPlacement::at_head(&src_nest, Idx::<Row>::n(0), g, 0, slabs),
++                    &ident_h,
++                    DevOff::ZERO,
++                    &tile_h,
++                    OperandPlacement::at_head(&part_nest, Idx::<Row>::n(0), g, 0, slabs),
++                    sym_id_base,
++                    layout,
++                ));
++            }
++            // (3) THE QUANT, OVER THE PART — the reference quantizes the padded part whole
++            // (`xi = x2d[i:i+mt].clone()` at `mt` = the padded extent, `:350-351`), pad rows
++            // included: they quantize to zero, exactly the wide path's own pad law.
++            ops.extend(fp8_quantize_descriptors(
++                &Fp8QuantSource {
++                    name: tile_name.clone(),
++                    id: a_id,
++                    rows,
++                    tile: Some(t),
++                    out_tid: facts.out_tid,
++                },
++                k,
++                1,
++                sym_id_base,
++                layout,
++                quantized,
++            )?);
++        }
++        // (4) THE PART'S mm — A comes from the TYPED staging: the extent is on the staging,
++        // so the mm's M and the quant's row count are one fact, and a handle at another
++        // extent is refused at `staged`.
++        let staging = Fp8NarrowStaging::staged(
++            r_rows,
++            rb_df(
++                &syn(layout, a_id.synth_tiled(R::FqAfp8, t)),
++                r_rows,
++                BlockCols::of_feature_cols(k_pad),
++                Df::Fp8,
++            ),
++            rb(
++                &syn(layout, a_id.synth_tiled(R::FqAscale, t)),
++                r_rows,
++                BlockCols::of_one_stick(Lanes::FP16),
++            ),
++        )
++        .map_err(SuperDscError)?;
++        ops.push(fp8_narrow_mm_op(
++            &staging,
++            facts,
++            n,
++            k_pad,
++            sym_id_base,
++            layout,
++        )?);
++        // (5) THE DEQUANT LEGS — into a PART-LOCAL landing buffer, not the output: pointwise
++        // outputs are column-windowed only, so the part's `[rows, n]` rows cannot land
++        // directly in the output; they land in their own buffer and the out-splice below
++        // copies the real rows over. `rows`-wide (the mm wrote every row; the pad rows are
++        // zero through the zero scale path), and `In::mb` for the w_scale broadcast.
++        let raw = syn(layout, out_id.synth_tiled(R::FqRaw, t));
++        let dqa = syn(layout, out_id.synth_tiled(R::FqDqA, t));
++        let landing = syn(layout, out_id.synth_tiled(R::FqTileRow, t));
++        if let Some(l) = layout {
++            l.synth(out_id.synth_tiled(R::FqDqA, t), &[rows, n]);
++            l.synth(out_id.synth_tiled(R::FqTileRow, t), &[rows, n]);
++        }
++        let raw_h = rb(&raw, r_rows, n_cols);
++        let dqa_h = rb(&dqa, r_rows, n_cols);
++        let landing_h = rb(&landing, r_rows, n_cols);
++        ops.push(pw2(
++            &format!("{out}_fq_dqa_t{t}_op"),
++            "mul",
++            r_rows,
++            n_cols,
++            In::full(&raw_h),
++            In::col(staging.ascale()),
++            &dqa_h,
++            sym_id_base,
++            layout,
++        ));
++        ops.push(pw2(
++            &format!("{out}_fq_dqw_t{t}_op"),
++            "mul",
++            r_rows,
++            n_cols,
++            In::full(&dqa_h),
++            In::mb(&ws_h),
++            &landing_h,
++            sym_id_base,
++            layout,
++        ));
++        // (6) THE OUT-SPLICE — the clone form again, N-side: the part's REAL rows (`m` of
++        // them — S5's `out[:orig_m].clone()`, `:362-367`) of each output stick group land
++        // at row 0 of the output. The part starts at row 0 (`m_parts = [padded]`, one part),
++        // and exactly `[0, m)` is written — the pad rows never reach the output.
++        for c in 0..n_groups {
++            ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
++                &format!("{out}_fq_to{t}c{c}_op"),
++                crate::sdsc_abstract::MatM::of_token_rows(m),
++                crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
++                crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
++                crate::sdsc_abstract::MatY::unbatched(),
++                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
++                    bmm_site::TapeLoweringSite::witness(),
++                ),
++                &landing_h,
++                OperandPlacement::at_head(&landing_nest, Idx::<Row>::n(0), c, 0, slabs),
++                &ident_h,
++                DevOff::ZERO,
++                &out_h,
++                OperandPlacement::at_head(&out_nest, Idx::<Row>::n(0), c, 0, slabs),
++                sym_id_base,
++                layout,
++            ));
++        }
++        Ok(ops)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -755,9 +1609,23 @@ mod tests {
+         place(8, n, k, SegRole::Weight, &mut l); // the fp8 weight (fp16-sized reservation is fine)
+         place(9, 1, n, SegRole::Activation, &mut l); // w_scale
+         place(10, m, n, SegRole::Activation, &mut l); // out_tid
++        place(11, m, n, SegRole::Activation, &mut l); // a second GEMM's out_tid (the sharing tests)
+         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
+             place(tid, 1, Fp16::ELEMS_PER_STICK, SegRole::Activation, &mut l);
+         }
++        // ⭐ THE IDENTITY TABLE — the row-tiled law's clone reads the same `[64,64]` registry
++        // entry the card-proven KV-cache write's clone does: one attention class at hd=64,
++        // class 0 = `IDENTITY_TID` (the widest). Placed LAST so no earlier tensor's absolute
++        // offset moves — the per-pair tail tests read address DELTAS, and those must stay
++        // pinned to the tail law alone.
++        l.attn_class_hds = vec![Fp16::ELEMS_PER_STICK];
++        place(
++            crate::reserved_tids::IDENTITY_TID,
++            Fp16::ELEMS_PER_STICK,
++            Fp16::ELEMS_PER_STICK,
++            SegRole::Activation,
++            &mut l,
++        );
+         l
+     }
+ 
+@@ -785,13 +1653,25 @@ mod tests {
+     /// `out`, so `rewrite_op_for_time_tile` strides them per trip and the bake accepts them. A
+     /// REDUCE accum is `RedStick` — exempt from the stride — which is the defect class, so the
+     /// reduce is what this pins.)
++    /// The reduce law belongs to the CHAIN, so this pins it with a direct chain call — the
++    /// door itself rows-tiles this geometry now (`work::Fp8GemmRowTiles`: k ≥ 4096 is wide),
++    /// and the tile's own quant runs at the ABI row class where the budget is never in
++    /// question. The chain still serves callers at whole-tensor row counts (the expert
++    /// door's per-chunk activations), so the single-shot law is pinned where it lives.
+     #[test]
+     fn the_quant_reduce_at_an_lx_overflowing_geometry_stays_single_shot() {
+         let (m, k, n) = (1024u32, 16384, 128);
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+-            .expect("the wide-geometry fp8 chain emits");
++        let ops = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), m),
++            k,
++            1,
++            &mut 0,
++            Some(&l),
++            &mut quantized,
++        )
++        .expect("the wide-geometry fp8 chain emits");
+         // The chain's ONE reduce — the fused quantscalepertokenfp8 — must be single-shot.
+         let tiled: Vec<&str> = ops
+             .iter()
+@@ -832,8 +1712,15 @@ mod tests {
+         let (m, k, n) = (71u32, 15360, 3840);
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+-        let ops = fp8_quantize_descriptors(&facts(), m, k, 1, &mut 0, Some(&l), &mut quantized)
+-            .expect("the fused-overflowing fp8 quant chain emits");
++        let ops = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), m),
++            k,
++            1,
++            &mut 0,
++            Some(&l),
++            &mut quantized,
++        )
++        .expect("the fused-overflowing fp8 quant chain emits");
+         assert!(
+             ops.iter()
+                 .all(|o| !o.op_name.contains("fq_qspt") || o.time == 1),
+@@ -864,10 +1751,11 @@ mod tests {
+     /// ⭐ THE FITTING CASE IS ONE FUSED OP: at a geometry the tiler passes (decode m=1, and
+     /// every granite fp8 prefill), the quant chain's amax is the ONE `fq_qspt_op` and NO
+     /// explicit amax-family op exists. Pins that no partial path can fire where the fused op
+-    /// was correct.
++    /// was correct. (m=4 keeps the door on its DENSE arm — `Fp8GemmRowTiles`'s small-M law
++    /// runs rows ≤ 4 whole — so this pins the chain the shipped bundles run.)
+     #[test]
+     fn the_quant_chain_at_a_fitting_geometry_is_one_fused_op() {
+-        let (m, k, n) = (32u32, 2048, 128);
++        let (m, k, n) = (4u32, 2048, 128);
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+@@ -959,9 +1847,11 @@ mod tests {
+     /// ⭐ THE ALIGNED CASE IS BYTE-IDENTICAL: at a 128-aligned k (every earlier fp8 model), no
+     /// zero-fill op exists, no widened reservation exists, and the chain is exactly the ops the
+     /// pre-pad emitter produced. Pins that the pad cannot fire where the width was already legal.
++    /// (m=128 keeps the door on its DENSE arm — `Fp8GemmRowTiles`'s narrow law runs a
++    /// 128-aligned row count whole.)
+     #[test]
+     fn an_aligned_k_emits_no_pad_op_and_no_widened_reservation() {
+-        let (m, k, n) = (32u32, 2048, 128);
++        let (m, k, n) = (128u32, 2048, 128);
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+@@ -982,27 +1872,6 @@ mod tests {
+         );
+     }
+ 
+-    /// ⭐⭐⭐⭐⭐ THE 26b UP/GATE GEMM: k=2816 (128-ALIGNED) but n=2112 (16.5 fp8 KERNEL sticks).
+-    /// The packed fp8 weight is `[n, k]` sticked on `out` (= n) — `view_stick_layout`'s
+-    /// `DeviceTileLayout::<Fp8>` guard (emit/mod.rs) refuses a non-128-multiple OUT the same way
+-    /// the convert refused a non-128-multiple K. This test REPRODUCES the pod panic locally:
+-    /// the phase-2 build died at `matmul_s20` (the 26b gate projection) with exactly this
+-    /// geometry, while the DOWN gemm (k=2112, n=2816) — the geometry the K-pad test covers —
+-    /// was already fixed by the K-pad commit.
+-    #[test]
+-    fn the_26b_n2112_packed_kernel_out_stick() {
+-        let (m, k, n) = (1u32, 2816, 2112);
+-        let l = fp8_layout(m, k, n);
+-        let mut quantized = std::collections::HashSet::new();
+-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+-            .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
+-        assert!(
+-            !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
+-            "an aligned k needs no K-pad"
+-        );
+-        let _ = ops;
+-    }
+-
+     /// An operand's own HBM start (core 0's allocate-node address for the binding whose buffer
+     /// matches `needle`), in BYTES — `resolve_seg_base` folds each arg's `offset_elems` into the
+     /// segment base, so the DELTAS between ops reading the same buffer at different offsets are
+@@ -1054,8 +1923,15 @@ mod tests {
+         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+-        let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
+-            .expect("the per-pair tail emits at the 26b DOWN geometry");
++        let ops = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), m),
++            k,
++            pairs,
++            &mut 0,
++            Some(&l),
++            &mut quantized,
++        )
++        .expect("the per-pair tail emits at the 26b DOWN geometry");
+         // EIGHT converts, named per pair.
+         let first = ops
+             .iter()
+@@ -1158,8 +2034,15 @@ mod tests {
+         let k = pairs * inn;
+         let l = fp8_layout(m, k, n);
+         let mut quantized = std::collections::HashSet::new();
+-        let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
+-            .expect("the aligned-inn pair chain emits");
++        let ops = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), m),
++            k,
++            pairs,
++            &mut 0,
++            Some(&l),
++            &mut quantized,
++        )
++        .expect("the aligned-inn pair chain emits");
+         assert_eq!(
+             ops.iter()
+                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
+@@ -1202,7 +2085,14 @@ mod tests {
+     fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill() {
+         let l = fp8_layout(1, 9, 128);
+         let mut quantized = std::collections::HashSet::new();
+-        let e = fp8_quantize_descriptors(&facts(), 1, 9, 2, &mut 0, Some(&l), &mut quantized);
++        let e = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), 1),
++            9,
++            2,
++            &mut 0,
++            Some(&l),
++            &mut quantized,
++        );
+         assert!(
+             e.is_err(),
+             "k=9 over pairs=2 has no whole lane count per pair — a typed refusal, not a bake"
+@@ -1219,9 +2109,15 @@ mod tests {
+         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
+         let l2 = fp8_layout(m, k, 128);
+         let mut quantized2 = std::collections::HashSet::new();
+-        let ops2 =
+-            fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l2), &mut quantized2)
+-                .expect("the half-stick tail emits at m>1 — the per-slot §4.5 arms");
++        let ops2 = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), m),
++            k,
++            pairs,
++            &mut 0,
++            Some(&l2),
++            &mut quantized2,
++        )
++        .expect("the half-stick tail emits at m>1 — the per-slot §4.5 arms");
+         assert_eq!(
+             ops2.iter()
+                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
+@@ -1319,9 +2215,15 @@ mod tests {
+         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
+         let l3 = fp8_layout(2, 2048, 128);
+         let mut quantized3 = std::collections::HashSet::new();
+-        let ops =
+-            fp8_quantize_descriptors(&facts(), 2, 2048, 2, &mut 0, Some(&l3), &mut quantized3)
+-                .expect("the aligned-inn pair chain emits at m=2");
++        let ops = fp8_quantize_descriptors(
++            &Fp8QuantSource::activation(&facts(), 2),
++            2048,
++            2,
++            &mut 0,
++            Some(&l3),
++            &mut quantized3,
++        )
++        .expect("the aligned-inn pair chain emits at m=2");
+         assert_eq!(
+             ops.iter()
+                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
+@@ -1334,4 +2236,222 @@ mod tests {
+             "no per-pair convert at an aligned inn, prefill included"
+         );
+     }
++
++    /// ⭐⭐⭐⭐⭐ THE WIDE PREFILL TILES ITS ROWS AND SPLICES THE REAL ONES BACK — the defect-3
++    /// geometry itself (granite-2b q/k/v at m=21, k=2048, n=3072: 3×1024 output tiles ⇒ wide).
++    /// The door must emit the row-tiled law, whole: per tile a zero-fill (`fq_tz`), one clone
++    /// per K stick group (`fq_tc`), the quant chain over the CLONE (its ops carrying the tile
++    /// index — never the dense staging's shared `fq_afp8_op`, the torn walk this law replaces),
++    /// one mm, the two dequant legs, and one TIME-FOLDED out-copy per tile (`fq_to`, the N
++    /// stick groups its trips). The counts are the plan's own: 6 tiles of 4 rows (21 padded
++    /// to 24), 32 K groups, 48 N groups.
++    #[test]
++    fn the_wide_prefill_tiles_its_rows_and_splices_the_real_ones_back() {
++        let (m, k, n) = (21u32, 2048, 3072);
++        let plan = crate::work::Fp8GemmRowTiles::of(
++            RowCount::of_token_rows(m),
++            BlockCols::of_feature_cols(k),
++            BlockCols::of_feature_cols(n),
++        )
++        .expect("the granite-2b qkv geometry plans");
++        assert_eq!(
++            (plan.tile_rows(), plan.tile_count(), plan.total_rows()),
++            (
++                RowCount::of_token_rows(4),
++                crate::work::Fp8GemmTileCount::new(6),
++                RowCount::of_token_rows(24)
++            ),
++            "21 rows tile by four, padded UP — never a trailing short tile"
++        );
++        let l = fp8_layout(m, k, n);
++        let mut quantized = std::collections::HashSet::new();
++        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
++            .expect("the wide prefill emits the row-tiled law");
++        let n_named = |pfx: &str| {
++            ops.iter()
++                .filter(|o| o.op_name.starts_with(pfx) && o.op_name.ends_with("_op"))
++                .count()
++        };
++        assert_eq!(n_named("t10_fq_tz"), 6, "one pad zero-fill per tile");
++        assert_eq!(
++            n_named("t10_fq_tc"),
++            6,
++            "one TIME-FOLDED clone per tile — the K stick groups are its trips (6×32)"
++        );
++        assert_eq!(n_named("t10_fq_qspt"), 6, "the quant chain runs per tile");
++        assert_eq!(n_named("t10_fq_mm_t"), 6, "one tile mm per tile");
++        assert_eq!(
++            n_named("t10_fq_dqa_t"),
++            6,
++            "one a-scale dequant leg per tile"
++        );
++        assert_eq!(
++            n_named("t10_fq_dqw_t"),
++            6,
++            "one w-scale dequant leg per tile"
++        );
++        assert_eq!(
++            n_named("t10_fq_to"),
++            6,
++            "one TIME-FOLDED out-copy per tile — the N stick groups are its trips (6×48)"
++        );
++        // ⭐ THE FANS ARE FOLDS — one op per tile, the stick groups its trips: `time` carries
++        // the count, `concrete_trips` materializes the per-group windows, each fan tensor
++        // steps by its nest's own group stride, and the identity table stays FIXED (empty
++        // stride map — the no-bump path).
++        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_tc")) {
++            assert_eq!(
++                o.time, 32,
++                "{}: the clone folds the 32 K stick groups",
++                o.op_name
++            );
++            assert_eq!(
++                o.concrete_trips().len(),
++                32,
++                "{}: the clone's trips are the 32 K stick-group windows",
++                o.op_name
++            );
++            assert_eq!(
++                o.affine_strides[0].get("out"),
++                Some(&nest_group_stride_bytes(m, 64)),
++                "{}: the A side steps by the source nest's group stride",
++                o.op_name
++            );
++            assert_eq!(
++                o.affine_strides[2].get("out"),
++                Some(&nest_group_stride_bytes(4, 64)),
++                "{}: the C side steps by the tile nest's group stride",
++                o.op_name
++            );
++            assert!(
++                o.affine_strides[1].is_empty(),
++                "{}: the identity table is fixed across trips",
++                o.op_name
++            );
++        }
++        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_to")) {
++            assert_eq!(
++                o.time, 48,
++                "{}: the splice folds the 48 N stick groups",
++                o.op_name
++            );
++            assert_eq!(
++                o.concrete_trips().len(),
++                48,
++                "{}: the splice's trips are the 48 N stick-group windows",
++                o.op_name
++            );
++            assert_eq!(
++                o.affine_strides[0].get("out"),
++                Some(&nest_group_stride_bytes(4, 64)),
++                "{}: the landing side steps by the tile nest's group stride",
++                o.op_name
++            );
++            assert_eq!(
++                o.affine_strides[2].get("out"),
++                Some(&nest_group_stride_bytes(m, 64)),
++                "{}: the output side steps by the output nest's group stride",
++                o.op_name
++            );
++            assert!(
++                o.affine_strides[1].is_empty(),
++                "{}: the identity table is fixed across trips",
++                o.op_name
++            );
++        }
++        // ⛔ THE TORN STAGING IS GONE: no op carries the DENSE law's shared convert name —
++        // every quant tensor and op is tile-indexed, so the quant walk and the mm's A walk
++        // spell ONE buffer's layout (the one-mint law).
++        assert!(
++            !ops.iter().any(|o| o.op_name.ends_with("fq_afp8_op")),
++            "the dense law's shared fq_afp8_op must not exist at a tiled geometry"
++        );
++        // Every tile mm reads ITS OWN staged afp8 (the typed staging's name, tile-indexed).
++        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_mm_t")) {
++            assert!(
++                o.arg_bindings
++                    .iter()
++                    .any(|b| b.is_input && b.buffer.contains("fq_afp8t")),
++                "{}: the tile mm binds the tile's own staged afp8",
++                o.op_name
++            );
++        }
++        // The staging reservations, at the TILE's row class: the clone `[4, k]` fp16 and the
++        // quantized `[4, k_pad]` fp8 (k is 128-aligned here, so k_pad == k).
++        let s = l.synth.borrow();
++        let a7 = PlaceId::Act(7);
++        let clone_sz = s
++            .sizes
++            .get(&a7.synth_tiled(SynthRole::FqTileRow, 0).to_string())
++            .expect("the tile clone is placed");
++        assert_eq!(
++            *clone_sz,
++            4u64 * k as u64 * 2,
++            "tile 0's clone owns [4, k] fp16"
++        );
++        let afp8_sz = s
++            .sizes
++            .get(&a7.synth_tiled(SynthRole::FqAfp8, 0).to_string())
++            .expect("the tile afp8 is placed");
++        assert_eq!(
++            *afp8_sz,
++            4u64 * k as u64,
++            "tile 0's afp8 owns [4, k_pad] fp8 (1 B/elem)"
++        );
++    }
++
++    /// ⭐ THE SECOND GEMM AT THE SAME PLAN REUSES THE TILE STAGING — the dense law's own
++    /// sharing (K/V after Q, Up after Gate), at tile grain: the clone, the zero-fill, and the
++    /// quant chain are keyed by the TILE's name in `quantized`, so only the per-matmul legs
++    /// (mm, dequant, out-splice) are emitted again, under the second output's namespace.
++    #[test]
++    fn a_second_gemm_at_the_same_plan_reuses_the_tile_staging() {
++        let (m, k, n) = (21u32, 2048, 3072);
++        let l = fp8_layout(m, k, n);
++        let mut quantized = std::collections::HashSet::new();
++        let f2 = Fp8Facts {
++            a_tid: 7,
++            a_name: act_name(7),
++            w_name: act_name(8),
++            ws_name: act_name(9),
++            out_tid: 11,
++        };
++        let _ = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
++            .expect("the first GEMM emits");
++        let ops2 = matmul_fp8_descriptors(&f2, m, k, n, &mut 0, Some(&l), &mut quantized)
++            .expect("the second GEMM over the same activation emits");
++        let n_named = |pfx: &str| {
++            ops2.iter()
++                .filter(|o| o.op_name.starts_with(pfx) && o.op_name.ends_with("_op"))
++                .count()
++        };
++        assert_eq!(n_named("t11_fq_tz"), 0, "no second zero-fill");
++        assert_eq!(n_named("t11_fq_tc"), 0, "no second clone");
++        assert_eq!(n_named("t11_fq_qspt"), 0, "no second quant chain");
++        assert_eq!(
++            n_named("t11_fq_mm_t"),
++            6,
++            "the per-matmul mm legs still run per tile"
++        );
++    }
++
++    /// ⛔ THE PLAN DISAGREEMENT IS A REFUSAL, NOT A RESIZE: a second GEMM over the SAME
++    /// activation whose own geometry takes the NARROW row class (n=64: one ABI tile, so the
++    /// rows run whole at the 128 alignment) would re-resolve the SAME tile names at a
++    /// different row class. `synth` is idempotent per name, so without the geometry guard
++    /// that reuse would be silent; the guard compares footprints and refuses at bake.
++    #[test]
++    fn a_second_gemm_at_a_different_row_class_refuses() {
++        let (m, k) = (21u32, 2048);
++        let l = fp8_layout(m, k, 3072);
++        let mut quantized = std::collections::HashSet::new();
++        let _ = matmul_fp8_descriptors(&facts(), m, k, 3072, &mut 0, Some(&l), &mut quantized)
++            .expect("the wide GEMM emits and reserves its tiles");
++        let e = matmul_fp8_descriptors(&facts(), m, k, 64, &mut 0, Some(&l), &mut quantized);
++        assert!(
++            e.is_err(),
++            "a second GEMM re-tiling the same activation at another row class is a plan \
++             disagreement — refused at bake, never a silent resize"
++        );
++    }
+ }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
+index c3e59503fe..76d9e24b53 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/lower_ktir_to_superdsc.rs
+@@ -7493,6 +7493,185 @@ mod elementwise_tests {
+             &[Scale::RedNonStick, Scale::Active, Scale::Active] as &[Scale],
+             "the spray dim is the stride-0 read — the vendor's reduced-dim law"
+         );
++        // ⭐⭐⭐ AND THE DIVISION IS THE SPRAY SPLIT — the law this op's own layout demands: the
++        // cores go to the leading `y` first (`y:4`), and the cores that leaves to `mb` (`mb:8`) —
++        // an `mb` split INSIDE one spray is contiguous, so a short spray count strands no cores.
++        assert_eq!(
++            op.iter.split_of("y"),
++            4,
++            "the spray axis takes its cores first"
++        );
++        assert_eq!(
++            op.iter.split_of("mb"),
++            8,
++            "the remainder goes to the slab's own outer dim"
++        );
++        assert_eq!(
++            op.iter.split_of("out"),
++            1,
++            "the one-stick `out` never splits"
++        );
++    }
++
++    /// ⭐⭐⭐⭐⭐ THE PREFILL MASK ADD'S OWN GEOMETRY, PINNED — `[y=32, mb=21, out=64]` (32 query
++    /// heads, 21 tokens, one stick of slots): the spray split takes all 32 cores, ONE SPRAY PER
++    /// CORE, and `mb` stays whole. This is the exact op whose rows-first emission measured 620 of
++    /// 672 sticks never written (every core's base advanced ONE STICK while its slab was 32
++    /// sticks — see [`crate::work::distribute_cores_sprays_first`]'s doc), and the per-core slab
++    /// here is the producer's own: the `[672, 64]` score tile's 32-core row partition is exactly
++    /// 21 sticks per core, the same bytes at the same bases.
++    #[test]
++    fn the_row_split_op_at_the_prefill_mask_geometry_splits_one_spray_per_core() {
++        let dense_h = rb(
++            "t5",
++            RowCount::of_token_rows(672),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let mask_h = rb(
++            "t6",
++            RowCount::of_token_rows(21),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let dense = In::full(&dense_h).ew();
++        let mask = In::y_broadcast(&mask_h, 32).ew();
++        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
++            &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
++            672,
++            64,
++            op_func_from_str("add"),
++            &[dense, mask],
++            "t7",
++            crate::addr::OutCorner::ZERO,
++            false,
++            None,
++            crate::work::CoreDivision::Ew(EwDivision::Law),
++        )
++        .expect("the mask add emits under the spray split");
++        assert_eq!(op.iter.extent("y"), 32, "y is the 32 query heads");
++        assert_eq!(op.iter.extent("mb"), 21, "mb is the 21 tokens");
++        assert_eq!(op.iter.split_of("y"), 32, "ONE SPRAY PER CORE");
++        assert_eq!(
++            op.iter.split_of("mb"),
++            1,
++            "the whole token axis stays in one slab"
++        );
++    }
++
++    /// ⭐⭐⭐⭐⭐ THE ROW-SPLIT OP SERIALIZES ITS WIRE ORDER THE WAY DXP READS IT — STICK
++    /// INNERMOST, RECONSTRUCT WALK. dxp reads `layoutDimOrder_` idx 0 as INNERMOST
++    /// (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`) while this crate's address model is
++    /// OUTERMOST-first, so the y-major view's `["y","mb","out"]` is serialized REVERSED:
++    /// `["out","mb","y"]`, the stick INNERMOST — the score matmul's own output spelling — with
++    /// the RECONSTRUCT walk (`maxDimSizes_ [-1,-1,-1]`), because a rank-3 stick-on-last view
++    /// classifies `Flat` and would otherwise PIN its actual extents `[32,21,64]`, which dxp
++    /// reads at the opposite end first. MEASURED on the prefill mask add (`11_add_o1417` at the
++    /// spray split): the verbatim spelling tore the walk — 310 of 672 output sticks never
++    /// written, the mask operand read at a TWO-STICK row stride (token row `2t mod 21`
++    /// applied) — while the same bytes' producer and every `mb`-split sibling (stick innermost
++    /// under `-1`) walked correctly. The address model reads `layout` unchanged, so the
++    /// per-core starts (one 21-stick spray per core) are untouched.
++    #[test]
++    fn the_row_split_op_serializes_stick_innermost_and_reconstructs() {
++        let dense_h = rb(
++            "t5",
++            RowCount::of_token_rows(672),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let mask_h = rb(
++            "t6",
++            RowCount::of_token_rows(21),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let out_h = rb(
++            "t7",
++            RowCount::of_token_rows(672),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let dense = In::full(&dense_h).ew();
++        let mask = In::y_broadcast(&mask_h, 32).ew();
++        let mut sid = 0i64;
++        let emitted =
++            crate::ir::bridge::tiled_op_sdsc_op::assemble_pointwise_broadcast_off_from_tile(
++                "add_o1417",
++                &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
++                "add",
++                672,
++                64,
++                &[dense, mask],
++                &out_h,
++                crate::addr::OutCorner::ZERO,
++                &mut sid,
++                None,
++            );
++        let v = serde_json::to_value(emitted.op.as_ref().expect("a descriptor")).unwrap();
++        // The spray split rides along untouched: one spray per core.
++        assert_eq!(
++            v["numWkSlicesPerDim_"],
++            serde_json::json!({"mb": 1, "out": 1, "y": 32})
++        );
++        let key = v["dscs_"][0]
++            .as_object()
++            .and_then(|m| m.keys().next().cloned())
++            .expect("a dsc");
++        let tree = v["dscs_"][0][&key]["scheduleTree_"]
++            .as_array()
++            .expect("the tree");
++        let allocs: Vec<_> = tree
++            .iter()
++            .filter(|n| n.get("nodeType_").and_then(|t| t.as_str()) == Some("allocate"))
++            .collect();
++        assert_eq!(allocs.len(), 3, "the three operands' allocate nodes");
++        for n in &allocs {
++            let name = n["name_"].as_str().unwrap_or("?");
++            assert_eq!(
++                n["layoutDimOrder_"],
++                serde_json::json!(["out", "mb", "y"]),
++                "{name}: the stick is INNERMOST on the wire, the matmul output's own spelling"
++            );
++            assert_eq!(
++                n["maxDimSizes_"],
++                serde_json::json!([-1, -1, -1]),
++                "{name}: the reconstruct walk — a pinned array is read at the opposite end first"
++            );
++        }
++    }
++
++    /// ⛔ A STATED NON-SPRAY DIVISION ON A Y-MAJOR OP IS REFUSED — the row-split mode's tensors
++    /// walk `["y", "mb", "out"]`, so a split over any inner dim hands every core a strided stick
++    /// set the per-core addressing walks at the wrong stride. The refusal names the law and the
++    /// measurement; the caller states [`EwDivision::SpraysFirst`] or the [`EwDivision::Law`].
++    #[test]
++    fn a_row_split_op_with_a_stated_inner_dim_split_is_refused() {
++        let dense_h = rb(
++            "t5",
++            RowCount::of_token_rows(672),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let mask_h = rb(
++            "t6",
++            RowCount::of_token_rows(21),
++            BlockCols::of_one_stick(Lanes::FP16),
++        );
++        let dense = In::full(&dense_h).ew();
++        let mask = In::y_broadcast(&mask_h, 32).ew();
++        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
++            &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
++            672,
++            64,
++            op_func_from_str("add"),
++            &[dense, mask],
++            "t7",
++            crate::addr::OutCorner::ZERO,
++            false,
++            None,
++            crate::work::CoreDivision::Ew(EwDivision::RowsFirst),
++        ) else {
++            panic!("a y-major op stated rows-first must not emit — that is the mask add's defect");
++        };
++        assert!(
++            m.contains("row-split (y-major) op whose stated division is not the spray split"),
++            "names the law: {m}"
++        );
+     }
+ 
+     /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
+index c3382a7ff0..26a816ae7e 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/emit/mod.rs
+@@ -963,7 +963,10 @@ pub fn pointwise_untiled_slice_bytes_divided(
+     tile_op
+         .tile(
+             crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
+-            division.resolve(true, true).splitter(),
++            // `false` for the spray fact: this sizing helper's tile states `y=1`, so the row-split
++            // (y-major) mode — the only presentation whose division that fact selects — cannot
++            // reach it.
++            division.resolve(true, true, false).splitter(),
+             "out",
+         )
+         .ok()
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/pointwise.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/pointwise.rs
+index b7a8f676ca..dade68b58d 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/pointwise.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/ir/bridge/tiled_op_sdsc_op/pointwise.rs
+@@ -442,13 +442,17 @@ pub fn pointwise_opspec_from_tile(
+     let stick_major = !head_major && rows > 1;
+     let core_local = layout
+         .is_some_and(|l| l.lx_core_local(o_name) || in_names.iter().any(|n| l.lx_core_local(n)));
++    // ⭐ `false` for the spray fact: this builder takes no `EwOperand`, so no operand can state the
++    // row-split (y-broadcast) mode — the only presentation whose division the fact selects.
+     pointwise_opspec_from_tile_split(
+         tile_op,
+         op,
+         in_names,
+         o_name,
+         head_major,
+-        EwDivision::Law.resolve(stick_major, core_local).splitter(),
++        EwDivision::Law
++            .resolve(stick_major, core_local, false)
++            .splitter(),
+         // Whole-tensor output — every caller but the gather copy, whose runs land at a base.
+         0,
+     )
+@@ -596,7 +600,8 @@ pub fn pointwise_broadcast_opspec_from_tile(
+     // bytes and the output's `(y·mb, out)` bytes are the same stick-blocked bytes the mints
+     // reserved. Everything below is cross-checks; the addressing itself is the ordinary
+     // scale-driven rule (`build_coordinates`/`per_core_addr`), which is why the form needs no
+-    // new addressing code — only the layout order and the operand scales stated honestly.
++    // new addressing code — only the layout order and the operand scales stated honestly, and
++    // the wire order REVERSED to the way dxp reads it (see the flag at the operand build).
+     let stated_ys: Vec<u32> = inputs
+         .iter()
+         .map(|i| i.y_broadcast())
+@@ -648,6 +653,31 @@ pub fn pointwise_broadcast_opspec_from_tile(
+         && inputs.iter().all(|i| {
+             i.out_broadcast() || i.is_stick_major_window_for(rows) || block_aligned(i.col_offset())
+         });
++    // ⭐⭐⭐ THE ROW-SPLIT MODE'S OWN DIVISION, AS A LAW AT THE DOOR — a y-major op's tensors walk
++    // `["y", "mb", "out"]`, so `y` is the outermost dim of the flat layout and a core's slab is
++    // CONTIGUOUS exactly when the split is over `y` ([`EwDivision::SpraysFirst`]'s doc holds the
++    // card measurement: the prefill mask add split `mb` 21 ways instead, every core's base advanced
++    // ONE STICK while its slab was 32 sticks, and the 21 cores covered sticks 0..51 of the
++    // 672-stick score tile — 29 of 32 heads' scores destroyed, 620 sticks never written). The LAW
++    // resolves to the spray split on this same fact; a caller that STATED another division (or a
++    // gathered split, which is `mb`-only by [`crate::work::GatherSplit`]'s own law) spelled an op
++    // this door cannot address, and the refusal names it rather than emitting the strided slab.
++    if ymajor
++        && !matches!(
++            division,
++            CoreDivision::Ew(EwDivision::Law | EwDivision::SpraysFirst)
++        )
++    {
++        return Err(format!(
++            "{o_name}: a row-split (y-major) op whose stated division is not the spray split — the \
++             op's tensors present [\"y\", \"mb\", \"out\"] with `y` the outermost flat dim, so only a \
++             split over the leading `y` gives a core a CONTIGUOUS slab; the stated division splits an \
++             inner dim and hands every core a strided stick set the per-core addressing walks at the \
++             wrong stride (MEASURED: the prefill mask add, sticks 0..51 of 672 covered, 620 never \
++             written). State [`EwDivision::SpraysFirst`] or the [`EwDivision::Law`], which resolves \
++             to it in this mode"
++        ));
++    }
+     // ⭐ THE DIVISION FOLLOWS THE LAYOUT JUST DECIDED for an ungathered op — the same
+     // `stickmajor`, so the operands' rank and the cores' cut are one decision. See `EwDivision`.
+     let core_local = layout.is_some_and(|l| {
+@@ -666,7 +696,7 @@ pub fn pointwise_broadcast_opspec_from_tile(
+         CoreDivision::Ew(d) => tile_op
+             .tile(
+                 MaxCores::<MAX_CORES>,
+-                d.resolve(stickmajor, core_local).splitter(),
++                d.resolve(stickmajor, core_local, ymajor).splitter(),
+                 "out",
+             )
+             .map_err(|e| e.0)?,
+@@ -745,26 +775,45 @@ pub fn pointwise_broadcast_opspec_from_tile(
+                     .with_row_blocked(matches!(df, Df::Fp32)),
+                 ))
+             } else {
+-                Ok(AnyTensorArg::R3(
+-                    TensorArg::<3>::new(
+-                        is_input,
+-                        name.to_string(),
+-                        Role::Output,
+-                        scale,
+-                        device_dims,
+-                        if ymajor {
+-                            ["y", "mb", "out"]
+-                        } else {
+-                            ["mb", "out", "y"]
+-                        },
+-                        "out",
+-                        Allocation::Hbm,
+-                    )
+-                    .map_err(|e| e.0)?
+-                    .with_offset(off)
+-                    .with_df(df)
+-                    .with_row_blocked(matches!(df, Df::Fp32)),
+-                ))
++                let t = TensorArg::<3>::new(
++                    is_input,
++                    name.to_string(),
++                    Role::Output,
++                    scale,
++                    device_dims,
++                    if ymajor {
++                        ["y", "mb", "out"]
++                    } else {
++                        ["mb", "out", "y"]
++                    },
++                    "out",
++                    Allocation::Hbm,
++                )
++                .map_err(|e| e.0)?
++                .with_offset(off)
++                .with_df(df)
++                .with_row_blocked(matches!(df, Df::Fp32));
++                // ⭐⭐⭐ THE ROW-SPLIT ORDER IS HEAD-OUTERMOST IN THE ADDRESS MODEL, SO THE WIRE
++                // CARRIES IT REVERSED. dxp reads `layoutDimOrder_` idx 0 as INNERMOST
++                // (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`); this crate's `layout` is
++                // OUTERMOST-first row-major. A y-major operand serialized verbatim therefore hands
++                // dxp the stick as the OUTERMOST dim and — because a rank-3 stick-on-last view
++                // classifies `Flat` and pins its actual extents — a pinned `maxDimSizes_` "read at
++                // the opposite end first" (the hazard `emit`'s own wire-order note states). MEASURED
++                // on the prefill mask add (`11_add_o1417`, y:32 spray split): the verbatim
++                // serialization emitted `layoutDimOrder_ ["y","mb","out"]` + `maxDimSizes_
++                // [32,21,64]`, and the card walked the op torn — 310 of 672 output sticks never
++                // written, the mask operand read at a TWO-STICK row stride (applied token row
++                // `2t mod 21`), while the SAME bytes' producer (the score matmul's output, stick
++                // innermost + `-1`) and every `mb`-split sibling walk correctly. The flag reverses
++                // the wire fields to `["out","mb","y"]` — the stick INNERMOST, the matmul output's
++                // own spelling — and forces the reconstruct walk; the address model reads `layout`
++                // unchanged, so the per-core starts (one 21-stick spray per core) are untouched.
++                if ymajor {
++                    Ok(AnyTensorArg::R3(t.with_dxp_innermost_first()))
++                } else {
++                    Ok(AnyTensorArg::R3(t))
++                }
+             }
+         };
+     let mut args = Vec::with_capacity(inputs.len() + 1);
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/place.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/place.rs
+index 1284a60f2e..705baf644a 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/place.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/place.rs
+@@ -52,6 +52,14 @@ pub enum SynthRole {
+     /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
+     /// of partials is the reduce's own time-tile count, known only at bake.
+     FqAmaxP(u32),
++    /// ⭐ THE fp16 ROW-TILE CLONE — one target-ABI tile's fresh copy of a GEMM operand
++    /// (`work::Fp8GemmRowTiles`): the ACTIVATION's `[tile_rows, k]` clone at the row-tiled
++    /// law's front (the lowering of the reference's `clone()`, `fp8_linear_kernel.py:351`),
++    /// and the OUTPUT's `[tile_rows, n]` dequant landing at its back (the buffer the
++    /// out-splice copies read — pointwise outputs are column-windowed only, so a tile's rows
++    /// land in a fresh buffer of their own before the splice). Always minted by
++    /// [`PlaceId::synth_tiled`]: the tile index is the staging's own, known only at bake.
++    FqTileRow,
+     // ── rmsnorm scratch ──
+     Sq16,
+     Mean,
+@@ -171,6 +179,7 @@ impl fmt::Display for SynthRole {
+             Self::FqMm => f.write_str("fq_mm"),
+             Self::FqRaw => f.write_str("fq_raw"),
+             Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
++            Self::FqTileRow => f.write_str("fq_tilerow"),
+             Self::Sq16 => f.write_str("sq16"),
+             Self::Mean => f.write_str("mean"),
+             Self::Meps => f.write_str("meps"),
+@@ -239,7 +248,14 @@ pub enum PlaceId {
+     /// not of this type.
+     Act(u32),
+     /// An intermediate the lowering invented, derived from `of`. Device-internal.
+-    Synth { of: u32, role: SynthRole },
++    /// The target-ABI row tile this synthetic belongs to (`synth_tiled`) — `None` for
++    /// every untiled derivation. The tile is a fact of the IDENTITY (which tile's
++    /// staging), never of the role.
++    Synth {
++        of: u32,
++        role: SynthRole,
++        tile: Option<u32>,
++    },
+ }
+ 
+ impl PlaceId {
+@@ -265,6 +281,20 @@ impl PlaceId {
+         Self::Synth {
+             of: self.tid(),
+             role,
++            tile: None,
++        }
++    }
++
++    /// Derive a synthetic from this tensor, in a target-ABI row tile's staging. ⭐ ONE
++    /// METHOD TILES EVERY ROLE — the fp8 GEMM row tiling (`work::Fp8GemmRowTiles`, the
++    /// copied `_m_tiles` law) quantizes per tile over per-tile fresh staging, so every
++    /// tensor a tile owns carries its tile index in its ID; the role stays the fact it
++    /// always was (no role gains a second spelling), and the index rides the ID.
++    pub fn synth_tiled(self, role: SynthRole, t: u32) -> Self {
++        Self::Synth {
++            of: self.tid(),
++            role,
++            tile: Some(t),
+         }
+     }
+ }
+@@ -275,7 +305,10 @@ impl fmt::Display for PlaceId {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+             Self::Act(t) => write!(f, "t{t}"),
+-            Self::Synth { of, role } => write!(f, "t{of}_{role}"),
++            Self::Synth { of, role, tile } => match tile {
++                None => write!(f, "t{of}_{role}"),
++                Some(t) => write!(f, "t{of}_{role}t{t}"),
++            },
+         }
+     }
+ }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
+index eb8a1f7720..ad653bbba9 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/placement.rs
+@@ -184,7 +184,9 @@ impl SegRole {
+ /// where those are constants. A new bind law is a new VARIANT, minted where its
+ /// geometry is computed, refused by every door until then — never a relaxation
+ /// of an existing one.
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++#[derive(
++    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
++)]
+ pub enum BindCover {
+     /// Every bind fills the placement exactly: `bytes == size`.
+     Full,
+@@ -204,7 +206,10 @@ impl BindCover {
+         match self {
+             BindCover::Full => bytes == size,
+             BindCover::FoldBlocks { block_bytes } => {
+-                bytes != 0 && *block_bytes != 0 && bytes % block_bytes == 0 && bytes <= size
++                bytes != 0
++                    && *block_bytes != 0
++                    && bytes.is_multiple_of(*block_bytes)
++                    && bytes <= size
+             }
+         }
+     }
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs
+index 302628de59..2553ebb03e 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/sdsc_abstract.rs
+@@ -3074,6 +3074,119 @@ impl<K: KindTag> Stk<K> {
+     }
+ }
+ 
++/// ⭐ THE PER-TILE fp8 STAGING, CONST-GENERIC ON ITS ROW CLASS — the staging seam's ONE MINT,
++/// as a type. The fp8 GEMM target-ABI row tiling (`work::Fp8GemmRowTiles`, the copied
++/// `_m_tiles` law) quantizes each row tile over its own fresh buffer and the consuming GEMM
++/// reads that same buffer, so the two ends of the seam must agree on the staging's row class.
++/// `R` is a COMPILE-TIME constant of the emission — the ABI's own 1 (decode) or 4 (the wide
++/// tile) — so a consumer minted against a different class (a quant at `Fp8TileStaging<4>`
++/// feeding a GEMM door that wants `<1>`, or any future second spelling of the row count) is a
++/// `cargo build` type error, never a checked equality at bake. This is the typed form of the
++/// reference's layout propagation (`torch_spyre/_inductor/propagate_layouts.py:408`,
++/// `_qfp8ch_stl`: the quant output's layout is inherited by the mm's A, never re-derived).
++///
++/// The handles are the ones the quantize chain minted — names AND `StickLayout`s — so the
++/// consumer's A view is the producer's own, and the dequant's per-row scale read rides the
++/// same mint. Constructed only by this crate's fp8 emission (the writer of the buffers).
++pub struct Fp8TileStaging<const R: u32> {
++    afp8: Stk<RowBlockedTag>,
++    ascale: Stk<RowBlockedTag>,
++}
++
++impl<const R: u32> Fp8TileStaging<R> {
++    /// The staging's row class — the ABI tile width the quant wrote and every consumer must
++    /// read. A const, not an accessor: it is a fact of the type.
++    pub const ROWS: u32 = R;
++
++    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
++    /// wrote it (`row_blocked_df(R, k_pad, Fp8)`).
++    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
++        &self.afp8
++    }
++
++    /// The per-token scale handle — the dequant's row input (`[R, one stick]`).
++    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
++        &self.ascale
++    }
++
++    /// The one constructor — the quantize emission's output mint. Same-crate private by
++    /// design: only this crate's fp8 emission (the writer of the buffers) can state them.
++    ///
++    /// REFUSES a handle whose row count is not `R`: the type's whole claim is that the
++    /// staging's row class is `R`, so a handle minted at another count is the two-ended
++    /// spelling the type exists to make unconstructable — rejected at emission (a `cargo
++    /// build` failure), never a buffer walked at two row classes.
++    pub(crate) fn staged(
++        afp8: Stk<RowBlockedTag>,
++        ascale: Stk<RowBlockedTag>,
++    ) -> Result<Self, String> {
++        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
++            if h.layout().rows as u32 != R {
++                return Err(format!(
++                    "Fp8TileStaging::<{R}>::staged: the {what} handle carries {} rows — the \
++                     staging's row class is {R}, and a handle at another class is exactly the \
++                     writer/reader drift this type refuses",
++                    h.layout().rows
++                ));
++            }
++        }
++        Ok(Self { afp8, ascale })
++    }
++}
++
++/// ⭐ THE NARROW fp8 STAGING — [`Fp8TileStaging`]'s runtime-rows twin, for the narrow
++/// law's ONE part at the padded 128-multiple (S3, `fp8_linear_kernel.py:343-346`): the
++/// extent is a fact of the INPUT (21→128, 192→256 — any 128-multiple), so it is carried
++/// as a [`RowCount`] the constructor pins, not a const generic. Same seam law as the tile
++/// staging: the handles are the quantize chain's own mints, and a handle whose row count
++/// is not the stated extent is exactly the writer/reader drift the type refuses.
++pub struct Fp8NarrowStaging {
++    rows: RowCount,
++    afp8: Stk<RowBlockedTag>,
++    ascale: Stk<RowBlockedTag>,
++}
++
++impl Fp8NarrowStaging {
++    /// The staging's row extent — the padded 128-multiple the quant wrote and every
++    /// consumer must read.
++    pub fn rows(&self) -> RowCount {
++        self.rows
++    }
++
++    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
++    /// wrote it (`row_blocked_df(rows, k_pad, Fp8)`).
++    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
++        &self.afp8
++    }
++
++    /// The per-token scale handle — the dequant's row input (`[rows, one stick]`).
++    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
++        &self.ascale
++    }
++
++    /// The one constructor — the quantize emission's output mint, at the part's stated
++    /// extent. REFUSES a handle whose row count is not that extent, for the same reason
++    /// [`Fp8TileStaging::staged`] refuses one at another class.
++    pub(crate) fn staged(
++        rows: RowCount,
++        afp8: Stk<RowBlockedTag>,
++        ascale: Stk<RowBlockedTag>,
++    ) -> Result<Self, String> {
++        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
++            if h.layout().rows as u32 != rows.get() {
++                return Err(format!(
++                    "Fp8NarrowStaging::staged: the {what} handle carries {} rows — the \
++                     staging's extent is {}, and a handle at another extent is exactly the \
++                     writer/reader drift this type refuses",
++                    h.layout().rows,
++                    rows.get()
++                ));
++            }
++        }
++        Ok(Self { rows, afp8, ascale })
++    }
++}
++
+ impl Stk<KernelTag> {
+     /// A `Kernel` handle `[in(K), out(N)]` stick-blocked on `out` — INFALLIBLE (the kind is `Kernel`
+     /// by construction, so no runtime check / `Result` / unwrap). The compile-time `KernelTag` then
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/src/work.rs b/crates/targets/spyre/ktir/ktir-superdsc/src/work.rs
+index 13b7cd65f0..6b67fd3a4f 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/src/work.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/src/work.rs
+@@ -264,6 +264,370 @@ pub const FP8_PACKED_KERNEL_OUT_GRAN: u32 = 64;
+ /// The packed kernel's K (in) axis granularity — 2-packed fp8 per fp16-width slot.
+ pub const FP8_PACKED_KERNEL_IN_GRAN: u32 = 2;
+ 
++/// ⭐ THE fp8 GEMM TARGET-ABI N SET — the output widths SuperDSC's fp8 GEMM accepts, in the
++/// decomposition order the reference itself uses (largest first). COPIED, not designed:
++/// `spyre_inference/custom_ops/fp8_linear_kernel.py:32` — "Granite 4096-wide SuperDSC only
++/// accepts M∈{1,4} and N∈{4096,1024,128}" — and `_n_tiles` (`:80`) decomposes a fused N over
++/// exactly these sizes, largest first, and refuses a remainder (`:90`). Every granite fp8 GEMM
++/// is expressible over it (3072 = 3·1024, 2048 = 2·1024, 512 = 4·128, 10240 = 2·4096 + 2·1024).
++pub const FP8_GEMM_N_SET: [u32; 3] = [4096, 1024, 128];
++
++/// ⭐ THE fp8 GEMM TARGET-ABI ROW TILES — the M form space of the fp8 GEMM, COPIED from the
++/// reference's `_m_tiles` (`fp8_linear_kernel.py:70`) and its module docstring (`:32`), the
++/// M-axis twin of [`fp8_k_pad`]'s K law. The reference NEVER presents a wide GEMM an A operand
++/// of arbitrary row count: prefill rows go to the card as tiles of **4** (padded UP to a
++/// multiple of 4 with zero rows), decode as **1**; a GEMM too small to split (max(k,n) < 4096
++/// and N a single ABI width) runs its rows whole, padded to a 128-multiple when not already a
++/// small M (`fp8_linear_kernel.py:338-346` — `_SMALL_M`/`_M_ALIGN` at their use in
++/// `apply_weights`). The row count the quantized
++/// A operand carries is therefore a TARGET fact, not a free shape — and the torn prefill
++/// staging (an `m`-row A the reference never emits) is the defect class this door closes.
++///
++/// THE CONTRACT, SAME AS [`fp8_k_pad`]'s: the row tiling of the fp8 quantize chain and of its
++/// consuming GEMM both take their per-tile M from this one type, so the A operand's row count
++/// cannot drift between the staging and the contraction. The tiles are UNIFORM — `rows ×
++/// tiles` is the padded total — because the reference's are (`[4] * (pad_m // 4)`, one padded
++/// part otherwise); a trailing short tile is a form it never emits and this type cannot state.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Fp8GemmRowTiles {
++    /// The caller's real row count — the source of every per-tile window.
++    m: crate::sdsc_abstract::RowCount,
++    /// Rows per tile — the A operand's M: a target-ABI row count (1, 4, a small M, or a
++    /// 128-multiple), never the caller's raw row count at wide geometries.
++    rows: crate::sdsc_abstract::RowCount,
++    /// How many such tiles the row extent splits into.
++    tiles: Fp8GemmTileCount,
++    /// The activation's contraction width — the clone loop's stick-group count is derived
++    /// from it here, so no site re-derives it.
++    k: crate::sdsc_abstract::BlockCols,
++    /// The GEMM's output width — the out-splice loop's stick-group count is derived from it.
++    n: crate::sdsc_abstract::BlockCols,
++}
++
++/// ONE TILE'S PLACEMENT FACTS — minted by [`Fp8GemmRowTiles::tile`], never re-derived at a
++/// site: the tile's first row as a typed row index (the placement vocabulary's own
++/// `Idx<Row>`), and the rows it actually covers (the last tile's are fewer — its clone
++/// never reads past the activation's footprint).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Fp8GemmRowTile {
++    /// The tile's first row in the activation — for `OperandPlacement`'s row coordinate.
++    pub row: crate::addr::Idx<crate::addr::Row>,
++    /// The rows this tile covers IN THE ACTIVATION (the clone op's M).
++    pub real_rows: crate::sdsc_abstract::RowCount,
++}
++
++impl Fp8GemmRowTiles {
++    /// The row tiling for an fp8 GEMM of `m` rows, `k` contraction features, `n` outputs —
++    /// the copied `_m_tiles` predicate, keyed on GEOMETRY alone, with the shape facts
++    /// arriving as the door's own types (`RowCount`/`BlockCols`: the KTIR's stated facts at
++    /// the production call, a named `Fp8GemmGeometry` in a test — never bare `u32`s at a
++    /// seam). `wide` is the reference's own test (`fp8_linear_kernel.py:338`): `max(k, n) ≥
++    /// 4096` OR the N decomposes over [`FP8_GEMM_N_SET`] into more than one tile. Wide ⇒
++    /// `m == 1` stays 1, anything else pads UP to a multiple of 4 and tiles by 4. Narrow ⇒
++    /// the rows run whole (`:338-346`, `_SMALL_M`/`_M_ALIGN` at their use in
++    /// `apply_weights`): a small M (≤ 4) or a 128-multiple as-is, otherwise padded up to a
++    /// 128-multiple. An N the ABI set cannot express is the reference's own refusal
++    /// (`fp8_linear_kernel.py:90`), carried whole — see [`Self::n_tile_count`]: there is
++    /// no other acceptance arm, ours or theirs.
++    ///
++    /// ⛔ FAIL-CLOSED ON THE STICK LAW: a `k` or `n` that is not a whole fp16 stick is
++    /// refused HERE — the clone and out-splice loops walk whole stick groups, and an
++    /// unchecked width division would silently truncate a sub-stick tail (the silent-tail
++    /// defect class). The refusal is the door's, so the accessors below divide only over a
++    /// width the door already proved stick-aligned.
++    pub fn of(
++        m: crate::sdsc_abstract::RowCount,
++        k: crate::sdsc_abstract::BlockCols,
++        n: crate::sdsc_abstract::BlockCols,
++    ) -> Result<Self, String> {
++        let (m, k, n) = (m.get(), k.get(), n.get());
++        let stick = crate::superdsc_opspec::Df::Fp16.elems_per_stick();
++        for (what, w) in [("k", k), ("n", n)] {
++            if w % stick != 0 {
++                return Err(format!(
++                    "fp8 GEMM {what}={w}: not a whole fp16 stick ({stick} elems) — the row \
++                     tiling walks whole stick groups and a sub-stick tail would divide \
++                     silently. Refused at the door, never truncated"
++                ));
++            }
++        }
++        let n_tiles = Self::n_tile_count(n)?;
++        let wide = k.max(n) >= FP8_GEMM_N_SET[0] || n_tiles > 1;
++        let (rows, tiles) = if !wide {
++            if m <= FP8_GEMM_SMALL_M || m % FP8_GEMM_NARROW_M_ALIGN == 0 {
++                (m, 1)
++            } else {
++                (m.next_multiple_of(FP8_GEMM_NARROW_M_ALIGN), 1)
++            }
++        } else if m == 1 {
++            (1, 1)
++        } else {
++            let padded = m.next_multiple_of(FP8_GEMM_WIDE_M);
++            (FP8_GEMM_WIDE_M, padded / FP8_GEMM_WIDE_M)
++        };
++        Ok(Self {
++            m: crate::sdsc_abstract::RowCount::of_token_rows(m),
++            rows: crate::sdsc_abstract::RowCount::of_token_rows(rows),
++            tiles: Fp8GemmTileCount::new(tiles),
++            k: crate::sdsc_abstract::BlockCols::of_feature_cols(k),
++            n: crate::sdsc_abstract::BlockCols::of_feature_cols(n),
++        })
++    }
++
++    /// How many ABI tiles `n` decomposes into over [`FP8_GEMM_N_SET`], largest first —
++    /// the reference's `_n_tiles` (`fp8_linear_kernel.py:80-91`) and the WHOLE law: `n`
++    /// already in the set is one tile, anything else decomposes greedily over
++    /// (4096, 1024, 128), and a remainder is the reference's own `RuntimeError` (`:90` —
++    /// "N={n} remainder {left} is not in _WIDE_N"). There is no other acceptance arm:
++    /// where our packed kernel could stage a width theirs refuses, the defect is in our
++    /// lowering or kernel, never a width law of ours (user arch — fixes in the lowering,
++    /// never invention at the ABI).
++    fn n_tile_count(n: u32) -> Result<u32, String> {
++        let mut left = n;
++        let mut tiles = 0;
++        for &size in FP8_GEMM_N_SET.iter() {
++            tiles += left / size;
++            left %= size;
++        }
++        if left == 0 {
++            return Ok(tiles);
++        }
++        Err(format!(
++            "fp8 GEMM N={n} remainder {left} is not in {FP8_GEMM_N_SET:?} — the reference's \
++             own refusal (fp8_linear_kernel.py:90). There is no other acceptance arm; where \
++             our packed kernel could stage this width, the defect is in our lowering or \
++             kernel, never a width law of ours"
++        ))
++    }
++
++    /// The A operand's M — one tile's row count, a target-ABI fact by construction.
++    pub fn tile_rows(&self) -> crate::sdsc_abstract::RowCount {
++        self.rows
++    }
++
++    /// How many row tiles the extent covers.
++    pub fn tile_count(&self) -> Fp8GemmTileCount {
++        self.tiles
++    }
++
++    /// The PADDED row total — `rows × tiles`. Rows `[m, total)` are the zero-filled pad.
++    pub fn total_rows(&self) -> crate::sdsc_abstract::RowCount {
++        crate::sdsc_abstract::RowCount::of_token_rows(self.rows.get() * self.tiles.get())
++    }
++
++    /// Tile `t`'s placement facts — the ONE site that computes the tile's row window, so no
++    /// clone/quant/mm/out site re-derives it: the first row as the placement vocabulary's own
++    /// typed index, and the rows the tile covers in the ACTIVATION (fewer on the last tile —
++    /// its clone never reads past the footprint).
++    pub fn tile(&self, t: Fp8GemmTileIdx) -> Fp8GemmRowTile {
++        let start = t.get() * self.rows.get();
++        Fp8GemmRowTile {
++            row: crate::addr::Idx::<crate::addr::Row>::n(start),
++            real_rows: crate::sdsc_abstract::RowCount::of_token_rows(
++                self.rows.get().min(self.m.get().saturating_sub(start)),
++            ),
++        }
++    }
++
++    /// The activation's fp16 stick-group count — the clone loop's extent, minted here (the
++    /// door refused a sub-stick `k` at `of`; a site re-deriving `k/64` is the
++    /// second-spelling disease).
++    pub fn k_stick_groups(&self) -> Fp8GemmStickGroups {
++        Fp8GemmStickGroups::new(self.k.get() / crate::superdsc_opspec::Df::Fp16.elems_per_stick())
++    }
++
++    /// The output's fp16 stick-group count — the out-splice loop's extent, minted here.
++    pub fn n_stick_groups(&self) -> Fp8GemmStickGroups {
++        Fp8GemmStickGroups::new(self.n.get() / crate::superdsc_opspec::Df::Fp16.elems_per_stick())
++    }
++
++    /// The caller's real row count — the source nest's rows and the out-splice's
++    /// destination extent. (The plan's own fact: no site re-derives it from the tiling.)
++    pub fn real_rows(&self) -> crate::sdsc_abstract::RowCount {
++        self.m
++    }
++
++    /// The contraction width, as the door's own typed width.
++    pub fn contraction_width(&self) -> crate::sdsc_abstract::BlockCols {
++        self.k
++    }
++
++    /// The output width, as the door's own typed width.
++    pub fn out_width(&self) -> crate::sdsc_abstract::BlockCols {
++        self.n
++    }
++
++    /// ⭐ THE TILED PLAN'S ROW CLASS — the emission's dispatch fact. A dense plan (rows run
++    /// whole at `m` — the small-M and 128-aligned inputs the reference runs unpadded,
++    /// `fp8_linear_kernel.py:343-346`) never reaches this door: the emission dispatches it
++    /// first. What remains is exactly the reference's two tiled forms, and the reference
++    /// refuses NO M anywhere in the file: the wide tile of 4 (`_m_tiles`, `:76-77`) and the
++    /// narrow single part at the padded extent (`:344-345` — pad UP to the next
++    /// 128-multiple, ONE part at ANY multiple).
++    pub fn row_class(&self) -> Fp8RowClass {
++        match self.rows.get() {
++            FP8_GEMM_WIDE_M => Fp8RowClass::Wide,
++            _ => Fp8RowClass::Narrow(self.rows),
++        }
++    }
++}
++
++/// The wide-GEMM tile row count — the M the reference tiles prefill rows into
++/// (`_m_tiles`, `fp8_linear_kernel.py:76-77`).
++pub const FP8_GEMM_WIDE_M: u32 = 4;
++/// The largest M that runs UNTILED at a narrow geometry — the reference's `_SMALL_M`
++/// (`fp8_linear_kernel.py:66`).
++pub const FP8_GEMM_SMALL_M: u32 = 4;
++/// The row alignment a narrow GEMM pads its rows up to — the reference's `_M_ALIGN`
++/// (`fp8_linear_kernel.py:67`).
++pub const FP8_GEMM_NARROW_M_ALIGN: u32 = 128;
++
++/// ⭐ ONE fp8 GEMM'S TILE COUNT — the number of ABI row tiles the padded row extent splits
++/// into. A newtype in the `counts!` idiom, local to this door's vocabulary: a bare `u32` at
++/// the seam is the raw-scalar disease, and the count has its own law (`rows × tiles` is the
++/// padded total, uniform — never a trailing short tile).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Fp8GemmTileCount(u32);
++
++impl Fp8GemmTileCount {
++    pub const fn new(v: u32) -> Self {
++        Self(v)
++    }
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++/// ⭐ ONE TILE'S INDEX in the row tiling — the tile the clone/quant/mm/out-splice legs name
++/// (`PlaceId::synth_tiled`'s index takes its value). Minted from the plan's own tile count,
++/// never a bare loop counter at a seam.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Fp8GemmTileIdx(u32);
++
++impl Fp8GemmTileIdx {
++    pub const fn new(v: u32) -> Self {
++        Self(v)
++    }
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++/// ⭐ A `[rows, cols]` BUFFER'S fp16 STICK-GROUP COUNT — the clone/out-splice loop extent.
++/// Minted by the plan (which refuses a sub-stick width at `of`), never re-derived at a site.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Fp8GemmStickGroups(u32);
++
++impl Fp8GemmStickGroups {
++    pub const fn new(v: u32) -> Self {
++        Self(v)
++    }
++    pub const fn get(self) -> u32 {
++        self.0
++    }
++}
++
++/// ⭐ ONE fp8 GEMM'S SHAPE FACTS, AS A NAMED TYPE — the only way a TEST states a geometry:
++/// `M`/`K`/`N` are const-generic parameters of a NAMED instance (a fact about a model's own
++/// GEMM), never bare `u32`s flowing through untyped parameters. The production call states
++/// its shapes as the KTIR's own facts, typed at the door's signature (`RowCount`/
++/// `BlockCols`); a test has no KTIR, so its geometry is a type — and `plan()` is the same
++/// single door either way.
++///
++/// ⛔ NO VALUE CONSTRUCTOR, EVER: a geometry is named, not built. A runtime-built geometry
++/// would be a second spelling of a model fact.
++#[derive(Clone, Copy, Debug)]
++pub struct Fp8GemmGeometry<const M: u32, const K: u32, const N: u32>;
++
++impl<const M: u32, const K: u32, const N: u32> Fp8GemmGeometry<M, K, N> {
++    /// The GEMM's real token rows — the source of every per-tile window.
++    pub const fn rows() -> crate::sdsc_abstract::RowCount {
++        crate::sdsc_abstract::RowCount::of_token_rows(M)
++    }
++    /// The contraction width.
++    pub fn features() -> crate::sdsc_abstract::BlockCols {
++        crate::sdsc_abstract::BlockCols::of_feature_cols(K)
++    }
++    /// The output width.
++    pub fn out_features() -> crate::sdsc_abstract::BlockCols {
++        crate::sdsc_abstract::BlockCols::of_feature_cols(N)
++    }
++    /// The row-tiling plan for this geometry — the ONE door, same as production.
++    pub fn plan() -> Result<Fp8GemmRowTiles, String> {
++        Fp8GemmRowTiles::of(Self::rows(), Self::features(), Self::out_features())
++    }
++}
++
++// The named instances — every geometry the tests state, and nothing else:
++/// granite-3.1-2b's QKV prefill — THE defect-3 geometry (21 tokens, hidden 2048, fused
++/// q+k+v 3072 = 3·1024 ⇒ wide via the split N).
++pub type Granite2bQkvPrefill = Fp8GemmGeometry<21, 2048, 3072>;
++/// granite-3.1-2b's QKV decode row.
++pub type Granite2bQkvDecode = Fp8GemmGeometry<1, 2048, 3072>;
++/// granite-3.1-2b's o_proj prefill (2048 = 2·1024 ⇒ wide below 4096).
++pub type Granite2bOProjPrefill = Fp8GemmGeometry<21, 2048, 2048>;
++/// A narrow small-M control (rows ≤ 4 run whole).
++pub type NarrowSmallM = Fp8GemmGeometry<3, 128, 128>;
++/// A narrow 128-align control (21 pads up to 128).
++pub type NarrowPadded = Fp8GemmGeometry<21, 128, 128>;
++/// The 192-rung narrow control — m=192 pads UP to 256 and RUNS (S3,
++/// `fp8_linear_kernel.py:343-346`: one part at ANY 128-multiple, no upper bound, no
++/// refusal on M). Replaces 04a's T5 refusal pin, whose premise the redirect overturned.
++pub type NarrowHighUnaligned = Fp8GemmGeometry<192, 128, 128>;
++/// A sub-granularity N tail (100) — the reference's own `_n_tiles` refusal width.
++pub type InexpressibleNTail = Fp8GemmGeometry<21, 2048, 100>;
++/// A contraction width that is not a whole fp16 stick (2044 = 31·64 + 60) — the stick-law
++/// refusal's control.
++pub type SubStickContraction = Fp8GemmGeometry<21, 2044, 128>;
++/// The 26b gate prefill — the reference's own `_n_tiles` REFUSAL control (n=2112 =
++/// 2·1024 + 64; `fp8_linear_kernel.py:90`). torch-spyre never runs this width through
++/// this kernel (the 26b is bf16 there), so the refusal is fidelity, not a regression.
++pub type Gemma26bGatePrefill = Fp8GemmGeometry<21, 2816, 2112>;
++/// The 26b gate decode row — the same refusal control at m=1.
++pub type Gemma26bGateDecode = Fp8GemmGeometry<1, 2816, 2112>;
++/// gemma-4-26b's DOWN decode row (k=2112, the K-pad law's own width).
++pub type Gemma26bDownDecode = Fp8GemmGeometry<1, 2112, 2816>;
++/// The amax-reduce LX-overflow CONTROL — `m=1024, k=16384, n=128`: the reduce-residency
++/// law's own stress shape. NOT a model fact: no config in `crates/models/arch/configs`
++/// yields 16384 as a GEMM width (verified by sweep — the 16384s there are
++/// `max_position_embeddings`/vocab, never a projection). Original test:
++/// `the_quant_reduce_at_an_lx_overflowing_geometry_stays_single_shot`.
++pub type LxOverflowControl = Fp8GemmGeometry<1024, 16384, 128>;
++/// The rung-71 partials+combine CONTROL — `m=71, k=15360, n=3840`. The widths are a real
++/// model's down projection (gemma-3-12b-it.json `text_config`: intermediate_size 15360 →
++/// hidden_size 3840), but the prime-rung wall it pins is the reduce-residency law's own
++/// stress shape, so it names the control, not the model. Original test:
++/// `the_quant_reduce_at_a_fused_overflowing_geometry_emits_partials`.
++pub type FusedOverflowControl = Fp8GemmGeometry<71, 15360, 3840>;
++/// A narrow small-M control at granite's hidden width (the dense arm's fitting geometry).
++pub type NarrowSmallMHidden = Fp8GemmGeometry<4, 2048, 128>;
++/// A narrow 128-aligned control at granite's hidden width.
++pub type NarrowAlignedHidden = Fp8GemmGeometry<128, 2048, 128>;
++/// A narrow single-tile-N control over the SAME activation as the wide QKV plan (the
++/// plan-disagreement refusal's geometry).
++pub type NarrowSingleTileN = Fp8GemmGeometry<21, 2048, 64>;
++
++/// ⭐ THE ROW CLASS A TILED PLAN TILES ITS ROWS INTO — exactly two variants, because the
++/// target ABI has exactly two tiled row classes: the wide GEMM's tile of
++/// [`FP8_GEMM_WIDE_M`] rows and the narrow GEMM's [`FP8_GEMM_NARROW_M_ALIGN`]-aligned
++/// whole rows. The emission's dispatch is EXHAUSTIVE over this enum with no catch-all:
++/// a third class is a compile error at the match, not a runtime refusal arm — and each
++/// arm's const-generic `ROWS` is the class's own row count, so the class and the emission
++/// context's row extent are one fact.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Fp8RowClass {
++    /// Wide: tiles of `FP8_GEMM_WIDE_M` rows (prefill rows padded up to a multiple of 4) —
++    /// a true const of the reference's ABI (`_m_tiles`, `fp8_linear_kernel.py:76-77`).
++    Wide,
++    /// Narrow: the whole row extent as ONE part at the FULL padded 128-multiple — ANY
++    /// multiple, no upper bound (S3, `fp8_linear_kernel.py:343-346`: 21→128, 192→256,
++    /// 256→256 unpadded). The extent is a runtime `RowCount`: it is a fact of the input,
++    /// not of the ABI, so the class carries it instead of a const generic —
++    /// `Fp8TileStaging::<ROWS>` cannot state it, and the reference refuses no M anywhere
++    /// in the file.
++    Narrow(crate::sdsc_abstract::RowCount),
++}
++
+ // ⛔ THE EXPERT SLAB CUT IS GONE — `expert_slab_chunks`/`expert_slab_subpages` (the LX-fit
+ // chunk and sub-page sizing of the MoE weight gather) existed only for the hand-written
+ // per-op MoE card lowering, which is deleted: the MoE lowers only from `kernels/moe.py`
+@@ -451,8 +815,8 @@ pub fn distribute_cores_reduced_axis(
+ /// the `out:32` line, so it is the stick axis taking its share first that matters, not `mb` going unsplit.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum EwDivision {
+-    /// THE LAW: whichever of the two below the op's operands call for ([`Self::resolve`]). Every
+-    /// elementwise door passes this, except for the two ops below that state their division outright.
++    /// THE LAW: whichever of the three below the op's operands call for ([`Self::resolve`]). Every
++    /// elementwise door passes this, except for the ops below that state their division outright.
+     Law,
+     /// [`distribute_cores`]: `mb` first, then the other output dims largest-first. Stated outright only by
+     /// an op whose own addressing is keyed on `mb` being the split axis (the gathered-row leg, whose index
+@@ -462,19 +826,34 @@ pub enum EwDivision {
+     /// outright by a decode batch chunk's `esub` and `exp`. Their shared core-local `cesub` is sized under
+     /// it, so both ops keep it (`attn`'s `ChunkBufs::sm_division_of`).
+     SticksFirst,
++    /// ⭐⭐⭐ [`distribute_cores_sprays_first`]: the LEADING `y` (the spray axis) first, then the ordinary
++    /// law over the cores it leaves. The ROW-SPLIT (y-major) mode's own — its tensors present
++    /// `["y", "mb", "out"]`, so `y` is the outermost dim of the flat layout and a core's slab is
++    /// CONTIGUOUS exactly when the split is over `y`. Stated by the y-major emission itself
++    /// ([`crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile`]'s row-split arm),
++    /// which refuses every other division for that mode by name — see the splitter's own doc for the
++    /// card measurement that made this a law rather than a preference.
++    SpraysFirst,
+ }
+ 
+ impl EwDivision {
+     /// The concrete division. [`Self::Law`] resolves on the operands: `stick_major` is the builder's own
+     /// rank-2 stick-major presentation decision — the SAME value that picks the operands' layout, so the
+-    /// layout and the division cannot disagree — and `core_local` is whether any operand is a core-local
+-    /// LX pin. Such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
++    /// layout and the division cannot disagree — `core_local` is whether any operand is a core-local
++    /// LX pin (such a tensor's division is its PRODUCER's, held by `emit_sdsc_tiled`'s read law and sized
+     /// by [`crate::emit::pointwise_untiled_slice_bytes`], so an op touching one under the law keeps the
+-    /// rows-first division those were laid out under. A pin laid out under a stated division is sized
+-    /// under that division instead ([`crate::emit::pointwise_untiled_slice_bytes_divided`]), and its ops
+-    /// state it. The two concrete divisions resolve to themselves.
+-    pub const fn resolve(self, stick_major: bool, core_local: bool) -> EwDivision {
++    /// rows-first division those were laid out under; a pin laid out under a stated division is sized
++    /// under that division instead, [`crate::emit::pointwise_untiled_slice_bytes_divided`], and its ops
++    /// state it), and `sprays` is the row-split (y-major) presentation decision, the same kind of fact:
++    /// the op's tensors walk `["y", "mb", "out"]`, and only a split over the leading `y` gives a core a
++    /// contiguous slab in that layout. The concrete divisions resolve to themselves.
++    ///
++    /// ⭐ `sprays` outranks `stick_major` by construction, not by choice: the row-split frame law holds
++    /// the op to ONE stick of `out` while the stick-major presentation requires wider than one, so the
++    /// two facts are disjoint and their order in the match cannot matter.
++    pub const fn resolve(self, stick_major: bool, core_local: bool, sprays: bool) -> EwDivision {
+         match self {
++            EwDivision::Law if sprays => EwDivision::SpraysFirst,
+             EwDivision::Law if stick_major && !core_local => EwDivision::SticksFirst,
+             EwDivision::Law => EwDivision::RowsFirst,
+             concrete => concrete,
+@@ -488,6 +867,7 @@ impl EwDivision {
+         match self {
+             EwDivision::Law | EwDivision::RowsFirst => distribute_cores,
+             EwDivision::SticksFirst => distribute_cores_sticks_first,
++            EwDivision::SpraysFirst => distribute_cores_sprays_first,
+         }
+     }
+ }
+@@ -581,7 +961,12 @@ pub enum CoreDivision {
+ 
+ #[cfg(test)]
+ mod gather_split_tests {
+-    use super::{CoreDivision, GatherSplit, ItDim};
++    use super::{
++        CoreDivision, Fp8GemmRowTiles, Fp8GemmStickGroups, Fp8GemmTileCount, Fp8GemmTileIdx,
++        Fp8RowClass, GatherSplit, Gemma26bGateDecode, Gemma26bGatePrefill, Granite2bOProjPrefill,
++        Granite2bQkvDecode, Granite2bQkvPrefill, InexpressibleNTail, ItDim, NarrowHighUnaligned,
++        NarrowPadded, NarrowSmallM, SubStickContraction,
++    };
+     use crate::superdsc_opspec::Df;
+     use std::collections::BTreeMap;
+ 
+@@ -639,6 +1024,167 @@ mod gather_split_tests {
+         );
+     }
+ 
++    /// ⭐ THE COPIED `_m_tiles` LAW — granite's prefill QKV (m=21, k=2048, n=3072=3·1024) is
++    /// WIDE via the split N, so the rows the card sees are SIX tiles of 4 over a 24-row
++    /// zero-padded extent — never a 21-row A operand. The reference's own decode form (m=1)
++    /// stays one tile of 1, byte-identical to the untiled emission.
++    #[test]
++    fn wide_prefill_rows_tile_by_four_padded_up() {
++        let t = Granite2bQkvPrefill::plan().expect("granite QKV prefill geometry");
++        assert_eq!(
++            t.tile_rows(),
++            crate::sdsc_abstract::RowCount::of_token_rows(4),
++            "the A operand's M is the ABI's 4, not the chunk's 21"
++        );
++        assert_eq!(t.tile_count(), Fp8GemmTileCount::new(6));
++        assert_eq!(
++            t.total_rows(),
++            crate::sdsc_abstract::RowCount::of_token_rows(24),
++            "rows [21,24) are the zero-filled pad"
++        );
++    }
++
++    #[test]
++    fn decode_is_one_untiled_row() {
++        let t = Granite2bQkvDecode::plan().expect("granite QKV decode geometry");
++        assert_eq!(
++            (t.tile_rows(), t.tile_count(), t.total_rows()),
++            (
++                crate::sdsc_abstract::RowCount::of_token_rows(1),
++                Fp8GemmTileCount::new(1),
++                crate::sdsc_abstract::RowCount::of_token_rows(1)
++            )
++        );
++    }
++
++    #[test]
++    fn a_split_n_is_wide_below_4096() {
++        let t = Granite2bOProjPrefill::plan().expect("o_proj geometry");
++        assert_eq!(
++            (t.tile_rows(), t.tile_count()),
++            (
++                crate::sdsc_abstract::RowCount::of_token_rows(4),
++                Fp8GemmTileCount::new(6)
++            )
++        );
++    }
++
++    #[test]
++    fn narrow_rows_run_whole_at_the_128_alignment() {
++        let small = NarrowSmallM::plan().expect("narrow small-M geometry");
++        assert_eq!(
++            (small.tile_rows(), small.tile_count()),
++            (
++                crate::sdsc_abstract::RowCount::of_token_rows(3),
++                Fp8GemmTileCount::new(1)
++            )
++        );
++        let padded = NarrowPadded::plan().expect("narrow padded geometry");
++        assert_eq!(
++            (padded.tile_rows(), padded.tile_count(), padded.total_rows()),
++            (
++                crate::sdsc_abstract::RowCount::of_token_rows(128),
++                Fp8GemmTileCount::new(1),
++                crate::sdsc_abstract::RowCount::of_token_rows(128)
++            )
++        );
++    }
++
++    #[test]
++    fn an_inexpressible_n_refuses() {
++        assert!(InexpressibleNTail::plan().is_err());
++    }
++
++    /// ⭐ THE NARROW LAW (S3, `fp8_linear_kernel.py:343-346`): ONE part at the FULL padded
++    /// 128-multiple — ANY multiple, no upper bound, no refusal on M anywhere in the file.
++    /// 21 pads to 128; 192 pads to 256 — exactly the extent the overturned branch-1
++    /// refusal once rejected, now run as the reference runs it.
++    #[test]
++    fn narrow_rows_pad_to_any_128_multiple_and_run() {
++        let t = NarrowPadded::plan().expect("narrow padded geometry");
++        assert_eq!(
++            t.row_class(),
++            Fp8RowClass::Narrow(crate::sdsc_abstract::RowCount::of_token_rows(128))
++        );
++        let t = NarrowHighUnaligned::plan().expect("the 192-rung geometry");
++        assert_eq!(
++            t.total_rows(),
++            crate::sdsc_abstract::RowCount::of_token_rows(256),
++            "192 pads UP to 256 — any 128-multiple, no upper bound"
++        );
++        assert_eq!(
++            t.row_class(),
++            Fp8RowClass::Narrow(crate::sdsc_abstract::RowCount::of_token_rows(256))
++        );
++    }
++
++    /// ⛔ A CONTRACTION WIDTH THAT IS NOT A WHOLE fp16 STICK IS REFUSED — the clone loop
++    /// walks whole stick groups, and an unchecked `k/64` would silently truncate a sub-stick
++    /// tail (the silent-tail class). The refusal is at the DOOR, so no accessor ever divides
++    /// an unchecked width.
++    #[test]
++    fn a_sub_stick_contraction_width_is_refused() {
++        let Err(m) = SubStickContraction::plan() else {
++            panic!("k=2044 is not a whole fp16 stick — refused, never truncated");
++        };
++        assert!(
++            m.contains("not a whole fp16 stick"),
++            "names the stick law: {m}"
++        );
++    }
++
++    /// ⛔ THE 26b GATE WIDTH (2112 = 2·1024 + 64) IS THE REFERENCE'S OWN REFUSAL —
++    /// `_n_tiles` raises at the remainder (`fp8_linear_kernel.py:90`), and there is no
++    /// other acceptance arm: where our packed kernel could stage a width theirs refuses,
++    /// the defect is in our lowering or kernel, never a width law of ours. torch-spyre
++    /// never runs this width through this kernel (the 26b is bf16 there) — the refusal is
++    /// fidelity, not a regression.
++    #[test]
++    fn the_26b_gate_n_tail_is_the_references_own_refusal() {
++        let Err(m) = Gemma26bGatePrefill::plan() else {
++            panic!("n=2112 leaves remainder 64 — the reference refuses it (:90), and so do we");
++        };
++        assert!(
++            m.contains("fp8_linear_kernel.py:90"),
++            "cites the reference's refusal: {m}"
++        );
++        let Err(m) = Gemma26bGateDecode::plan() else {
++            panic!("n=2112 leaves remainder 64 — the reference refuses it (:90), and so do we");
++        };
++        assert!(
++            m.contains("fp8_linear_kernel.py:90"),
++            "cites the reference's refusal: {m}"
++        );
++    }
++
++    #[test]
++    fn tile_windows_and_stick_groups_are_minted_by_the_door() {
++        let t = Granite2bQkvPrefill::plan().expect("granite QKV prefill geometry");
++        let first = t.tile(Fp8GemmTileIdx::new(0));
++        assert_eq!(first.row, crate::addr::Idx::<crate::addr::Row>::n(0));
++        assert_eq!(
++            first.real_rows,
++            crate::sdsc_abstract::RowCount::of_token_rows(4)
++        );
++        let last = t.tile(Fp8GemmTileIdx::new(5));
++        assert_eq!(last.row, crate::addr::Idx::<crate::addr::Row>::n(20));
++        assert_eq!(
++            last.real_rows,
++            crate::sdsc_abstract::RowCount::of_token_rows(1),
++            "the last tile covers only the real row — never past the footprint"
++        );
++        assert_eq!(
++            t.k_stick_groups(),
++            Fp8GemmStickGroups::new(32),
++            "2048 fp16 = 32 stick groups"
++        );
++        assert_eq!(
++            t.n_stick_groups(),
++            Fp8GemmStickGroups::new(48),
++            "3072 fp16 = 48 stick groups"
++        );
++    }
++
+     /// At MORE entries than cores the split is [`core_split`]'s largest divisor — every core
+     /// owns one or more WHOLE entries, and `out` still never splits.
+     #[test]
+@@ -777,6 +1323,60 @@ pub fn distribute_cores_sticks_first(
+     splits
+ }
+ 
++/// ⭐⭐⭐⭐⭐ THE ROW-SPLIT (Y-MAJOR) OP'S OWN SPLITTER — the leading `y` (spray) axis first, then the
++/// ordinary law over the cores it leaves.
++///
++/// ## Why this is a correctness law, not a preference (MEASURED on card, granite-3.1-2b prefill)
++/// A row-split op presents its tensors `["y", "mb", "out"]` — `y` is the OUTERMOST dim of the flat
++/// layout, so a core's slab is CONTIGUOUS exactly when the split is over `y`: core `y0` owns
++/// `[mb, out]` at flat stick `y0·mb`, and the stride every level of the addressing derives (the
++/// per-core start `per_core_addr`, the on-card walk `build_coordinates`) is computed from the
++/// PER-CORE extents — which are the FULL extents for every dim the split does not touch.
++///
++/// Splitting any INNER dim instead hands every core a STRIDED stick set, and the per-core-extent
++/// stride derivation then mis-walks it. MEASURED on the prefill mask add (`11_add_o1417`, the
++/// `[y=32 qh, mb=21 t, out=64]` add of the causal mask): the rows-first law split `mb` 21 ways, so
++/// each core's per-core `mb` extent was 1 row — its within-slab `y` stride came out ONE STICK
++/// instead of 21, and its start address (the flat corner of `mb=c`) was one stick past the last.
++/// Read straight off the emitted descriptor's `startAddressCoreCorelet_`: every core's base advanced
++/// 128 B (ONE stick) while each core's slab was 32 sticks — the 21 cores covered sticks 0..51 of the
++/// 672-stick score tile (identity reads, `t=20` stuttering onto `t=19`), and 620 sticks were NEVER
++/// WRITTEN, read downstream as pure zero. That destroyed 29 of 32 heads' scores outright and
++/// mis-cut the causal mask for the rest — the attention-dilution defect this splitter exists to
++/// make unconstructible.
++///
++/// This is the y-major TWIN of [`distribute_cores`]' own mb-first note ("splitting `mb` first makes
++/// each core own WHOLE rows … so the flat start alone places the row and there is no mb-stride to
++/// mis-walk"): splitting `y` first makes each core own WHOLE SPRAYS, so the start alone places the
++/// spray and there is no y-stride to mis-walk.
++///
++/// The remainder is spent by the ordinary law over the dims the spray axis leaves (an `mb` split
++/// WITHIN one spray is contiguous — `mb` is the slab's own outer dim — so a short spray count loses
++/// no cores: the J-slot merge at `y=4, mb=64` divides `{y:4, mb:8}` over 32 cores).
++pub fn distribute_cores_sprays_first(
++    dims: &[ItDim],
++    max_cores: u32,
++) -> BTreeMap<&'static str, u32> {
++    let mut splits: BTreeMap<&'static str, u32> = BTreeMap::new();
++    let mut remaining = max_cores;
++    if let Some(y) = dims
++        .iter()
++        .find(|d| d.name == "y" && !d.is_reduction && !d.is_stick)
++    {
++        let split = core_split(y.size, remaining);
++        if split > 1 {
++            splits.insert(y.name, split);
++            remaining /= split;
++        }
++    }
++    // The cores the spray axis leaves, spent by the ordinary law over the dims it leaves — one
++    // budget, one call, so the spray split and the remainder can never disagree about the count.
++    let rest: Vec<ItDim> = dims.iter().filter(|d| d.name != "y").cloned().collect();
++    let mut remainder = distribute_cores(&rest, remaining);
++    splits.append(&mut remainder);
++    splits
++}
++
+ /// Per-core slice index along each split dim, for `coreIdToWkSlice_`. Cores are
+ /// numbered row-major over the split dims in `splits` insertion order: for
+ /// `{out:2, mb:16}`, core c → out = c/16, mb = c%16 (matches the real fixture:
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_gather_destinations_refuse_at_the_mint.rs b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_gather_destinations_refuse_at_the_mint.rs
+index 41897fc492..2f4a78387c 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_gather_destinations_refuse_at_the_mint.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_gather_destinations_refuse_at_the_mint.rs
+@@ -196,10 +196,12 @@ fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String)
+     let src_id = PlaceId::Synth {
+         of: 5,
+         role: SynthRole::Rot,
++        tile: None,
+     };
+     let idx_id = PlaceId::Synth {
+         of: 6,
+         role: SynthRole::Xc,
++        tile: None,
+     };
+     // The pool's window for one run is the run's own `mb × out` elements (an index step advances
+     // `skip_addr = page × out`, and the run covers `mb / page` of them); the table's is the run's
+@@ -305,6 +307,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
+     let core_id = PlaceId::Synth {
+         of: 7,
+         role: SynthRole::VRep,
++        tile: None,
+     };
+     let lx_layout = BundleLayout::default();
+     lx_layout.synth_lx_core_local(core_id, lx.per_core_bytes());
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_stick_major_elementwise_op_splits_its_sticks_first.rs b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_stick_major_elementwise_op_splits_its_sticks_first.rs
+index a8a79919bb..752460466a 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_stick_major_elementwise_op_splits_its_sticks_first.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_stick_major_elementwise_op_splits_its_sticks_first.rs
+@@ -165,24 +165,46 @@ fn the_measured_shapes_split_their_sticks_first() {
+     );
+ }
+ 
+-/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, and a
+-/// concrete division is its own answer.
++/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, sprays
++/// first for a row-split (y-major) op, and a concrete division is its own answer.
+ #[test]
+ fn the_law_resolves_on_the_layout_and_the_pins() {
+     assert_eq!(
+-        EwDivision::Law.resolve(true, false),
++        EwDivision::Law.resolve(true, false, false),
+         EwDivision::SticksFirst
+     );
+-    assert_eq!(EwDivision::Law.resolve(true, true), EwDivision::RowsFirst);
+-    assert_eq!(EwDivision::Law.resolve(false, false), EwDivision::RowsFirst);
+     assert_eq!(
+-        EwDivision::RowsFirst.resolve(true, false),
++        EwDivision::Law.resolve(true, true, false),
+         EwDivision::RowsFirst
+     );
+     assert_eq!(
+-        EwDivision::SticksFirst.resolve(false, true),
++        EwDivision::Law.resolve(false, false, false),
++        EwDivision::RowsFirst
++    );
++    assert_eq!(
++        EwDivision::RowsFirst.resolve(true, false, false),
++        EwDivision::RowsFirst
++    );
++    assert_eq!(
++        EwDivision::SticksFirst.resolve(false, true, false),
+         EwDivision::SticksFirst
+     );
++    // ⭐ THE ROW-SPLIT FACT OUTRANKS THE OTHERS: a y-major op's tensors walk ["y", "mb", "out"],
++    // so only a split over the leading `y` gives a core a contiguous slab — the prefill mask add
++    // measured 620 of 672 sticks never written under the rows-first split (see
++    // `distribute_cores_sprays_first`'s doc).
++    assert_eq!(
++        EwDivision::Law.resolve(false, false, true),
++        EwDivision::SpraysFirst
++    );
++    assert_eq!(
++        EwDivision::Law.resolve(true, false, true),
++        EwDivision::SpraysFirst
++    );
++    assert_eq!(
++        EwDivision::SpraysFirst.resolve(false, false, true),
++        EwDivision::SpraysFirst
++    );
+ }
+ 
+ fn rb(name: &str, rows: RowCount, cols: BlockCols) -> Stk<RowBlockedTag> {
+diff --git a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_window_past_its_tensor_refuses_at_the_mint.rs b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_window_past_its_tensor_refuses_at_the_mint.rs
+index ab615640af..c96aa94603 100644
+--- a/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_window_past_its_tensor_refuses_at_the_mint.rs
++++ b/crates/targets/spyre/ktir/ktir-superdsc/tests/zz_a_window_past_its_tensor_refuses_at_the_mint.rs
+@@ -179,6 +179,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
+     let id = PlaceId::Synth {
+         of: 7,
+         role: SynthRole::Silu,
++        tile: None,
+     };
+     layout.synth(id, &[ROWS, COLS]);
+     let stk = Stk::<RowBlockedTag>::new(
+@@ -195,6 +196,7 @@ fn a_declared_synth_window_is_bounded_by_its_declaration() {
+     let short = PlaceId::Synth {
+         of: 7,
+         role: SynthRole::Xc,
++        tile: None,
+     };
+     layout.synth(short, &[ROWS, COLS / 2]);
+     let big_stk = Stk::<RowBlockedTag>::new(
+@@ -225,6 +227,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
+     let core_id = PlaceId::Synth {
+         of: 7,
+         role: SynthRole::Qs,
++        tile: None,
+     };
+     layout.synth_lx_core_local(core_id, 256);
+     let core_stk =
+@@ -247,6 +250,7 @@ fn a_core_local_lx_window_refuses_an_offset_and_op_local_is_bounded() {
+     let op_id = PlaceId::Synth {
+         of: 7,
+         role: SynthRole::KRep,
++        tile: None,
+     };
+     layout.synth_lx_op_local(op_id, &[1, 128]);
+     let op_stk =

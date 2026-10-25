@@ -1,0 +1,234 @@
+diff --git a/crates/targets/spyre/src/superdsc_bake.rs b/crates/targets/spyre/src/superdsc_bake.rs
+index 2c40b8a053..141a8db02c 100644
+--- a/crates/targets/spyre/src/superdsc_bake.rs
++++ b/crates/targets/spyre/src/superdsc_bake.rs
+@@ -1990,6 +1990,20 @@ pub struct BakeStats {
+ /// one-line edit against a number the build itself reported.
+ pub struct BakeBudget;
+ 
++/// ⭐ A BAKE-BUDGET REFUSAL, AS A TYPE — the ONE error class a ladder rung survives.
++///
++/// The budget verdicts ([`BakeBudget::bundle_verdict`], [`BakeBudget::group_verdict`],
++/// [`BakeBudget::total_verdict`]) refuse work the build can live without: a rung past a
++/// budget is skipped and the model serves through a narrower rung, while every other emit
++/// error is fatal. Before this type both travelled one `String` channel, so no rung arm
++/// could tell a refusal (skip the rung, keep building) from a defect (fail the build) — the
++/// 11k bake went RED on six budget refusals exactly because "refusal" was not matchable as
++/// a class. The prefill rung arm matches THIS and nothing else; a primary body turns it
++/// into a panic carrying the same text, which is unchanged semantics for a site that was
++/// already fatal.
++#[derive(Debug, Clone)]
++pub struct BudgetRefusal(pub String);
++
+ impl BakeBudget {
+     /// 16,384 lowered descriptors in ONE bundle. MEASURED envelope: the 2b fp8 bake's widest
+     /// bundle is ~2,000 trip-files (fp `c29fb27f2e6c8c85`, 22.7 MB staged, 5 groups — probe
+@@ -2024,6 +2038,64 @@ impl BakeBudget {
+     /// refusing with the measured count if it must.
+     pub const MAX_GROUPS_PER_LAYER: usize = 256;
+ 
++    /// ⭐ 92,000 trips in ONE model's WHOLE bake — the TOTAL-WORK ceiling, the per-model
++    /// sibling of [`Self::MAX_BUNDLE_TRIPS`]. The per-bundle wall bounds the wave's critical
++    /// path; NOTHING bounded the sum, which is how the inventory more than doubled silently
++    /// across warm builds (measured 283,062 sdsc files against the ~123k pre-campaign
++    /// inventory = 2.3×; the 384/512 rungs' ~1,316 groups ≈ 329 child-minutes put the
++    /// attempt-12 cold bake ~7× past the 6-10 minute law with every group individually legal). Sized to the
++    /// law, not to the inventory: 600 s cold × width 20 × the ~0.9 utilization an unthrottled
++    /// xargs demonstrates ÷ ~117 ms/trip (measured: the 926-group sweep, 231 child-minutes)
++    /// ≈ 92.3k trips. The census at the enforcement site names the rungs that pushed the
++    /// total over, and they are UNBAKED — same refusal semantics as the per-bundle wall:
++    /// green build, named census, shorter ladder. ⚠️ PROVISIONAL in the family's sense: the
++    /// verification bake's own census is the calibration, and moving this is a measured
++    /// decision that names the bake.
++    pub const MAX_TOTAL_TRIPS: u64 = 92_000;
++
++    /// The per-MODEL total-trips verdict — the sum over every body class's minted trips
++    /// (the arithmetic [`crate::lower_subtile_tape_to_ktir::mint_trips`] already runs per
++    /// body). `Err` carries the refusal verbatim for the census to name the rungs that
++    /// pushed the total over; the enforcement site drops them unbaked.
++    ///
++    /// ⛔ `>`, NOT `>=`, same law as [`Self::bundle_verdict`]: a bake that lands exactly AT
++    /// the ceiling is lawful, a past-ceiling one is the blow-up.
++    pub fn total_verdict(total: u64) -> Result<(), BudgetRefusal> {
++        if total > Self::MAX_TOTAL_TRIPS {
++            return Err(BudgetRefusal(format!(
++                "{total} trips over the whole bake is PAST THE TOTAL BUDGET of {} trips per \
++                 model. The per-bundle wall bounds the critical path; this bounds the work — \
++                 a total past it is the bake's floor blowing up, which no parallelism \
++                 recovers. Moving the budget is a measured decision that names the bake; this \
++                 refusal is the measurement.",
++                Self::MAX_TOTAL_TRIPS,
++            )));
++        }
++        Ok(())
++    }
++
++    /// ⭐ THE LADDER'S TOTAL-WORK DECISION, EXTRACTED PURE — every stageable rung's trips in
++    /// ASCENDING width order against [`Self::MAX_TOTAL_TRIPS`], answered as how many rungs
++    /// the bake KEEPS: the kept prefix, and the refused tail behind the returned count. The
++    /// commit loop walks the same `>` law one rung at a time — a rung landing exactly AT the
++    /// ceiling is lawful, the first rung past it refuses, and every later rung is wider and
++    /// costs more, so the tail goes with it — and this is that arithmetic stated once, so
++    /// the boundary is pinned where it is decided rather than re-derived at each caller.
++    pub fn total_budget_kept_rungs(trips: &[u64]) -> usize {
++        let mut total: u64 = 0;
++        trips
++            .iter()
++            .position(|&t| {
++                if total + t > Self::MAX_TOTAL_TRIPS {
++                    true
++                } else {
++                    total += t;
++                    false
++                }
++            })
++            .unwrap_or(trips.len())
++    }
++
+     /// The per-BUNDLE budget verdict — `Err` carries the refusal verbatim, for
+     /// `ktir_groups_via_superdsc` to return as the bundle's `Err` (fatal at a primary body,
+     /// the documented rung-skip on a ladder rung). `trips` is `Σ EmittedOp::time` over the
+@@ -2032,9 +2104,9 @@ impl BakeBudget {
+     /// ⛔ `>`, NOT `>=`: the granite-8b fp8 baseline's own largest group sits AT the group
+     /// ceiling below and its accepted bake must keep passing — a boundary bundle is lawful,
+     /// a past-boundary one is the blow-up. Same law here.
+-    pub fn bundle_verdict(fp: &str, descriptors: usize, trips: u64) -> Result<(), String> {
++    pub fn bundle_verdict(fp: &str, descriptors: usize, trips: u64) -> Result<(), BudgetRefusal> {
+         if descriptors > Self::MAX_BUNDLE_DESCRIPTORS || trips > Self::MAX_BUNDLE_TRIPS {
+-            return Err(format!(
++            return Err(BudgetRefusal(format!(
+                 "{fp}: {descriptors} lowered descriptor(s) over {trips} trip(s) is PAST THE BAKE \
+                  BUDGET of {} descriptors / {} trips per bundle. A bundle is the unit the \
+                  emitter runs concurrently, so this is the bake's critical path blowing up — \
+@@ -2042,7 +2114,7 @@ impl BakeBudget {
+                  names the bake; this refusal is the measurement.",
+                 Self::MAX_BUNDLE_DESCRIPTORS,
+                 Self::MAX_BUNDLE_TRIPS,
+-            ));
++            )));
+         }
+         Ok(())
+     }
+@@ -2054,9 +2126,9 @@ impl BakeBudget {
+     ///
+     /// ⛔ `>`, NOT `>=` — 4204 IS the granite-8b baseline's largest measured group: the accepted
+     /// bake must keep passing at exactly the ceiling.
+-    pub fn group_verdict(fp: &str, group: u32, descriptors: usize) -> Result<(), String> {
++    pub fn group_verdict(fp: &str, group: u32, descriptors: usize) -> Result<(), BudgetRefusal> {
+         if descriptors > DxGroupCeiling::MAX_DESCRIPTORS {
+-            return Err(format!(
++            return Err(BudgetRefusal(format!(
+                 "{fp}: launch group {group} carries {descriptors} descriptor(s), PAST THE \
+                  DXP-GROUP CEILING of {}. Group cost is superlinear in size — this is the \
+                  multi-hour compile that looks like a hang — and the gathered-fold window \
+@@ -2065,7 +2137,7 @@ impl BakeBudget {
+                  Moving the ceiling is a measured decision that names the bake; this refusal \
+                  is the measurement.",
+                 DxGroupCeiling::MAX_DESCRIPTORS,
+-            ));
++            )));
+         }
+         Ok(())
+     }
+@@ -2402,7 +2474,9 @@ mod tests {
+             BakeBudget::group_verdict("4f460f8b68a6c85a", 1, at).is_ok(),
+             "the granite-8b baseline's own largest group is lawful at exactly the ceiling"
+         );
+-        let err = BakeBudget::group_verdict("4f460f8b68a6c85a", 1, at + 1).unwrap_err();
++        let err = BakeBudget::group_verdict("4f460f8b68a6c85a", 1, at + 1)
++            .unwrap_err()
++            .0;
+         assert!(
+             err.contains("4f460f8b68a6c85a"),
+             "must name the bundle: {err}"
+@@ -2438,7 +2512,8 @@ mod tests {
+             BakeBudget::MAX_BUNDLE_DESCRIPTORS + 1,
+             2_066,
+         )
+-        .unwrap_err();
++        .unwrap_err()
++        .0;
+         assert!(
+             err.contains("c29fb27f2e6c8c85"),
+             "must name the bundle: {err}"
+@@ -2461,7 +2536,8 @@ mod tests {
+ 
+         let err =
+             BakeBudget::bundle_verdict("c29fb27f2e6c8c85", 12, BakeBudget::MAX_BUNDLE_TRIPS + 1)
+-                .unwrap_err();
++                .unwrap_err()
++                .0;
+         assert!(
+             err.contains(&format!(
+                 "over {} trip(s)",
+@@ -2470,4 +2546,70 @@ mod tests {
+             "the trips axis refuses on its own: {err}"
+         );
+     }
++
++    /// ⛔ THE TOTAL BOUNDARY IS `>`, NOT `>=` — a bake landing exactly AT 92,000 trips is
++    /// lawful (the ceiling is sized to the 600 s law, and a bake that meets its law exactly
++    /// has not blown it), one trip past it refuses naming the measured total and the
++    /// ceiling, and the refusal is a [`BudgetRefusal`] — the class a rung survives.
++    #[test]
++    fn a_total_at_the_ceiling_passes_and_one_past_it_refuses_naming_both() {
++        let at = BakeBudget::MAX_TOTAL_TRIPS;
++        assert!(
++            BakeBudget::total_verdict(at).is_ok(),
++            "a bake that lands exactly AT the total ceiling is lawful"
++        );
++        let err = BakeBudget::total_verdict(at + 1).unwrap_err().0;
++        assert!(
++            err.contains(&format!("{} trips over the whole bake", at + 1)),
++            "must name the measured total: {err}"
++        );
++        assert!(
++            err.contains(&format!("of {at} trips per model")),
++            "must name the ceiling: {err}"
++        );
++    }
++
++    /// The extracted ladder decision: rung trips in ASCENDING width order against
++    /// [`BakeBudget::MAX_TOTAL_TRIPS`], answered as the KEPT PREFIX. Exactly-at-ceiling is
++    /// lawful (the `>` law), the first rung past the ceiling refuses, and every later rung
++    /// is wider and costs more — so the tail behind the first refusal is refused with it
++    /// even where the arithmetic alone would let a narrow late rung fit.
++    #[test]
++    fn the_total_budget_keeps_the_prefix_and_refuses_the_tail_with_the_first_over() {
++        let ceil = BakeBudget::MAX_TOTAL_TRIPS;
++        // An empty ladder keeps nothing.
++        assert_eq!(BakeBudget::total_budget_kept_rungs(&[]), 0);
++        // Everything under: all kept.
++        assert_eq!(
++            BakeBudget::total_budget_kept_rungs(&[1, 2, 3]),
++            3,
++            "a ladder well under the ceiling keeps every rung"
++        );
++        // Landing exactly AT the ceiling on the last rung is lawful — the `>` law.
++        assert_eq!(
++            BakeBudget::total_budget_kept_rungs(&[ceil / 2, ceil - ceil / 2]),
++            2,
++            "a ladder landing exactly AT the ceiling is lawful"
++        );
++        // One past on the last rung refuses exactly that rung.
++        assert_eq!(
++            BakeBudget::total_budget_kept_rungs(&[ceil / 2, ceil - ceil / 2 + 1]),
++            1,
++            "the first rung past the ceiling refuses"
++        );
++        // A single rung over the whole ceiling refuses alone.
++        assert_eq!(
++            BakeBudget::total_budget_kept_rungs(&[ceil + 1]),
++            0,
++            "one rung past the whole ceiling keeps nothing"
++        );
++        // The tail goes with the first refusal: rung 2 blows the total, and rung 3 —
++        // narrower than rung 2 in this fixture's arithmetic — is refused WITH it, because
++        // the real ladder is ascending and a rung after a wider refused one is wider still.
++        assert_eq!(
++            BakeBudget::total_budget_kept_rungs(&[ceil / 3, ceil, 1]),
++            1,
++            "every rung after the first refusal is refused with it"
++        );
++    }
+ }

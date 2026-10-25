@@ -196,10 +196,12 @@ fn declare_gather_rig(layout: &BundleLayout, cp: GatherCopy) -> (String, String)
     let src_id = PlaceId::Synth {
         of: 5,
         role: SynthRole::Rot,
+        tile: None,
     };
     let idx_id = PlaceId::Synth {
         of: 6,
         role: SynthRole::Xc,
+        tile: None,
     };
     // The pool's window for one run is the run's own `mb × out` elements (an index step advances
     // `skip_addr = page × out`, and the run covers `mb / page` of them); the table's is the run's
@@ -305,6 +307,7 @@ fn a_core_local_destination_the_layout_does_not_hold_refuses() {
     let core_id = PlaceId::Synth {
         of: 7,
         role: SynthRole::VRep,
+        tile: None,
     };
     let lx_layout = BundleLayout::default();
     lx_layout.synth_lx_core_local(core_id, lx.per_core_bytes());

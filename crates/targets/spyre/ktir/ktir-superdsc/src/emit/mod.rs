@@ -963,7 +963,10 @@ pub fn pointwise_untiled_slice_bytes_divided(
     tile_op
         .tile(
             crate::superdsc_opspec::MaxCores::<{ crate::superdsc_opspec::MAX_CORES }>,
-            division.resolve(true, true).splitter(),
+            // `false` for the spray fact: this sizing helper's tile states `y=1`, so the row-split
+            // (y-major) mode — the only presentation whose division that fact selects — cannot
+            // reach it.
+            division.resolve(true, true, false).splitter(),
             "out",
         )
         .ok()

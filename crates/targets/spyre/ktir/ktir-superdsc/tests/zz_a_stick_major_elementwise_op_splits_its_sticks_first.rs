@@ -165,23 +165,45 @@ fn the_measured_shapes_split_their_sticks_first() {
     );
 }
 
-/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, and a
-/// concrete division is its own answer.
+/// The law's resolution: sticks first only for a stick-major op touching no core-local pin, sprays
+/// first for a row-split (y-major) op, and a concrete division is its own answer.
 #[test]
 fn the_law_resolves_on_the_layout_and_the_pins() {
     assert_eq!(
-        EwDivision::Law.resolve(true, false),
+        EwDivision::Law.resolve(true, false, false),
         EwDivision::SticksFirst
     );
-    assert_eq!(EwDivision::Law.resolve(true, true), EwDivision::RowsFirst);
-    assert_eq!(EwDivision::Law.resolve(false, false), EwDivision::RowsFirst);
     assert_eq!(
-        EwDivision::RowsFirst.resolve(true, false),
+        EwDivision::Law.resolve(true, true, false),
         EwDivision::RowsFirst
     );
     assert_eq!(
-        EwDivision::SticksFirst.resolve(false, true),
+        EwDivision::Law.resolve(false, false, false),
+        EwDivision::RowsFirst
+    );
+    assert_eq!(
+        EwDivision::RowsFirst.resolve(true, false, false),
+        EwDivision::RowsFirst
+    );
+    assert_eq!(
+        EwDivision::SticksFirst.resolve(false, true, false),
         EwDivision::SticksFirst
+    );
+    // ⭐ THE ROW-SPLIT FACT OUTRANKS THE OTHERS: a y-major op's tensors walk ["y", "mb", "out"],
+    // so only a split over the leading `y` gives a core a contiguous slab — the prefill mask add
+    // measured 620 of 672 sticks never written under the rows-first split (see
+    // `distribute_cores_sprays_first`'s doc).
+    assert_eq!(
+        EwDivision::Law.resolve(false, false, true),
+        EwDivision::SpraysFirst
+    );
+    assert_eq!(
+        EwDivision::Law.resolve(true, false, true),
+        EwDivision::SpraysFirst
+    );
+    assert_eq!(
+        EwDivision::SpraysFirst.resolve(false, false, true),
+        EwDivision::SpraysFirst
     );
 }
 

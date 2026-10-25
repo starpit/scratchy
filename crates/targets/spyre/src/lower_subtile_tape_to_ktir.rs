@@ -3306,7 +3306,7 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         }
     }
     let kv_request_stride = bundle_layout.kv_request_stride_bytes;
-    Ok(RolledSuperDsc {
+    let rolled = RolledSuperDsc {
         prefix,
         bodies,
         suffix,
@@ -3321,7 +3321,95 @@ pub fn lower_subtile_tape_to_ktir<F: RopeForm>(
         kv_request_stride,
         suffix_in_tid,
         attn_params,
-    })
+    };
+    census_bodies_over_the_trip_wall(&rolled);
+    Ok(rolled)
+}
+
+/// The trips the mint will bill this body class — `ktir_superdsc_door::lower` per op, the
+/// minted ops' `time` summed, exactly the loop `ktir_groups_via_superdsc` runs for the
+/// budget verdict: the same programs, the same `BundleLayout` and attention facts off the
+/// roll, a fresh symbol counter (`time` is `WorkPlan::time_tile_for_lx` tile arithmetic —
+/// it does not read symbol ids; the test pins that). `None` when the door declines an op:
+/// the counting pass adds no refusal path of its own — the body falls through unsplit and
+/// the mint surfaces the error at the site that owns it, where it surfaces it today.
+///
+/// ⭐ THE COUNT RUNS ON A CLONE of the roll's layout — the mint later sees exactly the state
+/// it sees today; the count equals the bill by determinism from the identical starting
+/// state, never by a replay assumption.
+fn mint_trips(
+    b: &RolledBody,
+    layout: &BundleLayout,
+    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+) -> Option<u64> {
+    let mut sym_id_base: i64 = 0;
+    let mut trips = 0u64;
+    for o in &b.ops {
+        let lowered = crate::ktir_superdsc_door::lower(
+            o.ktir.as_ref()?,
+            &mut sym_id_base,
+            Some(layout),
+            attn_params,
+        )
+        .ok()?;
+        trips += lowered.iter().map(|x| x.time.max(1) as u64).sum::<u64>();
+    }
+    Some(trips)
+}
+
+/// ⭐ THE TRIP-WALL CENSUS — the bake budget's own arithmetic, run on the assembled roll.
+/// Every body class whose TRIPS (the mint's own door count, [`mint_trips`]) would refuse the
+/// bake budget ([`crate::superdsc_bake::BakeBudget::MAX_BUNDLE_TRIPS`]) is NAMED here — body,
+/// trips, wall — and then flows to the mint WHOLE: the mint's `BakeBudget` refusal fires at
+/// its own site exactly as it does for a body no scan ever saw, this census is the log's
+/// attribution, and the model serves wide prompts through the narrower rung. The scan is
+/// read-only — nothing moves.
+///
+/// ⭐ THE COUNT RUNS ON A CLONE of the roll's layout (see [`mint_trips`]) — the mint later
+/// sees exactly the state it sees today.
+///
+/// ⭐ THE SEAM LAW, HELD AS KNOWLEDGE (NOT CODE) FOR WHENEVER AN INVENTORY BUDGET AFFORDS
+/// THE WIDE RUNGS: a body over the wall could become TWO body classes at the residual seam —
+/// the LAST op that reads the body's `hidden_in_tid` (the pre-norm block's skip-add) is the
+/// seam; `t_seam` is its SSA-fresh output; and the cut is legal only when exactly one tensor
+/// crosses it (the tensors bound by both halves are exactly `{t_seam}`) — the same in-place
+/// handoff the per-launch residual law threads, with `unroll_layers` rebinding both sides
+/// through the SHARED `per_layer` map the same way it already threads the body→body seam.
+/// The measured shape is the ladder's two top rungs (384 and 512 rows: 72,397 and 96,429
+/// trips over 65,536) — the attention half and the MLP half of one layer. The split
+/// APPLICATION (the halves construction, the launch duplication, the launch-table re-check)
+/// is DELETED: those rungs' ~1,316 groups ≈ 329 child-minutes put the cold bake ~7× past the
+/// 6-10 minute law, and no inventory budget exists that affords them. The law above is what
+/// a future budget would re-open.
+fn census_bodies_over_the_trip_wall(rolled: &RolledSuperDsc) {
+    let wall = crate::superdsc_bake::BakeBudget::MAX_BUNDLE_TRIPS;
+    // ── SCAN: the census. Read-only — nothing moves; an over-wall body flows to the mint
+    //    whole and its `BakeBudget` refusal fires at its own site, exactly as pre-split.
+    // ⭐ THE COUNTING PASS RUNS ON A CLONE — the door's emission reserves synth storage
+    //    through `&`, so the count must not touch the state the real mint will see. The
+    //    clone is a deep snapshot of the interior-mutable fields; the count equals the bill
+    //    by determinism from the identical starting state.
+    let count_layout = rolled.layout.clone();
+    for (bi, b) in rolled.bodies.iter().enumerate() {
+        if b.ops.iter().any(|o| o.ktir.is_none()) {
+            continue;
+        }
+        let Some(trips) = mint_trips(b, &count_layout, rolled.attn_params) else {
+            eprintln!(
+                "[trip-wall] body {bi}: the door declined an op in the counting pass — the mint \
+                 will report it at its own site"
+            );
+            continue;
+        };
+        if trips <= wall {
+            continue;
+        }
+        eprintln!(
+            "[trip-wall] body {bi}: {trips} trips over the {wall} wall — the body flows to the \
+             mint whole and its BakeBudget refusal names the rung; the model serves wide prompts \
+             through the narrower rung"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4466,6 +4554,1029 @@ mod attn_scale_weight_fold_tests {
             vec![(8, oproj_headmajor_tid(8))],
             "the uniform fixture mints exactly W_o t8's pair: one layer's o_proj weight gains \
              its head-major copy"
+        );
+    }
+}
+
+/// ⭐ THE TRIP-WALL CENSUS'S OWN TESTS — the over-wall body flows to the mint
+/// whole (nothing moves), the under-wall body passes through, and the counting pass
+/// leaves the roll's layout untouched, each over the same hand-stated three-program
+/// roll (the `zz_` roster's law: real op kinds, hand-stated bindings, output last).
+#[cfg(test)]
+mod trip_wall_census_tests {
+    use super::*;
+
+    /// The seam fixture's program — the terminal-only shape (two parameter loads, one stored
+    /// `arith.mulf` terminal). `whole_function::lower_function` recognises nothing and folds
+    /// nothing (its own module doc: an op becomes a Program only by 1:1 kind), so an unstored
+    /// interior materializes as its own op — the minting shape lowered to TWO (attempt 10,
+    /// left: 2); the one-op mint is the terminal-only shape. Hand-stated rather than spliced
+    /// for the same reason the minting body is.
+    fn seam_program(
+        a: u32,
+        b: u32,
+        out: u32,
+        name: &'static str,
+    ) -> ktir_superdsc::ktir_node::KtirNode {
+        use ktir_core::arena::Arena;
+        use ktir_core::attrkey::AttrKey;
+        use ktir_core::dtypes::DType;
+        use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+        use ktir_core::irtype::IrType;
+        use ktir_core::opkind::OpKind;
+        use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+        let arena: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, r: i64, c: i64| {
+            op.with_attr(arena, AttrKey::Shape, Attr::IntList(arena.ints(vec![r, c])))
+                .with_attr(arena, AttrKey::Dtype, Attr::Dtype(DType::F16))
+        };
+        // Parameters: a, b, out — the node's operand prefix, output LAST (the splice's own
+        // `default_bindings` law, so the fixture states the real binding order).
+        let (p_a, p_b, p_out) = (Ssa(0), Ssa(1), Ssa(2));
+        let zero = Ssa(3);
+        let (v_a, t_a, val_a) = (Ssa(4), Ssa(5), Ssa(6));
+        let (v_b, t_b, val_b) = (Ssa(7), Ssa(8), Ssa(9));
+        let (prod, v_o, t_o) = (Ssa(11), Ssa(12), Ssa(13));
+        let ops = vec![
+            Operation::new(arena, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                arena,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(arena, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_a]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_a),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_a, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(val_a), OpKind::KtdpLoad, &[t_a]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(v_b), OpKind::KtdpConstructMemoryView, &[p_b]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_b),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_b, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(val_b), OpKind::KtdpLoad, &[t_b]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_o),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_o, zero, zero],
+                ),
+                8,
+                64,
+            ),
+            shape(
+                Operation::new(arena, Some(prod), OpKind::ArithMulf, &[val_a, val_b]),
+                8,
+                64,
+            ),
+            Operation::new(arena, None, OpKind::KtdpStore, &[prod, t_o]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name,
+                arguments: arena.args(vec![
+                    (p_a, IrType::Index),
+                    (p_b, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: arena.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            program: Program::Elementwise(Elementwise::Mul),
+            bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
+            mask: None,
+            step_inputs: Vec::new(),
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    /// The seam fixture's layout — the two-node idiom, extended: activations `t0/t2/t4/t6`
+    /// in segment 0 at the idiom's own `tid·0x10000` spacing, and the per-layer weights
+    /// `t10/t11` and `t20/t21` in the weight segment at 1 KiB strides, with the `ids` row
+    /// per placement and both segments' high-water stated the way `compute_bundle_layout`
+    /// would state them.
+    fn seam_layout() -> ktir_superdsc::placement::BundleLayout {
+        use ktir_superdsc::placement::{BindCover, BundleLayout, SegRole, TensorPlacement};
+        let mut l = BundleLayout::default();
+        for tid in [0u32, 2, 4, 6] {
+            l.ids.borrow_mut().insert(
+                ktir_superdsc::place::act_name(tid),
+                ktir_superdsc::place::PlaceId::Act(tid),
+            );
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Activation,
+                    segment: 0,
+                    bank: 0,
+                    offset: u64::from(tid) * 0x10000,
+                    size: 8 * 64 * 2,
+                    cover: BindCover::Full,
+                },
+            );
+        }
+        let w_seg = SegRole::Weight.segment();
+        for (tid, off) in [(10u32, 0u64), (11, 1024), (20, 2048), (21, 3072)] {
+            l.ids.borrow_mut().insert(
+                ktir_superdsc::place::act_name(tid),
+                ktir_superdsc::place::PlaceId::Act(tid),
+            );
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role: SegRole::Weight,
+                    segment: w_seg,
+                    bank: 0,
+                    offset: off,
+                    size: 8 * 64 * 2,
+                    cover: BindCover::Full,
+                },
+            );
+        }
+        // The placement high-water of each segment, as `compute_bundle_layout` states it —
+        // the two-node idiom's own law, extended to the weight segment.
+        l.segment_bytes[0] = 7 * 0x10000;
+        l.segment_bytes[w_seg] = 4096;
+        l
+    }
+
+    /// The seam fixture's roll: ONE body under the wall by the door's own count (three
+    /// pointwise programs, each dooring to one op), whose residual seam is the middle program —
+    /// `split_a0` binds {t0, t10, t2}, `split_join` binds {t2, t0, t4} (the join reads the
+    /// staging AND the hidden, writes the seam), `split_b0` binds {t4, t20, t6}. The ops are
+    /// minted through `whole_function::lower_function` against the hand-stated layout (the
+    /// two-node test's own call), one `syms` counter threaded through all three, then PINNED
+    /// to the one field the split reads: `ktir` (the walk's own attachment).
+    fn seam_roll() -> RolledSuperDsc {
+        let layout = seam_layout();
+        let programs = [
+            seam_program(0, 10, 2, "split_a0"),
+            seam_program(2, 0, 4, "split_join"),
+            seam_program(4, 20, 6, "split_b0"),
+        ];
+        let mut syms = 0i64;
+        let mut ops = Vec::new();
+        for prog in &programs {
+            let mut lowered = ktir_superdsc::emit::whole_function::lower_function(
+                prog,
+                Some(&layout),
+                &mut syms,
+                None,
+            )
+            .expect("the fixture lowers the seam program");
+            assert_eq!(
+                lowered.len(),
+                1,
+                "the seam fixture's program must lower to exactly ONE fused op — a fixture \
+                 whose shape drifted FAILS, never quietly adapts"
+            );
+            let mut op = lowered.remove(0);
+            op.ktir = Some(prog.clone());
+            ops.push(op);
+        }
+        RolledSuperDsc {
+            prefix: Vec::new(),
+            bodies: vec![RolledBody {
+                ops,
+                iters: 2,
+                layer_ids: vec![0, 1],
+                hidden_in_tid: 0,
+                hidden_out_tid: 6,
+            }],
+            suffix: Vec::new(),
+            layout,
+            per_layer: std::collections::BTreeMap::from([
+                (10u32, vec![10u32, 11]),
+                (20u32, vec![20u32, 21]),
+            ]),
+            launches: vec![(0u8, 0u32), (0u8, 1u32)],
+            launch_w: vec![(0u8, 0u64), (0u8, 1024u64)],
+            launch_kv: vec![0u64, 0],
+            kv_page_stride: 0,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
+            kv_request_stride: 0,
+            suffix_in_tid: u32::MAX,
+            attn_params: None,
+        }
+    }
+
+    /// The trips sum the wall is measured against — the door's own count ([`mint_trips`]),
+    /// on a CLONE of the given layout: the door's emission reserves synth storage through
+    /// `&`, so the count must not touch the roll's real layout any more than the scan's
+    /// counting pass does.
+    fn trips(b: &RolledBody, layout: &BundleLayout) -> u64 {
+        let count_layout = layout.clone();
+        mint_trips(b, &count_layout, None).expect("the fixture's programs door cleanly")
+    }
+
+    // ── THE RUNG FIXTURE — the real 384-row layer shape, eight programs, one body ──────────
+
+    /// The rung fixture's rows — the 384 rung, `T = 96` four-row tiles per contraction.
+    const RUNG_ROWS: i64 = 384;
+
+    /// The rung fixture's contractions — the granite-3.1-2b fp8 projection set the 11m
+    /// ruling's table states. The first four are the A half (attention), the last three
+    /// the B half (MLP); the seam pointwise between them is `rung_add`. `w` is the
+    /// `[n, k]` fp8 buffer, `ws` its `[1, n]` f16 per-column scale row.
+    struct RungMatmul {
+        a: u32,
+        w: u32,
+        ws: u32,
+        out: u32,
+        name: &'static str,
+        k: i64,
+        n: i64,
+    }
+    const RUNG_MATMULS: [RungMatmul; 7] = [
+        RungMatmul {
+            a: 0,
+            w: 20,
+            ws: 21,
+            out: 2,
+            name: "rung_mq",
+            k: 2048,
+            n: 2048,
+        },
+        RungMatmul {
+            a: 0,
+            w: 22,
+            ws: 23,
+            out: 4,
+            name: "rung_mk",
+            k: 2048,
+            n: 512,
+        },
+        RungMatmul {
+            a: 0,
+            w: 24,
+            ws: 25,
+            out: 6,
+            name: "rung_mv",
+            k: 2048,
+            n: 512,
+        },
+        RungMatmul {
+            a: 2,
+            w: 26,
+            ws: 27,
+            out: 8,
+            name: "rung_mo",
+            k: 2048,
+            n: 2048,
+        },
+        RungMatmul {
+            a: 10,
+            w: 28,
+            ws: 29,
+            out: 12,
+            name: "rung_mg",
+            k: 2048,
+            n: 8192,
+        },
+        RungMatmul {
+            a: 10,
+            w: 30,
+            ws: 31,
+            out: 14,
+            name: "rung_mu",
+            k: 2048,
+            n: 8192,
+        },
+        RungMatmul {
+            a: 12,
+            w: 32,
+            ws: 33,
+            out: 16,
+            name: "rung_md",
+            k: 8192,
+            n: 2048,
+        },
+    ];
+
+    /// The rung fixture's activations — `(tid, rows, cols)`, f16, packed in segment 0.
+    const RUNG_ACTS: [(u32, i64, i64); 9] = [
+        (0, RUNG_ROWS, 2048),
+        (2, RUNG_ROWS, 2048),
+        (4, RUNG_ROWS, 512),
+        (6, RUNG_ROWS, 512),
+        (8, RUNG_ROWS, 2048),
+        (10, RUNG_ROWS, 2048),
+        (12, RUNG_ROWS, 8192),
+        (14, RUNG_ROWS, 8192),
+        (16, RUNG_ROWS, 2048),
+    ];
+
+    /// The layer-1 copy tids — each weight's per-layer copy at `tid + RUNG_COPY_STEP`, so
+    /// the copies sit above every bind tid the programs name.
+    const RUNG_COPY_STEP: u32 = 34;
+
+    /// The rung fixture's per-layer weight shift — the layer-0 packed total of the weight
+    /// segment (each `w` its `n·k` fp8 bytes, each `ws` its `n·2` f16 bytes), the uniform
+    /// SHIFT every layer-1 copy lands at.
+    fn rung_weight_shift() -> u64 {
+        RUNG_MATMULS
+            .iter()
+            .map(|mm| mm.n as u64 * mm.k as u64 + mm.n as u64 * 2)
+            .sum()
+    }
+
+    /// The rung fixture's fp8 W8A8 contraction program — the shape `matmul_fp8.py` spells
+    /// and the walk's fp8 arm recognizes: A `[m, k]` f16 and W `[n, k]` Fp8E4m3 (transpose-B,
+    /// stated by the `indexing_maps` the orientation proof reads), the per-column `w_scale`
+    /// `[1, n]` f16 row the ABSORBED `p * ws` epilogue multiplies in between the dot and the
+    /// store, and the `[m, n]` f16 output. Stated in the `KtirFunc::matmul_fp8` builder's
+    /// own op order (the ktir-optimizer recognizer's `contraction` fixture spells the same
+    /// list) — the REAL pre-door carrier is a BARE op with the program pinned, and the
+    /// fixture builds its carriers that way (see [`rung_roll`]).
+    fn fp8_matmul_program(mm: &RungMatmul, m: i64) -> ktir_superdsc::ktir_node::KtirNode {
+        let RungMatmul {
+            a,
+            w,
+            ws,
+            out,
+            name,
+            k,
+            n,
+        } = *mm;
+        use ktir_core::affine::{AffineExpr, AffineMap};
+        use ktir_core::arena::Arena;
+        use ktir_core::attrkey::AttrKey;
+        use ktir_core::dtypes::DType;
+        use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+        use ktir_core::irtype::IrType;
+        use ktir_core::opkind::OpKind;
+        use ktir_superdsc::ktir_node::{BufferId, KtirNode, Program};
+        let arena: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, r: i64, c: i64, dt: DType| {
+            op.with_attr(arena, AttrKey::Shape, Attr::IntList(arena.ints(vec![r, c])))
+                .with_attr(arena, AttrKey::Dtype, Attr::Dtype(dt))
+        };
+        // Parameters: a, w, ws, out — the node's operand prefix, output LAST (the splice's
+        // own `default_bindings` law, so the fixture states the real binding order).
+        let (p_a, p_w, p_ws, p_out) = (Ssa(0), Ssa(1), Ssa(2), Ssa(3));
+        let zero = Ssa(4);
+        let (v_a, t_a, val_a) = (Ssa(5), Ssa(6), Ssa(7));
+        let (v_w, t_w, val_w) = (Ssa(8), Ssa(9), Ssa(10));
+        let (v_s, t_s, val_s) = (Ssa(11), Ssa(12), Ssa(13));
+        let (v_o, t_o, empty) = (Ssa(14), Ssa(15), Ssa(16));
+        let (dot, scaled) = (Ssa(17), Ssa(18));
+        let ops = vec![
+            Operation::new(arena, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                arena,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(arena, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_a]),
+                m,
+                k,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_a),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_a, zero, zero],
+                ),
+                m,
+                k,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(arena, Some(val_a), OpKind::KtdpLoad, &[t_a]),
+                m,
+                k,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(arena, Some(v_w), OpKind::KtdpConstructMemoryView, &[p_w]),
+                n,
+                k,
+                DType::Fp8E4m3,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_w),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_w, zero, zero],
+                ),
+                n,
+                k,
+                DType::Fp8E4m3,
+            ),
+            shape(
+                Operation::new(arena, Some(val_w), OpKind::KtdpLoad, &[t_w]),
+                n,
+                k,
+                DType::Fp8E4m3,
+            ),
+            shape(
+                Operation::new(arena, Some(v_s), OpKind::KtdpConstructMemoryView, &[p_ws]),
+                1,
+                n,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_s),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_s, zero, zero],
+                ),
+                1,
+                n,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(arena, Some(val_s), OpKind::KtdpLoad, &[t_s]),
+                1,
+                n,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(arena, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+                m,
+                n,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_o),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_o, zero, zero],
+                ),
+                m,
+                n,
+                DType::F16,
+            ),
+            shape(
+                Operation::new(arena, Some(empty), OpKind::TensorEmpty, &[]),
+                m,
+                n,
+                DType::F16,
+            ),
+            // THE CONTRACTION — transpose-B, `[[d0,d2],[d1,d2],[d0,d1]]`: B's map ends in the
+            // reduction dim, so W is its on-disk `[n, k]` buffer, the form the orientation
+            // proof admits and a PRESENTED weight places.
+            shape(
+                Operation::new(
+                    arena,
+                    Some(dot),
+                    OpKind::LinalgMatmul,
+                    &[val_a, val_w, empty],
+                ),
+                m,
+                n,
+                DType::F16,
+            )
+            .with_attr(
+                arena,
+                AttrKey::IndexingMaps,
+                Attr::AffineMapList(arena.maps(vec![
+                    AffineMap {
+                        num_dims: 3,
+                        num_syms: 0,
+                        exprs: arena.exprs(vec![AffineExpr::Dim(0), AffineExpr::Dim(2)]),
+                    },
+                    AffineMap {
+                        num_dims: 3,
+                        num_syms: 0,
+                        exprs: arena.exprs(vec![AffineExpr::Dim(1), AffineExpr::Dim(2)]),
+                    },
+                    AffineMap {
+                        num_dims: 3,
+                        num_syms: 0,
+                        exprs: arena.exprs(vec![AffineExpr::Dim(0), AffineExpr::Dim(1)]),
+                    },
+                ])),
+            ),
+            // THE EPILOGUE — `p * ws` between the dot and the store, the multiply the walk
+            // ABSORBS into the W8A8 contraction.
+            shape(
+                Operation::new(arena, Some(scaled), OpKind::ArithMulf, &[dot, val_s]),
+                m,
+                n,
+                DType::F16,
+            ),
+            Operation::new(arena, None, OpKind::KtdpStore, &[scaled, t_o]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name,
+                arguments: arena.args(vec![
+                    (p_a, IrType::Index),
+                    (p_w, IrType::Index),
+                    (p_ws, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: arena.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            program: Program::Matmul,
+            bindings: vec![
+                BufferId::new(a),
+                BufferId::new(w),
+                BufferId::new(ws),
+                BufferId::new(out),
+            ],
+            mask: None,
+            step_inputs: Vec::new(),
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    /// The rung fixture's seam pointwise — the 11l seam shape with `arith.addf`: the
+    /// residual join `(to, t0) → t_seam`, its OWN program per the 11l-2 law (the stored add
+    /// is the terminal; nothing unstored materializes).
+    fn rung_add_program(
+        a: u32,
+        b: u32,
+        out: u32,
+        name: &'static str,
+        rows: i64,
+        cols: i64,
+    ) -> ktir_superdsc::ktir_node::KtirNode {
+        use ktir_core::arena::Arena;
+        use ktir_core::attrkey::AttrKey;
+        use ktir_core::dtypes::DType;
+        use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
+        use ktir_core::irtype::IrType;
+        use ktir_core::opkind::OpKind;
+        use ktir_superdsc::ktir_node::{BufferId, Elementwise, KtirNode, Program};
+        let arena: &'static Arena = Arena::global();
+        let shape = |op: Operation<'static>, r: i64, c: i64| {
+            op.with_attr(arena, AttrKey::Shape, Attr::IntList(arena.ints(vec![r, c])))
+                .with_attr(arena, AttrKey::Dtype, Attr::Dtype(DType::F16))
+        };
+        let (p_a, p_b, p_out) = (Ssa(0), Ssa(1), Ssa(2));
+        let zero = Ssa(3);
+        let (v_a, t_a, val_a) = (Ssa(4), Ssa(5), Ssa(6));
+        let (v_b, t_b, val_b) = (Ssa(7), Ssa(8), Ssa(9));
+        let (sum, v_o, t_o) = (Ssa(11), Ssa(12), Ssa(13));
+        let ops = vec![
+            Operation::new(arena, Some(zero), OpKind::ArithConstant, &[]).with_attr(
+                arena,
+                AttrKey::Value,
+                Attr::Int(0),
+            ),
+            shape(
+                Operation::new(arena, Some(v_a), OpKind::KtdpConstructMemoryView, &[p_a]),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_a),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_a, zero, zero],
+                ),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(arena, Some(val_a), OpKind::KtdpLoad, &[t_a]),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(arena, Some(v_b), OpKind::KtdpConstructMemoryView, &[p_b]),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_b),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_b, zero, zero],
+                ),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(arena, Some(val_b), OpKind::KtdpLoad, &[t_b]),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(arena, Some(v_o), OpKind::KtdpConstructMemoryView, &[p_out]),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(
+                    arena,
+                    Some(t_o),
+                    OpKind::KtdpConstructAccessTile,
+                    &[v_o, zero, zero],
+                ),
+                rows,
+                cols,
+            ),
+            shape(
+                Operation::new(arena, Some(sum), OpKind::ArithAddf, &[val_a, val_b]),
+                rows,
+                cols,
+            ),
+            Operation::new(arena, None, OpKind::KtdpStore, &[sum, t_o]),
+        ];
+        KtirNode {
+            func: IRFunction {
+                name,
+                arguments: arena.args(vec![
+                    (p_a, IrType::Index),
+                    (p_b, IrType::Index),
+                    (p_out, IrType::Index),
+                ]),
+                operations: arena.ops(ops),
+                grid: (1, 1, 1),
+                return_type: None,
+            },
+            program: Program::Elementwise(Elementwise::Add),
+            bindings: vec![BufferId::new(a), BufferId::new(b), BufferId::new(out)],
+            mask: None,
+            step_inputs: Vec::new(),
+            node_out_tid: None,
+            minted: Default::default(),
+        }
+    }
+
+    /// The rung fixture's layout — the seam fixture's own law, scaled to true footprints:
+    /// the activations packed in segment 0, the weights (each `w` fp8 beside its `ws` f16
+    /// scale row) packed in the weight segment with every layer-1 copy at the uniform
+    /// [`rung_weight_shift`], and the `ids` row per placement.
+    fn rung_layout() -> BundleLayout {
+        use ktir_superdsc::placement::{BindCover, BundleLayout, SegRole, TensorPlacement};
+        let mut l = BundleLayout::default();
+        let mut put = |tid: u32, role: SegRole, segment: usize, offset: u64, size: u64| {
+            l.ids.borrow_mut().insert(
+                ktir_superdsc::place::act_name(tid),
+                ktir_superdsc::place::PlaceId::Act(tid),
+            );
+            l.placements.insert(
+                tid,
+                TensorPlacement {
+                    tid,
+                    role,
+                    segment,
+                    bank: 0,
+                    offset,
+                    size,
+                    cover: BindCover::Full,
+                },
+            );
+        };
+        let mut off = 0u64;
+        for &(tid, rows, cols) in &RUNG_ACTS {
+            let size = rows as u64 * cols as u64 * 2;
+            put(tid, SegRole::Activation, 0, off, size);
+            off += size;
+        }
+        // ⭐ THE DOOR'S RESERVED CONSTANTS — the walk's own placement laws, verbatim
+        // (`lower_subtile_tape_to_superdsc.rs`): the fp8 tiled arm resolves its [64,64]
+        // identity through `identity_tid_of_class(64)` — the `attn_class_hds` registry, one
+        // class per distinct AttnDecode head dim, class 0 = the widest = `IDENTITY_TID` —
+        // and binds `FP8_POS448_TID`'s [1,stick] clamp row. A layout without them is a tape
+        // the walk never produces, and the door refuses it by name; the fixture carries
+        // exactly what the walk carries, never a door change.
+        l.attn_class_hds = ktir_superdsc::reserved_tids::rope_p_class_hds([64u32].into_iter());
+        for (class, &hd) in l.attn_class_hds.iter().enumerate() {
+            let tid = ktir_superdsc::reserved_tids::identity_class_tid(class);
+            let sz = hd as u64 * hd as u64 * 2; // [hd,hd] fp16 identity
+            put(tid, SegRole::Activation, 0, off, sz);
+            off = ktir_superdsc::placement::align128(off + sz);
+        }
+        // The walk places these three iff the tape has an arity-3 (fp8 W8A8) MatmulTile; the
+        // rung fixture is nothing but arity-3 MatmulTiles, so its layout carries all three.
+        for tid in [
+            ktir_superdsc::reserved_tids::FP8_POS448_TID,
+            ktir_superdsc::reserved_tids::FP8_NEG448_TID,
+            ktir_superdsc::reserved_tids::FP8_INV448_TID,
+        ] {
+            let sz = Fp16::ELEMS_PER_STICK as u64 * 2; // [1, stick] fp16
+            put(tid, SegRole::Activation, 0, off, sz);
+            off = ktir_superdsc::placement::align128(off + sz);
+        }
+        l.segment_bytes[0] = off;
+        let w_seg = SegRole::Weight.segment();
+        // Layer 0 packed at the base; every weight's offset and size kept for its layer-1
+        // copy at the uniform shift.
+        let mut bases: Vec<(u32, u64, u64)> = Vec::with_capacity(RUNG_MATMULS.len() * 2);
+        let mut woff = 0u64;
+        for mm in &RUNG_MATMULS {
+            let RungMatmul { w, ws, k, n, .. } = *mm;
+            let w_bytes = n as u64 * k as u64;
+            bases.push((w, woff, w_bytes));
+            put(w, SegRole::Weight, w_seg, woff, w_bytes);
+            woff += w_bytes;
+            let ws_bytes = n as u64 * 2;
+            bases.push((ws, woff, ws_bytes));
+            put(ws, SegRole::Weight, w_seg, woff, ws_bytes);
+            woff += ws_bytes;
+        }
+        let shift = rung_weight_shift();
+        for &(tid, base, size) in &bases {
+            put(
+                tid + RUNG_COPY_STEP,
+                SegRole::Weight,
+                w_seg,
+                base + shift,
+                size,
+            );
+        }
+        l.segment_bytes[w_seg] = woff + shift;
+        l
+    }
+
+    /// The rung fixture's roll — ONE body over the wall by the door's own count, the real
+    /// 384-rung layer shape: the A half (m_q/m_k/m_v/m_o and the seam add), the B half
+    /// (m_gate/m_up/m_down). The seven contractions are BARE pre-door carriers with their
+    /// programs pinned — the shape the tape walk hands the mint — and the seam add is minted
+    /// through `whole_function::lower_function` (one op, the 11l drift guard) with its
+    /// program pinned. `hidden_in` = t0; the seam is the add, the LAST t0 reader.
+    fn rung_roll() -> RolledSuperDsc {
+        let layout = rung_layout();
+        fn carrier(
+            ops: &mut Vec<EmittedOp>,
+            name: &str,
+            prog: &ktir_superdsc::ktir_node::KtirNode,
+        ) {
+            let mut op = EmittedOp::bare(name.to_string());
+            op.ktir = Some(prog.clone());
+            ops.push(op);
+        }
+        let mut ops = Vec::new();
+        for mm in &RUNG_MATMULS[..4] {
+            let prog = fp8_matmul_program(mm, RUNG_ROWS);
+            carrier(&mut ops, mm.name, &prog);
+        }
+        // THE SEAM — the residual join, the last t0 reader.
+        let seam_prog = rung_add_program(8, 0, 10, "rung_add", RUNG_ROWS, 2048);
+        let mut syms = 0i64;
+        let mut lowered = ktir_superdsc::emit::whole_function::lower_function(
+            &seam_prog,
+            Some(&layout),
+            &mut syms,
+            None,
+        )
+        .expect("the fixture lowers the seam program");
+        assert_eq!(
+            lowered.len(),
+            1,
+            "the seam fixture's program must lower to exactly ONE fused op — a fixture whose \
+             shape drifted FAILS, never quietly adapts"
+        );
+        let mut seam = lowered.remove(0);
+        seam.ktir = Some(seam_prog.clone());
+        ops.push(seam);
+        for mm in &RUNG_MATMULS[4..] {
+            let prog = fp8_matmul_program(mm, RUNG_ROWS);
+            carrier(&mut ops, mm.name, &prog);
+        }
+        RolledSuperDsc {
+            prefix: Vec::new(),
+            bodies: vec![RolledBody {
+                ops,
+                iters: 2,
+                layer_ids: vec![0, 1],
+                hidden_in_tid: 0,
+                hidden_out_tid: 16,
+            }],
+            suffix: Vec::new(),
+            layout,
+            per_layer: RUNG_MATMULS
+                .iter()
+                .flat_map(|mm| {
+                    [
+                        (mm.w, vec![mm.w, mm.w + RUNG_COPY_STEP]),
+                        (mm.ws, vec![mm.ws, mm.ws + RUNG_COPY_STEP]),
+                    ]
+                })
+                .collect::<std::collections::BTreeMap<u32, Vec<u32>>>(),
+            launches: vec![(0u8, 0u32), (0u8, 1u32)],
+            launch_w: vec![(0u8, 0u64), (0u8, rung_weight_shift())],
+            launch_kv: vec![0u64, 0],
+            kv_page_stride: 0,
+            prefix_weight_bank: 0,
+            suffix_weight_bank: 0,
+            kv_request_stride: 0,
+            suffix_in_tid: u32::MAX,
+            attn_params: None,
+        }
+    }
+
+    #[test]
+    fn a_body_over_the_trip_wall_flows_to_the_mint_whole() {
+        let wall = crate::superdsc_bake::BakeBudget::MAX_BUNDLE_TRIPS;
+        let rolled = rung_roll();
+        let whole = trips(&rolled.bodies[0], &rolled.layout);
+        assert!(
+            whole > wall,
+            "the rung fixture must sit OVER the wall by the door's own count — got {whole} \
+             trips against the {wall} wall"
+        );
+        census_bodies_over_the_trip_wall(&rolled);
+        // ── NOTHING MOVES — the census is the log's attribution: the over-wall body flows to
+        //    the mint whole and its `BakeBudget` refusal fires at the mint's own site.
+        assert_eq!(rolled.bodies.len(), 1, "the roll keeps its one body class");
+        assert_eq!(
+            rolled.bodies[0].ops.len(),
+            8,
+            "the body keeps all eight ops — four attention contractions, the seam add, three \
+             MLP contractions"
+        );
+        assert_eq!(
+            rolled.launches,
+            vec![(0u8, 0u32), (0u8, 1u32)],
+            "the launch sequence is untouched"
+        );
+        // rung_weight_shift() = the layer-0 packed weight total (4,198,400 + 1,049,600 +
+        // 1,049,600 + 4,198,400 + 16,793,600 + 16,793,600 + 16,781,312), the layer-1 shift.
+        assert_eq!(
+            rolled.launch_w,
+            vec![(0u8, 0u64), (0u8, rung_weight_shift())],
+            "the launch rows are untouched"
+        );
+        assert_eq!(
+            rolled.launch_kv,
+            vec![0u64, 0],
+            "the launch kv rows are untouched"
+        );
+    }
+
+    #[test]
+    fn a_body_under_the_wall_passes_through_untouched() {
+        let rolled = seam_roll();
+        let under = trips(&rolled.bodies[0], &rolled.layout);
+        assert!(
+            under <= crate::superdsc_bake::BakeBudget::MAX_BUNDLE_TRIPS,
+            "the seam fixture must sit UNDER the wall by the door's own count — got {under} \
+             trips; a fixture that rotted over the wall FAILS, never quietly adapts"
+        );
+        census_bodies_over_the_trip_wall(&rolled);
+        assert_eq!(rolled.bodies.len(), 1, "nothing mutates under the wall");
+        assert_eq!(
+            rolled.launches,
+            vec![(0u8, 0u32), (0u8, 1u32)],
+            "the no-op path leaves the launch sequence untouched"
+        );
+        assert_eq!(
+            rolled.launch_w,
+            vec![(0u8, 0u64), (0u8, 1024u64)],
+            "the no-op path leaves the launch rows untouched"
+        );
+        assert_eq!(rolled.launch_kv, vec![0u64, 0]);
+    }
+
+    /// T4 — the sym-independence pin: the door's trip count does not read the symbol
+    /// counter (the fresh-counter assumption [`mint_trips`] rests on), and the body-wide
+    /// count is the sum of per-op door counts each with its own fresh counter.
+    #[test]
+    fn the_door_s_trip_count_is_independent_of_the_symbol_counter() {
+        let rolled = rung_roll();
+        let body = &rolled.bodies[0];
+        let count = |base: i64| -> u64 {
+            let mut syms = base;
+            let count_layout = rolled.layout.clone();
+            crate::ktir_superdsc_door::lower(
+                body.ops[0]
+                    .ktir
+                    .as_ref()
+                    .expect("the fixture's ops carry programs"),
+                &mut syms,
+                Some(&count_layout),
+                None,
+            )
+            .expect("the rung fixture's first program doors cleanly")
+            .iter()
+            .map(|o| o.time.max(1) as u64)
+            .sum()
+        };
+        assert_eq!(
+            count(0),
+            count(999_999),
+            "the door's count is the same from symbol counter 0 and 999_999 — `time` is tile \
+             arithmetic, not a function of symbol ids"
+        );
+        let per_op: u64 = body
+            .ops
+            .iter()
+            .map(|o| {
+                let mut syms = 0i64;
+                let count_layout = rolled.layout.clone();
+                crate::ktir_superdsc_door::lower(
+                    o.ktir.as_ref().expect("the fixture's ops carry programs"),
+                    &mut syms,
+                    Some(&count_layout),
+                    None,
+                )
+                .expect("the rung fixture's programs door cleanly")
+                .iter()
+                .map(|x| x.time.max(1) as u64)
+                .sum::<u64>()
+            })
+            .sum();
+        let whole = trips(body, &rolled.layout);
+        assert_eq!(
+            whole, per_op,
+            "mint_trips threads one counter across the body and the per-op sums each use a \
+             fresh one — the counts agree"
+        );
+    }
+
+    /// T5 — the counting pass leaves the roll's layout untouched: the scan doors on a CLONE
+    /// (see [`census_bodies_over_the_trip_wall`]), so the placements, the synth allocator and
+    /// intermediate-tid cursor are exactly the state the real mint will see.
+    #[test]
+    fn the_counting_pass_leaves_the_roll_s_layout_untouched() {
+        let rolled = rung_roll();
+        let placements = rolled.layout.placements.len();
+        let (synth_next, synth_map, synth_sizes) = {
+            let s = rolled.layout.synth.borrow();
+            (s.next, s.map.len(), s.sizes.len())
+        };
+        let cursor = rolled.layout.inter_cursor.get();
+        census_bodies_over_the_trip_wall(&rolled);
+        assert_eq!(
+            rolled.bodies.len(),
+            1,
+            "the over-wall body flows to the mint whole — nothing moves; a refusal here means \
+             the fixture rotted, not the pin"
+        );
+        assert_eq!(
+            rolled.layout.placements.len(),
+            placements,
+            "the counting pass doors on a clone, so the real layout's placements are untouched"
+        );
+        {
+            let s = rolled.layout.synth.borrow();
+            assert_eq!(
+                s.next, synth_next,
+                "the counting pass doors on a clone, so the real layout's synth cursor is \
+                 untouched"
+            );
+            assert_eq!(
+                s.map.len(),
+                synth_map,
+                "the counting pass doors on a clone, so the real layout's synth map is untouched"
+            );
+            assert_eq!(
+                s.sizes.len(),
+                synth_sizes,
+                "the counting pass doors on a clone, so the real layout's synth sizes are \
+                 untouched"
+            );
+        }
+        assert_eq!(
+            rolled.layout.inter_cursor.get(),
+            cursor,
+            "the counting pass doors on a clone, so the real layout's intermediate-tid cursor \
+             is untouched"
         );
     }
 }

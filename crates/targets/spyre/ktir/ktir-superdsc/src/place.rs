@@ -52,6 +52,14 @@ pub enum SynthRole {
     /// before the `maximum` combine folds them into [`FqAmax`]. Indexed (like `Blk`) because the number
     /// of partials is the reduce's own time-tile count, known only at bake.
     FqAmaxP(u32),
+    /// ⭐ THE fp16 ROW-TILE CLONE — one target-ABI tile's fresh copy of a GEMM operand
+    /// (`work::Fp8GemmRowTiles`): the ACTIVATION's `[tile_rows, k]` clone at the row-tiled
+    /// law's front (the lowering of the reference's `clone()`, `fp8_linear_kernel.py:351`),
+    /// and the OUTPUT's `[tile_rows, n]` dequant landing at its back (the buffer the
+    /// out-splice copies read — pointwise outputs are column-windowed only, so a tile's rows
+    /// land in a fresh buffer of their own before the splice). Always minted by
+    /// [`PlaceId::synth_tiled`]: the tile index is the staging's own, known only at bake.
+    FqTileRow,
     // ── rmsnorm scratch ──
     Sq16,
     Mean,
@@ -171,6 +179,7 @@ impl fmt::Display for SynthRole {
             Self::FqMm => f.write_str("fq_mm"),
             Self::FqRaw => f.write_str("fq_raw"),
             Self::FqAmaxP(j) => write!(f, "fq_amaxp{j}"),
+            Self::FqTileRow => f.write_str("fq_tilerow"),
             Self::Sq16 => f.write_str("sq16"),
             Self::Mean => f.write_str("mean"),
             Self::Meps => f.write_str("meps"),
@@ -239,7 +248,14 @@ pub enum PlaceId {
     /// not of this type.
     Act(u32),
     /// An intermediate the lowering invented, derived from `of`. Device-internal.
-    Synth { of: u32, role: SynthRole },
+    /// The target-ABI row tile this synthetic belongs to (`synth_tiled`) — `None` for
+    /// every untiled derivation. The tile is a fact of the IDENTITY (which tile's
+    /// staging), never of the role.
+    Synth {
+        of: u32,
+        role: SynthRole,
+        tile: Option<u32>,
+    },
 }
 
 impl PlaceId {
@@ -265,6 +281,20 @@ impl PlaceId {
         Self::Synth {
             of: self.tid(),
             role,
+            tile: None,
+        }
+    }
+
+    /// Derive a synthetic from this tensor, in a target-ABI row tile's staging. ⭐ ONE
+    /// METHOD TILES EVERY ROLE — the fp8 GEMM row tiling (`work::Fp8GemmRowTiles`, the
+    /// copied `_m_tiles` law) quantizes per tile over per-tile fresh staging, so every
+    /// tensor a tile owns carries its tile index in its ID; the role stays the fact it
+    /// always was (no role gains a second spelling), and the index rides the ID.
+    pub fn synth_tiled(self, role: SynthRole, t: u32) -> Self {
+        Self::Synth {
+            of: self.tid(),
+            role,
+            tile: Some(t),
         }
     }
 }
@@ -275,7 +305,10 @@ impl fmt::Display for PlaceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Act(t) => write!(f, "t{t}"),
-            Self::Synth { of, role } => write!(f, "t{of}_{role}"),
+            Self::Synth { of, role, tile } => match tile {
+                None => write!(f, "t{of}_{role}"),
+                Some(t) => write!(f, "t{of}_{role}t{t}"),
+            },
         }
     }
 }

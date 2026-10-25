@@ -48,8 +48,10 @@ fn region(pages: u32, mq: u32) -> SplicedAttnRegion {
 /// The f16 lanes of one mask row, LE.
 fn row_lanes(bytes: &[u8], r: usize) -> Vec<half::f16> {
     bytes[r * 128..(r + 1) * 128]
-        .chunks_exact(2)
-        .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::f16::from_le_bytes(*c))
         .collect()
 }
 

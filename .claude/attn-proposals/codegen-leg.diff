@@ -1,0 +1,817 @@
+diff --git a/crates/compiler/macros/src/codegen.rs b/crates/compiler/macros/src/codegen.rs
+index a2173ecc39..18255124a6 100644
+--- a/crates/compiler/macros/src/codegen.rs
++++ b/crates/compiler/macros/src/codegen.rs
+@@ -9788,6 +9788,7 @@ fn synth_role_tokens(
+             let j = proc_macro2::Literal::u32_unsuffixed(*j);
+             quote! { #b::FqAmaxP(#j) }
+         }
++        R::FqTileRow => quote! { #b::FqTileRow },
+         // The per-head windowed-norm synthetics (the `FqAmaxP` shape: one per head,
+         // all at offset zero).
+         R::HeadMean(h) => {
+@@ -9876,11 +9877,22 @@ fn place_id_tokens(
+             let t = proc_macro2::Literal::u32_unsuffixed(*t);
+             quote! { ::scratchy_target_spyre::bundle_code::PlaceId::Act(#t) }
+         }
+-        P::Synth { of, role } => {
++        P::Synth { of, role, tile } => {
+             let of = proc_macro2::Literal::u32_unsuffixed(*of);
+             let role = synth_role_tokens(role);
++            let tile = match tile {
++                Some(t) => {
++                    let t = proc_macro2::Literal::u32_unsuffixed(*t);
++                    quote! { ::core::option::Option::Some(#t) }
++                }
++                None => quote! { ::core::option::Option::None },
++            };
+             quote! {
+-                ::scratchy_target_spyre::bundle_code::PlaceId::Synth { of: #of, role: #role }
++                ::scratchy_target_spyre::bundle_code::PlaceId::Synth {
++                    of: #of,
++                    role: #role,
++                    tile: #tile,
++                }
+             }
+         }
+     }
+@@ -10441,6 +10453,16 @@ const PREFILL_RUNGS: [u32; 27] = [
+     7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128,
+     192, 256, 384, 512,
+ ];
++/// The CHUNK-FORMED model's ladder — the measured winners (2026-10-25 ruling). A model whose
++/// causal block is chunk-formed past [`SUB_BLOCKED_PREFILL_CEILING`] (granite-3.1-2b at hd 64,
++/// granite-3.1-8b at hd 128) bakes exactly these in place of [`PREFILL_RUNGS`]: 256 — one page,
++/// the prefix ladder's narrow rung (`PagedKvPool::prefix_rungs`) — and 512 — the window,
++/// `PREFILL_CHUNK_SLOTS`, which the const assert below ties to [`PREFILL_RUNGS`]'s ceiling. The
++/// narrow interactive rungs are NOT baked: at the campaign's per-rung cost the whole-bake budget
++/// cannot pay for them (run-47: 96,550 trips by m=31 against the 92,000 ceiling, and the
++/// 384/512 bodies individually past the 65,536 per-bundle wall). Re-admitting a narrow rung is
++/// the ledger's law — one at a time, its measured short-prompt win paying its bake seconds.
++const CHUNK_FORMED_PREFILL_RUNGS: [u32; 2] = [256, 512];
+ /// The widest rung a SUB-BLOCKED causal block is baked at (see [`PREFILL_RUNGS`]). Read only by
+ /// the `#[cfg(feature = "spyre")]` ladder in `dump_wavefront_mega` — no test reads it, so it is
+ /// dead in every non-spyre build, test or not.
+@@ -10967,6 +10989,8 @@ fn dump_wavefront_mega(
+         let weight_naming = program.weight_naming();
+         // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
+         // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
++        use scratchy_target_spyre::lower_subtile_tape_to_superdsc as superdsc;
++        use scratchy_target_spyre::superdsc_bake::BudgetRefusal;
+         let emit_bundle_deferred =
+             |lwd: &to_wavefront::LoweredDecode,
+              base: String,
+@@ -10983,8 +11007,19 @@ fn dump_wavefront_mega(
+              // rung is a wider bake of the same tape, and reading the env knob here
+              // would tell every rung it was one row.
+              decode_rows: u32|
+-             -> (BakeOut, Vec<BakeEffect>) {
++             -> Result<
++                (BakeOut, Vec<BakeEffect>, Vec<superdsc::StageTicket>),
++                BudgetRefusal,
++            > {
+                 let mut fx: Vec<BakeEffect> = Vec::new();
++                // ⭐ THIS RUNG'S STAGE CLAIMS — every bundle the closure renders, pushed at each
++                //    emit site, submitted (or discarded) by the CALLER's commit: the prefill
++                //    ladder after its whole-bake total decision, the wrapper immediately. This is
++                //    the render half of the stage-at-commit law; `superdsc::submit_stage_tickets`
++                //    is the commit half. Chunk-rung bundles ride the per-rung ticket lists instead
++                //    (their flag says uncounted), so this list holds only stageable work.
++                let mut stage_fps: Vec<String> = Vec::new();
++                let mut rung_tickets: Vec<superdsc::StageTicket> = Vec::new();
+                 let is_prefill = prefill_mq.is_some();
+                 // The decode ladder's ONE-REQUEST rung: a CONCRETE single-row decode. `seq_sym`
+                 // must be absent because the symbolic CB batch ALSO passes `decode_rows = 1`,
+@@ -11024,7 +11059,13 @@ fn dump_wavefront_mega(
+                 let krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
+                 if let Err(e) = scratchy_subtile::subtile_ir::ValidatedGraph::new(&krg) {
+                     eprintln!("[spyre-ktir] {stem}: SubtileIR rejected by validate() — {e:?}");
+-                    return ((String::new(), Vec::new(), String::new(), Vec::new()), fx);
++                    // No bundle was emitted yet (the reroll never ran), so there are no
++                    // stage claims to carry — the empty ticket list is the honest payload.
++                    return Ok((
++                        (String::new(), Vec::new(), String::new(), Vec::new()),
++                        fx,
++                        Vec::new(),
++                    ));
+                 }
+                 // `--target sendnn`: lower the SAME real-model `krg` to a sendnn
+                 // op-graph JSON (the DeepTools toolchain compiles + runs it on the
+@@ -11113,10 +11154,13 @@ fn dump_wavefront_mega(
+                             superdsc::FoldGrouping::Split,
+                             None,
+                         ) {
+-                            Ok(fp) => eprintln!(
+-                                "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) — \
+-                                 dxp compiles it inline"
+-                            ),
++                            Ok(fp) => {
++                                stage_fps.push(fp.clone());
++                                eprintln!(
++                                    "[spyre-superdsc] GATE-1 single-matmul bundle emitted (fp {fp}) \
++                                     — dxp compiles it inline"
++                                )
++                            }
+                             Err(e) => eprintln!("[spyre-superdsc] GATE-1 bundle emit failed: {e}"),
+                         }
+                     }
+@@ -11313,12 +11357,31 @@ fn dump_wavefront_mega(
+                                         p
+                                     });
+                                     let pre = if card {
+-                                        superdsc::emit_bundle(
++                                        match superdsc::emit_bundle(
+                                             &rolled.prefix,
+                                             Some(&rolled.layout),
+                                             superdsc::FoldGrouping::Split,
+                                             rolled.attn_params,
+-                                        )
++                                        ) {
++                                            Ok(pfp) => {
++                                                stage_fps.push(pfp.clone());
++                                                Ok(pfp)
++                                            }
++                                            // ⭐ A BAKE-BUDGET REFUSAL IS A RUNG REFUSAL — the ONE
++                                            //    error this closure returns as a value. The rung's
++                                            //    already-rendered bundles are discarded HERE (never
++                                            //    staged, never compiled — the refusal costs only its
++                                            //    render), and the refusal rides out for the ladder
++                                            //    to file in `refused_rungs`; a primary caller
++                                            //    turns it into a panic with the same text.
++                                            Err(superdsc::EmitError::Budget(b)) => {
++                                                superdsc::discard_stage_tickets(
++                                                    &superdsc::stage_tickets_of(&stage_fps, true),
++                                                );
++                                                return Err(b);
++                                            }
++                                            Err(e) => Err(e),
++                                        }
+                                     } else {
+                                         Ok(String::new())
+                                     };
+@@ -11351,7 +11414,7 @@ fn dump_wavefront_mega(
+                                     // unrolled bundle stays ONE bundle: `unroll_layers` already
+                                     // walks the launch sequence across classes.
+                                     let mut body_fps: Vec<String> = Vec::new();
+-                                    let mut body_err: Option<std::io::Error> = None;
++                                    let mut body_err: Option<superdsc::EmitError> = None;
+                                     for (ci, b) in rolled.bodies.iter().enumerate() {
+                                         let r = superdsc::emit_bundle(
+                                             if card { &b.ops } else { &unrolled },
+@@ -11364,7 +11427,20 @@ fn dump_wavefront_mega(
+                                             },
+                                         );
+                                         match r {
+-                                            Ok(fp) => body_fps.push(fp),
++                                            Ok(fp) => {
++                                                stage_fps.push(fp.clone());
++                                                body_fps.push(fp);
++                                            }
++                                            // ⭐ THE BUDGET DOOR, same law as the prefix's: the
++                                            //    rung's renders are discarded and the refusal
++                                            //    rides out — a narrower rung still covers the
++                                            //    width.
++                                            Err(superdsc::EmitError::Budget(b)) => {
++                                                superdsc::discard_stage_tickets(
++                                                    &superdsc::stage_tickets_of(&stage_fps, true),
++                                                );
++                                                return Err(b);
++                                            }
+                                             Err(e) => {
+                                                 eprintln!(
+                                                     "[spyre-superdsc] {base}: body class {ci} emit \
+@@ -11376,7 +11452,7 @@ fn dump_wavefront_mega(
+                                             }
+                                         }
+                                     }
+-                                    let bod: Result<String, std::io::Error> =
++                                    let bod: Result<String, superdsc::EmitError> =
+                                         body_err.map(Err).unwrap_or_else(|| {
+                                             Ok(body_fps.first().cloned().unwrap_or_default())
+                                         });
+@@ -11424,20 +11500,29 @@ fn dump_wavefront_mega(
+                                                 .bodies
+                                                 .iter()
+                                                 .map(|b| {
+-                                                    superdsc::emit_bundle(
++                                                    match superdsc::emit_bundle(
+                                                         &b.ops,
+                                                         Some(&rolled.layout),
+                                                         superdsc::FoldGrouping::Fused,
+                                                         rolled.attn_params,
+-                                                    )
+-                                                    .map(superdsc::bundle::SiblingFp::from)
+-                                                    .unwrap_or_else(|e| {
+-                                                        eprintln!(
+-                                                            "[spyre-superdsc] {base}: fold-fused \
+-                                                             body twin emit failed: {e}"
+-                                                        );
+-                                                        superdsc::bundle::SiblingFp::none()
+-                                                    })
++                                                    ) {
++                                                        Ok(tfp) => {
++                                                            stage_fps.push(tfp.clone());
++                                                            superdsc::bundle::SiblingFp::from(tfp)
++                                                        }
++                                                        // The twin is a launch-grouping VARIANT:
++                                                        // an emit failure here (budget included)
++                                                        // falls to the split body — one launch per
++                                                        // layer dearer, the selector's documented
++                                                        // behavior — never a rung refusal.
++                                                        Err(e) => {
++                                                            eprintln!(
++                                                                "[spyre-superdsc] {base}: fold-fused \
++                                                                 body twin emit failed: {e}"
++                                                            );
++                                                            superdsc::bundle::SiblingFp::none()
++                                                        }
++                                                    }
+                                                 })
+                                                 .collect()
+                                         } else {
+@@ -11451,12 +11536,25 @@ fn dump_wavefront_mega(
+                                     // ONE layer now, run `iters` times. The emulator keeps the single
+                                     // unrolled bundle, where the suffix really is part of it.
+                                     let suf = if card {
+-                                        superdsc::emit_bundle(
++                                        match superdsc::emit_bundle(
+                                             &rolled.suffix,
+                                             Some(&rolled.layout),
+                                             superdsc::FoldGrouping::Split,
+                                             rolled.attn_params,
+-                                        )
++                                        ) {
++                                            Ok(sfp) => {
++                                                stage_fps.push(sfp.clone());
++                                                Ok(sfp)
++                                            }
++                                            // ⭐ THE BUDGET DOOR, same law as the prefix's.
++                                            Err(superdsc::EmitError::Budget(b)) => {
++                                                superdsc::discard_stage_tickets(
++                                                    &superdsc::stage_tickets_of(&stage_fps, true),
++                                                );
++                                                return Err(b);
++                                            }
++                                            Err(e) => Err(e),
++                                        }
+                                     } else {
+                                         Ok(String::new())
+                                     };
+@@ -11605,11 +11703,26 @@ fn dump_wavefront_mega(
+                                                         superdsc::BundleLayout,
+                                                     ),
+                                                 );
+-                                                let per_rung: Vec<Option<RungRecord>> = {
++                                                let per_rung: Vec<
++                                                    Result<
++                                                        (
++                                                            Option<RungRecord>,
++                                                            Vec<superdsc::StageTicket>,
++                                                        ),
++                                                        BudgetRefusal,
++                                                    >,
++                                                > = {
+                                                     use rayon::prelude::*;
+                                                     ladder
+                                                         .into_par_iter()
+-                                                        .map(|(rung, rung_chunk, rung_swept)| -> Option<RungRecord> {
++                                                        .map(
++                                                            |(rung, rung_chunk, rung_swept)| -> Result<
++                                                            (
++                                                                Option<RungRecord>,
++                                                                Vec<superdsc::StageTicket>,
++                                                            ),
++                                                            BudgetRefusal,
++                                                        > {
+                                                     match superdsc::lower_subtile_tape_to_superdsc(
+                                                         &tape_rolled,
+                                                         &krg,
+@@ -11673,6 +11786,17 @@ fn dump_wavefront_mega(
+                                                                 >,
+                                                             > = Vec::new();
+                                                             let mut ok = true;
++                                                            // ⭐ THE RUNG'S OWN TICKET LISTS, stageable
++                                                            //    and chunk apart: a chunk fp's groups
++                                                            //    always resolve through the bake's memo
++                                                            //    (MEASURED across three full bakes,
++                                                            //    nothing ever stages for them), so its
++                                                            //    trips are not compile work the whole-
++                                                            //    bake total counts.
++                                                            let mut rung_staged: Vec<String> =
++                                                                Vec::new();
++                                                            let mut rung_chunk_fps: Vec<String> =
++                                                                Vec::new();
+                                                             for (ci, b) in
+                                                                 rr.bodies.iter().enumerate()
+                                                             {
+@@ -11695,7 +11819,16 @@ fn dump_wavefront_mega(
+                                                                     },
+                                                                 ) {
+                                                                     Ok(rfp) => {
+-                                                                        rfps.push(rfp);
++                                                                        rfps.push(rfp.clone());
++                                                                        if rung_chunk.is_some() {
++                                                                            rung_chunk_fps.push(
++                                                                                rfp.clone(),
++                                                                            );
++                                                                        } else {
++                                                                            rung_staged.push(
++                                                                                rfp.clone(),
++                                                                            );
++                                                                        }
+                                                                         // The rung's fold-fused
+                                                                         // twin too: the rung bounds
+                                                                         // the sweep, this bounds the
+@@ -11720,30 +11853,70 @@ fn dump_wavefront_mega(
+                                                                         // on a one-page PREFIX, which a prompt
+                                                                         // chunk past one page has. Proven below
+                                                                         // (`no_chunk_has_a_fused_twin`).
+-                                                                        rfused.push(if card
+-                                                                            && rung_chunk.is_none()
+-                                                                        {
+-                                                                        superdsc::emit_bundle(
+-                                                                            &b.ops,
+-                                                                            Some(&rr.layout),
+-                                                                            superdsc::FoldGrouping::Fused,
+-                                                                            rr.attn_params,
+-                                                                        )
+-                                                                        .map(
+-                                                                            superdsc::bundle::SiblingFp::from,
+-                                                                        )
+-                                                                        .unwrap_or_else(|e| {
+-                                                                            eprintln!(
+-                                                                                "[spyre-superdsc] \
+-                                                                                 {base}: rung {} fused \
+-                                                                                 twin emit failed: {e}",
+-                                                                                rung.get()
++                                                                        rfused.push(
++                                                                            match if card
++                                                                                && rung_chunk.is_none()
++                                                                            {
++                                                                                Some(
++                                                                                    superdsc::emit_bundle(
++                                                                                        &b.ops,
++                                                                                        Some(&rr.layout),
++                                                                                        superdsc::FoldGrouping::Fused,
++                                                                                        rr.attn_params,
++                                                                                    ),
++                                                                                )
++                                                                            } else {
++                                                                                None
++                                                                            } {
++                                                                                // The twin is a
++                                                                                // launch-grouping
++                                                                                // VARIANT: a failure
++                                                                                // here (budget
++                                                                                // included) falls to
++                                                                                // the split body,
++                                                                                // the selector's
++                                                                                // documented
++                                                                                // behavior.
++                                                                                Some(Ok(tfp)) => {
++                                                                                    rung_staged.push(
++                                                                                        tfp.clone(),
++                                                                                    );
++                                                                                    superdsc::bundle::SiblingFp::from(tfp)
++                                                                                }
++                                                                                Some(Err(e)) => {
++                                                                                    eprintln!(
++                                                                                        "[spyre-superdsc] \
++                                                                                         {base}: rung {} fused \
++                                                                                         twin emit failed: {e}",
++                                                                                        rung.get()
++                                                                                    );
++                                                                                    superdsc::bundle::SiblingFp::none()
++                                                                                }
++                                                                                None => {
++                                                                                    superdsc::bundle::SiblingFp::none()
++                                                                                }
++                                                                            },
++                                                                        );
++                                                                    }
++                                                                    // ⭐ THE BUDGET DOOR, rung-local:
++                                                                    //    this sweep rung's renders are
++                                                                    //    discarded and the refusal rides
++                                                                    //    out per-item — the closure
++                                                                    //    files it after the collect.
++                                                                    Err(superdsc::EmitError::Budget(b)) => {
++                                                                        let mut tk =
++                                                                            superdsc::stage_tickets_of(
++                                                                                &rung_staged,
++                                                                                true,
+                                                                             );
+-                                                                            superdsc::bundle::SiblingFp::none()
+-                                                                        })
+-                                                                    } else {
+-                                                                        superdsc::bundle::SiblingFp::none()
+-                                                                    });
++                                                                        tk.extend(
++                                                                            superdsc::stage_tickets_of(
++                                                                                &rung_chunk_fps,
++                                                                                false,
++                                                                            ),
++                                                                        );
++                                                                        superdsc::discard_stage_tickets(&tk);
++                                                                        return Err(b);
+                                                                     }
+                                                                     Err(e) => {
+                                                                         eprintln!(
+@@ -11757,6 +11930,17 @@ fn dump_wavefront_mega(
+                                                                     }
+                                                                 }
+                                                             }
++                                                            let mut tickets =
++                                                                superdsc::stage_tickets_of(
++                                                                    &rung_staged,
++                                                                    true,
++                                                                );
++                                                            tickets.extend(
++                                                                superdsc::stage_tickets_of(
++                                                                    &rung_chunk_fps,
++                                                                    false,
++                                                                ),
++                                                            );
+                                                             if ok {
+                                                                 eprintln!(
+                                                                     "[spyre-superdsc] {base}: ladder rung \
+@@ -11776,20 +11960,23 @@ fn dump_wavefront_mega(
+                                                                 // twin counts.
+                                                                 let fused_twin =
+                                                                     rec.bodies_fused.iter().any(|f| !f.is_none());
+-                                                                Some((
+-                                                                    rec,
+-                                                                    (
+-                                                                        superdsc::bundle::SweptCols::new(rung_swept),
+-                                                                        scratchy_target_spyre::fold_plan::RungReach {
+-                                                                            folds: rung_folds,
+-                                                                            chunk: rung_chunk.is_some(),
+-                                                                            fused_twin,
+-                                                                        },
+-                                                                    ),
+-                                                                    (rung, rung_chunk, rr.layout),
++                                                                Ok((
++                                                                    Some((
++                                                                        rec,
++                                                                        (
++                                                                            superdsc::bundle::SweptCols::new(rung_swept),
++                                                                            scratchy_target_spyre::fold_plan::RungReach {
++                                                                                folds: rung_folds,
++                                                                                chunk: rung_chunk.is_some(),
++                                                                                fused_twin,
++                                                                            },
++                                                                        ),
++                                                                        (rung, rung_chunk, rr.layout),
++                                                                    )),
++                                                                    tickets,
+                                                                 ))
+                                                             } else {
+-                                                                None
++                                                                Ok((None, tickets))
+                                                             }
+                                                         }
+                                                         Err(e) => {
+@@ -11797,15 +11984,38 @@ fn dump_wavefront_mega(
+                                                                 "[spyre-superdsc] {base}: ladder rung {} lower failed: {e}",
+                                                                 rung.get()
+                                                             );
+-                                                            None
++                                                            Ok((None, Vec::new()))
+                                                         }
+                                                     }
+                                                         })
+                                                         .collect()
+                                                 };
+-                                                for (rec, reach, (rung, rung_chunk, layout)) in
+-                                                    per_rung.into_iter().flatten()
+-                                                {
++                                                // ⭐ A SWEEP RUNG'S BUDGET REFUSAL REFUSES THE
++                                                //    WHOLE CLOSURE RUNG: the ladder this match
++                                                //    builds would carry work the refusal says the
++                                                //    bake cannot pay for, so the rung's renders —
++                                                //    the ceiling's AND the sibling rungs' already-
++                                                //    emitted ones — are discarded here, and the
++                                                //    refusal rides out to the caller.
++                                                let mut sweep_refusal: Option<BudgetRefusal> =
++                                                    None;
++                                                for item in per_rung {
++                                                    let (rec, reach, (rung, rung_chunk, layout)) =
++                                                        match item {
++                                                            Ok((Some(x), tickets)) => {
++                                                                rung_tickets.extend(tickets);
++                                                                x
++                                                            }
++                                                            Ok((None, tickets)) => {
++                                                                rung_tickets.extend(tickets);
++                                                                continue;
++                                                            }
++                                                            Err(b) => {
++                                                                sweep_refusal =
++                                                                    sweep_refusal.or(Some(b));
++                                                                continue;
++                                                            }
++                                                        };
+                                                     // ⛔ ONE SESSION STAGES ONE LAYOUT: a rung reading a
+                                                     // staged input from elsewhere is a build failure,
+                                                     // never a wrong constant.
+@@ -11840,6 +12050,13 @@ fn dump_wavefront_mega(
+                                                     decode_rungs.push(rec);
+                                                     rung_reach.push(reach);
+                                                 }
++                                                if let Some(b) = sweep_refusal {
++                                                    let mut all =
++                                                        superdsc::stage_tickets_of(&stage_fps, true);
++                                                    all.extend(rung_tickets.drain(..));
++                                                    superdsc::discard_stage_tickets(&all);
++                                                    return Err(b);
++                                                }
+                                             }
+                                             decode_rungs.sort_by_key(|r| r.active_cap);
+                                             rung_reach.sort_by_key(|(cap, _)| *cap);
+@@ -12608,7 +12825,9 @@ fn dump_wavefront_mega(
+                         man: man.clone(),
+                     });
+                 }
+-                ((man, nodes, sengraph_json, group_graphs), fx)
++                let mut tickets = superdsc::stage_tickets_of(&stage_fps, true);
++                tickets.extend(rung_tickets.drain(..));
++                Ok(((man, nodes, sengraph_json, group_graphs), fx, tickets))
+             };
+         // Apply one bake's effects, in the order the bake recorded them. Serial, and the only code
+         // that touches the expansion's shared state.
+@@ -12697,15 +12916,32 @@ fn dump_wavefront_mega(
+              prefill_mq: Option<u32>,
+              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
+              decode_rows: u32| {
+-                let (r, fx) = emit_bundle_deferred(
++                let (r, fx, tickets) = match emit_bundle_deferred(
+                     lwd,
+-                    base,
++                    // `base` is cloned into the call so both panic arms below can borrow
++                    // the wrapper's own copy — rustc's own suggestion, one short-string
++                    // clone per wrapper call.
++                    base.clone(),
+                     cap,
+                     seq_sym,
+                     prefill_mq,
+                     active_cap,
+                     decode_rows,
+-                );
++                ) {
++                    Ok(x) => x,
++                    // ⛔ THE PRIMARY/BATCH PATH HAS NO NARROWER RUNG TO FALL TO — a bake-budget
++                    //    refusal here is the same build failure it was before the type existed
++                    //    (this site panicked on the emit's Err already); the type only carries
++                    //    the text verbatim now.
++                    Err(b) => panic!(
++                        "[spyre-superdsc] {base}: BAKE BUDGET REFUSED — {} (the decode/primary \
++                         bake has no ladder to shorten)",
++                        b.0
++                    ),
++                };
++                if let Err(e) = superdsc::submit_stage_tickets(&tickets) {
++                    panic!("[spyre-superdsc] {base}: staging failed — {e}");
++                }
+                 commit_bake(lwd, fx);
+                 r
+             };
+@@ -13028,8 +13264,21 @@ fn dump_wavefront_mega(
+         // With `PREFILL_RUNGS` running to 96 that was 21 bakes to use 1 (25 now, to 256) — the generated
+         // model source and rustc's single-threaded pass over it both paid for all of them.
+         let prefill_rung_widths: Vec<u32> = if sendnn_superdsc && cfg!(feature = "spyre-hw") {
+-            let mut v: Vec<u32> = PREFILL_RUNGS
+-                .into_iter()
++            // ⭐ THE CHUNK-FORMED CUT (2026-10-25 ruling): a model that admits ANY rung past the
++            //    sub-blocked ceiling bakes only the measured winners; a sub-blocked model
++            //    (gemma, hd ≥ 256) admits nothing up there, so `chunk_formed` is false and its
++            //    ≤128 ladder is byte for byte what it was.
++            let chunk_formed = PREFILL_RUNGS
++                .iter()
++                .any(|&r| r > SUB_BLOCKED_PREFILL_CEILING && rung_admitted(r));
++            let ladder: &[u32] = if chunk_formed {
++                &CHUNK_FORMED_PREFILL_RUNGS
++            } else {
++                &PREFILL_RUNGS
++            };
++            let mut v: Vec<u32> = ladder
++                .iter()
++                .copied()
+                 .filter(|&r| r > 1 && r <= prefill_m && rung_admitted(r))
+                 .collect();
+             // An explicit KTIR_PREFILL_LEN that is not itself a rung still gets baked, as the top.
+@@ -13042,19 +13291,25 @@ fn dump_wavefront_mega(
+         };
+         type PrefillPick = BakeOut;
+         let mut prefill: Option<PrefillPick> = None;
+-        // ⭐ THE RUNGS ARE BAKED IN PARALLEL AND COMMITTED IN ORDER. Each rung is a whole-model lowering
+-        // that reads nothing another rung writes — `emit_bundle_deferred` records its effects instead of
+-        // applying them — so the 25 bakes run side by side and `commit_bake` then applies their effects
+-        // rung by rung, ascending, exactly as the serial loop did (the last rung that lowered is still
+-        // the ceiling).
++        // ⭐ THE RUNGS ARE LOWERED AND COMMITTED ONE AT A TIME, ASCENDING — THE SERIAL LADDER.
++        // The whole-bake total budget needs a DETERMINISTIC order: each rung's keep decision
++        // reads the accumulator of every rung before it, so a rung's staging cannot race a
++        // narrower rung's commit. The parallelism this loop lost lives where it pays — the
++        // nested chunk-ladder rayon inside every bundle's emission, and the dxp compile pool
++        // behind the staging (MEASURED: the warm render is 85 s against a ~10 min compile
++        // drain, so rung-level parallelism bought ~nothing while oversubscribing the 20-CPU
++        // quota against the dxp children — the 63% render collapse of the 11k bake).
+         //
+-        // A rung that does not lower comes back as its `(width, reason)` instead, collected in the same
+-        // ascending order at commit — what the window guard below names when the baked ladder stops
+-        // short.
+-        type RungBake = (to_wavefront::LoweredDecode, PrefillPick, Vec<BakeEffect>);
+-        let per_rung: Vec<Result<RungBake, (u32, String)>> = {
+-            use rayon::prelude::*;
+-            prefill_rung_widths.par_iter().map(|&pl| -> Result<RungBake, (u32, String)> {
++        // A rung that does not lower, or one the bake budget refuses, comes back as its
++        // `(width, reason)` instead, collected in the same ascending order — what the window
++        // guard below names when the baked ladder stops short. A rung the whole-bake TOTAL
++        // refuses STOPS the ladder: every later rung is wider and costs more.
++        let mut refused_rungs: Vec<(u32, String)> = Vec::new();
++        // ⭐ THE TOTAL-WORK ACCUMULATOR — Σ trips of every rung the ladder has STAGED, the
++        //    running total of the `BakeBudget::MAX_TOTAL_TRIPS` decision below. Chunk-rung
++        //    bundles never count (their tickets say so — measured, they never stage).
++        let mut accumulated: u64 = 0;
++        for &pl in &prefill_rung_widths {
+             let lowered = to_wavefront::lower_decode_to_wavefront(
+                 fuf,
+                 decode_asn_check,
+@@ -13079,65 +13334,96 @@ fn dump_wavefront_mega(
+                 crate::to_wavefront::PrefixCapacity::new(prefix_len),
+                 pl,
+             );
+-            match lowered {
+-                Ok(lwd_p) => {
+-                    let (r, fx) = emit_bundle_deferred(
+-                        &lwd_p,
+-                        format!("ktir_prefill_{stem_id}"),
+-                        prefix_len.get(),
+-                        // prefill: rewrite the concrete prompt length `pl` → symbol
+-                        // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
+-                        // ── superdsc: keep the prefill tape CONCRETE (m=pl) so the reroll
+-                        //    bakes a real m=N dxp bundle (the dxp reroll is NOT symbolic; the
+-                        //    worker runs it at the fixed pl). Only the sengraph offline_decoder
+-                        //    path uses the s0 symbol. ──
+-                        if sendnn_superdsc {
+-                            None
+-                        } else {
+-                            Some(("s0", pl))
+-                        },
+-                        Some(pl), // prefill path (SDPA + Store), ladder rung m=pl
+-                        // ⛔ ZERO PREFIX BLOCKS, AND THAT IS ONLY RIGHT FOR THE FIRST CHUNK.
+-                        // `ActiveCap::NONE` is documented as valid ONLY where `start == 0`, but
+-                        // `manifest.rs`'s `KtirBundle::prefill` is a single `Option` and
+-                        // `spyre_forward.rs:1544` hands that one bundle to EVERY chunk, so chunk k
+-                        // attends only its own `mq` tokens and ignores the `k*mq` before it. The
+-                        // prefix-capable emission below (`:10176`) is reachable only through
+-                        // `prefill_prefix`, which the worker reads under `spyre-hw` alone.
+-                        //
+-                        // ⚠️ FLIPPING THIS TO `FULL` DOES NOT FIX IT — MEASURED. `ActiveCap` is the
+-                        // sweep extent of a DECODE attention, so `FULL` here lowers the chunk's
+-                        // attention in the decode form: its per-layer `new_k` comes back one row
+-                        // (`kv_dim`) while `forward_chunk` reads `n * kv_dim`
+-                        // (`spyre_forward.rs:1460`), and any prompt long enough to chunk PANICS
+-                        // (`range end index 49152 out of range for slice of length 512`, 49152 =
+-                        // 96*512). Multi-chunk prefill needs prefix blocks AND `mq` new rows
+-                        // together; that combination is not what this flag selects.
+-                        scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
+-                        1, // a prompt chunk is one request however many positions it spans
+-                    );
+-                    Ok((lwd_p, r, fx))
+-                }
++            let lwd_p = match lowered {
++                Ok(lwd_p) => lwd_p,
+                 Err(e) if sendnn_superdsc => {
+                     eprintln!(
+                         "[spyre-superdsc] {stem}: prefill ladder rung m={pl} NOT LOWERED — {e} \
+                          (SKIPPED; a narrower rung still covers this width)"
+                     );
+-                    Err((pl, e.to_string()))
++                    refused_rungs.push((pl, e.to_string()));
++                    continue;
+                 }
+                 Err(e) => panic!("[wavefront] {stem}: prefill (m={pl}) NOT LOWERED — {e}"),
+-            }
+-            }).collect()
+-        };
+-        let mut refused_rungs: Vec<(u32, String)> = Vec::new();
+-        for rung in per_rung {
+-            match rung {
+-                Ok((lwd_p, r, fx)) => {
+-                    commit_bake(&lwd_p, fx);
+-                    prefill = Some(r);
++            };
++            let (r, fx, tickets) = match emit_bundle_deferred(
++                &lwd_p,
++                format!("ktir_prefill_{stem_id}"),
++                prefix_len.get(),
++                // prefill: rewrite the concrete prompt length `pl` → symbol
++                // s0 (offline_decoder idx-0 graph: prompt sym = Tq = Tkv).
++                // ── superdsc: keep the prefill tape CONCRETE (m=pl) so the reroll
++                //    bakes a real m=N dxp bundle (the dxp reroll is NOT symbolic; the
++                //    worker runs it at the fixed pl). Only the sengraph offline_decoder
++                //    path uses the s0 symbol. ──
++                if sendnn_superdsc {
++                    None
++                } else {
++                    Some(("s0", pl))
++                },
++                Some(pl), // prefill path (SDPA + Store), ladder rung m=pl
++                // ⛔ ZERO PREFIX BLOCKS, AND THAT IS ONLY RIGHT FOR THE FIRST CHUNK.
++                // `ActiveCap::NONE` is documented as valid ONLY where `start == 0`, but
++                // `manifest.rs`'s `KtirBundle::prefill` is a single `Option` and
++                // `spyre_forward.rs:1544` hands that one bundle to EVERY chunk, so chunk k
++                // attends only its own `mq` tokens and ignores the `k*mq` before it. The
++                // prefix-capable emission below (`:10176`) is reachable only through
++                // `prefill_prefix`, which the worker reads under `spyre-hw` alone.
++                //
++                // ⚠️ FLIPPING THIS TO `FULL` DOES NOT FIX IT — MEASURED. `ActiveCap` is the
++                // sweep extent of a DECODE attention, so `FULL` here lowers the chunk's
++                // attention in the decode form: its per-layer `new_k` comes back one row
++                // (`kv_dim`) while `forward_chunk` reads `n * kv_dim`
++                // (`spyre_forward.rs:1460`), and any prompt long enough to chunk PANICS
++                // (`range end index 49152 out of range for slice of length 512`, 49152 =
++                // 96*512). Multi-chunk prefill needs prefix blocks AND `mq` new rows
++                // together; that combination is not what this flag selects.
++                scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::NONE,
++                1, // a prompt chunk is one request however many positions it spans
++            ) {
++                Ok(x) => x,
++                // A bake-budget refusal (per-bundle or per-group) refused this rung at its
++                // render — its renders were already discarded at the refusal site, so the
++                // rung is unbaked and uncounted.
++                Err(b) => {
++                    eprintln!(
++                        "[spyre-superdsc] {stem}: prefill ladder rung m={pl} BAKE BUDGET \
++                         REFUSED — {} (SKIPPED; a narrower rung still covers this width)",
++                        b.0
++                    );
++                    refused_rungs.push((pl, b.0));
++                    continue;
+                 }
+-                Err(refused) => refused_rungs.push(refused),
++            };
++            // ⭐ THE TOTAL-WORK DECISION, AT COMMIT — the whole-bake budget judges the
++            //    accumulator plus THIS rung's stageable trips BEFORE anything stages: a rung
++            //    past the total is discarded unbaked (its renders cost only their render,
++            //    never a compile) and the ladder STOPS — later rungs are wider and cost
++            //    more. Landing exactly AT the ceiling is lawful, the `>` law.
++            let trips: u64 = tickets
++                .iter()
++                .filter(|t| t.counts_toward_total)
++                .map(|t| t.trips)
++                .sum();
++            if let Err(refused) =
++                scratchy_target_spyre::superdsc_bake::BakeBudget::total_verdict(accumulated + trips)
++            {
++                superdsc::discard_stage_tickets(&tickets);
++                eprintln!(
++                    "[spyre-superdsc] {stem}: prefill ladder rung m={pl} REFUSED BY THE \
++                     WHOLE-BAKE TOTAL — {} (the ladder stops here; later rungs are wider \
++                     and cost more)",
++                    refused.0
++                );
++                refused_rungs.push((pl, refused.0));
++                break;
+             }
++            if let Err(e) = superdsc::submit_stage_tickets(&tickets) {
++                panic!("[spyre-superdsc] {stem}: prefill rung m={pl} staging failed — {e}");
++            }
++            commit_bake(&lwd_p, fx);
++            prefill = Some(r);
++            accumulated += trips;
+         }
+         // ⛔⛔⛔ AND THE LADDER THAT LOWERED MUST REACH THE POOL'S WINDOW, for a model that admits it — on
+         // the rungs codegen actually baked, never the const ladder. A short ladder runs, correctly and
+@@ -13237,6 +13523,31 @@ fn dump_wavefront_mega(
+             }
+         }
+ 
++        // ⭐ THE CENSUS PERSISTS — the width ladder's refusal record, on disk, because the
++        //    build log is not one: cargo swallows a build script's stderr on SUCCESS, so a
++        //    green build with a shortened ladder says nothing anywhere. One line per refused
++        //    rung (width + refusal text), the kept total trips, and the ceiling — the
++        //    calibration record for `BakeBudget::MAX_TOTAL_TRIPS`. Best-effort, same law as
++        //    the dump writes: a failed write is an eprintln, never a build failure.
++        if sendnn_superdsc {
++            let mut census = String::new();
++            for (pl, msg) in &refused_rungs {
++                census.push_str(&format!("PREFILL RUNG m={pl} REFUSED: {msg}\n"));
++            }
++            census.push_str(&format!(
++                "KEPT TOTAL TRIPS: {accumulated}\nTOTAL CEILING: {}\n",
++                scratchy_target_spyre::superdsc_bake::BakeBudget::MAX_TOTAL_TRIPS
++            ));
++            let path =
++                std::path::Path::new("/tmp/superdsc-dump").join(format!("{stem_id}-census.txt"));
++            if let Err(e) = std::fs::write(&path, census) {
++                eprintln!(
++                    "[spyre-superdsc] {stem}: could not write the census at {}: {e}",
++                    path.display()
++                );
++            }
++        }
++
+         // ⛔⛔⛔ ONE MODEL PACKS ONE RESIDENT WEIGHT SEGMENT — the parity ledger's verdict,
+         // judged ONCE here, after the last superdsc bake of this model. Every bundle that
+         // lowered recorded its packed weight segment (bank 0 + extra banks), exactly as the

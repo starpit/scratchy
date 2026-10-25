@@ -1,0 +1,322 @@
+# PROPOSAL — THE KILL, CORRECTED (count-cut only, re-ruled 2026-10-25 on run-47's measurement)
+
+Bring-for-ruling. NOTHING in this file is landed. Every hunk is old-text →
+new-text against the tree as it stands (`attn-contract` HEAD ee1ca99b3 +
+landed B + the landed, audited accumulator). Line numbers cite the current
+file. This replaces `kill-hunk.diff` (r1, REJECTED AS PROPOSED — the
+per_rung sweep never runs on the prefix-free path; kept on disk for the
+record).
+
+## The corrected ruling (restated)
+
+Run-47's build.log shows every ktir_prefill window with exactly FOUR
+bundles — prefix / body / body+'f' / suffix — and ZERO "ladder rung …
+baked" lines: `chunk_ceiling.is_none()` for prefix-free emissions, so the
+`:11686` gate never opens the sweep and there is no `rung_staged` content
+to reclassify. The counted pair at each prefix-free rung is the PRIMARY
+body (NONE-form, `:11431`) + the PRIMARY TWIN (`:11510`, minted by the
+`:11497` arm — `card && chunk_ceiling.is_none()` is exactly the prefill
+case; the `+f` dirs in the dump root are PRIMARY twins). The kill flips
+the PRIMARY SPLIT to `counts_toward_total=false`; the TWIN stays in
+`stage_fps`, counted — it is LIVE (chunk-0's RungFused). The kill is
+LOAD-BEARING, not an optimization: without it the 256 rung's door reads
+1 + 2×(~49k) + 45 ≈ 97-102k > 92,000 ⇒ the rung refuses ⇒ the ladder is
+empty ⇒ the window guard fails the build; with it the door reads ≈49-51k
+⇒ GREEN with headroom. The 512 rung still refuses at the body door
+(:11438-11443) — the per-bundle wall fires inside `emit_bundle` at
+render, pre-ticket, flag-ungated — so the ladder tops at 256 until
+fusion. Body trips are NOT confirmed 48.2k (6,209 @ m=31 = 200/row,
+96,429 @ m=512 = 188.3/row — the per-row rate falls with m); run-48's
+census calibrates the 256 body.
+
+The split stays emitted, submitted, staged, compiled, resolvable:
+`body_fps.push(fp)` is UNTOUCHED (the ceiling rung's bodies and
+RerollMeta's anchor keep the fp), manifest, rungs list, reach records,
+and the selector's inputs are unchanged. The twin push `:11510` and its
+Err catch `:11518-11524` are untouched. The per_rung classification
+`:11821-11831` is untouched — r1's hunks 1-3 are withdrawn entire. No
+wrapper change (its `filter(|t| t.counts_toward_total)` already drops the
+flag); no serial-ladder door change.
+
+## The discriminator (unchanged from r1, ruled correct)
+
+The flip keys on the closure's own `active_cap` parameter:
+`active_cap == superdsc::ActiveCap::NONE`. The closure signature is
+`:11005`; `:13409` (the serial prefix-free ladder) is the ONLY call site
+passing NONE; the tree's own keyings are `:12417-12424` (numeric gate)
+and `:12443` (prefix-capable filter); `:12311-12322` is the tree's own
+comment naming NONE the prefix-free marker. The prefix-capable ladder
+passes FULL (`:13518`); decode passes `decode_ladder(cap)`/FULL.
+
+---
+
+## HUNK 1 — the new list, at the closure head beside `stage_fps`
+
+OLD (`codegen.rs:11021-11022`):
+```rust
+                let mut stage_fps: Vec<String> = Vec::new();
+                let mut rung_tickets: Vec<superdsc::StageTicket> = Vec::new();
+```
+
+NEW:
+```rust
+                let mut stage_fps: Vec<String> = Vec::new();
+                let mut rung_tickets: Vec<superdsc::StageTicket> = Vec::new();
+                // ⭐ THE PREFIX-FREE PRIMARY SPLIT LIST — the kill (ruled 2026-10-25,
+                //    corrected on run-47's measurement): a prefix-free emission's primary
+                //    SPLIT-form body is dead-at-select — every chunk-0 step (the host
+                //    staging door and the launch, both asks) selects the fused TWIN, and
+                //    the split arm needs valid_len ≥ 15,361, past the ≤512-row window a
+                //    prefix-free rung bakes — but kept-resolvable: it stays emitted,
+                //    submitted, staged, and compiled exactly as before (the pre-campaign
+                //    green world paid this compile too), so only its TRIPS leave the
+                //    whole-bake total. The gate is the closure's own `active_cap`: NONE
+                //    is the prefix-free prefill marker — the serial prefix-free ladder
+                //    is the only call site that passes it, and the tree's own numeric
+                //    gate and prefix filter key on it the same way. The TWIN stays in
+                //    `stage_fps`, counted: it is LIVE (chunk-0's RungFused). Minted and
+                //    discarded at every `stage_fps` site, the same law — a rendered fp
+                //    left out of a discard dangles into into_code's
+                //    rendered-never-submitted build failure.
+                let mut prefix_free_primary_split_fps: Vec<String> = Vec::new();
+```
+
+## HUNK 2 — the primary body's Ok arm
+
+OLD (`codegen.rs:11429-11433`):
+```rust
+                                        match r {
+                                            Ok(fp) => {
+                                                stage_fps.push(fp.clone());
+                                                body_fps.push(fp);
+                                            }
+```
+
+NEW:
+```rust
+                                        match r {
+                                            Ok(fp) => {
+                                                if active_cap
+                                                    == superdsc::ActiveCap::NONE
+                                                {
+                                                    prefix_free_primary_split_fps
+                                                        .push(fp.clone());
+                                                } else {
+                                                    stage_fps.push(fp.clone());
+                                                }
+                                                body_fps.push(fp);
+                                            }
+```
+
+(`body_fps.push(fp)` UNTOUCHED — the anchor and the ceiling rung's bodies
+keep the fp; resolvability unchanged. rustfmt settles the wrap.)
+
+## HUNK 3 — ALL FIVE `stage_fps` mint/discard sites carry the new list at `false`
+
+### 3a — the prefix's budget door (fires with the list empty — uniform anyway)
+
+OLD (`codegen.rs:11377-11382`):
+```rust
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                superdsc::discard_stage_tickets(
+                                                    &superdsc::stage_tickets_of(&stage_fps, true),
+                                                );
+                                                return Err(b);
+                                            }
+```
+
+NEW:
+```rust
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                let mut tk =
+                                                    superdsc::stage_tickets_of(&stage_fps, true);
+                                                tk.extend(
+                                                    superdsc::stage_tickets_of(
+                                                        &prefix_free_primary_split_fps,
+                                                        false,
+                                                    ),
+                                                );
+                                                superdsc::discard_stage_tickets(&tk);
+                                                return Err(b);
+                                            }
+```
+
+### 3b — the body's budget door (the LOAD-BEARING discard: it fires with the
+primary already rendered)
+
+OLD (`codegen.rs:11434-11443`, the door with its comment):
+```rust
+                                            // ⭐ THE BUDGET DOOR, same law as the prefix's: the
+                                            //    rung's renders are discarded and the refusal
+                                            //    rides out — a narrower rung still covers the
+                                            //    width.
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                superdsc::discard_stage_tickets(
+                                                    &superdsc::stage_tickets_of(&stage_fps, true),
+                                                );
+                                                return Err(b);
+                                            }
+```
+
+NEW:
+```rust
+                                            // ⭐ THE BUDGET DOOR, same law as the prefix's: the
+                                            //    rung's renders are discarded and the refusal
+                                            //    rides out — a narrower rung still covers the
+                                            //    width. The primary split rides the discard at
+                                            //    false — rendered here, it must be named by the
+                                            //    discard set or it dangles.
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                let mut tk =
+                                                    superdsc::stage_tickets_of(&stage_fps, true);
+                                                tk.extend(
+                                                    superdsc::stage_tickets_of(
+                                                        &prefix_free_primary_split_fps,
+                                                        false,
+                                                    ),
+                                                );
+                                                superdsc::discard_stage_tickets(&tk);
+                                                return Err(b);
+                                            }
+```
+
+### 3c — the suffix's budget door (fires with the primary already rendered)
+
+OLD (`codegen.rs:11549-11555`):
+```rust
+                                            // ⭐ THE BUDGET DOOR, same law as the prefix's.
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                superdsc::discard_stage_tickets(
+                                                    &superdsc::stage_tickets_of(&stage_fps, true),
+                                                );
+                                                return Err(b);
+                                            }
+```
+
+NEW:
+```rust
+                                            // ⭐ THE BUDGET DOOR, same law as the prefix's.
+                                            Err(superdsc::EmitError::Budget(b)) => {
+                                                let mut tk =
+                                                    superdsc::stage_tickets_of(&stage_fps, true);
+                                                tk.extend(
+                                                    superdsc::stage_tickets_of(
+                                                        &prefix_free_primary_split_fps,
+                                                        false,
+                                                    ),
+                                                );
+                                                superdsc::discard_stage_tickets(&tk);
+                                                return Err(b);
+                                            }
+```
+
+### 3d — the sweep-refusal discard (unreachable for NONE today — carried
+anyway: the discard set must cover every rendered fp the closure created)
+
+OLD (`codegen.rs:12053-12059`):
+```rust
+                                                if let Some(b) = sweep_refusal {
+                                                    let mut all =
+                                                        superdsc::stage_tickets_of(&stage_fps, true);
+                                                    all.extend(rung_tickets.drain(..));
+                                                    superdsc::discard_stage_tickets(&all);
+                                                    return Err(b);
+                                                }
+```
+
+NEW:
+```rust
+                                                if let Some(b) = sweep_refusal {
+                                                    let mut all =
+                                                        superdsc::stage_tickets_of(&stage_fps, true);
+                                                    all.extend(
+                                                        superdsc::stage_tickets_of(
+                                                            &prefix_free_primary_split_fps,
+                                                            false,
+                                                        ),
+                                                    );
+                                                    all.extend(rung_tickets.drain(..));
+                                                    superdsc::discard_stage_tickets(&all);
+                                                    return Err(b);
+                                                }
+```
+
+### 3e — the expansion's final mint
+
+OLD (`codegen.rs:12828-12829`):
+```rust
+                let mut tickets = superdsc::stage_tickets_of(&stage_fps, true);
+                tickets.extend(rung_tickets.drain(..));
+```
+
+NEW:
+```rust
+                let mut tickets = superdsc::stage_tickets_of(&stage_fps, true);
+                tickets.extend(superdsc::stage_tickets_of(
+                    &prefix_free_primary_split_fps,
+                    false,
+                ));
+                tickets.extend(rung_tickets.drain(..));
+```
+
+(The tickets flow onward untouched — the wrapper's submit, the serial
+ladder's door, `commit_bake` — each primary-split ticket now simply says
+`counts_toward_total: false`, so the wrapper's
+`filter(|t| t.counts_toward_total)` sum and the serial ladder's door both
+drop it while `submit_stage_tickets` still stages it.)
+
+## HUNK 4 — the flag's doc law names the true second uncounted class
+
+OLD (`lower_subtile_tape_to_superdsc.rs:7007-7014`):
+```rust
+    /// ⛔ WHETHER THESE TRIPS COUNT toward [`crate::superdsc_bake::BakeBudget::MAX_TOTAL_TRIPS`].
+    /// The stageable classes — the bodies and their fused twins, the prefix and the suffix, the
+    /// decode sweep rungs — count: they are the compile work the total budget bounds. CHUNK rung
+    /// bundles do not: the pod census (two stage-dir inspections — the 44-minute complete bake
+    /// and attempt-12's partial — plus the dump-root classification) found a chunk fp's groups
+    /// always resolve through the bake's own memo (nothing ever stages for them), so their trips
+    /// are not compile work, and counting them would refuse rungs the bake never pays for.
+```
+
+NEW:
+```rust
+    /// ⛔ WHETHER THESE TRIPS COUNT toward [`crate::superdsc_bake::BakeBudget::MAX_TOTAL_TRIPS`].
+    /// The stageable classes — the bodies and their fused twins, the prefix and the suffix, the
+    /// decode sweep rungs — count: they are the compile work the total budget bounds. Two
+    /// classes do not. CHUNK rung bundles: the pod census (two stage-dir inspections — the
+    /// 44-minute complete bake and attempt-12's partial — plus the dump-root classification)
+    /// found a chunk fp's groups always resolve through the bake's own memo (nothing ever
+    /// stages for them), so their trips are not compile work, and counting them would refuse
+    /// rungs the bake never pays for. And the PREFIX-FREE PRIMARY SPLIT — the split-form body
+    /// a start==0 prefill rung bakes: dead-at-select (every chunk-0 step selects the fused
+    /// twin, and the split arm needs valid_len ≥ 15,361, past the window a prefix-free rung
+    /// bakes) but kept-resolvable (its bundle is still emitted, submitted, staged, and
+    /// compiled — the compile the pre-campaign green world paid), so only its trips leave
+    /// the total: counting them would refuse the bake for work the selector never runs.
+```
+
+---
+
+## Open points for ruling (one, defaults chosen)
+
+1. **The H2 gate keys on `active_cap == NONE` alone, per the ruling — no
+   `card` conjunct.** Off-card, the twin mint at `:11497` is `card && …`,
+   so an off-card NONE emission would put its ONLY body (no twin exists
+   there) in the uncounted list — its bake's total would drop the body's
+   trips too. I read the only NONE call site (`:13409`, the serial
+   prefix-free ladder) as card-path-only, so the case is unreachable;
+   flagging so the audit confirms rather than assumes. If it is reachable
+   and wrong, the gate gains `&& card`.
+
+## Behavior delta
+
+No green build changes semantically: nothing emitted, staged, compiled,
+or selectable changes — only the census's whole-bake number and the total
+door's input drop the primary split's counted trips. The 256 rung's door
+moves from ≈97-102k (REFUSE ⇒ empty ladder ⇒ window guard fails the
+build) to ≈49-51k — GREEN with headroom. The 512 rung still refuses at
+the body door `:11438-11443` (the per-bundle wall inside `emit_bundle`
+at render, pre-ticket, flag-ungated) — the ladder tops at 256 until
+fusion brings the 512 body under 65,536, depth from run-48's measured
+census. The uncounted primary still COMPILES: the cold clock against the
+6-10 minute law judges that, not the door.

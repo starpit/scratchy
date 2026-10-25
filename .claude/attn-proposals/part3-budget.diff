@@ -1,0 +1,46 @@
+diff --git a/crates/targets/spyre/src/superdsc_bake.rs b/crates/targets/spyre/src/superdsc_bake.rs
+index 2c40b8a053..09ba79b829 100644
+--- a/crates/targets/spyre/src/superdsc_bake.rs
++++ b/crates/targets/spyre/src/superdsc_bake.rs
+@@ -2024,6 +2024,41 @@ impl BakeBudget {
+     /// refusing with the measured count if it must.
+     pub const MAX_GROUPS_PER_LAYER: usize = 256;
+ 
++    /// ⭐ 92,000 trips in ONE model's WHOLE bake — the TOTAL-WORK ceiling, the per-model
++    /// sibling of [`Self::MAX_BUNDLE_TRIPS`]. The per-bundle wall bounds the wave's critical
++    /// path; NOTHING bounded the sum, which is how the inventory doubled silently across warm
++    /// builds (the 384/512 rungs' ~1,316 groups ≈ 329 child-minutes put the attempt-12 cold
++    /// bake ~7× past the 6-10 minute law with every group individually legal). Sized to the
++    /// law, not to the inventory: 600 s cold × width 20 × the ~0.9 utilization an unthrottled
++    /// xargs demonstrates ÷ ~117 ms/trip (measured: the 926-group sweep, 231 child-minutes)
++    /// ≈ 92.3k trips. The census at the enforcement site names the rungs that pushed the
++    /// total over, and they are UNBAKED — same refusal semantics as the per-bundle wall:
++    /// green build, named census, shorter ladder. ⚠️ PROVISIONAL in the family's sense: the
++    /// verification bake's own census is the calibration, and moving this is a measured
++    /// decision that names the bake.
++    pub const MAX_TOTAL_TRIPS: u64 = 92_000;
++
++    /// The per-MODEL total-trips verdict — the sum over every body class's minted trips
++    /// (the arithmetic [`crate::lower_subtile_tape_to_ktir::mint_trips`] already runs per
++    /// body). `Err` carries the refusal verbatim for the census to name the rungs that
++    /// pushed the total over; the enforcement site drops them unbaked.
++    ///
++    /// ⛔ `>`, NOT `>=`, same law as [`Self::bundle_verdict`]: a bake that lands exactly AT
++    /// the ceiling is lawful, a past-ceiling one is the blow-up.
++    pub fn total_verdict(total: u64) -> Result<(), String> {
++        if total > Self::MAX_TOTAL_TRIPS {
++            return Err(format!(
++                "{total} trips over the whole bake is PAST THE TOTAL BUDGET of {} trips per \
++                 model. The per-bundle wall bounds the critical path; this bounds the work — \
++                 a total past it is the bake's floor blowing up, which no parallelism \
++                 recovers. Moving the budget is a measured decision that names the bake; this \
++                 refusal is the measurement.",
++                Self::MAX_TOTAL_TRIPS,
++            ));
++        }
++        Ok(())
++    }
++
+     /// The per-BUNDLE budget verdict — `Err` carries the refusal verbatim, for
+     /// `ktir_groups_via_superdsc` to return as the bundle's `Err` (fatal at a primary body,
+     /// the documented rung-skip on a ladder rung). `trips` is `Σ EmittedOp::time` over the

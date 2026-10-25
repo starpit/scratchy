@@ -7493,6 +7493,185 @@ mod elementwise_tests {
             &[Scale::RedNonStick, Scale::Active, Scale::Active] as &[Scale],
             "the spray dim is the stride-0 read — the vendor's reduced-dim law"
         );
+        // ⭐⭐⭐ AND THE DIVISION IS THE SPRAY SPLIT — the law this op's own layout demands: the
+        // cores go to the leading `y` first (`y:4`), and the cores that leaves to `mb` (`mb:8`) —
+        // an `mb` split INSIDE one spray is contiguous, so a short spray count strands no cores.
+        assert_eq!(
+            op.iter.split_of("y"),
+            4,
+            "the spray axis takes its cores first"
+        );
+        assert_eq!(
+            op.iter.split_of("mb"),
+            8,
+            "the remainder goes to the slab's own outer dim"
+        );
+        assert_eq!(
+            op.iter.split_of("out"),
+            1,
+            "the one-stick `out` never splits"
+        );
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE PREFILL MASK ADD'S OWN GEOMETRY, PINNED — `[y=32, mb=21, out=64]` (32 query
+    /// heads, 21 tokens, one stick of slots): the spray split takes all 32 cores, ONE SPRAY PER
+    /// CORE, and `mb` stays whole. This is the exact op whose rows-first emission measured 620 of
+    /// 672 sticks never written (every core's base advanced ONE STICK while its slab was 32
+    /// sticks — see [`crate::work::distribute_cores_sprays_first`]'s doc), and the per-core slab
+    /// here is the producer's own: the `[672, 64]` score tile's 32-core row partition is exactly
+    /// 21 sticks per core, the same bytes at the same bases.
+    #[test]
+    fn the_row_split_op_at_the_prefill_mask_geometry_splits_one_spray_per_core() {
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(672),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let mask_h = rb(
+            "t6",
+            RowCount::of_token_rows(21),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let dense = In::full(&dense_h).ew();
+        let mask = In::y_broadcast(&mask_h, 32).ew();
+        let op = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
+            672,
+            64,
+            op_func_from_str("add"),
+            &[dense, mask],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::Law),
+        )
+        .expect("the mask add emits under the spray split");
+        assert_eq!(op.iter.extent("y"), 32, "y is the 32 query heads");
+        assert_eq!(op.iter.extent("mb"), 21, "mb is the 21 tokens");
+        assert_eq!(op.iter.split_of("y"), 32, "ONE SPRAY PER CORE");
+        assert_eq!(
+            op.iter.split_of("mb"),
+            1,
+            "the whole token axis stays in one slab"
+        );
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE ROW-SPLIT OP SERIALIZES ITS WIRE ORDER THE WAY DXP READS IT — STICK
+    /// INNERMOST, RECONSTRUCT WALK. dxp reads `layoutDimOrder_` idx 0 as INNERMOST
+    /// (`perfdsc/perfLdsInfo.h:29`, `dsc/dataOpDsc.h:347`) while this crate's address model is
+    /// OUTERMOST-first, so the y-major view's `["y","mb","out"]` is serialized REVERSED:
+    /// `["out","mb","y"]`, the stick INNERMOST — the score matmul's own output spelling — with
+    /// the RECONSTRUCT walk (`maxDimSizes_ [-1,-1,-1]`), because a rank-3 stick-on-last view
+    /// classifies `Flat` and would otherwise PIN its actual extents `[32,21,64]`, which dxp
+    /// reads at the opposite end first. MEASURED on the prefill mask add (`11_add_o1417` at the
+    /// spray split): the verbatim spelling tore the walk — 310 of 672 output sticks never
+    /// written, the mask operand read at a TWO-STICK row stride (token row `2t mod 21`
+    /// applied) — while the same bytes' producer and every `mb`-split sibling (stick innermost
+    /// under `-1`) walked correctly. The address model reads `layout` unchanged, so the
+    /// per-core starts (one 21-stick spray per core) are untouched.
+    #[test]
+    fn the_row_split_op_serializes_stick_innermost_and_reconstructs() {
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(672),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let mask_h = rb(
+            "t6",
+            RowCount::of_token_rows(21),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let out_h = rb(
+            "t7",
+            RowCount::of_token_rows(672),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let dense = In::full(&dense_h).ew();
+        let mask = In::y_broadcast(&mask_h, 32).ew();
+        let mut sid = 0i64;
+        let emitted =
+            crate::ir::bridge::tiled_op_sdsc_op::assemble_pointwise_broadcast_off_from_tile(
+                "add_o1417",
+                &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
+                "add",
+                672,
+                64,
+                &[dense, mask],
+                &out_h,
+                crate::addr::OutCorner::ZERO,
+                &mut sid,
+                None,
+            );
+        let v = serde_json::to_value(emitted.op.as_ref().expect("a descriptor")).unwrap();
+        // The spray split rides along untouched: one spray per core.
+        assert_eq!(
+            v["numWkSlicesPerDim_"],
+            serde_json::json!({"mb": 1, "out": 1, "y": 32})
+        );
+        let key = v["dscs_"][0]
+            .as_object()
+            .and_then(|m| m.keys().next().cloned())
+            .expect("a dsc");
+        let tree = v["dscs_"][0][&key]["scheduleTree_"]
+            .as_array()
+            .expect("the tree");
+        let allocs: Vec<_> = tree
+            .iter()
+            .filter(|n| n.get("nodeType_").and_then(|t| t.as_str()) == Some("allocate"))
+            .collect();
+        assert_eq!(allocs.len(), 3, "the three operands' allocate nodes");
+        for n in &allocs {
+            let name = n["name_"].as_str().unwrap_or("?");
+            assert_eq!(
+                n["layoutDimOrder_"],
+                serde_json::json!(["out", "mb", "y"]),
+                "{name}: the stick is INNERMOST on the wire, the matmul output's own spelling"
+            );
+            assert_eq!(
+                n["maxDimSizes_"],
+                serde_json::json!([-1, -1, -1]),
+                "{name}: the reconstruct walk — a pinned array is read at the opposite end first"
+            );
+        }
+    }
+
+    /// ⛔ A STATED NON-SPRAY DIVISION ON A Y-MAJOR OP IS REFUSED — the row-split mode's tensors
+    /// walk `["y", "mb", "out"]`, so a split over any inner dim hands every core a strided stick
+    /// set the per-core addressing walks at the wrong stride. The refusal names the law and the
+    /// measurement; the caller states [`EwDivision::SpraysFirst`] or the [`EwDivision::Law`].
+    #[test]
+    fn a_row_split_op_with_a_stated_inner_dim_split_is_refused() {
+        let dense_h = rb(
+            "t5",
+            RowCount::of_token_rows(672),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let mask_h = rb(
+            "t6",
+            RowCount::of_token_rows(21),
+            BlockCols::of_one_stick(Lanes::FP16),
+        );
+        let dense = In::full(&dense_h).ew();
+        let mask = In::y_broadcast(&mask_h, 32).ew();
+        let Err(m) = crate::ir::bridge::tiled_op_sdsc_op::pointwise_broadcast_opspec_from_tile(
+            &pointwise_tile_op(21, 64, 32, 3, Df::Fp16),
+            672,
+            64,
+            op_func_from_str("add"),
+            &[dense, mask],
+            "t7",
+            crate::addr::OutCorner::ZERO,
+            false,
+            None,
+            crate::work::CoreDivision::Ew(EwDivision::RowsFirst),
+        ) else {
+            panic!("a y-major op stated rows-first must not emit — that is the mask add's defect");
+        };
+        assert!(
+            m.contains("row-split (y-major) op whose stated division is not the spray split"),
+            "names the law: {m}"
+        );
     }
 
     /// ⛔ THE TILE AND THE OPERANDS MUST AGREE ON THE SPRAY COUNT — a `TileOp` whose `y` dim
