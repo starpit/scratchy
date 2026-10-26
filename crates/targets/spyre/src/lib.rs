@@ -55,6 +55,9 @@ pub mod ktir_superdsc_door;
 pub mod lower_subtile_tape_to_ktir;
 pub mod lower_subtile_tape_to_superdsc;
 mod op_abi;
+/// The read-before-write walk: one forward's emitted ops, in program order,
+/// against the bytes earlier ops wrote.
+pub mod read_before_write;
 // ⚠️ TEMPORARY bake-time instrumentation — strip with its call sites before landing.
 mod pc;
 pub mod superdsc_bake;

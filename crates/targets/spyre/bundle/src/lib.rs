@@ -488,6 +488,15 @@ pub struct KvShifts {
     /// also lets the passes collapse with no single pool stride (with [`Self::batched_requests`]); on a
     /// non-fold group it is the split-KV chunk's gather copies, launched once.
     pub gathered: bool,
+    /// ⭐ The STAGING CHANNEL — this group's gathered table is the FILL-STAGED REGION FORM
+    /// (`fill_attn_step_inputs`), not the composer's page-list table. `gathered` alone carries
+    /// both the addressing consequence (the zero shift) and the staging consequence (stage an
+    /// index table); a region-form group answers yes to the first and no to the second's
+    /// page-list spelling — its table is already staged by the host fill, and the composer must
+    /// not drive it as a chunk body. Both channels' entries are ABSOLUTE, so the zero shift is
+    /// correct for both; the page-list answer is `gathered && !region_form`. Meaningful only
+    /// when [`Self::gathered`].
+    pub region_form: bool,
     /// What one fold pass covers — see [`FoldRows`]. Meaningful only when [`Self::page_fold`].
     pub fold_rows: FoldRows,
 }

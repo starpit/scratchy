@@ -1623,11 +1623,10 @@ pub fn compute_bundle_layout<F: RopeForm>(
                      gathered read this bundle emits cannot address the pool"
                 ))
             })?;
-            for tid in [
-                k_id,
-                v_id,
-                ktir_superdsc::reserved_tids::KctResident::of(k_id).wire_tid(),
-            ] {
+            // ⛔ ONE SPELLING OF THE TID SET — `pool_reach_tids`, the same derivation the
+            // region stamp's premise guard asks, so the set this insertion covers and the set
+            // the stamp checks can never name different pools.
+            for tid in ktir_superdsc::sdsc_abstract::pool_reach_tids(k_id, v_id) {
                 gather_reach.insert(tid, reach);
             }
             // The per-layer stride the executor advances by MUST be exactly the three planes, with
@@ -2111,7 +2110,6 @@ pub fn compute_bundle_layout<F: RopeForm>(
         next: seg_bytes[SegRole::Intermediate.segment()],
         map: std::collections::BTreeMap::new(),
         sizes: std::collections::BTreeMap::new(),
-        fp8_row_arms: std::collections::BTreeMap::new(),
     });
     // Every placed tensor's spelling, registered at the one site that knows the whole set.
     let ids = std::cell::RefCell::new(
@@ -4441,21 +4439,26 @@ pub fn numeric_gate<F: RopeForm>(
     // membership: the result joins the folded law iff the splice's own
     // `tensor_feeds_result_through_row_local_ops` holds from a FOLDED node's
     // output to the result — the same predicate that admitted the fold, so
-    // nothing un-folded can ride in. The front end column-chunks a wide
-    // pointwise tail op past the predicate's width conjunct
-    // (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/ScalarMul/SiluMul —
-    // measured: granite's 49155-wide logits ScalarMul is 7 region-slice
-    // nodes of 8192 cols, so none matches and the tail op stays un-folded,
-    // the splice's documented cost-only shape: "row 0 is still right ...
-    // the device pays mq−1 rows of reads of unwritten logits for
-    // nothing"). Those chunks still scale the folded matmul's row-0 (=
-    // LAST-row) product — row-locally, guaranteed by this same walk — so
-    // the RESULT's row 0 is the fold's product and its rows 1+ are the
-    // dead stick: it takes the same last-row-vs-row-0 law (measured on the
-    // granite refusal dump: last-row rel 0.00049 at the fp8 floor, rows
-    // 1-30 exactly zero; the plain law reads 1.0136). A no-op when the
-    // tail's own op matched whole-region (gemma's TanhSoftCap already put
-    // the result in the set).
+    // nothing un-folded can ride in. The front end column-chunks every wide
+    // pointwise tail op (`n_blocks(out_cols, nb)` chunks Silu/Mul/Add/
+    // ScalarMul/SiluMul — measured: granite's 49155-wide logits ScalarMul is
+    // SEVEN region-slice nodes, six of 8192 + one of 3), and the predicate's
+    // width conjunct reads the output TENSOR's cols, not the chunk region's,
+    // so the chunking does not change the fold's decision: EVERY region-slice
+    // piece of the result-feeding tail tensor folds to the m=1 tail. (This is
+    // the leg-55 fix: region-keyed, every piece's 8192 failed the equality,
+    // the pieces stayed un-folded and read mq−1 rows the folded m=1 matmul
+    // never wrote — "row 0 is still right ... the device pays mq−1 rows of
+    // reads of unwritten logits for nothing" — a cost-only shape the tree
+    // carried on main too, until the read-before-write walk refused it at
+    // prefill leg 55.) The folded pieces each scale one row-0 column slice of
+    // the folded matmul's (= LAST-row) product — row-locally, guaranteed by
+    // this same walk — so the RESULT's row 0 is the fold's product and its
+    // rows 1+ are the dead stick: it takes the same last-row-vs-row-0 law
+    // (measured on the granite refusal dump: last-row rel 0.00049 at the fp8
+    // floor, rows 1-30 exactly zero; the plain law reads 1.0136). A no-op
+    // when the tail's own op matched whole-region (gemma's TanhSoftCap is
+    // never chunked and already put the result in the set).
     if ir.nodes.iter().any(|n| {
         folded.contains(&(n.output.tensor.index() as u64))
             && scratchy_triton_splice::tensor_feeds_result_through_row_local_ops(
@@ -5447,9 +5450,26 @@ fn trip_kinds_for(ops: &[EmittedOp], fold: FoldGrouping) -> (Vec<Trip>, Vec<usiz
     let (mut kinds, owner) = trip_kinds_and_owner(ops);
     if fold == FoldGrouping::Fused {
         for t in kinds.iter_mut() {
-            if matches!(t.kind, GroupKind::PageFold { .. }) {
+            if let GroupKind::PageFold { gathered } = t.kind {
                 // Reclassified, but it KEEPS ITS REQUEST — so it still cannot fuse across requests.
-                t.kind = GroupKind::Pure;
+                // ⭐⭐⭐⭐⭐ AND THE FUSED VARIANT FOLDS AWAY THE PER-PAGE RELAUNCH, NOT THE ENTRY
+                // SEMANTICS. A fold op whose gather reads ABSOLUTE stick-blocks (`kv_gathered`,
+                // carried here in the kind by `trip_kinds_and_owner` from the paged-fold stamp's
+                // chain of custody) is a `Gathered` run: `launch_index` derives the group's
+                // `KvShifts.gathered` from this kind, and the runtime's page-base composition
+                // asks that bit — a gathered fold rewritten to `Pure` composes the page base on
+                // top of the operand's own pool base and reads one page past its keys, the same
+                // two-bases defect the copy-leg stamp cures, through the fused twin. `Gathered`
+                // fuses only with `Gathered` (`fusable_kind_with`), so the fold's gathered ops
+                // leave the neighbouring `Pure` run — the launch-count cost the `FoldGrouping`
+                // doc already records for the split variant, paid here for correctness. An
+                // UNGATHERED fold stays `Pure` exactly as before, and `page_fold` stays `false`
+                // for either: the fused variant still never re-launches.
+                t.kind = if gathered {
+                    GroupKind::Gathered
+                } else {
+                    GroupKind::Pure
+                };
             }
         }
     }
@@ -5748,6 +5768,11 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
         // state the emitter can construct. What the part carries is [`Trip::part`]'s type.
         let fold_group = matches!(kinds[r.start].kind, GroupKind::PageFold { .. });
         let _ = gi; // launch order is the slice position now, not a field
+        // ⭐ THE GROUP'S GATHERED ANSWER, derived ONCE — the KV shift's zero and the staging
+        // channel below both key off it, so there is one derivation, not two that could
+        // disagree.
+        let gathered =
+            (fold_group && e.kv_gathered) || matches!(kinds[r.start].kind, GroupKind::Gathered);
         shifts.push(bundle::KvShifts {
             slot_stride_bytes: slot,
             slab_stride_bytes: slab,
@@ -5769,8 +5794,15 @@ pub fn launch_index(ops: &[EmittedOp], fold: FoldGrouping) -> Vec<bundle::KvShif
             // ⭐ AND WHETHER THAT AXIS IS OVER A GATHERED SCRATCH — the other half of `fold_plan::collapsed`,
             // and what sends the fold's KV shift to zero. A non-fold group gathers only as a `Gathered`
             // run (the split-KV chunk's copies), which takes the same zero shift and the same staged index.
-            gathered: (fold_group && e.kv_gathered)
-                || matches!(kinds[r.start].kind, GroupKind::Gathered),
+            // Derived ONCE here: the staging channel below keys off the same answer.
+            gathered,
+            // ⭐ THE STAGING CHANNEL — whether the table those absolute entries read through is
+            // the FILL-STAGED REGION FORM, not the composer's page-list table. Both channels'
+            // entries are ABSOLUTE (both take the zero shift above); this bit only discriminates
+            // WHO stages the table, so the composer and the forward's index-step door key their
+            // page-list answer on `gathered && !region_form`. Stamped by the walk on a region
+            // carrier's ops and on fold carriers (folds stage through the same host fill).
+            region_form: gathered && e.kv_region_form,
             fold_rows: match e.kv_fold_rows {
                 scratchy_subtile::sdsc_abstract::FoldRowRegime::PerRequest => {
                     bundle::FoldRows::PerRequest
@@ -6162,16 +6194,6 @@ pub fn write_rendered_dxp_input(
     dir: &std::path::Path,
     rendered: &[GroupInput],
 ) -> std::io::Result<()> {
-    // ⭐ CLEAR BEFORE REWRITE — the dump is the LATEST render's snapshot, and a rewrite over a
-    //    stale directory LIES: group directories from a prior emission of the same fingerprint
-    //    survive beside the new ones, and every one of them is page cache the bake's cgroup pays
-    //    for (MEASURED on the bake pod: the unpruned dump root had grown to 17 GB over 2,140
-    //    directories, and the one-time prune freed 28 GB in total — 17 GB of dumps plus 7.1 GB
-    //    of dead stage dirs — helping push memory.peak to the 200 GiB cgroup limit). One
-    //    remove_dir_all per fp bounds the dump root to the live emission's own shape.
-    //    Best-effort: the recreate below reports the error that matters if the clear failed for
-    //    a real reason.
-    let _ = std::fs::remove_dir_all(dir);
     for g in rendered {
         let gdir = dir.join(format!("group_{}", g.group));
         std::fs::create_dir_all(&gdir)?;
@@ -6467,116 +6489,6 @@ pub struct EmittedBundle {
     pub groups: PendingGroups,
 }
 
-/// ⭐ THE EMIT'S ERROR, WITH THE ONE SURVIVABLE CLASS TYPED.
-///
-/// [`EmitError::Budget`] is a [`crate::superdsc_bake::BudgetRefusal`] — a bundle past a bake
-/// budget. It is the ONE error a LADDER RUNG survives: the prefill width ladder files it in
-/// `refused_rungs` and shortens the ladder (a narrower rung still covers the width), while every
-/// primary caller PANICS with its text. [`EmitError::Fatal`] is everything else, and keeps the
-/// law it always had: fatal everywhere, never silently swallowed.
-///
-/// The old channel — a single `std::io::Error` string — could not carry the distinction, which is
-/// exactly how six budget refusals took a build RED instead of shortening its ladder: the rung arm
-/// had nothing to match but text.
-#[derive(Debug, Clone)]
-pub enum EmitError {
-    Budget(crate::superdsc_bake::BudgetRefusal),
-    Fatal(String),
-}
-
-impl std::fmt::Display for EmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EmitError::Budget(b) => write!(f, "{}", b.0),
-            EmitError::Fatal(s) => write!(f, "{s}"),
-        }
-    }
-}
-
-impl From<SuperDscError> for EmitError {
-    fn from(e: SuperDscError) -> Self {
-        EmitError::Fatal(e.0)
-    }
-}
-
-/// ⭐ ONE BUNDLE'S RENDER, HELD UN-STAGED — the stage-at-commit law's handle.
-///
-/// The render (mint, post-lowering guards, the typed budget verdicts, the json, the dump, the
-/// launch index) is machine-independent and runs at emit; the STAGE+SUBMIT (disk reserve, file
-/// writes, the bake queue) is the commit half, run by the macro's ladder commit AFTER the
-/// total-budget decision — a rung the total refuses is dropped UNBAKED, having cost only its
-/// render, never a compile. Until then the bundle sits in the registry as
-/// [`PendingGroups::Rendered`]; a handle that is never submitted nor discarded is a build failure
-/// at [`drain_emitted_bundles`], naming the fp.
-pub struct StageHandle {
-    /// The bundle this handle renders — its content fingerprint, its registry key.
-    pub fp: String,
-    /// Every launch pair, in launch order — computable at RENDER because a group's identity is
-    /// its CONTENT (`GroupId { fp, group }`), not its compiled artifact. This is exactly the list
-    /// the submit hands back, and what `PendingGroups::Staged` will hold after it does.
-    pub groups: Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>,
-    /// The rendered json, held in memory for the submit that writes it — ONE bundle's worth,
-    /// dropped the moment the submit ends (the serial ladder's memory law: rung k's handles are
-    /// submitted before rung k+1 renders).
-    pub rendered: Vec<GroupInput>,
-    /// Σ minted trips over the bundle's ops — the total budget's unit, and the per-bundle
-    /// verdict's own number.
-    pub trips: u64,
-    /// The `BUNDLE` log line's counts: KTIR programs and minted descriptors.
-    programs: usize,
-    descriptors: usize,
-}
-
-impl StageHandle {
-    /// Stage and submit every group — the commit half. Today's staging loop, verbatim, moved to
-    /// the moment the ladder's total-budget decision says KEEP. Errors here are FATAL everywhere:
-    /// a staging failure is a broken build, not a rung to skip.
-    pub fn submit(
-        mut self,
-    ) -> Result<Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>, String> {
-        // No dxp (a cardless `SCRATCHY_PLAN_ONLY_BAKE` check) ⇒ nothing to stage, and nothing to
-        // stage it FOR: the pairs go back EMPTY exactly as the pre-handle emit did, and
-        // `into_code`'s plan-only arm reads the empty list exactly as it did then.
-        let Some(bake) = crate::superdsc_bake::global() else {
-            self.groups.clear();
-            crate::pc::bundle_line(&self.fp, self.programs, self.descriptors, 0);
-            return Ok(self.groups);
-        };
-        let mut staged: u64 = 0;
-        for g in &self.rendered {
-            let id = crate::superdsc_bake::GroupId {
-                fp: self.fp.clone(),
-                group: g.group,
-            };
-            // ⭐ ALREADY IN HAND — compiled earlier in this build, mid-compile for an identical
-            // group, or by a previous build of the same emission ([`crate::dxp_cache`]): the group
-            // never reaches the staging root, the budget, or a `dxp_standalone` child, and its
-            // program is filed under `id` by the same content law that lets the memo skip a twin.
-            if bake.adopt(&id, g.key) {
-                crate::pc::count("cachit", 1);
-                continue;
-            }
-            {
-                let _pc = crate::pc::Pc::start("stage");
-                let gdir = bake.stage().group_dir(&self.fp, g.group as usize);
-                bake.reserve(g.bytes);
-                std::fs::create_dir_all(&gdir).map_err(|e| e.to_string())?;
-                for (name, contents) in &g.files {
-                    std::fs::write(gdir.join(name), contents).map_err(|e| e.to_string())?;
-                }
-                bake.submit(crate::superdsc_bake::SealedGroup::of_rendered(
-                    gdir,
-                    id.clone(),
-                    g,
-                ))?;
-            }
-            staged += g.bytes as u64;
-        }
-        crate::pc::bundle_line(&self.fp, self.programs, self.descriptors, staged);
-        Ok(self.groups)
-    }
-}
-
 /// A bundle's launches, either already complete or waiting on the device compiler.
 pub enum PendingGroups {
     /// ⭐ EVERY LAUNCH, IN LAUNCH ORDER, COMPLETE — the `-Fspyre-emu` shape.
@@ -6585,13 +6497,8 @@ pub enum PendingGroups {
     /// no compiler to wait on, no id to look a device image up by. A constructed program is
     /// finished the moment it is constructed.
     Ready(Vec<bundle::LaunchGroup<'static>>),
-    /// ⭐ RENDERED, AWAITING THE LADDER'S COMMIT DECISION — the stage-at-commit shape. The
-    /// bundle's render is finished (verdicts included, typed); the staging and submission are
-    /// [`StageHandle::submit`]'s to do, and ONLY the macro's commit path calls it. A rung the
-    /// total budget refuses DISCARDS its handle instead — never staged, never compiled.
-    Rendered(StageHandle),
-    /// `-Fspyre-hw`'s committed shape: each group's SuperDSC directory is staged and submitted
-    /// ([`StageHandle::submit`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
+    /// `-Fspyre-hw`'s shape: each group's SuperDSC directory is staged and submitted
+    /// ([`ktir_groups_via_superdsc`]), and its `(KvShifts, GroupId)` is all `into_code` needs to
     /// find the compiled artifact once `superdsc_bake::finish_global()` has drained the queue —
     /// exactly the id `emit_bundle_inner` "used to" carry before this branch pivoted to KTIR.
     Staged(Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>),
@@ -6748,7 +6655,7 @@ pub fn emit_bundle(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> Result<String, EmitError> {
+) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
     {
         let _pc = crate::pc::Pc::start("audit");
@@ -6944,9 +6851,6 @@ pub fn emitted_bundle_folds(fp: &str) -> Option<bool> {
     let (b, _) = c.get(fp)?;
     Some(match &b.groups {
         PendingGroups::Ready(groups) => groups.iter().any(|g| g.kv.page_fold),
-        // The pairs are decided at render (a group's identity is its content), so the fold
-        // flag the proof reads is answerable before the submit too.
-        PendingGroups::Rendered(h) => h.groups.iter().any(|(kv, _)| kv.page_fold),
         PendingGroups::Staged(groups) => groups.iter().any(|(kv, _)| kv.page_fold),
     })
 }
@@ -6965,8 +6869,7 @@ pub fn with_emitted_groups<R>(
     let (b, _) = c.get(fp)?;
     match &b.groups {
         PendingGroups::Ready(groups) => Some(f(groups)),
-        // Nothing to gate yet: the compiled artifact does not exist until the submit.
-        PendingGroups::Rendered(_) | PendingGroups::Staged(_) => None,
+        PendingGroups::Staged(_) => None,
     }
 }
 
@@ -6998,114 +6901,19 @@ pub fn drain_emitted_bundles() -> Result<Vec<bundle::BundleCode<'static>>, Strin
         .collect()
 }
 
-/// ⭐ ONE BUNDLE'S STAGE TICKET — the macro-side claim check for a rendered bundle: the
-/// fingerprint the registry holds it under, the trips its render minted, and whether those trips
-/// count toward the whole-bake total.
-pub struct StageTicket {
-    pub fp: String,
-    /// Σ minted trips of this bundle's render — the total budget's unit.
-    pub trips: u64,
-    /// ⛔ WHETHER THESE TRIPS COUNT toward [`crate::superdsc_bake::BakeBudget::MAX_TOTAL_TRIPS`].
-    /// The stageable classes — the bodies and their fused twins, the prefix and the suffix, the
-    /// decode sweep rungs — count: they are the compile work the total budget bounds. Two
-    /// classes do not. CHUNK rung bundles: the pod census (two stage-dir inspections — the
-    /// 44-minute complete bake and attempt-12's partial — plus the dump-root classification)
-    /// found a chunk fp's groups always resolve through the bake's own memo (nothing ever
-    /// stages for them), so their trips are not compile work, and counting them would refuse
-    /// rungs the bake never pays for. And the PREFIX-FREE PRIMARY SPLIT — the split-form body
-    /// a start==0 prefill rung bakes: dead-at-select (every chunk-0 step selects the fused
-    /// twin, and the split arm needs valid_len ≥ 15,361, past the window a prefix-free rung
-    /// bakes) but kept-resolvable (its bundle is still emitted, submitted, staged, and
-    /// compiled — the compile the pre-campaign green world paid), so only its trips leave
-    /// the total: counting them would refuse the bake for work the selector never runs.
-    pub counts_toward_total: bool,
-}
-
-/// The stage tickets for `fps` — every bundle still holding its render contributes its trips;
-/// one an earlier rung already STAGED compiles once and contributes ZERO (its trips were counted
-/// by the rung that staged it, never twice). A fingerprint with no registry entry is a PANIC,
-/// not a skip: the ticket list and the emit are two views of one set of bundles, and a
-/// disagreement means the macro dropped a bundle on the floor — the same fatal class as a
-/// staging failure, and unreachable in a correct macro.
-pub fn stage_tickets_of(fps: &[String], counts_toward_total: bool) -> Vec<StageTicket> {
-    let Ok(c) = emitted().lock() else {
-        return Vec::new();
-    };
-    fps.iter()
-        .map(|fp| {
-            let (b, _) = c.get(fp).unwrap_or_else(|| {
-                panic!(
-                    "{fp}: no emitted bundle under this fingerprint — the emit and the ticket \
-                     list disagree"
-                )
-            });
-            let trips = match &b.groups {
-                PendingGroups::Rendered(h) => h.trips,
-                // Already staged by an earlier rung (content-addressed dedup) or emu-Ready:
-                // no render is pending, so there is no compile work left to count.
-                _ => 0,
-            };
-            StageTicket {
-                fp: fp.clone(),
-                trips,
-                counts_toward_total,
-            }
-        })
-        .collect()
-}
-
-/// Submit every rendered-unstaged bundle named by `tickets` — the commit half of the
-/// stage-at-commit law, run by the macro's ladder commit SERIALLY after the total-budget
-/// decision. A ticket whose fp has no bundle, or a staging failure, is an `Err`: both are a
-/// broken build, not a rung to skip. Already-staged entries (a dedup'd twin of an earlier-kept
-/// rung) are left alone — the memo already filed them.
-pub fn submit_stage_tickets(tickets: &[StageTicket]) -> Result<(), String> {
-    let Ok(mut c) = emitted().lock() else {
-        return Err("the emit collector was poisoned by a panic".to_string());
-    };
-    for t in tickets {
-        let Some((b, _)) = c.get_mut(&t.fp) else {
-            return Err(format!(
-                "{}: no emitted bundle under this fingerprint — the emit and the submit disagree",
-                t.fp
-            ));
-        };
-        if let PendingGroups::Rendered(h) =
-            std::mem::replace(&mut b.groups, PendingGroups::Staged(Vec::new()))
-        {
-            let pairs = h.submit().map_err(|e| format!("{}: {e}", t.fp))?;
-            b.groups = PendingGroups::Staged(pairs);
-        }
-    }
-    Ok(())
-}
-
-/// Drop every STILL-RENDERED bundle named by `tickets` — the refused rung's cleanup. A bundle an
-/// earlier KEPT rung already staged is `Staged` by now (the ladder commits rung k before rung k+1
-/// renders), so a dedup'd fingerprint shared with a kept rung SURVIVES the refusal; only this
-/// rung's own unsubmitted renders are discarded, having cost only their render, never a compile.
-pub fn discard_stage_tickets(tickets: &[StageTicket]) {
-    let Ok(mut c) = emitted().lock() else {
-        return;
-    };
-    for t in tickets {
-        c.retain(|fp, (b, _)| fp != &t.fp || !matches!(b.groups, PendingGroups::Rendered(_)));
-    }
-}
-
 fn emit_bundle_inner(
     ops: &[EmittedOp],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> Result<EmittedBundle, EmitError> {
+) -> std::io::Result<EmittedBundle> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
     //    trips, no two writes to the SAME OUTPUT tensor may land on the same byte address. With real
     //    per-core HBM segment addressing each tiled tensor's trips advance from a real per-core base,
     //    so they cannot alias by construction — a residual stride bug would be silently wrong, so it
     //    is checked rather than assumed. ──
     if let Some(e) = ops.iter().find(|e| e.time > 1 && tiled_trips_alias(e)) {
-        return Err(EmitError::Fatal(format!(
+        return Err(std::io::Error::other(format!(
             "[spyre-superdsc] time-tiled op '{}' (time={}) emits ALIASING per-trip OUTPUT addresses \
              — two trips would write the same HBM byte (silently-wrong). The #50 per-core stride must \
              advance each trip past the previous; this is an internal stride/segment bug. Refusing to \
@@ -7127,20 +6935,16 @@ fn emit_bundle_inner(
 
     // ⭐ ONE SHARED KTIR, TWO CONSUMERS. `-Fspyre-emu` runs the group's own programs directly, so
     // the group IS the result — nothing is staged and nothing is submitted. `-Fspyre-hw` lowers
-    // that SAME KTIR to a real SuperDSC directory and hands it to the device compiler — but the
-    // staging is the COMMIT half now: the render (mint, guards, the typed verdicts, the json, the
-    // dump, the launch index) runs here and comes back as a [`StageHandle`] for the macro's ladder
-    // commit to submit or discard per the total-budget decision.
+    // that SAME KTIR to a real SuperDSC directory and stages + submits it to the device compiler:
+    // this is the write-files/reserve-disk/pair-with-an-id step `emit_bundle_inner` used to do
+    // directly from SubtileIR, revived here over KTIR instead (`ktir_groups_via_superdsc`).
     let groups = if cfg!(feature = "spyre-hw") {
-        PendingGroups::Rendered(ktir_groups_via_superdsc(
-            ops,
-            &fp,
-            fold,
-            layout,
-            attn_params,
-        )?)
+        PendingGroups::Staged(
+            ktir_groups_via_superdsc(ops, &fp, fold, layout, attn_params)
+                .map_err(|e| std::io::Error::other(e.0))?,
+        )
     } else {
-        PendingGroups::Ready(ktir_groups(ops, fold).map_err(|e| EmitError::Fatal(e.0))?)
+        PendingGroups::Ready(ktir_groups(ops, fold).map_err(|e| std::io::Error::other(e.0))?)
     };
 
     Ok(EmittedBundle {
@@ -7162,18 +6966,6 @@ impl EmittedBundle {
     ) -> Result<bundle::BundleCode<'static>, String> {
         let groups = match self.groups {
             PendingGroups::Ready(g) => g,
-            // ⛔ A RENDER THAT WAS NEITHER SUBMITTED NOR DISCARDED IS A BUILD FAILURE — the
-            // stage-at-commit law has exactly two exits for a rendered bundle, and a bundle
-            // that took neither was forgotten by the ladder's commit path: its launches
-            // cannot be resolved (nothing was staged), so naming the fp here is the loud
-            // alternative to shipping a bundle with a hole in its launch sequence.
-            PendingGroups::Rendered(h) => {
-                return Err(format!(
-                    "{}: rendered but never submitted — the stage-at-commit law's submit \
-                     (or discard, for a refused rung) never ran for it",
-                    h.fp
-                ));
-            }
             PendingGroups::Staged(staged) => {
                 let bake = crate::superdsc_bake::global();
                 let mut out = Vec::with_capacity(staged.len());
@@ -7726,35 +7518,137 @@ pub fn ktir_groups(
     Ok(out)
 }
 
-/// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
-/// descriptors and handed to the bake queue.
-///
-/// ⛔⛔⛔ THIS RENDERS NOTHING AND WRITES NOTHING OF ITS OWN. `lower_ktir_to_superdsc::lower` returns
-/// [`EmittedOp`]s carrying in-memory [`SdscOp`]s — built by `pw1`/`pw2`/`assemble_matmul`, the SAME
-/// builders the SubtileIR path uses — and everything after that is main's mechanism, unchanged:
-/// [`render_dxp_input`] renders, [`launch_index`] partitions, and the `superdsc_bake` queue stages,
-/// seals and compiles. The chain is `SubtileIR (memory) → KTIR (memory) → SuperDSC (memory) → this
-/// bake → inventory::submit → this launch`.
-///
-/// ⛔ AND THAT IS A CORRECTION. This function used to call a SECOND emitter — a vendored port of the
-/// sibling repo's `triton-superdsc-lower`, with its own `Dsc` model, its own JSON writer, its own
-/// `bundle.mlir` writer — and `std::fs::write` the bytes itself. Two emitters for one format meant
-/// every layout decision was made twice and the copy got them wrong (a 64-element stick declared on
-/// an axis of extent 1, which dxp refuses from inside its scheduler). The copy is deleted; the law
-/// lives once, where it is proven on the card.
-///
-/// Returns the render as a [`StageHandle`] — the launch pairs are decided here (a group's identity
-/// is its content, not its compiled artifact), and the STAGING is the commit half,
-/// [`StageHandle::submit`], run by the macro's ladder commit after the total-budget decision.
-/// Nothing here reads a compiled result back; that happens once for the whole emit, in
-/// [`EmittedBundle::into_code`], after `superdsc_bake::finish_global()` has drained the queue.
-fn ktir_groups_via_superdsc(
+/// ⭐ THE STAMP — ONE FUNCTION, and the walk's call is the production path. Everything the
+/// splice states about a carrier's KV (`kv_paged_fold`, `kv_paged_region` — each the ONE door
+/// for its fact) reaches the descriptors the bake actually groups HERE, copied verbatim onto
+/// every op the door minted from that carrier's program. One function so there is one
+/// stamping site to audit; [`mint_bundle_ops`]'s call below is the only production
+/// caller, and the pin (`prefix_free_prefill_rung_stamps_its_carrier_at`) calls it
+/// directly on a door-lowered carrier to check the stamp's own contract — every op, no
+/// exceptions, non-empty.
+/// Fatal refusals — no rung can survive a broken stamp premise.
+fn stamp_carrier_kv_facts(
+    carrier: &EmittedOp,
+    lowered: &mut Vec<EmittedOp>,
+    layout: Option<&BundleLayout>,
+) -> Result<(), SuperDscError> {
+    // ⭐ THE PAGED-FOLD STAMP — the CHAIN-OF-CUSTODY step. The splice states the fold on the
+    // program's EmittedOp (`kv_paged_fold`, the ONE door: no other site may set it); THIS is
+    // where it reaches the descriptors the bake actually groups, copied VERBATIM onto every
+    // op the door minted from that program — the walk derives nothing, the stamp recomputes
+    // nothing, and `emitted_bundle_folds`'s proof reads what this wrote. A program that
+    // states no fold stamps nothing, so every non-fold bundle stays byte-identical.
+    // The `kv_region_form` rider: a fold's step inputs are staged by the SAME host fill
+    // (`fill_attn_step_inputs`) a region carrier's are, so its groups answer the staging
+    // channel `region_form = true` — folds never read the composer's page-list table.
+    if let Some(facts) = carrier.kv_paged_fold {
+        for o in lowered {
+            o.kv_page_fold = true;
+            o.kv_batched_requests = facts.batched_requests;
+            o.kv_gathered = facts.gathered;
+            o.kv_region_form = true;
+            o.kv_fold_rows = facts.fold_rows;
+            o.kv_page_slots = facts.page_slots;
+        }
+    }
+    // ⭐ THE PAGED-REGION STAMP — the one-shot attention chain of custody, the same shape as
+    // the fold's. The splice states the fill-form region on the program's EmittedOp
+    // (`kv_paged_region`, the ONE door); THIS is where it reaches the descriptors the bake
+    // actually groups. The addressing fact (`kv_gathered` — the entries are ABSOLUTE
+    // stick-blocks, the op takes the ZERO KV shift, never the page base on top) and the
+    // staging channel (`kv_region_form` — the table is host-fill-staged, not
+    // composer-composed) are stamped together onto EVERY op the door minted from that
+    // carrier's program: the door materializes the gather as legs + dots + softmax inside
+    // the one carrier, the KV shift only touches seg2 operands, and the whole attention
+    // group takes the zero shift — the per-leg granularity the retired door stamps carried
+    // was a grouping optimization, not a correctness requirement. A program that states no
+    // region stamps nothing.
+    //
+    // ⛔ THE SLOT/SLAB GUARD — the stamp's soundness, ENFORCED, not assumed. The region
+    // stamp is sound because the attention program carries no runtime-composed seg2 shift
+    // of its own: it has no slot writes (the cache write is the door's RopeAppend arm, a
+    // SEPARATE program that self-stamps its slot facts) and its only SEG_KV readers are
+    // the pool gathers (absolute entries — the second half of the soundness statement is
+    // what `kv_gathered` means). An op with a runtime-composed slot/slab shift inside this
+    // carrier would have that shift zeroed too — every new key landing on the wrong slot,
+    // silently — so a future kernel that fuses the cache write into attention must hit
+    // THIS refusal, not the card. (The else-if order above already makes a mixed
+    // fold+region carrier impossible: `kv_paged_fold` is checked first.)
+    else if let Some(region) = carrier.kv_paged_region {
+        // ⛔⛔ (a') THE REACH GUARD — the stamp's premise, CHECKED, not assumed. The stamp
+        // is sound because the entries the carrier gathers are ABSOLUTE stick-blocks, and
+        // "absolute" is a fact of a POOL the layout placed a `gather_reach` for — the same
+        // reach the placement loop inserts for these tids (`pool_reach_tids`, the ONE
+        // spelling both sites derive through). A carrier whose pool carries no reach is a
+        // graph that is not paged the way the mint assumed — a future non-paged attention
+        // form reaching the one-shot arm — and stamping it would zero the KV shift over an
+        // UNPAGED read, silently. It refuses here, at the build, instead.
+        let reach_tids = region.reach_tids();
+        match layout {
+            Some(l)
+                if reach_tids
+                    .iter()
+                    .all(|tid| l.gather_reach.contains_key(tid)) => {}
+            Some(_) => {
+                return Err(SuperDscError(format!(
+                    "[spyre-superdsc] {}: the paged-region carrier's pool (k=t{}, v=t{}) \
+                     carries no gather reach in this bundle's layout — the region stamp gives \
+                     every op of the carrier the ZERO KV page shift because the entries are \
+                     ABSOLUTE stick-blocks, and absolute entries are a fact of a pool the \
+                     placement covered. A graph that placed no reach for these tids is not \
+                     paged; stamping it would zero the shift over an unpaged read. Refusing.",
+                    carrier.op_name, region.k_tid, region.v_tid
+                )));
+            }
+            None => {
+                return Err(SuperDscError(format!(
+                    "[spyre-superdsc] {}: a paged-region carrier arrived with no bundle \
+                     layout to check its pool's gather reach against — the region stamp's \
+                     premise (a placed pool) has no artifact behind it on this path. \
+                     Refusing.",
+                    carrier.op_name
+                )));
+            }
+        }
+        if let Some(o) = lowered
+            .iter()
+            .find(|o| o.slot_stride_bytes > 0 || o.slab_write)
+        {
+            return Err(SuperDscError(format!(
+                "[spyre-superdsc] {}: a paged-region carrier may not carry the \
+                 slot/slab-shifted op '{}' (slot_stride_bytes={}, slab_write={}): the \
+                 region stamp gives every op of the carrier the ZERO KV page shift, which \
+                 would corrupt a runtime-composed slot/slab shift. The cache write is a \
+                 separate program; keep it there.",
+                carrier.op_name, o.op_name, o.slot_stride_bytes, o.slab_write
+            )));
+        }
+        for o in lowered {
+            o.kv_gathered = true;
+            o.kv_region_form = true;
+        }
+    }
+    Ok(())
+}
+
+/// What the walk's mint hands the rest of the walk: every descriptor it lowered, in program
+/// order, and each program's name with its descriptor count (the dump's `per_program` and the
+/// LX slot walk read the second).
+struct MintedBundle {
+    ops: Vec<EmittedOp>,
+    per_prog: Vec<(String, usize)>,
+}
+
+/// The walk's mint, extracted verbatim so the stamp's custody is testable WITHOUT the bake: a test
+/// can run this, then the walk's own pure consumers (`launch_index`, `render_dxp_input`), and count
+/// trips — the same counting the walk itself groups by — while never touching the bake queue, the
+/// staging root, or dxp. The walk (`ktir_groups_via_superdsc`) calls this and then runs its guards,
+/// render, and staging exactly as before.
+fn mint_bundle_ops(
     ops: &[EmittedOp],
-    fp: &str,
-    fold: FoldGrouping,
     layout: Option<&BundleLayout>,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
-) -> Result<StageHandle, EmitError> {
+) -> Result<MintedBundle, SuperDscError> {
     // KTIR → SuperDSC, in memory. One symbol counter for the WHOLE bundle, exactly as the SubtileIR
     // walk threads it: a per-op restart would alias addresses across ops in one bundle.
     let mut sym_id_base: i64 = 0;
@@ -7762,7 +7656,6 @@ fn ktir_groups_via_superdsc(
     // (program name, descriptors) — written into the dump's `bundle_id.json`, since the eprintln below
     // is invisible on a successful build.
     let mut per_prog: Vec<(String, usize)> = Vec::new();
-    let _pc_mint = crate::pc::Pc::start("mint");
     for e in ops {
         // ⛔ ONE PATH, AND IT IS CHECKED HERE. An op arriving with a descriptor ALREADY BUILT means
         // some producer arm lowered a `SubtileNode` straight to SuperDSC, which is the `*_sdsc`
@@ -7770,7 +7663,7 @@ fn ktir_groups_via_superdsc(
         // (`lower_sumreduce_node`); that arm is deleted, so the pass-through is a refusal now — the
         // only way to SuperDSC is through a KTIR program.
         if e.op.is_some() {
-            return Err(EmitError::Fatal(format!(
+            return Err(SuperDscError(format!(
                 "{}: arrived carrying a SuperDSC descriptor built by the PRODUCER. The only path to \
                  SuperDSC is `SubtileIR → KTIR → SuperDSC`; a node lowered straight to a descriptor \
                  is a second path to the same format. Build its KTIR in \
@@ -7792,21 +7685,7 @@ fn ktir_groups_via_superdsc(
             )?;
         drop(_pc_cls);
         crate::pc::count(crate::pc::mint_class(&e.op_name), lowered.len() as u64);
-        // ⭐ THE PAGED-FOLD STAMP — the CHAIN-OF-CUSTODY step. The splice states the fold on the
-        // program's EmittedOp (`kv_paged_fold`, the ONE door: no other site may set it); THIS is
-        // where it reaches the descriptors the bake actually groups, copied VERBATIM onto every
-        // op the door minted from that program — the walk derives nothing, the stamp recomputes
-        // nothing, and `emitted_bundle_folds`'s proof reads what this wrote. A program that
-        // states no fold stamps nothing, so every non-fold bundle stays byte-identical.
-        if let Some(facts) = e.kv_paged_fold {
-            for o in &mut lowered {
-                o.kv_page_fold = true;
-                o.kv_batched_requests = facts.batched_requests;
-                o.kv_gathered = facts.gathered;
-                o.kv_fold_rows = facts.fold_rows;
-                o.kv_page_slots = facts.page_slots;
-            }
-        }
+        stamp_carrier_kv_facts(e, &mut lowered, layout)?;
         // ⭐ THE CACHE-WRITE FACTS NEED NO STAMP SITE — the append's recipe
         // (`kv_cache_write`, called from the door's `Program::RopeAppend` arm)
         // SELF-STAMPS every op it mints (`kv_page_slots`, `kv_request`,
@@ -7837,6 +7716,44 @@ fn ktir_groups_via_superdsc(
         per_prog.push((e.op_name.clone(), lowered.len()));
         sdsc_ops.extend(lowered);
     }
+    Ok(MintedBundle {
+        ops: sdsc_ops,
+        per_prog,
+    })
+}
+
+/// `-Fspyre-hw`'s counterpart to [`ktir_groups`]: the SAME per-op KTIR, lowered to real SuperDSC
+/// descriptors and handed to the bake queue.
+///
+/// ⛔⛔⛔ THIS RENDERS NOTHING AND WRITES NOTHING OF ITS OWN. `lower_ktir_to_superdsc::lower` returns
+/// [`EmittedOp`]s carrying in-memory [`SdscOp`]s — built by `pw1`/`pw2`/`assemble_matmul`, the SAME
+/// builders the SubtileIR path uses — and everything after that is main's mechanism, unchanged:
+/// [`render_dxp_input`] renders, [`launch_index`] partitions, and the `superdsc_bake` queue stages,
+/// seals and compiles. The chain is `SubtileIR (memory) → KTIR (memory) → SuperDSC (memory) → this
+/// bake → inventory::submit → this launch`.
+///
+/// ⛔ AND THAT IS A CORRECTION. This function used to call a SECOND emitter — a vendored port of the
+/// sibling repo's `triton-superdsc-lower`, with its own `Dsc` model, its own JSON writer, its own
+/// `bundle.mlir` writer — and `std::fs::write` the bytes itself. Two emitters for one format meant
+/// every layout decision was made twice and the copy got them wrong (a 64-element stick declared on
+/// an axis of extent 1, which dxp refuses from inside its scheduler). The copy is deleted; the law
+/// lives once, where it is proven on the card.
+///
+/// Returns the identity each group's compiled artifact will be found under — nothing here reads a
+/// compiled result back; that happens once for the whole emit, in [`EmittedBundle::into_code`], after
+/// `superdsc_bake::finish_global()` has drained the queue.
+fn ktir_groups_via_superdsc(
+    ops: &[EmittedOp],
+    fp: &str,
+    fold: FoldGrouping,
+    layout: Option<&BundleLayout>,
+    attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+) -> Result<Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)>, SuperDscError> {
+    let _pc_mint = crate::pc::Pc::start("mint");
+    let MintedBundle {
+        ops: sdsc_ops,
+        per_prog,
+    } = mint_bundle_ops(ops, layout, attn_params)?;
 
     // ⛔⛔⛔ main's FOUR POST-LOWERING GUARDS, AT THE GRAIN WHERE THE DESCRIPTORS NOW EXIST.
     //
@@ -7850,7 +7767,7 @@ fn ktir_groups_via_superdsc(
     {
         let _pc = crate::pc::Pc::start("guards");
         if let Some(e) = sdsc_ops.iter().find(|e| e.time > 1 && tiled_trips_alias(e)) {
-            return Err(EmitError::Fatal(format!(
+            return Err(SuperDscError(format!(
                 "[spyre-superdsc] time-tiled op '{}' (time={}) emits ALIASING per-trip OUTPUT addresses \
              — two trips would write the same HBM byte (silently-wrong). The #50 per-core stride must \
              advance each trip past the previous; this is an internal stride/segment bug. Refusing to \
@@ -7868,7 +7785,7 @@ fn ktir_groups_via_superdsc(
             for dsc_map in &op.dscs_ {
                 for (dname, dsc) in dsc_map {
                     if dsc.scheduleTree_.is_empty() {
-                        return Err(EmitError::Fatal(format!(
+                        return Err(SuperDscError(format!(
                             "op {name} (dsc {dname}): empty scheduleTree_ — dxp_standalone \
                          DtException's at allocNode (dsc2.cpp:3999) without the per-tensor HBM \
                          allocate nodes. Emit them via the page_coalesce HBM coloring (task #50) \
@@ -7887,7 +7804,7 @@ fn ktir_groups_via_superdsc(
                             .map(|o| o.is_empty())
                             .unwrap_or(true);
                         if empty_coord {
-                            return Err(EmitError::Fatal(format!(
+                            return Err(SuperDscError(format!(
                                 "op {name} (dsc {dname}, alloc {}): empty coordinates_.coordInfo — \
                              dxp's scheduler DtException's ('at least one valid candidate', \
                              L3DlOpsScheduler.cpp:1195) without the per-dim tile-folds. Emit the \
@@ -7907,7 +7824,7 @@ fn ktir_groups_via_superdsc(
                         let corelet_ok =
                             attrs.get(1).map(|f| f.factor_) == Some(op.coreletFoldProp_.factor_);
                         if !core_ok || !corelet_ok {
-                            return Err(EmitError::Fatal(format!(
+                            return Err(SuperDscError(format!(
                                 "op {name} (alloc {}): startAddressCoreCorelet_ fold factors \
                              [{:?}] disagree with coreFoldProp_={} / coreletFoldProp_={} — dxp \
                              FoldManager throws 'Different cardinality' (foldInfrastructure.h:2775).",
@@ -7930,17 +7847,17 @@ fn ktir_groups_via_superdsc(
     //    the card leg as the measurement). Also THE LEDGER's one computation — the dump below
     //    writes it beside the descriptors, and the same-class pair hunts read it from there.
     let lx_ledger =
-        walk_lx_slot_alternation(&sdsc_ops, &per_prog, fold, layout).map_err(EmitError::Fatal)?;
+        walk_lx_slot_alternation(&sdsc_ops, &per_prog, fold, layout).map_err(SuperDscError)?;
 
     // ── THE BAKE BUDGET, PER BUNDLE (`BakeBudget::bundle_verdict`) ─────────────────────────
     //    A bundle is the unit the emitter fans out, so its counts bound BOTH the wave's critical
     //    path and every serial path's per-bundle cost. Refused here, after the correctness guards
     //    but before the render: a bundle past the budget costs nothing to refuse, and a bundle
     //    that is also incorrect should name the correctness defect, not the size.
-    let trips: u64 = sdsc_ops.iter().map(|o| o.time.max(1) as u64).sum();
     {
+        let trips: u64 = sdsc_ops.iter().map(|o| o.time.max(1) as u64).sum();
         crate::superdsc_bake::BakeBudget::bundle_verdict(fp, sdsc_ops.len(), trips)
-            .map_err(EmitError::Budget)?;
+            .map_err(SuperDscError)?;
     }
 
     // ⭐ ONE RENDER, TWO CONSUMERS. `render_dxp_input` serialises every trip of the bundle, and it
@@ -7952,7 +7869,7 @@ fn ktir_groups_via_superdsc(
     // pays it once instead of twice.
     let rendered = {
         let _pc = crate::pc::Pc::start("render");
-        render_dxp_input(&sdsc_ops, fold).map_err(|e| EmitError::Fatal(e.to_string()))?
+        render_dxp_input(&sdsc_ops, fold).map_err(|e| SuperDscError(e.to_string()))?
     };
 
     // ── THE BAKE BUDGET, PER GROUP (`BakeBudget::group_verdict`) ── the bake-side
@@ -7967,7 +7884,7 @@ fn ktir_groups_via_superdsc(
     for g in &rendered {
         let descriptors = g.files.len() - 1;
         crate::superdsc_bake::BakeBudget::group_verdict(fp, g.group, descriptors)
-            .map_err(EmitError::Budget)?;
+            .map_err(SuperDscError)?;
     }
 
     // ⭐ WHICH BUNDLE THE NEXT `GROUPS` LINE BELONGS TO. `launch_index` prints the group/trip totals
@@ -8092,43 +8009,60 @@ fn ktir_groups_via_superdsc(
         );
     } // pc:dump
 
-    // ── from here down this is main's block, verbatim — EXCEPT THE SPLIT: the staging moved to
-    //    `StageHandle::submit`, the commit half the macro's ladder runs after the total-budget
-    //    decision. What stays here is everything that decision needs: the launch index, the launch
-    //    pairs, the trips, and the rendered json the submit will write. ──
+    // ── from here down this is main's block, verbatim ──
     let shifts = {
         let _pc = crate::pc::Pc::start("launch");
         launch_index(&sdsc_ops, fold)
     };
-    // Every launch pair, IN LAUNCH ORDER — computable at render because a group's identity is its
-    // CONTENT (`GroupId { fp, group }`), not its compiled artifact. The shift-disagreement fence
-    // is the same fence it always was; only the point it runs moved, ahead of the staging it
-    // guards. The adopt/memo pass inside the submit hands this SAME list back, adopt-hits
-    // included, exactly as the staging loop built it.
     let mut groups: Vec<(bundle::KvShifts, crate::superdsc_bake::GroupId)> = Vec::new();
-    for g in &rendered {
-        let id = crate::superdsc_bake::GroupId {
-            fp: fp.to_string(),
-            group: g.group,
-        };
-        let kv = *shifts.get(g.group as usize).ok_or_else(|| {
-            EmitError::Fatal(format!(
-                "{fp}: group {} has dxp input but no entry in the launch index ({} entries) — \
-                 `render_dxp_input` and `launch_index` disagree about the group partition",
-                g.group,
-                shifts.len(),
-            ))
-        })?;
-        groups.push((kv, id));
+    let mut staged: u64 = 0;
+    // No dxp (a Mac / cardless `cargo check`) ⇒ nothing to stage, and nothing to stage it FOR. This
+    // is a CAPABILITY probe, not a behaviour flag.
+    if let Some(bake) = crate::superdsc_bake::global() {
+        for g in &rendered {
+            let id = crate::superdsc_bake::GroupId {
+                fp: fp.to_string(),
+                group: g.group,
+            };
+            let kv = *shifts.get(g.group as usize).ok_or_else(|| {
+                SuperDscError(format!(
+                    "{fp}: group {} has dxp input but no entry in the launch index ({} entries) — \
+                     `render_dxp_input` and `launch_index` disagree about the group partition",
+                    g.group,
+                    shifts.len(),
+                ))
+            })?;
+            // ⭐ ALREADY IN HAND — compiled earlier in this build, mid-compile for an identical group,
+            // or by a previous build of the same emission ([`crate::dxp_cache`]): the group never
+            // reaches the staging root, the budget, or a `dxp_standalone` child, and its program is
+            // filed under `id` by the same content law that lets the memo skip a twin.
+            if bake.adopt(&id, g.key) {
+                crate::pc::count("cachit", 1);
+                groups.push((kv, id));
+                continue;
+            }
+            {
+                let _pc = crate::pc::Pc::start("stage");
+                let gdir = bake.stage().group_dir(fp, g.group as usize);
+                bake.reserve(g.bytes);
+                std::fs::create_dir_all(&gdir).map_err(|e| SuperDscError(e.to_string()))?;
+                for (name, contents) in &g.files {
+                    std::fs::write(gdir.join(name), contents)
+                        .map_err(|e| SuperDscError(e.to_string()))?;
+                }
+                bake.submit(crate::superdsc_bake::SealedGroup::of_rendered(
+                    gdir,
+                    id.clone(),
+                    g,
+                ))
+                .map_err(SuperDscError)?;
+            }
+            staged += g.bytes as u64;
+            groups.push((kv, id));
+        }
     }
-    Ok(StageHandle {
-        fp: fp.to_string(),
-        groups,
-        rendered,
-        trips,
-        programs: ops.len(),
-        descriptors: sdsc_ops.len(),
-    })
+    crate::pc::bundle_line(fp, ops.len(), sdsc_ops.len(), staged);
+    Ok(groups)
 }
 
 /// RE-ROLLED tape-driven SuperDSC lowering — `SubtileIR → KTIR → SuperDSC`, and nothing but the
@@ -8619,7 +8553,7 @@ mod tests {
         // The matmul OpSpec lowers to the frontend-minimal field set.
         let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").unwrap();
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let j = serde_json::to_string(&sdsc).unwrap();
         // Frontend-minimal memOrg: hbm+lx only, NO register file.
         assert!(j.contains("\"memOrg_\":{\"hbm\":{\"isPresent\":1},\"lx\":{\"isPresent\":1}}"));
@@ -8690,7 +8624,7 @@ mod tests {
         // And the FULL emit succeeds (would have panicked pre-fix if "y" were absent from this
         // shape's layout, or produced a silently-wrong scale_ if the marker were dropped).
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let labeled = &sdsc.dscs_[0]["MatMul_0"].labeledDs_;
         let mask_lds = labeled
             .iter()
@@ -8767,7 +8701,7 @@ mod tests {
             },
         });
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).unwrap();
         let ops = &sdsc.dscs_[0]["MatMul_0"].computeOp_;
         assert_eq!(
             ops.len(),
@@ -10119,5 +10053,337 @@ mod tests {
             },
         );
         let _ = bake_layout(&layout);
+    }
+
+    /// ⛔ (b) THE PREFIX-FREE PREFILL RUNG STAMPS ITS CARRIER — the trigger fix's anti-regression
+    /// pin, the WALK-STAMP half (the carrier half is `triton_splice_golden`'s door test, which
+    /// asserts the mint over every arm and shape). A fresh prompt (start == 0) bakes a
+    /// PREFIX-FREE rung — `ActiveCap::NONE`, a chunk ceiling the ladder never stated — so its walk
+    /// threads NO fold region, and that is exactly the shape whose carrier the old region-keyed
+    /// mint left BARE: the fill-staged absolute entries read with the page base composed on top
+    /// (token 0's double-base defect). This test runs the production chain up to the walk —
+    /// [`super::lower_graph_to_ktir`] (which threads `paged_fold = None` to every node) → the
+    /// step-input placements → the walk's own bundle params — then, for the wiring half, the
+    /// walk's own mint ([`super::mint_bundle_ops`]) and the walk's own PURE consumers
+    /// ([`super::launch_index`], [`super::render_dxp_input`]), NEVER the walk itself: the walk's
+    /// group Vec is filled only inside the bake, so a cardless test through the walk would assert
+    /// over nothing, and a bake-side test would start a real bake from inside `cargo test`. The
+    /// render is machine-independent — no dxp, no staging, nothing written — so the test runs
+    /// cardless exactly where the walk's mint does. It asserts BOTH halves of the fix: the
+    /// carrier arrives at the walk stating its region (the prefill arm's own extent contract),
+    /// and the walk's minted gathered groups account for EXACTLY the carrier's own trips — the
+    /// TRIP-ARITHMETIC DIFFERENTIAL against a carrier-alone run of the same mint (program
+    /// identity is not name-readable off the trips: the walk composes op names from roles
+    /// and regions, a different name space from the program's own) — the zero-KV-shift
+    /// contract whose absence double-based the read.
+    ///
+    /// The pin's body, parameterized over the rung's WIDTH: `valid_len` states the
+    /// one-pass cell's dead prefix (`prefix = valid_len − 1`), the golden cell's own
+    /// prefix-free law scaled to the width.
+    fn prefix_free_prefill_rung_stamps_its_carrier_at(mq: u32, valid_len: u32) {
+        // The judgment's GEOMETRY: granite 2b (32 q-heads, 8 kv-heads, hd 64), a
+        // one-page pool (`cap` 256), rope-appended caches — the golden's rope-appended
+        // prefix-free prefill cell, restated here through the same `lower_region`
+        // entrance so the graph is the production shape, rope tables included (the
+        // cos/sin sources below state the K stream's own width, the same real-path
+        // staging the golden's `attn_ir` states since its own fix). This fixture was
+        // BORN RED on that very shape — its cos/sin first stated `q_width` against
+        // the K stream's `kv_width`, and the committed windowing law refused it at
+        // the mint (§9 of the campaign proposal carries the record).
+        let (nqh, nkvh, hd) = (32u32, 8u32, 64u32);
+        let cap = 256u32;
+        let scale = 0.015625f32; // granite 2b's attention_multiplier (hd 64, f16-exact)
+        let q_width = nqh * hd;
+        let kv_width = nkvh * hd;
+        let sources = |cache_rows: u32| {
+            vec![
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: q_width,
+                }, // 0: q
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: cache_rows,
+                    cols: kv_width,
+                }, // 1: prefix_k
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: cache_rows,
+                    cols: kv_width,
+                }, // 2: prefix_v
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 3: new_k
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 4: new_v
+                // ⭐ 5/6: cos/sin AT THE K STREAM'S OWN WIDTH — the REAL construction. The
+                // real path stages each rope's tables at THAT rope's own full column width —
+                // GQA's Q and K differ (`to_wavefront.rs`: "Cos/sin pre-tiled to each rope's
+                // full width (GQA: Q and K differ)", minted through `bx.cos_sin(k_cols)` over
+                // the K projection's own width) — and the worker fills them head-replicated
+                // at exactly that width (`spyre_forward.rs`'s `tile`: a `[rows, width]`
+                // source, `width` a multiple of the class's head dim, the per-position
+                // rotary row repeated `width / head_dim` times per row). The splice's
+                // windowing law demands precisely this staging: x, cos, sin and v share ONE
+                // row window and take WHOLE `total` columns over tensors of one height,
+                // `total` being the append's output width — `kv_width` here. This fixture
+                // was BORN RED on that law (its cos/sin stated `q_width`, copied from the
+                // golden `attn_ir`'s then-inert spelling, and the mint refused it); both
+                // fixtures now state the real staging.
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 5: cos
+                scratchy_subtile::subtile_ir::SourceShape {
+                    rows: mq,
+                    cols: kv_width,
+                }, // 6: sin
+            ]
+        };
+        let geom = scratchy_subtile::model_geometry::ModelAttnGeometry::mint(
+            scratchy_subtile::model_geometry::QueryHeads::new(nqh),
+            scratchy_subtile::model_geometry::KvHeads::new(nkvh),
+            scratchy_subtile::model_geometry::HeadDim::new(hd),
+        )
+        .expect("granite's geometry mints");
+        let attn_op = scratchy_subtile::lower::OpDesc {
+            op: scratchy_subtile::subtile_ir::SubOp::attn_decode(
+                geom,
+                scale,
+                valid_len,
+                scratchy_subtile::subtile_ir::AttnMask::Causal,
+            ),
+            m: mq,
+            inputs: vec![
+                scratchy_subtile::lower::InputRef::Ext(0),
+                scratchy_subtile::lower::InputRef::Ext(1),
+                scratchy_subtile::lower::InputRef::Ext(2),
+                scratchy_subtile::lower::InputRef::Ext(3),
+                scratchy_subtile::lower::InputRef::Ext(4),
+            ],
+        };
+        let input = scratchy_subtile::lower::LoweringInput {
+            sources: sources(cap),
+            ops: vec![
+                // 0: k' = rope_append(k, cos, sin, v, prefix_k, prefix_v) — the cache write that
+                // binds `KvCacheProducer::SameForwardRopeAppend` for the attention below.
+                scratchy_subtile::lower::OpDesc {
+                    op: scratchy_subtile::subtile_ir::SubOp::rope_append(
+                        scratchy_subtile::model_geometry::HeadDim::new(hd),
+                        0,
+                        scratchy_subtile::subtile_ir::AttnMask::Causal,
+                        scratchy_subtile::subtile_ir::RopeFormTag::NeoX,
+                    ),
+                    m: mq,
+                    inputs: vec![
+                        scratchy_subtile::lower::InputRef::Ext(3),
+                        scratchy_subtile::lower::InputRef::Ext(5),
+                        scratchy_subtile::lower::InputRef::Ext(6),
+                        scratchy_subtile::lower::InputRef::Ext(4),
+                        scratchy_subtile::lower::InputRef::Ext(1),
+                        scratchy_subtile::lower::InputRef::Ext(2),
+                    ],
+                },
+                // 1: attn = AttnDecode(q, prefix_k, prefix_v, new_k, new_v)
+                attn_op,
+            ],
+            result: 1,
+            exported: None,
+        };
+        let nb = std::num::NonZeroU32::new(8192).expect("8192 != 0");
+        let ir = scratchy_subtile::subtile_ir::lower_region(&input, nb);
+
+        // ⛔ THE PREFIX-FREE WALK: `ActiveCap::NONE` (a start==0 chunk has nothing resident to
+        // attend) and prefill rows, through the production unrolled entrance — which threads
+        // `paged_fold = None` to every node, the exact condition the judgment prefill's bake
+        // runs under.
+        let weight_ids = std::collections::HashSet::new();
+        let (programs, mut layout) =
+            super::lower_graph_to_ktir(&ir, &weight_ids, super::ActiveCap::new(u32::MAX), false)
+                .unwrap_or_else(|e| panic!("the prefix-free prefill walk lowered: {e}"));
+
+        // ── THE CARRIER HALF: exactly one op arrives stating its region, and it states the
+        // prefill arm's own extent contract. ──
+        let carriers: Vec<_> = programs
+            .iter()
+            .filter(|e| e.kv_paged_region.is_some())
+            .collect();
+        assert_eq!(
+            carriers.len(),
+            1,
+            "the walk's one attention carrier — and only it — states a paged region"
+        );
+        let carrier = carriers[0];
+        let region = carrier.kv_paged_region.expect("filtered on Some");
+        let node = ir.nodes.last().expect("the attention node");
+        let prefix_len = node.inputs[1].region.rows.len;
+        let new_len = node.inputs[3].region.rows.len;
+        let expected_pages = (prefix_len + new_len)
+            .div_ceil(ktir_superdsc::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32);
+        assert_eq!(
+            region.region_pages, expected_pages,
+            "the prefix-free carrier's region defaults to the walk's own extent (the spec's \
+             `region_pages.unwrap_or(pages)` law)"
+        );
+        // And the layout this walk returned PLACED the pool the region names — the reach the
+        // stamp's premise guard checks is present, not just assumed.
+        for tid in region.reach_tids() {
+            assert!(
+                layout.gather_reach.contains_key(&tid),
+                "the layout placed no gather reach for t{tid} — the stamp's premise guard \
+                 would refuse this walk"
+            );
+        }
+
+        // ── THE WALK-STAMP HALF: the same chain the unrolled entrance runs, landing in the
+        // walk that stamps. ──
+        super::place_step_inputs(&mut layout, &[&programs], ir.tensors.len() as u32)
+            .unwrap_or_else(|e| panic!("step inputs placed: {e}"));
+        layout.place_kv_block_index_last();
+        let attn_params =
+            crate::lower_subtile_tape_to_ktir::attn_bundle_params(&ir, false, false, None)
+                .unwrap_or_else(|e| panic!("bundle params minted: {e}"))
+                .expect("an attention graph mints attention params");
+        // ── THE DIRECT-STAMP PIN (the child): the stamp's OWN contract, checked where it
+        // happens. Lower the carrier through the door directly — a fresh sym-id base is
+        // immaterial here, the stamped bits are constants and only per-op coverage and
+        // non-emptiness matter — and call the walk's own stamp function
+        // (`stamp_carrier_kv_facts`, the ONE stamping site) on the result. ──
+        let k = carrier
+            .ktir
+            .as_ref()
+            .expect("the carrier carries its KTIR program");
+        let mut solo_base: i64 = 0;
+        let mut solo_lowered =
+            crate::ktir_superdsc_door::lower(k, &mut solo_base, Some(&layout), Some(attn_params))
+                .unwrap_or_else(|err| {
+                    panic!("the carrier lowered through the door: {}", err.message)
+                });
+        super::stamp_carrier_kv_facts(carrier, &mut solo_lowered, Some(&layout))
+            .unwrap_or_else(|e| panic!("the stamp function accepted the carrier: {e}"));
+        assert!(
+            !solo_lowered.is_empty(),
+            "the door minted no ops from the carrier — the stamp would cover nothing"
+        );
+        assert!(
+            solo_lowered
+                .iter()
+                .all(|o| o.kv_gathered && o.kv_region_form),
+            "the stamp left an op of the carrier unstamped — a partial stamp is exactly \
+             the defect class this pin exists for"
+        );
+
+        // ── THE WIRING HALF: the walk's own mint and the walk's own PURE consumers — launch_index
+        // and render_dxp_input — NEVER the walk itself. The walk's group Vec is filled only inside
+        // the bake (`if let Some(bake) = superdsc_bake::global()`), so a cardless test through the
+        // walk would assert over NOTHING, and a bake-side test would start a REAL bake from inside
+        // `cargo test`. The mint is the walk's own extraction — same loop, same stamp call — so
+        // what it stamps is what the walk stamps. ──
+        let sdsc = super::mint_bundle_ops(&programs, Some(&layout), Some(attn_params))
+            .unwrap_or_else(|e| panic!("the walk's mint rendered: {e}"))
+            .ops;
+        let shifts = super::launch_index(&sdsc, super::FoldGrouping::Split);
+        let rendered = super::render_dxp_input(&sdsc, super::FoldGrouping::Split)
+            .unwrap_or_else(|e| panic!("the walk's render ran cardless: {e}"));
+        // ⛔ THE TRIP-ARITHMETIC DIFFERENTIAL (the wiring half) — the walk's mint APPLIED the
+        // stamp and the groups FAITHFULLY CARRY the bits, proven by COUNTING, not naming.
+        // Program identity is NOT readable off the rendered trips: the walk composes op
+        // names from roles and regions (`{act_name(tid)}_g{leg}`, `{name}_scatter_t{tid}`,
+        // …) — a different name space from the program's own `attn_s{id}` — so no
+        // name-keyed membership test can find the carrier's trips. Instead the mint runs a
+        // SECOND TIME on the carrier ALONE, and the full run's gathered groups must account
+        // for EXACTLY the carrier's own trip total. The per-group trip count is the walk's
+        // OWN derivation, not a new one: `files.len() − 1`, the same formula the group
+        // budget uses for its `descriptors` count, resting on the render law "one
+        // `sdsc_{i}.json` per trip, then `bundle.mlir` LAST" (`render_dxp_input`
+        // constructs exactly one file per trip). TWO PREMISES, both stated:
+        // (i) `group_ranges` is an EXACT covering partition (Kani-proven via the scalar
+        //     twin `group_ranges_cover_ok`), so Σ trips over groups answering `gathered`
+        //     is exactly the Gathered-kind trip count — a partial stamp leaves carrier
+        //     trips Pure, a strict shortfall, never an invisible shuffle;
+        // (ii) the carrier's trip count is bundle-context-free (the door's time-tiling is
+        //      a per-op decision, sym-id-independent) — if that ever breaks, the equality
+        //      fails LOUDLY here, which is the pin doing its job. The emptiness case — a
+        //      deleted stamp leaving no gathered group at all — is caught by the alone
+        //      run's own trip count.
+        let carrier_idx = programs
+            .iter()
+            .position(|e| e.kv_paged_region.is_some())
+            .expect("the carrier asserted above");
+        let alone_sdsc = super::mint_bundle_ops(
+            &programs[carrier_idx..carrier_idx + 1],
+            Some(&layout),
+            Some(attn_params),
+        )
+        .unwrap_or_else(|e| panic!("the carrier-alone mint rendered: {e}"))
+        .ops;
+        let alone_rendered = super::render_dxp_input(&alone_sdsc, super::FoldGrouping::Split)
+            .unwrap_or_else(|e| panic!("the carrier-alone render ran cardless: {e}"));
+        // Summed over ALL of the alone run's groups — not its gathered ones — so a deleted
+        // stamp leaves `alone_trips` intact and the differential below fails at the
+        // EQUALITY, not vacuously at this assert.
+        let alone_trips = alone_rendered
+            .iter()
+            .map(|g| (g.files.len() - 1) as u64)
+            .sum::<u64>();
+        assert!(
+            alone_trips > 0,
+            "the carrier-alone run minted no trips — the carrier lowered to nothing, so \
+             the differential below would pass vacuously"
+        );
+        let mut gathered_trips = 0u64;
+        let mut region_form_trips = 0u64;
+        for g in &rendered {
+            // One `sdsc_{li}.json` per trip, then `bundle.mlir` last — a group's trip
+            // count is its file count minus one. The group's channel bits come from the
+            // walk's own launch index, keyed by the group's own id — the same pairing the
+            // walk's staging loop uses.
+            let group_trips = (g.files.len() - 1) as u64;
+            let kv = *shifts.get(g.group as usize).unwrap_or_else(|| {
+                panic!(
+                    "group {} has dxp input but no entry in the launch index ({} entries) — \
+                     `render_dxp_input` and `launch_index` disagree about the group partition",
+                    g.group,
+                    shifts.len()
+                )
+            });
+            if kv.gathered {
+                gathered_trips += group_trips;
+            }
+            if kv.gathered && kv.region_form {
+                region_form_trips += group_trips;
+            }
+        }
+        assert_eq!(
+            gathered_trips, alone_trips,
+            "the full run's gathered groups hold {gathered_trips} trips but the carrier \
+             alone mints {alone_trips} — the stamp lost part of the carrier mid-body"
+        );
+        assert_eq!(
+            region_form_trips, alone_trips,
+            "the full run's gathered-and-region-form groups hold {region_form_trips} trips \
+             but the carrier alone mints {alone_trips} — part of the carrier read the region \
+             form unstaged"
+        );
+    }
+
+    #[test]
+    fn the_prefix_free_prefill_rung_stamps_its_carrier() {
+        // The judgment's GEOMETRY at the m=31 one-pass rung — NOT the judgment prefill's
+        // own shape: the judgment prefill's BODY is the mq=256 primary top
+        // (4ae78fbfabfa3098, 4 groups/257 trips), whose width the variant below pins.
+        prefix_free_prefill_rung_stamps_its_carrier_at(31, 33);
+    }
+
+    #[test]
+    fn the_judgment_prefill_width_stamps_its_split_carrier() {
+        // The judgment prefill's own WIDTH (mq=256, a one-page dead prefix over a
+        // two-page gathered region) — the split-carrier case: the real body's carrier
+        // is 161 counted ops spanning the 128-cut into two Gathered groups. Whether
+        // this fixture's synthetic carrier crosses the cut is a counted fact the pod
+        // run's dump will show; the stamp assert holds over every carved group either
+        // way.
+        prefix_free_prefill_rung_stamps_its_carrier_at(256, 257);
     }
 }

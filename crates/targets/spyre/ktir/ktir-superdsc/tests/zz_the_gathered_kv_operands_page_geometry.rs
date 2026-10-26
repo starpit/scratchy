@@ -372,7 +372,7 @@ fn gathered_score_shaped_op(axis: KernelAxis, page: PageExtent) -> serde_json::V
     )
     .expect("the gather-copy op builds at the score leg's extents");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_gathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 
@@ -408,7 +408,7 @@ fn ungathered_score_shaped_op() -> serde_json::Value {
     op.args.remove(idx);
     op.indirect = None;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("score_ungathered", &op, &folds, None).expect("emits");
     serde_json::to_value(&e).expect("serializes")
 }
 

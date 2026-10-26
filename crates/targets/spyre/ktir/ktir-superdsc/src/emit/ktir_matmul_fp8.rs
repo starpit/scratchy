@@ -18,19 +18,15 @@ use super::{
     assemble_pointwise_broadcast_off, bmm_site, emit_sdsc_tiled, op_func_from_str, pw1, pw2, rb,
     rb_df, rbo,
 };
-use crate::addr::{DevOff, Idx, Nest, Row, Slabs};
 use crate::ir::bridge::tiled_op_sdsc_op::reduce::{
     assemble_reduce_off, assemble_reduce_seeded, reduce_opspec, win_reduce_accum, win_reduce_data,
 };
 use crate::place::{PlaceId, SynthRole};
 use crate::placement::{BundleLayout, syn};
 use crate::reserved_tids::{FP8_INV448_TID, FP8_NEG448_TID, FP8_POS448_TID};
-use crate::sdsc_abstract::{
-    BlockCols, Fp8NarrowStaging, Fp8TileStaging, KernelTag, Lanes, OperandPlacement, RowCount, Stk,
-};
+use crate::sdsc_abstract::{BlockCols, Lanes, RowCount};
 use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{DataFormat, Df, Fp16, Role, SdscFoldSet};
-use std::collections::BTreeMap;
 
 /// What the KTIR states about one fp8 W8A8 contraction, recovered from its shapes and parameters.
 ///
@@ -52,48 +48,11 @@ pub(crate) struct Fp8Facts {
     pub out_tid: u32,
 }
 
-/// ⭐ THE QUANT CHAIN'S SOURCE — the activation whole (the dense law) or ONE target-ABI row
-/// tile's fresh clone (the row-tiled law, [`crate::work::Fp8GemmRowTiles`]). The chain is a
-/// pure function of its source's `[rows, k]` window, so ONE body serves both laws; what
-/// changes is WHERE it reads and WHAT its tensors are named — a tile's quant tensors carry
-/// their tile index ([`PlaceId::synth_tiled`]), keyed off the ACTIVATION's id either way
-/// because a tile's staging is a fact of the activation that tiled, and its ops carry the
-/// index in their names. The `quantized` sharing key is the source's own name, so a second
-/// GEMM over the same activation at the same plan reuses one staging instead of
-/// re-quantizing per matmul.
-pub(crate) struct Fp8QuantSource {
-    /// The tensor the chain reads — the activation, or the tile's fp16 clone.
-    pub name: String,
-    /// The id every chain synth derives from — the ACTIVATION's, either way.
-    pub id: PlaceId,
-    /// The rows the source carries — `m`, or the tile's ABI row class.
-    pub rows: u32,
-    /// The tile index when this source is one tile of the row-tiled law (`None` = dense).
-    pub tile: Option<u32>,
-    /// The output tensor's id — the op-name namespace, shared by both laws.
-    pub out_tid: u32,
-}
-
-impl Fp8QuantSource {
-    /// The DENSE law's source — the activation whole, at its own row count.
-    pub(crate) fn activation(facts: &Fp8Facts, m: u32) -> Self {
-        Self {
-            name: facts.a_name.clone(),
-            id: PlaceId::Act(facts.a_tid),
-            rows: m,
-            tile: None,
-            out_tid: facts.out_tid,
-        }
-    }
-}
-
 /// ⭐⭐⭐ THE SHARED W8A8 ACTIVATION QUANTIZE — the first half of every fp8 matmul door
 /// (`matmul_fp8_descriptors`'s own body, extracted): `abs → amax → floor → scale → clamp →
-/// zero-pad → qfp8ch`, over the source's `[rows, k]` window, ONE scale per token row. The EXPERT
-/// door calls this DIRECTLY (its per-pair matmuls and flat dequant legs replace the dense body),
-/// and so does the row-tiled arm — once per tile over the tile's fresh clone (the reference
-/// quantizes AFTER the clone, `fp8_linear_kernel.py:351` then `:33`) — so every door shares one
-/// chain and no op is emitted only to be spliced out — the dense body's
+/// zero-pad → qfp8ch`, over the `[m, k]` activation, ONE scale per token row. The EXPERT door
+/// calls this DIRECTLY (its per-pair matmuls and flat dequant legs replace the dense body), so
+/// the two doors share one chain and no op is emitted only to be spliced out — the dense body's
 /// own `matmulfp8` binds its W as a whole-tensor `[k_pad, n]` view, which against the expert
 /// door's chunk scratch the synth footprint guard refuses at bake.
 ///
@@ -109,14 +68,14 @@ impl Fp8QuantSource {
 /// convert stands (byte-identical to the pre-pair emission), and at `pairs == 1` this is the
 /// dense law verbatim (`cl_reach = k_pad = fp8_k_pad(k)`, one tail window, one convert).
 pub(crate) fn fp8_quantize_descriptors(
-    src: &Fp8QuantSource,
+    facts: &Fp8Facts,
+    m: u32,
     k: u32,
     pairs: u32,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
-    let m = src.rows;
     // fp8 W8A8 PREFILL (m>1). torch-spyre's `quantize_fp8_with_scale`
     // (decompositions.py:966) takes `scale` as an input computed by the CALLER via native `torch.abs` +
     // `torch.ops.aten.amax` (confirmed via grep — no L2-norm substitute anywhere in torch-spyre); the
@@ -128,7 +87,7 @@ pub(crate) fn fp8_quantize_descriptors(
         return Err(SuperDscError(format!(
             "fp8 quantize t{}: the K axis is {k} lanes over {pairs} pairs — the per-pair tail law \
              needs a whole lane count per pair",
-            src.id.tid()
+            facts.a_tid
         )));
     }
     let inn = k / pairs;
@@ -163,8 +122,8 @@ pub(crate) fn fp8_quantize_descriptors(
             crate::sdsc_abstract::BlockCols::of_one_stick(crate::sdsc_abstract::Lanes::FP16);
         // ⭐ THE NAMES COME FROM THE KTIR'S OWN PARAMETERS — `args[i]` → `wiring::act_name(tid)`, the
         // same spelling `ds_name` produced for the SubtileIR path.
-        let a_name = src.name.clone();
-        let out = crate::place::act_name(src.out_tid);
+        let a_name = facts.a_name.clone();
+        let out = crate::place::act_name(facts.out_tid);
         use SynthRole as R;
         // SHARED quant tensors are a pure function of the ACTIVATION (abs→amax→scale→clamp→fp8) — derive
         // them from the ACTIVATION's id so a second matmul on the same activation resolves the IDENTICAL
@@ -172,26 +131,15 @@ pub(crate) fn fp8_quantize_descriptors(
         // tensors (the matmul output `raw` and its dequant `dqa`) derive from the OUTPUT's id — those
         // belong to the dense body, not this half.
         // ⭐ THE DOOR: the ids come from the KTIR-recovered facts, not from a `&SubtileNode`. They are
-        // the same tensor ids either way — `Fp8QuantSource::id` is recorded off the program's
+        // the same tensor ids either way — `Fp8Facts::a_tid`/`out_tid` are recorded off the program's
         // own views — so the placements these mint are the ones the proven path minted.
-        let a_id = src.id;
-        // ⭐ THE TILE ID MAP — a tiled source wraps EVERY role's id in its tile index
-        // (`synth_tiled`), so a tile's staging tensors are named apart from the activation's
-        // own and from every other tile's; the dense source maps every role to itself
-        // (byte-identical names).
-        let st = |r: R| match src.tile {
-            Some(t) => a_id.synth_tiled(r, t),
-            None => a_id.synth(r),
-        };
-        let qn = |r: R| syn(layout, st(r));
+        let a_id = PlaceId::Act(facts.a_tid);
+        // The operand SPELLING is a rendering of the id the layout is keyed by, so the op's name and
+        // the allocator's key cannot drift — they have one preimage.
+        let qn = |r: R| syn(layout, a_id.synth(r));
         // OP names — a DIFFERENT namespace from tensor names (a program's ops are not placed), so
-        // they stay strings and take no `PlaceId`. A tiled source carries its tile index here too,
-        // BEFORE the trailing `_op` — the tiled arm's one naming law (`fq_tz{t}_op`,
-        // `fq_mm_t{t}_op`) — so a tile's ops are named apart from every other tile's.
-        let opn = |s: &str| match src.tile {
-            Some(t) => format!("{out}_{}_t{t}_op", s.strip_suffix("_op").unwrap_or(s)),
-            None => format!("{out}_{s}"),
-        };
+        // they stay strings and take no `PlaceId`.
+        let opn = |s: &str| format!("{out}_{s}");
         let (absx, amax, amaxfl, ascale, invs, sc, chi, cl) = (
             qn(R::FqAbsX),
             qn(R::FqAmax),
@@ -207,17 +155,17 @@ pub(crate) fn fp8_quantize_descriptors(
             // Footprints are `m` query rows (decode m=1 ⇒ byte-identical to the old `[1,·]`; prefill m>1
             // reserves the real multi-row extent so a per-row write can't clobber a neighbor row).
             for r in [R::FqAbsX, R::FqSc, R::FqChi] {
-                l.synth(st(r), &[m, k]);
+                l.synth(a_id.synth(r), &[m, k]);
             }
             // The chain's tail widens to the PAD: `cl` feeds the convert (whose 128-elem stick law
             // is the reason the pad exists) and `afp8` is the fp8 contraction operand — both are
             // reserved at the PER-PAIR PADDED width, the one layout the convert, the per-pair
             // matmul A windows, and the packed weight's K rows all share (`cl` only to its last
             // convert's REACH — the one-stick overhang the fill below covers).
-            l.synth(st(R::FqCl), &[m, cl_reach]);
-            l.synth_df(st(R::FqAfp8), &[m, k_pad], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
+            l.synth(a_id.synth(R::FqCl), &[m, cl_reach]);
+            l.synth_df(a_id.synth(R::FqAfp8), &[m, k_pad], Df::Fp8); // 1-byte / 128-stick residency (½ fp16)
             for r in [R::FqAmax, R::FqAmaxFl, R::FqAscale, R::FqInvS] {
-                l.synth(st(r), &[m, stk]);
+                l.synth(a_id.synth(r), &[m, stk]);
             }
         }
         let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
@@ -349,11 +297,11 @@ pub(crate) fn fp8_quantize_descriptors(
                 // floor, and the max of identical floors is that floor.
                 let k_part = k / qspt_time;
                 let partials: Vec<String> = (1..qspt_time)
-                    .map(|j| syn(layout, st(R::FqAmaxP(j))))
+                    .map(|j| syn(layout, a_id.synth(R::FqAmaxP(j))))
                     .collect();
                 if let Some(l) = layout {
                     for j in 1..qspt_time {
-                        l.synth(st(R::FqAmaxP(j)), &[m, stk]);
+                        l.synth(a_id.synth(R::FqAmaxP(j)), &[m, stk]);
                     }
                 }
                 for j in 0..qspt_time {
@@ -647,11 +595,8 @@ pub(crate) fn fp8_quantize_descriptors(
 /// ⭐⭐⭐ THE PROVEN fp8 W8A8 MATMUL DESCRIPTORS, dense form — the quantize chain (via
 /// [`fp8_quantize_descriptors`] at `pairs == 1`, the dense law verbatim) plus the dense
 /// body: `matmulfp8` binding the WHOLE packed weight as one `[k_pad, n]` view, then the
-/// two dequant legs. This is the single-tile arm of [`matmul_fp8_descriptors`] — the plan's
-/// `tile_count() == 1 ∧ total_rows() == m`, i.e. every decode (m=1) and every narrow
-/// single-tile prefill — byte-identical to the pre-split emission (same ops, same names,
-/// same reservations).
-pub(crate) fn matmul_fp8_dense_descriptors(
+/// two dequant legs. The signature is the pre-split one — every caller and test stands.
+pub(crate) fn matmul_fp8_descriptors(
     facts: &Fp8Facts,
     m: u32,
     k: u32,
@@ -660,14 +605,7 @@ pub(crate) fn matmul_fp8_dense_descriptors(
     layout: Option<&BundleLayout>,
     quantized: &mut std::collections::HashSet<String>,
 ) -> Result<Vec<EmittedOp>, SuperDscError> {
-    let mut ops = fp8_quantize_descriptors(
-        &Fp8QuantSource::activation(facts, m),
-        k,
-        1,
-        sym_id_base,
-        layout,
-        quantized,
-    )?;
+    let mut ops = fp8_quantize_descriptors(facts, m, k, 1, sym_id_base, layout, quantized)?;
     // ⭐ THE 26b K-PAD (dense form) — the contraction width the packed weight was staged at.
     let k_pad = crate::work::fp8_k_pad(k);
     let m_rows = crate::sdsc_abstract::RowCount::of_token_rows(m);
@@ -781,830 +719,6 @@ pub(crate) fn matmul_fp8_dense_descriptors(
     Ok(ops)
 }
 
-/// ⭐⭐⭐ THE fp8 MATMUL DOOR — ONE entry, TWO laws, and the PLAN picks. `work::Fp8GemmRowTiles`
-/// is the copied `_m_tiles` law (`fp8_linear_kernel.py:70`): a WIDE geometry (max(k,n) ≥ 4096 or
-/// an N the target-ABI set decomposes into more than one tile) rows-tiles the prefill into
-/// target-ABI tiles PADDED UP with zero rows, M=1 stays whole at decode, and a narrow geometry
-/// runs its rows whole. This door is the ONLY spelling of that choice — the dense arm
-/// ([`matmul_fp8_dense_descriptors`], byte-identical to the pre-split emission at every
-/// single-tile geometry) and the row-tiled arm ([`matmul_fp8_row_tiled_descriptors`], the
-/// reference's clone-then-quantize-per-tile) are both behind it, so no caller can reach one
-/// by a second route and the two can never disagree about which law a geometry takes.
-///
-/// ⛔ THE TILED ARM IS THE DEFECT-3 FIX. The dense arm's shared quant staging writes the
-/// activation's fp8 at one walk ({mb:21} — the whole tensor) while its mm read the SAME bytes
-/// at another ({in:4|8, mb:1, out:8|4} — the packed-kernel walk), and at m>1 those two
-/// spellings of the mb axis tear the rows. The tiled arm never shares that staging: each tile
-/// quantizes its OWN fresh `[ROWS, k]` clone, and the mm reads that clone through
-/// [`Fp8TileStaging::<ROWS>`] — the row class is a const generic on the type, so a
-/// writer/reader disagreement is a `cargo build` type error, never a torn read on card.
-pub(crate) fn matmul_fp8_descriptors(
-    facts: &Fp8Facts,
-    m: u32,
-    k: u32,
-    n: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-    quantized: &mut std::collections::HashSet<String>,
-) -> Result<Vec<EmittedOp>, SuperDscError> {
-    let plan = crate::work::Fp8GemmRowTiles::of(
-        RowCount::of_token_rows(m),
-        BlockCols::of_feature_cols(k),
-        BlockCols::of_feature_cols(n),
-    )
-    .map_err(SuperDscError)?;
-    if plan.tile_count() == crate::work::Fp8GemmTileCount::new(1)
-        && plan.total_rows() == RowCount::of_token_rows(m)
-        && (m == 1 || !plan.is_wide())
-    {
-        return matmul_fp8_dense_descriptors(facts, m, k, n, sym_id_base, layout, quantized);
-    }
-    // ⭐ THE DISPATCH IS EXHAUSTIVE OVER THE CLASS — exactly two tiled row classes exist,
-    // the enum says so, and a third is a COMPILE ERROR at this match (no catch-all arm, no
-    // dead-looking runtime refusal). Each arm states its own row extent: the wide tile's
-    // [`FP8_GEMM_WIDE_M`] is our whole-tile pick over the reference's `_m_tiles` 4
-    // (fp8_linear_kernel.py:76-77 — see the const's doc for the trip-bill law), and the
-    // narrow part's padded 128-multiple is a fact of the input carried as a `RowCount`
-    // (S3, :343-346 — one part at ANY multiple, no refusal on M).
-    match plan.row_class() {
-        crate::work::Fp8RowClass::Wide => Fp8TileEmit::<{ crate::work::FP8_GEMM_WIDE_M }>::new(
-            facts,
-            &plan,
-            sym_id_base,
-            layout,
-            quantized,
-        )
-        .emit(),
-        crate::work::Fp8RowClass::Narrow(padded) => {
-            Fp8NarrowEmit::new(facts, &plan, padded, sym_id_base, layout, quantized).emit()
-        }
-    }
-}
-
-/// One stick-group's byte advance in a `[rows, groups, 64]` fp16 nest — the group law
-/// (`g·rows·64` elems) as bytes: the per-trip stride a time-folded fan op carries, minted
-/// from the same footprint law the geometry guard compares against (`synth_footprint_bytes`).
-fn nest_group_stride_bytes(rows: u32, stk: u32) -> i64 {
-    crate::placement::synth_footprint_bytes(&[rows, stk], Df::Fp16) as i64
-}
-
-/// ⭐ ONE TILE'S `matmulfp8` — the dense body's own mm leg at the tile's row class: the SAME
-/// `matmul_opspec_off_operands::<Fp16>` + fp8 `set_df` stamp + `emit_sdsc_tiled`, differing only
-/// in that the A operand name comes from the TYPED staging (so the mm reads exactly the buffer
-/// the tile's quant wrote, at the row class the type states) and the output lands in the tile's
-/// own `[ROWS, n]` raw synth. `ROWS`-wide on purpose: the pad rows quantize to zero (the clone's
-/// zero fill), so their raw rows are written zero — deterministic — and the out-splice copies
-/// only the real rows anyway.
-fn fp8_tile_mm_op<const ROWS: u32>(
-    staging: &Fp8TileStaging<ROWS>,
-    facts: &Fp8Facts,
-    n: u32,
-    k_pad: u32,
-    t: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
-    let out = crate::place::act_name(facts.out_tid);
-    let out_id = PlaceId::Act(facts.out_tid);
-    let raw = syn(layout, out_id.synth_tiled(SynthRole::FqRaw, t));
-    if let Some(l) = layout {
-        l.synth(out_id.synth_tiled(SynthRole::FqRaw, t), &[ROWS, n]);
-    }
-    let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
-        // ⭐ M FROM THE TYPE — `Fp8TileStaging::<ROWS>::ROWS`, never a second spelling of the
-        // row count: the staging's class and the mm's M are one fact because they are one type.
-        crate::sdsc_abstract::MatM::of_token_rows(Fp8TileStaging::<ROWS>::ROWS),
-        crate::sdsc_abstract::MatN::of_out_features(n),
-        crate::sdsc_abstract::MatK::of_in_features(k_pad),
-        crate::sdsc_abstract::MatY::unbatched(),
-        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-            bmm_site::TapeLoweringSite::witness(),
-        ),
-        staging.afp8().name(),
-        &facts.w_name,
-        &raw,
-        0,
-        0,
-        0,
-        Df::Fp8,
-    )
-    .map_err(SuperDscError)?;
-    for arg in &mut spec.args {
-        if !matches!(arg.view().role, Role::Output) {
-            arg.set_df(Df::Fp8);
-        }
-    }
-    let folds = SdscFoldSet::new(spec.iter.cores_used());
-    emit_sdsc_tiled(
-        &format!("{out}_fq_mm_t{t}_op"),
-        &spec,
-        &folds,
-        sym_id_base,
-        layout,
-    )
-}
-
-/// ⭐ THE NARROW PART'S `matmulfp8` — `fp8_tile_mm_op`'s runtime-rows twin: the SAME
-/// `matmul_opspec_off_operands::<Fp16>` + fp8 `set_df` stamp + `emit_sdsc_tiled`, with
-/// the A operand name from the narrow staging and M from the staging's OWN extent — the
-/// padded 128-multiple is a fact of the input (S3, `fp8_linear_kernel.py:343-346`), a
-/// `RowCount` on the staging, never a const generic and never re-derived here.
-fn fp8_narrow_mm_op(
-    staging: &Fp8NarrowStaging,
-    facts: &Fp8Facts,
-    n: u32,
-    k_pad: u32,
-    sym_id_base: &mut i64,
-    layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
-    let rows = staging.rows().get();
-    let out = crate::place::act_name(facts.out_tid);
-    let out_id = PlaceId::Act(facts.out_tid);
-    let raw = syn(layout, out_id.synth_tiled(SynthRole::FqRaw, 0));
-    if let Some(l) = layout {
-        l.synth(out_id.synth_tiled(SynthRole::FqRaw, 0), &[rows, n]);
-    }
-    let mut spec = crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec_off_operands::<Fp16>(
-        // ⭐ M FROM THE STAGING'S OWN EXTENT — the narrow law's padded 128-multiple,
-        // carried by the staging type so the mm's M and the quant's row count are one
-        // fact (the wide twin's `Fp8TileStaging::<ROWS>::ROWS`, at a runtime extent).
-        crate::sdsc_abstract::MatM::of_token_rows(rows),
-        crate::sdsc_abstract::MatN::of_out_features(n),
-        crate::sdsc_abstract::MatK::of_in_features(k_pad),
-        crate::sdsc_abstract::MatY::unbatched(),
-        crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-            bmm_site::TapeLoweringSite::witness(),
-        ),
-        staging.afp8().name(),
-        &facts.w_name,
-        &raw,
-        0,
-        0,
-        0,
-        Df::Fp8,
-    )
-    .map_err(SuperDscError)?;
-    for arg in &mut spec.args {
-        if !matches!(arg.view().role, Role::Output) {
-            arg.set_df(Df::Fp8);
-        }
-    }
-    let folds = SdscFoldSet::new(spec.iter.cores_used());
-    emit_sdsc_tiled(
-        &format!("{out}_fq_mm_narrow_op"),
-        &spec,
-        &folds,
-        sym_id_base,
-        layout,
-    )
-}
-
-/// ⭐⭐⭐ THE ROW-TILED LAW'S EMISSION CONTEXT — every fact the tiled arm reads, in ONE
-/// typed argument, with the row class as the const generic: the mm's M, the staging's row
-/// count, and the tile buffers' row extent are ONE fact by type (`Fp8TileStaging::<ROWS>`
-/// refuses any other). Built by the door at the dispatch arm from the PLAN itself (m/k/n
-/// are the plan's own facts; `k_pad` is minted HERE, once, as typed feature-cols — the
-/// single spelling the tile mm and the staging handles consume), so no shape is passed
-/// twice or spelled twice. What the context carries, in order: the KTIR-recovered
-/// contraction facts; the row-tiling plan (the one source of tile windows and stick-group
-/// extents); the activation's real row count; the contraction and output widths; the
-/// contraction width at the packed-kernel pad; and the three emission threads.
-///
-/// ⭐ THE CLONES ARE IDENTITY MATMULS — the card-proven KV-cache-write form
-/// (`assemble_matmul_placed`, `at_head` + `MatY::unbatched()`): one op per stick group,
-/// `N = K = one stick` so the walk never crosses a group boundary, reading the
-/// `[64,64]` identity table the tape's placement pass registers (`identity_tid_of_class`).
-/// Pointwise outputs are column-windowed only (`OutCorner`), which is why the out-splice is
-/// this form too: a matmul output is placed by a LAW (`OperandPlacement`), so the row window
-/// a tile's real rows occupy is expressible here and nowhere else.
-///
-/// ⭐ SHARING: the tile clone/zero/quant legs are keyed by the TILE's own name in `quantized`,
-/// so a second GEMM over the same activation at the same plan (K/V after Q, Up after Gate)
-/// reuses one staging instead of re-quantizing per matmul — the dense law's own sharing,
-/// at tile grain. The reservation carries a GEOMETRY GUARD: `synth` is idempotent per name,
-/// so a second GEMM that re-tiles the same activation at a DIFFERENT row class would
-/// silently reuse the wrong-shaped buffer — the guard compares the reserved footprint
-/// against this plan's and refuses loudly instead.
-struct Fp8TileEmit<'a, const ROWS: u32> {
-    /// The KTIR-recovered contraction facts.
-    facts: &'a Fp8Facts,
-    /// The row-tiling plan — the one source of tile windows and stick-group extents.
-    plan: &'a crate::work::Fp8GemmRowTiles,
-    /// The activation's real row count (the source nest's rows).
-    m: RowCount,
-    /// The contraction width.
-    k: BlockCols,
-    /// The output width.
-    n: BlockCols,
-    /// The contraction width at the packed-kernel pad — minted ONCE, here.
-    k_pad: BlockCols,
-    sym_id_base: &'a mut i64,
-    layout: Option<&'a BundleLayout>,
-    quantized: &'a mut std::collections::HashSet<String>,
-}
-
-impl<'a, const ROWS: u32> Fp8TileEmit<'a, ROWS> {
-    /// The door's arm mints the context from the plan itself — no shape argument exists to
-    /// disagree with the plan, and the row class is the const generic on the type.
-    fn new(
-        facts: &'a Fp8Facts,
-        plan: &'a crate::work::Fp8GemmRowTiles,
-        sym_id_base: &'a mut i64,
-        layout: Option<&'a BundleLayout>,
-        quantized: &'a mut std::collections::HashSet<String>,
-    ) -> Self {
-        Self {
-            facts,
-            plan,
-            m: plan.real_rows(),
-            k: plan.contraction_width(),
-            n: plan.out_width(),
-            k_pad: BlockCols::of_feature_cols(crate::work::fp8_k_pad(
-                plan.contraction_width().get(),
-            )),
-            sym_id_base,
-            layout,
-            quantized,
-        }
-    }
-
-    /// The whole tiled arm — the reference's wide-GEMM form, copied not invented
-    /// (`fp8_linear_kernel.py`): per tile, zero-fill the pad rows (:32), `clone()` the real
-    /// rows into the fresh `[ROWS, k]` buffer (:351), quantize THE CLONE (:33), contract at
-    /// the tile's row class, dequant into a tile-local landing, splice the REAL rows back.
-    fn emit(self) -> Result<Vec<EmittedOp>, SuperDscError> {
-        use SynthRole as R;
-        let Self {
-            facts,
-            plan,
-            m,
-            k,
-            n,
-            k_pad,
-            sym_id_base,
-            layout,
-            quantized,
-        } = self;
-        // ⚠ F2/F3/F4 ROUND re-types these seams (source struct carries the minted tile;
-        // MatM takes RowCount; tiles()/stick-group windows iterate minted values).
-        let (m, k, n, k_pad) = (m.get(), k.get(), n.get(), k_pad.get());
-        let stk = Fp16::ELEMS_PER_STICK; // 64
-        let out = crate::place::act_name(facts.out_tid);
-        let a_id = PlaceId::Act(facts.a_tid);
-        let out_id = PlaceId::Act(facts.out_tid);
-        let r_rows = RowCount::of_token_rows(ROWS);
-        let k_cols = BlockCols::of_feature_cols(k);
-        let n_cols = BlockCols::of_feature_cols(n);
-        let slabs = Slabs::new(1);
-        // ⭐ THE IDENTITY TABLE — the same [`stk`,`stk`] registry entry the card-proven KV-cache
-        // write's clone reads. A tape that registers no hd-`stk` class cannot tile rows: the
-        // refusal names the table, never a fallback copy form (there is none — pointwise outputs
-        // are column-windowed, so the identity matmul is the only placed-row copy this compiler
-        // has).
-        let ident = layout
-            .and_then(|l| l.identity_tid_of_class(stk))
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "fp8 matmul {out}: the row-tiled law's clone reads the [{stk},{stk}] identity \
-                 table, and this tape registers no hd-{stk} class — a tape without the table \
-                 cannot tile rows"
-                ))
-            })?;
-        let ident_h = Stk::<KernelTag>::one_stick_identity(crate::place::act_name(ident));
-        let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
-        // ⭐ THE NESTS SPELL THE ROWBLOCKED STICK-GROUP LAW — stick group `g` of every row of a
-        // `[rows, cols]` buffer sits at `g·rows·64`, rows 64 apart within the group. A rank-3
-        // `[row, head, feat]` nest over `[rows, groups, 64]` reproduces it exactly
-        // (`off([r,g,f]) = g·(rows·64) + r·64 + f`), which is what lets ONE `at_head` placement
-        // aim a clone at (row, group) on both sides without any raw address arithmetic.
-        let k_groups = plan.k_stick_groups().get();
-        let n_groups = plan.n_stick_groups().get();
-        let src_nest = Nest::new(&["row", "head", "feat"], &[m, k_groups, stk], Df::Fp16);
-        let tile_nest = Nest::new(&["row", "head", "feat"], &[ROWS, k_groups, stk], Df::Fp16);
-        let landing_nest = Nest::new(&["row", "head", "feat"], &[ROWS, n_groups, stk], Df::Fp16);
-        let out_nest = Nest::new(&["row", "head", "feat"], &[m, n_groups, stk], Df::Fp16);
-        let a_h = rb(&facts.a_name, RowCount::of_token_rows(m), k_cols);
-        let out_h = rb(&out, RowCount::of_token_rows(m), n_cols);
-        let ws_h = rb(&facts.ws_name, RowCount::of_broadcast_row(), n_cols);
-        let mut ops: Vec<EmittedOp> = Vec::new();
-        for t in 0..plan.tile_count().get() {
-            let tile = plan.tile(crate::work::Fp8GemmTileIdx::new(t));
-            let real = tile.real_rows.get();
-            let tile_id = a_id.synth_tiled(R::FqTileRow, t);
-            let tile_name = syn(layout, tile_id);
-            // ⭐ THE GEOMETRY GUARD — `synth` is idempotent per name, so a second GEMM over the
-            // same activation re-resolves the SAME tile names; if it does so at a different row
-            // class (a different plan for the same activation), the footprints disagree and the
-            // reuse is refused here, at bake, rather than silently reading the wrong-shaped clone.
-            // ⭐ THE ARM IS THE DISCRIMINATOR, not only the bytes: at `FP8_GEMM_WIDE_M` == the
-            // narrow arm's 128 alignment a wide tile and a narrow part reserve the SAME
-            // footprint, so the byte-compare alone goes blind exactly there — converged
-            // footprints do not make the staging walks agree, they hide the disagreement
-            // (defect 3's class). The arm stamp (the same reservation call, one door) refuses
-            // it first.
-            if let Some(l) = layout {
-                let want = crate::placement::synth_footprint_bytes(&[ROWS, k], Df::Fp16);
-                if let Some(have) = l.synth.borrow().sizes.get(&tile_name).copied()
-                    && have != want
-                {
-                    return Err(SuperDscError(format!(
-                        "fp8 matmul {out}: tile {t} of activation t{} was already reserved at {have} bytes but \
-                         this plan needs {want} — two GEMMs over one activation at different row \
-                         classes is a plan disagreement; it is not a resize",
-                        facts.a_tid
-                    )));
-                }
-                if l.synth.borrow().fp8_row_arms.get(&tile_name).copied() == Some(false) {
-                    return Err(SuperDscError(format!(
-                        "fp8 matmul {out}: tile {t} of activation t{} was already reserved by the \
-                         NARROW row class — this plan takes the WIDE tile at the same 128-row \
-                         footprint, and converged footprints do not make the staging walks agree \
-                         (defect 3's class); it is a plan disagreement, not a resize",
-                        facts.a_tid
-                    )));
-                }
-                l.synth_fp8_row_tile(tile_id, &[ROWS, k], true);
-            }
-            let tile_h = rb(&tile_name, r_rows, k_cols);
-            if !quantized.contains(&tile_name) {
-                // (1) THE PAD ROWS' ZERO FILL — a broadcast zero (`sub(448,448)`, the quant chain's
-                // own pad-window law) over the WHOLE tile buffer, so the rows the clone below does
-                // not reach (the pad rows, `ROWS − real` of them on the last tile) are written zero
-                // exactly as the reference's zero-padded staging writes them — never-written bytes
-                // are card nondeterminism, and a quantized zero row is the clipMin-floor scale over
-                // a zero activation, the value the reference's own pad rows carry.
-                ops.push(assemble_pointwise_broadcast_off(
-                    PointwiseFacts {
-                        op_name: &format!("{out}_fq_tz{t}_op"),
-                        op_func: "sub",
-                        rows: r_rows,
-                        cols: k_cols,
-                        inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
-                        o: &tile_h,
-                        out_offset: crate::addr::OutCorner::ZERO,
-                    },
-                    sym_id_base,
-                    layout,
-                ));
-                // (2) THE CLONE — ONE identity matmul, TIME-FOLDED over the K stick groups: the
-                // g=0 op at full shape, `time = k_groups`, each fan tensor stepping by its nest's
-                // head stride (`g·rows·64` elems — the group law the nests spell), the identity
-                // table FIXED across trips (empty stride map — `concrete_trips`' no-bump path).
-                // `concrete_trips` lands each trip at exactly the address the per-g ops
-                // carried, so the render's trips are the same ops at the same windows: the fan
-                // is the fold, not new work. (`M = real`; the source has no rows past `m`, so a
-                // full-`ROWS` read would sweep out of footprint. The pad rows keep the zero
-                // fill.)
-                let mut tc = crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                    &format!("{out}_fq_tc{t}_op"),
-                    crate::sdsc_abstract::MatM::of_token_rows(real),
-                    crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
-                    crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
-                    crate::sdsc_abstract::MatY::unbatched(),
-                    crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                        bmm_site::TapeLoweringSite::witness(),
-                    ),
-                    &a_h,
-                    OperandPlacement::at_head(&src_nest, tile.row, 0, 0, slabs),
-                    &ident_h,
-                    DevOff::ZERO,
-                    &tile_h,
-                    OperandPlacement::at_head(&tile_nest, Idx::<Row>::n(0), 0, 0, slabs),
-                    sym_id_base,
-                    layout,
-                );
-                tc.time = k_groups;
-                tc.affine_strides = vec![
-                    BTreeMap::from([("out", nest_group_stride_bytes(m, stk))]),
-                    BTreeMap::new(),
-                    BTreeMap::from([("out", nest_group_stride_bytes(ROWS, stk))]),
-                ];
-                ops.push(tc);
-                // (3) THE QUANT, OVER THE CLONE — the reference quantizes AFTER the clone
-                // (:351 then :33), and so does the law: the chain's source is the tile's fresh
-                // buffer, its tensors carry the tile index, and its ops carry it in their names.
-                ops.extend(fp8_quantize_descriptors(
-                    &Fp8QuantSource {
-                        name: tile_name.clone(),
-                        id: a_id,
-                        rows: ROWS,
-                        tile: Some(t),
-                        out_tid: facts.out_tid,
-                    },
-                    k,
-                    1,
-                    sym_id_base,
-                    layout,
-                    quantized,
-                )?);
-            }
-            // (4) THE TILE'S mm — A comes from the TYPED staging: the row class is on the type, so
-            // the mm's M and the quant's row count are one fact, and a handle at another class is
-            // refused at `staged`.
-            let staging = Fp8TileStaging::<ROWS>::staged(
-                rb_df(
-                    &syn(layout, a_id.synth_tiled(R::FqAfp8, t)),
-                    r_rows,
-                    BlockCols::of_feature_cols(k_pad),
-                    Df::Fp8,
-                ),
-                rb(
-                    &syn(layout, a_id.synth_tiled(R::FqAscale, t)),
-                    r_rows,
-                    BlockCols::of_one_stick(Lanes::FP16),
-                ),
-            )
-            .map_err(SuperDscError)?;
-            ops.push(fp8_tile_mm_op::<ROWS>(
-                &staging,
-                facts,
-                n,
-                k_pad,
-                t,
-                sym_id_base,
-                layout,
-            )?);
-            // (5) THE DEQUANT LEGS — into a TILE-LOCAL landing buffer, not the output: pointwise
-            // outputs are column-windowed only, so a tile's `[ROWS, n]` rows cannot land directly
-            // at `tile.row` of the output; they land in their own buffer and the out-splice below
-            // copies the real rows over. `ROWS`-wide (the mm wrote every row; the pad rows are
-            // zero through the zero scale path), and `In::mb` for the w_scale broadcast — `ROWS >
-            // 1` by this arm's own law (the plan only tiles at multi-row prefill).
-            let raw = syn(layout, out_id.synth_tiled(R::FqRaw, t));
-            let dqa = syn(layout, out_id.synth_tiled(R::FqDqA, t));
-            let landing = syn(layout, out_id.synth_tiled(R::FqTileRow, t));
-            if let Some(l) = layout {
-                l.synth(out_id.synth_tiled(R::FqDqA, t), &[ROWS, n]);
-                l.synth(out_id.synth_tiled(R::FqTileRow, t), &[ROWS, n]);
-            }
-            let raw_h = rb(&raw, r_rows, n_cols);
-            let dqa_h = rb(&dqa, r_rows, n_cols);
-            let landing_h = rb(&landing, r_rows, n_cols);
-            ops.push(pw2(
-                &format!("{out}_fq_dqa_t{t}_op"),
-                "mul",
-                r_rows,
-                n_cols,
-                In::full(&raw_h),
-                In::col(staging.ascale()),
-                &dqa_h,
-                sym_id_base,
-                layout,
-            ));
-            ops.push(pw2(
-                &format!("{out}_fq_dqw_t{t}_op"),
-                "mul",
-                r_rows,
-                n_cols,
-                In::full(&dqa_h),
-                In::mb(&ws_h),
-                &landing_h,
-                sym_id_base,
-                layout,
-            ));
-            // (6) THE OUT-SPLICE — the clone form again, N-side, TIME-FOLDED over the output
-            // stick groups: the c=0 op, `time = n_groups`, the landing side stepping by its
-            // ROWS-row group stride and the output side by its m-row one — the tile's real rows
-            // of each output stick group land at `tile.row` of the output. The union of the
-            // tiles' real rows covers `[0, m)` exactly (the plan's own law), so every output
-            // byte is written — one (tile, stick) trip at a time, as before.
-            let mut to = crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                &format!("{out}_fq_to{t}_op"),
-                crate::sdsc_abstract::MatM::of_token_rows(real),
-                crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &landing_h,
-                OperandPlacement::at_head(&landing_nest, Idx::<Row>::n(0), 0, 0, slabs),
-                &ident_h,
-                DevOff::ZERO,
-                &out_h,
-                OperandPlacement::at_head(&out_nest, tile.row, 0, 0, slabs),
-                sym_id_base,
-                layout,
-            );
-            to.time = n_groups;
-            to.affine_strides = vec![
-                BTreeMap::from([("out", nest_group_stride_bytes(ROWS, stk))]),
-                BTreeMap::new(),
-                BTreeMap::from([("out", nest_group_stride_bytes(m, stk))]),
-            ];
-            ops.push(to);
-        }
-        Ok(ops)
-    }
-}
-
-/// ⭐⭐⭐ THE NARROW ARM'S EMISSION CONTEXT — `Fp8TileEmit`'s runtime-rows twin, for the
-/// reference's narrow law (S3, `fp8_linear_kernel.py:343-346`): ONE part at the FULL
-/// padded 128-multiple, ANY multiple (21→128, 192→256), no upper bound. The extent is a
-/// runtime `RowCount` — a fact of the input, not of the ABI — so the context carries it
-/// where the wide context carries a const generic (`Fp8TileStaging::<ROWS>` cannot state
-/// it). Every leg is the wide context's own law at the part's extent: zero-fill the pad
-/// rows, clone the real rows, quantize the clone, contract at the staged extent, dequant
-/// into a local landing, splice the REAL rows back — S5's `out[:orig_m]` (`:362-367`).
-/// Sharing and the geometry guard are the wide context's, unchanged: keyed by the part's
-/// own name in `quantized`, footprint-compared at `synth`.
-struct Fp8NarrowEmit<'a> {
-    /// The KTIR-recovered contraction facts.
-    facts: &'a Fp8Facts,
-    /// The row-tiling plan — the one source of stick-group extents.
-    plan: &'a crate::work::Fp8GemmRowTiles,
-    /// The ONE part's row extent — the padded 128-multiple (S3).
-    rows: RowCount,
-    /// The activation's real row count (the source nest's rows, the splice's extent).
-    m: RowCount,
-    /// The contraction width.
-    k: BlockCols,
-    /// The output width.
-    n: BlockCols,
-    /// The contraction width at the packed-kernel pad — minted ONCE, here.
-    k_pad: BlockCols,
-    sym_id_base: &'a mut i64,
-    layout: Option<&'a BundleLayout>,
-    quantized: &'a mut std::collections::HashSet<String>,
-}
-
-impl<'a> Fp8NarrowEmit<'a> {
-    /// The door's arm mints the context from the plan and the class's own extent — no
-    /// shape argument exists to disagree with the plan.
-    fn new(
-        facts: &'a Fp8Facts,
-        plan: &'a crate::work::Fp8GemmRowTiles,
-        rows: RowCount,
-        sym_id_base: &'a mut i64,
-        layout: Option<&'a BundleLayout>,
-        quantized: &'a mut std::collections::HashSet<String>,
-    ) -> Self {
-        Self {
-            facts,
-            plan,
-            rows,
-            m: plan.real_rows(),
-            k: plan.contraction_width(),
-            n: plan.out_width(),
-            k_pad: BlockCols::of_feature_cols(crate::work::fp8_k_pad(
-                plan.contraction_width().get(),
-            )),
-            sym_id_base,
-            layout,
-            quantized,
-        }
-    }
-
-    /// The whole narrow arm — the reference's narrow form, copied not invented: pad the
-    /// rows UP to the 128-multiple with zeros (`:344-345` + `_pad_m`'s materialized zero
-    /// rows, `:266-271`), ONE part (`:346`), quantize the part, contract at its extent,
-    /// dequant, splice the real rows back (`:362-367`).
-    fn emit(self) -> Result<Vec<EmittedOp>, SuperDscError> {
-        use SynthRole as R;
-        let Self {
-            facts,
-            plan,
-            m,
-            rows,
-            k,
-            n,
-            k_pad,
-            sym_id_base,
-            layout,
-            quantized,
-        } = self;
-        let (m, rows, k, n, k_pad) = (m.get(), rows.get(), k.get(), n.get(), k_pad.get());
-        let stk = Fp16::ELEMS_PER_STICK; // 64
-        let out = crate::place::act_name(facts.out_tid);
-        let a_id = PlaceId::Act(facts.a_tid);
-        let out_id = PlaceId::Act(facts.out_tid);
-        let r_rows = RowCount::of_token_rows(rows);
-        let k_cols = BlockCols::of_feature_cols(k);
-        let n_cols = BlockCols::of_feature_cols(n);
-        let slabs = Slabs::new(1);
-        // ⭐ THE IDENTITY TABLE — the same [`stk`,`stk`] registry entry the card-proven KV-cache
-        // write's clone reads. A tape that registers no hd-`stk` class cannot tile rows: the
-        // refusal names the table, never a fallback copy form (there is none — pointwise outputs
-        // are column-windowed, so the identity matmul is the only placed-row copy this compiler
-        // has).
-        let ident = layout
-            .and_then(|l| l.identity_tid_of_class(stk))
-            .ok_or_else(|| {
-                SuperDscError(format!(
-                    "fp8 matmul {out}: the narrow law's clone reads the [{stk},{stk}] identity \
-                 table, and this tape registers no hd-{stk} class — a tape without the table \
-                 cannot run a padded part"
-                ))
-            })?;
-        let ident_h = Stk::<KernelTag>::one_stick_identity(crate::place::act_name(ident));
-        let pos448 = rbo(&crate::place::act_name(FP8_POS448_TID));
-        // ⭐ THE NESTS SPELL THE ROWBLOCKED STICK-GROUP LAW — stick group `g` of every row of a
-        // `[rows, cols]` buffer sits at `g·rows·64`, rows 64 apart within the group. A rank-3
-        // `[row, head, feat]` nest over `[rows, groups, 64]` reproduces it exactly
-        // (`off([r,g,f]) = g·(rows·64) + r·64 + f`), which is what lets ONE `at_head` placement
-        // aim a clone at (row, group) on both sides without any raw address arithmetic.
-        let k_groups = plan.k_stick_groups().get();
-        let n_groups = plan.n_stick_groups().get();
-        let src_nest = Nest::new(&["row", "head", "feat"], &[m, k_groups, stk], Df::Fp16);
-        let part_nest = Nest::new(&["row", "head", "feat"], &[rows, k_groups, stk], Df::Fp16);
-        let landing_nest = Nest::new(&["row", "head", "feat"], &[rows, n_groups, stk], Df::Fp16);
-        let out_nest = Nest::new(&["row", "head", "feat"], &[m, n_groups, stk], Df::Fp16);
-        let a_h = rb(&facts.a_name, RowCount::of_token_rows(m), k_cols);
-        let out_h = rb(&out, RowCount::of_token_rows(m), n_cols);
-        let ws_h = rb(&facts.ws_name, RowCount::of_broadcast_row(), n_cols);
-        let mut ops: Vec<EmittedOp> = Vec::new();
-        // THE ONE PART — tile index 0: the narrow law has exactly one row part (`:346`,
-        // `m_parts = [padded]`), so the staging names carry t0 and the geometry guard pins
-        // the part's footprint exactly as a wide tile's.
-        let t = 0u32;
-        let tile_id = a_id.synth_tiled(R::FqTileRow, t);
-        let tile_name = syn(layout, tile_id);
-        // ⭐ THE GEOMETRY GUARD — `synth` is idempotent per name, so a second GEMM over the
-        // same activation re-resolves the SAME part names; if it does so at a different row
-        // class (a different plan for the same activation), the footprints disagree and the
-        // reuse is refused here, at bake, rather than silently reading the wrong-shaped part.
-        // ⭐ THE ARM IS THE DISCRIMINATOR, not only the bytes: at `FP8_GEMM_WIDE_M` == the
-        // narrow arm's 128 alignment a wide tile and a narrow part reserve the SAME
-        // footprint, so the byte-compare alone goes blind exactly there — converged
-        // footprints do not make the staging walks agree, they hide the disagreement
-        // (defect 3's class). The arm stamp (the same reservation call, one door) refuses
-        // it first.
-        if let Some(l) = layout {
-            let want = crate::placement::synth_footprint_bytes(&[rows, k], Df::Fp16);
-            if let Some(have) = l.synth.borrow().sizes.get(&tile_name).copied()
-                && have != want
-            {
-                return Err(SuperDscError(format!(
-                    "fp8 matmul {out}: part t{t} of activation t{} was already reserved at {have} bytes but \
-                     this plan needs {want} — two GEMMs over one activation at different row \
-                     classes is a plan disagreement; it is not a resize",
-                    facts.a_tid
-                )));
-            }
-            if l.synth.borrow().fp8_row_arms.get(&tile_name).copied() == Some(true) {
-                return Err(SuperDscError(format!(
-                    "fp8 matmul {out}: part t{t} of activation t{} was already reserved by the \
-                     WIDE row class — this plan takes the NARROW part at the same 128-row \
-                     footprint, and converged footprints do not make the staging walks agree \
-                     (defect 3's class); it is a plan disagreement, not a resize",
-                    facts.a_tid
-                )));
-            }
-            l.synth_fp8_row_tile(tile_id, &[rows, k], false);
-        }
-        let tile_h = rb(&tile_name, r_rows, k_cols);
-        if !quantized.contains(&tile_name) {
-            // (1) THE PAD ROWS' ZERO FILL — a broadcast zero (`sub(448,448)`, the quant chain's
-            // own pad-window law) over the WHOLE part buffer, so the rows the clone below does
-            // not reach (the pad rows, `rows − m` of them) are written zero exactly as the
-            // reference's `_pad_m` materializes them (`:266-271`, `:344-345`) — never-written
-            // bytes are card nondeterminism, and a quantized zero row is the clipMin-floor
-            // scale over a zero activation, the value the reference's own pad rows carry.
-            ops.push(assemble_pointwise_broadcast_off(
-                PointwiseFacts {
-                    op_name: &format!("{out}_fq_tz{t}_op"),
-                    op_func: "sub",
-                    rows: r_rows,
-                    cols: k_cols,
-                    inputs: &[In::scalar(&pos448).ew(), In::scalar(&pos448).ew()],
-                    o: &tile_h,
-                    out_offset: crate::addr::OutCorner::ZERO,
-                },
-                sym_id_base,
-                layout,
-            ));
-            // (2) THE CLONE — one identity matmul per stick group, copying the part's REAL rows
-            // (`M = m`; the source has no rows past `m`, so a full-`rows` read would sweep out
-            // of footprint). The pad rows keep the zero fill.
-            for g in 0..k_groups {
-                ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                    &format!("{out}_fq_tc{t}g{g}_op"),
-                    crate::sdsc_abstract::MatM::of_token_rows(m),
-                    crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
-                    crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
-                    crate::sdsc_abstract::MatY::unbatched(),
-                    crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                        bmm_site::TapeLoweringSite::witness(),
-                    ),
-                    &a_h,
-                    OperandPlacement::at_head(&src_nest, Idx::<Row>::n(0), g, 0, slabs),
-                    &ident_h,
-                    DevOff::ZERO,
-                    &tile_h,
-                    OperandPlacement::at_head(&part_nest, Idx::<Row>::n(0), g, 0, slabs),
-                    sym_id_base,
-                    layout,
-                ));
-            }
-            // (3) THE QUANT, OVER THE PART — the reference quantizes the padded part whole
-            // (`xi = x2d[i:i+mt].clone()` at `mt` = the padded extent, `:350-351`), pad rows
-            // included: they quantize to zero, exactly the wide path's own pad law.
-            ops.extend(fp8_quantize_descriptors(
-                &Fp8QuantSource {
-                    name: tile_name.clone(),
-                    id: a_id,
-                    rows,
-                    tile: Some(t),
-                    out_tid: facts.out_tid,
-                },
-                k,
-                1,
-                sym_id_base,
-                layout,
-                quantized,
-            )?);
-        }
-        // (4) THE PART'S mm — A comes from the TYPED staging: the extent is on the staging,
-        // so the mm's M and the quant's row count are one fact, and a handle at another
-        // extent is refused at `staged`.
-        let staging = Fp8NarrowStaging::staged(
-            r_rows,
-            rb_df(
-                &syn(layout, a_id.synth_tiled(R::FqAfp8, t)),
-                r_rows,
-                BlockCols::of_feature_cols(k_pad),
-                Df::Fp8,
-            ),
-            rb(
-                &syn(layout, a_id.synth_tiled(R::FqAscale, t)),
-                r_rows,
-                BlockCols::of_one_stick(Lanes::FP16),
-            ),
-        )
-        .map_err(SuperDscError)?;
-        ops.push(fp8_narrow_mm_op(
-            &staging,
-            facts,
-            n,
-            k_pad,
-            sym_id_base,
-            layout,
-        )?);
-        // (5) THE DEQUANT LEGS — into a PART-LOCAL landing buffer, not the output: pointwise
-        // outputs are column-windowed only, so the part's `[rows, n]` rows cannot land
-        // directly in the output; they land in their own buffer and the out-splice below
-        // copies the real rows over. `rows`-wide (the mm wrote every row; the pad rows are
-        // zero through the zero scale path), and `In::mb` for the w_scale broadcast.
-        let raw = syn(layout, out_id.synth_tiled(R::FqRaw, t));
-        let dqa = syn(layout, out_id.synth_tiled(R::FqDqA, t));
-        let landing = syn(layout, out_id.synth_tiled(R::FqTileRow, t));
-        if let Some(l) = layout {
-            l.synth(out_id.synth_tiled(R::FqDqA, t), &[rows, n]);
-            l.synth(out_id.synth_tiled(R::FqTileRow, t), &[rows, n]);
-        }
-        let raw_h = rb(&raw, r_rows, n_cols);
-        let dqa_h = rb(&dqa, r_rows, n_cols);
-        let landing_h = rb(&landing, r_rows, n_cols);
-        ops.push(pw2(
-            &format!("{out}_fq_dqa_t{t}_op"),
-            "mul",
-            r_rows,
-            n_cols,
-            In::full(&raw_h),
-            In::col(staging.ascale()),
-            &dqa_h,
-            sym_id_base,
-            layout,
-        ));
-        ops.push(pw2(
-            &format!("{out}_fq_dqw_t{t}_op"),
-            "mul",
-            r_rows,
-            n_cols,
-            In::full(&dqa_h),
-            In::mb(&ws_h),
-            &landing_h,
-            sym_id_base,
-            layout,
-        ));
-        // (6) THE OUT-SPLICE — the clone form again, N-side: the part's REAL rows (`m` of
-        // them — S5's `out[:orig_m].clone()`, `:362-367`) of each output stick group land
-        // at row 0 of the output. The part starts at row 0 (`m_parts = [padded]`, one part),
-        // and exactly `[0, m)` is written — the pad rows never reach the output.
-        for c in 0..n_groups {
-            ops.push(crate::ir::bridge::tiled_op_sdsc_op::assemble_matmul_placed(
-                &format!("{out}_fq_to{t}c{c}_op"),
-                crate::sdsc_abstract::MatM::of_token_rows(m),
-                crate::sdsc_abstract::MatN::one_stick(Lanes::FP16),
-                crate::sdsc_abstract::MatK::one_stick(Lanes::FP16),
-                crate::sdsc_abstract::MatY::unbatched(),
-                crate::ir::bridge::tiled_op_sdsc_op::SharedKernelBmmForm::batch_inner_proven(
-                    bmm_site::TapeLoweringSite::witness(),
-                ),
-                &landing_h,
-                OperandPlacement::at_head(&landing_nest, Idx::<Row>::n(0), c, 0, slabs),
-                &ident_h,
-                DevOff::ZERO,
-                &out_h,
-                OperandPlacement::at_head(&out_nest, Idx::<Row>::n(0), c, 0, slabs),
-                sym_id_base,
-                layout,
-            ));
-        }
-        Ok(ops)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1641,23 +755,9 @@ mod tests {
         place(8, n, k, SegRole::Weight, &mut l); // the fp8 weight (fp16-sized reservation is fine)
         place(9, 1, n, SegRole::Activation, &mut l); // w_scale
         place(10, m, n, SegRole::Activation, &mut l); // out_tid
-        place(11, m, n, SegRole::Activation, &mut l); // a second GEMM's out_tid (the sharing tests)
         for tid in [FP8_POS448_TID, FP8_NEG448_TID, FP8_INV448_TID] {
             place(tid, 1, Fp16::ELEMS_PER_STICK, SegRole::Activation, &mut l);
         }
-        // ⭐ THE IDENTITY TABLE — the row-tiled law's clone reads the same `[64,64]` registry
-        // entry the card-proven KV-cache write's clone does: one attention class at hd=64,
-        // class 0 = `IDENTITY_TID` (the widest). Placed LAST so no earlier tensor's absolute
-        // offset moves — the per-pair tail tests read address DELTAS, and those must stay
-        // pinned to the tail law alone.
-        l.attn_class_hds = vec![Fp16::ELEMS_PER_STICK];
-        place(
-            crate::reserved_tids::IDENTITY_TID,
-            Fp16::ELEMS_PER_STICK,
-            Fp16::ELEMS_PER_STICK,
-            SegRole::Activation,
-            &mut l,
-        );
         l
     }
 
@@ -1685,25 +785,13 @@ mod tests {
     /// `out`, so `rewrite_op_for_time_tile` strides them per trip and the bake accepts them. A
     /// REDUCE accum is `RedStick` — exempt from the stride — which is the defect class, so the
     /// reduce is what this pins.)
-    /// The reduce law belongs to the CHAIN, so this pins it with a direct chain call — the
-    /// door itself rows-tiles this geometry now (`work::Fp8GemmRowTiles`: k ≥ 4096 is wide),
-    /// and the tile's own quant runs at the ABI row class where the budget is never in
-    /// question. The chain still serves callers at whole-tensor row counts (the expert
-    /// door's per-chunk activations), so the single-shot law is pinned where it lives.
     #[test]
     fn the_quant_reduce_at_an_lx_overflowing_geometry_stays_single_shot() {
         let (m, k, n) = (1024u32, 16384, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
-        let ops = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), m),
-            k,
-            1,
-            &mut 0,
-            Some(&l),
-            &mut quantized,
-        )
-        .expect("the wide-geometry fp8 chain emits");
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the wide-geometry fp8 chain emits");
         // The chain's ONE reduce — the fused quantscalepertokenfp8 — must be single-shot.
         let tiled: Vec<&str> = ops
             .iter()
@@ -1744,15 +832,8 @@ mod tests {
         let (m, k, n) = (71u32, 15360, 3840);
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
-        let ops = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), m),
-            k,
-            1,
-            &mut 0,
-            Some(&l),
-            &mut quantized,
-        )
-        .expect("the fused-overflowing fp8 quant chain emits");
+        let ops = fp8_quantize_descriptors(&facts(), m, k, 1, &mut 0, Some(&l), &mut quantized)
+            .expect("the fused-overflowing fp8 quant chain emits");
         assert!(
             ops.iter()
                 .all(|o| !o.op_name.contains("fq_qspt") || o.time == 1),
@@ -1783,11 +864,10 @@ mod tests {
     /// ⭐ THE FITTING CASE IS ONE FUSED OP: at a geometry the tiler passes (decode m=1, and
     /// every granite fp8 prefill), the quant chain's amax is the ONE `fq_qspt_op` and NO
     /// explicit amax-family op exists. Pins that no partial path can fire where the fused op
-    /// was correct. (m=4 keeps the door on its DENSE arm — `Fp8GemmRowTiles`'s small-M law
-    /// runs rows ≤ 4 whole — so this pins the chain the shipped bundles run.)
+    /// was correct.
     #[test]
     fn the_quant_chain_at_a_fitting_geometry_is_one_fused_op() {
-        let (m, k, n) = (4u32, 2048, 128);
+        let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
@@ -1879,11 +959,9 @@ mod tests {
     /// ⭐ THE ALIGNED CASE IS BYTE-IDENTICAL: at a 128-aligned k (every earlier fp8 model), no
     /// zero-fill op exists, no widened reservation exists, and the chain is exactly the ops the
     /// pre-pad emitter produced. Pins that the pad cannot fire where the width was already legal.
-    /// (m=128 keeps the door on its DENSE arm — `Fp8GemmRowTiles`'s narrow law runs a
-    /// 128-aligned row count whole.)
     #[test]
     fn an_aligned_k_emits_no_pad_op_and_no_widened_reservation() {
-        let (m, k, n) = (128u32, 2048, 128);
+        let (m, k, n) = (32u32, 2048, 128);
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
         let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
@@ -1902,6 +980,27 @@ mod tests {
             m as u64 * k as u64 * 2,
             "cl owns [m, k] fp16 — no widening"
         );
+    }
+
+    /// ⭐⭐⭐⭐⭐ THE 26b UP/GATE GEMM: k=2816 (128-ALIGNED) but n=2112 (16.5 fp8 KERNEL sticks).
+    /// The packed fp8 weight is `[n, k]` sticked on `out` (= n) — `view_stick_layout`'s
+    /// `DeviceTileLayout::<Fp8>` guard (emit/mod.rs) refuses a non-128-multiple OUT the same way
+    /// the convert refused a non-128-multiple K. This test REPRODUCES the pod panic locally:
+    /// the phase-2 build died at `matmul_s20` (the 26b gate projection) with exactly this
+    /// geometry, while the DOWN gemm (k=2112, n=2816) — the geometry the K-pad test covers —
+    /// was already fixed by the K-pad commit.
+    #[test]
+    fn the_26b_n2112_packed_kernel_out_stick() {
+        let (m, k, n) = (1u32, 2816, 2112);
+        let l = fp8_layout(m, k, n);
+        let mut quantized = std::collections::HashSet::new();
+        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
+            .expect("the n=2112 packed-kernel fp8 chain emits (the 26b gate gemm wall is gone)");
+        assert!(
+            !ops.iter().any(|o| o.op_name.ends_with("fq_zfpad_op")),
+            "an aligned k needs no K-pad"
+        );
+        let _ = ops;
     }
 
     /// An operand's own HBM start (core 0's allocate-node address for the binding whose buffer
@@ -1955,15 +1054,8 @@ mod tests {
         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
-        let ops = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), m),
-            k,
-            pairs,
-            &mut 0,
-            Some(&l),
-            &mut quantized,
-        )
-        .expect("the per-pair tail emits at the 26b DOWN geometry");
+        let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
+            .expect("the per-pair tail emits at the 26b DOWN geometry");
         // EIGHT converts, named per pair.
         let first = ops
             .iter()
@@ -2066,15 +1158,8 @@ mod tests {
         let k = pairs * inn;
         let l = fp8_layout(m, k, n);
         let mut quantized = std::collections::HashSet::new();
-        let ops = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), m),
-            k,
-            pairs,
-            &mut 0,
-            Some(&l),
-            &mut quantized,
-        )
-        .expect("the aligned-inn pair chain emits");
+        let ops = fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l), &mut quantized)
+            .expect("the aligned-inn pair chain emits");
         assert_eq!(
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
@@ -2117,14 +1202,7 @@ mod tests {
     fn the_per_pair_tail_refuses_a_non_whole_lane_count_and_pads_per_slot_at_prefill() {
         let l = fp8_layout(1, 9, 128);
         let mut quantized = std::collections::HashSet::new();
-        let e = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), 1),
-            9,
-            2,
-            &mut 0,
-            Some(&l),
-            &mut quantized,
-        );
+        let e = fp8_quantize_descriptors(&facts(), 1, 9, 2, &mut 0, Some(&l), &mut quantized);
         assert!(
             e.is_err(),
             "k=9 over pairs=2 has no whole lane count per pair — a typed refusal, not a bake"
@@ -2141,15 +1219,9 @@ mod tests {
         let (k_pad, cl_reach) = (pairs * inn_pad, (pairs - 1) * inn + inn_pad);
         let l2 = fp8_layout(m, k, 128);
         let mut quantized2 = std::collections::HashSet::new();
-        let ops2 = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), m),
-            k,
-            pairs,
-            &mut 0,
-            Some(&l2),
-            &mut quantized2,
-        )
-        .expect("the half-stick tail emits at m>1 — the per-slot §4.5 arms");
+        let ops2 =
+            fp8_quantize_descriptors(&facts(), m, k, pairs, &mut 0, Some(&l2), &mut quantized2)
+                .expect("the half-stick tail emits at m>1 — the per-slot §4.5 arms");
         assert_eq!(
             ops2.iter()
                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
@@ -2247,15 +1319,9 @@ mod tests {
         // EMITS — one whole-tensor convert, the m-generic form the prefill door consumes.
         let l3 = fp8_layout(2, 2048, 128);
         let mut quantized3 = std::collections::HashSet::new();
-        let ops = fp8_quantize_descriptors(
-            &Fp8QuantSource::activation(&facts(), 2),
-            2048,
-            2,
-            &mut 0,
-            Some(&l3),
-            &mut quantized3,
-        )
-        .expect("the aligned-inn pair chain emits at m=2");
+        let ops =
+            fp8_quantize_descriptors(&facts(), 2, 2048, 2, &mut 0, Some(&l3), &mut quantized3)
+                .expect("the aligned-inn pair chain emits at m=2");
         assert_eq!(
             ops.iter()
                 .filter(|o| o.op_name.ends_with("fq_afp8_op"))
@@ -2266,232 +1332,6 @@ mod tests {
         assert!(
             !ops.iter().any(|o| o.op_name.contains("fq_afp8_p")),
             "no per-pair convert at an aligned inn, prefill included"
-        );
-    }
-
-    /// ⭐⭐⭐⭐⭐ THE WIDE PREFILL TILES ITS ROWS AND SPLICES THE REAL ONES BACK — the defect-3
-    /// geometry itself (granite-2b q/k/v at m=21, k=2048, n=3072: 3×1024 output tiles ⇒ wide).
-    /// The door must emit the row-tiled law, whole: per tile a zero-fill (`fq_tz`), one clone
-    /// per K stick group (`fq_tc`), the quant chain over the CLONE (its ops carrying the tile
-    /// index — never the dense staging's shared `fq_afp8_op`, the torn walk this law replaces),
-    /// one mm, the two dequant legs, and one TIME-FOLDED out-copy per tile (`fq_to`, the N
-    /// stick groups its trips). The counts are the plan's own: 1 tile of 128 rows (21 padded
-    /// to 128), 32 K groups, 48 N groups.
-    #[test]
-    fn the_wide_prefill_tiles_its_rows_and_splices_the_real_ones_back() {
-        let (m, k, n) = (21u32, 2048, 3072);
-        let plan = crate::work::Fp8GemmRowTiles::of(
-            RowCount::of_token_rows(m),
-            BlockCols::of_feature_cols(k),
-            BlockCols::of_feature_cols(n),
-        )
-        .expect("the granite-2b qkv geometry plans");
-        assert_eq!(
-            (plan.tile_rows(), plan.tile_count(), plan.total_rows()),
-            (
-                RowCount::of_token_rows(128),
-                crate::work::Fp8GemmTileCount::new(1),
-                RowCount::of_token_rows(128)
-            ),
-            "21 rows pad UP to the one 128-row tile — never a trailing short tile"
-        );
-        let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
-        let ops = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the wide prefill emits the row-tiled law");
-        let n_named = |pfx: &str| {
-            ops.iter()
-                .filter(|o| o.op_name.starts_with(pfx) && o.op_name.ends_with("_op"))
-                .count()
-        };
-        assert_eq!(n_named("t10_fq_tz"), 1, "one pad zero-fill per tile");
-        assert_eq!(
-            n_named("t10_fq_tc"),
-            1,
-            "one TIME-FOLDED clone per tile — the K stick groups are its trips (1×32)"
-        );
-        assert_eq!(n_named("t10_fq_qspt"), 1, "the quant chain runs per tile");
-        assert_eq!(n_named("t10_fq_mm_t"), 1, "one tile mm per tile");
-        assert_eq!(
-            n_named("t10_fq_dqa_t"),
-            1,
-            "one a-scale dequant leg per tile"
-        );
-        assert_eq!(
-            n_named("t10_fq_dqw_t"),
-            1,
-            "one w-scale dequant leg per tile"
-        );
-        assert_eq!(
-            n_named("t10_fq_to"),
-            1,
-            "one TIME-FOLDED out-copy per tile — the N stick groups are its trips (1×48)"
-        );
-        // ⭐ THE FANS ARE FOLDS — one op per tile, the stick groups its trips: `time` carries
-        // the count, `concrete_trips` materializes the per-group windows, each fan tensor
-        // steps by its nest's own group stride, and the identity table stays FIXED (empty
-        // stride map — the no-bump path).
-        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_tc")) {
-            assert_eq!(
-                o.time, 32,
-                "{}: the clone folds the 32 K stick groups",
-                o.op_name
-            );
-            assert_eq!(
-                o.concrete_trips().len(),
-                32,
-                "{}: the clone's trips are the 32 K stick-group windows",
-                o.op_name
-            );
-            assert_eq!(
-                o.affine_strides[0].get("out"),
-                Some(&nest_group_stride_bytes(m, 64)),
-                "{}: the A side steps by the source nest's group stride",
-                o.op_name
-            );
-            assert_eq!(
-                o.affine_strides[2].get("out"),
-                Some(&nest_group_stride_bytes(128, 64)),
-                "{}: the C side steps by the tile nest's group stride",
-                o.op_name
-            );
-            assert!(
-                o.affine_strides[1].is_empty(),
-                "{}: the identity table is fixed across trips",
-                o.op_name
-            );
-        }
-        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_to")) {
-            assert_eq!(
-                o.time, 48,
-                "{}: the splice folds the 48 N stick groups",
-                o.op_name
-            );
-            assert_eq!(
-                o.concrete_trips().len(),
-                48,
-                "{}: the splice's trips are the 48 N stick-group windows",
-                o.op_name
-            );
-            assert_eq!(
-                o.affine_strides[0].get("out"),
-                Some(&nest_group_stride_bytes(128, 64)),
-                "{}: the landing side steps by the tile nest's group stride",
-                o.op_name
-            );
-            assert_eq!(
-                o.affine_strides[2].get("out"),
-                Some(&nest_group_stride_bytes(m, 64)),
-                "{}: the output side steps by the output nest's group stride",
-                o.op_name
-            );
-            assert!(
-                o.affine_strides[1].is_empty(),
-                "{}: the identity table is fixed across trips",
-                o.op_name
-            );
-        }
-        // ⛔ THE TORN STAGING IS GONE: no op carries the DENSE law's shared convert name —
-        // every quant tensor and op is tile-indexed, so the quant walk and the mm's A walk
-        // spell ONE buffer's layout (the one-mint law).
-        assert!(
-            !ops.iter().any(|o| o.op_name.ends_with("fq_afp8_op")),
-            "the dense law's shared fq_afp8_op must not exist at a tiled geometry"
-        );
-        // Every tile mm reads ITS OWN staged afp8 (the typed staging's name, tile-indexed).
-        for o in ops.iter().filter(|o| o.op_name.starts_with("t10_fq_mm_t")) {
-            assert!(
-                o.arg_bindings
-                    .iter()
-                    .any(|b| b.is_input && b.buffer.contains("fq_afp8t")),
-                "{}: the tile mm binds the tile's own staged afp8",
-                o.op_name
-            );
-        }
-        // The staging reservations, at the TILE's row class: the clone `[128, k]` fp16 and the
-        // quantized `[128, k_pad]` fp8 (k is 128-aligned here, so k_pad == k).
-        let s = l.synth.borrow();
-        let a7 = PlaceId::Act(7);
-        let clone_sz = s
-            .sizes
-            .get(&a7.synth_tiled(SynthRole::FqTileRow, 0).to_string())
-            .expect("the tile clone is placed");
-        assert_eq!(
-            *clone_sz,
-            128u64 * k as u64 * 2,
-            "tile 0's clone owns [128, k] fp16"
-        );
-        let afp8_sz = s
-            .sizes
-            .get(&a7.synth_tiled(SynthRole::FqAfp8, 0).to_string())
-            .expect("the tile afp8 is placed");
-        assert_eq!(
-            *afp8_sz,
-            128u64 * k as u64,
-            "tile 0's afp8 owns [128, k_pad] fp8 (1 B/elem)"
-        );
-    }
-
-    /// ⭐ THE SECOND GEMM AT THE SAME PLAN REUSES THE TILE STAGING — the dense law's own
-    /// sharing (K/V after Q, Up after Gate), at tile grain: the clone, the zero-fill, and the
-    /// quant chain are keyed by the TILE's name in `quantized`, so only the per-matmul legs
-    /// (mm, dequant, out-splice) are emitted again, under the second output's namespace.
-    #[test]
-    fn a_second_gemm_at_the_same_plan_reuses_the_tile_staging() {
-        let (m, k, n) = (21u32, 2048, 3072);
-        let l = fp8_layout(m, k, n);
-        let mut quantized = std::collections::HashSet::new();
-        let f2 = Fp8Facts {
-            a_tid: 7,
-            a_name: act_name(7),
-            w_name: act_name(8),
-            ws_name: act_name(9),
-            out_tid: 11,
-        };
-        let _ = matmul_fp8_descriptors(&facts(), m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the first GEMM emits");
-        let ops2 = matmul_fp8_descriptors(&f2, m, k, n, &mut 0, Some(&l), &mut quantized)
-            .expect("the second GEMM over the same activation emits");
-        let n_named = |pfx: &str| {
-            ops2.iter()
-                .filter(|o| o.op_name.starts_with(pfx) && o.op_name.ends_with("_op"))
-                .count()
-        };
-        assert_eq!(n_named("t11_fq_tz"), 0, "no second zero-fill");
-        assert_eq!(n_named("t11_fq_tc"), 0, "no second clone");
-        assert_eq!(n_named("t11_fq_qspt"), 0, "no second quant chain");
-        assert_eq!(
-            n_named("t11_fq_mm_t"),
-            1,
-            "the per-matmul mm legs still run per tile"
-        );
-    }
-
-    /// ⛔ THE PLAN DISAGREEMENT IS A REFUSAL, NOT A RESIZE: a second GEMM over the SAME
-    /// activation whose own geometry takes the NARROW row class (n=128: one ABI tile, so the
-    /// rows run whole at the 128 alignment) would re-resolve the SAME tile names at a
-    /// different row class. `synth` is idempotent per name, so without the geometry guard
-    /// that reuse would be silent — and at this convergence the footprint compare is BLIND
-    /// (the narrow part's [128, k] is the wide tile's own bytes), so the refusal is the ARM
-    /// guard's: the stamp `fp8_row_arms` minted by the first (wide) call is the discriminator.
-    #[test]
-    fn a_second_gemm_at_a_different_row_class_refuses() {
-        let (m, k) = (21u32, 2048);
-        let l = fp8_layout(m, k, 3072);
-        let mut quantized = std::collections::HashSet::new();
-        let _ = matmul_fp8_descriptors(&facts(), m, k, 3072, &mut 0, Some(&l), &mut quantized)
-            .expect("the wide GEMM emits and reserves its tiles");
-        let e = matmul_fp8_descriptors(&facts(), m, k, 128, &mut 0, Some(&l), &mut quantized)
-            .err()
-            .expect(
-                "a second GEMM re-tiling the same activation at another row class is a \
-                 plan disagreement — refused at bake, never a silent resize",
-            );
-        let msg = e.to_string();
-        assert!(
-            msg.contains("WIDE row class"),
-            "the refusal must be the ARM guard's own text (wide-then-narrow at converged \
-             footprints), not some earlier door refusal: {msg}"
         );
     }
 }

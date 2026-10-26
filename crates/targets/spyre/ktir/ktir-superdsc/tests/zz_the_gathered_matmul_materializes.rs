@@ -1287,3 +1287,104 @@ fn a_one_slice_table_without_a_reach_still_refuses_at_the_placement() {
         "the un-reached table keeps the swept-window law -- got {e}"
     );
 }
+
+// ── THE LEG-REACH PIN (defect C, RE-POINTED at the carrier form) ───────────────────────────
+//
+// The gathered fact's two halves: the STAGING half (the bundle's layout reserves an index tensor)
+// and the ADDRESSING half (`EmittedOp::kv_gathered`, which the runtime's page-base composition
+// asks — `nonfold_page_delta` and the composed chunk index). Defect C was the ONE-SHOT attention
+// carriers minting the addressing half FALSE while reading the fill-staged region form, so the
+// runtime composed the page base on top of the operand's own pool base and attention read one page
+// past its keys. The cure states the fact at the CARRIER's mint (`EmittedOp::paged_region`, the
+// one door) and stamps it in the walk onto every op lowered from that carrier — so the DOOR no
+// longer stamps anything, and this pin holds the ONE-STAMPING-SITE law at the door the corpus
+// drives, in all three cases:
+//
+//   * a POOL-PLANE reach (`GatherReach::of_plane`)      ⇒ the door's ops carry `false` — the
+//     fact is the carrier's to state, and a door stamp would be a SECOND writer for the same
+//     fact on the same ops (the parked general-door class; no non-carrier pool program exists
+//     in the tree's models today);
+//   * NO reach (a sweep that fits its placement)        ⇒ every op carries `false`;
+//   * a SOURCE-EXTENT reach (`of_source_extent`)        ⇒ every op carries `false`.
+//
+// The walk's region stamp is pinned where it lives, in the spyre crate's own corpus — this file
+// can only see the door.
+#[test]
+fn the_leg_reach_law_three_cases() {
+    // ⭐ CASE 1 — POOL-PLANE: the pooled-table statement's own shape (a one-entry slice placement
+    // under an `of_plane` reach), and the door must NOT stamp it — the carrier mint is the one
+    // writer. A `true` here would be a second stamping site for the addressing fact, the desync
+    // the one-door law exists to prevent.
+    let k = paged_program(GatheredSlot::B);
+    let reach = fixture_reach(1).expect("hd=1 states the fixture's own entry unit");
+    let ops = emitted_with(&k, &pooled_layout_for(&k, reach))
+        .expect("a pooled table's gather is bounded by its reach, not its slice placement");
+    assert_eq!(
+        ops.len(),
+        3,
+        "the pooled gather emits two copy legs and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    for o in &ops {
+        assert!(
+            !o.kv_gathered,
+            "the door does not stamp the gathered bit -- the carrier mint \
+             (EmittedOp::paged_region) is the ONE writer: {:?}",
+            o.op_name
+        );
+    }
+
+    // ⛔ CASE 2 — NO REACH: the whole-placed table whose sweep fits, the embedding's own
+    // card-proven shape. Nothing here addresses a pool, so every op must carry `false`.
+    let ops = emitted_with(&k, &layout_for(&k, GatheredSlot::B))
+        .expect("a fitting sweep keeps the swept-window law, byte for byte");
+    assert_eq!(
+        ops.len(),
+        3,
+        "the fitting sweep emits the same two copy legs and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    for o in &ops {
+        assert!(
+            !o.kv_gathered,
+            "an op with no declared reach carries no gathered bit: {:?}",
+            o.op_name
+        );
+    }
+
+    // ⛔ CASE 3 — SOURCE-EXTENT: the whole-placed-source statement's own admitted arm (the table
+    // shrunk to 16 rows under an `of_source_extent(16, HEAD)` reach). The presence of a reach is
+    // NOT the pool fact — the entries are rows of the placement itself, not stick-blocks of a
+    // pool — so every op must carry `false`. A presence-keyed stamp would fail exactly here.
+    let k = paged_program(GatheredSlot::A);
+    let shrink = |l: &mut BundleLayout| {
+        let tid = k.bindings[1].get();
+        l.placements
+            .get_mut(&tid)
+            .expect("the table is placed")
+            .size = 16 * HEAD as u64 * 2;
+    };
+    let reach = ktir_superdsc::sdsc_abstract::GatherReach::of_source_extent(16, HEAD as u64)
+        .expect("16 rows at a 64-element unit is a legal source extent");
+    let mut l = layout_for(&k, GatheredSlot::A);
+    shrink(&mut l);
+    l.gather_reach.insert(k.bindings[1].get(), reach);
+    let ops = emitted_with(&k, &l).expect(
+        "a repeat gather admits under a declared source-extent reach: the values name rows of \
+         the placed source",
+    );
+    assert_eq!(
+        ops.len(),
+        3,
+        "the repeat gather emits the same two copy legs and the contraction -- got {:?}",
+        ops.iter().map(|o| o.op_name.clone()).collect::<Vec<_>>()
+    );
+    for o in &ops {
+        assert!(
+            !o.kv_gathered,
+            "a SOURCE-EXTENT reach's op carries no gathered bit -- the family, not the presence, \
+             is the fact: {:?}",
+            o.op_name
+        );
+    }
+}

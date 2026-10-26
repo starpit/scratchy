@@ -529,14 +529,6 @@ pub struct SynthAlloc {
     /// that no access exceeds it — an out-of-footprint access is a shape mismatch and a
     /// `cargo build` Err, not silent on-card aliasing.
     pub sizes: std::collections::BTreeMap<String, u64>,
-    /// ⭐ THE fp8 ROW-TILE ARM per synth name (`true` = the wide tile, `false` = the narrow
-    /// part) — stamped by the SAME reservation call that mints the tile
-    /// ([`BundleLayout::synth_fp8_row_tile`]), never a second site. The plan-disagreement
-    /// guards in `emit/ktir_matmul_fp8.rs` read it: at `FP8_GEMM_WIDE_M` == the narrow
-    /// arm's 128 alignment the two arms' footprints CONVERGE, so the byte-compare alone
-    /// cannot tell a wide tile from a narrow part — the arm is the discriminator, and a
-    /// disagreement is refused at bake, never silently reused.
-    pub fp8_row_arms: std::collections::BTreeMap<String, bool>,
 }
 
 /// LX scratchpad size per core: 2 MiB (`sysdef.cpp:587`, `lxSize = 2L*1024*1024`).
@@ -985,22 +977,6 @@ impl BundleLayout {
     /// guess. `synth(name, dims)` is exactly `synth_df(name, dims, Df::Fp16)`.
     pub fn synth_df(&self, id: PlaceId, dims: &[u32], df: Df) {
         self.synth_bytes(id, synth_footprint_bytes(dims, df));
-    }
-
-    /// [`synth`](Self::synth) for an fp8 row TILE — reserves the footprint AND stamps the
-    /// plan's row-class arm (`wide`) beside it, in the SAME call: one door, no second
-    /// stamping site. The plan-disagreement guards in `emit/ktir_matmul_fp8.rs` read the
-    /// stamp, because at `work::FP8_GEMM_WIDE_M` == the narrow arm's 128 alignment a wide
-    /// tile and a narrow part reserve the SAME bytes — the footprint compare alone goes
-    /// blind exactly there, and converged footprints do not make the staging walks agree
-    /// (defect 3's class). The arm is the discriminator; a disagreement is a refusal at
-    /// bake, before `staged()` ever sees the converged rows.
-    pub fn synth_fp8_row_tile(&self, id: PlaceId, dims: &[u32], wide: bool) {
-        self.synth(id, dims);
-        self.synth
-            .borrow_mut()
-            .fp8_row_arms
-            .insert(id.to_string(), wide);
     }
 
     /// Declare a SYNTHETIC intermediate LX-RESIDENT and OP-LOCAL at its FULL shape (`dims`,

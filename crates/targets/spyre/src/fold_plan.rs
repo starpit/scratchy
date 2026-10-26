@@ -482,6 +482,15 @@ pub struct OpKv {
     /// `addr = idx * skip_addr + base` from whatever base the launch installed, so a per-pass page shift
     /// on top of an absolute entry composes two bases and lands inside neither: fluent, no fault.
     pub gathered: bool,
+    /// ⭐ THE STAGING CHANNEL — the per-op mirror of the group's
+    /// `kv_region_form` ([`bundle::KvShifts::region_form`]): this op's gathered table is the
+    /// FILL-STAGED REGION FORM, not the composer's page-list table. `gathered` carries the
+    /// addressing consequence (the zero KV shift) for BOTH channels; this bit carries the
+    /// staging one — a region-form body's table is already staged by the host fill, so the
+    /// composer must not drive it as a chunk body and no KV-block-index step is minted for
+    /// it. The page-list answer is `gathered && !region_form`. Meaningful only when
+    /// [`Self::gathered`].
+    pub region_form: bool,
 }
 
 /// ⭐⭐⭐⭐ THE PAGE GEOMETRY ONE OP'S ARITHMETIC RUNS UNDER — paged or not, and the page size —

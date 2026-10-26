@@ -5037,6 +5037,14 @@ fn gathered_matmul_materializes(
             .map_err(|message| Error { message })?;
             super::apply_lx_residency(&mut cop, Some(layout));
             let folds = crate::superdsc_opspec::SdscFoldSet::new(cop.iter.cores_used());
+            // 🅿️ PARKED — NO STAMP ON THE BATCHED DOOR'S COPY LEGS. These legs are the
+            // INNER ops of a door-lowered carrier program; the addressing fact is stated at
+            // the CARRIER's mint (`EmittedOp::paged_region` / `paged_fold`, the one doors)
+            // and stamped by the walk onto every op it lowers from that carrier — so a door
+            // stamp here would be a SECOND writer for the same fact on the same ops, which
+            // the one-stamping-site law forbids. A pool-reach table in a NON-carrier program
+            // (none exists in the tree's models today) is the parked general-door class; see
+            // the parked note at the pointwise door's reach binding (`emit/mod.rs`).
             ctx.ops.push(
                 super::emit_sdsc_tiled(
                     &format!("{inter_name}_g{leg}"),

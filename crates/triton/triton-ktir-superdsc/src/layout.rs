@@ -513,7 +513,6 @@ pub fn for_regions(node: &KtirNode, r: &[Region]) -> Result<BundleLayout, Error>
         next: segment_bytes[SegRole::Intermediate.segment()],
         map: Default::default(),
         sizes: Default::default(),
-        fp8_row_arms: Default::default(),
     });
 
     // IDENTITY BY OPERAND SPELLING, for every placed tensor, from the one site that knows the whole

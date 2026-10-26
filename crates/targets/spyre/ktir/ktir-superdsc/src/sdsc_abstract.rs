@@ -3074,120 +3074,6 @@ impl<K: KindTag> Stk<K> {
     }
 }
 
-/// ⭐ THE PER-TILE fp8 STAGING, CONST-GENERIC ON ITS ROW CLASS — the staging seam's ONE MINT,
-/// as a type. The fp8 GEMM target-ABI row tiling (`work::Fp8GemmRowTiles`, the copied
-/// `_m_tiles` law) quantizes each row tile over its own fresh buffer and the consuming GEMM
-/// reads that same buffer, so the two ends of the seam must agree on the staging's row class.
-/// `R` is a COMPILE-TIME constant of the emission — the ABI's own 1 (decode) or 128 (the
-/// wide tile, `work::FP8_GEMM_WIDE_M`) — so a consumer minted against a different class (a
-/// quant at `Fp8TileStaging<128>` feeding a GEMM door that wants `<1>`, or any future
-/// second spelling of the row count) is a
-/// `cargo build` type error, never a checked equality at bake. This is the typed form of the
-/// reference's layout propagation (`torch_spyre/_inductor/propagate_layouts.py:408`,
-/// `_qfp8ch_stl`: the quant output's layout is inherited by the mm's A, never re-derived).
-///
-/// The handles are the ones the quantize chain minted — names AND `StickLayout`s — so the
-/// consumer's A view is the producer's own, and the dequant's per-row scale read rides the
-/// same mint. Constructed only by this crate's fp8 emission (the writer of the buffers).
-pub struct Fp8TileStaging<const R: u32> {
-    afp8: Stk<RowBlockedTag>,
-    ascale: Stk<RowBlockedTag>,
-}
-
-impl<const R: u32> Fp8TileStaging<R> {
-    /// The staging's row class — the ABI tile width the quant wrote and every consumer must
-    /// read. A const, not an accessor: it is a fact of the type.
-    pub const ROWS: u32 = R;
-
-    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
-    /// wrote it (`row_blocked_df(R, k_pad, Fp8)`).
-    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
-        &self.afp8
-    }
-
-    /// The per-token scale handle — the dequant's row input (`[R, one stick]`).
-    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
-        &self.ascale
-    }
-
-    /// The one constructor — the quantize emission's output mint. Same-crate private by
-    /// design: only this crate's fp8 emission (the writer of the buffers) can state them.
-    ///
-    /// REFUSES a handle whose row count is not `R`: the type's whole claim is that the
-    /// staging's row class is `R`, so a handle minted at another count is the two-ended
-    /// spelling the type exists to make unconstructable — rejected at emission (a `cargo
-    /// build` failure), never a buffer walked at two row classes.
-    pub(crate) fn staged(
-        afp8: Stk<RowBlockedTag>,
-        ascale: Stk<RowBlockedTag>,
-    ) -> Result<Self, String> {
-        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
-            if h.layout().rows as u32 != R {
-                return Err(format!(
-                    "Fp8TileStaging::<{R}>::staged: the {what} handle carries {} rows — the \
-                     staging's row class is {R}, and a handle at another class is exactly the \
-                     writer/reader drift this type refuses",
-                    h.layout().rows
-                ));
-            }
-        }
-        Ok(Self { afp8, ascale })
-    }
-}
-
-/// ⭐ THE NARROW fp8 STAGING — [`Fp8TileStaging`]'s runtime-rows twin, for the narrow
-/// law's ONE part at the padded 128-multiple (S3, `fp8_linear_kernel.py:343-346`): the
-/// extent is a fact of the INPUT (21→128, 192→256 — any 128-multiple), so it is carried
-/// as a [`RowCount`] the constructor pins, not a const generic. Same seam law as the tile
-/// staging: the handles are the quantize chain's own mints, and a handle whose row count
-/// is not the stated extent is exactly the writer/reader drift the type refuses.
-pub struct Fp8NarrowStaging {
-    rows: RowCount,
-    afp8: Stk<RowBlockedTag>,
-    ascale: Stk<RowBlockedTag>,
-}
-
-impl Fp8NarrowStaging {
-    /// The staging's row extent — the padded 128-multiple the quant wrote and every
-    /// consumer must read.
-    pub fn rows(&self) -> RowCount {
-        self.rows
-    }
-
-    /// The quantized activation handle — the GEMM's A operand, minted by the quantize that
-    /// wrote it (`row_blocked_df(rows, k_pad, Fp8)`).
-    pub fn afp8(&self) -> &Stk<RowBlockedTag> {
-        &self.afp8
-    }
-
-    /// The per-token scale handle — the dequant's row input (`[rows, one stick]`).
-    pub fn ascale(&self) -> &Stk<RowBlockedTag> {
-        &self.ascale
-    }
-
-    /// The one constructor — the quantize emission's output mint, at the part's stated
-    /// extent. REFUSES a handle whose row count is not that extent, for the same reason
-    /// [`Fp8TileStaging::staged`] refuses one at another class.
-    pub(crate) fn staged(
-        rows: RowCount,
-        afp8: Stk<RowBlockedTag>,
-        ascale: Stk<RowBlockedTag>,
-    ) -> Result<Self, String> {
-        for (what, h) in [("afp8", &afp8), ("ascale", &ascale)] {
-            if h.layout().rows as u32 != rows.get() {
-                return Err(format!(
-                    "Fp8NarrowStaging::staged: the {what} handle carries {} rows — the \
-                     staging's extent is {}, and a handle at another extent is exactly the \
-                     writer/reader drift this type refuses",
-                    h.layout().rows,
-                    rows.get()
-                ));
-            }
-        }
-        Ok(Self { rows, afp8, ascale })
-    }
-}
-
 impl Stk<KernelTag> {
     /// A `Kernel` handle `[in(K), out(N)]` stick-blocked on `out` — INFALLIBLE (the kind is `Kernel`
     /// by construction, so no runtime check / `Result` / unwrap). The compile-time `KernelTag` then
@@ -4812,6 +4698,65 @@ pub struct PagedFold {
     /// The pool's page width, for `kv_page_slots`. This is the shared device law
     /// ([`PagedKvPool::PAGE_SLOTS`]), restated so the stamp never re-derives it.
     pub page_slots: u32,
+}
+
+/// ⭐⭐⭐⭐⭐ THE FILL-STAGED REGION A ONE-SHOT ATTENTION CARRIER GATHERS — the attribute the
+/// one-shot chain of custody runs on, the same shape as [`PagedFold`]'s.
+///
+/// Every one-shot attention program (the batched paged kernels the splice mints) gathers the
+/// paged pool through the absolute-entry tables the host fill stages, whether or not its ladder
+/// stated a fold region — a PREFIX-FREE rung states none (its bake is `ActiveCap::NONE`: a
+/// start==0 chunk has nothing resident to attend) yet its kernel gathers the same way. The
+/// splice therefore states the region UNCONDITIONALLY at the mint, and the walk
+/// (`ktir_groups_via_superdsc`) stamps the addressing fact (`kv_gathered` — the entries are
+/// ABSOLUTE stick-blocks, the op takes the ZERO KV shift) onto every op it lowers from that
+/// carrier's program.
+///
+/// ⛔ THE POOL TIDS RIDE WITH THE REGION so the stamp can CHECK its own premise instead of
+/// assuming it: "the entries are absolute" is a fact of a POOL the layout placed a
+/// [`GatherReach`] for, not of the carrier, so the stamp site refuses the build when the
+/// layout carries no reach for [`Self::reach_tids`] — a future non-paged attention form that
+/// reaches the one-shot arm fails the bake rather than silently zeroing the KV shift over an
+/// unpaged read. [`pool_reach_tids`] is the ONE spelling of that tid set: the placement pass's
+/// reach insertion and the stamp site's guard both derive through it, so the set the stamp
+/// checks and the set the placement covers cannot disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PagedRegion {
+    /// The region's page count — the table region the host fill stages. The prefill arm's value
+    /// is its spec's own default (`region_pages.unwrap_or(pages)`, the walk's own extent); the
+    /// decode arm's is the pool capacity its spec received as `pages`.
+    ///
+    /// READER STATEMENT: this field is the minted derivation record, not a behavior gate. The
+    /// arm's spec consumed it pre-lowering (through the id-table extents' region law); post-mint
+    /// nothing at bake or runtime reads it — the walk's stamp consumes only [`Self::reach_tids`],
+    /// the emit side only constructs and copies, and the only field readers are the two pins
+    /// (`triton_splice_golden`'s carrier half and the walk-stamp half) — so a later reader does
+    /// not mistake it for a value the card path branches on.
+    pub region_pages: u32,
+    /// The pool's K cache tensor — the AttnDecode's own `layout.cache_tensor()`.
+    pub k_tid: u32,
+    /// The pool's V cache tensor — `layout.v_cache_tensor()`.
+    pub v_tid: u32,
+}
+
+impl PagedRegion {
+    /// The tids a gathered read of this pool addresses — derived through [`pool_reach_tids`],
+    /// the one spelling shared with the placement's reach insertion.
+    pub fn reach_tids(&self) -> [u32; 3] {
+        pool_reach_tids(self.k_tid, self.v_tid)
+    }
+}
+
+/// The pool tids a gathered read of a paged KV pool addresses: the two cache tensors plus the
+/// Kᵀ-resident wire tid derived from the K one. ONE derivation, shared by the placement pass's
+/// `gather_reach` insertion and the region stamp's premise guard, so the two can never cover
+/// different pools.
+pub fn pool_reach_tids(k_tid: u32, v_tid: u32) -> [u32; 3] {
+    [
+        k_tid,
+        v_tid,
+        crate::reserved_tids::KctResident::of(k_tid).wire_tid(),
+    ]
 }
 
 /// THE COUNT OF REAL QUERY ROWS — `mq`: the decode batch size, or a prefill chunk's token rows.
@@ -9992,10 +9937,11 @@ impl GatherScratch {
     /// ⭐⭐⭐⭐⭐ "COULD ANY BODY OF THIS BUNDLE GATHER" — [`Self::of_fold_pass`] ITSELF, asked without a
     /// window count, and the ONE rule the three bundle-level places that must agree now read.
     ///
-    /// ⛔⛔⛔ THE DEFECT THIS CLOSES, AND IT WAS INVISIBLE AT hd=64. Three constructors answer "does this
-    /// bundle gather" ([`crate::…::GathersKv`] in the target crate: `of(BakeFacts)`, `of_layout()`,
+    /// ⛔⛔⛔ THE DEFECT THIS CLOSES, AND IT WAS INVISIBLE AT hd=64. Three constructors used to answer
+    /// "does this bundle gather" ([`crate::…::GathersKv`] in the target crate: `of(BakeFacts)`,
+    /// `of_layout()` — since RETIRED and replaced by `of_code()`, which reads the groups — and
     /// `of_launch_groups()`). The first two read the `KV_BLOCK_INDEX_TID` PLACEMENT, which was reserved
-    /// on `rows_are_requests` ALONE; the third reads the emitted fold groups, which additionally require
+    /// on `rows_are_requests` ALONE; the third read the emitted fold groups, which additionally require
     /// `of_fold_pass` to have returned a scratch. At hd=64 `of_fold_pass` never refuses, so all three
     /// agreed and the split could not be seen. At hd=128 it always refuses: the bundle reserves an index
     /// activation and the forward tape carries a `KvBlockIndex` step for a gather that is in no

@@ -631,6 +631,10 @@ impl OpProg {
                 // ⭐ THE OTHER HALF OF `fold_plan::collapsed`, and what sends the fold's KV shift to
                 // zero — a bake fact, carried on the group exactly like the axis itself.
                 gathered: kv.gathered,
+                // The staging channel's own mirror — the ruled custody chain's first link
+                // (`OpKv → KvShifts → StepBody`), minted off the same group value as
+                // `gathered` so the two bits cannot come from different derivations.
+                region_form: kv.region_form,
             },
         }
     }
@@ -3068,6 +3072,13 @@ impl Executor {
         // `page_fold` its own launch groups carry (what `fold_plan::reps` multiplies by) — any
         // class's fold makes the step a fold, not a chunk.
         let mut folds_any = false;
+        // ⭐ THE STAGING CHANNEL, folded from the same launch groups: whether this body's
+        // gathered table is the FILL-STAGED REGION FORM. A region-form body answers
+        // `gathers` YES (absolute entries, zero shift) but its table is already staged by
+        // the host fill — the composer must not drive it as a chunk body, and no
+        // KV-block-index step is minted for it. Folded strongest-claim like `gathers_any`:
+        // any class's region-form group makes the step's page-list answer false.
+        let mut region_form_any = false;
         for c in 0..self.n_classes() {
             let ls = self.list_sel_for(sel, c);
             gathers_any |= crate::wiring::GathersKv::of_launch_groups(
@@ -3075,12 +3086,14 @@ impl Executor {
             )
             .get();
             folds_any |= self.list(ls).iter().any(|o| o.kv.page_fold);
+            region_form_any |= self.list(ls).iter().any(|o| o.kv.region_form);
         }
         Ok(StepBody {
             sel,
             swept: self.body_swept(sel),
             gathers: crate::wiring::GathersKv::of_launch_groups([gathers_any]),
             folds: folds_any,
+            region_form: gathers_any && region_form_any,
             // The rung's op-local pin slots, the same layout's baked sum — every bundle of the
             // rung carries the same number, so the body's own artifact is as good a seat as any.
             lx_op_local_bytes: self.code.layout.lx_op_local_bytes,
@@ -3682,7 +3695,10 @@ impl Executor {
             }
 
             if d.optrace {
-                self.optrace(oi)?;
+                // ⭐ THE OP'S OWN NAME, on the line that reports it — the label the group-time and
+                // launch-mark paths already print (:3659/:3511), so a trace names its ops without a
+                // harvest pull. Passed in (not re-derived) because the op is the loop's own local.
+                self.optrace(oi, &op.label())?;
             }
             if d.tensordump.is_some() {
                 self.tensordump(oi, op)?;
@@ -4017,9 +4033,9 @@ impl Executor {
     /// print nonzero-count + max|.|. One prefill run then shows the signal flow op-by-op; the op
     /// index where nz collapses to 0 (or max → inf) IS the divergence. seg1 (weights, ~2.6 GB) is
     /// deliberately SKIPPED: static across the pass and already ruled out.
-    fn optrace(&mut self, oi: usize) -> Result<()> {
+    fn optrace(&mut self, oi: usize, label: &str) -> Result<()> {
         let _ = self.stream_ref()?.synchronize();
-        let mut line = format!("[optrace] op[{oi}]");
+        let mut line = format!("[optrace] op[{oi}] {label}");
         for i in [0usize, 2, 3, 4, 5, 6] {
             let seg = SegIdx::checked(i as i64).expect("literal < NUM_SEGMENTS");
             let got = self.d2h_seg_clamped(seg);
@@ -5954,6 +5970,7 @@ pub struct StepBody {
     swept: SweptCols,
     gathers: crate::wiring::GathersKv,
     folds: bool,
+    region_form: bool,
     lx_op_local_bytes: u64,
     lx_prob_pin_bytes: u64,
 }
@@ -5975,13 +5992,31 @@ impl StepBody {
         self.gathers
     }
 
+    /// ⭐ WHETHER **THIS** BODY'S GATHERED TABLE IS THE FILL-STAGED REGION FORM — the staging
+    /// channel, off the same launch groups (`bundle::KvShifts::region_form`). The body still
+    /// `gathers` (absolute entries, zero shift); its table is staged by the host fill
+    /// (`fill_attn_step_inputs`), so the composer's page-list answer for it is FALSE —
+    /// see [`Self::page_list`].
+    pub const fn region_form(self) -> bool {
+        self.region_form
+    }
+
+    /// ⭐ THE PAGE-LIST ANSWER — whether the HOST must stage this body's index table through
+    /// the composer and mint a KV-block-index step for it: it gathers AND its table is not
+    /// the fill-staged region form. The ONE expression every staging-side consumer keys on
+    /// (the composer's gate and the forward's `gathers` parameter), so the two cannot drift.
+    pub const fn page_list(self) -> bool {
+        self.gathers.get() && !self.region_form
+    }
+
     /// ⭐ WHETHER **THIS** BODY IS A SPLIT-KV CHUNK — it gathers and carries no page fold, so it attends
     /// exactly its own chunk in one launch and the host stages the CHUNK's index and mask, not the
     /// fold's. On a decode batch this is what separates a chunk rung from the gathered fold below and
     /// past it — both gather, and staging one's table for the other reads real block numbers from the
-    /// wrong layout.
+    /// wrong layout. Keyed on [`Self::page_list`]: a region-form body's staging is the fill's, not
+    /// the chunk table's.
     pub const fn chunk(self) -> bool {
-        self.gathers.get() && !self.folds
+        self.page_list() && !self.folds
     }
 
     /// ⭐ THE RUNG'S OP-LOCAL LX PIN SLOTS, in bytes — read off the selected body's own baked

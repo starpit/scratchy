@@ -152,9 +152,19 @@ pub struct BakeFacts {
     /// layout's own `scalarmul_scales_stage` column, so the sendnn fill and the KTIR worker
     /// handoff read ONE list.
     pub scalarmul_scales_stage: &'static [bundle::ScaleStage],
-    /// ⭐⭐⭐⭐⭐ The bundle placed `KV_BLOCK_INDEX_TID` — it emitted a GATHERED KV read, so the forward
-    /// tape carries a [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex)
-    /// step and the launch must stage a block table.
+    /// ⭐⭐⭐⭐⭐ The bundle's launch groups carry a gathered KV read — the body's own ops said
+    /// `kv_gathered` (per-group, [`bundle::KvShifts::gathered`]), so the forward tape carries a
+    /// [`ForwardKernel::KvBlockIndex`](crate::forward_tape::ForwardKernel::KvBlockIndex) step and
+    /// the launch must stage a block table.
+    ///
+    /// ⛔ THE GROUPS ARE THE AUTHORITY, NOT THE LAYOUT'S `KV_BLOCK_INDEX_TID` PLACEMENT. The two
+    /// answered the same question through different code — the placement says the emission
+    /// reserved an index tensor, the groups say the emitted ops carry the gather bit — and defect
+    /// C was exactly those two halves disagreeing (legs minted `kv_gathered = false` under a placed
+    /// index). With the family-tagged stamp on the legs they agree on every buildable bundle, but
+    /// this field is now READ FROM THE GROUPS so the two halves cannot be asked of different
+    /// artifacts again: `BakeFacts::of_code` asks [`GathersKv::of_code`], the same per-body door
+    /// `step_body` asks.
     ///
     /// Same mechanism and the same reason as [`Self::uses_identity`]: the descriptor half and the
     /// staging half of a feature must be decided by ONE artifact-derived question, because they fail
@@ -176,15 +186,18 @@ impl BakeFacts {
         gathers_kv: false,
     };
 
-    /// Read them off the generated layout.
-    pub fn of(layout: &'static bundle::BundleLayout<'static>) -> Self {
+    /// Read them off the generated CODE — the layout for the placements, the LAUNCH GROUPS for the
+    /// gather fact (see [`Self::gathers_kv`]: the ops, not the placement, are the authority). Both
+    /// call sites hold the `BundleCode`, so this takes the code and never a bare layout.
+    pub fn of_code(code: &'static bundle::BundleCode<'static>) -> Self {
         use crate::lower_subtile_tape_to_superdsc as sd;
+        let layout = &code.layout;
         let ones = layout.place_of_tid(sd::ONES_REDUCE_TID);
         BakeFacts {
             uses_ones_reduce: ones.is_some(),
             ones_reduce_len: ones.map_or(0, |p| (p.size / 2) as usize),
             uses_identity: layout.place_of_tid(sd::IDENTITY_TID).is_some(),
-            gathers_kv: layout.place_of_tid(sd::KV_BLOCK_INDEX_TID).is_some(),
+            gathers_kv: GathersKv::of_code(code).get(),
             scalarmul_scales: match &layout.scalarmul_scales {
                 std::borrow::Cow::Borrowed(v) => v,
                 // A generated layout is always `Cow::Borrowed`; the owned arm exists for the
@@ -520,25 +533,42 @@ impl GathersKv {
         GathersKv(facts.gathers_kv)
     }
 
-    /// The same answer straight off a LAYOUT, for callers that hold one but no [`BakeFacts`] — the
-    /// load-time placement check. It is the same lookup [`BakeFacts::of`] performs, spelled once here
-    /// rather than duplicated at the call site, and it takes a plain reference so a non-`'static`
-    /// layout can be asked.
-    pub fn of_layout(layout: &bundle::BundleLayout<'_>) -> Self {
-        GathersKv(
-            layout
-                .place_of_tid(crate::lower_subtile_tape_to_superdsc::KV_BLOCK_INDEX_TID)
-                .is_some(),
-        )
+    /// The same answer straight off a CODE — the load-time check for callers that hold the code but
+    /// no [`BakeFacts`] (the worker's preflight holds both a decode and a prefill code). It is
+    /// [`Self::of_launch_groups`] over the code's own groups, spelled once here rather than
+    /// duplicated at the call site, and it takes a plain reference so a non-`'static` code can be
+    /// asked.
+    ///
+    /// ⛔ RETIRES `of_layout`, which answered the same question from the layout's
+    /// `KV_BLOCK_INDEX_TID` placement — the OTHER half of the artifact from the one the per-body
+    /// doors ask. Defect C was those halves disagreeing; the walk's chain-of-custody stamp now
+    /// mints `kv_gathered` on every op lowered from a one-shot attention carrier UNCONDITIONALLY
+    /// (the `paged_region` door's own totality law — an attention body arriving with NO region
+    /// attribute is a walk/splice desync, `emit/mod.rs`), so on a PREFIX-FREE top the two halves
+    /// DISCLOSEDLY DISAGREE: the groups gather (this door answers true) while the index placement
+    /// does not exist (the reservation keys at LAYOUT time on `rows_are_requests ||
+    /// chunk_pages.is_some()`, before any stamp — nothing refuses the divergence). The
+    /// disagreement is inert by construction: the consumers that can ask the placement half are
+    /// the DECODE-side load check (`spyre_load`'s unplaced refusal — decode-only, and unchanged:
+    /// every decode bundle places the index via `rows_are_requests`) and the launch-time pairing
+    /// check (`kernel_values`, which demands a table only when a step mints — the re-keyed
+    /// `page_list` param mints no step for a region-form body, and every batch- or chunk-launched
+    /// bundle that mints places the index); the prefill side runs no unplaced check, and the
+    /// prefill facts' `gathers_kv` flip has no reader. Zero bundle bytes move; the ANSWER moves
+    /// on prefix-free tops (false → true, unread). The re-point's value is closing the desync
+    /// class — the two halves of the gather fact can no longer be asked of different artifacts —
+    /// with the one disagreement that remains STATED here rather than assumed away.
+    pub fn of_code(code: &bundle::BundleCode<'_>) -> Self {
+        Self::of_launch_groups(code.groups.iter().map(|g| g.kv.gathered))
     }
 
     /// ⭐⭐⭐ THE **PER-BODY** ANSWER, off the body's own LAUNCH GROUPS — each group's
     /// `bundle::KvShifts::gathered`, which the emitter stamps on the fold group it built the gather into.
     ///
-    /// ⛔ WHY A THIRD DOOR RATHER THAN REUSING THE LAYOUT ONE. [`Self::of_layout`] answers about a
-    /// BUNDLE: `KV_BLOCK_INDEX_TID` is placed if ANY body of it gathers. A decode bundle holds a whole
+    /// ⛔ WHY A SEPARATE DOOR FROM THE BUNDLE-LEVEL ONE ([`Self::of_code`]). A bundle-level answer
+    /// says "ANY body of this code gathers": a decode bundle holds a whole
     /// sk_bucket ladder of bodies plus their fold-fused twins, and which one a step runs is the
-    /// selector's answer from the live context length — so the bundle's placement cannot answer "does
+    /// selector's answer from the live context length — so a bundle-level fact cannot answer "does
     /// the body I am about to launch gather", and answering it from the bundle is exactly the mistake
     /// this file has now recorded three times (see `superdsc_exec::Executor::step_body`).
     ///
@@ -554,6 +584,15 @@ impl GathersKv {
     /// appears in a grep for who claims a bundle does not gather.
     pub const fn no_layout_to_ask() -> Self {
         GathersKv(false)
+    }
+
+    /// ⭐ THE STAGING CHANNEL'S ANSWER, as the forward's `gathers` parameter: the body gathers
+    /// AND its table is the composer's page-list form (not the fill-staged region form). This
+    /// is the door the host's index-step ask keys on — spelled as its own name, like
+    /// [`Self::no_layout_to_ask`], so a grep for who claims a body needs a staged table finds
+    /// exactly the staging-side callers.
+    pub const fn of_page_list(page_list: bool) -> Self {
+        GathersKv(page_list)
     }
 
     pub const fn get(self) -> bool {

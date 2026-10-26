@@ -865,7 +865,13 @@ fn chunk_index_table(
         mapped,
         rows,
     } = keys;
-    if !step.gathers().get() {
+    // ⛔ THE STAGING CHANNEL — keyed on the PAGE-LIST answer, not `gathers` alone. A
+    // region-form body gathers (absolute entries, zero shift) but its table is already
+    // staged by the host fill (`fill_attn_step_inputs`); driving it through here would
+    // compose a page-list table its ops never read, and a swept extent that is not a whole
+    // page multiple (the sweep rungs' 64) would REFUSE below and break the chat at the
+    // first decode step.
+    if !step.page_list() {
         return Ok(None);
     }
     const PER_PAGE: u32 = scratchy_subtile::sdsc_abstract::PagedKvPool::PAGE_SLOTS as u32;
@@ -1618,8 +1624,10 @@ pub(crate) fn superdsc_forward_chunk(
                     rung,
                     // ⛔ THE RUNNING BODY'S OWN ANSWER, not the bundle's: the prefix bundle's ladder
                     // mixes the per-page body (gathers nothing) with split-KV chunks (gather every
-                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's.
-                    step.gathers(),
+                    // page), and its `KV_BLOCK_INDEX` placement is the chunk ceiling's. Keyed on
+                    // `page_list` — a region-form body's staging is the fill's, so no index step
+                    // is minted for it.
+                    scratchy_target_spyre::wiring::GathersKv::of_page_list(step.page_list()),
                     chunk_start,
                     // A prompt's tail is FOLDED to one row by the emitter, so there is one row to
                     // read however many rows this chunk ran at.
@@ -1862,7 +1870,9 @@ pub(crate) fn superdsc_forward_chunk(
             // within one page gather nothing, the split-KV chunks past it gather every page, and
             // the bundle's `KV_BLOCK_INDEX` placement is the chunk ceiling's. Asked of the bundle,
             // a one-page context demanded a table its body never reads and the step refused.
-            step.gathers(),
+            // Keyed on `page_list` — a region-form body's staging is the fill's, so no index
+            // step is minted for it.
+            scratchy_target_spyre::wiring::GathersKv::of_page_list(step.page_list()),
             consts.len(),
         );
         // fp16-safe attention "-inf": half the largest finite fp16 magnitude, negated —
@@ -1953,6 +1963,18 @@ pub(crate) fn superdsc_forward_chunk(
         })?
         .grid(
             scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1).expect("1 is a width"),
+            // 📌 THE FORM'S CONSUMER SET, PINNED (the region-form flip's inertness proof):
+            // the form rides `MaskPassGrid` into `MaskBlocks::of` and `declare_to`, which
+            // records it on the session (`sdsc_runner.rs`'s `FoldWalker` impl:
+            // `set_mask_blocks` + `set_fold_pages`). Those two records are read ONLY by the
+            // fold launch path — `fold_plan::reps`'s walk-vs-declaration guard, per
+            // `page_fold` group, and the fold's prefix-mask staging — and a ONE-SHOT step
+            // launches no fold group, so neither consumer runs: the flip to `PerPage` that
+            // the region-form stamp causes on one-shot steps is INERT (the one-shot body's
+            // own mask is fill-staged by `fill_attn_step_inputs`, which reads the discovery
+            // table's extents, not this declaration). A fold step (the fold twin,
+            // valid_len 129-256) IS collapsed and gathered, so `PerPage` is the correct form
+            // there — the flip lands it, which is the direction the fold wants.
             if step.gathers().get() {
                 scratchy_subtile::sdsc_abstract::MaskBlockForm::PerPage
             } else {

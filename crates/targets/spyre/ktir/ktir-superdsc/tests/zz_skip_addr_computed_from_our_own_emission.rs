@@ -84,7 +84,7 @@ fn dsc_and_node<'a>(
 fn the_instrument_reproduces_a_known_product() {
     let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2").expect("a matmul");
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("MatMul_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "MatMul_0", 0);
 
@@ -177,7 +177,7 @@ fn the_shipped_gather_copys_skip_addr_is_one_pool_stick_block() {
             .expect("the gather-copy op builds");
             let value_idx = op.indirect.expect("a declared gather").value;
             let folds = SdscFoldSet::new(op.iter.cores_used());
-            let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+            let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
             let j = serde_json::to_value(&e).unwrap();
             let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
             let got = skip_addr_elems(dsc, node).expect("derivable");
@@ -264,7 +264,7 @@ fn the_shipped_page_gather_copys_skip_addr_is_one_pool_stick_block() {
                 let value_idx = op.indirect.expect("a declared gather").value;
                 let cores = op.iter.cores_used().get();
                 let folds = SdscFoldSet::new(op.iter.cores_used());
-                let e = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
+                let (e, _) = superdsc::emit_sdsc("PageGather_0", &op, &folds, None).expect("emits");
                 let j = serde_json::to_value(&e).unwrap();
                 let (dsc, node) = dsc_and_node(&j, "PageGather_0", value_idx);
                 let got = skip_addr_elems(dsc, node).expect("derivable");
@@ -363,7 +363,7 @@ fn pinning_the_entry_dim_makes_skip_addr_one_entrys_size() {
     .expect("the gather-copy op builds");
     let value_idx = op.indirect.expect("a declared gather").value;
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+    let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
     let j = serde_json::to_value(&e).unwrap();
     let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
 
@@ -499,7 +499,7 @@ fn the_two_pins_hd_128_needs_derive_the_two_window_strides_the_pool_has() {
         .expect("the gather-copy op builds at both pins");
         let value_idx = op.indirect.expect("a declared gather").value;
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let e = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
+        let (e, _) = superdsc::emit_sdsc("Gather_0", &op, &folds, None).expect("emits");
         let j = serde_json::to_value(&e).unwrap();
         let (dsc, node) = dsc_and_node(&j, "Gather_0", value_idx);
         let got = skip_addr_elems(dsc, node).expect("derivable");

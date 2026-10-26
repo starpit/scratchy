@@ -409,17 +409,10 @@ fn place_id_tokens(
             let t = proc_macro2::Literal::u32_unsuffixed(t);
             quote! { __KPlace::Act(#t) }
         }
-        PlaceId::Synth { of, role, tile } => {
+        PlaceId::Synth { of, role } => {
             let of = proc_macro2::Literal::u32_unsuffixed(of);
             let r = synth_role_tokens(role);
-            let tile = match tile {
-                Some(t) => {
-                    let t = proc_macro2::Literal::u32_unsuffixed(t);
-                    quote! { ::core::option::Option::Some(#t) }
-                }
-                None => quote! { ::core::option::Option::None },
-            };
-            quote! { __KPlace::Synth { of: #of, role: #r, tile: #tile } }
+            quote! { __KPlace::Synth { of: #of, role: #r } }
         }
     }
 }

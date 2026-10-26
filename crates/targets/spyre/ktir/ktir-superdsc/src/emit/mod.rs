@@ -1451,9 +1451,8 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     // A table with NO declared reach takes none of this: its gather keeps the swept-window law
     // exactly as the embedding's card-proven emission runs it, byte for byte.
     let mut pooled_inputs;
-    let inputs = if let Some(reach) =
-        pooled_reach_of(op_name, layout, inputs[gathered_input].name(), cols)?
-    {
+    let reach_of_table = pooled_reach_of(op_name, layout, inputs[gathered_input].name(), cols)?;
+    let inputs = if let Some(reach) = reach_of_table {
         pooled_inputs = inputs.to_vec();
         pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_pooled(reach);
         &pooled_inputs[..]
@@ -1469,6 +1468,16 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         pooled_inputs[gathered_input] = pooled_inputs[gathered_input].mark_gathered();
         &pooled_inputs[..]
     };
+    // 🅿️ PARKED — THE GENERAL-DOOR STAMP FOR POOL LEGS IN NON-CARRIER PROGRAMS. This door's
+    // pool legs (a `GatherReach::of_plane` table reached here, in a program that is NOT a
+    // spliced attention carrier) are UNSTAMPED by the unified gathered-fact slice: the
+    // addressing fact is stated at the CARRIER's mint (`EmittedOp::paged_region`, the one
+    // door) and stamped by the walk onto every op it lowers from that carrier — so a door
+    // stamp here would be a SECOND writer for the same fact on the same ops, which the
+    // one-stamping-site law forbids. No such program exists in the tree's models today
+    // (every live pool gather rides an attention carrier); the door-law stamp for that
+    // class is PARKED, not silently dropped — landing it means minting the carrier fact
+    // for that program class first.
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
     let head_major = O::kind() == StickKind::Flat;
@@ -1819,6 +1828,11 @@ fn one_gathered_leg(
     let entry_axis = ia.entry_dim.dim();
     let folds = SdscFoldSet::new(op.iter.cores_used());
     let mut emitted = emit_sdsc_tiled(leg_name, &op, &folds, sym_id_base, layout)?;
+    // 🅿️ NO STAMP HERE — the door's pool legs take their addressing fact from the CARRIER's
+    // mint (`EmittedOp::paged_region`), stamped by the walk onto the ops it lowers from that
+    // carrier; a stamp here would be a second writer for the same fact on the same ops. The
+    // parked general-door note at the reach binding above states the class this leaves
+    // unstamped (non-carrier programs — none exist in the tree's models today).
     // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TENSOR'S** ROW COUNT, NOT THE LEG'S — THE ONE NUMBER THE CUT CHANGES
     // ABOUT THE WIRE, AND THE CARD DECIDED IT.
     //
@@ -2463,6 +2477,32 @@ pub struct ArgBinding {
     /// whole tensor). What [`crate::emit::lower_ktir_to_superdsc::column_windows_are_honoured`] holds
     /// a column-blocked piece's operands to.
     pub offset_elems: u32,
+    /// ⭐⭐⭐ THE DOOR'S OWN ANSWER, CARRIED — `resolve_seg_base`'s resolution of THIS
+    /// operand, stamped here by [`EmittedOp::new`] from the facts the door returned at
+    /// emission time. There is ONE resolution in the codebase; a consumer that resolves
+    /// again keeps its own copy of the door's address logic and the copy DRIFTS (the
+    /// record-53 word-source drift, then the record-54 arm-order drift — both were the
+    /// walk's private `resolve()` disagreeing with `resolve_seg_base` on the same
+    /// operand). Not serialised into the op.
+    ///
+    /// The segment the door resolved this operand into (`segment_base`'s index), NOT
+    /// derivable from `base_bytes` — the walk keys its Written table by (segment, bank)
+    /// so two different banks of the same role never alias, and a consumer must not
+    /// invert the base address to get it back.
+    pub segment: usize,
+    /// The bank WITHIN `segment` the door resolved — part of the Written-table key.
+    pub bank: u32,
+    /// The role the door resolved — the read-before-write walk's honest-set membership
+    /// (`Weight | Activation | Kv`, nothing else).
+    pub role: crate::placement::SegRole,
+    /// The door's INTRA-segment base in bytes: the placement/synth/segment-fallback
+    /// offset PLUS the `offset_elems · word` slice. The walk's byte interval base is
+    /// EXACTLY this (plus per-trip affine shift), so the walk never re-derives the
+    /// slice arithmetic either.
+    pub base_bytes: u64,
+    /// The door's LX verdict — true means core-local (a pin in core-local space, no
+    /// HBM bytes), and the walk SKIPS the operand rather than judge core-local bytes.
+    pub lx: bool,
 }
 
 /// ⭐⭐⭐ AN OPERAND'S MATERIALIZED FOOTPRINT IN BYTES — the ONE derivation, for every caller.
@@ -2702,6 +2742,19 @@ pub struct EmittedOp {
     /// false for any free-list allocation — stops being a precondition. Without it a request axis still
     /// needs that proof, so the runtime must be able to tell the two situations apart.
     pub kv_gathered: bool,
+    /// ⭐ THE STAGING CHANNEL — this op's gathered table is the FILL-STAGED REGION FORM
+    /// (`fill_attn_step_inputs`), not the composer's page-list table.
+    ///
+    /// `kv_gathered` alone carries TWO consequences that can diverge: the addressing half (the
+    /// group's KV shift must be ZERO — absolute entries plus a page base compose two bases) and
+    /// the staging half (the host must stage an index table). A region-form body answers YES to
+    /// the first and NO to the second's page-list spelling: its table is already staged by the
+    /// fill, and the composer must not drive it as a chunk body (a swept extent that is not a
+    /// whole multiple of the page would refuse). BOTH channels' entries are ABSOLUTE, so the
+    /// zero shift is correct for both — this bit only discriminates WHO stages the table.
+    /// Written ONLY by the walk's chain-of-custody stamps (a fold carrier's or a region
+    /// carrier's), never at a mint.
+    pub kv_region_form: bool,
     /// THE ROW REGIME this op's fold passes were baked under (meaningful with [`Self::kv_page_fold`]):
     /// whole-batch passes sweep every `nqh*mq` shared-buffer row and need NO per-pass rebase in the
     /// intermediate segment; per-request passes carry one request's `nqh` rows and do. Declared on the
@@ -2733,6 +2786,20 @@ pub struct EmittedOp {
     /// fallback proof CHECKS the stamped groups. The seed and finalize carriers of the same
     /// family stay `None` — they launch once per step, not once per page.
     pub kv_paged_fold: Option<crate::sdsc_abstract::PagedFold>,
+    /// ⭐⭐⭐⭐⭐ THE PAGED REGION THIS OP'S PROGRAM GATHERS ITS KV THROUGH — the attribute the
+    /// ONE-SHOT attention chain of custody runs on. `None` on every op but a spliced
+    /// attention body: the splice STATES the region here through [`Self::paged_region`] (the
+    /// ONE door, UNCONDITIONALLY — every one-shot attention program gathers the pool through
+    /// the absolute-entry tables, whether or not its ladder stated a fold region), the walk
+    /// STAMPS the addressing fact onto every op it lowers from that carrier's program
+    /// (`kv_gathered`, plus the region-form channel bit the staging side keys on), and the
+    /// entries the host stages are ABSOLUTE stick-block numbers — the op takes the ZERO KV
+    /// shift, never the page base on top. The seed and finalize carriers of a fold family
+    /// stay `None`; the fold body itself states its region through [`Self::kv_paged_fold`]
+    /// instead, whose stamped ops carry the same region form. The pool tids ride with the
+    /// region so the stamp site can check the layout's gather reach — see
+    /// [`crate::sdsc_abstract::PagedRegion`].
+    pub kv_paged_region: Option<crate::sdsc_abstract::PagedRegion>,
     /// ⭐ WHICH PAGE OF A MULTI-PAGE WINDOW THIS OP ADDRESSES — a
     /// [`PagePart`](crate::page_part::PagePart), never a number.
     ///
@@ -2848,10 +2915,12 @@ impl EmittedOp {
             kv_page_fold: false,
             kv_batched_requests: false,
             kv_gathered: false,
+            kv_region_form: false,
             kv_fold_rows: Default::default(),
             kv_page_slots: 0,
             kv_request: 0,
             kv_paged_fold: None,
+            kv_paged_region: None,
             kv_part: crate::page_part::PagePart::at_cursor(),
             host_kv_write: false,
             kv_n_skip: 0,
@@ -2882,6 +2951,24 @@ impl EmittedOp {
         e
     }
 
+    /// ⭐⭐⭐⭐⭐ THE ONE DOOR FOR THE PAGED-REGION ATTRIBUTE — a one-shot attention body, with
+    /// the region stated by the layer that minted it (the splice, at the shared tail of both
+    /// row arms) and the pool's own tids riding with it for the stamp site's premise check.
+    ///
+    /// ⛔ NOTHING ELSE MAY WRITE [`Self::kv_paged_region`]. The attribute is the single
+    /// carrier between the splice's statement and the walk's stamp (which copies the
+    /// addressing fact onto every op it lowers from this carrier's program), so a second
+    /// writer is a second source of the region fact, which is the desync the field exists
+    /// to prevent. `bare` stays the mint for every op that is not a one-shot attention
+    /// carrier: the region is now stated UNCONDITIONALLY for the arm (a prefix-free rung
+    /// gathers the pool through the same absolute-entry tables), so an attention body with
+    /// NO attribute is a walk/splice desync, not an unpaged form.
+    pub fn paged_region(op_name: String, region: crate::sdsc_abstract::PagedRegion) -> EmittedOp {
+        let mut e = EmittedOp::bare(op_name);
+        e.kv_paged_region = Some(region);
+        e
+    }
+
     /// A by-value copy, for building a trimmed op list (see `ops_for_grouping`). `EmittedOp` is not
     /// `Clone` by design — copies of a baked op are almost always a mistake — so this is explicit.
     pub fn shallow_copy(&self) -> EmittedOp {
@@ -2896,10 +2983,12 @@ impl EmittedOp {
             kv_page_fold: self.kv_page_fold,
             kv_batched_requests: self.kv_batched_requests,
             kv_gathered: self.kv_gathered,
+            kv_region_form: self.kv_region_form,
             kv_fold_rows: self.kv_fold_rows,
             kv_page_slots: self.kv_page_slots,
             kv_request: self.kv_request,
             kv_paged_fold: self.kv_paged_fold,
+            kv_paged_region: self.kv_paged_region,
             kv_part: self.kv_part,
             slab_write: self.slab_write,
             slab_stride_bytes: self.slab_stride_bytes,
@@ -2922,6 +3011,12 @@ impl EmittedOp {
     /// has a matching AllocNode (so [`concrete_trips`] can bump its base address
     /// per trip) — a tiled tensor with a stride but no node is a build-time panic
     /// (internal-consistency bug), not a silently-wrong on-card address.
+    ///
+    /// It also ASSERTS **FactsMatchBindings**: `facts.len() == spec_args.len()` —
+    /// the door resolved every operand, so a parallel-array mismatch is a
+    /// build-time panic (the same internal-consistency class as
+    /// TiledHasStrideAndNode), never an unchecked parallel-index assumption that
+    /// stamps one operand's resolution onto another's binding.
     fn new(
         op_name: String,
         op: SdscOp,
@@ -2933,7 +3028,17 @@ impl EmittedOp {
         iter: &WorkPlan,
         time: u32,
         affine_strides: Vec<BTreeMap<&'static str, i64>>,
+        // The door's per-operand resolutions (`resolve_seg_base`, collected by `emit_sdsc`) —
+        // stamped onto binding[i] so there is ONE resolution in the codebase, never a second copy.
+        facts: &[SegFacts],
     ) -> EmittedOp {
+        assert!(
+            facts.len() == spec_args.len(),
+            "EmittedOp {op_name}: the door resolved {} operands but the op binds {} \
+             (FactsMatchBindings witness)",
+            facts.len(),
+            spec_args.len()
+        );
         if time > 1 {
             for dsc_map in &op.dscs_ {
                 for dsc in dsc_map.values() {
@@ -2952,14 +3057,21 @@ impl EmittedOp {
         }
         let arg_bindings = spec_args
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(i, a)| {
                 let v = a.view();
+                let f = facts[i];
                 ArgBinding {
                     buffer: v.name.to_string(),
                     is_input: v.is_input,
                     footprint_bytes: materialized_bytes(&v, iter),
                     touched: touched_blocks(&v, iter),
                     offset_elems: v.offset_elems,
+                    segment: f.segment,
+                    bank: f.bank,
+                    role: f.role,
+                    base_bytes: f.intra_base,
+                    lx: f.lx,
                 }
             })
             .collect();
@@ -2975,10 +3087,12 @@ impl EmittedOp {
             kv_page_fold: false,
             kv_batched_requests: false,
             kv_gathered: false,
+            kv_region_form: false,
             kv_fold_rows: crate::sdsc_abstract::FoldRowRegime::WholeBatch,
             kv_page_slots: 0,
             kv_request: 0,
             kv_paged_fold: None,
+            kv_paged_region: None,
             kv_part: crate::page_part::PagePart::at_cursor(),
             slab_write: false,
             slab_stride_bytes: 0,
@@ -3028,7 +3142,7 @@ pub fn emit_sdsc_tiled(
         _ => op,
     };
     let time = op.time();
-    let inner = emit_sdsc(op_name, op, folds, layout)?;
+    let (inner, facts) = emit_sdsc(op_name, op, folds, layout)?;
     if time == 1 {
         // Concrete-address single-shot path: all-empty strides, no unroll.
         let affine_strides = vec![BTreeMap::new(); op.args.len()];
@@ -3039,9 +3153,10 @@ pub fn emit_sdsc_tiled(
             &op.iter,
             1,
             affine_strides,
+            &facts,
         ));
     }
-    rewrite_op_for_time_tile(op_name, op, folds, inner, time, sym_id_base)
+    rewrite_op_for_time_tile(op_name, op, folds, inner, time, sym_id_base, &facts)
 }
 
 /// Rewrite a freshly-emitted (time=1-shaped) [`SdscOp`] into its TIME-TILED form:
@@ -3059,6 +3174,7 @@ fn rewrite_op_for_time_tile(
     mut inner: SdscOp,
     time: u32,
     sym_id_base: &mut i64,
+    facts: &[SegFacts],
 ) -> Result<EmittedOp, SuperDscError> {
     let tiled_dim = op
         .time_tile
@@ -3341,6 +3457,7 @@ fn rewrite_op_for_time_tile(
         &op.iter,
         time,
         affine_strides,
+        facts,
     ))
 }
 
@@ -3397,7 +3514,55 @@ fn set_iter_dim_i(it: &mut IterSpace, name: &str, v: i64) {
     }
 }
 
-/// Resolve one arg's HBM segment base + intra-segment byte offset. With a
+/// ⭐⭐⭐⭐⭐ THE RESOLVED PLACEMENT FACTS FOR ONE OPERAND — `resolve_seg_base`'s
+/// answer, carried whole. Every field was already in hand per arm; the struct
+/// exists so the answer can TRAVEL: `emit_sdsc` collects one per operand and
+/// `EmittedOp::new` stamps it onto the matching [`ArgBinding`], which is how the
+/// read-before-write walk reads placement facts OFF THE BINDING instead of
+/// re-deriving them — records 53 and 54 were the same defect twice (the walk's
+/// own copy of this resolution drifting from the door's at a different spot
+/// each time), and the cure is ONE resolution, stated here, consumed
+/// everywhere. `seg_base`/`intra_base` are the address pair the on-card walk
+/// always consumed; `role`/`segment`/`bank` are the facts the coverage walk
+/// keys on; `lx` marks the pinned-LX arm (per-core scratchpad, out of the HBM
+/// walk's domain).
+#[derive(Clone, Copy)]
+pub struct SegFacts {
+    /// The operand's HBM segment base (`SEGMENT_OFFSETS[segment]`); 0 for an
+    /// LX-resident name, whose address is its pin.
+    pub seg_base: u64,
+    /// The intra-segment byte base — the placement/synth offset PLUS the
+    /// `offset_elems · df.word_length()` slice, exactly the number the address
+    /// math always consumed.
+    pub intra_base: u64,
+    /// The buffer's role — the honest-set key for the coverage walk.
+    pub role: crate::placement::SegRole,
+    /// The segment INDEX (never the base address — the walk keys its written
+    /// table on the index, which cannot alias the way a number can).
+    pub segment: usize,
+    /// The weight bank, for the walk's `(segment, bank)` table key.
+    pub bank: u32,
+    /// TRUE when the name resolved through the pinned-LX arm: per-core
+    /// scratchpad, invisible to (and skipped by) the HBM coverage walk.
+    pub lx: bool,
+}
+
+/// The role a segment index belongs to — the inverse of `SegRole::segment()`,
+/// stated for the NO-LAYOUT fallback only (a real bundle's facts come from the
+/// placement row or the synth map, never from here). Segments 5 and 6 are
+/// intermediate COLORS (`inter_segs`), so they answer Intermediate.
+fn role_of_segment(seg: usize) -> crate::placement::SegRole {
+    match seg {
+        1 => crate::placement::SegRole::Weight,
+        2 => crate::placement::SegRole::Kv,
+        3 => crate::placement::SegRole::Activation,
+        4 => crate::placement::SegRole::Logits,
+        _ => crate::placement::SegRole::Intermediate,
+    }
+}
+
+/// Resolve one arg's HBM segment base + intra-segment byte offset, and the
+/// placement facts that travel with them. With a
 /// [`BundleLayout`] (the real full-model walk) the arg's GLOBAL placement is looked
 /// up by its `t{id}` name → `(SEGMENT_OFFSETS[role_segment], packed_offset + slice)`,
 /// so every op references a shared tensor at the SAME address (task #55). Without a
@@ -3411,7 +3576,7 @@ fn resolve_seg_base(
     arg_bytes: u64,
     df: Df,
     lane_read: bool,
-) -> Result<(u64, u64), SuperDscError> {
+) -> Result<SegFacts, SuperDscError> {
     let slice = offset_elems as u64 * df.word_length() as u64; // 4 B for fp32, 1 B fp8/int8, else 2 B fp16
     // The footprint guard's WINDOW END — the last byte this access can touch.
     //
@@ -3458,7 +3623,14 @@ fn resolve_seg_base(
                          sits at the pin, so a view into it has no offset to take"
                     )));
                 }
-                return Ok((0, pin));
+                return Ok(SegFacts {
+                    seg_base: 0,
+                    intra_base: pin,
+                    role: crate::placement::SegRole::Intermediate,
+                    segment: crate::placement::SegRole::Intermediate.segment(),
+                    bank: 0,
+                    lx: true,
+                });
             }
             if window_end > fp {
                 return Err(SuperDscError(format!(
@@ -3469,7 +3641,14 @@ fn resolve_seg_base(
                      op's view/offset."
                 )));
             }
-            return Ok((0, pin + slice));
+            return Ok(SegFacts {
+                seg_base: 0,
+                intra_base: pin + slice,
+                role: crate::placement::SegRole::Intermediate,
+                segment: crate::placement::SegRole::Intermediate.segment(),
+                bank: 0,
+                lx: true,
+            });
         }
         // 1. A real caller-bound buffer → its global placement. The id comes from the layout's own
         //    mint table, NOT from picking the digits back out of the spelling.
@@ -3492,7 +3671,14 @@ fn resolve_seg_base(
                     p.size, p.segment
                 )));
             }
-            return Ok((segment_base(p.segment)?, p.offset + slice));
+            return Ok(SegFacts {
+                seg_base: segment_base(p.segment)?,
+                intra_base: p.offset + slice,
+                role: p.role,
+                segment: p.segment,
+                bank: p.bank,
+                lx: false,
+            });
         }
         // 2. A SYNTHETIC intermediate (silu/rmsnorm decomposition: `t{id}_silu`,
         //    `t{id}_sq`, …) — no `t{id}` placement. Assign it a STABLE offset in the
@@ -3555,10 +3741,24 @@ fn resolve_seg_base(
                 s.next = end;
             }
         }
-        return Ok((segment_base(seg)?, off + slice));
+        return Ok(SegFacts {
+            seg_base: segment_base(seg)?,
+            intra_base: off + slice,
+            role: crate::placement::SegRole::Intermediate,
+            segment: seg,
+            bank: 0,
+            lx: false,
+        });
     }
     // No layout (single-op fixtures / unit tests): per-op segment by arg position.
-    Ok((segment_base(arg_index)?, slice))
+    Ok(SegFacts {
+        seg_base: segment_base(arg_index)?,
+        intra_base: slice,
+        role: role_of_segment(arg_index),
+        segment: arg_index,
+        bank: 0,
+        lx: false,
+    })
 }
 
 pub fn emit_sdsc(
@@ -3566,7 +3766,7 @@ pub fn emit_sdsc(
     op: &OpSpec,
     folds: &SdscFoldSet,
     layout: Option<&BundleLayout>,
-) -> Result<SdscOp, SuperDscError> {
+) -> Result<(SdscOp, Vec<SegFacts>), SuperDscError> {
     let cores = folds.core_fold();
     let views: Vec<ArgView<'_>> = op.args.iter().map(|a| a.view()).collect();
     let out_idx = views.len().saturating_sub(1);
@@ -3895,6 +4095,10 @@ pub fn emit_sdsc(
     // Collision guard: collect every (output) byte address emitted; any duplicate
     // is two cores writing the same byte = silently-wrong → build `Err`.
     let mut out_addr_seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    // ⭐ THE PER-ARG RESOLVED FACTS, collected beside the addresses they came from —
+    // one `SegFacts` per operand, threaded to `EmittedOp::new` so the binding
+    // carries the door's OWN resolution and no consumer ever re-derives it.
+    let mut arg_facts: Vec<SegFacts> = Vec::with_capacity(views.len());
     for (i, v) in views.iter().enumerate() {
         let comp = v.allocation.component();
         let name = format!("allocate-Tensor{i}_{comp}");
@@ -4055,25 +4259,24 @@ pub fn emit_sdsc(
             }
             clamped * v.df.word_length() as u64
         };
-        let (seg_base, intra_base) =
-            resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
-                // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
-                // stride-0 fold reads ONE element per materialized row at `row_base + offset`
-                // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
-                // addresses a lane within each row's stick rather than shifting the block. Every
-                // prior offset on a collapsed-stick operand is a stick-MULTIPLE block base (the
-                // per-head attention `col_at` bases), which keeps the default window model — this
-                // fires only for the lane read. See `resolve_seg_base`'s own doc for the window
-                // arithmetic the flag selects.
-                let stick_collapsed = v
-                    .layout
-                    .iter()
-                    .position(|&d| d == v.stick)
-                    .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
-                stick_collapsed
-                    && v.offset_elems > 0
-                    && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
-            })?;
+        let facts = resolve_seg_base(layout, v.name, i, v.offset_elems, arg_bytes, v.df, {
+            // ⭐ A SUB-STICK OFFSET ON A COLLAPSED STICK DIM IS A LANE READ — the RedStick
+            // stride-0 fold reads ONE element per materialized row at `row_base + offset`
+            // (exx2's E[x²] pair slot at element 8, read by rmsnorm's `rmxn`), so the offset
+            // addresses a lane within each row's stick rather than shifting the block. Every
+            // prior offset on a collapsed-stick operand is a stick-MULTIPLE block base (the
+            // per-head attention `col_at` bases), which keeps the default window model — this
+            // fires only for the lane read. See `resolve_seg_base`'s own doc for the window
+            // arithmetic the flag selects.
+            let stick_collapsed = v
+                .layout
+                .iter()
+                .position(|&d| d == v.stick)
+                .is_some_and(|p| !matches!(v.scale.get(p), Some(Scale::Active) | None));
+            stick_collapsed
+                && v.offset_elems > 0
+                && !(v.offset_elems as u64).is_multiple_of(v.df.elems_per_stick() as u64)
+        })?;
         // ── arrangement authority ── record THIS view's device layout for its tensor. If an earlier op
         // addressed the same tensor NON-equivalently (a producer/consumer Dense-vs-stick disagreement, the
         // M>1 scramble), this is a build Err naming the tensor — not silent garbage on-card. Declare only
@@ -4100,7 +4303,16 @@ pub fn emit_sdsc(
                 l.declare_arrangement(v.name, view_stick_layout(v, iter))?;
             }
         }
-        let per_core = per_core_addr(seg_base, v, &sl, iter, &wk_slice, intra_base, cores)?;
+        arg_facts.push(facts);
+        let per_core = per_core_addr(
+            facts.seg_base,
+            v,
+            &sl,
+            iter,
+            &wk_slice,
+            facts.intra_base,
+            cores,
+        )?;
         // No two cores of an OUTPUT tensor may share a byte address (aliased write) — EXCEPT a K-split
         // matmul, where the `k` cores each contract a K-slice into a PARTIAL product that dxp
         // PSUM-accumulates into the SHARED output tile (torch-spyre's reduction-dim split). That case is
@@ -4583,7 +4795,7 @@ pub fn emit_sdsc(
         },
     };
 
-    Ok(SdscOp {
+    let sdsc = SdscOp {
         sdscFoldProps_: vec![FoldProp {
             factor_: folds.time_fold() as i64,
             label_: "time",
@@ -4619,7 +4831,8 @@ pub fn emit_sdsc(
         coreIdToWkSlice_: wk_slice,
         coreIdToDscSchedule: core_dsc_schedule(cores),
         dscs_: vec![BTreeMap::from([(op_name.to_string(), dsc)])],
-    })
+    };
+    Ok((sdsc, arg_facts))
 }
 
 /// Set one named iteration dim in the dense [`IterSpace`] by slot name.
@@ -7079,7 +7292,7 @@ mod indirect_access_baseline {
         let op = matmul_opspec(384, 384, 64, 16, "Tensor0", "Tensor1", "Tensor2")
             .expect("a 384x384x64 batch-16 fp16 matmul is a legal OpSpec");
         let folds = SdscFoldSet::new(op.iter.cores_used());
-        let sdsc = emit_sdsc("MatMul_0", &op, &folds, None).expect("emit_sdsc accepts it");
+        let (sdsc, _) = emit_sdsc("MatMul_0", &op, &folds, None).expect("emit_sdsc accepts it");
         let json = serde_json::to_string(&sdsc).expect("SdscOp serializes");
         (sdsc, json)
     }
@@ -7966,6 +8179,48 @@ mod time_tiled_mb_operand_advances_per_trip {
             g1 > g0,
             "the mb operand moved {g0:#x} → {g1:#x}: it must ADVANCE — each trip reads its \
              own out-window of the row, unlike the address-stable scalar broadcast"
+        );
+    }
+}
+
+/// ⭐ THE FactsMatchBindings WITNESS, PINNED AT THE STAMP: `EmittedOp::new` refuses a
+/// facts/bindings length mismatch BY NAME before stamping anything. The door resolves
+/// one fact per spec operand; a parallel-array mismatch here would silently stamp one
+/// operand's resolution onto another's binding (the exact drift class records 53 and
+/// 54 paid for), so it is a build-time panic, never an unchecked zip.
+#[cfg(test)]
+mod facts_match_bindings_witness {
+    use super::*;
+
+    /// Emit a real three-operand matmul through the door, then re-stamp it with a
+    /// TRUNCATED facts list — the shape only an internal defect can produce.
+    #[test]
+    #[should_panic(
+        expected = "EmittedOp factless: the door resolved 1 operands but the op binds 3 \
+                    (FactsMatchBindings witness)"
+    )]
+    fn a_facts_bindings_length_mismatch_panics_naming_the_op() {
+        let op =
+            crate::ir::bridge::tiled_op_sdsc_op::matmul_opspec(64, 64, 64, 1, "tA", "tW", "tO")
+                .expect("a small matmul is a legal OpSpec");
+        let folds = crate::superdsc_opspec::SdscFoldSet::new(op.iter.cores_used());
+        let (inner, facts) =
+            emit_sdsc("factless", &op, &folds, None).expect("the small matmul emits");
+        assert_eq!(
+            facts.len(),
+            op.args.len(),
+            "the fixture premise: the door resolved one fact per operand"
+        );
+        // The mismatch: 1 fact for 3 operands. The panic must name the OP and state
+        // both counts before any binding is stamped.
+        let _ = EmittedOp::new(
+            "factless".to_string(),
+            inner,
+            &op.args,
+            &op.iter,
+            1,
+            vec![std::collections::BTreeMap::new(); op.args.len()],
+            &facts[..1],
         );
     }
 }

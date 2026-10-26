@@ -520,13 +520,28 @@ pub fn lower<F: scratchy_subtile::subtile_ir::RopeForm>(
 /// stayed fp16-clean. A width COLLISION is not an identity: only the tail's own
 /// rows are dead, and only the result's ancestors are the tail. The walk is
 /// [`tensor_feeds_result_through_row_local_ops`] (main's own law).
+///
+/// ⭐ THE WIDTH CONJUNCT READS THE OUTPUT **TENSOR'S** COLS, NOT THE REGION'S.
+/// The front end column-chunks every elementwise op (`n_blocks(out_cols, nb)`,
+/// subtile_ir.rs) — granite's 49155-wide logits ScalarMul arrives here as SEVEN
+/// chunk nodes (six of 8192 + one of 3) — so a region-keyed test sees each
+/// chunk's 8192 against the result's 49155 and the fold's elementwise arms
+/// (ScalarMul, TanhSoftCap) never fire, while the MatmulTile above them IS
+/// whole-width and folds: the tail's own scale then reads mq rows of which
+/// mq−1 were never written (the read-before-write walk's first true positive,
+/// prefill leg 55). Keying on the TENSOR's width makes a chunk fold iff its
+/// tensor would fold as a whole node — the chunking stops changing the fold's
+/// decision. For a whole-region node the two readings agree (the region IS the
+/// tensor), so the MatmulTile arm and the gemma-4 collision refusal (still
+/// rejected by the dataflow conjunct — a width collision is not an identity)
+/// are unchanged.
 pub fn is_prefill_lm_head_tail<F: scratchy_subtile::subtile_ir::RopeForm>(
     node: &SubtileNode<F>,
     ir: &SubtileIR<F>,
     rows_are_requests: bool,
 ) -> bool {
     let result_cols = ir.tensors[ir.result.index()].cols;
-    node.output.region.cols.len == result_cols
+    ir.tensors[node.output.tensor.index()].cols == result_cols
         && node.output.region.rows.len > 1
         && !rows_are_requests
         && tensor_feeds_result_through_row_local_ops(ir, node.output.tensor)
@@ -1636,6 +1651,7 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         geom,
         scale,
         valid_len,
+        layout: kv,
         ..
     } = &node.op
     else {
@@ -1758,7 +1774,11 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     // rung of the ladder places its step inputs identically (`ladder_stages_one_layout`), so
     // the sweep and chunk rungs' tables and mask state the SAME region the fold reads.
     let region_pages = paged_fold.map(|pf| pf.region_pages);
-    let spec = if rows_are_requests {
+    // ⭐ THE REGION VALUE IS BOUND PER ARM, from the same pages fact that arm's spec got — the
+    // spec's own law, not a second derivation: the prefill arm's spec defaults a `None` region
+    // to the walk's own extent, and the decode arm's spec receives the pool capacity as its
+    // `pages`. The mint below states it on the carrier unconditionally.
+    let (spec, region) = if rows_are_requests {
         // ── THE DECODE ROW: the request count is the batch. ──
         let num_seqs = node.output.region.rows.len;
         if num_seqs == 0 {
@@ -1789,17 +1809,21 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
         // carries. Pages per sequence, then chunks at this batch's own chunk depth.
         let pages_per_seq = valid_len.div_ceil(page_slots);
         let num_chunks = pages_per_seq.div_ceil(blocks_per_chunk);
-        batched_decode_spec(&BatchedDecodeFacts {
-            num_seqs,
-            nkvh,
-            gqa,
-            hd,
-            pages: cap,
-            page_slots,
-            blocks_per_chunk,
-            num_chunks,
-            scale,
-        })?
+        (
+            batched_decode_spec(&BatchedDecodeFacts {
+                num_seqs,
+                nkvh,
+                gqa,
+                hd,
+                pages: cap,
+                page_slots,
+                blocks_per_chunk,
+                num_chunks,
+                scale,
+            })?,
+            // The value that arm's spec received as `pages`: the pool capacity.
+            cap,
+        )
     } else {
         // ── THE PREFILL ROW: the chunk's query rows are M. ──
         if node.inputs.len() < 5 {
@@ -1833,16 +1857,21 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
                 node.output.tensor.index()
             ));
         }
-        batched_prefill_spec(&BatchedPrefillFacts {
-            mq,
-            nkvh,
-            gqa,
-            hd,
-            pages,
-            page_slots,
-            region_pages,
-            scale,
-        })?
+        (
+            batched_prefill_spec(&BatchedPrefillFacts {
+                mq,
+                nkvh,
+                gqa,
+                hd,
+                pages,
+                page_slots,
+                region_pages,
+                scale,
+            })?,
+            // The spec's own default law (`batched_prefill_spec`'s `region_pages.unwrap_or(pages)`):
+            // a rung whose ladder stated no fold region keeps the region at the walk's own extent.
+            region_pages.unwrap_or(pages),
+        )
     };
     // ONE PROGRAM FOR THE WHOLE BATCH/CHUNK — grid [1, 1] is both kernels' own contract:
     // every descriptor corner is a compile-time constant (the page/chunk loop is
@@ -1851,7 +1880,26 @@ pub fn lower_attn<F: scratchy_subtile::subtile_ir::RopeForm>(
     let positional = attn_positional(src, &spec, &grid, *attn_program)?;
     let k = mint_attn(node, ir, positional, rows_are_requests)?;
     let name = format!("attn_s{}", node.id.index());
-    let mut e = EmittedOp::bare(name);
+    // ⭐⭐⭐⭐⭐ THE REGION FACT AT THE MINT — UNCONDITIONAL, the SHARED TAIL over both row
+    // arms. Every op this arm mints is a one-shot attention carrier whose program gathers the
+    // paged pool through the absolute-entry tables — `mint_attn` binds the id tables in BOTH
+    // row arms — whether or not its ladder stated a fold region: a PREFIX-FREE rung states
+    // none (its bake is `ActiveCap::NONE`, because a start==0 chunk has nothing resident to
+    // attend) yet its kernel gathers the pool the same way, so keying the mint on
+    // `region_pages` left those carriers BARE and their reads double-based (the page base
+    // composed on top of the absolute entries — token 0's defect). The region VALUE is each
+    // arm's own contract, bound above. The pool's tids ride with it: the walk's stamp site
+    // checks the layout's gather reach for exactly those tids before stamping, so a graph
+    // that placed no pool REFUSES the build instead of taking the zero shift over an
+    // unpaged read.
+    let mut e = EmittedOp::paged_region(
+        name,
+        ktir_superdsc::sdsc_abstract::PagedRegion {
+            region_pages: region,
+            k_tid: kv.cache_tensor().index() as u32,
+            v_tid: kv.v_cache_tensor().index() as u32,
+        },
+    );
     e.ktir = Some(k);
     Ok(vec![e])
 }
