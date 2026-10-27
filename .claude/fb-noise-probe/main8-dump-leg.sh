@@ -12,10 +12,10 @@
 # Tree: /work/front-b-chatmain (main e63c6f8ac8 + the never-committed patch —
 # do not touch it). Build: ON THE POD, release, its own warm target dir (the
 # main8-ref-leg build). Model: granite-3.1-8b fp8. Markers: MAIN8LOG-DONE /
-# MAIN8LOG-FAILED. Log: /work/main8-logits-leg.log
+# MAIN8LOG-FAILED. Log: /work/main8-dump-leg.log
 set -u
 
-LOG=/work/main8-logits-leg.log
+LOG=/work/main8-dump-leg.log
 TREE=/work/front-b-chatmain
 TDIR=/work/front-b-chatmain/target
 REF2B=/work/fb-chat-main
@@ -30,7 +30,7 @@ if [ "${BG:-0}" != "1" ]; then
 fi
 exec >>"$LOG" 2>&1
 
-echo "==== main8-logits-leg start $(date -u +%FT%TZ) ===="
+echo "==== main8-dump-leg start $(date -u +%FT%TZ) ===="
 
 # ── busy check (live cargo only; zombies are the pod's normal litter) ──
 if pgrep -x cargo >/dev/null 2>&1; then
@@ -89,5 +89,5 @@ fi
 [ -s "$REF8B/logits-0000.bin" ] || { echo "MAIN8LOG-DUMP-MISSING (no $REF8B/logits-0000.bin)"; echo MAIN8LOG-FAILED; exit 1; }
 ls -la "$REF8B"/logits-*.bin | head -5
 tail -5 "$REF8B/main8-greedy-chat.err"
-echo "==== main8-logits-leg end $(date -u +%FT%TZ) ===="
+echo "==== main8-dump-leg end $(date -u +%FT%TZ) ===="
 echo MAIN8LOG-DONE
