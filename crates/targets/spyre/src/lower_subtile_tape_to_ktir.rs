@@ -1936,7 +1936,7 @@ pub fn graph_wiring<F: RopeForm>(
         if let Some(seat) = &sample_seat {
             staged.insert(seat.noise);
         }
-        for (&tid, _) in &staggered {
+        for &tid in staggered.keys() {
             if !staged.contains(&tid) {
                 return Err(SuperDscError(format!(
                     "the arrangement propagation marked t{tid} — a parameter outside the \
