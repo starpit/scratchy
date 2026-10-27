@@ -1,0 +1,160 @@
+{
+  "probe": "8b-fp8-seeded",
+  "model": "RedHatAI/granite-3.1-8b-instruct-FP8-dynamic",
+  "prompt": "Write two sentences about the ocean.",
+  "note": "rebased onto 8143cf0ebe; P3 + P5 only per the auditor's order",
+  "p3_concurrent_pair_deterministic": {
+    "seed1234_run_a_equals_run_b": true,
+    "seed9999_run_a_equals_run_b": true,
+    "gate": "the concurrent pair against itself across two runs (ruling (b), 2026-10-27 \u2014 batched numerics, never equated with solo)"
+  },
+  "texts": {
+    "concurrent_seed1234_run_a": "1. The ocean, spanning vast distances across the Earth's surface, is home to a diverse range of marine life, playing a crucial role in climate regulation and the global carbon cycle.\n\n2. Covering more than 70% of the Earth's surface, the",
+    "concurrent_seed1234_run_b": "1. The ocean, spanning vast distances across the Earth's surface, is home to a diverse range of marine life, playing a crucial role in climate regulation and the global carbon cycle.\n\n2. Covering more than 70% of the Earth's surface, the",
+    "concurrent_seed9999_run_a": "The ocean, a vast and complex ecosystem, covers approximately 71% of the Earth's surface and hosts an incredible diversity of marine life. Its influence extends beyond Earth, as it plays a crucial role in regulating climate and weather patterns, supporting global biodiversity, and",
+    "concurrent_seed9999_run_b": "The ocean, a vast and complex ecosystem, covers approximately 71% of the Earth's surface and hosts an incredible diversity of marine life. Its influence extends beyond Earth, as it plays a crucial role in regulating climate and weather patterns, supporting global biodiversity, and"
+  },
+  "p5_distribution": {
+    "draws": 200,
+    "seeds": "100000..100199",
+    "temperature": 1.0,
+    "reference": "main's 8b host logits (main8-logits-leg, main e63c6f8ac8)",
+    "ambiguous_texts": [
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd",
+      "\ufffd"
+    ],
+    "top10": [
+      {
+        "id": 1318,
+        "text": "The",
+        "p": 0.5986616353083434,
+        "expected": 119.73232706166867,
+        "observed": 119,
+        "sigma": 6.9320398400223215,
+        "z": -0.1056438045033382,
+        "ambiguous_text": false
+      },
+      {
+        "id": 35,
+        "text": "1",
+        "p": 0.386525002665744,
+        "expected": 77.3050005331488,
+        "observed": 81,
+        "sigma": 6.886558283787201,
+        "z": 0.5365524133514149,
+        "ambiguous_text": false
+      },
+      {
+        "id": 1465,
+        "text": "As",
+        "p": 0.0041617953508092395,
+        "expected": 0.832359070161848,
+        "observed": 0,
+        "sigma": 0.9104366875590222,
+        "z": -0.9142415738907571,
+        "ambiguous_text": false
+      },
+      {
+        "id": 39743,
+        "text": "Gran",
+        "p": 0.0023345556095180093,
+        "expected": 0.46691112190360184,
+        "observed": 0,
+        "sigma": 0.6825108731183815,
+        "z": -0.6841079611967091,
+        "ambiguous_text": false
+      },
+      {
+        "id": 52,
+        "text": "B",
+        "p": 0.0019354145783018223,
+        "expected": 0.38708291566036446,
+        "observed": 0,
+        "sigma": 0.621557519254963,
+        "z": -0.6227628235023941,
+        "ambiguous_text": false
+      },
+      {
+        "id": 11428,
+        "text": "Cover",
+        "p": 0.0005721074565671508,
+        "expected": 0.11442149131343016,
+        "observed": 0,
+        "sigma": 0.3381656841328792,
+        "z": -0.22884298262686031,
+        "ambiguous_text": false
+      },
+      {
+        "id": 69,
+        "text": "S",
+        "p": 0.000405684934470302,
+        "expected": 0.0811369868940604,
+        "observed": 0,
+        "sigma": 0.28478776455607985,
+        "z": -0.1622739737881208,
+        "ambiguous_text": false
+      },
+      {
+        "id": 2774,
+        "text": "Ab",
+        "p": 0.000405684934470302,
+        "expected": 0.0811369868940604,
+        "observed": 0,
+        "sigma": 0.28478776455607985,
+        "z": -0.1622739737881208,
+        "ambiguous_text": false
+      },
+      {
+        "id": 1450,
+        "text": "Des",
+        "p": 0.000358015698095276,
+        "expected": 0.0716031396190552,
+        "observed": 0,
+        "sigma": 0.26753972522045893,
+        "z": -0.1432062792381104,
+        "ambiguous_text": false
+      },
+      {
+        "id": 2166,
+        "text": "Sp",
+        "p": 0.000358015698095276,
+        "expected": 0.0716031396190552,
+        "observed": 0,
+        "sigma": 0.26753972522045893,
+        "z": -0.1432062792381104,
+        "ambiguous_text": false
+      }
+    ],
+    "pass_within_3sigma": true,
+    "draws_in_ref_top1000": 200,
+    "expected_in_ref_top1000": 199.94782959834592,
+    "draws_outside_top1000": {},
+    "n_outside": 0
+  },
+  "log_evidence": {
+    "seat_bind_lines": 334,
+    "seat_bound_seed_1234": true,
+    "seat_bound_seed_9999": true,
+    "both_seeds_one_launch": true,
+    "prefill_batched_lines": 204,
+    "decode_batch_lines": 1,
+    "two_row_rung_line": true,
+    "seat_readback_lines": 334,
+    "refusals_or_panics": [],
+    "sample_seat_lines": [
+      "2026-10-27T12:03:39.705378Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step0:inv_t1",
+      "2026-10-27T12:03:39.872500Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step67:inv_t1",
+      "2026-10-27T12:03:39.949935Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=9999@step0:inv_t1",
+      "2026-10-27T12:03:40.114809Z DEBUG SEAT_BIND rows=1 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step68:inv_t1",
+      "2026-10-27T12:03:40.188104Z DEBUG SEAT_BIND rows=2 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step69:inv_t1 r1:seed=9999@step67:inv_t1",
+      "2026-10-27T12:03:40.270966Z DEBUG SEAT_BIND rows=2 seed_words=[727, 728, 729, 730] invt=t731 laws=r0:seed=1234@step70:inv_t1 r1:seed=9999@step68:inv_t1"
+    ]
+  }
+}
