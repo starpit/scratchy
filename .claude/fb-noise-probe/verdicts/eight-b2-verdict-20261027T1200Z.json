@@ -1,0 +1,64 @@
+{
+  "probe": "8b-fp8-b2only-releg",
+  "model": "RedHatAI/granite-3.1-8b-instruct-FP8-dynamic",
+  "prompt": "Write two sentences about the ocean.",
+  "note": "rebased onto 8143cf0ebe (the scatter commit); b2 only per the auditor's order",
+  "b2_concurrent_greedy": {
+    "gate_multiset_equals_main_batched": false,
+    "pairwise_by_file": false,
+    "note": "main's own 2-concurrent greedy texts are the reference (batched numerics), never solo",
+    "info_branch_pair_texts_identical": true,
+    "info_lengths": {
+      "branch_a": 244,
+      "branch_b": 244,
+      "main_a": 241,
+      "main_b": 244
+    }
+  },
+  "b2_first_divergence": {
+    "branch_a_vs_main_a": {
+      "at_char": 169,
+      "x": "e in regulating the global climate. Its ",
+      "y": "e in regulating the climate. Its vastnes"
+    },
+    "branch_b_vs_main_b": {
+      "at_char": 189,
+      "x": "global climate. Its vastness and depth r",
+      "y": "global climate. Its depths remain largel"
+    }
+  },
+  "log_evidence": {
+    "prefill_batched_lines": 2,
+    "decode_batch_lines": 1,
+    "two_row_rung_line": true,
+    "rung_load_lines": 8,
+    "refusals_or_panics": [],
+    "sample_rung_lines": [
+      "2026-10-27T11:47:19.775517Z  INFO superdsc paged: prefill anchor BORROWS \u2014 its 8755 MB spare (a twin of the weight home + a second 983100 MB KV pool) does NOT fit inside the 88473 MB that --gpu-memory",
+      "2026-10-27T11:47:19.863884Z DEBUG [sdsc-superdsc] PAGED KV: 3 of 20 rungs have a fold-fused twin (a context inside one page runs it \u2014 the split body costs two extra launches per layer, ~1 ms/token)",
+      "2026-10-27T11:47:19.863888Z DEBUG [sdsc-superdsc] load: LADDER \u2014 20 decode rungs (active_cap [64, 128, 256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336",
+      "2026-10-27T11:47:25.437910Z DEBUG [timing] prefill ladder: 26 rung(s) ready in 5.57s wall \u2014 built in parallel on background threads while the decode session staged",
+      "2026-10-27T11:47:25.437915Z  INFO [spyre-worker] sendnn: PREFILL ladder = [7, 11, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 39, 43, 47, 55, 63, 71, 80, 88, 96, 112, 128, 192, 256, 384, 512] (chunk runs ",
+      "2026-10-27T11:47:25.438182Z DEBUG [sdsc-superdsc] PAGED KV: 1 of 18 rungs have a fold-fused twin (a context inside one page runs it \u2014 the split body costs two extra launches per layer, ~1 ms/token)"
+    ]
+  },
+  "texts": {
+    "main_b2_a": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the climate. Its vastness and depth remain largely unexplored, revealing new",
+    "main_b2_b": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the global climate. Its depths remain largely unexplored, revealing new species",
+    "branch_b2_a": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the global climate. Its vastness and depth remain largely unexplored, making it",
+    "branch_b2_b": "The ocean, covering over 70% of the Earth's surface, is the largest habitat on our planet, teeming with diverse marine life and playing a crucial role in regulating the global climate. Its vastness and depth remain largely unexplored, making it"
+  },
+  "auditor_ruling_20261027": {
+    "accepted": "corruption fixed at 8b; the remaining delta is the batched-numerics class at a token where main's own two batched rows disagree with each other \u2014 not a defect, no instrument needed",
+    "row_stability": {
+      "branch_rows_byte_identical": true,
+      "main_rows_diverge": true,
+      "note": "our two rows are byte-identical while main's diverge \u2014 main's own instability, not ours"
+    },
+    "main_row_divergence_point": {
+      "at_char": 169,
+      "x": "e in regulating the climate. Its vastnes",
+      "y": "e in regulating the global climate. Its "
+    }
+  }
+}

@@ -92,6 +92,31 @@ def main() -> int:
         "branch_b2_a": ba, "branch_b2_b": bb,
     }
 
+    # ── the auditor's ruling, recorded (2026-10-27): the corruption is FIXED
+    #    at 8b (the pre-rebase texts were degenerate from the first shared
+    #    rows=2 step; the rebased tree's are fluent). The remaining delta sits
+    #    at a token where MAIN's OWN two batched rows disagree with each
+    #    other — that is the batched-numerics class, not a defect, and it
+    #    does not need the instrument. Note the row-stability asymmetry: our
+    #    two rows are byte-identical to each other while main's diverge —
+    #    main's own instability, not ours. The multiset gate above stays FALSE
+    #    as measured (a failed gate is never rewritten); this ruling is the
+    #    closure of record. ──
+    report["auditor_ruling_20261027"] = {
+        "accepted": "corruption fixed at 8b; the remaining delta is the "
+                    "batched-numerics class at a token where main's own two "
+                    "batched rows disagree with each other — not a defect, "
+                    "no instrument needed",
+        "row_stability": {
+            "branch_rows_byte_identical": ba == bb,
+            "main_rows_diverge": main_b2_a != main_b2_b,
+            "note": "our two rows are byte-identical while main's diverge — "
+                    "main's own instability, not ours",
+        },
+        "main_row_divergence_point": first_div(main_b2_a, main_b2_b)
+            if main_b2_a != main_b2_b else None,
+    }
+
     (HERE / "eight-b2-verdict.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     if not ok:

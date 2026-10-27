@@ -23,10 +23,12 @@
 # seeds) and the PREFILL_PATH=batched / decode-batch rung lines are in the
 # log. Tree: /work/front-b-noise (this branch). Build: ON THE POD, release,
 # WARM target dir /work/pr916/head/target. Server port 8791. Markers:
-# CHAT-DONE / CHAT-FAILED. Log: /work/chat-leg.log
+# CHAT-DONE / CHAT-FAILED. Log: /work/chat2-leg.log — the RE-CHECK leg's own
+# FRESH log (2026-10-27, the rebased tree), so no earlier chat leg's terminal
+# markers can stale-cursor a watch.
 set -u
 
-LOG=/work/chat-leg.log
+LOG=/work/chat2-leg.log
 TREE=/work/front-b-noise
 # ── front-b's OWN target dir (auditor order 2026-10-27: the shared
 #    /work/pr916/head/target is a hazard — another tree's rlibs can be
@@ -86,12 +88,17 @@ echo "==== CHAT-SERVE-START $(date -u +%FT%TZ) ===="
 setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --device spyre \
   --port $PORT --log-level debug > "$SRVLOG" 2>&1 &
 SRVPID=$!
-# wait for readiness (the health/models endpoint answers)
+# wait for readiness (the health/models endpoint answers); A DEAD SERVER
+# ENDS THE LEG — never poll a corpse (auditor order 2026-10-27).
 for i in $(seq 1 120); do
   if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then break; fi
+  if ! kill -0 $SRVPID 2>/dev/null; then break; fi
   sleep 5
 done
 if ! curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
+  if ! kill -0 $SRVPID 2>/dev/null; then
+    echo "CHAT-SERVE-DIED"; tail -30 "$SRVLOG"; echo CHAT-FAILED; exit 1
+  fi
   echo "CHAT-SERVE-NEVER-READY"; kill $SRVPID 2>/dev/null; tail -30 "$SRVLOG"; echo CHAT-FAILED; exit 1
 fi
 echo "==== CHAT-SERVE-READY $(date -u +%FT%TZ) ===="
@@ -193,6 +200,7 @@ setsid nohup "$SCR" serve -m RedHatAI/granite-3.1-2b-instruct-FP8-dynamic --devi
 SRVPID=$!
 for i in $(seq 1 120); do
   if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then break; fi
+  if ! kill -0 $SRVPID 2>/dev/null; then break; fi
   sleep 5
 done
 if curl -s -o /dev/null "http://127.0.0.1:$PORT/v1/models"; then
