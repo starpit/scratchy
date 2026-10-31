@@ -4539,7 +4539,15 @@ mod walk_on_the_card {
     #[test]
     fn a_decode_batch_lowers_at_every_rung_shape() {
         for hd in [64, 128] {
-            for (seqs, walk) in [(2, 1), (2, 64), (32, 1), (32, 64), (4, 2048)] {
+            for (seqs, walk) in [
+                (1, 1),
+                (1, 128),
+                (2, 1),
+                (2, 64),
+                (32, 1),
+                (32, 64),
+                (4, 2048),
+            ] {
                 let at = format!("{seqs} sequences over {walk} blocks at head dim {hd}");
                 let (node, c) = batched_walk_at(seqs, walk, hd);
                 let layout = triton_ktir_superdsc::layout::for_node(&node)
@@ -4867,7 +4875,7 @@ mod walk_on_the_card {
             let body: Vec<_> = ops.iter().filter(|e| e.walk.is_some()).cloned().collect();
             let walk = body[0].walk.expect("a walk");
             assert_eq!(walk.trips, 4, "mq={mq}: four pages, four trips");
-            let unrolled = unroll_walk(ops.clone(), 128);
+            let unrolled = unroll_walk(ops.clone(), 128).expect("the body is one walk's run");
             let copies: Vec<_> = unrolled.iter().filter(|e| e.walk.is_some()).collect();
             assert_eq!(
                 copies.len(),

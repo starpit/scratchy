@@ -142,15 +142,29 @@ fn indirect_anchor_var(tile: &Operation<'_>) -> Option<usize> {
 /// row and mask tile are the only tensors a body reads there), and the walk relaunched `trips / u`
 /// times at `u` steps a launch. `u` is the largest power of two that divides the trip count and keeps
 /// the unrolled body within `max_descriptors` (a launch group's bound).
-pub fn unroll_walk(ops: Vec<super::EmittedOp>, max_descriptors: usize) -> Vec<super::EmittedOp> {
+///
+/// The body is one contiguous run of one walk's ops: an op inside it outside the walk, or of another
+/// walk, would be copied `u` times, so it is refused.
+pub fn unroll_walk(
+    ops: Vec<super::EmittedOp>,
+    max_descriptors: usize,
+) -> Result<Vec<super::EmittedOp>, Error> {
     let (Some(first), Some(last)) = (
         ops.iter().position(|e| e.walk.is_some()),
         ops.iter().rposition(|e| e.walk.is_some()),
     ) else {
-        return ops;
+        return Ok(ops);
     };
-    let Some(walk) = ops[first].walk else {
-        return ops;
+    let walk = ops[first].walk;
+    if let Some(e) = ops[first..=last].iter().find(|e| e.walk != walk) {
+        return err(format!(
+            "{}: relaunches as {:?} inside a walk body that relaunches as {walk:?} — a body is one \
+             contiguous run of one walk's ops, and unrolling it would copy this op with it",
+            e.op_name, e.walk
+        ));
+    }
+    let Some(walk) = walk else {
+        return Ok(ops);
     };
     let body_descriptors: usize = ops[first..=last]
         .iter()
@@ -161,7 +175,7 @@ pub fn unroll_walk(ops: Vec<super::EmittedOp>, max_descriptors: usize) -> Vec<su
         u *= 2;
     }
     if u == 1 {
-        return ops;
+        return Ok(ops);
     }
     let folded = WalkTrips {
         trips: walk.trips / u,
@@ -180,7 +194,7 @@ pub fn unroll_walk(ops: Vec<super::EmittedOp>, max_descriptors: usize) -> Vec<su
         }));
     }
     ops.extend(tail);
-    ops
+    Ok(ops)
 }
 
 /// Whether `k` walks — states a top-level `scf.for` — whatever it computes. A walk's windows are
