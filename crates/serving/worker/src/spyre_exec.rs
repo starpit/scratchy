@@ -382,9 +382,9 @@ impl Worker for SpyreWorker {
         // a prefill continuation and stays on the per-request path below.
         //
         // Through `run_card_launch` — the SAME path a prompt chunk takes. One request decodes on the
-        // W=1 owner (spyre-inference's `page_attn_head_major_decode`), several on a ladder rung
-        // (`batched_decode_head_major`); the paged step each stages is built from the requests' own
-        // block tables and positions.
+        // W=1 owner, several on a ladder rung, every one as a decode batch
+        // (`batched_decode_head_major`, as spyre-inference serves them); the paged step each stages is
+        // built from the requests' own block tables and positions.
         //
         // A continuation chunk (n > 1) is not a decode step and keeps the per-request path below;
         // a DECODE step never does — one request is the W=1 OWNER here, and a live count past the
