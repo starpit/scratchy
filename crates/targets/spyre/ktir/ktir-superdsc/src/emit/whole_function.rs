@@ -6724,6 +6724,16 @@ fn lower_function_folded(
             ));
         };
         o = windowed_region(k, o, tile)?;
+        // Stored through a shape op that moves no byte (one sequence's `[KV·G, D]` attention
+        // stored as its `[1, H·D]` output row), the result is written in its own frame: the
+        // store's whole view and the result are the same bytes, framed apart.
+        if let Some(dims) = op.result_type.and_then(|t| t.dims())
+            && [o.r_len, o.c_len] != flat_frame(dims)
+            && (o.r_start, o.c_start, o.r_len, o.c_len) == (0, 0, o.v_rows, o.v_cols)
+            && same_card_bytes(&[i64::from(o.v_rows), i64::from(o.v_cols)], dims)
+        {
+            o = reframed(o, flat_frame(dims));
+        }
         o.is_out = true;
         per_op.push(o);
         // ⭐⭐⭐ A STORED RESULT IS STILL READABLE. The value this op writes to the store's
