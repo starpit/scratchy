@@ -11381,9 +11381,15 @@ fn dump_wavefront_mega(
              -> (BakeOut, Vec<BakeEffect>) {
                 let mut fx: Vec<BakeEffect> = Vec::new();
                 let is_prefill = prefill_mq.is_some();
-                // A prefill chunk's rows are one prompt's positions; the decode bundle's are one
-                // token each of the running requests once it is baked wider than a single row.
-                let rows_are_requests = !is_prefill && decode_rows > 1;
+                // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
+                // each of the running requests. On the card that includes the one-row bundle:
+                // spyre-inference serves every decode, a single sequence's too, with
+                // `batched_decode_head_major` (`SPYRE_BATCHED_DECODE`, on by default and validated
+                // for the head-major layout under the tiled walk), 32 pages a chunk trip at one
+                // sequence — never its per-sequence fallback. Off the card the emulator worker runs
+                // the per-sequence kernel, one request a forward.
+                let rows_are_requests =
+                    !is_prefill && (decode_rows > 1 || cfg!(feature = "spyre-hw"));
                 // ⛔ THE WIRING MUST NOT DESCRIBE A PROGRAM THAT DID NOT SHIP. A prefill
                 // rung whose reroll fails PANICS (no rung may fail to lower), but this
                 // closure's KTIR emission and wiring stamp run AFTER the reroll and
