@@ -4791,6 +4791,7 @@ fn lower_function_folded(
                     if let &[b, r, c] = to.as_slice()
                         && b > i64::from(g.entries)
                         && b % i64::from(g.entries) == 0
+                        && g.entries <= crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP
                         && c % stick == 0
                         // Landed stick-major: the frame a multi-stick page is read in (`page_to_sticks`,
                         // as the one-block-an-entry gather below requires), and at one stick the
