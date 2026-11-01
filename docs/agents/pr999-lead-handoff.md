@@ -83,7 +83,9 @@ Card-proven as of PR comment **6560275506**. Every cell — 2b and 8b, solo and 
    fails identically, through `scr chat` AND `scr serve`, on 2b AND 8b — so the bind failure
    PREDATES the rebase.** A same-hour control of this morning's v4 (`797`-plus-patch) binary was on
    the card when I handed over; its verdict closes whether the patch stack was what made `797`
-   serve. **Start at §4.1a — it names the one hypothesis left and how to test it without a card.**
+   serve. **ANSWERED TOO (PR comment 6560413795): the v4 patched tree SERVES AND IS COHERENT right
+   now, so the fix exists in the pre-rebase patched lineage and the rebase lost it.**
+   **⭐ START AT §4.1b. It names the exact delta the fix is in, and what I already ruled out of it.**
 3. **The 2b `C` leg** (= B's 2b binary `4829f00e…`) is the only unmeasured 2b point, queued behind.
 4. **A PR-thread watcher must be running.** See §6.1 — if it is not, you are not receiving card
    results.
@@ -162,6 +164,51 @@ decode-slot stamp (or in `decode_seat` selecting by width).
 separately print the fp codegen stamps into the decode slot. If the stamped fp is a `rows>1` bake,
 the hypothesis is confirmed. (The probe needs `-vv` to surface build-script stderr and a `touch` of
 the model crate to defeat caching.)
+
+#### ⭐⭐ 4.1b The card closed the bisect — and the delta that fixes it is nameable (PR comment 6560413795)
+
+A same-hour control settled it. The card's full story:
+
+| head | serves? | output |
+|---|---|---|
+| **v4** = pre-rebase lineage + the `fixgather` patch stack | **yes** | **coherent**, 2b and 8b, at 03:03 *and* at 16:05 (md5 `757f94cb…`, 126.6 ms ITL) |
+| bare `797df4104` (pre-rebase, unpatched) | no | 500s, `t4292967123`, mq=1, chat **and** serve |
+| `fef674680` / **A** `74987efb6` (post-rebase) | no | the same 500s, both models |
+| **B** `08007b8dd` | yes | garbage, both models |
+| **C** / **D** | as B | as B (D adds its own condemned prefill defect) |
+
+No drift: B reproduced this afternoon's garbage and v4 reproduced this morning's coherence within
+the same hour, same pod, same flags.
+
+**So the bind failure was already dead in the pre-rebase PATCHED lineage, and the rebase lost
+whatever killed it.** Either it lived in the `fixgather` patch stack, or in pre-rebase commits after
+`797df4104` that the rebase dropped when it rebuilt onto `fef674680`. **The fix is in that delta.**
+
+**What I established about the patch stack before handing over** (the v4 patch is on the pod at
+`/work/pr999-fixgatherv4`, and on this machine at `.scratch/pr999_fixgather_v4.patch` — untracked,
+so pull it from the pod). Its diffstat is 6 files / +192 −79:
+
+* `crates/serving/worker/src/spyre_load.rs` — **a comment only.** Not the fix.
+* `crates/triton/splice/src/lib.rs` — **a test only** (`a_decode_batch_gathers_each_page_whole`).
+  Not the fix, but keep the test: it is the law that a decode batch gathers each page whole, one op,
+  a page a core — the 128-slot page had put 2b onto the piece copy and that is what made two
+  concurrent requests decode garbage from their first batched step (bisected to `b82250b17`).
+* `crates/targets/spyre/src/superdsc_exec.rs` (+15) — **zeroes the paged KV segment in `prepare`**
+  when the session owns it and is not reserve-only. Real, and needed for coherence (device memory
+  left as found holds non-finite words that no additive mask cancels; 8,253 measured in page 0) —
+  but it is not a *placement* fix, so it is not what makes the bind succeed.
+* `lower_ktir_to_superdsc.rs` (±101), `whole_function.rs` (±24),
+  `tiled_op_sdsc_op/pointwise.rs` (+79) — **the emission changes. The bind fix is in here, or in the
+  pre-rebase commits the patch sat on.** I did not get to isolate which.
+
+**Reconcile this with §4.1a.** §4.1a says the mq=1 seat stages a Sequence source into a bundle with
+no Sequence placements. An emission change *can* produce exactly that by moving which placements the
+layout emits. So the two readings agree, and the test in §4.1a (print the decode-slot's stamped fp,
+and the `paged_rows` of the bake it names) still discriminates — it tells you whether the owner
+session is on the wrong bundle, or on the right bundle with a layout the emission change altered.
+
+**Card state at handover: both pods free, ready for the next head.** `E` (`pr999-relayout`) stays
+unmeasurable until this is fixed — its own gate needs either A-plus-this-fix or a v4-lineage base.
 
 ### 4.2 Concurrent decode is incoherent — **root cause CONFIRMED on the card, fix written**
 
