@@ -6,6 +6,31 @@ hypothesis rather than a measurement, it says so.
 
 ---
 
+## 0. What this handoff carries with it
+
+This document used to point at eight artifacts under `.scratch/`, which is **untracked** — on any
+machine but the one that wrote it, those were dead references. They are now in the repo, on this
+branch, under **`docs/agents/pr999/`**:
+
+| file | what it is | why you need it |
+|---|---|---|
+| `pr999_fixgather_v4.patch` | the `fixgather` patch stack | **the delta the bind fix is in — see §4.1b.** The only other copy is `/work/pr999-fixgatherv4` on the pod, and pods get wiped |
+| `perf_plan.md` | the running log, ~400 lines | the port ladder and every measurement taken. Read the last 150 lines |
+| `torch_ref/` | 6 of 28 SDSC descriptors + `bundle.mlir` | the capture of torch-spyre's *compiled* decode program — the reference claims are checked against (§6.4) |
+| `capture_tc3/*.sh` | the bake scripts | the full-model type-check gate (§6.3) |
+| `stubsdk/{make.sh,empty.c}` | the stub SDK's sources | the bakes need it; `make.sh` generates the dylibs, so only the sources are carried |
+| `watch_pr999.sh` | the PR-thread poller | the card loop (§6.1) |
+
+**Not carried, and not carryable:**
+
+* **The pod state.** `/work/pr999-fixgatherv4`, the built binaries, and the cell JSONs live on
+  `nickm` / `nickm2`. The card agent has them; ask in the PR thread rather than rebuilding.
+* **spyre-inference and torch-spyre.** Readable under the user's home **for this port only** (a
+  standing exception to the no-home-directory rule) — clone them on the new machine.
+* **The models.** granite-3.1-2b-instruct and granite-3.1-8b-instruct, fp8.
+
+---
+
 ## 1. The goal
 
 `AI-native-Systems-Research/scratchy` PR **#999** ports torch-spyre / spyre-inference's **paged
@@ -185,8 +210,8 @@ whatever killed it.** Either it lived in the `fixgather` patch stack, or in pre-
 `797df4104` that the rebase dropped when it rebuilt onto `fef674680`. **The fix is in that delta.**
 
 **What I established about the patch stack before handing over** (the v4 patch is on the pod at
-`/work/pr999-fixgatherv4`, and on this machine at `.scratch/pr999_fixgather_v4.patch` — untracked,
-so pull it from the pod). Its diffstat is 6 files / +192 −79:
+`/work/pr999-fixgatherv4`, and **carried in this repo at `docs/agents/pr999/pr999_fixgather_v4.patch`**
+— see §0). Its diffstat is 6 files / +192 −79:
 
 * `crates/serving/worker/src/spyre_load.rs` — **a comment only.** Not the fix.
 * `crates/triton/splice/src/lib.rs` — **a test only** (`a_decode_batch_gathers_each_page_whole`).
@@ -312,10 +337,10 @@ runs cells and posts results **as PR #999 comments**. The loop is:
 Step 3 is the part that gets dropped. Arm it:
 
 ```bash
-SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ) bash .scratch/watch_pr999.sh   # under Monitor, re-arm on expiry
+SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ) bash docs/agents/pr999/watch_pr999.sh   # under Monitor, re-arm on expiry
 ```
 
-(`.scratch/` is untracked — the script is 15 lines of `gh api` polling and is trivial to rewrite:
+(the script is 15 lines of `gh api` polling, carried in §0; trivial to rewrite anyway:
 poll `issues/999/comments`, `pulls/999/comments`, `pulls/999/reviews`, emit one line per new id.)
 
 ⛔ **Gate first, then push to the PR branch.** The established pattern is side branch → card gate →
@@ -352,21 +377,23 @@ cargo test -p scratchy-target-spyre --lib
 cargo test -p triton-numeric --test paged_attn      # 8 cases vs spyre-inference's own kernels
 cargo test -p scratchy-target-spyre --features spyre-emu --test triton_splice_golden
 cargo clippy -p <crate> --all-targets -- -D warnings
-bash .scratch/capture_tc3/bake_2b_fp8.sh            # and bake_8b_fp8.sh — full-model type-check
+bash docs/agents/pr999/capture_tc3/bake_2b_fp8.sh   # and bake_8b_fp8.sh — full-model type-check
 ```
 
-The bake scripts need the stub SDK (`.scratch/stubsdk`, `FLEX_RS_SPYRE_ROOT`,
-`SCRATCHY_SKIP_SENDNN_CXX=1`, `DXP_STANDALONE`, `DEEPTOOLS_PATH`). Rebuild from
-`.scratch/capture_tc3/bake_fp8.sh` if `.scratch` is lost.
+The bake scripts need the stub SDK: **build it with `bash docs/agents/pr999/stubsdk/make.sh`**
+(its dylibs are generated from `empty.c`, which is why only the two sources are carried), then set
+`FLEX_RS_SPYRE_ROOT`, `SCRATCHY_SKIP_SENDNN_CXX=1`, `DXP_STANDALONE`, `DEEPTOOLS_PATH` as
+`docs/agents/pr999/capture_tc3/bake_fp8.sh` does.
 
 ### 6.4 The reference
 
 `~/git/spyre-inference` and `~/git/torch-spyre` are readable **for this port only** (a standing
 exception to the no-home-directory rule). Cite `file:line` when claiming "theirs does X" — several
 claims this session were wrong until checked against the source.
-`.scratch/torch_ref/` holds a **partial** capture of their compiled decode program (6 of 28
-descriptors: `sdsc_6/8/9/13/24/26`); the reductions are **not** among them, so their summation order
-is unknown. `.scratch/perf_plan.md` is the running log — ~400 lines, read the last 150.
+`docs/agents/pr999/torch_ref/` holds a **partial** capture of their compiled decode program (6 of
+28 descriptors: `sdsc_6/8/9/13/24/26`, plus `bundle.mlir`); the reductions are **not** among them,
+so their summation order is unknown. `docs/agents/pr999/perf_plan.md` is the running log — ~400
+lines, read the last 150.
 
 ### 6.5 Working rules that bit us
 
