@@ -79,7 +79,11 @@ Card-proven as of PR comment **6560275506**. Every cell — 2b and 8b, solo and 
 2. **The bisect is running on `nickm2`.** `fef674680` built **byte-identical to A on 8b** (so
    `6fcd27dbb` is emission-neutral there and its cells will 500 the same way). **`797df4104`
    (pre-rebase) is the deciding cell** — it says whether the bind failure came in with the rebase
-   onto `upstream/main` or predates it. Verdict due in the next card-agent comment.
+   onto `upstream/main` or predates it. **ANSWERED (PR comment 6560404488): bare `797df4104`
+   fails identically, through `scr chat` AND `scr serve`, on 2b AND 8b — so the bind failure
+   PREDATES the rebase.** A same-hour control of this morning's v4 (`797`-plus-patch) binary was on
+   the card when I handed over; its verdict closes whether the patch stack was what made `797`
+   serve. **Start at §4.1a — it names the one hypothesis left and how to test it without a card.**
 3. **The 2b `C` leg** (= B's 2b binary `4829f00e…`) is the only unmeasured 2b point, queued behind.
 4. **A PR-thread watcher must be running.** See §6.1 — if it is not, you are not receiving card
    results.
@@ -110,6 +114,54 @@ Ruled out by inspection: `6fcd27dbb`'s entire `wiring.rs` diff is in the **batch
 one-sequence arm is byte-identical. What that commit *does* change is the batch rungs' layout
 (`rep_rows` grows up to 8× at the 8b under the gather floor) — look there if the bisect clears the
 rebase. **Evidence: PR comment 6560054671 (the failure), 6560131764 (the tid identification).**
+
+#### ⭐ 4.1a What the card and the tid arithmetic now say together (2026-11-01 16:0x)
+
+Two facts arrived after the section above was written. Together they narrow this to one hypothesis
+the next lead can test **without a card**.
+
+**Fact A — the card agent's discriminator (PR comment 6560404488).** Bare `797df4104` fails
+identically through `scr chat` *and* `scr serve`, on 2b *and* 8b, with prefix caching on *and* off:
+`superdsc decode stage (mq=1, at=20): bind: raw tensor 't4292967123'`. So it is not the serve
+wrapper, not a flag, not the port — it is the paged decode path at the **mq=1 seat**, on the first
+decode step. Their boot logs show the batch rungs (`seqs=2/4/8/16/32 ready`) and the
+`try_load (decode m=1)` session both build; only the *bind* fails. They also noticed a second,
+`paged=false` standalone dxp session (fp `0e128e36e297afa9`) alongside the paged engine and flagged
+that they do not know whether that duality is expected — **it is worth confirming.**
+
+**Fact B — what `t4292967123` can only be.** It is `at(1)` = `PAGED_PAGE_TABLE_TID`, and
+`PagedStep::card_placements` (`crates/targets/spyre/src/wiring.rs:750`) places `page_table` /
+`mask` / `query_rows` **only** in the `None` (Sequence) arm, `rep_rows` / `chunk_pages` /
+`chunk_masks` **only** in the `Some` (Batch) arm. A missing placement for `page_table` therefore
+means exactly one thing: **the step was staged as Sequence into a bundle that was baked as Batch.**
+
+**The contradiction.** On `74987efb6`/`797df4104`, `rows_are_requests = !is_prefill && decode_rows > 1`
+(`crates/compiler/macros/src/codegen.rs`), so the **W=1 decode bundle bakes Sequence** — and a local
+`SCRATCHY_PROBE_PAGED` bake of the 2b confirmed it prints `paged_rows=Sequence rows=1`. A Sequence
+bundle *does* place `page_table`. So the bundle the mq=1 seat **binds into** is not the W=1 bundle
+whose bake we just inspected.
+
+**The hypothesis to test first — the owner session may be built on the wrong bundle.**
+`SpyreWirings::decode_seat` (`crates/serving/worker/src/spyre_types.rs:422`) hands `RungId::Owner`
+`&mut self.decode` and *asserts in a comment* "the owner is the m=1 bake". That session is built at
+`crates/serving/worker/src/spyre_load.rs:1773` from `code`, and `code` comes from the fingerprint
+stamped into `groups[0].decode.graph_json` (`spyre_load.rs:1077-1092`). **Nobody has checked that
+that slot carries the m=1 bake rather than the widest decode rung.** If codegen stamps the decode
+slot with the last/widest decode bake, the owner session's `places` map is a *Batch* bundle's, the
+mq=1 Sequence staging can never find `page_table`, and every symptom follows: both models, both
+entry paths, first decode step, batch rungs fine.
+
+**Why this also predicts the ladder we measured.** `2c6c3f1b2` changes `rows_are_requests` to
+`!is_prefill`, making the W=1 bundle **Batch** — which would make both sides agree by accident and
+let the request run. That is exactly what the card saw: **A 500s; B/C/D run and return garbage.**
+If this hypothesis holds, `2c6c3f1b2` is masking the bug, not fixing it, and the real fix is in the
+decode-slot stamp (or in `decode_seat` selecting by width).
+
+**How to test it, no card needed.** Bake the 2b with the `SCRATCHY_PROBE_PAGED` probe described in
+§6.2, but print the *fingerprint* alongside `paged_rows`/`rows` in `compute_bundle_layout`, and
+separately print the fp codegen stamps into the decode slot. If the stamped fp is a `rows>1` bake,
+the hypothesis is confirmed. (The probe needs `-vv` to surface build-script stderr and a `touch` of
+the model crate to defeat caching.)
 
 ### 4.2 Concurrent decode is incoherent — **root cause CONFIRMED on the card, fix written**
 
