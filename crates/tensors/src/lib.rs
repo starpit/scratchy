@@ -10,6 +10,7 @@
 //! and gives the `targets/{cuda,metal}` crates a shared home that cannot
 //! name a backend.
 
+pub mod compiler_ids;
 pub mod device_allocator;
 pub mod dtype;
 pub mod lowering_dtype;
