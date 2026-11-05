@@ -48,6 +48,7 @@ members = [
     "crates/models/spec",
     "crates/compiler",
     "crates/compiler/macros",
+    "crates/compiler/frontend",
     "crates/compiler/subtile",
     "crates/targets/cuda/cost-sweep",
     "crates/targets/metal",

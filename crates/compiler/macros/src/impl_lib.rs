@@ -1694,6 +1694,11 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
                 (num_den_lit as u64 * den_num_lit as u64) as u32,
             )
         }
+        Dim::Add(_) => {
+            panic!(
+                "Reshape target dim may not be a sum: the runtime opcode has no sum path. Got {d:?}"
+            )
+        }
         Dim::Var(_) => {
             panic!("Reshape target dim must be closed (no Var) — compiler bug")
         }
@@ -16776,6 +16781,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
@@ -16860,6 +16866,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
@@ -16966,6 +16973,7 @@ mod tests {
             locals: Default::default(),
             weights: Default::default(),
             reshape_targets: Default::default(),
+            dim_casts: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),

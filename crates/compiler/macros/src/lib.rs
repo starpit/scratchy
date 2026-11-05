@@ -38,16 +38,16 @@ use quote::quote;
 use syn::Ident;
 
 mod alias_rules;
+// The front end, at the paths the passes here name it by (`crate::classified`, ...).
+use scratchy_forward_compiler_frontend::{
+    ast, classified, classify, dim, draft_capture, hf_config, parse_python, weights_manifest,
+};
 mod arch_spec;
-mod ast;
 mod cfg;
-mod classified;
-mod classify;
 mod codegen;
 #[cfg(feature = "cuda")]
 mod concurrency;
 mod config;
-mod draft_capture;
 /// The baked program, as const tokens — see its own header.
 #[cfg(feature = "spyre")]
 mod ktir_tokens;
@@ -57,13 +57,11 @@ pub use config::{
 mod assignment;
 #[cfg(feature = "cuda")]
 mod cost;
-mod dim;
 mod emit;
 mod fuf;
 mod impl_lib;
 mod interpreter_codegen;
 // The DSL front end: a `dsl/<arch>.py` carrier → `Ast`.
-mod parse_python;
 mod quantization;
 /// The front end, exposed for the `scratchy-forwards` build driver in
 /// scratchy-models.
@@ -92,6 +90,8 @@ mod tp_lowering;
 mod typed_shapes;
 #[cfg(test)]
 mod typed_shapes_tests;
+#[cfg(test)]
+mod frontend_tests;
 // ⭐ THE ONE PRODUCER OF THE MODEL'S WEIGHT ACCESSOR SET, for every target.
 //
 // It used to be gated `all(feature = "spyre", not(feature = "metal"))` because metal derived
@@ -108,7 +108,6 @@ mod typed_shapes_tests;
 #[cfg(any(feature = "metal", feature = "spyre"))]
 mod weight_bindings;
 mod weight_vocab;
-mod weights_manifest;
 
 mod vision_glue;
 
@@ -1222,6 +1221,9 @@ pub fn compile_carrier(
                     );
                 }
             }
+            // A regrouping that is the identity for this model (a split by a factor of 1) is its
+            // source's view: no node.
+            shape::erase_identity_regroupings(&mut model_prog, &model_inferred, &model.bounds);
             let model_cfg = cfg::build_cfg(&model_prog, model).map_err(|e| {
                 syn::Error::new(args.span, format!("cfg [{}]: {e}", model.source_stem))
             })?;
