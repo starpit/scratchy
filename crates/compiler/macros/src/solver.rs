@@ -82,7 +82,7 @@ pub enum SolveError {
     },
     /// An Impl's cost function returned None despite having a
     /// match and passing applicability filters. Means either (a)
-    /// shape inference left a Var, or (b) a bug in the cost fn.
+    /// a dim names a bound the model lacks, or (b) a bug in the cost fn.
     /// Silently skipping the Impl would mask the bug — hard error.
     UnreachableCost {
         tile: TileId,
@@ -811,7 +811,6 @@ fn resolve_input_shapes(fuf: &Fuf, node: &FufNode, inferred: &Inferred) -> Vec<S
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;
-    use crate::classify::classify;
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::{
@@ -819,7 +818,6 @@ mod tests {
         Resources, WorkloadConstraint, starter_library,
     };
     use crate::parse_python::parse_body;
-    use crate::shape::infer;
     use crate::target::from_profile_def;
     use std::path::PathBuf;
 
@@ -837,14 +835,10 @@ mod tests {
     }
 
     fn build(src: &str, params: &ModelParams) -> (Fuf, Inferred) {
-        let ast = parse_body(src).unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            src,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         (fuf, inferred)

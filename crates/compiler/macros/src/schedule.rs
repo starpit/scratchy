@@ -205,12 +205,9 @@ pub fn find_intra_wave_dep_violation(
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;
-    use crate::classify::classify;
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::starter_library;
-    use crate::parse_python::parse_body;
-    use crate::shape::infer;
     use crate::solver::solve;
     use crate::target::TargetProfile;
     use crate::target::from_profile_def;
@@ -230,14 +227,10 @@ mod tests {
     }
 
     fn solved_body(src: &str, params: &ModelParams) -> (Fuf, Assignment) {
-        let ast = parse_body(src).unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            src,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
@@ -341,7 +334,7 @@ mod tests {
     #[test]
     fn workload_sweep_produces_one_loop_per_point() {
         let params = llama_3_2_1b_params();
-        let ast = parse_body(
+        let (program, inferred) = crate::typed_bodies::trace_body(
             "
             hidden_states = embed(input_ids, embed_tokens)
             for layer in range(num_hidden_layers):
@@ -351,15 +344,8 @@ mod tests {
                 hidden_states = add(oproj, hidden_states)
             final_norm = rmsnorm(hidden_states, norm)
             ",
-        )
-        .unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();

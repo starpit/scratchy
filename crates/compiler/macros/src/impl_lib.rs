@@ -1469,10 +1469,9 @@ impl Implementation for GemmRefImpl {
 
 // ── ReshapeRefImpl ───────────────────────────────────────────────
 //
-// Claims `OpKind::Reshape` tiles — metadata-only view changes
-// synthesized by shape inference to bridge axis-factor mismatches
-// (e.g. per-head QK-norm: rmsnorm on `[T, heads, head_dim]` where
-// upstream produced `[T, heads * head_dim]`). Emits a single
+// Claims `OpKind::Reshape` tiles — metadata-only view changes the
+// DSL writes to regroup an axis (e.g. per-head QK-norm: rmsnorm on
+// `[T * heads, head_dim]` where upstream produced `[T, heads * head_dim]`). Emits a single
 // `TensorView::reshape(&[d0, d1, ...])` with concrete dims evaluated
 // from the tile's output shape via the model's bound table. No
 // allocation, no kernel launch.
@@ -1649,8 +1648,6 @@ impl Implementation for ReshapeRefImpl {
 /// - `Div(num, den)` → numerator decomposes normally; the denominator
 ///   must be num_tokens-free (`pow == 0`) or it's a compiler bug —
 ///   the runtime opcode has no machinery for `nt`-in-denominator.
-/// - `Var` is a compiler bug — shape inference should have closed
-///   every dim.
 fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) -> (u32, u8, u32) {
     use crate::shape::Dim;
     match d {
@@ -1698,9 +1695,6 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
             panic!(
                 "Reshape target dim may not be a sum: the runtime opcode has no sum path. Got {d:?}"
             )
-        }
-        Dim::Var(_) => {
-            panic!("Reshape target dim must be closed (no Var) — compiler bug")
         }
     }
 }
@@ -17814,11 +17808,7 @@ mod tests {
         let fuf = fused_mean_sub_rmsnorm_gemm_scalarmul_test_fuf();
         let profile = crate::target::from_profile_def(&scratchy_target_cuda::targets::L4_SM89);
         let lib = starter_library();
-        let inferred = Inferred {
-            locals: std::collections::HashMap::new(),
-            weights: std::collections::HashMap::new(),
-            hybrid_attention_geometry: false,
-        };
+        let inferred = Inferred::default();
         let bounds: BTreeMap<String, u64> = BTreeMap::new();
         let assignments =
             crate::solver::solve(&fuf, &lib, &profile, &inferred, &bounds, &[1], &[0])
@@ -17854,11 +17844,7 @@ mod tests {
         let fuf = fused_mean_sub_rmsnorm_gemm_test_fuf();
         let profile = crate::target::from_profile_def(&scratchy_target_cuda::targets::L4_SM89);
         let lib = starter_library();
-        let inferred = Inferred {
-            locals: std::collections::HashMap::new(),
-            weights: std::collections::HashMap::new(),
-            hybrid_attention_geometry: false,
-        };
+        let inferred = Inferred::default();
         let bounds: BTreeMap<String, u64> = BTreeMap::new();
         let assignments =
             crate::solver::solve(&fuf, &lib, &profile, &inferred, &bounds, &[1], &[0])
@@ -17947,11 +17933,7 @@ mod tests {
              gemm_singleton={gemm_singleton_us:.6}. A delta means the DP \
              tiebreak hands the lm_head pick to (trio + cublas) singletons."
         );
-        let _ = Inferred {
-            locals: std::collections::HashMap::new(),
-            weights: std::collections::HashMap::new(),
-            hybrid_attention_geometry: false,
-        };
+        let _ = Inferred::default();
     }
 
     #[test]

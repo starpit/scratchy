@@ -108,13 +108,10 @@ pub fn refresh_predicted_us(
 mod tests {
     use super::*;
     use crate::cfg::build_cfg;
-    use crate::classify::classify;
     use crate::config::{self, ModelParams};
     use crate::fuf::unroll;
     use crate::impl_lib::starter_library;
-    use crate::parse_python::parse_body;
     use crate::schedule::schedule_workloads;
-    use crate::shape::infer;
     use crate::solver::solve;
     use crate::target::from_profile_def;
     use std::path::PathBuf;
@@ -163,14 +160,10 @@ mod tests {
         // update the test to match) or the concurrency model's
         // factor-1 identity broke.
         let params = llama_params("llama-3.2-1b");
-        let ast = parse_body(LLAMA_BODY).unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            LLAMA_BODY,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
@@ -205,14 +198,10 @@ mod tests {
     #[test]
     fn loop_cost_us_is_deterministic() {
         let params = llama_params("llama-3.2-1b");
-        let ast = parse_body(LLAMA_BODY).unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            LLAMA_BODY,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
@@ -250,14 +239,10 @@ mod tests {
     #[test]
     fn refresh_predicted_us_overwrites_in_place() {
         let params = llama_params("llama-3.2-1b");
-        let ast = parse_body(LLAMA_BODY).unwrap();
-        let program = classify(&ast).unwrap();
-        let inferred = infer(
-            &program,
+        let (program, inferred) = crate::typed_bodies::trace_body(
+            LLAMA_BODY,
             &crate::weights_manifest::WeightsManifest::llama_test_conventions(),
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap();
+        );
         let cfg = build_cfg(&program, &params).unwrap();
         let fuf = unroll(&cfg, &inferred).unwrap();
         let lib = starter_library();
