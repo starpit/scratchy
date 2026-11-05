@@ -513,27 +513,122 @@ fn typed_llama(
     edit: impl Fn(&str) -> String,
     declare: impl Fn(&mut crate::weights_manifest::WeightsManifest),
 ) -> Result<crate::shape::Inferred, String> {
+    typed_carrier("llama", edit, declare)
+}
+
+/// The carrier `stem` (its text edited by `edit`) and its `weights.json` (edited by `declare`),
+/// through the emit pass and rustc as the build script and this crate's compile take it: the
+/// trace, or rustc's errors.
+fn typed_carrier(
+    stem: &str,
+    edit: impl Fn(&str) -> String,
+    declare: impl Fn(&mut crate::weights_manifest::WeightsManifest),
+) -> Result<crate::shape::Inferred, String> {
     let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch");
-    let written = std::fs::read_to_string(arch.join("dsl/llama.py")).expect("llama.py");
+    let written = std::fs::read_to_string(arch.join(format!("dsl/{stem}.py"))).expect("carrier");
     let source = edit(&written);
     let carrier = crate::parse_python::parse_python_file(&source).expect("parse");
     let program = crate::classify::carrier_program(&carrier).unwrap();
-    let mut manifest =
-        crate::weights_manifest::load_or_empty(&arch.join("configs/llama")).expect("manifest");
+    let configs = arch.join("configs").join(stem);
+    let mut manifest = crate::weights_manifest::load_or_empty(&configs).expect("manifest");
     declare(&mut manifest);
     let facts = scratchy_forward_compiler_frontend::carrier_facts::carrier_facts(
         &arch,
-        "llama",
-        false,
+        stem,
+        carrier.vision,
         &mut Vec::new(),
     );
     crate::typed_bodies::typed(
         &program,
         &source,
-        "crates/models/arch/dsl/llama.py",
+        &format!("crates/models/arch/dsl/{stem}.py"),
         &manifest,
         &facts,
     )
+}
+
+/// `stem`'s bundle `bundle` with its role `role` declared `dims`.
+fn redeclare_role(
+    stem: &str,
+    bundle: &str,
+    role: &str,
+    dims: &[&str],
+) -> Result<crate::shape::Inferred, String> {
+    typed_carrier(stem, str::to_string, |m| {
+        let b = m.bundles.get_mut(bundle).expect("the bundle");
+        let at = (b.kind.roles().iter())
+            .position(|r| *r == role)
+            .expect("the role");
+        b.roles[at] = dims
+            .iter()
+            .map(|d| crate::dim::Dim::Bound(d.to_string()))
+            .collect();
+    })
+}
+
+/// The types reject a wrong bundle: qwen3-moe's experts as written compile, and with their down
+/// bank declared at the up bank's `[E, hidden, inter]` (its rows must be the experts' width) the
+/// typed compile is refused at the carrier's line that reads the bundle, naming both widths.
+#[test]
+fn a_misdeclared_expert_bank_fails_the_typed_compile_and_names_the_line() {
+    assert!(
+        typed_carrier("qwen3-moe", str::to_string, |_| {}).is_ok(),
+        "qwen3-moe types"
+    );
+    refused(
+        redeclare_role(
+            "qwen3-moe",
+            "mlp",
+            "down",
+            &["num_experts", "hidden_size", "moe_intermediate_size"],
+        ),
+        &[
+            "crates/models/arch/dsl/qwen3-moe.py:29: mlp_out = moe_block(normed2, mlp[layer])",
+            "MoeIntermediateSize",
+            "HiddenSize",
+        ],
+    );
+}
+
+/// The types tie a mixer's bundle to its projections: qwen3.5's Gated-DeltaNet conv declared over
+/// `hidden_size` channels (they are `in_proj_qkv`'s packed row) is refused at the mixer's line.
+#[test]
+fn a_misdeclared_mixer_conv_fails_the_typed_compile_and_names_the_line() {
+    assert!(
+        typed_carrier("qwen3-5", str::to_string, |_| {}).is_ok(),
+        "qwen3.5 types"
+    );
+    refused(
+        redeclare_role(
+            "qwen3-5",
+            "linear_attn",
+            "conv",
+            &["hidden_size", "linear_conv_kernel_dim"],
+        ),
+        &[
+            "crates/models/arch/dsl/qwen3-5.py:27: core = gated_delta_net(qkv, z, a, b, linear_attn[layer])",
+            "LinearKeyHeadDim",
+            "W2<typed_shapes::HiddenSize, typed_shapes::LinearConvKernelDim>",
+        ],
+    );
+}
+
+/// A Mamba-2 mixer's norm is over its inner width: nemotron-h's declared over `hidden_size` is
+/// refused at the mixer's line.
+#[test]
+fn a_misdeclared_mamba_norm_fails_the_typed_compile_and_names_the_line() {
+    assert!(
+        typed_carrier("nemotron-h", str::to_string, |_| {}).is_ok(),
+        "nemotron-h types"
+    );
+    refused(
+        redeclare_role("nemotron-h", "mamba", "norm", &["hidden_size"]),
+        &[
+            "crates/models/arch/dsl/nemotron-h.py:27: y = mamba2(zxbcdt, mamba[layer])",
+            "W1<typed_shapes::Mul<typed_shapes::MambaHeadDim, typed_shapes::MambaNumHeads>>",
+            "W1<typed_shapes::HiddenSize>",
+        ],
+    );
 }
 
 /// The rustc errors of a program that must not compile, with what each must name.
@@ -594,4 +689,142 @@ fn a_misdeclared_weight_width_fails_the_typed_compile_and_names_the_line() {
             "HiddenSize",
         ],
     );
+}
+
+/// Each bundle-header fixture (`tests/bundle_headers/*.json`: one public checkpoint's tensor
+/// shapes under each of its bundles' prefixes, read from its safetensors headers) with each model
+/// it is checked under: the model's bounds, its carrier's manifest, and the fixture.
+fn bundle_header_fixtures() -> Vec<(
+    String,
+    crate::config::ModelParams,
+    crate::weights_manifest::WeightsManifest,
+    serde_json::Value,
+)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let arch = root.join("../../models/arch/configs");
+    let mut paths: Vec<_> = (std::fs::read_dir(root.join("tests/bundle_headers")).unwrap())
+        .map(|e| e.unwrap().path())
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for path in paths {
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for config in fixture["configs"].as_array().unwrap() {
+            let config = config.as_str().unwrap();
+            let (carrier, model) = match fixture["head"].as_bool().unwrap() {
+                // A head's config is its target's: `<head>/<target carrier>/<target stem>`.
+                true => {
+                    let (head, target) = config.split_once('/').unwrap();
+                    let model = crate::config::load_head_file(
+                        &arch.join(format!("{target}.json")),
+                        &arch.join(head),
+                    );
+                    (head.to_string(), model)
+                }
+                false => {
+                    let carrier = config.split('/').next().unwrap().to_string();
+                    let model =
+                        crate::config::load_file_declared(&arch.join(format!("{config}.json")));
+                    (carrier, model)
+                }
+            };
+            let model = model.unwrap_or_else(|e| panic!("{config}: {e:?}"));
+            let manifest = crate::weights_manifest::load_or_empty(&arch.join(&carrier)).unwrap();
+            let name = format!(
+                "{} under {config}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            out.push((name, model, manifest, fixture.clone()));
+        }
+    }
+    out
+}
+
+/// A fixture's tensors as a header.
+fn fixture_header(fixture: &serde_json::Value) -> crate::weights_manifest::Header {
+    (fixture["tensors"].as_object().unwrap().iter())
+        .map(|(t, s)| {
+            let shape = s
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d.as_u64().unwrap())
+                .collect();
+            (t.clone(), shape)
+        })
+        .collect()
+}
+
+/// Every bundle's `weights.json` declaration is the checkpoint's: each bundle of each fixture, read
+/// from its public checkpoint's safetensors header by the loader's layouts
+/// (`weights_manifest::role_in_checkpoint`: per-expert banks stacked, a fused gate/up split, MXFP4
+/// blocks, a conv's singleton axis dropped), equals its declaration under the model's bounds.
+/// Every carrier that declares a bundle has a fixture.
+#[test]
+fn every_bundle_declaration_is_its_checkpoints() {
+    let fixtures = bundle_header_fixtures();
+    for (name, model, manifest, fixture) in &fixtures {
+        let header = fixture_header(fixture);
+        let mut bounds = model.bounds.clone();
+        bounds.insert("num_tokens".to_string(), 1);
+        for (bundle, prefix) in fixture["bundles"].as_object().unwrap() {
+            let declared = (manifest.bundles.get(bundle))
+                .unwrap_or_else(|| panic!("{name}: no bundle `{bundle}` declared"));
+            let eval = |d: &crate::dim::Dim| crate::shape::eval_closed_dim(d, &bounds);
+            if let Err(wrong) = declared.check(&header, prefix.as_str().unwrap(), eval) {
+                panic!("{name}: `{bundle}`:\n  {}", wrong.join("\n  "));
+            }
+        }
+    }
+    let arch = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/arch/configs");
+    for dir in std::fs::read_dir(&arch).unwrap().map(|e| e.unwrap().path()) {
+        let Ok(manifest) = crate::weights_manifest::load_or_empty(&dir) else {
+            continue;
+        };
+        let carrier = dir.file_name().unwrap().to_string_lossy().to_string();
+        for bundle in manifest.bundles.keys() {
+            assert!(
+                fixtures.iter().any(|(n, _, m, f)| {
+                    m.bundles.contains_key(bundle)
+                        && f["bundles"].get(bundle).is_some()
+                        && n.contains(&format!("{carrier}/"))
+                }),
+                "{carrier}'s bundle `{bundle}` has no checkpoint fixture"
+            );
+        }
+    }
+}
+
+/// The check refuses a wrong declaration: in every fixture, each bundle role of rank 2 or more
+/// declared with its last two dims swapped (where that changes its extents) is refused, naming the
+/// role.
+#[test]
+fn a_bundle_role_declared_with_swapped_dims_is_refused_against_its_checkpoint() {
+    let mut refused = 0;
+    for (name, model, manifest, fixture) in bundle_header_fixtures() {
+        let header = fixture_header(&fixture);
+        let eval = |d: &crate::dim::Dim| crate::shape::eval_closed_dim(d, &model.bounds);
+        for (bundle, prefix) in fixture["bundles"].as_object().unwrap() {
+            let declared = &manifest.bundles[bundle];
+            for (at, role) in declared.kind.roles().into_iter().enumerate() {
+                let shape = &declared.roles[at];
+                let n = shape.len();
+                if n < 2 || eval(&shape[n - 1]) == eval(&shape[n - 2]) {
+                    continue;
+                }
+                let mut swapped = declared.clone();
+                swapped.roles[at].swap(n - 1, n - 2);
+                let wrong = swapped
+                    .check(&header, prefix.as_str().unwrap(), eval)
+                    .expect_err(&format!("{name}: `{bundle}.{role}` swapped is refused"));
+                assert!(
+                    wrong.len() == 1 && wrong[0].starts_with(&format!("`{role}`")),
+                    "{name}: `{bundle}.{role}`: {wrong:?}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert!(refused > 50, "{refused} swapped roles refused");
 }

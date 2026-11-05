@@ -52,10 +52,27 @@ crates/models/arch/
   }
   ```
 
-  Only weights whose shape can't be derived from op-sig dataflow +
-  `<size>.json` bounds belong here. For most Llama / Qwen2 / Granite
-  entries, dataflow pins everything and `weights.json` is empty or
-  absent.
+  A weight the DSL passes whole to one op (`moe_block(x, mlp[layer])`,
+  `gated_delta_net(.., linear_attn[layer])`, `mamba2(.., mamba[layer])`)
+  is a bundle. It is declared under `__bundles__`: its kind and the shape
+  of each of the kind's roles. Matrices are `[in, out]`, an expert bank is
+  `[experts, in, out]`, and a conv is `[channels, taps]` (drop the on-disk
+  singleton axis). The emit pass passes the roles to the kind's
+  constructor, and its signature relates them to each other and to the
+  op's activations. The kinds and their roles are
+  `weights_manifest::BundleKind`. For example, Qwen3-MoE's experts:
+
+  ```json
+  "__bundles__": {
+    "mlp": {
+      "kind": "routed_experts",
+      "router": ["hidden_size", "num_experts"],
+      "gate": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "up": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "down": ["num_experts", "moe_intermediate_size", "hidden_size"]
+    }
+  }
+  ```
 
 - **`arch.json`** (optional) — the arch's own declarations: everything
   about it that is **not** derivable from a verbatim `config.json` plus

@@ -63,6 +63,169 @@ pub struct WeightsManifest {
     /// the matching `LinearLayer` accessor to the alternate loader.
     /// See [`ManifestEntryKind`] for the variants.
     pub kinds: BTreeMap<String, ManifestEntryKind>,
+    /// Optional `__bundles__` top-level key: each weight bundle the DSL passes whole to one op
+    /// (`moe_block(x, mlp[layer])`), its kind and the shape of each of its roles —
+    /// `"mlp": {"kind": "routed_experts", "router": [..], "gate": [..], ..}`. The typed-Rust
+    /// emit pass types each role at its shape and passes them to the kind's constructor, whose
+    /// signature relates them to each other and to the op's activations.
+    pub bundles: BTreeMap<String, Bundle>,
+}
+
+/// One weight bundle (`__bundles__`): its kind, and its roles' shapes in the kind's role order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bundle {
+    pub kind: BundleKind,
+    /// Each role's shape, in [`BundleKind::roles`]' order.
+    pub roles: Vec<Shape>,
+}
+
+/// What a weight bundle holds: the roles an op reads from it, each a tensor of the checkpoint. A
+/// matrix is `[in, out]` (the manifest's orientation), an expert bank `[experts, in, out]`, a conv
+/// `[channels, taps]` (the on-disk singleton axis dropped, as the loader drops it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleKind {
+    /// Routed SwiGLU experts: the router and each expert's gate, up and down.
+    RoutedExperts,
+    /// [`Self::RoutedExperts`] whose routing adds a per-expert score correction
+    /// (`e_score_correction_bias`).
+    CorrectedExperts,
+    /// Routed experts and a shared SwiGLU expert, scaled by its own sigmoid gate.
+    GatedSharedExperts,
+    /// Routed experts and shared SwiGLU experts, unscaled.
+    SharedExperts,
+    /// [`Self::SharedExperts`] whose routing adds a per-expert score correction.
+    CorrectedSharedExperts,
+    /// Routed un-gated (relu²) experts with a score correction, on their own width (a latent MoE's
+    /// latent, or the block's input).
+    UngatedExperts,
+    /// Routed SwiGLU experts with a router bias and per-expert biases.
+    BiasedExperts,
+    /// A router of its own: its projection, the input's scale and a per-expert output scale.
+    ScaledRouter,
+    /// Unrouted expert banks (a [`Self::ScaledRouter`] routes them).
+    ExpertBank,
+    /// A Gated-DeltaNet mixer's non-projection weights.
+    GatedDeltaNet,
+    /// A Mamba-2 mixer's non-projection weights.
+    Mamba2,
+}
+
+/// One argument of a bundle kind's constructor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleArg {
+    /// A role, passed as itself.
+    Role(&'static str),
+    /// A part: the constructor named first, over these roles.
+    Part(&'static str, &'static [&'static str]),
+}
+
+impl BundleKind {
+    /// Every kind.
+    pub const ALL: [Self; 11] = [
+        Self::RoutedExperts,
+        Self::CorrectedExperts,
+        Self::GatedSharedExperts,
+        Self::SharedExperts,
+        Self::CorrectedSharedExperts,
+        Self::UngatedExperts,
+        Self::BiasedExperts,
+        Self::ScaledRouter,
+        Self::ExpertBank,
+        Self::GatedDeltaNet,
+        Self::Mamba2,
+    ];
+
+    /// Its name in `weights.json`, and its constructor's in the signatures.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RoutedExperts => "routed_experts",
+            Self::CorrectedExperts => "corrected_experts",
+            Self::GatedSharedExperts => "gated_shared_experts",
+            Self::SharedExperts => "shared_experts",
+            Self::CorrectedSharedExperts => "corrected_shared_experts",
+            Self::UngatedExperts => "ungated_experts",
+            Self::BiasedExperts => "biased_experts",
+            Self::ScaledRouter => "scaled_router",
+            Self::ExpertBank => "expert_bank",
+            Self::GatedDeltaNet => "gated_delta_net_mixer",
+            Self::Mamba2 => "mamba2_mixer",
+        }
+    }
+
+    /// Its constructor's arguments: each a role, or a part its own constructor builds from roles.
+    pub const fn args(self) -> &'static [BundleArg] {
+        use BundleArg::{Part, Role};
+        const SWIGLU: BundleArg = Part("swiglu", &["shared_gate", "shared_up", "shared_down"]);
+        match self {
+            Self::RoutedExperts => &[Role("router"), Role("gate"), Role("up"), Role("down")],
+            Self::CorrectedExperts => &[
+                Role("router"),
+                Role("correction"),
+                Role("gate"),
+                Role("up"),
+                Role("down"),
+            ],
+            Self::GatedSharedExperts => &[
+                Role("router"),
+                Role("gate"),
+                Role("up"),
+                Role("down"),
+                SWIGLU,
+                Role("shared_scale"),
+            ],
+            Self::SharedExperts => &[
+                Role("router"),
+                Role("gate"),
+                Role("up"),
+                Role("down"),
+                SWIGLU,
+            ],
+            Self::CorrectedSharedExperts => &[
+                Role("router"),
+                Role("correction"),
+                Role("gate"),
+                Role("up"),
+                Role("down"),
+                SWIGLU,
+            ],
+            Self::UngatedExperts => &[Role("router"), Role("correction"), Role("up"), Role("down")],
+            Self::BiasedExperts => &[
+                Role("router"),
+                Role("router_bias"),
+                Role("gate"),
+                Role("up"),
+                Role("down"),
+                Part("expert_biases", &["gate_bias", "up_bias", "down_bias"]),
+            ],
+            Self::ScaledRouter => &[Role("proj"), Role("scale"), Role("per_expert_scale")],
+            Self::ExpertBank => &[Role("gate"), Role("up"), Role("down")],
+            Self::GatedDeltaNet => &[Role("conv"), Role("a_log"), Role("dt_bias"), Role("norm")],
+            Self::Mamba2 => &[
+                Role("conv"),
+                Role("conv_bias"),
+                Role("a_log"),
+                Role("d"),
+                Role("dt_bias"),
+                Role("norm"),
+            ],
+        }
+    }
+
+    /// Its roles, in its constructor's argument order (a part's in place).
+    pub fn roles(self) -> Vec<&'static str> {
+        (self.args().iter())
+            .flat_map(|arg| match arg {
+                BundleArg::Role(role) => std::slice::from_ref(role),
+                BundleArg::Part(_, roles) => roles,
+            })
+            .copied()
+            .collect()
+    }
+
+    /// The kind `weights.json` names `name`.
+    pub fn of_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name() == name)
+    }
 }
 
 /// Per-entry storage convention. The default
@@ -139,6 +302,7 @@ impl WeightsManifest {
             packed_concats: BTreeMap::new(),
             pad_to_mult8: Vec::new(),
             kinds: BTreeMap::new(),
+            bundles: BTreeMap::new(),
         }
     }
 
@@ -251,7 +415,24 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
     let mut packed_concats: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pad_to_mult8: Vec<PadHint> = Vec::new();
     let mut kinds: BTreeMap<String, ManifestEntryKind> = BTreeMap::new();
+    let mut bundles: BTreeMap<String, Bundle> = BTreeMap::new();
     for (k, v) in obj {
+        if k == "__bundles__" {
+            let map = v.as_object().ok_or_else(|| ManifestError::BadShape {
+                path: path.to_path_buf(),
+                weight: k.clone(),
+                reason: "`__bundles__` must be an object of bundles".into(),
+            })?;
+            for (bundle, decl) in map {
+                let parsed = parse_bundle(decl).map_err(|reason| ManifestError::BadShape {
+                    path: path.to_path_buf(),
+                    weight: bundle.clone(),
+                    reason,
+                })?;
+                bundles.insert(bundle.clone(), parsed);
+            }
+            continue;
+        }
         if k == "__pad_to_mult8__" {
             let arr = v.as_array().ok_or_else(|| ManifestError::BadShape {
                 path: path.to_path_buf(),
@@ -347,7 +528,186 @@ pub fn load_file(path: &Path) -> Result<WeightsManifest, ManifestError> {
         packed_concats,
         pad_to_mult8,
         kinds,
+        bundles,
     })
+}
+
+/// A checkpoint's tensors' shapes by name, as its safetensors headers state them.
+#[cfg(any(test, feature = "test-support"))]
+pub type Header = BTreeMap<String, Vec<u64>>;
+
+#[cfg(any(test, feature = "test-support"))]
+impl Bundle {
+    /// Check the declaration against a checkpoint: each role read from the tensors under `prefix`
+    /// (one layer's bundle, e.g. `model.layers.0.mlp`) by [`role_in_checkpoint`], against its
+    /// declared shape evaluated by `eval` (a config's bounds). Every role that differs, or that
+    /// the checkpoint does not hold, is named.
+    pub fn check(
+        &self,
+        header: &Header,
+        prefix: &str,
+        eval: impl Fn(&Dim) -> Option<u64>,
+    ) -> Result<(), Vec<String>> {
+        let mut wrong = Vec::new();
+        for (role, declared) in self.kind.roles().into_iter().zip(&self.roles) {
+            let want: Option<Vec<u64>> = declared.iter().map(&eval).collect();
+            match (want, role_in_checkpoint(role, header, prefix)) {
+                (Some(want), Ok(held)) if want == held => {}
+                (Some(want), Ok(held)) => wrong.push(format!(
+                    "`{role}`: declared {declared:?} = {want:?}, the checkpoint holds {held:?}"
+                )),
+                (None, _) => wrong.push(format!(
+                    "`{role}`: {declared:?} names a bound the config lacks"
+                )),
+                (_, Err(why)) => wrong.push(format!("`{role}`: {why}")),
+            }
+        }
+        match wrong.is_empty() {
+            true => Ok(()),
+            false => Err(wrong),
+        }
+    }
+}
+
+/// A bundle role's shape as a checkpoint holds it under `prefix`, in the manifest's orientation:
+/// the layouts the loader reads it from. A matrix is stored `[out, in]` and read `[in, out]`; an
+/// expert bank is stacked `[experts, in, out]` from per-expert `experts.{e}.<proj>.weight`
+/// (`gate_proj` / `up_proj` / `down_proj`, Mixtral's `w1` / `w3` / `w2`), from a pre-stacked
+/// `experts.<proj>` `[E, out, in]`, from a fused `experts.gate_up_proj` `[E, 2·I, in]`, or from
+/// gpt-oss's MXFP4 `experts.<proj>_blocks` `[E, out, in / 32, 16]`; a conv `[C, 1, K]` is read
+/// `[C, K]`, its singleton axis dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub fn role_in_checkpoint(role: &str, header: &Header, prefix: &str) -> Result<Vec<u64>, String> {
+    let at = |leaf: &str| header.get(&format!("{prefix}.{leaf}")).cloned();
+    let first = |leaves: &[&str]| -> Result<Vec<u64>, String> {
+        (leaves.iter()).find_map(|l| at(l)).ok_or_else(|| {
+            let names: Vec<String> = leaves.iter().map(|l| format!("{prefix}.{l}")).collect();
+            format!("none of {} in the checkpoint", names.join(", "))
+        })
+    };
+    let transposed = |s: Vec<u64>| match s.as_slice() {
+        [out, inp] => Ok(vec![*inp, *out]),
+        _ => Err(format!("a matrix of rank {}", s.len())),
+    };
+    match role {
+        "router" => transposed(first(&["gate.weight", "router.weight"])?),
+        "correction" => first(&["gate.e_score_correction_bias"]),
+        "router_bias" => first(&["router.bias"]),
+        "proj" => transposed(first(&["proj.weight"])?),
+        "scale" => first(&["scale"]),
+        "per_expert_scale" => first(&["per_expert_scale"]),
+        "shared_gate" | "shared_up" | "shared_down" => {
+            let proj = &role["shared_".len()..];
+            transposed(first(&[
+                &format!("shared_expert.{proj}_proj.weight"),
+                &format!("shared_experts.{proj}_proj.weight"),
+            ])?)
+        }
+        "shared_scale" => transposed(first(&["shared_expert_gate.weight"])?),
+        "gate_bias" | "up_bias" => {
+            let fused = first(&["experts.gate_up_proj_bias"])?;
+            match fused.as_slice() {
+                [e, two_i] if two_i % 2 == 0 => Ok(vec![*e, two_i / 2]),
+                _ => Err(format!("a fused gate/up bias of shape {fused:?}")),
+            }
+        }
+        "down_bias" => first(&["experts.down_proj_bias"]),
+        "gate" | "up" | "down" => expert_bank(role, header, prefix),
+        "conv" => match first(&["conv1d.weight"])?.as_slice() {
+            [c, 1, k] => Ok(vec![*c, *k]),
+            other => Err(format!(
+                "a conv of shape {other:?}, not [channels, 1, taps]"
+            )),
+        },
+        "conv_bias" => first(&["conv1d.bias"]),
+        "a_log" => first(&["A_log"]),
+        "d" => first(&["D"]),
+        "dt_bias" => first(&["dt_bias"]),
+        "norm" => first(&["norm.weight"]),
+        other => Err(format!("no checkpoint layout for the role `{other}`")),
+    }
+}
+
+/// An expert bank's stacked `[experts, in, out]` ([`role_in_checkpoint`]'s layouts).
+#[cfg(any(test, feature = "test-support"))]
+fn expert_bank(role: &str, header: &Header, prefix: &str) -> Result<Vec<u64>, String> {
+    let names: &[&str] = match role {
+        "gate" => &["gate_proj", "w1"],
+        "up" => &["up_proj", "w3"],
+        _ => &["down_proj", "w2"],
+    };
+    // Per-expert: every expert's `[out, in]`, one shape.
+    for name in names {
+        let experts: Vec<&Vec<u64>> = (0..)
+            .map_while(|e| header.get(&format!("{prefix}.experts.{e}.{name}.weight")))
+            .collect();
+        if let Some(first) = experts.first() {
+            if let Some(other) = experts.iter().find(|s| *s != first) {
+                return Err(format!("experts of two shapes, {first:?} and {other:?}"));
+            }
+            return match first.as_slice() {
+                [out, inp] => Ok(vec![experts.len() as u64, *inp, *out]),
+                _ => Err(format!("an expert matrix of shape {first:?}")),
+            };
+        }
+    }
+    let stacked = |leaf: &str| header.get(&format!("{prefix}.experts.{leaf}"));
+    // Pre-stacked, one projection.
+    for name in names {
+        if let Some(s) = stacked(name) {
+            return match s.as_slice() {
+                [e, out, inp] => Ok(vec![*e, *inp, *out]),
+                _ => Err(format!("a stacked bank of shape {s:?}")),
+            };
+        }
+    }
+    // MXFP4 blocks: 32 codes a block.
+    let blocks = |leaf: &str| match stacked(leaf).map(Vec::as_slice) {
+        Some([e, out, nb, 16]) => Some((*e, *out, nb * 32)),
+        _ => None,
+    };
+    let (fused, fused_blocks) = (stacked("gate_up_proj"), blocks("gate_up_proj_blocks"));
+    match role {
+        "gate" | "up" => {
+            if let Some([e, two_i, inp]) = fused.map(Vec::as_slice) {
+                return Ok(vec![*e, *inp, two_i / 2]);
+            }
+            if let Some((e, two_i, inp)) = fused_blocks {
+                return Ok(vec![e, inp, two_i / 2]);
+            }
+        }
+        _ => {
+            if let Some((e, out, inp)) = blocks("down_proj_blocks") {
+                return Ok(vec![e, inp, out]);
+            }
+        }
+    }
+    Err(format!("no `{role}` expert bank under {prefix}.experts"))
+}
+
+/// One `__bundles__` declaration: `{"kind": "<kind>", "<role>": [dims], ..}`, every role of the
+/// kind and no other.
+fn parse_bundle(v: &serde_json::Value) -> Result<Bundle, String> {
+    let obj = (v.as_object()).ok_or("a bundle is an object of its kind and roles")?;
+    let name = (obj.get("kind").and_then(|k| k.as_str())).ok_or("a bundle names its `kind`")?;
+    let kind = BundleKind::of_name(name).ok_or_else(|| {
+        let known: Vec<&str> = BundleKind::ALL.iter().map(|k| k.name()).collect();
+        format!("unknown bundle kind `{name}` (known: {})", known.join(", "))
+    })?;
+    if let Some(extra) = (obj.keys()).find(|r| *r != "kind" && !kind.roles().contains(&r.as_str()))
+    {
+        return Err(format!(
+            "`{name}` has no role `{extra}` (its roles: {:?})",
+            kind.roles()
+        ));
+    }
+    let roles = (kind.roles().iter())
+        .map(|role| {
+            let shape = (obj.get(*role)).ok_or_else(|| format!("`{name}` needs its `{role}`"))?;
+            parse_shape(shape).map_err(|e| format!("`{role}`: {e}"))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(Bundle { kind, roles })
 }
 
 /// Parse one weight entry value. Two accepted shapes:
@@ -654,5 +1014,63 @@ mod tests {
             found[0].starts_with("orphan.bias") && found[1].starts_with("q_proj.bias"),
             "{found:#?}"
         );
+    }
+
+    /// A bundle declaration parses into its kind's roles, in the kind's order whatever the JSON's.
+    #[test]
+    fn a_bundle_parses_its_roles_in_its_kinds_order() {
+        let decl = serde_json::json!({
+            "down": ["num_experts", "moe_intermediate_size", "hidden_size"],
+            "kind": "routed_experts",
+            "router": ["hidden_size", "num_experts"],
+            "up": ["num_experts", "hidden_size", "moe_intermediate_size"],
+            "gate": ["num_experts", "hidden_size", "moe_intermediate_size"],
+        });
+        let bundle = parse_bundle(&decl).unwrap();
+        assert_eq!(bundle.kind, BundleKind::RoutedExperts);
+        let ranks: Vec<usize> = bundle.roles.iter().map(Vec::len).collect();
+        assert_eq!(ranks, [2, 3, 3, 3], "router, gate, up, down");
+        assert_eq!(bundle.roles[3][2], Dim::Bound("hidden_size".into()));
+    }
+
+    /// A bundle of an unknown kind, missing one of its kind's roles, or naming a role its kind
+    /// lacks is refused, each naming what is wrong.
+    #[test]
+    fn a_bundle_without_exactly_its_kinds_roles_is_refused() {
+        let routed = |roles: serde_json::Value| {
+            let mut decl = roles;
+            decl["kind"] = "routed_experts".into();
+            parse_bundle(&decl).unwrap_err()
+        };
+        let shape = serde_json::json!(["hidden_size"]);
+        let unknown = parse_bundle(&serde_json::json!({"kind": "experts"})).unwrap_err();
+        assert!(
+            unknown.contains("unknown bundle kind `experts`"),
+            "{unknown}"
+        );
+        for kind in BundleKind::ALL {
+            assert!(
+                unknown.contains(kind.name()),
+                "names `{}`: {unknown}",
+                kind.name()
+            );
+        }
+        let missing = routed(serde_json::json!({"router": shape, "gate": shape, "up": shape}));
+        assert!(missing.contains("needs its `down`"), "{missing}");
+        let extra = routed(serde_json::json!({
+            "router": shape, "gate": shape, "up": shape, "down": shape, "bias": shape,
+        }));
+        assert!(extra.contains("has no role `bias`"), "{extra}");
+    }
+
+    /// Every kind's name round-trips, and no two kinds share one.
+    #[test]
+    fn every_bundle_kind_is_named_once() {
+        for kind in BundleKind::ALL {
+            assert_eq!(BundleKind::of_name(kind.name()), Some(kind));
+        }
+        let names: std::collections::BTreeSet<&str> =
+            BundleKind::ALL.iter().map(|k| k.name()).collect();
+        assert_eq!(names.len(), BundleKind::ALL.len());
     }
 }

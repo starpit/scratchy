@@ -10,9 +10,6 @@
     "hidden_size",
     "vocab_size"
   ],
-  "block_sparse_moe": [
-    "hidden_size"
-  ],
   "norm": [
     "hidden_size"
   ],
@@ -34,5 +31,15 @@
   "self_attn.v_proj": [
     "hidden_size",
     "head_dim * num_key_value_heads"
-  ]
+  ],
+
+  "__bundles__": {
+    "block_sparse_moe": {
+      "kind": "routed_experts",
+      "router": ["hidden_size", "num_local_experts"],
+      "gate": ["num_local_experts", "hidden_size", "intermediate_size"],
+      "up": ["num_local_experts", "hidden_size", "intermediate_size"],
+      "down": ["num_local_experts", "intermediate_size", "hidden_size"]
+    }
+  }
 }

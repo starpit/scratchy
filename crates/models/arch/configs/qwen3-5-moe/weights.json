@@ -12,16 +12,31 @@
   "self_attn.q_norm": ["head_dim"],
   "self_attn.k_norm": ["head_dim"],
 
-  "linear_attn": ["hidden_size"],
   "linear_attn.in_proj_qkv": ["hidden_size", "gdn_conv_dim"],
   "linear_attn.in_proj_z": ["hidden_size", "gdn_value_dim"],
   "linear_attn.in_proj_a": ["hidden_size", "linear_num_value_heads"],
   "linear_attn.in_proj_b": ["hidden_size", "linear_num_value_heads"],
   "linear_attn.out_proj": ["linear_num_value_heads * linear_value_head_dim", "hidden_size"],
 
-  "mlp": ["hidden_size"],
   "mlp.shared_expert.gate_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.up_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.down_proj": ["shared_expert_intermediate_size", "hidden_size"],
-  "mlp.shared_expert_gate": ["hidden_size", "1"]
+  "mlp.shared_expert_gate": ["hidden_size", "1"],
+
+  "__bundles__": {
+    "mlp": {
+      "kind": "routed_experts",
+      "router": ["hidden_size", "num_experts"],
+      "gate": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "up": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "down": ["num_experts", "moe_intermediate_size", "hidden_size"]
+    },
+    "linear_attn": {
+      "kind": "gated_delta_net_mixer",
+      "conv": ["gdn_conv_dim", "linear_conv_kernel_dim"],
+      "a_log": ["linear_num_value_heads"],
+      "dt_bias": ["linear_num_value_heads"],
+      "norm": ["linear_value_head_dim"]
+    }
+  }
 }

@@ -146,38 +146,35 @@ pub fn emit(c: &Carrier<'_>, base_bounds: &mut BTreeSet<String>) -> Result<Strin
     let mut weights = String::new();
     for id in c.program.weights.ids() {
         let path = c.program.weights.path(id);
+        let dotted = path.join(".");
         let field = field_name(path);
-        let declared = (c.manifest.lookup(path).cloned()).ok_or_else(|| {
-            format!(
-                "{}: the weight `{}` has no `weights.json` declaration to type it by",
-                c.file,
-                path.join(".")
-            )
-        })?;
-        let dims = (declared.iter())
-            .map(|d| dim_type(d, bounds))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{}: weight `{}`: {e}", c.file, path.join(".")))?;
-        let ty = match dims.as_slice() {
-            [d] => format!("W1<{d}>"),
-            [k, n] => format!("W2<{k}, {n}>"),
-            _ => {
-                return Err(format!(
-                    "{}: weight `{}` is rank {}; the typed emit has rank 1 and 2",
-                    c.file,
-                    path.join("."),
-                    dims.len()
-                ));
+        // A bundle: one field per role, each at its declared shape.
+        let typed: Vec<(String, &crate::dim::Shape)> = match c.manifest.bundles.get(&dotted) {
+            Some(bundle) => (bundle.kind.roles().into_iter())
+                .zip(&bundle.roles)
+                .map(|(role, shape)| (format!("{field}_{role}"), shape))
+                .collect(),
+            None => {
+                let declared = c.manifest.lookup(path).ok_or_else(|| {
+                    format!(
+                        "{}: the weight `{dotted}` has no `weights.json` declaration to type it by",
+                        c.file
+                    )
+                })?;
+                vec![(field.clone(), declared)]
             }
         };
-        if let Some(other) = cx.fields.insert(field.clone(), path.join(".")) {
-            return Err(format!(
-                "{}: the weights `{other}` and `{}` both spell the field `{field}`",
-                c.file,
-                path.join(".")
-            ));
+        for (field, declared) in typed {
+            let ty = weight_type(declared, bounds)
+                .map_err(|e| format!("{}: weight `{dotted}` (`{field}`): {e}", c.file))?;
+            if let Some(other) = cx.fields.insert(field.clone(), dotted.clone()) {
+                return Err(format!(
+                    "{}: the weights `{other}` and `{dotted}` both spell the field `{field}`",
+                    c.file
+                ));
+            }
+            let _ = writeln!(weights, "        pub {field}: {ty},");
         }
-        let _ = writeln!(weights, "        pub {field}: {ty},");
     }
     let init: String = (cx.fields.keys())
         .map(|f| format!("            {f}: Declared::declared(),\n"))
@@ -369,6 +366,27 @@ const STATED_WIDTHS: [(OpKind, &[&str], usize); 1] = [
     // A pool's rows are the patch rows over `vision_pool_factor`.
     (OpKind::AvgPool2d, &["vision_pool_factor"], 2),
 ];
+
+/// A weight's type at its declared shape: `W1<D>`, `W2<K, N>`, or an expert bank's `W3<E, K, N>`.
+fn weight_type(
+    declared: &crate::dim::Shape,
+    bounds: &mut BTreeSet<String>,
+) -> Result<String, String> {
+    let dims = (declared.iter())
+        .map(|d| dim_type(d, bounds))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match dims.as_slice() {
+        [d] => format!("W1<{d}>"),
+        [k, n] => format!("W2<{k}, {n}>"),
+        [e, k, n] => format!("W3<{e}, {k}, {n}>"),
+        _ => {
+            return Err(format!(
+                "rank {}; the typed emit has ranks 1 to 3",
+                dims.len()
+            ));
+        }
+    })
+}
 
 /// A weight's field in `Weights`: its dotted path, `_`-joined, in snake case (a checkpoint's
 /// `attn.Wo` is `attn_wo`). [`emit`] refuses two weights that spell one field.
@@ -683,8 +701,28 @@ impl Cx<'_, '_> {
             Expr::Local(id) => format!("l{}", id.0),
             Expr::Extern { kind, .. } => format!("inputs.{}", kind.name()),
             Expr::Weight { id, .. } => {
-                let field = field_name(self.c.program.weights.path(*id));
-                format!("tr.weight({}, w.{field})", id.0)
+                let path = self.c.program.weights.path(*id);
+                let field = field_name(path);
+                match self.c.manifest.bundles.get(&path.join(".")) {
+                    // A bundle is its kind's constructor over its roles: its signature relates
+                    // them. It is no weight of the program's (its roles are the checkpoint's).
+                    Some(bundle) => {
+                        use crate::weights_manifest::BundleArg;
+                        let roles = |roles: &[&str]| -> Vec<String> {
+                            roles.iter().map(|r| format!("w.{field}_{r}")).collect()
+                        };
+                        let args: Vec<String> = (bundle.kind.args().iter())
+                            .map(|arg| match arg {
+                                BundleArg::Role(role) => format!("w.{field}_{role}"),
+                                BundleArg::Part(ctor, parts) => {
+                                    format!("ops::{ctor}({})", roles(parts).join(", "))
+                                }
+                            })
+                            .collect();
+                        format!("ops::{}({})", bundle.kind.name(), args.join(", "))
+                    }
+                    None => format!("tr.weight({}, w.{field})", id.0),
+                }
             }
             // A sum with a scalar operand offsets the tensor (Gemma's `(1 + w)` norm weight).
             Expr::Call { op, args }

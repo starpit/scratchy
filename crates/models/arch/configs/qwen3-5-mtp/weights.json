@@ -15,9 +15,18 @@
   "self_attn.q_norm": ["head_dim"],
   "self_attn.k_norm": ["head_dim"],
 
-  "mlp": ["hidden_size"],
   "mlp.shared_expert.gate_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.up_proj": ["hidden_size", "shared_expert_intermediate_size"],
   "mlp.shared_expert.down_proj": ["shared_expert_intermediate_size", "hidden_size"],
-  "mlp.shared_expert_gate": ["hidden_size", "1"]
+  "mlp.shared_expert_gate": ["hidden_size", "1"],
+
+  "__bundles__": {
+    "mlp": {
+      "kind": "routed_experts",
+      "router": ["hidden_size", "num_experts"],
+      "gate": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "up": ["num_experts", "hidden_size", "moe_intermediate_size"],
+      "down": ["num_experts", "moe_intermediate_size", "hidden_size"]
+    }
+  }
 }

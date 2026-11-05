@@ -5,12 +5,24 @@
   "mlp.down_proj": ["intermediate_size", "hidden_size"],
   "mlp.gate_proj": ["hidden_size", "intermediate_size"],
   "mlp.up_proj": ["hidden_size", "intermediate_size"],
-  "moe": ["hidden_size"],
   "norm": ["hidden_size"],
   "post_attention_layernorm": ["hidden_size"],
   "self_attn.kv_a_layernorm": ["kv_lora_rank"],
   "self_attn.kv_a_proj_with_mqa": ["hidden_size", "kv_a_proj_out"],
   "self_attn.kv_b_proj": ["kv_lora_rank", "kv_lora_out"],
   "self_attn.o_proj": ["attn_out", "hidden_size"],
-  "self_attn.q_proj": ["hidden_size", "q_proj_out"]
+  "self_attn.q_proj": ["hidden_size", "q_proj_out"],
+
+  "__bundles__": {
+    "moe": {
+      "kind": "shared_experts",
+      "router": ["hidden_size", "n_routed_experts"],
+      "gate": ["n_routed_experts", "hidden_size", "moe_intermediate_size"],
+      "up": ["n_routed_experts", "hidden_size", "moe_intermediate_size"],
+      "down": ["n_routed_experts", "moe_intermediate_size", "hidden_size"],
+      "shared_gate": ["hidden_size", "n_shared_experts * moe_intermediate_size"],
+      "shared_up": ["hidden_size", "n_shared_experts * moe_intermediate_size"],
+      "shared_down": ["n_shared_experts * moe_intermediate_size", "hidden_size"]
+    }
+  }
 }
