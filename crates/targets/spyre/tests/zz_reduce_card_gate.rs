@@ -109,7 +109,12 @@ fn dump_reduce_card_gate() {
     // ── THE TALL RUNG — the full production path, exactly the door test's own program ──
     let (m, c) = TALL;
     let ir = rmsnorm_ir(m, c, GainConvention::Scale);
-    let weight_ids: HashSet<u32> = [0u32, 1u32].into_iter().collect();
+    // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — it is
+    // staged raw on the per-step path — and t1 (the gain row) is the one real weight, staged
+    // through the weight loop's IEEE→sen re-encode (`stage_weights` refuses a raw id by name:
+    // bundle_run.rs:742-752). Handing the layout {0, 1} made x itself a Weight, and every
+    // `raw:t0` bind a refusal on the card.
+    let weight_ids: HashSet<u32> = [1u32].into_iter().collect();
     let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
     let node = &ir.nodes[0];
@@ -277,11 +282,17 @@ fn write_layout_cell(
             )
         })
         .collect();
+    // A synth NAME is either a plain `t<id>` (an intermediate placed as its own tensor — it
+    // gets a `places` row) or a NAMED intermediate the walk mints from another tensor
+    // (`<t>_mean`, …) — those are stated BY NAME in the `synth` list alone, with no `places`
+    // row: their placement is the runtime's, read off the synth entry, never a bare tid.
     for (name, off) in synth.map.iter() {
-        let tid: u32 = name
-            .trim_start_matches('t')
-            .parse()
-            .unwrap_or_else(|_| panic!("synth intermediate {name} is not a t<tid>"));
+        let Some(tid) = name
+            .strip_prefix('t')
+            .and_then(|rest| rest.parse::<u32>().ok())
+        else {
+            continue;
+        };
         rows.push(format!(
             "    {{\"tid\": {}, \"role\": \"{}\", \"segment\": {}, \"bank\": 0, \"offset\": {}, \
              \"size\": {}}}",

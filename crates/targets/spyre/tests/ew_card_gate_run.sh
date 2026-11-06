@@ -132,10 +132,32 @@ print("n_in=%d" % len(c["in_tids"]))
 print("in_list=%s" % ",".join(str(t) for t in c["in_tids"]))
 PY
 )"
+  # A Weight-role input (the rmsnorm gain) is staged through the WEIGHT path — the plain
+  # t<id>=<file> bind, which stage_weights re-encodes IEEE→sen fp16 once, before prepare.
+  # raw:t<id> is the per-step ACTIVATION path only: bundle_run.rs:742 refuses a raw id whose
+  # placement role is Weight, by name. The role comes from the cell own placements.json,
+  # one role per input tid, in order.
+  local role_list
+  role_list=$(python3 - "$cell" "$in_list" <<"PY"
+import json, sys
+cell = sys.argv[1]
+tids = sys.argv[2].split(",") if sys.argv[2] else []
+places = json.load(open(cell + "/placements.json"))["places"]
+role = {}
+for p in places:
+    role[str(p["tid"])] = p["role"]
+print(",".join(role.get(str(t), "Activation") for t in tids))
+PY
+)
   args=()
   IFS=, read -r -a in_tids <<< "$in_list"
-  for tid in "${in_tids[@]}"; do
-    args+=("t$tid=$cell/in-t$tid.bin" "raw:t$tid")
+  IFS=, read -r -a in_roles <<< "$role_list"
+  for i in "${!in_tids[@]}"; do
+    tid=${in_tids[$i]}
+    args+=("t$tid=$cell/in-t$tid.bin")
+    if [ "${in_roles[$i]}" != "Weight" ]; then
+      args+=("raw:t$tid")
+    fi
   done
   ./target/release/examples/bundle_run_dev "$cell" "${args[@]}" \
     --out "raw:t$out_tid=$cell/out.bin" > "$cell/run.log" 2>&1
