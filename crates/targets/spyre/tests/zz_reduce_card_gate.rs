@@ -168,15 +168,19 @@ fn rmsnorm_ir(m: u32, c: u32, gain: GainConvention) -> SubtileIR {
         tensor: TensorId::from_index(t),
         region: tensors[t].whole(),
     };
+    // The node is built BEFORE the struct moves `tensors` — the golden builder's own order:
+    // `whole` borrows `tensors`, so a node built inside the struct literal after the
+    // `tensors` field is a move-out-while-borrowed (E0505).
+    let node = SubtileNode {
+        id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
+        op: SubOp::RmsNorm { eps: 1e-5, gain },
+        inputs: vec![whole(0), whole(1)],
+        output: whole(2),
+    };
     SubtileIR {
         tensors,
         num_sources: 2,
-        nodes: vec![SubtileNode {
-            id: scratchy_subtile::subtile_ir::SubtileId::from_index(0),
-            op: SubOp::RmsNorm { eps: 1e-5, gain },
-            inputs: vec![whole(0), whole(1)],
-            output: whole(2),
-        }],
+        nodes: vec![node],
         result: TensorId::from_index(2),
         op_output: Vec::new(),
     }

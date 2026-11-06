@@ -20,7 +20,12 @@
 #   rmsnormunit x/√(mean(x²)+1e-6)                                   (eps 1e-6, no gain)
 #   rmsnorm     x/√(mean(x²)+1e-5)·gain                              (eps 1e-5, Scale gain)
 #   reduce_sum  Σ x per row (fp32 accumulate of the f16 values)
-#   reduce_max  max x per row; the accum is one stick per row, the value at lane 0
+#   reduce_max  max x per row; the accum is one stick per row, the value at lane 0 —
+#               THE DOOR'S OWN LAW, not an assumption: the single shot's output leg is a
+#               row-blocked [rows, 1] region (lower_ktir_to_superdsc.rs:10600 at
+#               347ee3feee — the Fp16 arm's assemble_reduce_seeded call passes
+#               rb(&out.name(), rows, 1)), and a row-blocked region's column 0 of row r is
+#               lane 0 of its stick: D = r·64.
 # The verdict line states the program, the shape, the max abs error, the max fp16 ulp, and
 # the artifact path. PASS bar: max fp16 ulp ≤ 8 (stated here, once — the numbers print
 # regardless, so a tighter or looser bar is a one-line change, never a re-run).
@@ -29,6 +34,12 @@
 # /work/.spyre-bake.lock for the whole run, and ABORTS ON FENCE — after every compile and
 # every run the logs are checked for the card's fence signatures, and the first one stops
 # the sweep with a FENCED verdict and a non-zero exit.
+#
+# ⛔ THE BODY CARRIES NO SINGLE QUOTE: the whole body runs as `bash -c '…'`, so one `'`
+# inside it (a python dict key, an f-string) closes the body and the outer shell sees the
+# remainder as its own words — `c: unbound variable` under `set -u`. Every python string
+# below is double-quoted and every value crosses as a POSITIONAL arg, exactly as
+# page_gather_sweep_run.sh does it.
 set -uo pipefail
 [ $# -eq 3 ] || { echo "usage: ew_card_gate_run.sh <gate-root> <tree-with-bundle_run_dev> <log>" >&2; exit 2; }
 ROOT=$(cd "$1" && pwd) || exit 80
@@ -87,16 +98,16 @@ PY
 import json, sys
 import numpy as np
 cell = sys.argv[1]
-c = json.load(open(f"{cell}/cell.json"))
+c = json.load(open(cell + "/cell.json"))
 n = c["m"] * c["c"]
 for i, tid in enumerate(c["in_tids"]):
     rng = np.random.default_rng(c["seed"] + i)
     if c["op"] == "rmsnorm" and i == 1:
         # the gain row: [1, c], centered at 1 so the reference is a real gain
         g = (1.0 + 0.25 * rng.standard_normal(c["c"])).astype(np.float16)
-        g.tofile(f"{cell}/in-t{tid}.bin")
+        g.tofile(cell + "/in-t%d.bin" % tid)
     else:
-        (2.0 * rng.standard_normal(n)).astype(np.float16).tofile(f"{cell}/in-t{tid}.bin")
+        (2.0 * rng.standard_normal(n)).astype(np.float16).tofile(cell + "/in-t%d.bin" % tid)
 PY
   [ $? -eq 0 ] || { echo "VERDICT $name NOT-RUN fill-failed sha=$sha md5=$md5" | tee -a "$LOG"; return; }
 
@@ -112,17 +123,18 @@ PY
   fi
   [ $crc -ne 0 ] && { echo "VERDICT $name NOT-RUN compile_rc=$crc sha=$sha md5=$md5" | tee -a "$LOG"; return; }
 
-  local out_tid stage args rrc
+  local out_tid n_in stage tid rrc
   eval "$(python3 - "$cell" <<"PY"
 import json, sys
 c = json.load(open(sys.argv[1] + "/cell.json"))
 print("out_tid=%d" % c["out_tid"])
 print("n_in=%d" % len(c["in_tids"]))
+print("in_list=%s" % ",".join(str(t) for t in c["in_tids"]))
 PY
 )"
   args=()
-  for ((i = 0; i < n_in; i++)); do
-    tid=$(python3 -c "import json;print(json.load(open(\"$cell/cell.json\"))[\"in_tids\"][$i])")
+  IFS=, read -r -a in_tids <<< "$in_list"
+  for tid in "${in_tids[@]}"; do
     args+=("t$tid=$cell/in-t$tid.bin" "raw:t$tid")
   done
   ./target/release/examples/bundle_run_dev "$cell" "${args[@]}" \
@@ -140,7 +152,7 @@ PY
 import json, sys
 import numpy as np
 cell, name = sys.argv[1], sys.argv[2]
-c = json.load(open(f"{cell}/cell.json"))
+c = json.load(open(cell + "/cell.json"))
 m, cols = c["m"], c["c"]
 op = c["op"]
 n = m * cols
@@ -156,16 +168,14 @@ def dev_index():
         + (colsv % 64)[None, :]
     ).reshape(m * cols)
 
-x = np.fromfile(f"{cell}/in-t{c['in_tids'][0]}.bin", dtype=np.float16, count=n).astype(np.float32)
+x = np.fromfile(cell + "/in-t%d.bin" % c["in_tids"][0], dtype=np.float16, count=n).astype(np.float32)
 if op == "gelu":
     k = float(np.sqrt(2.0 / np.pi))
     u = k * (x + 0.044715 * x * x * x)
     want = (0.5 * x * (1.0 + np.tanh(u))).astype(np.float16)
-    got = np.fromfile(f"{cell}/out.bin", dtype=np.float16, count=n)
+    got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=n)
     # decode the stick-column law into host row-major order
-    host = np.empty(n, dtype=np.float16)
-    D = dev_index()
-    host = got[D]
+    host = got[dev_index()]
     cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
 elif op in ("rmsnormunit", "rmsnorm"):
     eps = 1e-6 if op == "rmsnormunit" else 1e-5
@@ -173,12 +183,11 @@ elif op in ("rmsnormunit", "rmsnorm"):
     ms = (rows * rows).mean(axis=1, keepdims=True)
     ref = rows / np.sqrt(ms + eps)
     if op == "rmsnorm":
-        g = np.fromfile(f"{cell}/in-t{c['in_tids'][1]}.bin", dtype=np.float16, count=cols).astype(np.float32)
+        g = np.fromfile(cell + "/in-t%d.bin" % c["in_tids"][1], dtype=np.float16, count=cols).astype(np.float32)
         ref = ref * g[None, :]
     want = ref.astype(np.float16).reshape(n)
-    got = np.fromfile(f"{cell}/out.bin", dtype=np.float16, count=n)
-    D = dev_index()
-    host = got[D]
+    got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=n)
+    host = got[dev_index()]
     cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
 elif op in ("reduce_sum", "reduce_max"):
     rows = x.reshape(m, cols)
@@ -187,16 +196,19 @@ elif op in ("reduce_sum", "reduce_max"):
     else:
         want = rows.max(axis=1)
     want = want.astype(np.float16)
-    got = np.fromfile(f"{cell}/out.bin", dtype=np.float16, count=m * 64)
-    # the accum is one stick per row, the value at lane 0
+    got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=m * 64)
+    # THE ACCUM LAW, from the door itself: the single-shot output leg is a row-blocked
+    # [rows, 1] region (lower_ktir_to_superdsc.rs:10600 at 347ee3feee — the Fp16 arm
+    # assemble_reduce_seeded call passes rb(&out.name(), rows, 1)), and a row-blocked
+    # region column 0 of row r is LANE 0 of its stick: D = r*64.
     host = got.reshape(m, 64)[:, 0]
     cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
 else:
-    print(f"VERDICT {name} NOT-RUN unknown-op={op} sha={c['sha']} md5={c['group_0_md5']}")
+    print("VERDICT %s NOT-RUN unknown-op=%s sha=%s md5=%s" % (name, op, c["sha"], c["group_0_md5"]))
     sys.exit()
 
-if cmp_a.size < cmp_b.size or host.size != want.size:
-    print(f"VERDICT {name} NOT-RUN short-readback {host.size} of {want.size} sha={c['sha']} md5={c['group_0_md5']}")
+if host.size != want.size:
+    print("VERDICT %s NOT-RUN short-readback %d of %d sha=%s md5=%s" % (name, host.size, want.size, c["sha"], c["group_0_md5"]))
     sys.exit()
 
 def ulp16(a, b):
@@ -235,10 +247,12 @@ for c in $cell_list; do
   [ -d "$c/group_0" ] || continue
   runnable=$((runnable + 1))
   name=$(basename "$c")
-  stamp=$(python3 -c "
-import json
-c = json.load(open('$c/cell.json'))
-print('sha=%s md5=%s' % (c['sha'], c['group_0_md5']))")
+  stamp=$(python3 - "$c" <<"PY"
+import json, sys
+c = json.load(open(sys.argv[1] + "/cell.json"))
+print("sha=%s md5=%s" % (c["sha"], c["group_0_md5"]))
+PY
+)
   kind=$(grep "^VERDICT $name " "$LOG" 2>/dev/null | grep -F "$stamp" | tail -1 | awk "{print \$3}")
   case "$kind" in
     PASS) pass=$((pass + 1));;
