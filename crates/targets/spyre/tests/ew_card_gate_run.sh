@@ -52,16 +52,25 @@
 #   PASS on it would claim a bar nobody stated. REPORTED counts as its own tally kind: the
 #   fence treats it as COMPLETE (the cell ran and its laws held) but NOT a PASS, so a
 #   runnable cell needs a PASS or a REPORTED at its own stamp for the gate to close.
-#   reduce_max: max_ulp <= 8 over the head. Reason: the selection over f16 values is exact,
-#   so the output is one of the inputs, exactly.
-#   reduce_sum: max_abs <= sigma_row·sqrt(cols)·2^-6 — the row's own random-walk scale
-#   (sigma·sqrt(N)·2^-11: one f16 rounding of the final magnitude) at 32x headroom for the
-#   split's slice-partial and combine roundings. PROPOSED 2026-11-07 for the auditor: the old
-#   max_rel <= 2^-5 was reasoned at 512 lanes and is not derived at 2^20, and a relative bar
-#   on a CANCELLING sum (a small difference of large partials) measures the cancellation, not
-#   the arithmetic — the absolute walk scale is the op's own error law. The constant is
-#   anchored on the measured run cg1113-ca8a1115 (device at ~24 walk units); the auditor
-#   rules it. err_over_walk and err_over_abssum are REPORTED either way.
+#   reduce_max: EXACT — bit equality with the f16 max of the f16 inputs, 0 ulp, no headroom.
+#   Reason: the op law is a SELECTION over f16 values — the output IS one of the inputs,
+#   exactly — and the host want is the f16 max of the x this runner itself read as f16 (an
+#   f32 upcast of a selection, cast back, rounds nothing). The measured <=1 ulp at
+#   cg1113-ca8a1115 (9.297 vs 9.289; 9.156 vs 9.148) is a REAL DIFFERENCE TO EXPLAIN — a
+#   device combine that rounds, or a readback lane — never a bar to widen: max_ulp is
+#   reported as the diagnostic that names it.
+#   reduce_sum (RULED by the auditor 2026-11-07 — a bar calibrated on the run it judges
+#   proves nothing, so every input is door-stated, never runner-derived): per row,
+#     |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5 * ulp_f16(|want|)
+#   with T the split trip count, slice_lanes the slices swept reduce widths, and eps the
+#   accumulator error unit: 2^-11 when the accum is fp16 on the device, 2^-24 when fp32.
+#   T, slice_lanes and the accum df are the SPLIT FACTS the dump writes into cell.json off
+#   the door OWN emitted ops (the slice descriptors N_.out_ widths and OUTPUT wordLength);
+#   a reduce_sum cell without them is a named NOT-RUN, never a guessed bar. The formula is
+#   the auditor own ruling, taken verbatim: T trip terms plus ceil(log2(slice_lanes))
+#   reduction terms, each one eps of the row absolute magnitude sum|x|, plus half an ulp of
+#   the final f16 image. err_over_abssum (err / sum|x|) and err_over_sigmasqrtn
+#   (err / (sigma_row*sqrt(cols))) are REPORTED unbarred beside it.
 #
 # ⛔ THE GELU THREE-NUMBER PROTOCOL (#1112, auditor ruling): on the same input vector,
 #   (i)   the folded gelufwd cell, against
@@ -359,6 +368,9 @@ elif op in ("reduce_sum", "reduce_max"):
     if op == "reduce_sum":
         want = rows.sum(axis=1)
     else:
+        # THE EXACT LAW (header): x is the f16-read input upcast to f32, and a max over it
+        # cast back to f16 rounds NOTHING — the want IS the f16 max of the f16 inputs, so
+        # the reduce_max bar can be bit equality.
         want = rows.max(axis=1)
     want = want.astype(np.float16)
     # ⛔ THE ACCUM LAW, from the door OWN out placement — never a guessed stride. Three
@@ -393,16 +405,38 @@ elif op in ("reduce_sum", "reduce_max"):
         sys.exit()
     got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=m * stride)
     got = got.reshape(m, stride)[:, 0]
-    # reported, never barred: the sum error against its own walk scale and against the
-    # row absolute magnitude (a cancelling sum relative error is not a metric — see the
-    # reduce_sum bar in the header).
+    # THE SUM BAR INPUTS (header, ruled 2026-11-07): T, slice_lanes and the accum df come
+    # from the SPLIT FACTS the dump wrote off the door OWN emitted ops — never re-derived
+    # here. A reduce_sum cell without a complete, self-consistent set is a named NOT-RUN:
+    # a bar calibrated on numbers this runner guessed proves nothing.
+    bound = None
     if op == "reduce_sum":
+        split = c.get("split") or {}
+        T = split.get("time")
+        lanes = split.get("slice_lanes") or []
+        adf = split.get("accum_df")
+        if not isinstance(T, int) or T < 1 or len(lanes) != T or adf not in ("fp16", "fp32"):
+            print("VERDICT %s NOT-RUN no-door-stated-split-facts split=%s sha=%s md5=%s"
+                  % (name, split, c["sha"], c.get("group_0_md5")))
+            sys.exit()
+        eps = 2.0 ** -11 if adf == "fp16" else 2.0 ** -24
         sig = rows.std(axis=1).astype(np.float32)
-        walk = np.maximum(sig * math.sqrt(cols) * 2.0 ** -11, 2.0 ** -24)
         abssum = np.abs(rows).sum(axis=1).astype(np.float32)
         err = np.abs(got.astype(np.float32) - want.astype(np.float32))
-        sum_report = " err_over_walk=%.6g err_over_abssum=%.6g" % (
-            float((err / walk).max()), float((err / np.maximum(abssum, 2.0 ** -24)).max()),
+        # ulp_f16 at |want|: the normal spacing 2^(floor(log2 v)-10), the subnormal and
+        # zero spacing 2^-24 (one min-subnormal step).
+        w = np.abs(want.astype(np.float32))
+        with np.errstate(divide="ignore"):
+            expo = np.floor(np.log2(np.where(w >= 2.0 ** -14, w, 1.0)))
+        ulp = np.where(w >= 2.0 ** -14, 2.0 ** (expo - 10), 2.0 ** -24)
+        bound = (T + math.ceil(math.log2(max(lanes)))) * eps * abssum + 0.5 * ulp
+        # reported, never barred: the sum error against the row absolute magnitude and
+        # against the row random-walk scale sigma*sqrt(N) (a cancelling sum relative error
+        # is not a metric — see the reduce_sum bar in the header).
+        sum_report = " err_over_abssum=%.6g err_over_sigmasqrtn=%.6g split_T=%d split_lanes_max=%d accum_df=%s" % (
+            float((err / np.maximum(abssum, 2.0 ** -24)).max()),
+            float((err / np.maximum(sig * math.sqrt(cols), 2.0 ** -24)).max()),
+            T, max(lanes), adf,
         )
     else:
         sum_report = ""
@@ -537,16 +571,17 @@ else:
     max_abs, tail_abs, max_rel, max_ulp, finite = metrics(got, want, bar)
     extra = sum_report if op == "reduce_sum" else ""
     if op == "reduce_sum":
-        # THE SUM BAR (proposed to the auditor 2026-11-07, replacing the 512-lane max_rel):
-        # max_abs <= sigma_row · sqrt(cols) · 2^-6 — the row own random-walk scale
-        # (sigma·sqrt(N)·2^-11, one f16 rounding of the final magnitude) at 32x headroom,
-        # covering the split slice-partial and combine roundings on top of the single
-        # image. The constant is ANCHORED ON THE MEASURED run cg1113-ca8a1115 (max err 24 at
-        # sigma~=2, N=2^20, walk unit 1 — the device sat at ~24 units) and is stated here as
-        # the proposal; the auditor rules the constant. max_rel on a cancelling sum is
-        # REPORTED (sum_report), never barred.
-        sig = np.abs(rows.std(axis=1).astype(np.float32) * math.sqrt(cols) * 2.0 ** -6)
-        ok = (max_abs <= float(sig.max())) and finite and eq_ok
+        # THE SUM BAR (RULED 2026-11-07, header): per row
+        #   |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5*ulp_f16(|want|)
+        # with every input door-stated (the dump split facts) — max_abs alone is not the
+        # metric: the bound is per row, against the row own absolute magnitude.
+        ok = bool((err <= bound).all()) and finite and eq_ok
+    elif op == "reduce_max":
+        # THE EXACT LAW (header): the output IS one of the f16 inputs — a selection rounds
+        # nothing — so the bar is BIT EQUALITY with the f16 max of the f16-read inputs.
+        # max_ulp stays in the verdict line as the diagnostic that names any difference
+        # (the measured <=1 ulp at cg1113-ca8a1115 is to EXPLAIN, never to bar).
+        ok = bool((got == want).all()) and finite and eq_ok
     else:
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
 

@@ -37,8 +37,11 @@
 //! (`StickLayout::group_stride`), and the placement reserves `row_footprint_bytes(1, Fp16)`
 //! per row — so the launcher's whole-placement readback at `stick:t=m` resticks to host
 //! `[m, size/2/m]` and row r's value is host `(r, 0)`, lane 0 of its stick. The per-op bars
-//! (tail law, rmsnorm ulp ≤ 8, reduce_max ulp ≤ 8, and the reduce_sum walk bar — each with
-//! its reason) are stated in the runner header, before the run.
+//! (tail law, rmsnorm ulp ≤ 8, the exact reduce_max law, and the reduce_sum split-facts bar
+//! — each with its reason) are stated in the runner header, before the run. The sum bar's
+//! inputs — the split's trip count T, each slice's swept width, and the accum's device
+//! format — are written into `cell.json` by THIS dump off the door's own emitted ops
+//! ([`SplitFacts`]), never re-derived from geometry by the runner.
 //!
 //! ```bash
 //! REDUCE_CARD_GATE_ROOT=<dir> REDUCE_CARD_GATE_SHA=<sha> \
@@ -109,6 +112,101 @@ struct Cell {
     out_tid: u32,
     /// The commit this dump ran at — required at dump time (a dump refuses to run unstamped).
     sha: String,
+    /// ⭐ THE DOOR'S OWN SPLIT FACTS (moe-lead ruling 2026-11-07) — the inputs of the
+    /// runner's reduce bars, written by the DUMP off what the door EMITTED, never
+    /// re-derived from geometry by the runner: a bar calibrated on the run it judges
+    /// proves nothing. See [`SplitFacts`].
+    split: SplitFacts,
+}
+
+/// ⭐ THE DOOR'S OWN SPLIT FACTS — every field is read off the split ops the door emitted
+/// (`{op}_p{j}_op` slices, the spelling `assemble_reduce_split` itself mints), never
+/// recomputed from the cell geometry:
+/// * `time` — the split's trip count T: the number of `_p{j}_op` slice ops, `j` a
+///   contiguous run from 0 (the door emits one slice per trip, in trip order);
+/// * `slice_lanes` — each slice's swept reduce width, in lanes: the `out` extent the
+///   slice's OWN descriptor states (`N_.out_` — the stick-padded width the reduce walks;
+///   its pad lanes are masked to the reduce's identity, so they contribute nothing);
+/// * `accum_df` — the accumulator's device format, off the slice's OWN descriptor: the
+///   `wordLength` of its OUTPUT `labeledDs_` row (2 = fp16, 4 = fp32). The runner's sum
+///   bar takes its ε from this alone (2⁻¹¹ fp16, 2⁻²⁴ fp32).
+#[derive(serde::Serialize)]
+struct SplitFacts {
+    time: u32,
+    slice_lanes: Vec<u32>,
+    accum_df: String,
+}
+
+/// Derive [`SplitFacts`] from the ops the door emitted. Every assertion is a refusal
+/// naming the cell — a fact this fn cannot state off the door own emission is a dump
+/// bug, never a guessed number.
+fn split_facts(ops: &[ktir_superdsc::emit::EmittedOp], what: &str) -> SplitFacts {
+    let mut slices: std::collections::BTreeMap<u32, &ktir_superdsc::emit::EmittedOp> =
+        std::collections::BTreeMap::new();
+    for op in ops {
+        let Some(j) = op
+            .op_name
+            .rsplit_once("_p")
+            .and_then(|(_, rest)| rest.strip_suffix("_op"))
+            .and_then(|j| j.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        assert!(
+            slices.insert(j, op).is_none(),
+            "{what}: two slice ops spell _p{j}_op"
+        );
+    }
+    let time = slices.len() as u32;
+    assert!(
+        time > 0 && slices.keys().copied().eq(0..time),
+        "{what}: the door emitted no contiguous 0.._p{{j}}_op slice run"
+    );
+    let mut slice_lanes = Vec::with_capacity(time as usize);
+    let mut accum_df: Option<String> = None;
+    for (j, op) in &slices {
+        assert!(
+            op.time == 1,
+            "{what}: _p{j}_op is time-tiled (time={}) — its N_ would state a per-trip \
+             extent, and this dump refuses to guess the sweep",
+            op.time
+        );
+        let sdsc = op
+            .op
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: _p{j}_op carries no descriptor"));
+        let dscs: Vec<&ktir_superdsc::wire::Dsc> =
+            sdsc.dscs_.iter().flat_map(|m| m.values()).collect();
+        assert!(!dscs.is_empty(), "{what}: _p{j}_op states no dsc");
+        let out_extents: HashSet<i64> = dscs.iter().map(|d| d.N_.out_).collect();
+        assert!(
+            out_extents.len() == 1 && *out_extents.iter().next().unwrap() > 0,
+            "{what}: _p{j}_op does not state ONE positive out extent: {out_extents:?}"
+        );
+        slice_lanes.push(*out_extents.iter().next().unwrap() as u32);
+        let dfs: HashSet<u32> = dscs
+            .iter()
+            .flat_map(|d| d.labeledDs_.iter().filter(|ds| ds.dsType_ == "OUTPUT"))
+            .map(|ds| ds.wordLength)
+            .collect();
+        let df = match dfs.iter().copied().collect::<Vec<_>>()[..] {
+            [2] => "fp16",
+            [4] => "fp32",
+            other => panic!("{what}: _p{j}_op does not state ONE accum df: wordLength {other:?}"),
+        };
+        match accum_df.as_deref() {
+            None => accum_df = Some(df.to_string()),
+            Some(prev) => assert!(
+                prev == df,
+                "{what}: the slices disagree on the accum df: {prev} vs _p{j}_op {df}"
+            ),
+        }
+    }
+    SplitFacts {
+        time,
+        slice_lanes,
+        accum_df: accum_df.expect("time > 0 holds a df"),
+    }
 }
 
 /// Dump every cell. One directory per cell: `group_0/` ([`superdsc::write_dxp_input`]),
@@ -159,7 +257,8 @@ fn dump_reduce_card_gate() {
     let dir = root.join(format!("rmsnorm_m{m}_c{c}"));
     std::fs::create_dir_all(&dir).unwrap();
     write_layout_cell(&dir, &layout, Some(&ops), 2);
-    write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, &sha);
+    let split = split_facts(&ops, "the tall rung");
+    write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, &sha, split);
 
     // ── THE BARE-REDUCE DOOR TWINS — the door itself, wide multi-row, through the real
     //    placement (compute_bundle_layout), with the split FIRING ──
@@ -189,6 +288,7 @@ fn dump_reduce_card_gate() {
         let dir = root.join(format!("reduce_{}_m{m}_c{c}", kind.op_func()));
         std::fs::create_dir_all(&dir).unwrap();
         write_layout_cell(&dir, &layout, Some(&ops), REDUCE_OUT_TID);
+        let split = split_facts(&ops, &format!("{kind:?} [{m}, {c}]"));
         write_cell_json(
             &dir,
             &format!("reduce_{}", kind.op_func()),
@@ -197,6 +297,7 @@ fn dump_reduce_card_gate() {
             vec![REDUCE_DATA_TID],
             REDUCE_OUT_TID,
             &sha,
+            split,
         );
     }
 }
@@ -312,6 +413,7 @@ fn write_cell_json(
     in_tids: Vec<u32>,
     out_tid: u32,
     sha: &str,
+    split: SplitFacts,
 ) {
     let cell = Cell {
         op: op.to_string(),
@@ -321,6 +423,7 @@ fn write_cell_json(
         in_tids,
         out_tid,
         sha: sha.to_string(),
+        split,
     };
     std::fs::write(
         dir.join("cell.json"),
