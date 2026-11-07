@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ⭐ THE #1112/#1113 OP CARD-GATE RUNNER — runs every cell the dump test wrote
 # (zz_ew_card_gate.rs / zz_reduce_card_gate.rs, this directory) on the card and checks it
-# against a HOST reference computed from the op's own formula, over SEEDED RANDOM fills
+# against a HOST reference computed from the op's own definition, over SEEDED RANDOM fills
 # (never constants, so a wrong lane cannot hide). Test tooling: nothing here ships.
 #
 # usage: ew_card_gate_run.sh <gate-root> <tree-with-bundle_run_dev> <log>
@@ -10,25 +10,65 @@
 #                 the SAME commit the dump test ran at
 #   <log>         the verdict log (one line per cell, appended — the run is resumable)
 #
-# THE BAR, per cell: the read-back buffer holds the card image of the op over the fills,
-# decoded by the rank-2 stick-column law (a device layout is row-major with the stick dim
-# last, so a host [m, c] sits on the device as [c/64, m, 64]:
-#   D = (c/64)·(m·64) + t·64 + (c%64)
-# — the same law the page-gather runner decodes by), against a host reference in fp32 from
-# the formula:
-#   gelu        the TANH form: 0.5·x·(1+tanh(√(2/π)·(x+0.044715x³)))
-#   rmsnormunit x/√(mean(x²)+1e-6)                                   (eps 1e-6, no gain)
-#   rmsnorm     x/√(mean(x²)+1e-5)·gain                              (eps 1e-5, Scale gain)
-#   reduce_sum  Σ x per row (fp32 accumulate of the f16 values)
-#   reduce_max  max x per row; the accum is one stick per row, the value at lane 0 —
-#               THE DOOR'S OWN LAW, not an assumption: the single shot's output leg is a
-#               row-blocked [rows, 1] region (lower_ktir_to_superdsc.rs:10600 at
-#               347ee3feee — the Fp16 arm's assemble_reduce_seeded call passes
-#               rb(&out.name(), rows, 1)), and a row-blocked region's column 0 of row r is
-#               lane 0 of its stick: D = r·64.
-# The verdict line states the program, the shape, the max abs error, the max fp16 ulp, and
-# the artifact path. PASS bar: max fp16 ulp ≤ 8 (stated here, once — the numbers print
-# regardless, so a tighter or looser bar is a one-line change, never a re-run).
+# ⛔ THE CODEC LAW (run-3): the card's activation format is SEN fp16, not IEEE — `raw:t<id>`
+# binds IEEE bytes verbatim, which is why run-2 measured max_abs 0.47-8.8 on cells whose
+# arithmetic was right. Every input is staged and every output read back through the
+# launcher's IEEE<->SEN codec instead:
+#   stage    t<id>=<file> stick:t<id>=<rows>
+#   readback --out t<id>=<file> stick:t<id>=<rows>
+# (bundle_run.rs: the input path resticks row-major host bytes to the device stick order and
+# re-encodes IEEE->SEN; `read_tensor` decodes SEN->IEEE and `restick`s back to host
+# row-major on the way out). So the read-back file IS host row-major IEEE and the runner
+# decodes it as the IDENTITY — the stick-column law is applied exactly once, by the
+# launcher, never again below. No `raw:` remains anywhere in this runner: the page-gather
+# runner kept one only because its fills were small exact integers.
+# The rmsnorm gain row is staged the same way with `stick:t1=1` — which IS the [1, C] row's
+# identity map (bundle_run.rs: "stick:tN=1 is the identity, and saying it out loud is the
+# point"), from the cell's own gain tensor file, staged through the weight loop's
+# IEEE->SEN re-encode.
+#
+# ⛔ THE BAR IS STATED PER OP, FROM THE OP'S DEFINITION, BEFORE THE CELL RUNS — never tuned
+# after seeing a number. Metrics: max_abs everywhere; max_rel and max fp16 ulp over the
+# lanes with |want| >= 1e-2 (the HEAD); tail_abs over the rest.
+#   THE TAIL LAW (every op, stated once): lanes with |want| < 1e-2 are judged by tail_abs
+#   <= 2^-6 (0.015625). Reason: at this runner's +-2-ish fill scale 2^-6 is 8 f16 ulp, and
+#   near a zero of the function the ulp metric is defeated by sign flips and denormal
+#   spacing, so the bar there is absolute.
+#   rmsnorm / rmsnormunit: max_ulp <= 8 over the head. Reason: the op's mean(x^2) reduce
+#   accumulates in f32, so the device value is the f16 image of an f32 computation — a few
+#   ulp, with 8 leaving headroom for the rsqrt and the gain multiply's own rounding.
+#   gelu (the folded cell): max_ulp <= 8 over the head against the FEST-modeled gelufwd
+#   form (see (iii) below). Reason: gelufwd is ONE device primitive, and the cell must be
+#   the f16 image of its own defining polynomial. The distance to the TRUE tanh form is
+#   also reported.
+#   gelu_longhand (the unfolded cell): the tail law plus finiteness. The distance to the
+#   true tanh form is REPORTED with no invented tight bar — the longhand lowers through the
+#   exp island (exp.smc, 13 SFP instructions) which this host does not model, so any tight
+#   number would be tuned, not derived.
+#   reduce_max: max_ulp <= 8 over the head. Reason: the selection over f16 values is exact,
+#   so the output is one of the inputs, exactly.
+#   reduce_sum: max_rel <= 2^-5 (3.1%) over the head. Reason: the sum accumulates in f16
+#   across the row — a random walk of sqrt(cols)*2^-11 ~= 1.4% of the magnitude at 512
+#   lanes — and 2^-5 is one order of headroom over that walk.
+#
+# ⛔ THE GELU THREE-NUMBER PROTOCOL (#1112, auditor ruling): on the same input vector,
+#   (i)   the folded gelufwd cell, against
+#   (iii) gelufwd's defining form, cited from the vendored deeptools tree by direct path
+#         read — crates/compiler/deeptools/opaque_templates/gelu.smc at 1b5e66c1a9:
+#           gelu(x) = 0.5x + 0.5x*tanh(A1*x + A2*x^3)
+#         with A1 = SEN169 0x3D31 = 2^-1*(1+305/512) = 0.7978515625 (~sqrt(2/pi)) and
+#         A2 = SEN169 0x3448 = 2^-5*(1+72/512) = 0.03564453125 (~0.044715*sqrt(2/pi)),
+#         decoded by the sen169_bits law (emit/mod.rs:7066: sign 1, exp 6 bias 31, mantissa
+#         9). The tanh is the FEST hardware approximation (gelu.smc FEST imm=8 slope,
+#         imm=9 offset), modeled in fp32 here from senulator/src/sfp.rs's tables: 16
+#         segments over [0.0625, 4.0), slope/offset = 2^exp*mant/512, below the first break
+#         slope 1 offset 0, at/above the last slope 0 offset 1;
+#   (ii)  the SAME tanh longhand lowered op by op (the gelu_longhand cells: the unclaimed
+#         spelling, no negf, so program_gelu_chains leaves it and lower_function walks it),
+#         against the TRUE tanh form, distance reported.
+# If (i) matches (iii) the fold is spelling the right function and the PR states the
+# measured distance; if (i) does not match (iii), the fold is spelling the wrong function —
+# a bug, not a bar to move.
 #
 # ⛔ THE FENCE PROTOCOL (the page-gather runner's own ruling): the runner holds
 # /work/.spyre-bake.lock for the whole run, and ABORTS ON FENCE — after every compile and
@@ -123,44 +163,35 @@ PY
   fi
   [ $crc -ne 0 ] && { echo "VERDICT $name NOT-RUN compile_rc=$crc sha=$sha md5=$md5" | tee -a "$LOG"; return; }
 
-  local out_tid n_in stage tid rrc
+  # THE STAGE MAP — every input through the codec, each with its own ROW COUNT: m for an
+  # [m, c] activation, 1 for the rmsnorm gain (the [1, c] row: stick:t1=1 is its identity
+  # map). The read-back states m rows for every op — the reduce accum is one stick per row,
+  # so m rows of 64 lanes, its value at lane 0.
+  local out_tid out_rows rrc
   eval "$(python3 - "$cell" <<"PY"
 import json, sys
 c = json.load(open(sys.argv[1] + "/cell.json"))
+rows = []
+for i, tid in enumerate(c["in_tids"]):
+    if c["op"] == "rmsnorm" and i == 1:
+        rows.append(1)
+    else:
+        rows.append(c["m"])
 print("out_tid=%d" % c["out_tid"])
-print("n_in=%d" % len(c["in_tids"]))
+print("out_rows=%d" % c["m"])
 print("in_list=%s" % ",".join(str(t) for t in c["in_tids"]))
+print("rows_list=%s" % ",".join(str(r) for r in rows))
 PY
 )"
-  # A Weight-role input (the rmsnorm gain) is staged through the WEIGHT path — the plain
-  # t<id>=<file> bind, which stage_weights re-encodes IEEE→sen fp16 once, before prepare.
-  # raw:t<id> is the per-step ACTIVATION path only: bundle_run.rs:742 refuses a raw id whose
-  # placement role is Weight, by name. The role comes from the cell own placements.json,
-  # one role per input tid, in order.
-  local role_list
-  role_list=$(python3 - "$cell" "$in_list" <<"PY"
-import json, sys
-cell = sys.argv[1]
-tids = sys.argv[2].split(",") if sys.argv[2] else []
-places = json.load(open(cell + "/placements.json"))["places"]
-role = {}
-for p in places:
-    role[str(p["tid"])] = p["role"]
-print(",".join(role.get(str(t), "Activation") for t in tids))
-PY
-)
   args=()
   IFS=, read -r -a in_tids <<< "$in_list"
-  IFS=, read -r -a in_roles <<< "$role_list"
+  IFS=, read -r -a in_rows <<< "$rows_list"
   for i in "${!in_tids[@]}"; do
     tid=${in_tids[$i]}
-    args+=("t$tid=$cell/in-t$tid.bin")
-    if [ "${in_roles[$i]}" != "Weight" ]; then
-      args+=("raw:t$tid")
-    fi
+    args+=("t$tid=$cell/in-t$tid.bin" "stick:t$tid=${in_rows[$i]}")
   done
   ./target/release/examples/bundle_run_dev "$cell" "${args[@]}" \
-    --out "raw:t$out_tid=$cell/out.bin" > "$cell/run.log" 2>&1
+    --out "t$out_tid=$cell/out.bin" "stick:t$out_tid=$out_rows" > "$cell/run.log" 2>&1
   rrc=$?
   sig=$(fenced "$cell/run.log")
   if [ -n "$sig" ]; then
@@ -171,7 +202,7 @@ PY
   [ $rrc -ne 0 ] && { echo "VERDICT $name NOT-RUN run_rc=$rrc sha=$sha md5=$md5" | tee -a "$LOG"; return; }
 
   python3 - "$cell" "$name" >> "$LOG" <<"PY"
-import json, sys
+import json, math, sys
 import numpy as np
 cell, name = sys.argv[1], sys.argv[2]
 c = json.load(open(cell + "/cell.json"))
@@ -179,26 +210,51 @@ m, cols = c["m"], c["c"]
 op = c["op"]
 n = m * cols
 
-def dev_index():
-    # the rank-2 stick-column law, VECTORIZED (the tall rung is 33.5M elements — a python
-    # loop would take minutes): D = (c/64)*(m*64) + t*64 + (c%64), one device offset per
-    # host (t, col), flattened row-major
-    colsv = np.arange(cols)
-    return (
-        (colsv // 64)[None, :] * (m * 64)
-        + np.arange(m)[:, None] * 64
-        + (colsv % 64)[None, :]
-    ).reshape(m * cols)
+# (iii) the gelufwd defining form — see the runner header for the full citation
+# (gelu.smc at 1b5e66c1a9 + senulator/src/sfp.rs FEST tables, fp32 on the host).
+GELU_A1 = 0.7978515625
+GELU_A2 = 0.03564453125
+FEST_BREAKS = [0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0,
+               1.125, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
+FEST_SLOPE_E = [-1] * 7 + [-2] * 3 + [-3] * 2 + [-4, -5, -6, -8]
+FEST_SLOPE_M = [1016, 989, 931, 851, 759, 661, 565, 947, 781, 638,
+                931, 593, 742, 737, 545, 575]
+FEST_OFF_E = [-12, -9, -6, -5, -4, -3, -3, -2, -2, -2, -1, -1, -1, -1, -1, -1]
+FEST_OFF_M = [1016, 992, 591, 771, 755, 621, 911, 615, 780, 940,
+              579, 706, 803, 896, 968, 1006]
+
+def fest_tanh(v):
+    av = np.abs(v)
+    slope = np.zeros_like(v)
+    off = np.zeros_like(v)
+    lo = FEST_BREAKS[0]
+    hi = FEST_BREAKS[-1]
+    inside = (av >= lo) & (av < hi)
+    if inside.any():
+        idx = np.searchsorted(np.array(FEST_BREAKS), av[inside], side="right") - 1
+        slope[inside] = np.array([2.0 ** FEST_SLOPE_E[j] * FEST_SLOPE_M[j] / 512.0 for j in idx])
+        off[inside] = np.array([2.0 ** FEST_OFF_E[j] * FEST_OFF_M[j] / 512.0 for j in idx])
+    slope[av < lo] = 1.0
+    off[av < lo] = 0.0
+    slope[av >= hi] = 0.0
+    off[av >= hi] = 1.0
+    return slope * v + np.sign(v) * off
+
+def gelu_fest(x):
+    u = GELU_A1 * x + GELU_A2 * x * x * x
+    return 0.5 * x + 0.5 * x * fest_tanh(u)
+
+def gelu_true(x):
+    k = math.sqrt(2.0 / math.pi)
+    u = k * (x + 0.044715 * x * x * x)
+    return 0.5 * x * (1.0 + np.tanh(u))
 
 x = np.fromfile(cell + "/in-t%d.bin" % c["in_tids"][0], dtype=np.float16, count=n).astype(np.float32)
-if op == "gelu":
-    k = float(np.sqrt(2.0 / np.pi))
-    u = k * (x + 0.044715 * x * x * x)
-    want = (0.5 * x * (1.0 + np.tanh(u))).astype(np.float16)
+
+# The read-back is host row-major IEEE (the launcher already un-sticked and SEN->IEEE
+# decoded it) — the IDENTITY decode. The reduce accum keeps the lane law the door states.
+if op in ("gelu", "gelu_longhand"):
     got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=n)
-    # decode the stick-column law into host row-major order
-    host = got[dev_index()]
-    cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
 elif op in ("rmsnormunit", "rmsnorm"):
     eps = 1e-6 if op == "rmsnormunit" else 1e-5
     rows = x.reshape(m, cols)
@@ -207,10 +263,8 @@ elif op in ("rmsnormunit", "rmsnorm"):
     if op == "rmsnorm":
         g = np.fromfile(cell + "/in-t%d.bin" % c["in_tids"][1], dtype=np.float16, count=cols).astype(np.float32)
         ref = ref * g[None, :]
-    want = ref.astype(np.float16).reshape(n)
     got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=n)
-    host = got[dev_index()]
-    cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
+    want = ref.astype(np.float16).reshape(n)
 elif op in ("reduce_sum", "reduce_max"):
     rows = x.reshape(m, cols)
     if op == "reduce_sum":
@@ -221,16 +275,12 @@ elif op in ("reduce_sum", "reduce_max"):
     got = np.fromfile(cell + "/out.bin", dtype=np.float16, count=m * 64)
     # THE ACCUM LAW, from the door itself: the single-shot output leg is a row-blocked
     # [rows, 1] region (lower_ktir_to_superdsc.rs:10600 at 347ee3feee — the Fp16 arm
-    # assemble_reduce_seeded call passes rb(&out.name(), rows, 1)), and a row-blocked
-    # region column 0 of row r is LANE 0 of its stick: D = r*64.
-    host = got.reshape(m, 64)[:, 0]
-    cmp_a, cmp_b = host.astype(np.float32), want.astype(np.float32)
+    # calls assemble_reduce_seeded with rb(&out.name(), rows, 1)), and column 0 of row r
+    # in a row-blocked region is LANE 0 of its stick. The codec readback at m rows of
+    # one stick each lands those lanes at reshape(m, 64)[:, 0].
+    got = got.reshape(m, 64)[:, 0]
 else:
     print("VERDICT %s NOT-RUN unknown-op=%s sha=%s md5=%s" % (name, op, c["sha"], c["group_0_md5"]))
-    sys.exit()
-
-if host.size != want.size:
-    print("VERDICT %s NOT-RUN short-readback %d of %d sha=%s md5=%s" % (name, host.size, want.size, c["sha"], c["group_0_md5"]))
     sys.exit()
 
 def ulp16(a, b):
@@ -243,14 +293,56 @@ def ulp16(a, b):
     d[~same] = 1 << 16
     return d
 
-max_abs = float(np.max(np.abs(cmp_a - cmp_b))) if cmp_a.size else 0.0
-ulps = ulp16(cmp_a, cmp_b)
-max_ulp = int(ulps.max()) if ulps.size else 0
-ok = max_ulp <= 8
+TAIL_BAR = 2.0 ** -6
+HEAD = 1e-2
+
+def metrics(got, want):
+    a = got.astype(np.float32)
+    b = want.astype(np.float32)
+    d = np.abs(a - b)
+    head = np.abs(b) >= HEAD
+    max_abs = float(d.max()) if d.size else 0.0
+    tail_abs = float(d[~head].max()) if (~head).any() else 0.0
+    max_rel = float((d[head] / np.abs(b[head])).max()) if head.any() else 0.0
+    ulps = ulp16(got, want)
+    max_ulp = int(ulps[head].max()) if head.any() else 0
+    finite = bool(np.isfinite(a).all())
+    return max_abs, tail_abs, max_rel, max_ulp, finite
+
+if op in ("gelu", "gelu_longhand"):
+    if op == "gelu":
+        want = gelu_fest(x).astype(np.float16)      # (i) vs (iii): THE BAR
+        alt = gelu_true(x).astype(np.float16)       # reported distance to the true tanh
+    else:
+        want = gelu_true(x).astype(np.float16)      # (ii) vs tanh: reported, no tight bar
+        alt = None
+    if got.size != want.size:
+        print("VERDICT %s NOT-RUN short-readback %d of %d sha=%s md5=%s" % (name, got.size, want.size, c["sha"], c["group_0_md5"]))
+        sys.exit()
+    max_abs, tail_abs, max_rel, max_ulp, finite = metrics(got, want)
+    extra = ""
+    if alt is not None:
+        _, _, _, ulp_true, _ = metrics(got, alt)
+        extra = " ulp_true=%d" % ulp_true
+    if op == "gelu":
+        ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite
+    else:
+        ok = (tail_abs <= TAIL_BAR) and finite
+else:
+    if got.size != want.size:
+        print("VERDICT %s NOT-RUN short-readback %d of %d sha=%s md5=%s" % (name, got.size, want.size, c["sha"], c["group_0_md5"]))
+        sys.exit()
+    max_abs, tail_abs, max_rel, max_ulp, finite = metrics(got, want)
+    extra = ""
+    if op == "reduce_sum":
+        ok = (max_rel <= 2.0 ** -5) and (tail_abs <= TAIL_BAR) and finite
+    else:
+        ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite
+
 kind = "PASS" if ok else "FAIL"
 print(
-    "VERDICT %s %s op=%s m=%d c=%d max_abs=%.6g max_ulp=%d artifact=%s sha=%s md5=%s"
-    % (name, kind, op, m, cols, max_abs, max_ulp, cell, c["sha"], c["group_0_md5"])
+    "VERDICT %s %s op=%s m=%d c=%d max_abs=%.6g tail_abs=%.6g max_rel=%.6g max_ulp=%d%s finite=%d artifact=%s sha=%s md5=%s"
+    % (name, kind, op, m, cols, max_abs, tail_abs, max_rel, max_ulp, extra, int(finite), cell, c["sha"], c["group_0_md5"])
 )
 PY
 }

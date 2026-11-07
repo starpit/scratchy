@@ -14,18 +14,23 @@
 //! * `reduce_sum` / `reduce_max` — the BARE-REDUCE DOOR TWINS at the historical wide
 //!   multi-row cell's shape family (`[4, 512]`, 8 sticks): the reduce door
 //!   (`lower_ktir_to_superdsc::reduce`) with `Sum` and `Max`, single-shot (the shape fits
-//!   one LX pass — the split path is the tall rung's cell above), laid out by hand: the
-//!   data at its stick-padded width, the accum at one stick per row, both what a placement
-//!   reserves in production.
+//!   one LX pass — the split path is the tall rung's cell above), placed by the reduce's
+//!   OWN placement law — the same law the door's no-layout arm addresses with — each arg
+//!   in its OWN 16 GiB segment (see [`write_reduce_cell`]).
 //!
 //! ## The bar (checked by the runner, not here)
-//! The read-back buffer holds the card image of the op over SEEDED RANDOM fills — never
-//! constants, so a wrong lane cannot hide — against a HOST reference computed in fp32 from
-//! the formula (rmsnorm: `x/√(mean(x²)+1e-5)·gain`; sum: Σx per row; max: max x per row).
-//! The rmsnorm read-back decodes by the rank-2 stick-column law
-//! (`D = (c/64)·(m·64) + t·64 + (c%64)`); the reduce accum is one stick per row, its value
-//! at lane 0. The verdict line states the program, the shape, the max abs error, the max
-//! fp16 ulp, and the artifact path.
+//! Inputs are staged and outputs read back through the launcher's IEEE↔SEN codec
+//! (`t<id>=<file> stick:t<id>=<rows>` both ways — `raw:` binds IEEE bytes verbatim, but the
+//! card's activation format is SEN fp16), so the read-back file is host row-major IEEE and
+//! the runner decodes it as the IDENTITY: the stick-column law is applied exactly once, by
+//! the launcher, never again below. The rmsnorm gain row is staged the same way with
+//! `stick:t1=1`, which IS the `[1, C]` row's identity map (`bundle_run.rs`: "stick:tN=1 is
+//! the identity, and saying it out loud is the point"), from the cell's own gain tensor.
+//! Over SEEDED RANDOM fills — never constants, so a wrong lane cannot hide — against a HOST
+//! reference in fp32 (rmsnorm: `x/√(mean(x²)+1e-5)·gain`; sum: Σx per row; max: max x per
+//! row). The reduce accum is one stick per row, its value at lane 0 — the door's own law.
+//! The per-op bars (tail law, rmsnorm ulp ≤ 8, reduce_max ulp ≤ 8, reduce_sum
+//! max_rel ≤ 2^-5, each with its reason) are stated in the runner header, before the run.
 //!
 //! ```bash
 //! REDUCE_CARD_GATE_ROOT=<dir> REDUCE_CARD_GATE_SHA=<sha> \
@@ -109,11 +114,12 @@ fn dump_reduce_card_gate() {
     // ── THE TALL RUNG — the full production path, exactly the door test's own program ──
     let (m, c) = TALL;
     let ir = rmsnorm_ir(m, c, GainConvention::Scale);
-    // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — it is
-    // staged raw on the per-step path — and t1 (the gain row) is the one real weight, staged
-    // through the weight loop's IEEE→sen re-encode (`stage_weights` refuses a raw id by name:
-    // bundle_run.rs:742-752). Handing the layout {0, 1} made x itself a Weight, and every
-    // `raw:t0` bind a refusal on the card.
+    // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — staged
+    // through the per-step codec path — and t1 (the gain row) is the one real weight, staged
+    // through the weight loop's IEEE→sen re-encode with `stick:t1=1`, the [1, C] row's
+    // identity map (`stage_weights` refuses a raw id by name: bundle_run.rs:742-752).
+    // Handing the layout {0, 1} made x itself a Weight, and every raw bind a refusal on the
+    // card.
     let weight_ids: HashSet<u32> = [1u32].into_iter().collect();
     let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
         .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
@@ -323,11 +329,21 @@ fn write_layout_cell(
     std::fs::write(dir.join("placements.json"), s).unwrap();
 }
 
-/// Write the bundle for a bare-reduce door twin: the door's own two placements, laid out
-/// BY HAND exactly as a production placement reserves them — the data at its stick-padded
-/// width, the accum at one stick per row — in the intermediate segment, back to back, the
-/// accum labeled `Logits` (the role the runtime's launcher demands of the read-back
-/// tensor). No synthetics: the twin is single-shot.
+/// Write the bundle for a bare-reduce door twin: the REDUCE'S OWN PLACEMENT LAW, which is
+/// the law the door's no-layout arm itself addresses with — the door is called with no
+/// `BundleLayout` (the door test's own spelling; a bare reduce has no SubtileIR, so
+/// `compute_bundle_layout` cannot place it), and that arm places each arg in its OWN
+/// 16 GiB segment keyed by `arg_index` (wire.rs `SEGMENT_OFFSETS`/`segment_base`, 16 GiB
+/// stride): the data is `op.args[0]` → segment 0 at `DevOff::ZERO`, the accum is
+/// `op.args[1]` → segment 1 at `DevOff::ZERO`. The run-2 hand layout put both back to
+/// back in the intermediate segment, so the device's store to the ACCUM's own address
+/// (`0x4_0000_0100` — segment 1, the second row-stick) hit a region the launch sized for
+/// the data alone and the card rejected the run (`HMI=STORE … scheduler rejected
+/// submission`). The extents are the door's own handle law (`win_reduce_data` /
+/// `win_reduce_accum`, the mint tests in `zz_a_reduce_windows_refuse_at_the_mint.rs`): the
+/// data at its STICK-PADDED swept width, the accum at ONE STICK PER ROW. The accum is
+/// labeled `Logits` (the role the runtime's launcher demands of the read-back tensor). No
+/// synthetics: the twin is single-shot.
 fn write_reduce_cell(
     dir: &std::path::Path,
     ops: &Vec<ktir_superdsc::emit::EmittedOp>,
@@ -339,15 +355,18 @@ fn write_reduce_cell(
     let sticks = cols.div_ceil(64) as u64;
     let data_bytes = rows as u64 * sticks * 64 * 2;
     let accum_bytes = rows as u64 * 64 * 2;
-    let intermediate = SegRole::Intermediate.segment();
+    // ⛔ PER-ARG SEGMENTS, at the offsets the emitted descriptor itself names: data (arg 0)
+    // at segment 0 offset 0, accum (arg 1) at segment 1 offset 0. Any other layout is a
+    // disagreement with the door's own addressing, and the card rejects it.
     let mut seg_bytes = [0u64; scratchy_target_spyre::bundle_code::NUM_SEGMENTS];
-    seg_bytes[intermediate] = data_bytes + accum_bytes;
+    seg_bytes[0] = data_bytes;
+    seg_bytes[1] = accum_bytes;
     let s = format!(
         "{{\n  \"segment_bytes\": [{}],\n  \"places\": [\n\
-         \x20   {{\"tid\": {REDUCE_DATA_TID}, \"role\": \"Activation\", \"segment\": {intermediate}, \
+         \x20   {{\"tid\": {REDUCE_DATA_TID}, \"role\": \"Activation\", \"segment\": 0, \
          \"bank\": 0, \"offset\": 0, \"size\": {data_bytes}}},\n\
-         \x20   {{\"tid\": {REDUCE_OUT_TID}, \"role\": \"Logits\", \"segment\": {intermediate}, \
-         \"bank\": 0, \"offset\": {data_bytes}, \"size\": {accum_bytes}}}\n\
+         \x20   {{\"tid\": {REDUCE_OUT_TID}, \"role\": \"Logits\", \"segment\": 1, \
+         \"bank\": 0, \"offset\": 0, \"size\": {accum_bytes}}}\n\
          \x20 ],\n  \"synth\": [\n  ],\n  \"scalarmul_scales\": [\n  ]\n}}\n",
         seg_bytes
             .iter()
