@@ -81,6 +81,23 @@
 # reported as `VERDICT <name> MISSING-LOWERING sha=<sha> reason=<text>` and counts as its
 # own tally kind: the gate is INCOMPLETE while any stands, never silently skipped.
 #
+# ⛔ THE EVERY-BOUND-TENSOR LAW (run-5, moe-lead 2026-11-06): the runner stages EVERY
+#   worker-bound tensor the bundle names, read from the launch map itself, and REFUSES BY
+#   NAME to launch a cell whose bundle names a bound tensor it did not stage. The expected
+#   set is the `places` rows at or above the reserved-const floor (4294966272 = u32::MAX -
+#   1024, `bundle_run.rs`'s RESERVED_TID_FLOOR — the producer's reserved device constants,
+#   counted down from u32::MAX); the values are the `scalarmul_scales` (tid, value) rows the
+#   dump writes from the layout's own scale registry (index i at scalarmul_scale_tid(i)),
+#   staged through `bundle_run`'s `const:t<id>=<value>` marker. A reserved placement with no
+#   staged value is a named NOT-RUN, never a launch: `bundle_run` zeroes every segment
+#   holding no staged weight, and a zero in a scale slot is SILENT — measured on card at
+#   4f71242b9f (cgpx-4f71242b), where two never-staged registry scales made the longhand's
+#   cubic chain ALL ZEROS (0·(x+0·x³)=0) and the exp cell ALL ONES (exp(0)=1) while every
+#   launch reported success, and the rmsnormunit eps passed only because 1e-6 is below f16
+#   resolution (identical f16 image at eps=0 — a latent gap, not a proof). A staged const
+#   naming no placement is the same refusal the other way round: the two lists must agree
+#   exactly, or the cell does not run.
+#
 # ⛔ THE FENCE PROTOCOL (the page-gather runner's own ruling): the runner holds
 # /work/.spyre-bake.lock for the whole run, and ABORTS ON FENCE — after every compile and
 # every run the logs are checked for the card's fence signatures, and the first one stops
@@ -215,6 +232,19 @@ print("out_tid=%d" % c["out_tid"])
 print("out_rows=%d" % c["m"])
 print("in_list=%s" % ",".join(str(t) for t in c["in_tids"]))
 print("rows_list=%s" % ",".join(str(r) for r in rows))
+# THE EVERY-BOUND-TENSOR LAW (header): the expected set is the reserved-region places rows
+# (4294966272 = u32::MAX - 1024, bundle_run.rs RESERVED_TID_FLOOR); the values are the
+# launch map own scalarmul_scales rows. The two lists must agree exactly.
+pf = json.load(open(sys.argv[1] + "/placements.json"))
+FLOOR = 4294966272
+expected = sorted(p["tid"] for p in pf["places"] if p["tid"] >= FLOOR)
+consts = pf.get("scalarmul_scales") or []
+staged = sorted(k["tid"] for k in consts)
+missing = [t for t in expected if t not in staged]
+stale = [t for t in staged if t not in expected]
+print("const_list=%s" % ",".join("t%d=%r" % (k["tid"], k["value"]) for k in consts))
+print("missing_list=%s" % ",".join(str(t) for t in missing))
+print("stale_list=%s" % ",".join(str(t) for t in stale))
 PY
 )"
   args=()
@@ -224,6 +254,22 @@ PY
     tid=${in_tids[$i]}
     args+=("t$tid=$cell/in-t$tid.bin" "stick:t$tid=${in_rows[$i]}")
   done
+  # THE EVERY-BOUND-TENSOR LAW: a reserved placement with no staged value is a named
+  # NOT-RUN, never a launch — a missing constant would read as a zeroed segment, silently
+  # (the ALL-ZEROS cubic of run cgpx-4f71242b). A staged const naming no placement is the
+  # same refusal the other way round.
+  if [ -n "$missing_list" ]; then
+    echo "VERDICT $name NOT-RUN unstaged-bound-tensor tids=$missing_list sha=$sha md5=$md5" | tee -a "$LOG"
+    return
+  fi
+  if [ -n "$stale_list" ]; then
+    echo "VERDICT $name NOT-RUN stale-const-row tids=$stale_list sha=$sha md5=$md5" | tee -a "$LOG"
+    return
+  fi
+  if [ -n "$const_list" ]; then
+    IFS=, read -r -a bound_consts <<< "$const_list"
+    args+=("${bound_consts[@]/#/const:}")
+  fi
   ./target/release/examples/bundle_run_dev "$cell" "${args[@]}" \
     --out "t$out_tid=$cell/out.bin" "stick:t$out_tid=$out_rows" > "$cell/run.log" 2>&1
   rrc=$?
