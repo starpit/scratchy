@@ -189,10 +189,10 @@ fn split_facts(ops: &[ktir_superdsc::emit::EmittedOp], what: &str) -> SplitFacts
             .flat_map(|d| d.labeledDs_.iter().filter(|ds| ds.dsType_ == "OUTPUT"))
             .map(|ds| ds.wordLength)
             .collect();
-        let df = match dfs.iter().copied().collect::<Vec<_>>()[..] {
-            [2] => "fp16",
-            [4] => "fp32",
-            other => panic!("{what}: _p{j}_op does not state ONE accum df: wordLength {other:?}"),
+        let df = match dfs.iter().copied().min() {
+            Some(2) if dfs.len() == 1 => "fp16",
+            Some(4) if dfs.len() == 1 => "fp32",
+            _ => panic!("{what}: _p{j}_op does not state ONE accum df: wordLengths {dfs:?}"),
         };
         match accum_df.as_deref() {
             None => accum_df = Some(df.to_string()),
