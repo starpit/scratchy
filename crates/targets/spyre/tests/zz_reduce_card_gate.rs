@@ -30,8 +30,9 @@
 //! `stick:t1=1`, which IS the `[1, C]` row's identity map (`bundle_run.rs`: "stick:tN=1 is
 //! the identity, and saying it out loud is the point"), from the cell's own gain tensor.
 //! Over SEEDED RANDOM fills — never constants, so a wrong lane cannot hide — against a HOST
-//! reference in fp32 (rmsnorm: `x/√(mean(x²)+1e-5)·gain`; sum: Σx per row; max: max x per
-//! row). The reduce readback decodes the door's OWN out placement, never a guessed stride:
+//! reference in fp32 (rmsnorm: `x/√(mean(x²)+1e-5)·gain`; sum: Σx per row; max: the STAGE
+//! IMAGE of max x per row — the codec tie law, stated with its card measurement in the
+//! runner header). The reduce readback decodes the door's OWN out placement, never a guessed stride:
 //! the door mints the caller's accum as ONE STICK PER ROW row-blocked (the reduce door's Fp16
 //! arm), a row-blocked tensor's device order interleaves the rows inside each stick-group
 //! (`StickLayout::group_stride`), and the placement reserves `row_footprint_bytes(1, Fp16)`

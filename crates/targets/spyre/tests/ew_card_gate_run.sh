@@ -52,13 +52,21 @@
 #   PASS on it would claim a bar nobody stated. REPORTED counts as its own tally kind: the
 #   fence treats it as COMPLETE (the cell ran and its laws held) but NOT a PASS, so a
 #   runnable cell needs a PASS or a REPORTED at its own stamp for the gate to close.
-#   reduce_max: EXACT — bit equality with the f16 max of the f16 inputs, 0 ulp, no headroom.
-#   Reason: the op law is a SELECTION over f16 values — the output IS one of the inputs,
-#   exactly — and the host want is the f16 max of the x this runner itself read as f16 (an
-#   f32 upcast of a selection, cast back, rounds nothing). The measured <=1 ulp at
-#   cg1113-ca8a1115 (9.297 vs 9.289; 9.156 vs 9.148) is a REAL DIFFERENCE TO EXPLAIN — a
-#   device combine that rounds, or a readback lane — never a bar to widen: max_ulp is
-#   reported as the diagnostic that names it.
+#   reduce_max: EXACT — bit equality with the f16 max of the STAGE IMAGE of the inputs,
+#   0 ulp, no headroom. The op law is a SELECTION: the output IS one of the values the
+#   device saw, exactly. The device does not see the raw f16 fills — the stage codec
+#   re-encodes them IEEE->SEN169 (1 sign, 6 exp bias 31, 9 mantissa bits — the sen169_bits
+#   law, emit/mod.rs), and an f16 value with an ODD mantissa sits exactly halfway between
+#   two SEN169 values and the codec rounds the tie UP: measured on card (cg1113r-1a0882da,
+#   the max split): the row maxima 0x48a5 and 0x4893 — SEN169 fraction slots 82.5/512 and
+#   73.5/512, both EXACT ties — both came back +1 f16 ulp as 0x48a6 and 0x4894, values
+#   present nowhere in the raw fills, which is why the raw-f16 reference was wrong. The
+#   readback decodes a SEN169 value exactly (a 9-bit mantissa is an even-mantissa f16), so
+#   the exact law compares against the STAGE IMAGE of the row max: odd mantissa +1 ulp,
+#   even mantissa unchanged — and the map is monotone, so the image of the max IS the max
+#   of the images. ulp_vs_rawmax is REPORTED as the diagnostic that separates a codec tie
+#   from a real defect; a difference past the image is a lowering defect, never a bar to
+#   widen.
 #   reduce_sum (RULED by the auditor 2026-11-07 — a bar calibrated on the run it judges
 #   proves nothing, so every input is door-stated, never runner-derived): per row,
 #     |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5 * ulp_f16(|want|)
@@ -365,14 +373,19 @@ elif op in ("rmsnormunit", "rmsnorm"):
     want = ref.astype(np.float16).reshape(n)
 elif op in ("reduce_sum", "reduce_max"):
     rows = x.reshape(m, cols)
+    raw_want = None
     if op == "reduce_sum":
-        want = rows.sum(axis=1)
+        want = rows.sum(axis=1).astype(np.float16)
     else:
-        # THE EXACT LAW (header): x is the f16-read input upcast to f32, and a max over it
-        # cast back to f16 rounds NOTHING — the want IS the f16 max of the f16 inputs, so
-        # the reduce_max bar can be bit equality.
-        want = rows.max(axis=1)
-    want = want.astype(np.float16)
+        # THE EXACT LAW (header): a selection rounds nothing, so the want is the row max —
+        # but over the STAGE IMAGE of the fills, the values the device actually saw: the
+        # codec re-encodes each f16 into SEN169 (9-bit mantissa), where an odd-mantissa f16
+        # sits exactly on a tie that rounds UP, and decodes a 9-bit value back exactly. The
+        # map is monotone, so the image of the row max IS the row max of the images.
+        raw_want = rows.max(axis=1).astype(np.float16)
+        h = raw_want.view(np.uint16).astype(np.uint32)
+        mag = h & 0x7FFF
+        want = (((h & 0x8000) | (mag + (mag & 1))) & 0xFFFF).astype(np.uint16).view(np.float16)
     # ⛔ THE ACCUM LAW, from the door OWN out placement — never a guessed stride. Three
     # cited facts fix the decode:
     #   1. the door mints the caller accum as ONE STICK PER ROW, row-blocked —
@@ -570,6 +583,10 @@ else:
     bar = (~ovf) & (~want_nf)
     max_abs, tail_abs, max_rel, max_ulp, finite = metrics(got, want, bar)
     extra = sum_report if op == "reduce_sum" else ""
+    if op == "reduce_max":
+        # the codec-tie distance (header): how many rows the stage image moved the raw max
+        # — the number that separates a SEN tie from a real defect.
+        extra = " ulp_vs_rawmax=%d" % int(ulp16(raw_want, want).max())
     if op == "reduce_sum":
         # THE SUM BAR (RULED 2026-11-07, header): per row
         #   |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5*ulp_f16(|want|)
@@ -577,11 +594,16 @@ else:
         # metric: the bound is per row, against the row own absolute magnitude.
         ok = bool((err <= bound).all()) and finite and eq_ok
     elif op == "reduce_max":
-        # THE EXACT LAW (header): the output IS one of the f16 inputs — a selection rounds
-        # nothing — so the bar is BIT EQUALITY with the f16 max of the f16-read inputs.
-        # max_ulp stays in the verdict line as the diagnostic that names any difference
-        # (the measured <=1 ulp at cg1113-ca8a1115 is to EXPLAIN, never to bar).
+        # THE EXACT LAW (header): the output IS one of the stage images — a selection
+        # rounds nothing — so the bar is BIT EQUALITY with the image of the row max.
+        # max_ulp (vs the image) and ulp_vs_rawmax (the codec ties) stay in the verdict
+        # line as the diagnostics that name any difference; a difference past the image is
+        # a lowering defect, never a bar to widen.
         ok = bool((got == want).all()) and finite and eq_ok
+        if not ok:
+            bad = int(np.argmax(got != want))
+            print("DIAG %s max-not-exact row=%d raw_max=%.6g stage_image=%.6g got=%.6g"
+                  % (name, bad, raw_want[bad], want[bad], got[bad]))
     else:
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
 
