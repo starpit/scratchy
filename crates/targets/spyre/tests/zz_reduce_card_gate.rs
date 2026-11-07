@@ -31,9 +31,14 @@
 //! the identity, and saying it out loud is the point"), from the cell's own gain tensor.
 //! Over SEEDED RANDOM fills — never constants, so a wrong lane cannot hide — against a HOST
 //! reference in fp32 (rmsnorm: `x/√(mean(x²)+1e-5)·gain`; sum: Σx per row; max: max x per
-//! row). The reduce accum is one stick per row, its value at lane 0 — the door's own law.
-//! The per-op bars (tail law, rmsnorm ulp ≤ 8, reduce_max ulp ≤ 8, reduce_sum
-//! max_rel ≤ 2^-5, each with its reason) are stated in the runner header, before the run.
+//! row). The reduce readback decodes the door's OWN out placement, never a guessed stride:
+//! the door mints the caller's accum as ONE STICK PER ROW row-blocked (the reduce door's Fp16
+//! arm), a row-blocked tensor's device order interleaves the rows inside each stick-group
+//! (`StickLayout::group_stride`), and the placement reserves `row_footprint_bytes(1, Fp16)`
+//! per row — so the launcher's whole-placement readback at `stick:t=m` resticks to host
+//! `[m, size/2/m]` and row r's value is host `(r, 0)`, lane 0 of its stick. The per-op bars
+//! (tail law, rmsnorm ulp ≤ 8, reduce_max ulp ≤ 8, and the reduce_sum walk bar — each with
+//! its reason) are stated in the runner header, before the run.
 //!
 //! ```bash
 //! REDUCE_CARD_GATE_ROOT=<dir> REDUCE_CARD_GATE_SHA=<sha> \
@@ -399,10 +404,10 @@ fn write_layout_cell(
     // here): the launch map states its OWN worker-bound consts — the layout's scale registry
     // as (tid, value) rows, index i at `scalarmul_scale_tid(i)` (the address law the
     // placement pass and the worker's wiring both state, so the dump cannot disagree with
-    // either) — and the runner stages every one, refusing by name on a bound tensor it did
-    // not stage. The zero that taught this law was measured on card (cgpx-4f71242b): a
+    // either). The zero that taught this law was measured on card (cgpx-4f71242b): a
     // never-staged registry scale made a launch report success over ALL-ZEROS numerics,
-    // because `bundle_run` zeroes every segment holding no staged weight.
+    // because `bundle_run` zeroes every segment holding no staged weight. The READ SET the
+    // runner stages them against is stated below, off the emitted ops' own operand bindings.
     s.push_str("  ],\n  \"scalarmul_scales\": [\n");
     for (i, v) in l.scalarmul_scales.iter().enumerate() {
         s.push_str(&format!(
@@ -414,6 +419,36 @@ fn write_layout_cell(
             } else {
                 ","
             },
+        ));
+    }
+    // ⭐⭐ THE EVERY-BOUND-TENSOR LAW's READ SET (read-set amendment 2026-11-07) — the same
+    // rows `zz_ew_card_gate.rs`'s writer states, so the SHARED runner stages this dump by the
+    // same law: every RESERVED tid an op of this bundle READS, taken from the emitted ops'
+    // own operand bindings (`EmittedOp`'s `arg_bindings`, the same walk `write_dxp_input`
+    // states), never the placement list. A placed-but-UNREAD reserved tensor
+    // (RMS_HALF/RMS_INVCOLS, placed for every RmsNorm node) is a layout fact, not a
+    // correctness one — measured at cg1113-ca8a1115, where the placement-list expectation
+    // made the tall rung NOT-RUN on the two tids nothing reads — so the placement list is
+    // not the expected set. The protected invariant is NO OP READS A SOURCE NOBODY WROTE.
+    let mut reads: Vec<u32> = ops
+        .into_iter()
+        .flatten()
+        .flat_map(|op| op.arg_bindings.iter().filter(|b| b.is_input))
+        .filter_map(|b| {
+            b.buffer
+                .strip_prefix('t')
+                .and_then(|rest| rest.parse::<u32>().ok())
+                .filter(|&tid| ktir_superdsc::reserved_tids::is_reserved(tid))
+        })
+        .collect();
+    reads.sort_unstable();
+    reads.dedup();
+    s.push_str("  ],\n  \"reads\": [\n");
+    for (i, tid) in reads.iter().enumerate() {
+        s.push_str(&format!(
+            "    {}{}\n",
+            tid,
+            if i + 1 == reads.len() { "" } else { "," },
         ));
     }
     s.push_str("  ]\n}\n");
