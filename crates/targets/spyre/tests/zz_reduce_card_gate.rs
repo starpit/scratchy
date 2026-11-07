@@ -394,6 +394,28 @@ fn write_layout_cell(
             if i + 1 == synth.map.len() { "" } else { "," },
         ));
     }
-    s.push_str("  ],\n  \"scalarmul_scales\": [\n  ]\n}\n");
+    // ⭐⭐ THE EVERY-BOUND-TENSOR LAW (moe-lead, 2026-11-06; dc17da7dcc's dump half, ported to
+    // this line's own writer — the EW gate's dump test is card-tooling's file, not carried
+    // here): the launch map states its OWN worker-bound consts — the layout's scale registry
+    // as (tid, value) rows, index i at `scalarmul_scale_tid(i)` (the address law the
+    // placement pass and the worker's wiring both state, so the dump cannot disagree with
+    // either) — and the runner stages every one, refusing by name on a bound tensor it did
+    // not stage. The zero that taught this law was measured on card (cgpx-4f71242b): a
+    // never-staged registry scale made a launch report success over ALL-ZEROS numerics,
+    // because `bundle_run` zeroes every segment holding no staged weight.
+    s.push_str("  ],\n  \"scalarmul_scales\": [\n");
+    for (i, v) in l.scalarmul_scales.iter().enumerate() {
+        s.push_str(&format!(
+            "    {{\"tid\": {}, \"value\": {:?}}}{}\n",
+            superdsc::scalarmul_scale_tid(i),
+            v,
+            if i + 1 == l.scalarmul_scales.len() {
+                ""
+            } else {
+                ","
+            },
+        ));
+    }
+    s.push_str("  ]\n}\n");
     std::fs::write(dir.join("placements.json"), s).unwrap();
 }
