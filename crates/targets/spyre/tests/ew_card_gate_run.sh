@@ -60,15 +60,26 @@
 #         A2 = SEN169 0x3448 = 2^-5*(1+72/512) = 0.03564453125 (~0.044715*sqrt(2/pi)),
 #         decoded by the sen169_bits law (emit/mod.rs:7066: sign 1, exp 6 bias 31, mantissa
 #         9). The tanh is the FEST hardware approximation (gelu.smc FEST imm=8 slope,
-#         imm=9 offset), modeled in fp32 here from senulator/src/sfp.rs's tables: 16
-#         segments over [0.0625, 4.0), slope/offset = 2^exp*mant/512, below the first break
-#         slope 1 offset 0, at/above the last slope 0 offset 1;
+#         imm=9 offset). RUN-4: the (iii) is NOT modeled here — the dump test itself
+#         computes it on the dump-owned fills (zz_ew_card_gate.rs `fest`: senulator
+#         src/sfp.rs's own segment tables and segment_lookup at 1b5e66c1a9, every smc
+#         intermediate round-tripped through the tree's own SEN169 codec) and writes
+#         want_iii.bin; this runner only READS the file. The gelu and gelu_longhand fills
+#         are dump-owned too (`fills: "dump"` in cell.json): (i) and (ii) run the SAME x
+#         vector, and this runner generates fills only for the cells the dump left to it;
 #   (ii)  the SAME tanh longhand lowered op by op (the gelu_longhand cells: the unclaimed
 #         spelling, no negf, so program_gelu_chains leaves it and lower_function walks it),
 #         against the TRUE tanh form, distance reported.
 # If (i) matches (iii) the fold is spelling the right function and the PR states the
 # measured distance; if (i) does not match (iii), the fold is spelling the wrong function —
-# a bug, not a bar to move.
+# a bug, not a bar to move. RUN-4 diagnostics on every gelu cell: the x at max ulp with
+# got vs (iii) vs true, the whole cell as (x, got, want_iii, want_true) CSV in the cell
+# dir, and on a failing longhand the first 8 lanes got vs want.
+#
+# ⛔ A DOOR REFUSAL IS MISSING-LOWERING (run-4): a cell whose cell.json carries
+# `missing_lowering` (the door's refusal text — the dump records it instead of dying) is
+# reported as `VERDICT <name> MISSING-LOWERING sha=<sha> reason=<text>` and counts as its
+# own tally kind: the gate is INCOMPLETE while any stands, never silently skipped.
 #
 # ⛔ THE FENCE PROTOCOL (the page-gather runner's own ruling): the runner holds
 # /work/.spyre-bake.lock for the whole run, and ABORTS ON FENCE — after every compile and
@@ -103,6 +114,25 @@ fenced() {
 run_cell() {
   local cell=$1 name sha md5 skip; name=$(basename "$cell")
   [ -f "$cell/cell.json" ] || return 0
+  # ⛔ MISSING-LOWERING FIRST (run-4): the dump records a door refusal in cell.json and
+  # writes no group_0 — state it by name (resumable by sha) and move on; it is never a
+  # silent skip and never a dead dump.
+  if grep -q "missing_lowering" "$cell/cell.json" 2>/dev/null; then
+    python3 - "$cell" "$name" "$LOG" <<"PY"
+import json, os, sys
+cell, name, log = sys.argv[1], sys.argv[2], sys.argv[3]
+c = json.load(open(cell + "/cell.json"))
+sha = c["cell"]["sha"] if "cell" in c else c["sha"]
+want = "VERDICT %s MISSING-LOWERING sha=%s " % (name, sha)
+if os.path.exists(log) and any(line.startswith(want) for line in open(log)):
+    print("SKIP %s (already verdicted MISSING-LOWERING at sha %s)" % (name, sha))
+else:
+    reason = " ".join(str(c.get("missing_lowering", "")).split())
+    with open(log, "a") as f:
+        f.write("VERDICT %s MISSING-LOWERING sha=%s reason=%s\n" % (name, sha, reason))
+PY
+    return
+  fi
   [ -d "$cell/group_0" ] || return 0
   eval "$(python3 - "$cell" "$LOG" <<"PY"
 import hashlib, json, os, sys
@@ -133,12 +163,16 @@ PY
 
   # The fills: SEEDED RANDOM (one seed per input, offset by the input index), standard
   # normal scaled to ±2-ish so the whole f16 mantissa is exercised; the gain row (the
-  # rmsnorm cells second input) is drawn the same way.
+  # rmsnorm cells second input) is drawn the same way. A `fills: "dump"` cell already
+  # carries its in-t0.bin from the dump (the gelu family: folded and longhand run the
+  # SAME x vector) — the runner generates nothing for it.
   python3 - "$cell" <<"PY"
 import json, sys
 import numpy as np
 cell = sys.argv[1]
 c = json.load(open(cell + "/cell.json"))
+if c.get("fills") == "dump":
+    sys.exit(0)
 n = c["m"] * c["c"]
 for i, tid in enumerate(c["in_tids"]):
     rng = np.random.default_rng(c["seed"] + i)
@@ -211,38 +245,9 @@ op = c["op"]
 n = m * cols
 
 # (iii) the gelufwd defining form — see the runner header for the full citation
-# (gelu.smc at 1b5e66c1a9 + senulator/src/sfp.rs FEST tables, fp32 on the host).
-GELU_A1 = 0.7978515625
-GELU_A2 = 0.03564453125
-FEST_BREAKS = [0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0,
-               1.125, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0]
-FEST_SLOPE_E = [-1] * 7 + [-2] * 3 + [-3] * 2 + [-4, -5, -6, -8]
-FEST_SLOPE_M = [1016, 989, 931, 851, 759, 661, 565, 947, 781, 638,
-                931, 593, 742, 737, 545, 575]
-FEST_OFF_E = [-12, -9, -6, -5, -4, -3, -3, -2, -2, -2, -1, -1, -1, -1, -1, -1]
-FEST_OFF_M = [1016, 992, 591, 771, 755, 621, 911, 615, 780, 940,
-              579, 706, 803, 896, 968, 1006]
-
-def fest_tanh(v):
-    av = np.abs(v)
-    slope = np.zeros_like(v)
-    off = np.zeros_like(v)
-    lo = FEST_BREAKS[0]
-    hi = FEST_BREAKS[-1]
-    inside = (av >= lo) & (av < hi)
-    if inside.any():
-        idx = np.searchsorted(np.array(FEST_BREAKS), av[inside], side="right") - 1
-        slope[inside] = np.array([2.0 ** FEST_SLOPE_E[j] * FEST_SLOPE_M[j] / 512.0 for j in idx])
-        off[inside] = np.array([2.0 ** FEST_OFF_E[j] * FEST_OFF_M[j] / 512.0 for j in idx])
-    slope[av < lo] = 1.0
-    off[av < lo] = 0.0
-    slope[av >= hi] = 0.0
-    off[av >= hi] = 1.0
-    return slope * v + np.sign(v) * off
-
-def gelu_fest(x):
-    u = GELU_A1 * x + GELU_A2 * x * x * x
-    return 0.5 * x + 0.5 * x * fest_tanh(u)
+# (gelu.smc at 1b5e66c1a9 + senulator/src/sfp.rs FEST tables). RUN-4: the (iii) is
+# computed BY THE DUMP on these exact x values (zz_ew_card_gate.rs `fest`) and read here from
+# want_iii.bin — this runner no longer models the FEST law at all.
 
 def gelu_true(x):
     k = math.sqrt(2.0 / math.pi)
@@ -311,7 +316,9 @@ def metrics(got, want):
 
 if op in ("gelu", "gelu_longhand"):
     if op == "gelu":
-        want = gelu_fest(x).astype(np.float16)      # (i) vs (iii): THE BAR
+        # (i) vs (iii): THE BAR — the (iii) is the dump-written want_iii.bin (f32), cast to
+        # its f16 image for the ulp metric.
+        want = np.fromfile(cell + "/want_iii.bin", dtype=np.float32, count=n).astype(np.float16)
         alt = gelu_true(x).astype(np.float16)       # reported distance to the true tanh
     else:
         want = gelu_true(x).astype(np.float16)      # (ii) vs tanh: reported, no tight bar
@@ -328,6 +335,29 @@ if op in ("gelu", "gelu_longhand"):
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite
     else:
         ok = (tail_abs <= TAIL_BAR) and finite
+    # ⛔ RUN-4 DIAGNOSTICS — the x at max ulp (over the head, the lanes the bar covers),
+    # got vs (iii) vs true; the whole cell as (x, got, want_iii, want_true) CSV; and on a
+    # failing longhand the first 8 lanes got vs want (max_rel 1 with finite values means
+    # the chain computes something else — the shape of the divergence, lane by lane).
+    um = ulp16(got, want)
+    head = np.abs(want) >= HEAD
+    um_head = np.where(head, um, -1)
+    i = int(np.argmax(um_head)) if um_head.size else 0
+    if op == "gelu":
+        print("DIAG %s x-at-max-ulp i=%d x=%.6g got=%.6g want_iii=%.6g want_true=%.6g lane_ulp=%d"
+              % (name, i, x[i], got[i], want[i], alt[i], int(um_head[i])))
+    else:
+        print("DIAG %s x-at-max-ulp i=%d x=%.6g got=%.6g want_true=%.6g lane_ulp=%d"
+              % (name, i, x[i], got[i], want[i], int(um_head[i])))
+    with open(cell + "/cell.csv", "w") as f:
+        f.write("x,got,want_iii,want_true\n")
+        for j in range(n):
+            w3 = ("%.9g" % want[j]) if op == "gelu" else ""
+            wt = ("%.9g" % alt[j]) if alt is not None else ("%.9g" % want[j])
+            f.write("%.9g,%.9g,%s,%s\n" % (x[j], got[j], w3, wt))
+    if op == "gelu_longhand" and not ok:
+        for j in range(min(8, n)):
+            print("LANE %s [%d] x=%.6g got=%.6g want=%.6g" % (name, j, x[j], got[j], want[j]))
 else:
     if got.size != want.size:
         print("VERDICT %s NOT-RUN short-readback %d of %d sha=%s md5=%s" % (name, got.size, want.size, c["sha"], c["group_0_md5"]))
@@ -355,9 +385,14 @@ if [ -z "$cell_list" ]; then
 fi
 echo "$cell_list" | while read -r c; do run_cell "$c"; done
 
-pass=0; fail=0; notrun=0; fenced=0; runnable=0; total=0
+pass=0; fail=0; notrun=0; fenced=0; missing=0; runnable=0; total=0
 for c in $cell_list; do
   total=$((total + 1))
+  # A MISSING-LOWERING cell has no group_0 — it counts as its own kind, never a skip.
+  if grep -q "missing_lowering" "$c/cell.json" 2>/dev/null; then
+    missing=$((missing + 1))
+    continue
+  fi
   [ -d "$c/group_0" ] || continue
   runnable=$((runnable + 1))
   name=$(basename "$c")
@@ -375,9 +410,9 @@ PY
     FENCED) fenced=$((fenced + 1));;
   esac
 done
-echo "PASS=$pass FAIL=$fail NOT-RUN=$notrun FENCED=$fenced CELLS=$runnable TOTAL=$total"
-if [ "$fail" -gt 0 ] || [ "$notrun" -gt 0 ] || [ "$fenced" -gt 0 ] || [ "$pass" -lt "$runnable" ]; then
-  echo "EW_CARD_GATE_RUN_INCOMPLETE — every runnable cell needs a PASS at its own stamp" >&2
+echo "PASS=$pass FAIL=$fail NOT-RUN=$notrun FENCED=$fenced MISSING-LOWERING=$missing CELLS=$runnable TOTAL=$total"
+if [ "$fail" -gt 0 ] || [ "$notrun" -gt 0 ] || [ "$fenced" -gt 0 ] || [ "$missing" -gt 0 ] || [ "$pass" -lt "$runnable" ]; then
+  echo "EW_CARD_GATE_RUN_INCOMPLETE — every runnable cell needs a PASS at its own stamp, and no cell may stand MISSING-LOWERING" >&2
   exit 1
 fi
 echo EW_CARD_GATE_RUN_DONE
