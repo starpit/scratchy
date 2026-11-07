@@ -34,9 +34,32 @@
 #   <= 2^-6 (0.015625). Reason: at this runner's +-2-ish fill scale 2^-6 is 8 f16 ulp, and
 #   near a zero of the function the ulp metric is defeated by sign flips and denormal
 #   spacing, so the bar there is absolute.
-#   rmsnorm / rmsnormunit: max_ulp <= 8 over the head. Reason: the op's mean(x^2) reduce
-#   accumulates in f32, so the device value is the f16 image of an f32 computation — a few
-#   ulp, with 8 leaving headroom for the rsqrt and the gain multiply's own rounding.
+#   rmsnorm: max_ulp <= ceil(ceil(log2 c)/2) + 2 over the head, c the cell OWN swept width
+#   — THE N-DEPENDENT BAR, stated BEFORE the control re-run (moe-lead 2026-11-07: the flat
+#   8 was stated for widths <= 4096; a bar is a function of N derived from the op law,
+#   never a constant calibrated on the widths already measured). DERIVATION, from the op
+#   law: the mean(x^2) reduce is the fp16 summeanmaxexx2 template (the dump-stated accum
+#   df), where EVERY accumulation level is computetype="FMA16" over SEN169_FP16-allocated
+#   registers (summeanmaxexx2.ddl, the deeptools C++ tree by direct path: the tensors and
+#   internal tensors are SEN169_FP16 :23-35, the chunk accumulate :277, across-subchunks
+#   :336, PE->SFP :456, the core-to-core psum start/middle/end :528/:569/:547, the final
+#   SFP combine :602; the f32 flavor is a SEPARATE template, summeanmaxexx2_fp32.ddl,
+#   IEEE_FP32 throughout, taken only when the reduce own df is fp32) — so the accumulation
+#   error unit is eps = 2^-11 per level, and:
+#     E[x^2] carries a relative error <= ceil(log2 N) * eps — a tree reduction, one eps
+#       per level, the same model the ruled reduce_sum bar states over this same template;
+#     the E f16 write adds 1/2 eps relative; the rsqrt image, the x*r rounding and the
+#     *gain rounding are each <= 1 output ulp; the rsqrt HALVES the E error.
+#   At the worst lane position (just above a power of two, where one output ulp is exactly
+#   the 2^-11 relative unit) that sums to ceil(ceil(log2 N)/2) + 2 ulp — 8 at N=4096 and
+#   N=2048 (the old bar, now derived instead of asserted: never looser below them), 9 at
+#   N >= 8192. The SAME bar is applied to the split and the unsplit rmsnorm cells (the
+#   control pair): only the split differs, so if the unsplit cell also exceeds it the
+#   model's eps or tree assumption is refuted — a finding to investigate, never a bar to
+#   move.
+#   rmsnormunit: max_ulp <= 8 over the head, unchanged — the flat bar the EW gate stated
+#   for it; the N-dependent derivation above is stated for the rmsnorm cells this gate
+#   adds, and no rmsnormunit cell changes.
 #   gelu (the folded cell): max_ulp <= 8 over the head against the FEST-modeled gelufwd
 #   form (see (iii) below). Reason: gelufwd is ONE device primitive, and the cell must be
 #   the f16 image of its own defining polynomial. The distance to the TRUE tanh form is
@@ -72,6 +95,16 @@
 #     |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5 * ulp_f16(|want|)
 #   with T the split trip count, slice_lanes the slices swept reduce widths, and eps the
 #   accumulator error unit: 2^-11 when the accum is fp16 on the device, 2^-24 when fp32.
+#   THE FP16 UNIT IS CITED, NOT FITTED (moe-lead 2026-11-07): the fp16 sum template is
+#   ddc/ddl_templates/summeanmaxexx2.ddl in the deeptools C++ tree, read by direct path —
+#   every tensor is data_type="SEN169_FP16" (:23) and every sum accumulation level is
+#   computetype="FMA16" over those fp16-allocated registers: the chunk accumulate :277,
+#   across-subchunks :336, PE->SFP :456, the core-to-core psum start/middle/end
+#   :528/:569/:547, and the final SFP combine :602 — a 16-bit FMA at every level, no f32
+#   stage anywhere in the fp16 template (the f32 flavor is the separate
+#   summeanmaxexx2_fp32.ddl, IEEE_FP32 throughout, taken only when the reduce own df is
+#   fp32). The measured 24-abs at cg1113r-1a0882da (T=2, 2x524288 lanes, accum fp16)
+#   sits inside the ruled bound at eps=2^-11, as the citation says it must.
 #   T, slice_lanes and the accum df are the SPLIT FACTS the dump writes into cell.json off
 #   the door OWN emitted ops (the slice descriptors N_.out_ widths and OUTPUT wordLength);
 #   a reduce_sum cell without them is a named NOT-RUN, never a guessed bar. The formula is
@@ -604,6 +637,15 @@ else:
             bad = int(np.argmax(got != want))
             print("DIAG %s max-not-exact row=%d raw_max=%.6g stage_image=%.6g got=%.6g"
                   % (name, bad, raw_want[bad], want[bad], got[bad]))
+    elif op == "rmsnorm":
+        # THE N-DEPENDENT RMSNORM BAR (header, stated before this run):
+        #   max_ulp <= ceil(ceil(log2 c)/2) + 2 over the head
+        # derived from the op law (the FMA16 accumulation of the fp16 summeanmaxexx2
+        # the rsqrt halving, the f16 roundings) — applied IDENTICALLY to the split and the
+        # unsplit cells of the control pair. rms_bar rides the verdict line.
+        rms_bar = int(math.ceil(math.ceil(math.log2(cols)) / 2.0)) + 2
+        ok = (max_ulp <= rms_bar) and (tail_abs <= TAIL_BAR) and finite and eq_ok
+        extra = " rms_bar=%d" % rms_bar
     else:
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
 

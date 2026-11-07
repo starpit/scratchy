@@ -11,6 +11,12 @@
 //!   `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door` pins at the door, run here
 //!   on the card. The dump asserts the split's own slice marker (`_p1_op`) is present, so
 //!   the cell cannot silently degrade to a fitting rung.
+//! * `rmsnorm` (the control) — THE SAME OP, UNSPLIT: the same chain at
+//!   [`CONTROL`]'s row count, small enough that the probe answers in ONE LX pass (no
+//!   `_p{j}_op` marker anywhere — the dump asserts the negative). The moe-lead's ruled
+//!   control experiment (2026-11-07): same op, same fill law, same runner, same
+//!   N-dependent bar — only the split differs, so the pair arbitrates whether the tall
+//!   rung's error is the split's or the width's.
 //! * `reduce_sum` / `reduce_max` — the BARE-REDUCE DOOR TWINS, WIDE MULTI-ROW, at the
 //!   split's own fire point (`[4, 1048576]`, 16,384 sticks): the reduce door
 //!   (`lower_ktir_to_superdsc::reduce`) with `Sum` and `Max`, driven the way production
@@ -38,8 +44,9 @@
 //! (`StickLayout::group_stride`), and the placement reserves `row_footprint_bytes(1, Fp16)`
 //! per row — so the launcher's whole-placement readback at `stick:t=m` resticks to host
 //! `[m, size/2/m]` and row r's value is host `(r, 0)`, lane 0 of its stick. The per-op bars
-//! (tail law, rmsnorm ulp ≤ 8, the exact reduce_max law, and the reduce_sum split-facts bar
-//! — each with its reason) are stated in the runner header, before the run. The sum bar's
+//! (tail law, the rmsnorm N-DEPENDENT ulp bar, the exact reduce_max law, and the
+//! reduce_sum split-facts bar — each with its reason) are stated in the runner header,
+//! before the run. The sum bar's
 //! inputs — the split's trip count T, each slice's swept width, and the accum's device
 //! format — are written into `cell.json` by THIS dump off the door's own emitted ops
 //! ([`SplitFacts`]), never re-derived from geometry by the runner.
@@ -83,6 +90,14 @@ fn door_lower(
 
 /// The tall rung's own geometry — `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door`'s.
 const TALL: (u32, u32) = (2048, 16384);
+
+/// ⭐ THE CONTROL's row count — the same rmsnorm chain at hidden 16384, small enough that
+/// the door's own probe answers in ONE LX pass. The probe bills the exx2 data window per
+/// core: `ceil(m/32)` rows × 16384 lanes × 2 B. At m = 512 that is 16 × 32,768 B =
+/// 524,288 B — 3.2× under the 1,677,721-B usable-LX budget, so no split can fire (the
+/// tall rung at m = 2048 bills 2 MiB and splits, T = 2 measured at cg1113r-1a0882da).
+/// Same hidden width as the tall rung, so the pair differs in the split ALONE.
+const CONTROL: (u32, u32) = (512, 16384);
 
 /// The bare-reduce twins' shape — the historical wide multi-row cell's family (`ROWS` in
 /// `zz_the_ktir_door_lowers_the_wide_multi_row_max.rs`), scaled to the split's own fire
@@ -138,10 +153,12 @@ struct SplitFacts {
     accum_df: String,
 }
 
-/// Derive [`SplitFacts`] from the ops the door emitted. Every assertion is a refusal
-/// naming the cell — a fact this fn cannot state off the door own emission is a dump
-/// bug, never a guessed number.
-fn split_facts(ops: &[ktir_superdsc::emit::EmittedOp], what: &str) -> SplitFacts {
+/// The `_p{j}_op` slice markers the split itself mints (`assemble_reduce_split`'s own
+/// spelling), `j` → op. Empty when the door answered in one pass — the control's own
+/// negative marker.
+fn slice_markers<'a>(
+    ops: &'a [ktir_superdsc::emit::EmittedOp],
+) -> std::collections::BTreeMap<u32, &'a ktir_superdsc::emit::EmittedOp> {
     let mut slices: std::collections::BTreeMap<u32, &ktir_superdsc::emit::EmittedOp> =
         std::collections::BTreeMap::new();
     for op in ops {
@@ -155,8 +172,79 @@ fn split_facts(ops: &[ktir_superdsc::emit::EmittedOp], what: &str) -> SplitFacts
         };
         assert!(
             slices.insert(j, op).is_none(),
-            "{what}: two slice ops spell _p{j}_op"
+            "two slice ops spell _p{j}_op"
         );
+    }
+    slices
+}
+
+/// One reduce op's OWN swept width and accum df, read off its descriptor — the law the
+/// split's `_p{j}_op` slices and the single-shot reduce state identically (the sweep is
+/// the `out` extent `N_.out_` states, the format the OUTPUT `labeledDs_` wordLength).
+fn op_reduce_facts(
+    op: &ktir_superdsc::emit::EmittedOp,
+    what: &str,
+    name: &str,
+) -> (u32, &'static str) {
+    assert!(
+        op.time == 1,
+        "{what}: {name} is time-tiled (time={}) — its N_ would state a per-trip extent, \
+         and this dump refuses to guess the sweep",
+        op.time
+    );
+    let sdsc = op
+        .op
+        .as_ref()
+        .unwrap_or_else(|| panic!("{what}: {name} carries no descriptor"));
+    let dscs: Vec<&ktir_superdsc::wire::Dsc> = sdsc.dscs_.iter().flat_map(|m| m.values()).collect();
+    assert!(!dscs.is_empty(), "{what}: {name} states no dsc");
+    let out_extents: HashSet<i64> = dscs.iter().map(|d| d.N_.out_).collect();
+    assert!(
+        out_extents.len() == 1 && *out_extents.iter().next().unwrap() > 0,
+        "{what}: {name} does not state ONE positive out extent: {out_extents:?}"
+    );
+    let dfs: HashSet<u32> = dscs
+        .iter()
+        .flat_map(|d| d.labeledDs_.iter().filter(|ds| ds.dsType_ == "OUTPUT"))
+        .map(|ds| ds.wordLength)
+        .collect();
+    let df = match dfs.iter().copied().min() {
+        Some(2) if dfs.len() == 1 => "fp16",
+        Some(4) if dfs.len() == 1 => "fp32",
+        _ => panic!("{what}: {name} does not state ONE accum df: wordLengths {dfs:?}"),
+    };
+    (*out_extents.iter().next().unwrap() as u32, df)
+}
+
+/// Derive [`SplitFacts`] from the ops the door emitted. Every assertion is a refusal
+/// naming the cell — a fact this fn cannot state off the door own emission is a dump
+/// bug, never a guessed number. `unsplit_prefix` names the reduce's own single-shot op
+/// spelling (the `assemble_reduce_seeded` name the caller states) for the one-pass case:
+/// the control's facts then come off that op's own descriptor — T = 1 by the absence of
+/// every `_p{j}_op` marker, the lane width and the accum df by the same descriptor law.
+fn split_facts(
+    ops: &[ktir_superdsc::emit::EmittedOp],
+    what: &str,
+    unsplit_prefix: &str,
+) -> SplitFacts {
+    let slices = slice_markers(ops);
+    if slices.is_empty() {
+        let hits: Vec<&ktir_superdsc::emit::EmittedOp> = ops
+            .iter()
+            .filter(|e| e.op_name.starts_with(unsplit_prefix))
+            .collect();
+        assert!(
+            hits.len() == 1,
+            "{what}: the door answered in one pass, so exactly one {unsplit_prefix}* op \
+             must state the reduce — found {}",
+            hits.len()
+        );
+        let (lanes, df) = op_reduce_facts(hits[0], what, &hits[0].op_name);
+        return SplitFacts {
+            time: 1,
+            slice_lanes: vec![lanes],
+            accum_df: df.to_string(),
+        };
     }
     let time = slices.len() as u32;
     assert!(
@@ -166,35 +254,9 @@ fn split_facts(ops: &[ktir_superdsc::emit::EmittedOp], what: &str) -> SplitFacts
     let mut slice_lanes = Vec::with_capacity(time as usize);
     let mut accum_df: Option<String> = None;
     for (j, op) in &slices {
-        assert!(
-            op.time == 1,
-            "{what}: _p{j}_op is time-tiled (time={}) — its N_ would state a per-trip \
-             extent, and this dump refuses to guess the sweep",
-            op.time
-        );
-        let sdsc = op
-            .op
-            .as_ref()
-            .unwrap_or_else(|| panic!("{what}: _p{j}_op carries no descriptor"));
-        let dscs: Vec<&ktir_superdsc::wire::Dsc> =
-            sdsc.dscs_.iter().flat_map(|m| m.values()).collect();
-        assert!(!dscs.is_empty(), "{what}: _p{j}_op states no dsc");
-        let out_extents: HashSet<i64> = dscs.iter().map(|d| d.N_.out_).collect();
-        assert!(
-            out_extents.len() == 1 && *out_extents.iter().next().unwrap() > 0,
-            "{what}: _p{j}_op does not state ONE positive out extent: {out_extents:?}"
-        );
-        slice_lanes.push(*out_extents.iter().next().unwrap() as u32);
-        let dfs: HashSet<u32> = dscs
-            .iter()
-            .flat_map(|d| d.labeledDs_.iter().filter(|ds| ds.dsType_ == "OUTPUT"))
-            .map(|ds| ds.wordLength)
-            .collect();
-        let df = match dfs.iter().copied().min() {
-            Some(2) if dfs.len() == 1 => "fp16",
-            Some(4) if dfs.len() == 1 => "fp32",
-            _ => panic!("{what}: _p{j}_op does not state ONE accum df: wordLengths {dfs:?}"),
-        };
+        let name = format!("_p{j}_op");
+        let (lanes, df) = op_reduce_facts(op, what, &name);
+        slice_lanes.push(lanes);
         match accum_df.as_deref() {
             None => accum_df = Some(df.to_string()),
             Some(prev) => assert!(
@@ -223,43 +285,13 @@ fn dump_reduce_card_gate() {
     let root = std::path::Path::new(&root);
     std::fs::create_dir_all(root).unwrap();
 
-    // ── THE TALL RUNG — the full production path, exactly the door test's own program ──
-    let (m, c) = TALL;
-    let ir = rmsnorm_ir(m, c, GainConvention::Scale);
-    // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — staged
-    // through the per-step codec path — and t1 (the gain row) is the one real weight, staged
-    // through the weight loop's IEEE→sen re-encode with `stick:t1=1`, the [1, C] row's
-    // identity map (`stage_weights` refuses a raw id by name: bundle_run.rs:742-752).
-    // Handing the layout {0, 1} made x itself a Weight, and every raw bind a refusal on the
-    // card.
-    let weight_ids: HashSet<u32> = [1u32].into_iter().collect();
-    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
-        .unwrap_or_else(|e| panic!("layout minted m={m} c={c}: {e}"));
-    let node = &ir.nodes[0];
-    let spliced = scratchy_triton_splice::lower(node, &ir, false)
-        .unwrap_or_else(|e| panic!("splice compiled m={m} c={c}: {e}"));
-    let mut sym = 0i64;
-    let ops = door_lower(
-        spliced
-            .ktir
-            .as_ref()
-            .expect("spliced op carries its program"),
-        &mut sym,
-        Some(&layout),
-    )
-    .unwrap_or_else(|e| panic!("spliced program lowered m={m} c={c}: {}", e.message));
-    // ⛔ THE CELL IS THE SPLIT — the same marker the door test pins: a bundle without it is
-    // a fitting rung, not this cell, and the run would prove nothing about the split.
-    assert!(
-        ops.iter().any(|e| e.op_name.contains("_p1_op")),
-        "the tall rung's mean(x²) splits: no `_p1_op` slice among {} emitted ops",
-        ops.len()
-    );
-    let dir = root.join(format!("rmsnorm_m{m}_c{c}"));
-    std::fs::create_dir_all(&dir).unwrap();
-    write_layout_cell(&dir, &layout, Some(&ops), 2);
-    let split = split_facts(&ops, "the tall rung");
-    write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, &sha, split);
+    // ── THE RMSNORM PAIR — the tall rung (SPLIT) and its control (one LX pass, UNSPLIT,
+    //    same hidden width): the same program, the same fill law, the same runner, the
+    //    same N-dependent bar — only the split differs, so the pair arbitrates whether the
+    //    tall rung's error is the split's or the width's (moe-lead's ruled control,
+    //    2026-11-07) ──
+    rmsnorm_cell(root, &sha, TALL, "the tall rung", true);
+    rmsnorm_cell(root, &sha, CONTROL, "the control rung", false);
 
     // ── THE BARE-REDUCE DOOR TWINS — the door itself, wide multi-row, through the real
     //    placement (compute_bundle_layout), with the split FIRING ──
@@ -289,7 +321,7 @@ fn dump_reduce_card_gate() {
         let dir = root.join(format!("reduce_{}_m{m}_c{c}", kind.op_func()));
         std::fs::create_dir_all(&dir).unwrap();
         write_layout_cell(&dir, &layout, Some(&ops), REDUCE_OUT_TID);
-        let split = split_facts(&ops, &format!("{kind:?} [{m}, {c}]"));
+        let split = split_facts(&ops, &format!("{kind:?} [{m}, {c}]"), &bare);
         write_cell_json(
             &dir,
             &format!("reduce_{}", kind.op_func()),
@@ -301,6 +333,69 @@ fn dump_reduce_card_gate() {
             split,
         );
     }
+}
+
+/// One rmsnorm chain cell — the tall rung and its control differ only in their row count
+/// and their split expectation. `expect_split` states the cell's own marker law: the tall
+/// rung IS the split (a bundle without `_p1_op` is a fitting rung, and the run would prove
+/// nothing about the split path), the control IS the one-pass answer (no `_p{j}_op` marker
+/// at all — a bundle that split is the tall rung, not this cell).
+fn rmsnorm_cell(
+    root: &std::path::Path,
+    sha: &str,
+    (m, c): (u32, u32),
+    what: &str,
+    expect_split: bool,
+) {
+    let ir = rmsnorm_ir(m, c, GainConvention::Scale);
+    // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — staged
+    // through the per-step codec path — and t1 (the gain row) is the one real weight, staged
+    // through the weight loop's IEEE→sen re-encode with `stick:t1=1`, the [1, C] row's
+    // identity map (`stage_weights` refuses a raw id by name: bundle_run.rs:742-752).
+    // Handing the layout {0, 1} made x itself a Weight, and every raw bind a refusal on the
+    // card.
+    let weight_ids: HashSet<u32> = [1u32].into_iter().collect();
+    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        .unwrap_or_else(|e| panic!("{what}: layout minted m={m} c={c}: {e}"));
+    let node = &ir.nodes[0];
+    let spliced = scratchy_triton_splice::lower(node, &ir, false)
+        .unwrap_or_else(|e| panic!("{what}: splice compiled m={m} c={c}: {e}"));
+    let mut sym = 0i64;
+    let ops = door_lower(
+        spliced
+            .ktir
+            .as_ref()
+            .expect("spliced op carries its program"),
+        &mut sym,
+        Some(&layout),
+    )
+    .unwrap_or_else(|e| panic!("{what}: spliced program lowered m={m} c={c}: {}", e.message));
+    let markers = slice_markers(&ops);
+    if expect_split {
+        // ⛔ THE CELL IS THE SPLIT — the same marker the door test pins: a bundle without
+        // it is a fitting rung, not this cell.
+        assert!(
+            markers.contains_key(&1),
+            "{what}: the mean(x²) splits: no `_p1_op` slice among {} emitted ops",
+            ops.len()
+        );
+    } else {
+        // ⛔ THE CELL IS THE ONE-PASS ANSWER — the control's own negative marker: any slice
+        // op means the probe split a row count the budget arithmetic said fits, and the cell
+        // would silently be a second tall rung.
+        assert!(
+            markers.is_empty(),
+            "{what}: the control must run UNSPLIT — {} `_p{{j}}_op` slice markers among {} \
+             emitted ops",
+            markers.len(),
+            ops.len()
+        );
+    }
+    let dir = root.join(format!("rmsnorm_m{m}_c{c}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    write_layout_cell(&dir, &layout, Some(&ops), 2);
+    let split = split_facts(&ops, what, "rmmean_");
+    write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, sha, split);
 }
 
 /// `triton_splice_golden.rs`'s own rmsnorm builder, verbatim: t0 = source, t1 = the gain
