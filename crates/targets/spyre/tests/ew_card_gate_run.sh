@@ -34,32 +34,33 @@
 #   <= 2^-6 (0.015625). Reason: at this runner's +-2-ish fill scale 2^-6 is 8 f16 ulp, and
 #   near a zero of the function the ulp metric is defeated by sign flips and denormal
 #   spacing, so the bar there is absolute.
-#   rmsnorm: max_ulp <= ceil(ceil(log2 c)/2) + 2 over the head, c the cell OWN swept width
-#   — THE N-DEPENDENT BAR, stated BEFORE the control re-run (moe-lead 2026-11-07: the flat
-#   8 was stated for widths <= 4096; a bar is a function of N derived from the op law,
-#   never a constant calibrated on the widths already measured). DERIVATION, from the op
-#   law: the mean(x^2) reduce is the fp16 summeanmaxexx2 template (the dump-stated accum
-#   df), where EVERY accumulation level is computetype="FMA16" over SEN169_FP16-allocated
-#   registers (summeanmaxexx2.ddl, the deeptools C++ tree by direct path: the tensors and
-#   internal tensors are SEN169_FP16 :23-35, the chunk accumulate :277, across-subchunks
-#   :336, PE->SFP :456, the core-to-core psum start/middle/end :528/:569/:547, the final
-#   SFP combine :602; the f32 flavor is a SEPARATE template, summeanmaxexx2_fp32.ddl,
-#   IEEE_FP32 throughout, taken only when the reduce own df is fp32) — so the accumulation
-#   error unit is eps = 2^-11 per level, and:
-#     E[x^2] carries a relative error <= ceil(log2 N) * eps — a tree reduction, one eps
-#       per level, the same model the ruled reduce_sum bar states over this same template;
-#     the E f16 write adds 1/2 eps relative; the rsqrt image, the x*r rounding and the
-#     *gain rounding are each <= 1 output ulp; the rsqrt HALVES the E error.
-#   At the worst lane position (just above a power of two, where one output ulp is exactly
-#   the 2^-11 relative unit) that sums to ceil(ceil(log2 N)/2) + 2 ulp — 8 at N=4096 and
-#   N=2048 (the old bar, now derived instead of asserted: never looser below them), 9 at
-#   N >= 8192. The SAME bar is applied to the split and the unsplit rmsnorm cells (the
-#   control pair): only the split differs, so if the unsplit cell also exceeds it the
-#   model's eps or tree assumption is refuted — a finding to investigate, never a bar to
-#   move.
-#   rmsnormunit: max_ulp <= 8 over the head, unchanged — the flat bar the EW gate stated
-#   for it; the N-dependent derivation above is stated for the rmsnorm cells this gate
-#   adds, and no rmsnormunit cell changes.
+#   rmsnorm at the SHIPPED widths (c <= 4096): max_ulp <= 8 over the head — the flat bar
+#   the EW gate stated, KEPT by the auditor ruling (2026-11-07): every shipped model sits
+#   at hidden 2048/4096 and passes it. rmsnorm at c >= 8192: REPORTED, never PASS — the
+#   derived N-dependent bar (a log-depth tree model, 9 ulp at 16384) was REFUTED at
+#   N=16384 by both the split (12 ulp) and the unsplit control (13 ulp,
+#   cg1113r-bcd507ca), and a withdrawn bar is not replaced by a guess: the wide cells
+#   state max_ulp, the tail law and finiteness, and the LEVEL-B PER-ROW DETERMINISTIC
+#   BOUND column below, pending the filed issue's ruled bar. The device structure the
+#   refutation established (accepted as the device fact): the exx2 accumulation is a
+#   SEQUENTIAL FMA16 chain — a <=64-element subchain (the :94 datastage cap) then
+#   M = ceil(N/64) subchain combines at the running total magnitude
+#   (summeanmaxexx2.ddl :277/:336) — with SEN169 registers (9-bit fraction), so the
+#   per-rounding relative unit is the SEN169 half-ulp 2^-10, not the f16 2^-11.
+#   THE LEVEL-B PER-ROW DETERMINISTIC BOUND (the filed issue's resolution path,
+#   REPORTED unbarred until ruled, exx2_bound_ratio on the verdict line): from each row
+#   OWN staged x, the level-B chain bounds the E[x^2] error deterministically —
+#     d(Sigma x^2) <= 2^-10 * sum_j |S_j|,  S_j = the exact sum of the row first 64j
+#   squared staged values (j = 1..M, the running totals the combines round at) — then
+#   through the 1/N scale, the rsqrt (which HALVES it), and the O(1) roundings (the E
+#   f16 write, the rsqrt image, the two multiplies, the final image) it lands per lane
+#   as |ref|*(0.5*dE/(E+eps) + 2^-12 + 2^-10 + 2^-11 + 2^-11) + 0.5*ulp_f16(|want|).
+#   exx2_bound_ratio is max over the head lanes of err/bound — checkable, not
+#   statistical: a ruled bar is this bound with a ruled coverage, and the four control
+#   widths give it four points to be checked against, never fitted. Level A (the
+#   64-deep subchain walk, ~0.6 ulp at 16384 and vanishing below) is NOT in the bound —
+#   the issue scopes the bound to the level-B chain plus the O(1) terms.
+#   rmsnormunit: max_ulp <= 8 over the head, unchanged.
 #   gelu (the folded cell): max_ulp <= 8 over the head against the FEST-modeled gelufwd
 #   form (see (iii) below). Reason: gelufwd is ONE device primitive, and the cell must be
 #   the f16 image of its own defining polynomial. The distance to the TRUE tanh form is
@@ -94,17 +95,21 @@
 #   proves nothing, so every input is door-stated, never runner-derived): per row,
 #     |got - want| <= (T + ceil(log2(slice_lanes))) * eps * sum|x| + 0.5 * ulp_f16(|want|)
 #   with T the split trip count, slice_lanes the slices swept reduce widths, and eps the
-#   accumulator error unit: 2^-11 when the accum is fp16 on the device, 2^-24 when fp32.
-#   THE FP16 UNIT IS CITED, NOT FITTED (moe-lead 2026-11-07): the fp16 sum template is
-#   ddc/ddl_templates/summeanmaxexx2.ddl in the deeptools C++ tree, read by direct path —
-#   every tensor is data_type="SEN169_FP16" (:23) and every sum accumulation level is
-#   computetype="FMA16" over those fp16-allocated registers: the chunk accumulate :277,
-#   across-subchunks :336, PE->SFP :456, the core-to-core psum start/middle/end
-#   :528/:569/:547, and the final SFP combine :602 — a 16-bit FMA at every level, no f32
-#   stage anywhere in the fp16 template (the f32 flavor is the separate
-#   summeanmaxexx2_fp32.ddl, IEEE_FP32 throughout, taken only when the reduce own df is
-#   fp32). The measured 24-abs at cg1113r-1a0882da (T=2, 2x524288 lanes, accum fp16)
-#   sits inside the ruled bound at eps=2^-11, as the citation says it must.
+#   accumulator error unit: 2^-10 when the accum is fp16 on the device (RESTATED from the
+#   ruled 2^-11 by the auditor 2026-11-07 — the registers are SEN169), 2^-24 when fp32.
+#   THE FP16 UNIT IS CITED, NOT FITTED (moe-lead 2026-11-07; restated 2026-11-07): the
+#   fp16 sum template is ddc/ddl_templates/summeanmaxexx2.ddl in the deeptools C++ tree,
+#   read by direct path — every tensor is data_type="SEN169_FP16" (:23), the accumulator
+#   registers are ALLOCATED from those SEN169_FP16 tensors (:180-183 the PE LRFs, :441-448
+#   the SFP LRFs — a 9-bit fraction, so one FMA16 accumulate rounds the running sum at
+#   the SEN169 half-ulp 2^-10, twice the f16 unit), and every sum accumulation level is
+#   computetype="FMA16" over those registers: the chunk accumulate :277, across-subchunks
+#   :336, PE->SFP :456, the core-to-core psum start/middle/end :528/:569/:547, and the
+#   final SFP combine :602 — no f32 stage anywhere in the fp16 template (the f32 flavor
+#   is the separate summeanmaxexx2_fp32.ddl, IEEE_FP32 throughout, taken only when the
+#   reduce own df is fp32). The measured 24-abs at cg1113r-1a0882da (T=2, 2x524288 lanes,
+#   accum fp16) sits inside the restated bound (~36 at eps=2^-10), as the citation says
+#   it must.
 #   T, slice_lanes and the accum df are the SPLIT FACTS the dump writes into cell.json off
 #   the door OWN emitted ops (the slice descriptors N_.out_ widths and OUTPUT wordLength);
 #   a reduce_sum cell without them is a named NOT-RUN, never a guessed bar. The formula is
@@ -465,7 +470,11 @@ elif op in ("reduce_sum", "reduce_max"):
             print("VERDICT %s NOT-RUN no-door-stated-split-facts split=%s sha=%s md5=%s"
                   % (name, split, c["sha"], c.get("group_0_md5")))
             sys.exit()
-        eps = 2.0 ** -11 if adf == "fp16" else 2.0 ** -24
+        # eps RESTATED to the SEN169 half-ulp 2^-10 (auditor 2026-11-07): the accumulator
+        # registers are allocated from the SEN169_FP16 tensors (header citation), so one
+        # FMA16 accumulate rounds at 2^-10 relative — twice the f16 unit the bar was first
+        # ruled with. The fp32 arm is the IEEE_FP32 template own unit.
+        eps = 2.0 ** -10 if adf == "fp16" else 2.0 ** -24
         sig = rows.std(axis=1).astype(np.float32)
         abssum = np.abs(rows).sum(axis=1).astype(np.float32)
         err = np.abs(got.astype(np.float32) - want.astype(np.float32))
@@ -515,6 +524,13 @@ if op == "gelu_longhand":
         bad = (~np.isfinite(img)) & (~ovf)
         ovf |= bad
         ovf_stage[bad] = nm
+
+def f16_ulp(w):
+    # the f16 spacing at |w|: the normal spacing 2^(floor(log2 v)-10), the subnormal and
+    # zero spacing 2^-24 (one min-subnormal step) — the same law the sum bar states.
+    with np.errstate(divide="ignore"):
+        expo = np.floor(np.log2(np.where(w >= 2.0 ** -14, w, 1.0)))
+    return np.where(w >= 2.0 ** -14, 2.0 ** (expo - 10), 2.0 ** -24)
 
 def ulp16(a, b):
     # the fp16 ulp distance: the bit patterns as integers, same-sign; a sign flip is
@@ -638,14 +654,40 @@ else:
             print("DIAG %s max-not-exact row=%d raw_max=%.6g stage_image=%.6g got=%.6g"
                   % (name, bad, raw_want[bad], want[bad], got[bad]))
     elif op == "rmsnorm":
-        # THE N-DEPENDENT RMSNORM BAR (header, stated before this run):
-        #   max_ulp <= ceil(ceil(log2 c)/2) + 2 over the head
-        # derived from the op law (the FMA16 accumulation of the fp16 summeanmaxexx2
-        # the rsqrt halving, the f16 roundings) — applied IDENTICALLY to the split and the
-        # unsplit cells of the control pair. rms_bar rides the verdict line.
-        rms_bar = int(math.ceil(math.ceil(math.log2(cols)) / 2.0)) + 2
-        ok = (max_ulp <= rms_bar) and (tail_abs <= TAIL_BAR) and finite and eq_ok
-        extra = " rms_bar=%d" % rms_bar
+        # THE RMSNORM BARS (header, auditor ruling 2026-11-07): the SHIPPED widths
+        # (c <= 4096) keep the flat 8-ulp bar; the wide cells carry no ruled bar — the
+        # derived N-dependent bar was refuted at N=16384 by both the split and the
+        # unsplit control, and a withdrawn bar is not replaced by a guess — so they are
+        # judged by the tail law and finiteness only and print REPORTED, never PASS.
+        if cols <= 4096:
+            ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
+            extra = " rms_bar=8"
+        else:
+            ok = (tail_abs <= TAIL_BAR) and finite and eq_ok
+            extra = " rms_bar=none-withdrawn"
+        # THE LEVEL-B PER-ROW DETERMINISTIC BOUND (header, the filed issue resolution
+        # path — REPORTED unbarred until ruled): from each row OWN staged x,
+        #   d(Sigma x^2) <= 2^-10 * sum_j |S_j|,  S_j = the exact sum of the row first
+        #   64j squared staged values (the running totals the M = ceil(c/64) combines
+        #   round at),
+        # through the 1/c scale and the rsqrt (which halves it), plus the O(1) roundings
+        # (the E f16 write 2^-12 through the halving, the rsqrt image 2^-10, the two
+        # multiplies 2^-11 each) and the final half-ulp image. exx2_bound_ratio is max
+        # over the head lanes of err/bound — checkable, not statistical.
+        x2 = rows.astype(np.float64) ** 2
+        cs = np.cumsum(x2, axis=1)
+        M = (cols + 63) // 64
+        idx = np.minimum(np.arange(1, M + 1) * 64, cols) - 1
+        dsig = (2.0 ** -10) * np.abs(cs[:, idx]).sum(axis=1)
+        E = cs[:, cols - 1] / cols
+        dE = dsig / cols
+        rel = 0.5 * dE / np.maximum(E + eps, 2.0 ** -24) + 2.0 ** -12 + 2.0 ** -10 + 2.0 ** -11 + 2.0 ** -11
+        wmat = np.abs(want.reshape(m, cols).astype(np.float32))
+        bmat = np.abs(ref) * rel[:, None] + 0.5 * f16_ulp(wmat)
+        emat = np.abs(got.reshape(m, cols).astype(np.float32) - want.reshape(m, cols).astype(np.float32))
+        headm = wmat >= HEAD
+        ratio = float((emat / np.maximum(bmat, 2.0 ** -24))[headm].max()) if headm.any() else 0.0
+        extra += " exx2_bound_ratio=%.6g" % ratio
     else:
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
 
@@ -699,8 +741,11 @@ if ovf.any():
 
 # ⛔ A CELL WITHOUT A STATED BAR PRINTS REPORTED, NEVER PASS (run-8): the longhand is judged
 # only by the tail law and finiteness — its distance numbers are stated, not barred, so the
-# kind cannot say PASS. Every barred cell keeps PASS/FAIL verbatim.
-if op == "gelu_longhand":
+# kind cannot say PASS. The WIDE rmsnorm cells (c > 4096) are the same class (auditor
+# 2026-11-07): their derived bar was refuted and withdrawn, so no PASS is claimed at those
+# widths pending the filed issue — max_ulp and the level-B bound ratio are stated, not
+# barred. Every barred cell keeps PASS/FAIL verbatim.
+if op == "gelu_longhand" or (op == "rmsnorm" and cols > 4096):
     kind = "REPORTED" if ok else "FAIL"
 else:
     kind = "PASS" if ok else "FAIL"

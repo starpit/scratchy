@@ -11,12 +11,15 @@
 //!   `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door` pins at the door, run here
 //!   on the card. The dump asserts the split's own slice marker (`_p1_op`) is present, so
 //!   the cell cannot silently degrade to a fitting rung.
-//! * `rmsnorm` (the control) — THE SAME OP, UNSPLIT: the same chain at
-//!   [`CONTROL`]'s row count, small enough that the probe answers in ONE LX pass (no
-//!   `_p{j}_op` marker anywhere — the dump asserts the negative). The moe-lead's ruled
-//!   control experiment (2026-11-07): same op, same fill law, same runner, same
-//!   N-dependent bar — only the split differs, so the pair arbitrates whether the tall
-//!   rung's error is the split's or the width's.
+//! * `rmsnorm` (the control sweep) — THE SAME OP, UNSPLIT, at FOUR hidden widths
+//!   ([`CONTROL_WIDTHS`], all at [`CONTROL_M`] rows, all under the budget so none can
+//!   split — no `_p{j}_op` marker anywhere, the dump asserts the negative at every
+//!   width). The moe-lead's ruled control experiment (2026-11-07), widened per the
+//!   auditor (four points, not one fitted): every control is seeded with the tall rung's
+//!   own seed — the same rows, the same gain values, prefix-consistent across widths —
+//!   so the controls differ from the tall rung in the split alone and from each other in
+//!   N alone, and the runner's per-row deterministic level-B bound column (the filed
+//!   issue's resolution path) has four points to be checked against, never fitted.
 //! * `reduce_sum` / `reduce_max` — the BARE-REDUCE DOOR TWINS, WIDE MULTI-ROW, at the
 //!   split's own fire point (`[4, 1048576]`, 16,384 sticks): the reduce door
 //!   (`lower_ktir_to_superdsc::reduce`) with `Sum` and `Max`, driven the way production
@@ -43,10 +46,11 @@
 //! arm), a row-blocked tensor's device order interleaves the rows inside each stick-group
 //! (`StickLayout::group_stride`), and the placement reserves `row_footprint_bytes(1, Fp16)`
 //! per row — so the launcher's whole-placement readback at `stick:t=m` resticks to host
-//! `[m, size/2/m]` and row r's value is host `(r, 0)`, lane 0 of its stick. The per-op bars
-//! (tail law, the rmsnorm N-DEPENDENT ulp bar, the exact reduce_max law, and the
-//! reduce_sum split-facts bar — each with its reason) are stated in the runner header,
-//! before the run. The sum bar's
+//! `[m, size/2/m]` and row r's value is host `(r, 0)`, lane 0 of its stick. The per-op
+//! bars (tail law; rmsnorm 8 ulp at the SHIPPED widths with the wide cells REPORTED
+//! pending the filed issue's ruled bar, alongside its per-row deterministic level-B
+//! bound column; the exact reduce_max law; and the reduce_sum split-facts bar — each
+//! with its reason) are stated in the runner header, before the run. The sum bar's
 //! inputs — the split's trip count T, each slice's swept width, and the accum's device
 //! format — are written into `cell.json` by THIS dump off the door's own emitted ops
 //! ([`SplitFacts`]), never re-derived from geometry by the runner.
@@ -91,13 +95,20 @@ fn door_lower(
 /// The tall rung's own geometry — `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door`'s.
 const TALL: (u32, u32) = (2048, 16384);
 
-/// ⭐ THE CONTROL's row count — the same rmsnorm chain at hidden 16384, small enough that
-/// the door's own probe answers in ONE LX pass. The probe bills the exx2 data window per
-/// core: `ceil(m/32)` rows × 16384 lanes × 2 B. At m = 512 that is 16 × 32,768 B =
-/// 524,288 B — 3.2× under the 1,677,721-B usable-LX budget, so no split can fire (the
-/// tall rung at m = 2048 bills 2 MiB and splits, T = 2 measured at cg1113r-1a0882da).
-/// Same hidden width as the tall rung, so the pair differs in the split ALONE.
-const CONTROL: (u32, u32) = (512, 16384);
+/// ⭐ THE CONTROL SWEEP — the same rmsnorm chain, UNSPLIT, at FOUR hidden widths (the
+/// filed issue's resolution path: four points, not one fitted). m = 512 at every width:
+/// the probe bills the exx2 data window per core as `ceil(m/32)` rows × width × 2 B, so
+/// the widest (16384) bills 16 × 32,768 B = 524,288 B — 3.2× under the 1,677,721-B
+/// usable-LX budget — and every narrower width bills less, so no cell can split (the
+/// tall rung at m = 2048, c = 16384 bills 2 MiB and splits, T = 2 measured at
+/// cg1113r-1a0882da). The four cells differ in N ALONE. Every one is seeded with the
+/// TALL RUNG'S OWN SEED, so all four run the tall rung's first 512 rows and gain values
+/// (prefix-consistent: a row's first k staged values are the same values at every width
+/// — the reduce just sweeps fewer of them); the c = 16384 cell is the tall rung's own
+/// control and also carries the same-rows reference (the only width its output is
+/// elementwise comparable with the tall rung's at).
+const CONTROL_M: u32 = 512;
+const CONTROL_WIDTHS: [u32; 4] = [2048, 4096, 8192, 16384];
 
 /// The cell's fill seed — the runner derives its fills from `rng(seed + input_index)`, so
 /// two cells with the same seed and the same input order draw the SAME values, and a cell
@@ -299,22 +310,26 @@ fn dump_reduce_card_gate() {
     let root = std::path::Path::new(&root);
     std::fs::create_dir_all(root).unwrap();
 
-    // ── THE RMSNORM PAIR — the tall rung (SPLIT) and its control (one LX pass, UNSPLIT,
-    //    same hidden width, SAME ROWS: the control is seeded with the tall rung's own
-    //    seed, so it runs the tall rung's first 512 rows and the same gain row): the same
-    //    program, the same fill law, the same runner, the same N-dependent bar — only the
-    //    split differs, over identical inputs (moe-lead's ruled control, 2026-11-07;
-    //    same-rows amendment after cg1113r-bcd507ca measured the pair on different rows) ──
+    // ── THE RMSNORM CELLS — the tall rung (SPLIT) and the four-width control sweep (one
+    //    LX pass, UNSPLIT, same rows at every width: every control is seeded with the
+    //    tall rung's own seed, so they run the tall rung's first 512 rows and the same
+    //    gain values): the same program, the same fill law, the same runner — the controls
+    //    differ from the tall rung in the split alone, and from each other in N alone
+    //    (moe-lead's ruled control, 2026-11-07; four-width amendment after
+    //    cg1113r-bcd507ca, auditor: four points, not one fitted) ──
     rmsnorm_cell(root, &sha, TALL, "the tall rung", true, seed_of(TALL), None);
-    rmsnorm_cell(
-        root,
-        &sha,
-        CONTROL,
-        "the control rung",
-        false,
-        seed_of(TALL),
-        Some(format!("rmsnorm_m{}_c{}", TALL.0, TALL.1)),
-    );
+    for c in CONTROL_WIDTHS {
+        let same_rows = (c == TALL.1).then(|| format!("rmsnorm_m{}_c{}", TALL.0, TALL.1));
+        rmsnorm_cell(
+            root,
+            &sha,
+            (CONTROL_M, c),
+            "the control rung",
+            false,
+            seed_of(TALL),
+            same_rows,
+        );
+    }
 
     // ── THE BARE-REDUCE DOOR TWINS — the door itself, wide multi-row, through the real
     //    placement (compute_bundle_layout), with the split FIRING ──
