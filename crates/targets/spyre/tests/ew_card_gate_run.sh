@@ -370,7 +370,7 @@ PY
   [ $rrc -ne 0 ] && { echo "VERDICT $name NOT-RUN run_rc=$rrc sha=$sha md5=$md5" | tee -a "$LOG"; return; }
 
   python3 - "$cell" "$name" >> "$LOG" <<"PY"
-import json, math, sys
+import json, math, os, sys
 import numpy as np
 cell, name = sys.argv[1], sys.argv[2]
 c = json.load(open(cell + "/cell.json"))
@@ -648,6 +648,41 @@ else:
         extra = " rms_bar=%d" % rms_bar
     else:
         ok = (max_ulp <= 8) and (tail_abs <= TAIL_BAR) and finite and eq_ok
+
+    # ⭐ THE SAME-ROWS PROOF (moe-lead 2026-11-07): a cell whose cell.json carries
+    # `same_rows_ref` runs that cell OWN first m rows (the dump seeds it so — the same
+    # seed, the same input order, row-major draws), so its output is comparable
+    # ELEMENTWISE with the reference cell output over exactly those rows. This is the
+    # direct measure of whether the split computes the same function as the one-pass
+    # reduce: max |split - unsplit| in f16 ulp and absolute, over the shared rows.
+    # REPORTED, unbarred — the number IS the claim, and the reference cell must have run
+    # (its out.bin is its verdict own artifact): a missing or short reference is a named
+    # NOT-RUN, never a skipped report.
+    ref = c.get("same_rows_ref")
+    if ref:
+        rp = os.path.dirname(cell) + "/" + ref + "/out.bin"
+        if not os.path.exists(rp):
+            print("VERDICT %s NOT-RUN ref-not-run ref=%s sha=%s md5=%s" % (name, ref, c["sha"], c.get("group_0_md5")))
+            sys.exit()
+        # the premise CHECKED, never assumed: this cell own fills must BE the reference
+        # cell first m rows (same seed, same input order — the dump states it, this reads
+        # it back off both cells own staged fill files, bit for bit).
+        rp0 = os.path.dirname(cell) + "/" + ref + "/in-t%d.bin" % c["in_tids"][0]
+        if not os.path.exists(rp0) or not np.array_equal(
+            np.fromfile(rp0, dtype=np.float16, count=n),
+            np.fromfile(cell + "/in-t%d.bin" % c["in_tids"][0], dtype=np.float16, count=n),
+        ):
+            print("VERDICT %s NOT-RUN same-rows-fill-mismatch ref=%s sha=%s md5=%s" % (name, ref, c["sha"], c.get("group_0_md5")))
+            sys.exit()
+        rg = np.fromfile(rp, dtype=np.float16, count=n)
+        if rg.size != n:
+            print("VERDICT %s NOT-RUN short-ref-readback %d of %d ref=%s sha=%s md5=%s" % (name, rg.size, n, ref, c["sha"], c.get("group_0_md5")))
+            sys.exit()
+        extra += " same_rows_ulp=%d same_rows_abs=%.6g same_rows_ref=%s" % (
+            int(ulp16(got, rg).max()),
+            float(np.abs(got.astype(np.float32) - rg.astype(np.float32)).max()),
+            ref,
+        )
 
 # THE OVERFLOW LAW, clause 1 — the REPORT, never a bar: count, x, got and the stage that
 # overflowed (the first 8 lanes here; the whole cell is in cell.csv). The lanes outside the

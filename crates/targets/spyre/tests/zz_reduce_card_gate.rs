@@ -99,6 +99,13 @@ const TALL: (u32, u32) = (2048, 16384);
 /// Same hidden width as the tall rung, so the pair differs in the split ALONE.
 const CONTROL: (u32, u32) = (512, 16384);
 
+/// The cell's fill seed — the runner derives its fills from `rng(seed + input_index)`, so
+/// two cells with the same seed and the same input order draw the SAME values, and a cell
+/// with a smaller row count draws the PREFIX of a taller cell's rows (row-major draws).
+fn seed_of((m, c): (u32, u32)) -> u64 {
+    u64::from(m) * 1_000_003 + u64::from(c)
+}
+
 /// The bare-reduce twins' shape — the historical wide multi-row cell's family (`ROWS` in
 /// `zz_the_ktir_door_lowers_the_wide_multi_row_max.rs`), scaled to the split's own fire
 /// point: 4 rows × 1,048,576 (16,384 sticks, whole-stick aligned). Per row the swept width
@@ -128,6 +135,13 @@ struct Cell {
     out_tid: u32,
     /// The commit this dump ran at — required at dump time (a dump refuses to run unstamped).
     sha: String,
+    /// ⭐ THE SAME-ROWS PROOF (moe-lead 2026-11-07): names the cell whose FIRST m rows this
+    /// cell runs (this dump seeds it so — see [`seed_of`]), so the runner can compare this
+    /// cell's output elementwise with that cell's output over exactly those rows: the
+    /// direct measure of whether the split computes the same function as the one-pass
+    /// reduce. Absent on every cell that is not the control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    same_rows_ref: Option<String>,
     /// ⭐ THE DOOR'S OWN SPLIT FACTS (moe-lead ruling 2026-11-07) — the inputs of the
     /// runner's reduce bars, written by the DUMP off what the door EMITTED, never
     /// re-derived from geometry by the runner: a bar calibrated on the run it judges
@@ -286,12 +300,21 @@ fn dump_reduce_card_gate() {
     std::fs::create_dir_all(root).unwrap();
 
     // ── THE RMSNORM PAIR — the tall rung (SPLIT) and its control (one LX pass, UNSPLIT,
-    //    same hidden width): the same program, the same fill law, the same runner, the
-    //    same N-dependent bar — only the split differs, so the pair arbitrates whether the
-    //    tall rung's error is the split's or the width's (moe-lead's ruled control,
-    //    2026-11-07) ──
-    rmsnorm_cell(root, &sha, TALL, "the tall rung", true);
-    rmsnorm_cell(root, &sha, CONTROL, "the control rung", false);
+    //    same hidden width, SAME ROWS: the control is seeded with the tall rung's own
+    //    seed, so it runs the tall rung's first 512 rows and the same gain row): the same
+    //    program, the same fill law, the same runner, the same N-dependent bar — only the
+    //    split differs, over identical inputs (moe-lead's ruled control, 2026-11-07;
+    //    same-rows amendment after cg1113r-bcd507ca measured the pair on different rows) ──
+    rmsnorm_cell(root, &sha, TALL, "the tall rung", true, seed_of(TALL), None);
+    rmsnorm_cell(
+        root,
+        &sha,
+        CONTROL,
+        "the control rung",
+        false,
+        seed_of(TALL),
+        Some(format!("rmsnorm_m{}_c{}", TALL.0, TALL.1)),
+    );
 
     // ── THE BARE-REDUCE DOOR TWINS — the door itself, wide multi-row, through the real
     //    placement (compute_bundle_layout), with the split FIRING ──
@@ -327,10 +350,12 @@ fn dump_reduce_card_gate() {
             &format!("reduce_{}", kind.op_func()),
             m,
             c,
+            seed_of((m, c)),
             vec![REDUCE_DATA_TID],
             REDUCE_OUT_TID,
             &sha,
             split,
+            None,
         );
     }
 }
@@ -339,13 +364,19 @@ fn dump_reduce_card_gate() {
 /// and their split expectation. `expect_split` states the cell's own marker law: the tall
 /// rung IS the split (a bundle without `_p1_op` is a fitting rung, and the run would prove
 /// nothing about the split path), the control IS the one-pass answer (no `_p{j}_op` marker
-/// at all — a bundle that split is the tall rung, not this cell).
+/// at all — a bundle that split is the tall rung, not this cell). `seed` is the fill seed
+/// and `same_rows_ref` the same-rows reference: the control is seeded with the TALL RUNG'S
+/// OWN SEED, so it draws the tall rung's first m rows and the same gain row — the pair
+/// then differs in the split alone, over identical inputs, and the runner's elementwise
+/// same-rows report is the direct proof of whether the split computes the same function.
 fn rmsnorm_cell(
     root: &std::path::Path,
     sha: &str,
     (m, c): (u32, u32),
     what: &str,
     expect_split: bool,
+    seed: u64,
+    same_rows_ref: Option<String>,
 ) {
     let ir = rmsnorm_ir(m, c, GainConvention::Scale);
     // ⛔ EXACTLY THE GAIN tid is a weight here: t0 (the source x) is an ACTIVATION — staged
@@ -395,7 +426,18 @@ fn rmsnorm_cell(
     std::fs::create_dir_all(&dir).unwrap();
     write_layout_cell(&dir, &layout, Some(&ops), 2);
     let split = split_facts(&ops, what, "rmmean_");
-    write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, sha, split);
+    write_cell_json(
+        &dir,
+        "rmsnorm",
+        m,
+        c,
+        seed,
+        vec![0, 1],
+        2,
+        sha,
+        split,
+        same_rows_ref,
+    );
 }
 
 /// `triton_splice_golden.rs`'s own rmsnorm builder, verbatim: t0 = source, t1 = the gain
@@ -500,26 +542,31 @@ fn region(tid: u32, rows: u32, cols: u32, is_out: bool) -> Region {
     }
 }
 
-/// Write the cell's manifest.
+/// Write the cell's manifest. `seed` is the fill seed ([`seed_of`] — the control passes
+/// the tall rung's own seed, so it runs the tall rung's first rows); `same_rows_ref` names
+/// the cell those rows come from, for the runner's elementwise same-rows report.
 fn write_cell_json(
     dir: &std::path::Path,
     op: &str,
     m: u32,
     c: u32,
+    seed: u64,
     in_tids: Vec<u32>,
     out_tid: u32,
     sha: &str,
     split: SplitFacts,
+    same_rows_ref: Option<String>,
 ) {
     let cell = Cell {
         op: op.to_string(),
         m,
         c,
-        seed: u64::from(m) * 1_000_003 + u64::from(c),
+        seed,
         in_tids,
         out_tid,
         sha: sha.to_string(),
         split,
+        same_rows_ref,
     };
     std::fs::write(
         dir.join("cell.json"),
