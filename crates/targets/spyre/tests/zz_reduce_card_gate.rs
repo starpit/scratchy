@@ -11,12 +11,15 @@
 //!   `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door` pins at the door, run here
 //!   on the card. The dump asserts the split's own slice marker (`_p1_op`) is present, so
 //!   the cell cannot silently degrade to a fitting rung.
-//! * `reduce_sum` / `reduce_max` — the BARE-REDUCE DOOR TWINS at the historical wide
-//!   multi-row cell's shape family (`[4, 512]`, 8 sticks): the reduce door
-//!   (`lower_ktir_to_superdsc::reduce`) with `Sum` and `Max`, single-shot (the shape fits
-//!   one LX pass — the split path is the tall rung's cell above), placed by the reduce's
-//!   OWN placement law — the same law the door's no-layout arm addresses with — each arg
-//!   in its OWN 16 GiB segment (see [`write_reduce_cell`]).
+//! * `reduce_sum` / `reduce_max` — the BARE-REDUCE DOOR TWINS, WIDE MULTI-ROW, at the
+//!   split's own fire point (`[4, 1048576]`, 16,384 sticks): the reduce door
+//!   (`lower_ktir_to_superdsc::reduce`) with `Sum` and `Max`, driven the way production
+//!   drives it — with a REAL `BundleLayout` from `compute_bundle_layout` over the twins'
+//!   two-tensor placement manifest (see [`reduce_twin_ir`]), never the door's no-layout
+//!   arm. Per row the swept width bills 2 MiB past the 1,677,721-B usable-LX budget, so
+//!   the door's own probe-and-split answers in trips: the dump asserts the split's slice
+//!   and combine markers are present, so the cell cannot silently degrade to a fitting
+//!   rung.
 //!
 //! ## The bar (checked by the runner, not here)
 //! Inputs are staged and outputs read back through the launcher's IEEE↔SEN codec
@@ -48,7 +51,7 @@ use std::collections::HashSet;
 use ktir_superdsc::emit::ktir_matmul_fp8::QuantizedActivations;
 use ktir_superdsc::emit::lower_ktir_to_superdsc::{Region, reduce};
 use ktir_superdsc::ktir_node::ReduceKind;
-use ktir_superdsc::placement::SegRole;
+use ktir_superdsc::placement::{BundleLayout, SegRole};
 use ktir_superdsc::superdsc_opspec::Df;
 use scratchy_subtile::subtile_ir::{
     GainConvention, SubOp, SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
@@ -72,13 +75,18 @@ fn door_lower(
 /// The tall rung's own geometry — `the_tall_wide_hidden_rmsnorm_mean_splits_through_the_door`'s.
 const TALL: (u32, u32) = (2048, 16384);
 
-/// The bare-reduce twins' shape — the historical wide multi-row cell's family (`ROWS`,
-/// `WIDE` in `zz_the_ktir_door_lowers_the_wide_multi_row_max.rs`): 4 rows × 512 (8 sticks).
-const TWIN: (u32, u32) = (4, 512);
+/// The bare-reduce twins' shape — the historical wide multi-row cell's family (`ROWS` in
+/// `zz_the_ktir_door_lowers_the_wide_multi_row_max.rs`), scaled to the split's own fire
+/// point: 4 rows × 1,048,576 (16,384 sticks, whole-stick aligned). Per row the swept width
+/// bills 2 MiB past the 1,677,721-B usable-LX budget and half of it fits, so the door's own
+/// probe-and-split answers in trips — the same geometry class the door fixture
+/// `the_past_the_budget_reduce_splits_through_the_door` pins at one row.
+const TWIN: (u32, u32) = (4, 1_048_576);
 
-/// The reduce door's own operand tids (the door test's own spelling).
-const REDUCE_DATA_TID: u32 = 7;
-const REDUCE_OUT_TID: u32 = 8;
+/// The twins' placement-manifest tids: t0 the `[rows, cols]` data source, t1 the `[rows, 1]`
+/// result — the two tensors [`reduce_twin_ir`] declares.
+const REDUCE_DATA_TID: u32 = 0;
+const REDUCE_OUT_TID: u32 = 1;
 
 /// The cell's own manifest row — everything the runner's fills and decoder need, stated
 /// once. The same schema `zz_ew_card_gate.rs` writes; the runner is shared.
@@ -101,7 +109,7 @@ struct Cell {
 /// Dump every cell. One directory per cell: `group_0/` ([`superdsc::write_dxp_input`]),
 /// `placements.json` (the launch map) and `cell.json`.
 #[test]
-#[ignore]
+#[ignore = "needs a spyre card: dumps cells for ew_card_gate_run.sh"]
 fn dump_reduce_card_gate() {
     let Some(root) = std::env::var_os("REDUCE_CARD_GATE_ROOT") else {
         panic!("REDUCE_CARD_GATE_ROOT=<dir> names where the cells are written");
@@ -148,13 +156,34 @@ fn dump_reduce_card_gate() {
     write_layout_cell(&dir, &layout, Some(&ops), 2);
     write_cell_json(&dir, "rmsnorm", m, c, vec![0, 1], 2, &sha);
 
-    // ── THE BARE-REDUCE DOOR TWINS — the door itself, at the historical cell's shape ──
+    // ── THE BARE-REDUCE DOOR TWINS — the door itself, wide multi-row, through the real
+    //    placement (compute_bundle_layout), with the split FIRING ──
     for kind in [ReduceKind::Sum, ReduceKind::Max] {
         let (m, c) = TWIN;
-        let ops = reduce_twin(kind, m, c);
+        let (ops, layout) = reduce_twin(kind, m, c);
+        // ⛔ THE CELL IS THE SPLIT — the same law the tall rung's marker states: a bundle
+        // whose reduce came back SINGLE-SHOT (the bare `{kind}_o{tid}` op name) is a fitting
+        // rung, not this cell, and the run would prove nothing about the split path.
+        let bare = format!("{}_o{}", kind.op_func(), REDUCE_OUT_TID);
+        assert!(
+            !ops.iter().any(|e| e.op_name == bare),
+            "{kind:?} [{m}, {c}]: the wide reduce must SPLIT, not fit one LX pass — \
+             {} ops, none named {bare}",
+            ops.len()
+        );
+        assert!(
+            ops.iter().any(|e| e.op_name.contains("_p1_op")),
+            "{kind:?} [{m}, {c}]: no `_p1_op` slice among {} emitted ops",
+            ops.len()
+        );
+        assert!(
+            ops.iter().any(|e| e.op_name.contains("_c1_op")),
+            "{kind:?} [{m}, {c}]: no `_c1_op` combine among {} emitted ops",
+            ops.len()
+        );
         let dir = root.join(format!("reduce_{}_m{m}_c{c}", kind.op_func()));
         std::fs::create_dir_all(&dir).unwrap();
-        write_reduce_cell(&dir, &ops, m, c);
+        write_layout_cell(&dir, &layout, Some(&ops), REDUCE_OUT_TID);
         write_cell_json(
             &dir,
             &format!("reduce_{}", kind.op_func()),
@@ -197,18 +226,58 @@ fn rmsnorm_ir(m: u32, c: u32, gain: GainConvention) -> SubtileIR {
     }
 }
 
-/// One bare-reduce door twin: the door with `Sum`/`Max` at `[rows, cols]`, single-shot
-/// (the shape fits one LX pass), `Df::Fp16` — the reduce's own proven basis.
-fn reduce_twin(kind: ReduceKind, rows: u32, cols: u32) -> Vec<ktir_superdsc::emit::EmittedOp> {
+/// The twins' PLACEMENT MANIFEST — the two-tensor `SubtileIR` the walk's own layout law
+/// places: t0 the `[rows, cols]` source (an ACTIVATION, staged per step through the codec)
+/// and t1 the `[rows, 1]` result (LOGITS, the read-back tensor). No `SubOp` splices to a
+/// bare column reduce (`SumReduce` is unconstructed; the rmsnorm reduce rides the chain
+/// arm), so the op itself is the door's `reduce` — the SAME door `whole_function`'s
+/// `Lowering::Reduce` arm drives with a real layout in production — and this manifest is
+/// what hands that door the placement: `compute_bundle_layout` sizes and places both
+/// tensors by its own role law (source → seg0, result → seg4), never a hand-written
+/// placements row. The split's partial accumulators mint through the layout's own synth
+/// map, which `write_layout_cell` writes out with the bundle.
+fn reduce_twin_ir(rows: u32, cols: u32) -> SubtileIR {
+    SubtileIR {
+        tensors: vec![TensorShape { rows, cols }, TensorShape { rows, cols: 1 }],
+        num_sources: 1,
+        nodes: Vec::new(),
+        result: TensorId::from_index(1),
+        op_output: Vec::new(),
+    }
+}
+
+/// One bare-reduce door twin: the door with `Sum`/`Max` at `[rows, cols]`, `Df::Fp16` (the
+/// reduce's own proven basis), driven with the REAL placement — the layout
+/// `compute_bundle_layout` mints over [`reduce_twin_ir`], the same law every production
+/// bundle's placement comes from. Returns the emitted ops together with the layout they
+/// were placed through (the cell writer needs both).
+fn reduce_twin(
+    kind: ReduceKind,
+    rows: u32,
+    cols: u32,
+) -> (Vec<ktir_superdsc::emit::EmittedOp>, BundleLayout) {
+    let ir = reduce_twin_ir(rows, cols);
+    let weight_ids: HashSet<u32> = HashSet::new();
+    let layout = compute_bundle_layout(&ir, &weight_ids, PagedRows::Sequence, &[])
+        .unwrap_or_else(|e| panic!("{kind:?} [{rows}, {cols}]: the layout must mint: {e}"));
     let data = region(REDUCE_DATA_TID, rows, cols, false);
     let out = region(REDUCE_OUT_TID, rows, 1, true);
     let mut sym = 0i64;
-    reduce("attn_bmax_g0", kind, Df::Fp16, &[data, out], &mut sym, None).unwrap_or_else(|e| {
+    let ops = reduce(
+        "attn_bmax_g0",
+        kind,
+        Df::Fp16,
+        &[data, out],
+        &mut sym,
+        Some(&layout),
+    )
+    .unwrap_or_else(|e| {
         panic!(
-            "{kind:?} [{rows}, {cols}]: the door must lower it: {}",
+            "{kind:?} [{rows}, {cols}]: the door must lower it through the real placement: {}",
             e.message
         )
-    })
+    });
+    (ops, layout)
 }
 
 /// The door test's own region spelling.
@@ -326,53 +395,5 @@ fn write_layout_cell(
         ));
     }
     s.push_str("  ],\n  \"scalarmul_scales\": [\n  ]\n}\n");
-    std::fs::write(dir.join("placements.json"), s).unwrap();
-}
-
-/// Write the bundle for a bare-reduce door twin: the REDUCE'S OWN PLACEMENT LAW, which is
-/// the law the door's no-layout arm itself addresses with — the door is called with no
-/// `BundleLayout` (the door test's own spelling; a bare reduce has no SubtileIR, so
-/// `compute_bundle_layout` cannot place it), and that arm places each arg in its OWN
-/// 16 GiB segment keyed by `arg_index` (wire.rs `SEGMENT_OFFSETS`/`segment_base`, 16 GiB
-/// stride): the data is `op.args[0]` → segment 0 at `DevOff::ZERO`, the accum is
-/// `op.args[1]` → segment 1 at `DevOff::ZERO`. The run-2 hand layout put both back to
-/// back in the intermediate segment, so the device's store to the ACCUM's own address
-/// (`0x4_0000_0100` — segment 1, the second row-stick) hit a region the launch sized for
-/// the data alone and the card rejected the run (`HMI=STORE … scheduler rejected
-/// submission`). The extents are the door's own handle law (`win_reduce_data` /
-/// `win_reduce_accum`, the mint tests in `zz_a_reduce_windows_refuse_at_the_mint.rs`): the
-/// data at its STICK-PADDED swept width, the accum at ONE STICK PER ROW. The accum is
-/// labeled `Logits` (the role the runtime's launcher demands of the read-back tensor). No
-/// synthetics: the twin is single-shot.
-fn write_reduce_cell(
-    dir: &std::path::Path,
-    ops: &Vec<ktir_superdsc::emit::EmittedOp>,
-    rows: u32,
-    cols: u32,
-) {
-    superdsc::write_dxp_input(dir, ops, superdsc::FoldGrouping::Split)
-        .unwrap_or_else(|e| panic!("{}: write_dxp_input: {e}", dir.display()));
-    let sticks = cols.div_ceil(64) as u64;
-    let data_bytes = rows as u64 * sticks * 64 * 2;
-    let accum_bytes = rows as u64 * 64 * 2;
-    // ⛔ PER-ARG SEGMENTS, at the offsets the emitted descriptor itself names: data (arg 0)
-    // at segment 0 offset 0, accum (arg 1) at segment 1 offset 0. Any other layout is a
-    // disagreement with the door's own addressing, and the card rejects it.
-    let mut seg_bytes = [0u64; scratchy_target_spyre::bundle_code::NUM_SEGMENTS];
-    seg_bytes[0] = data_bytes;
-    seg_bytes[1] = accum_bytes;
-    let s = format!(
-        "{{\n  \"segment_bytes\": [{}],\n  \"places\": [\n\
-         \x20   {{\"tid\": {REDUCE_DATA_TID}, \"role\": \"Activation\", \"segment\": 0, \
-         \"bank\": 0, \"offset\": 0, \"size\": {data_bytes}}},\n\
-         \x20   {{\"tid\": {REDUCE_OUT_TID}, \"role\": \"Logits\", \"segment\": 1, \
-         \"bank\": 0, \"offset\": 0, \"size\": {accum_bytes}}}\n\
-         \x20 ],\n  \"synth\": [\n  ],\n  \"scalarmul_scales\": [\n  ]\n}}\n",
-        seg_bytes
-            .iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(", "),
-    );
     std::fs::write(dir.join("placements.json"), s).unwrap();
 }
