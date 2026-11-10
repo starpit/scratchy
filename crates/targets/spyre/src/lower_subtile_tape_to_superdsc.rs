@@ -6852,11 +6852,15 @@ fn audit_op_work<T: ktir_superdsc::collective::Tp>(ops: &[EmittedOp<T>], fp: &st
 ///
 /// `attn_params` is [`RolledSuperDsc::attn_params`] — the four attention facts no KTIR states, which
 /// main's own walk held as parameters. It is `None` for a bundle with no attention node.
+///
+/// `query_rows` is the extent pair the graph was lowered at — the request facts the ops cannot state.
+/// It reaches the fingerprint ([`bundle_fp`]) and nothing else: the layout was already computed from it.
 pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     dump: DumpRoot<'_>,
 ) -> std::io::Result<String> {
     // ⭐ EVERY LOOP COUNT IN THESE OPS IS DECIDED. Prove they terminate and do work before emitting.
@@ -6868,7 +6872,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     // nothing to do. The ladder's ceiling rung IS the body, so this fires on every rolled model.
     let fp = {
         let _pc = crate::pc::Pc::start("fp");
-        bundle_fp(ops, fold, attn_params)
+        bundle_fp(ops, fold, attn_params, query_rows)
     };
     // ⛔ THE CHECK AND THE EMIT ARE ONE STEP PER FINGERPRINT. Ladder rungs bake in parallel, and two
     // rungs can be one program: a decode batch pads its walk to whole chunks, so at two sequences
@@ -6885,7 +6889,7 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
     }
     let b = {
         let _pc = crate::pc::Pc::start("inner");
-        emit_bundle_inner(ops, layout, fold, attn_params, dump)?
+        emit_bundle_inner(ops, layout, fold, attn_params, query_rows, dump)?
     };
     debug_assert_eq!(
         b.fp, fp,
@@ -6914,13 +6918,31 @@ pub fn emit_bundle<T: ktir_superdsc::collective::Tp>(
 /// [`emit_bundle`] returns the FIRST rung's body for all of them, and a 16-page context runs a 1-page
 /// chunk: clean bake, no fault, every key past slot 256 silently unread. Appended only when present, so
 /// every bundle without a chunk keeps its fingerprint byte for byte.
+///
+/// ⛔⛔⛔ AND THE PACKED REQUEST PAIR, FOR THE SAME REASON. A packed prefill rung's pre/suffix groups are
+/// BIT-IDENTICAL to the solo rung's at the same rows — the graph runs `width · seqs` rows either way —
+/// but the LAYOUT differs: `compute_bundle_layout` sizes the per-request regions and the KV stride off
+/// the pair, and the baked image differs with them. Hashed without it, the two rungs fingerprint alike,
+/// the content-addressed early-out in [`emit_bundle`] serves whichever rung baked first to BOTH, and the
+/// bake races — one rung silently runs the other's layout. Appended only when both halves exceed one (a
+/// solo prefill's rows state their own width; a decode batch's rows state their own count), so every
+/// bundle today keeps its fingerprint byte for byte.
 fn bundle_fp<T: ktir_superdsc::collective::Tp>(
     ops: &[EmittedOp<T>],
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
 ) -> String {
+    use std::hash::{Hash, Hasher};
     let _ = attn_params;
-    let base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
+    let mut base = bundle_fingerprint_grouped(ops, FoldGrouping::Split);
+    if query_rows.per_request().get() > 1 && query_rows.requests().get() > 1 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        "packed-prefill-pair".hash(&mut h);
+        query_rows.per_request().get().hash(&mut h);
+        query_rows.requests().get().hash(&mut h);
+        base = format!("{base}p{:016x}", h.finish());
+    }
     match fold {
         FoldGrouping::Split => base,
         FoldGrouping::Fused => format!("{base}f"),
@@ -7161,6 +7183,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
     layout: Option<&BundleLayout>,
     fold: FoldGrouping,
     attn_params: Option<crate::ktir_superdsc_door::BundleAttnParams>,
+    query_rows: scratchy_subtile::sdsc_abstract::QueryExtent,
     dump: DumpRoot<'_>,
 ) -> std::io::Result<EmittedBundle<T>> {
     // ── GUARD #14 (a VERIFICATION since task #50, not a refusal of time-tiling): across an op's
@@ -7178,7 +7201,7 @@ fn emit_bundle_inner<T: ktir_superdsc::collective::Tp>(
         )));
     }
 
-    let fp = bundle_fp(ops, fold, attn_params);
+    let fp = bundle_fp(ops, fold, attn_params, query_rows);
     let kept: Vec<&EmittedOp<T>> = ops_for_grouping(ops, fold);
     let filtered: Vec<EmittedOp<T>>;
     let ops: &[EmittedOp<T>] = if kept.len() == ops.len() {

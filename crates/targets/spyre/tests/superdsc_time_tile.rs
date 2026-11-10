@@ -970,6 +970,15 @@ fn an_unbatched_fp16_matmul_is_one_descriptor() {
         Some(&layout),
         superdsc::FoldGrouping::Split,
         None,
+        // Same pair as the lowering above: 64 requests of one row. One row per request, so the
+        // fingerprint appends nothing — this bundle's name is byte-for-byte what it was.
+        scratchy_subtile::sdsc_abstract::QueryExtent::of_baked_rung(
+            scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(1)
+                .expect("one row is nonzero"),
+            scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(64)
+                .expect("64 requests is nonzero"),
+        )
+        .expect("64 rows fit a u32"),
         superdsc::DumpRoot::NONE,
     );
     assert!(r.is_ok(), "the untiled matmul's bundle builds: {r:?}");

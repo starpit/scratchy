@@ -467,6 +467,7 @@ fn sharded_bundle(
         // The world's own ladders: every prompt length and live request count the one-rank world
         // serves, on this world's bundles.
         prefill_rungs: f.prefill_rungs,
+        packed_prefill_rungs: f.packed_prefill_rungs,
         decode_rungs: f.decode_rungs,
         prefill_prefix: f.prefill_prefix,
     };

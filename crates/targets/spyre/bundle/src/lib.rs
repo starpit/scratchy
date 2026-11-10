@@ -48,6 +48,59 @@ pub use inventory;
 use std::borrow::Cow;
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
+//  The prefill rung's own pair — a grid of its own
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// ⭐ THE PREFILL RUNG'S OWN PAIR — one request's chunk width, and how many requests the rung
+/// packs. The packed prefill ladder's key: a packed rung's graph runs `width · seqs` rows (the
+/// weights move once for the whole launch) while its attention serves one request's `width` rows
+/// per request — the pair those two facts need, and neither alone is.
+///
+/// ⛔ THE PAIR IS THE KEY, NOT EITHER HALF. A width handed where a capacity is read bakes a rung
+/// at `2·w` rows for one sequence and silently doubles every chunk; a capacity where a width is
+/// read packs a rung the launch cannot stage. [`Self::new`] is the only way in, at the bake's own
+/// ladder literal, so the halves cannot be swapped anywhere downstream — the same law [`RungSeqs`]
+/// states for the decode grid's axes.
+///
+/// `seqs == 1` is every prefill rung today (one request per chunk, however many positions it
+/// spans); the packed table's rungs state their own capacities from the decode batch ladder's
+/// values. The runtime mints its [`QueryExtent`](ktir_superdsc::sdsc_abstract::QueryExtent)-shaped
+/// facts FROM this pair at load — the bake names, the loader mints.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct PrefillRungPair {
+    width: u32,
+    seqs: u32,
+}
+
+impl PrefillRungPair {
+    /// The pair, from the bake's own ladder literal — the site that knows which rung this is.
+    pub const fn new(width: u32, seqs: u32) -> PrefillRungPair {
+        PrefillRungPair { width, seqs }
+    }
+
+    /// One request's chunk width — the attention kernel's per-request extent.
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// How many requests the rung packs.
+    pub const fn seqs(self) -> u32 {
+        self.seqs
+    }
+
+    /// The graph's row count — `width · seqs`, held as the rung's own one statement so no reader
+    /// re-derives it (a product a later reader recomputed could disagree with the one the bake
+    /// lowered at). A pair whose product does not fit a `u32` is a bake bug; it refuses here,
+    /// by name, rather than truncating.
+    pub const fn graph_rows(self) -> u32 {
+        match self.width.checked_mul(self.seqs) {
+            Some(rows) => rows,
+            None => panic!("PrefillRungPair: graph rows overflow u32 — a bake bug"),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
 //  The two axes of the rung grid
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 

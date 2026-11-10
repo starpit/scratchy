@@ -12,7 +12,7 @@ use std::path::Path;
 /// Re-exported rather than redeclared: the BAKED ladder ([`crate::bundle_code::LadderRung`]) is keyed by
 /// `SweptCols` and this manifest's `decode_rungs` by `RungSeqs`, and a second definition of either would
 /// be a second way to spell the same count — which is exactly how the two axes became interchangeable.
-pub use crate::bundle_code::{RungSeqs, SweptCols};
+pub use crate::bundle_code::{PrefillRungPair, RungSeqs, SweptCols};
 
 /// One decode batch rung's OWN staged constants — `(tid, kind)` at the rung's
 /// own `rows` (see [`SengraphBundleGroup::decode_rungs`]).
@@ -230,6 +230,23 @@ pub struct SengraphBundleGroup {
     ///
     /// EMPTY ⇒ no ladder; the worker uses [`prefill`](Self::prefill) at its baked width.
     pub prefill_rungs: &'static [(u32, &'static str)],
+    /// PACKED PREFILL LADDER `[(pair, sentinel)]`, ascending by `(width, seqs)` — the rungs that
+    /// pack SEVERAL requests into ONE graph.
+    ///
+    /// ⛔ A SEPARATE LIST, NOT A WIDER `prefill_rungs`: the solo ladder's consumers select by a
+    /// chunk's token count alone (`position(|r| r.0 >= n)`), so a packed rung on that ladder would
+    /// be selectable by a SOLO chunk wider than every solo rung — one request on a graph whose
+    /// attention relaunches `seqs` times over other requests' tables. The packed list is selected
+    /// by the pair (`(max chunk width, live count)`), and a solo launch can never see it.
+    ///
+    /// A packed rung `(w, S)` runs its graph at `w·S` rows — the weights move once for every
+    /// request — while its attention span serves ONE request's `w` rows per relaunch, `S`
+    /// relaunches by the span law (`Requests` on `LaunchWhere`). Its width axis `S` takes the
+    /// decode batch ladder's own values; `S = 1` is every rung of [`prefill_rungs`](Self::prefill_rungs),
+    /// which stays this list's exclusive floor.
+    ///
+    /// EMPTY ⇒ no packed ladder; the worker serves every prefill request solo (every model today).
+    pub packed_prefill_rungs: &'static [(PrefillRungPair, BundleSentinel)],
     /// DECODE BATCH LADDER `[(seqs, sentinel)]`, ascending — the request counts the decode bundle is
     /// baked at.
     ///

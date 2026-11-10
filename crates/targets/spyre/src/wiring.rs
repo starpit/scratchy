@@ -2003,6 +2003,12 @@ pub struct TpForward<T: crate::bundle_code::collective::World> {
         crate::manifest::RungLoadConsts,
     )],
     pub prefill_prefix: &'static [(u32, &'static str)],
+    /// The world's packed prefill rungs, as the one-rank bundle group carries its own
+    /// ([`crate::manifest::SengraphBundleGroup::packed_prefill_rungs`]).
+    pub packed_prefill_rungs: &'static [(
+        crate::manifest::PrefillRungPair,
+        crate::manifest::BundleSentinel,
+    )],
     /// Their launch wirings, numbered by the rank-local forwards' own tensor ids.
     pub wirings: Wirings,
     /// Per source of the one-rank forward (same indices): the slice each rank loads.
