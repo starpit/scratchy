@@ -825,15 +825,28 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         self.stage_step_acts(activations, activations_f16, activations_i32)?;
-        self.run_staged_step(n_new, seq_pos, logits)
+        // One request — these are the general doors; a packed launch states its own count and
+        // pitch through [`Self::run_staged_step`] directly.
+        self.run_staged_step(
+            n_new,
+            seq_pos,
+            crate::fold_plan::Requests::default(),
+            logits,
+        )
     }
 
     /// Run the step whatever the shadow holds — every input already staged
     /// ([`Self::stage_step_acts`] / [`Self::stage_step_acts_seeded`]).
+    ///
+    /// `requests` is the launch's own request facts ([`crate::fold_plan::Requests`]): how many
+    /// requests this forward serves, and the pitch their staged tables sit at. A packed prefill
+    /// launch is the one caller that states more than the default — its attention span relaunches
+    /// once per request by the count, each relaunch reading request `r`'s tables at `r · pitch`.
     pub fn run_staged_step(
         &mut self,
         n_new: usize,
         seq_pos: usize,
+        requests: crate::fold_plan::Requests,
         logits: StepLogits,
     ) -> Result<Option<Vec<f32>>> {
         let (n_new, seq_pos) = (NewTokens(n_new as i64), SeqPos(seq_pos as i64));
@@ -844,7 +857,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> SuperDscSession<'c, T> {
         };
         // ⭐ EVERY CARD SUBMITS BEFORE ANY CARD IS WAITED ON — a rank's collective waits on its
         // peers' sends, so the forward is in flight on all of them before the host drains one.
-        let submitted = self.each_parallel(|e| e.predict_submit(n_new, seq_pos, want))?;
+        let submitted = self.each_parallel(|e| e.predict_submit(n_new, seq_pos, want, requests))?;
         let mut row = vec![0u8; self.vocab * 2];
         for ((r, e), s) in self.ranks.iter_mut().zip(submitted) {
             // Rank 0 reads the row back; every other rank's forward is drained, its read the same

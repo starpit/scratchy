@@ -240,7 +240,25 @@ pub(crate) fn run_card_launch(
         .wiring
         .paged
         .ok_or_else(|| werr("this bundle states no paged step — its attention has no pools"))?
-        .on_body(width.get(), rows_in.paged_rows(), swept)
+        .on_body(
+            width.get(),
+            rows_in.paged_rows(),
+            swept,
+            // ⭐ THE LAUNCH'S OWN PAIR, by its kind's law — this front launches one chunk's
+            // rows (a `Sequence` of one request, a `Batch` of one row per request). The
+            // packed prefill front states its rung's own `(w, S)` pair instead, keyed on
+            // the packed ladder; `on_body`'s agreement check pins whichever arrives to the
+            // rows the graph runs.
+            scratchy_target_spyre::wiring::PagedStep::kind_extent(
+                rows_in.paged_rows(),
+                width.get(),
+            )
+            .ok_or_else(|| {
+                werr(format!(
+                    "card launch: the {mq}-row rung names no launch extent of its own kind"
+                ))
+            })?,
+        )
         .ok_or_else(|| {
             werr(format!(
                 "card launch: the body sweeps {swept} slot(s), which is no walk of this bundle's pool"
@@ -496,7 +514,16 @@ pub(crate) fn run_card_launch(
         // A middle prompt chunk: no suffix runs and nothing is read back.
         (LogitsWanted::None, _) => {
             pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::Discarded))
+                // One request — this front launches one chunk at a time today; the packed
+                // prefill front states the launch's own count and pitch here, the same door.
+                .and_then(|()| {
+                    pf.run_staged_step(
+                        mq,
+                        seq_pos,
+                        scratchy_target_spyre::fold_plan::Requests::default(),
+                        StepLogits::Discarded,
+                    )
+                })
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"
@@ -509,7 +536,15 @@ pub(crate) fn run_card_launch(
         // stick comes back raw, exactly like a decode's.
         (LogitsWanted::LastRow, Some((seat, seat_width))) => {
             pf.stage_step_acts_seeded(&acts, &[], &acts_i32, &seeds)
-                .and_then(|()| pf.run_staged_step(mq, seq_pos, StepLogits::LeftOnDevice))
+                // One request, as above: this front's launch is one chunk's rows.
+                .and_then(|()| {
+                    pf.run_staged_step(
+                        mq,
+                        seq_pos,
+                        scratchy_target_spyre::fold_plan::Requests::default(),
+                        StepLogits::LeftOnDevice,
+                    )
+                })
                 .map_err(|e| {
                     werr(format!(
                         "superdsc prefill run_step (mq={mq}, at={seq_pos}): {e}"

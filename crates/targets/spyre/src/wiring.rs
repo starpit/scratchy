@@ -689,8 +689,9 @@ pub struct PagedStep {
     /// checks against the graph ([`QueryExtent`]'s own doc). The pair's held product IS
     /// `rows` — the two are one fact in two spellings, pinned at the one mint
     /// ([`crate::lower_subtile_tape_to_ktir::paged_step_of_ir`]'s agreement check) and maintained
-    /// by [`Self::on_body`]'s own re-mint, so a `PagedStep` can never carry a pair its rows
-    /// disagree with.
+    /// by [`Self::on_body`]'s agreement check (the caller states the launch's own pair, and a
+    /// pair whose product is not `rows` is refused), so a `PagedStep` can never carry a pair its
+    /// rows disagree with.
     pub extent: QueryExtent,
 }
 
@@ -878,30 +879,53 @@ impl PagedStep {
     /// `swept` slots, whole pages for every body (a `walk_buckets` rung, or the ceiling's walk).
     /// `None` when `swept` is no walk of this pool.
     ///
-    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, by the launch's own kind — never a comparison
-    /// against the wiring's stated pair. The wiring states ONE representative of a tape the
-    /// ladders bake at several widths (the prefill ladder's rungs all bind the same tensor ids,
-    /// so one wiring serves them; `rows` here is the rung actually launching), and the runtime
-    /// truth is what the launch itself is: a `Sequence` launch is ONE request of `rows` rows —
-    /// `(rows, 1)` — and a `Batch` launch is one row per request — `(1, rows)`. Both are the
-    /// same law the bake's codegen minted each rung's own pair by, so a launch on the
-    /// representative's own width re-derives the wiring's pair exactly.
+    /// ⭐ THE EXTENT IS THE LAUNCH'S OWN PAIR, STATED BY THE CALLER — never a comparison against
+    /// the wiring's stated pair, and never a derivation from `rows`. The wiring states ONE
+    /// representative of a tape the ladders bake at several widths (the prefill ladder's rungs
+    /// all bind the same tensor ids, so one wiring serves them; `rows` here is the rung actually
+    /// launching), and the runtime truth is what the launch itself is. A launch of this step's
+    /// OWN kind states its pair by the kind's law ([`PagedRows::launch_extent`]: a `Sequence`
+    /// launch is ONE request of `rows` rows — `(rows, 1)` — and a `Batch` launch one row per
+    /// request — `(1, rows)`); a PACKED prefill launch states its rung's own `(w, S)` pair,
+    /// keyed on the packed ladder, because `w·S` graph rows do not name that pair without a
+    /// division the mint's law forbids. The agreement check below is the one law that binds
+    /// the stated pair to the rows the graph runs: a pair whose product is not `rows` names a
+    /// launch this step cannot serve, and `None` says so by name at the caller.
+    /// ⭐ THE KIND'S OWN EXTENT LAW — the pair a launch of this step's kind at `rows` GRAPH rows
+    /// runs: a `Sequence` launch is ONE request of `rows` rows — `(rows, 1)` — and a `Batch`
+    /// launch one row per request — `(1, rows)`. This is the one statement of that law (moved
+    /// out of `on_body`'s old body when the pair became a parameter): the internal walk proofs
+    /// and every solo launch state their pair by it, minted by the same constructor the bake's
+    /// codegen minted each rung's own pair by.
+    ///
+    /// ⛔ A PACKED prefill launch states its OWN pair instead — its rung's `(w, S)`, keyed on
+    /// the packed ladder — because `w · S` graph rows do not name that pair without a division
+    /// the mint's law forbids ([`QueryExtent`]'s own doc). The launch hands the stated pair to
+    /// [`PagedStep::on_body`], whose agreement check pins it to the rows the graph runs.
+    pub fn kind_extent(paged_rows: crate::paged_step::PagedRows, rows: u32) -> Option<QueryExtent> {
+        match paged_rows {
+            crate::paged_step::PagedRows::Sequence => {
+                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)
+            }
+            crate::paged_step::PagedRows::Batch => {
+                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)
+            }
+        }
+    }
+
     pub fn on_body(
         self,
         rows: u32,
         paged_rows: crate::paged_step::PagedRows,
         swept: u32,
+        extent: QueryExtent,
     ) -> Option<PagedStep> {
         let walk = swept / self.page_slots;
-        let extent = match paged_rows {
-            crate::paged_step::PagedRows::Sequence => {
-                QueryExtent::of_baked_rung(RungWidth::of_baked_rows(rows)?, RungCap::ONE)?
-            }
-            crate::paged_step::PagedRows::Batch => {
-                QueryExtent::of_baked_rung(RungWidth::ONE, RungCap::of_baked_seqs(rows)?)?
-            }
-        };
-        (rows > 0 && walk > 0 && swept.is_multiple_of(self.page_slots) && walk <= self.pages)
+        (rows > 0
+            && extent.graph_rows().get() == rows
+            && walk > 0
+            && swept.is_multiple_of(self.page_slots)
+            && walk <= self.pages)
             .then_some(PagedStep {
                 rows,
                 paged_rows,
@@ -1971,6 +1995,14 @@ pub struct Wirings {
     pub decode: Wiring,
     /// `None` when the model bakes no batched-prefill program.
     pub prefill: Option<Wiring>,
+    /// ⭐ THE PACKED RUNGS' OWN WIRINGS, keyed by the pair each baked at. The solo
+    /// `prefill` slot serves ONE request — its seat states the folded single row and
+    /// its tensor shapes are one request's — so a packed launch under it would bind
+    /// one row of an S-row seat. Each packed rung's bake stamps its own wiring here,
+    /// matched BY PAIR to `SengraphBundleGroup::packed_prefill_rungs`: the expansion
+    /// refuses a pair on one list and not the other, so the join is total or the
+    /// BUILD fails — never a load-time guess over an index.
+    pub packed_prefill: &'static [(crate::manifest::PrefillRungPair, Wiring)],
 }
 
 /// How each rank loads a source — the shared analysis's slice law, re-exported so the tokens

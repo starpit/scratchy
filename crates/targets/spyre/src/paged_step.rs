@@ -94,7 +94,10 @@ pub fn prove_ladder_walks(
                  reach it"
             ));
         }
-        if step.on_body(step.rows, step.paged_rows, swept).is_none() {
+        if step
+            .on_body(step.rows, step.paged_rows, swept, step.extent)
+            .is_none()
+        {
             return Err(format!(
                 "a step reaching {p} position(s) selects rung {at}, whose {swept}-slot sweep is no \
                  walk of the {}-page pool ({} slots a page) — the worker has no walk to stage",
@@ -987,7 +990,7 @@ mod tests {
             for p in 1..=u64::from(top) {
                 let (_, rung) = ladder.rung_for(p);
                 if !rung.active_cap.covers(p)
-                    || s.on_body(s.rows, s.paged_rows, rung.active_cap.get())
+                    || s.on_body(s.rows, s.paged_rows, rung.active_cap.get(), s.extent)
                         .is_none()
                 {
                     return Err(format!("{p}"));
@@ -1538,7 +1541,13 @@ mod tests {
             };
             for walk in [1, 2, 4] {
                 let body = full
-                    .on_body(rows, PagedRows::Sequence, walk * full.page_slots)
+                    .on_body(
+                        rows,
+                        PagedRows::Sequence,
+                        walk * full.page_slots,
+                        PagedStep::kind_extent(PagedRows::Sequence, rows)
+                            .expect("the fixture's row count is nonzero"),
+                    )
                     .unwrap();
                 let st = StepRows {
                     start: 0,
@@ -1562,7 +1571,13 @@ mod tests {
         };
         for walk in [1, 2, 3, 8, 16] {
             let body = full
-                .on_body(4, PagedRows::Batch, walk * full.page_slots)
+                .on_body(
+                    4,
+                    PagedRows::Batch,
+                    walk * full.page_slots,
+                    PagedStep::kind_extent(PagedRows::Batch, 4)
+                        .expect("the fixture's request count is nonzero"),
+                )
                 .unwrap();
             let blocks: Vec<u32> = (0..walk).collect();
             let seqs = [BatchSeq {
@@ -1829,18 +1844,26 @@ mod tests {
     }
 
     /// A body's step walks the whole pages its sweep covers, and a sweep that is no walk of the pool
-    /// names no step. ⭐ AND THE BODY'S EXTENT — a body's step states the LAUNCH's own extent
-    /// pair, by the launch's kind: a `Sequence`
-    /// launch is one request of `rows` rows — `(rows, 1)` — whatever width the wiring's own
-    /// pair names (the ladders bake one tape at several widths under one wiring, and `rows` is
-    /// the rung actually launching — the worker's chunk ladder stages a narrow chunk under the
-    /// shared wiring every prompt), and a `Batch` launch is one row per request — `(1, rows)`.
-    /// Both are the same law the bake's codegen minted each rung's own pair by, so a launch on
-    /// the wiring's own width re-derives the wiring's pair exactly.
+    /// names no step. ⭐ AND THE BODY'S EXTENT — the CALLER states the launch's own extent pair
+    /// and `on_body` agrees it with the rows: a solo launch of this step's kind states its pair
+    /// by the kind's law (`PagedStep::kind_extent`: a `Sequence` launch is one request of
+    /// `rows` rows — `(rows, 1)` — and a `Batch` launch one row per request — `(1, rows)`),
+    /// whatever width the wiring's own pair names (the ladders bake one tape at several widths
+    /// under one wiring, and `rows` is the rung actually launching — the worker's chunk ladder
+    /// stages a narrow chunk under the shared wiring every prompt); a packed launch states its
+    /// rung's own `(w, S)` pair. A stated pair whose product is not `rows` names no step.
     #[test]
     fn a_body_steps_at_its_own_walk() {
         let s = step();
-        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        let body = s
+            .on_body(
+                3,
+                PagedRows::Sequence,
+                8,
+                PagedStep::kind_extent(PagedRows::Sequence, 3)
+                    .expect("the fixture's row count is nonzero"),
+            )
+            .unwrap();
         assert_eq!((body.rows, body.walk, body.reach()), (3, 2, 8));
         assert_eq!(
             (
@@ -1858,7 +1881,15 @@ mod tests {
             extent: pair(3, 2),
             ..step()
         };
-        let body = wide.on_body(4, PagedRows::Sequence, 8).unwrap();
+        let body = wide
+            .on_body(
+                4,
+                PagedRows::Sequence,
+                8,
+                PagedStep::kind_extent(PagedRows::Sequence, 4)
+                    .expect("the fixture's row count is nonzero"),
+            )
+            .unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1872,7 +1903,15 @@ mod tests {
             extent: pair(1, 1),
             ..step()
         };
-        let body = decode.on_body(4, PagedRows::Batch, 8).unwrap();
+        let body = decode
+            .on_body(
+                4,
+                PagedRows::Batch,
+                8,
+                PagedStep::kind_extent(PagedRows::Batch, 4)
+                    .expect("the fixture's request count is nonzero"),
+            )
+            .unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1881,7 +1920,15 @@ mod tests {
             (1, 4),
             "a batch launch is one row per request"
         );
-        let body = s.on_body(3, PagedRows::Sequence, 8).unwrap();
+        let body = s
+            .on_body(
+                3,
+                PagedRows::Sequence,
+                8,
+                PagedStep::kind_extent(PagedRows::Sequence, 3)
+                    .expect("the fixture's row count is nonzero"),
+            )
+            .unwrap();
         assert_eq!(
             (
                 body.extent.per_request().get(),
@@ -1890,16 +1937,47 @@ mod tests {
             (3, 1),
             "a launch on the wiring's own width re-derives its pair"
         );
+        // ⛔ A STATED PAIR THAT DISAGREES WITH THE ROWS NAMES NO STEP — the agreement law that
+        // binds the caller's pair to the graph the rung runs.
         assert!(
-            s.on_body(3, PagedRows::Sequence, 6).is_none(),
+            s.on_body(3, PagedRows::Sequence, 8, pair(2, 1)).is_none(),
+            "a pair whose product is not the rung's rows"
+        );
+        assert!(
+            s.on_body(
+                3,
+                PagedRows::Sequence,
+                6,
+                PagedStep::kind_extent(PagedRows::Sequence, 3)
+                    .expect("the fixture's row count is nonzero")
+            )
+            .is_none(),
             "not whole pages"
         );
-        assert!(s.on_body(3, PagedRows::Sequence, 0).is_none());
         assert!(
-            s.on_body(3, PagedRows::Sequence, 20).is_none(),
+            s.on_body(
+                3,
+                PagedRows::Sequence,
+                0,
+                PagedStep::kind_extent(PagedRows::Sequence, 3)
+                    .expect("the fixture's row count is nonzero")
+            )
+            .is_none()
+        );
+        assert!(
+            s.on_body(
+                3,
+                PagedRows::Sequence,
+                20,
+                PagedStep::kind_extent(PagedRows::Sequence, 3)
+                    .expect("the fixture's row count is nonzero")
+            )
+            .is_none(),
             "past the pool"
         );
-        assert!(s.on_body(0, PagedRows::Sequence, 8).is_none());
+        // Zero rows refuses on the rows themselves — no pair minted for it (the mint's own law),
+        // so the fixture states a disagreeing one.
+        assert!(s.on_body(0, PagedRows::Sequence, 8, pair(1, 1)).is_none());
     }
 
     #[test]

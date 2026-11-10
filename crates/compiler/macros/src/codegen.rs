@@ -9309,6 +9309,62 @@ fn ladder_lits(
     (prefill, packed, decode, prefix)
 }
 
+/// ⭐ THE PACKED RUNGS' OWN WIRINGS, as tokens — one `(PrefillRungPair, Wiring)` per baked
+/// packed rung, for a [`Wirings`](scratchy_target_spyre::wiring::Wirings)'s `packed_prefill`
+/// field. Rendered beside `ladder_lits` from the same world's cells, sorted and deduped by the
+/// pair exactly as its packed ladder is, so the two lists walk in the same order.
+///
+/// ⛔ THE JOIN IS TOTAL OR THE BUILD FAILS — HERE, AT THE EXPANSION, never at load. Every
+/// packed rung's bake stamps its own wiring (the solo prefill slot serves ONE request: its
+/// seat states the folded single row, so a packed launch under it would bind one row of an
+/// S-row seat), so a pair on the rung list and not the wiring list means a bake stamped its
+/// rung without its wiring — a loader left to guess would bind the solo seat, which is the
+/// silent-wrong this check exists to refuse while it is still a build error.
+#[cfg(feature = "spyre")]
+fn packed_wiring_lits(
+    packed_prefill_rungs: &[(u32, u32, String)],
+    packed_wirings: &[(u32, u32, proc_macro2::TokenStream)],
+) -> Vec<proc_macro2::TokenStream> {
+    let mut wirings = packed_wirings.to_vec();
+    wirings.sort_by_key(|(w, s, _)| (*w, *s));
+    wirings.dedup_by_key(|(w, s, _)| (*w, *s));
+    let rung_pairs: std::collections::BTreeSet<(u32, u32)> = packed_prefill_rungs
+        .iter()
+        .map(|(w, s, _)| (*w, *s))
+        .collect();
+    let wiring_pairs: std::collections::BTreeSet<(u32, u32)> =
+        wirings.iter().map(|(w, s, _)| (*w, *s)).collect();
+    if rung_pairs != wiring_pairs {
+        let show = |p: &std::collections::BTreeSet<(u32, u32)>| {
+            p.iter()
+                .map(|(w, s)| format!("({w} rows × {s} requests)"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        panic!(
+            "[spyre] the packed prefill rungs and their wirings disagree — rungs [{}] against \
+             wirings [{}]. Every packed rung's bake stamps its own wiring at the same site it \
+             stamps its rung, so a pair on one list and not the other is a bake bug; refuse \
+             rather than load a rung whose seat the loader must guess.",
+            show(&rung_pairs),
+            show(&wiring_pairs),
+        );
+    }
+    wirings
+        .iter()
+        .map(|(w, s, wiring)| {
+            let w = proc_macro2::Literal::u32_unsuffixed(*w);
+            let s = proc_macro2::Literal::u32_unsuffixed(*s);
+            quote! {
+                (
+                    ::scratchy_target_spyre::manifest::PrefillRungPair::new(#w, #s),
+                    #wiring,
+                )
+            }
+        })
+        .collect()
+}
+
 /// One load-const entry `(tid, kind)` as a token stream — the ONE renderer,
 /// shared by the wiring static (`emit_superdsc_wiring`) and every decode
 /// batch rung's OWN consts in the manifest (`decode_rung_lits`), so the two
@@ -11778,6 +11834,9 @@ fn dump_wavefront_mega(
         // `manifest::SengraphBundleGroup::packed_prefill_rungs`.
         let superdsc_packed_prefill_rungs: std::cell::RefCell<Vec<(u32, u32, String)>> =
             std::cell::RefCell::new(Vec::new());
+        // The packed rungs' own wiring tokens, one entry per baked pair (see `WorldBake`).
+        let superdsc_packed_wirings: std::cell::RefCell<Vec<(u32, u32, proc_macro2::TokenStream)>> =
+            std::cell::RefCell::new(Vec::new());
         // DECODE BATCH LADDER `[(seqs, body_fp)]` — one entry per width that actually LOWERED, never
         // an assumed list. The one-request rung is the bundle already stamped into `superdsc_fp`, so
         // every path that predates the ladder is unchanged; wider rungs only ever add entries.
@@ -11830,6 +11889,12 @@ fn dump_wavefront_mega(
             packed_prefill_rungs: &'w std::cell::RefCell<Vec<(u32, u32, String)>>,
             prefill_prefix_rungs: &'w std::cell::RefCell<Vec<(u32, String)>>,
             decode_rungs: &'w std::cell::RefCell<Vec<DecodeRungEntry>>,
+            // The PACKED rungs' own wirings `[(width, seqs, wiring tokens)]`, deduped on the
+            // pair like `packed_prefill_rungs`. A SEPARATE cell from `wiring` (never a wider
+            // entry of it) for the same reason the packed rung list is separate: the solo
+            // prefill slot serves one request, and a packed rung's seat and tensor shapes are
+            // its pair's own.
+            packed_wirings: &'w std::cell::RefCell<Vec<(u32, u32, proc_macro2::TokenStream)>>,
             wiring: &'w std::cell::RefCell<WiringPair>,
             fold_census: &'w std::cell::RefCell<WeightFoldCensus>,
             weight_seg_ledger: &'w std::cell::RefCell<Vec<(String, u64, Vec<u64>)>>,
@@ -11845,6 +11910,7 @@ fn dump_wavefront_mega(
             packed_prefill_rungs: &superdsc_packed_prefill_rungs,
             prefill_prefix_rungs: &superdsc_prefill_prefix_rungs,
             decode_rungs: &superdsc_decode_rungs,
+            packed_wirings: &superdsc_packed_wirings,
             wiring: &wiring_tokens,
             fold_census: &weight_fold_census,
             weight_seg_ledger: &weight_seg_ledger,
@@ -11856,6 +11922,8 @@ fn dump_wavefront_mega(
         let tp_packed_prefill_rungs = std::cell::RefCell::new(Vec::new());
         let tp_prefill_prefix_rungs = std::cell::RefCell::new(Vec::new());
         let tp_decode_rungs = std::cell::RefCell::new(Vec::new());
+        let tp_packed_wirings: std::cell::RefCell<Vec<(u32, u32, proc_macro2::TokenStream)>> =
+            std::cell::RefCell::new(Vec::new());
         let tp_wiring: std::cell::RefCell<WiringPair> = std::cell::RefCell::new((None, None));
         let tp_fold_census = std::cell::RefCell::new(None);
         let tp_weight_seg_ledger = std::cell::RefCell::new(Vec::new());
@@ -11866,6 +11934,7 @@ fn dump_wavefront_mega(
             packed_prefill_rungs: &tp_packed_prefill_rungs,
             prefill_prefix_rungs: &tp_prefill_prefix_rungs,
             decode_rungs: &tp_decode_rungs,
+            packed_wirings: &tp_packed_wirings,
             wiring: &tp_wiring,
             fold_census: &tp_fold_census,
             weight_seg_ledger: &tp_weight_seg_ledger,
@@ -11935,6 +12004,10 @@ fn dump_wavefront_mega(
         enum WiringSlot {
             Decode,
             Prefill,
+            // A PACKED rung's own slot: not a half of `wiring_tokens` but its own entry in
+            // `packed_wirings`, keyed by the pair this rung baked at (the fp law's twin —
+            // `BakeEffect::PrefillRung` carries the same pair to the rung list).
+            PackedPrefill { w: u32, s: u32 },
         }
         // `prefill_rung`: Some((width, seqs)) marks the PREFILL path AND carries the rung this bake
         // belongs to. `None` = decode.
@@ -12042,6 +12115,10 @@ fn dump_wavefront_mega(
                 // nothing, and the worker falls to its sequential per-token prefill
                 // (slower, never wrong).
                 let mut prefill_fp_stamped = false;
+                // The PACKED pair this call baked at, if any — set at the same site that
+                // pushes `BakeEffect::PrefillRung` for a seqs>1 rung (one statement of the
+                // pair, read at the wiring stamp below), never re-derived from rows.
+                let mut packed_pair: Option<(u32, u32)> = None;
                 let fused = scratchy_subtile::lower::fuse_silu_mul(&lwd.input);
                 let mut krg = scratchy_subtile::subtile_ir::lower_region(&fused, knb);
                 // ⭐⭐⭐ THE CHAINED HEAD'S WIDENING PASS — ABOVE every mint, tie-gated
@@ -13275,6 +13352,12 @@ fn dump_wavefront_mega(
                                                 seqs: s.get(),
                                                 fp: bfp.clone(),
                                             });
+                                            // The wiring stamp's own copy of the pair — stamped here,
+                                            // at the one site that knows the rung packed, so the
+                                            // stamp below states the same fact the effect did.
+                                            if s.get() > 1 {
+                                                packed_pair = Some((w.get(), s.get()));
+                                            }
                                             // ⛔ THE SINGLE-BUNDLE PREFILL SLOT SERVES ONE REQUEST —
                                             // its fp and its wiring describe a solo launch, which the
                                             // worker stages one chunk's rows through — so a packed rung
@@ -13448,7 +13531,18 @@ fn dump_wavefront_mega(
                     // the widest rung that actually lowered (`commit_bake` applies the
                     // calls' effects in that order however the rungs were baked).
                     let slot = if is_prefill {
-                        prefill_fp_stamped.then_some(WiringSlot::Prefill)
+                        // A PACKED rung stamps its OWN wiring (keyed by the pair), not the
+                        // solo prefill slot: its seat bakes S answer rows and its tensor
+                        // shapes are per-request regions, so the solo slot — seat rows = the
+                        // folded single row — would bind one row of an S-row seat. The pair
+                        // arrives from the rung-stamp site above, the same fact the
+                        // `PrefillRung` effect carried; a packed rung that did not bake
+                        // stamped neither (its `bfp.is_empty()` refusal fired first).
+                        if let Some((w, s)) = packed_pair {
+                            Some(WiringSlot::PackedPrefill { w, s })
+                        } else {
+                            prefill_fp_stamped.then_some(WiringSlot::Prefill)
+                        }
                     } else if seq_sym.is_none() && decode_rows == primary_m {
                         Some(WiringSlot::Decode)
                     } else {
@@ -13564,6 +13658,21 @@ fn dump_wavefront_mega(
                             Some(WiringSlot::Decode) => {
                                 s.0 = Some(w);
                                 bound.0 = Some(gk.scalarmul_scales.clone());
+                            }
+                            // ⛔ THE PACKED RUNG'S OWN WIRING, deduped on the pair like
+                            // `BakeEffect::PrefillRung`'s commit above — a rebake of the
+                            // same pair must not double-enter. Never the solo slots: the
+                            // emission joins this list to the packed rung list BY PAIR and
+                            // refuses a pair on one and not the other, so the loader's join
+                            // is total by construction.
+                            Some(WiringSlot::PackedPrefill {
+                                w: pair_w,
+                                s: pair_s,
+                            }) => {
+                                let mut r = world.packed_wirings.borrow_mut();
+                                if !r.iter().any(|(pw, ps, _)| *pw == pair_w && *ps == pair_s) {
+                                    r.push((pair_w, pair_s, w));
+                                }
                             }
                             None => {}
                         }
@@ -14832,6 +14941,12 @@ fn dump_wavefront_mega(
         // generated code naming a real field, the way metal's forward names
         // `wm.q_proj`, instead of a disk-key string resolved at load.
         {
+            // ⛔ THE PACKED JOIN CHECK runs for EVERY model, not only under a decode wiring:
+            // a bake that stamped packed rungs stamped their wirings, whatever else it did.
+            let packed_wirings = packed_wiring_lits(
+                &superdsc_packed_prefill_rungs.borrow(),
+                &superdsc_packed_wirings.borrow(),
+            );
             let (dec, pre) = &*wiring_tokens.borrow();
             if let Some(dec) = dec {
                 let pre = match pre {
@@ -14845,6 +14960,7 @@ fn dump_wavefront_mega(
                         ::scratchy_target_spyre::wiring::Wirings {
                             decode: #dec,
                             prefill: #pre,
+                            packed_prefill: &[#(#packed_wirings),*],
                         };
                 });
             }
@@ -14891,6 +15007,12 @@ fn dump_wavefront_mega(
                         &tp_packed_prefill_rungs.borrow(),
                         &tp_decode_rungs.borrow(),
                         &tp_prefill_prefix_rungs.borrow(),
+                    );
+                    // The sharded world's own packed wirings, joined to its own packed rungs
+                    // by pair — the same total-or-build-fails law as the one-rank world's.
+                    let tp_packed_wiring_lits = packed_wiring_lits(
+                        &tp_packed_prefill_rungs.borrow(),
+                        &tp_packed_wirings.borrow(),
                     );
                     let sources = sources.iter().map(|s| match s {
                         S::Whole => quote! { ::scratchy_target_spyre::wiring::SourceShard::Whole },
@@ -14946,6 +15068,7 @@ fn dump_wavefront_mega(
                             wirings: ::scratchy_target_spyre::wiring::Wirings {
                                 decode: #wiring,
                                 prefill: #prefill_wiring,
+                                packed_prefill: &[#(#tp_packed_wiring_lits),*],
                             },
                             sources: &[#(#sources),*],
                             world: ::core::marker::PhantomData,

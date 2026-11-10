@@ -2997,6 +2997,11 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // ⭐ WHICH WEIGHT BANK backs positional slot 1 for these launches. 0 for every unbanked
         // bundle, which is what makes banking invisible to every model whose weights fit one region.
         weight_bank: usize,
+        // ⭐ THE LAUNCH'S REQUEST FACTS — how many requests this forward serves and the pitch their
+        // tables sit at. Stated by the door the launch came in through (a packed prefill names its
+        // own; every one-request door passes [`fold_plan::Requests::default`]), never defaulted
+        // here: a launch that forgot its count would silently run one request's span.
+        requests: fold_plan::Requests,
     ) -> Result<()> {
         let d = Diag::get();
         // The list is taken out so `&self` stays free for the stream and the fold state; every op
@@ -3009,9 +3014,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             LaunchWhere {
                 byte_off,
                 weight_bank,
-                // One request — the count a packed prefill launch states is a later law's; every
-                // launch today serves one, and the span law is inert at one.
-                requests: fold_plan::Requests::default(),
+                requests,
             },
             d,
         );
@@ -4021,6 +4024,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         seq_pos: SeqPos,
         suffix: SuffixLaunch,
         d: &Diag,
+        requests: fold_plan::Requests,
     ) -> Result<ForwardHalf> {
         if !self.prepared {
             bail!("predict before prepare");
@@ -4068,7 +4072,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             && suffix == SuffixLaunch::Launched
             && self.try_replay_forward(seq_pos)?.is_some();
         if !replayed {
-            self.launch_forward(seq_pos, suffix)?;
+            self.launch_forward(seq_pos, suffix, requests)?;
         }
 
         if d.phase_time && !sharded {
@@ -4164,9 +4168,15 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// the bound activations, launch prefix → body×iters → suffix, and copy the logits row back.
     /// `logits` says what the caller does with this forward's logits ([`Logits`]): a prompt chunk
     /// whose logits nobody reads skips the suffix and the read-back both.
-    pub fn predict(&mut self, n_new: NewTokens, seq_pos: SeqPos, logits: Logits<'_>) -> Result<()> {
+    pub fn predict(
+        &mut self,
+        n_new: NewTokens,
+        seq_pos: SeqPos,
+        requests: fold_plan::Requests,
+        logits: Logits<'_>,
+    ) -> Result<()> {
         let want = LogitsRead::of(&logits);
-        let submitted = self.predict_submit(n_new, seq_pos, want)?;
+        let submitted = self.predict_submit(n_new, seq_pos, want, requests)?;
         self.predict_finish(submitted, logits)
     }
 
@@ -4180,6 +4190,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         n_new: NewTokens,
         seq_pos: SeqPos,
         want: LogitsRead,
+        requests: fold_plan::Requests,
     ) -> Result<PredictSubmitted> {
         let suffix = match want {
             LogitsRead::Discarded => SuffixLaunch::Skipped,
@@ -4187,7 +4198,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         };
         let d = Diag::get();
         let n_new = NewTokens(n_new.0.max(1));
-        let half = self.forward_half(n_new, seq_pos, suffix, d)?;
+        let half = self.forward_half(n_new, seq_pos, suffix, d, requests)?;
 
         // ── D2H the logits' segment, sen→IEEE the logits slice at its baked offset. ──
         // Skipped entirely when the caller wants no logits: only the LAST prefill chunk asks for
@@ -4357,7 +4368,16 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
     /// Stated here rather than silently dropped.
     pub fn submit_step(&mut self, n_new: NewTokens, seq_pos: SeqPos) -> Result<()> {
         let d = Diag::get();
-        let _half = self.forward_half(n_new, seq_pos, SuffixLaunch::Launched, d)?;
+        // One request, by the decode law: a decode batch's requests ride ONE launch of the batched
+        // kernel — its bundle's `per_request` span repeats once — so the count is 1 whatever the
+        // batch holds. A packed prefill launch is the only door that states more.
+        let _half = self.forward_half(
+            n_new,
+            seq_pos,
+            SuffixLaunch::Launched,
+            d,
+            fold_plan::Requests::default(),
+        )?;
         Ok(())
     }
 
@@ -4630,7 +4650,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
 
     /// The forward itself: prefix → body×iters → suffix (rolled), or the single body. `suffix` is
     /// [`SuffixLaunch::Skipped`] only for a forward whose logits are discarded ([`Logits`]).
-    fn launch_forward(&mut self, seq_pos: SeqPos, suffix: SuffixLaunch) -> Result<()> {
+    fn launch_forward(
+        &mut self,
+        seq_pos: SeqPos,
+        suffix: SuffixLaunch,
+        requests: fold_plan::Requests,
+    ) -> Result<()> {
         let zero = [0u64; NUM_SEGMENTS];
         let Some(rolled) = self.rolled.as_ref() else {
             // Not rolled: one body over the whole model.
@@ -4643,12 +4668,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             // region by construction (`bank_weight_segment` refuses to bank without layer classes),
             // so bank 0 is the only bank there is.
             let ls = self.list_sel_for(sel, 0);
-            return self.launch_ops(ls, zero, 0);
+            return self.launch_ops(ls, zero, 0, requests);
         };
         let pre_bank = rolled.prefix_weight_bank;
         let suf_bank = rolled.suffix_weight_bank;
 
-        self.launch_ops(ListSel::Prefix, zero, pre_bank)?;
+        self.launch_ops(ListSel::Prefix, zero, pre_bank, requests)?;
 
         // sk_bucket ladder: pick this token's decode body rung by its KV length (valid_len =
         // seq_pos+1 — positions [0..seq_pos] are filled, including the token just written to KV
@@ -4679,7 +4704,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             off[SEG_WEIGHT.get()] = woff;
             off[SEG_KV.get()] = kvoff;
             let ls = self.list_sel_for(sel, body);
-            self.launch_ops(ls, off, wbank as usize)?;
+            self.launch_ops(ls, off, wbank as usize, requests)?;
         }
         // NO HOST ROUTING: the loop-carried residual + the body→suffix seam thread IN-PLACE via
         // emitter placement aliasing (hidden_out/suffix_in aliased onto hidden_in's resident
@@ -4692,7 +4717,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
         // chunk at 512 rows, 2.11 at 256, run on every chunk though only the last chunk's logits
         // are ever sampled — 53 ms of a ~10k prompt's 20 chunks.
         match suffix {
-            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank),
+            SuffixLaunch::Launched => self.launch_ops(ListSel::Suffix, zero, suf_bank, requests),
             SuffixLaunch::Skipped => Ok(()),
         }
     }
@@ -4896,7 +4921,7 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             Some(r) => (ListSel::Prefix, r.prefix_weight_bank),
             None => (ListSel::Body(0), 0),
         };
-        self.launch_ops(sel, zero, bank)?;
+        self.launch_ops(sel, zero, bank, fold_plan::Requests::default())?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_prefix_only sync: {e}"))
@@ -4914,7 +4939,12 @@ impl<'c, T: ktir_superdsc::collective::Tp> Executor<'c, T> {
             return Ok(false);
         }
         self.refill_activations(Diag::get())?;
-        self.launch_forward(SeqPos(0), SuffixLaunch::Launched)?;
+        // The selftest serves one request — the packed launch's count is the serving door's.
+        self.launch_forward(
+            SeqPos(0),
+            SuffixLaunch::Launched,
+            fold_plan::Requests::default(),
+        )?;
         self.stream_ref()?
             .synchronize()
             .map_err(|e| anyhow!("run_full sync: {e}"))?;
