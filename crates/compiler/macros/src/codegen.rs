@@ -11333,6 +11333,39 @@ fn fuf_row_local_tail_op(op: OpKind) -> bool {
     )
 }
 
+/// ⭐ THE PREFILL RUNG'S OWN PAIR — `(per-request width, packed requests)` as the typed halves
+/// the bake closure's extent mint ([`scratchy_subtile::sdsc_abstract::QueryExtent`]) reads,
+/// handed over by the rung walks that know the rung they are baking. This is the follow-up the
+/// mint's own comment named — "the rung walks should hand the closure a `RungWidth` / `RungCap`
+/// directly" — because `prefill_mq` and `decode_rows` sat side by side as two bare `u32`s, and a
+/// width handed where a capacity is read bakes a rung at `2·w` rows for one sequence and
+/// silently doubles every chunk (the `RungCap` doc's own hazard). Typed apart at the seam, the
+/// halves cannot be swapped at any call site.
+///
+/// `RungCap::ONE` is every prefill rung today; the packed table (M2, the concurrent-prefill
+/// rung) states its own capacities — the decode batch ladder's own `BATCH_RUNGS` values. A half
+/// that does not name a bakeable rung is a bake bug — panicked HERE, by name, at the walk that
+/// asked for it.
+#[cfg(feature = "spyre")]
+fn prefill_rung_pair(
+    stem: &str,
+    width: u32,
+    seqs: u32,
+) -> (
+    scratchy_subtile::sdsc_abstract::RungWidth,
+    scratchy_subtile::sdsc_abstract::RungCap,
+) {
+    let w = scratchy_subtile::sdsc_abstract::RungWidth::of_baked_rows(width).unwrap_or_else(|| {
+        panic!("[spyre-superdsc] {stem}: prefill rung width {width} is not a bakeable row count")
+    });
+    let s = scratchy_subtile::sdsc_abstract::RungCap::of_baked_seqs(seqs).unwrap_or_else(|| {
+        panic!(
+            "[spyre-superdsc] {stem}: prefill rung capacity {seqs} is not a bakeable request count"
+        )
+    });
+    (w, s)
+}
+
 #[allow(clippy::too_many_arguments)]
 // `program` and `ktir_bundle_out` are only
 // read inside the spyre cfg block below; without that feature the
@@ -11764,8 +11797,8 @@ fn dump_wavefront_mega(
             Decode,
             Prefill,
         }
-        // `prefill_mq`: Some(mq) marks the PREFILL path AND carries the concrete query-row count the
-        // tape was lowered at — the ladder rung this bake belongs to. `None` = decode.
+        // `prefill_rung`: Some((width, seqs)) marks the PREFILL path AND carries the rung this bake
+        // belongs to. `None` = decode.
         // ⭐ ONE BAKE BODY, STAMPED PER WORLD. A bake's ops, launch groups and bundle are its
         // world's types and a closure cannot be generic, so the body is stated ONCE here and
         // instantiated for each world this expansion bakes: the one-rank forward's (`TpWorld<1>`)
@@ -11778,7 +11811,15 @@ fn dump_wavefront_mega(
              // every other call site passes the full `prefix_len`.
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
-             prefill_mq: Option<u32>,
+             // ⭐ THE PREFILL RUNG'S OWN PAIR — `Some((width, seqs))` marks the PREFILL path AND
+             // carries the rung this bake belongs to: one request's chunk width and how many
+             // requests the rung packs (ONE, until the packed table lands). `None` = decode.
+             // Minted by the ONE constructor (`prefill_rung_pair`) at the rung walks, so the
+             // halves arrive typed and cannot be swapped for `decode_rows` below.
+             prefill_rung: Option<(
+                scratchy_subtile::sdsc_abstract::RungWidth,
+                scratchy_subtile::sdsc_abstract::RungCap,
+            )>,
              // The resident-prefix sweep this bundle is baked for. Decode always FULL.
              // A PREFILL chunk with start==0 has no resident prefix, so it bakes NONE
              // (nb=0) and skips 308 of 710 ops/layer; continuation chunks need FULL.
@@ -11795,7 +11836,7 @@ fn dump_wavefront_mega(
                 #[cfg(not(feature = "spyre-emu"))]
                 let _ = shards;
                 let mut fx: Vec<BakeEffect> = Vec::new();
-                let is_prefill = prefill_mq.is_some();
+                let is_prefill = prefill_rung.is_some();
                 // A prefill chunk's rows are one prompt's positions; a decode bundle's are one token
                 // each of the running requests, at any width — one row is one request's token, and
                 // spyre-inference decodes it with the batched kernel at one sequence (its sequence
@@ -11803,17 +11844,17 @@ fn dump_wavefront_mega(
                 let rows_are_requests = !is_prefill;
                 // ⭐ THE QUERY'S EXTENT PAIR, MINTED ONCE FROM THE RUNG — the rung's own
                 // `(per-request width, requests)`, never a division of the graph's rows. A
-                // prefill chunk is ONE request however many positions it spans (its pair is
-                // `(mq, ONE)`); a decode rung's every row is a request's one token (its pair
-                // is `(1 row, decode_rows)`). The attention splice spends the pair as the
-                // kernel's two extents and checks its held product against the graph it
-                // lowers — the one place the mint and the graph are proven to agree.
-                // ONE match on the one fact (`prefill_mq`'s presence IS `is_prefill`), one
-                // named bake panic for the whole mint: a half that does not name a baked
-                // rung — a zero or overflowing count, or a product past u32 — is refused
-                // here, never defaulted. (The u32 parameters `prefill_mq` / `decode_rows`
-                // are the missing source type: the rung walks should hand the closure a
-                // `RungWidth` / `RungCap` directly, follow-up.)
+                // prefill rung states its pair at its walk (ONE request per chunk until the
+                // packed table lands, its `(w, S)` then); a decode rung's every row is a
+                // request's one token (its pair is `(1 row, decode_rows)`). The attention
+                // splice spends the pair as the kernel's two extents and checks its held
+                // product against the graph it lowers — the one place the mint and the graph
+                // are proven to agree.
+                // ONE match on the one fact (`prefill_rung`'s presence IS `is_prefill`), one
+                // named bake panic for the whole mint: a pair whose product does not fit a
+                // u32 is refused here, never defaulted. The halves themselves arrive typed
+                // from the ONE constructor (`prefill_rung_pair`), so a zero or a swap is
+                // already a named bake panic at the walk that asked.
                 //
                 // ⭐ A SYMBOLIC BATCH TAPE states its width through `seq_sym`: the CB decode
                 // emission lowers at `CB_BATCH_TEMPLATE` rows (a batch SYMBOL the DEM
@@ -11821,11 +11862,11 @@ fn dump_wavefront_mega(
                 // `DecodeRung` effect and slot discriminators read the CONCRETE rung
                 // count, which the symbolic tape does not have. Each arm says which
                 // source states the width for which kind of tape: a prefill — symbolic
-                // or concrete — takes its width from `prefill_mq` (one request however
-                // many positions), a symbolic decode batch from its symbol's template,
-                // a concrete decode rung from `decode_rows`.
-                let (per_request, requests) = match (prefill_mq, seq_sym) {
-                    (Some(mq), _) => (mq, 1u32),
+                // or concrete — takes its width from `prefill_rung` (the rung's own pair),
+                // a symbolic decode batch from its symbol's template, a concrete decode
+                // rung from `decode_rows`.
+                let (per_request, requests) = match (prefill_rung, seq_sym) {
+                    (Some((w, s)), _) => (w.get(), s.get()),
                     (None, Some((_, width))) => (1u32, width),
                     (None, None) => (1u32, decode_rows),
                 };
@@ -12274,7 +12315,7 @@ fn dump_wavefront_mega(
                                             Err(e) => panic!(
                                                 "[spyre-superdsc] {base}: body class {ci} emit \
                                                  failed at decode_rows={decode_rows} \
-                                                 prefill_mq={prefill_mq:?} — {e}. A rung the bake \
+                                                 prefill_rung={prefill_rung:?} — {e}. A rung the bake \
                                                  was asked for must ship its bundle; a skip here \
                                                  ships a binary whose batch silently runs elsewhere"
                                             ),
@@ -12396,7 +12437,9 @@ fn dump_wavefront_mega(
                                             let ceiling_walk =
                                                 scratchy_target_spyre::paged_step::walk_pages(
                                                     pool_pages,
-                                                    prefill_mq.unwrap_or(decode_rows),
+                                                    prefill_rung
+                                                        .map(|(w, _)| w.get())
+                                                        .unwrap_or(decode_rows),
                                                     active_cap,
                                                 );
                                             let mut decode_rungs: Vec<
@@ -12840,7 +12883,8 @@ fn dump_wavefront_mega(
                                                 )>,
                                             );
                                             let prefill_classes: Option<PrefillRotaryClasses> =
-                                                prefill_mq.map(|mq| {
+                                                prefill_rung.map(|(w, _)| {
+                                                let mq = w.get();
                                                 let hd = superdsc_model_head_dim(model);
                                                 let theta = model.text.rope_theta.get();
                                                 let mut rotary_cos = Vec::new();
@@ -13030,7 +13074,7 @@ fn dump_wavefront_mega(
                                                             }
                                                         }
                                                     };
-                                                match prefill_mq {
+                                                match prefill_rung {
                                                     None => run_gate(None),
                                                     Some(_)
                                                         if active_cap
@@ -13038,12 +13082,14 @@ fn dump_wavefront_mega(
                                                     {
                                                         run_gate(prefill_gate.as_ref())
                                                     }
-                                                    Some(mq) => eprintln!(
+                                                    Some((w, _)) => eprintln!(
                                                         "[spyre-superdsc] {base}: NUMERIC GATE \
-                                                         SKIP prefill bundle {bfp} (mq={mq}, \
-                                                         prefix-capable) — the continuation-chunk \
-                                                         mask law (resident prefix ∘ [mq, mq] \
-                                                         triangle) is the next rung; UNCHECKED"
+                                                         SKIP prefill bundle {bfp} \
+                                                         (mq={}, prefix-capable) — the \
+                                                         continuation-chunk mask law (resident \
+                                                         prefix ∘ [mq, mq] triangle) is the next \
+                                                         rung; UNCHECKED",
+                                                        w.get()
                                                     ),
                                                 }
                                             }
@@ -13056,19 +13102,21 @@ fn dump_wavefront_mega(
                                             );
                                             // Stamp the DECODE body_fp or the PREFILL body_fp by phase
                                             // (the prefill reroll must NOT clobber the decode fp).
-                                            if let Some(mq) = prefill_mq.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
+                                            if let Some((w, _)) = prefill_rung.filter(|_| active_cap == scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL) {
                                             // A PREFIX-CAPABLE prefill rung: continuation chunks
                                             // (start>0) run on these, since they DO have resident KV to
                                             // attend — each on the smallest rung that holds it.
-                                            fx.push(BakeEffect::PrefillPrefixRung { mq, fp: bfp });
+                                            // (Packed prefix rungs are a later rung of the same law;
+                                            // every prefix rung today is one request.)
+                                            fx.push(BakeEffect::PrefillPrefixRung { mq: w.get(), fp: bfp });
                                             prefill_fp_stamped = true;
-                                        } else if let Some(mq) = prefill_mq {
+                                        } else if let Some((w, _)) = prefill_rung {
                                             // Ladder rung (deduped on mq: a rebake of the same width
                                             // must not double-enter). The TOP rung additionally lands in
                                             // `superdsc_prefill_fp` — the single-bundle prefill slot —
                                             // which the rung loop below arranges by baking it FIRST.
                                             fx.push(BakeEffect::PrefillRung {
-                                                mq,
+                                                mq: w.get(),
                                                 fp: bfp.clone(),
                                             });
                                             // Rungs bake ASCENDING, so the LAST write is the widest
@@ -13156,7 +13204,7 @@ fn dump_wavefront_mega(
                                     // the rung and the error.
                                     panic!(
                                         "[spyre-superdsc] {base}: RE-ROLL NOT LOWERABLE at \
-                                         decode_rows={decode_rows} prefill_mq={prefill_mq:?} — {e}. \
+                                         decode_rows={decode_rows} prefill_rung={prefill_rung:?} — {e}. \
                                          Every rung the bake was asked for must lower; a skip ships \
                                          a binary whose batch silently runs elsewhere"
                                     );
@@ -13246,7 +13294,7 @@ fn dump_wavefront_mega(
                     fx.push(BakeEffect::Registry {
                         prefill: is_prefill,
                         base: format!(
-                            "{base} (prefill_mq={prefill_mq:?}, rows={decode_rows}, sweep={active_cap:?})"
+                            "{base} (prefill_rung={prefill_rung:?}, rows={decode_rows}, sweep={active_cap:?})"
                         ),
                         scales: gk.scalarmul_scales.clone(),
                     });
@@ -13367,7 +13415,15 @@ fn dump_wavefront_mega(
              base: String,
              cap: u32,
              seq_sym: Option<(&'static str, u32)>,
-             prefill_mq: Option<u32>,
+             // ⭐ THE PREFILL RUNG'S OWN PAIR — `Some((width, seqs))` marks the PREFILL path AND
+             // carries the rung this bake belongs to: one request's chunk width and how many
+             // requests the rung packs (ONE, until the packed table lands). `None` = decode.
+             // Minted by the ONE constructor (`prefill_rung_pair`) at the rung walks, so the
+             // halves arrive typed and cannot be swapped for `decode_rows` below.
+             prefill_rung: Option<(
+                scratchy_subtile::sdsc_abstract::RungWidth,
+                scratchy_subtile::sdsc_abstract::RungCap,
+            )>,
              active_cap: scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap,
              decode_rows: u32| {
                 let (r, fx) = emit_bundle_deferred(
@@ -13375,7 +13431,7 @@ fn dump_wavefront_mega(
                     base,
                     cap,
                     seq_sym,
-                    prefill_mq,
+                    prefill_rung,
                     active_cap,
                     decode_rows,
                     None,
@@ -13575,7 +13631,7 @@ fn dump_wavefront_mega(
                             format!("ktir_decode_{stem_id}"),
                             // `cap`: this bundle is baked for the full prefix.
                             prefix_len.get(),
-                            // `seq_sym` / `prefill_mq`: decode, so neither applies.
+                            // `seq_sym` / `prefill_rung`: decode, so neither applies.
                             None,
                             None,
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
@@ -13926,7 +13982,7 @@ fn dump_wavefront_mega(
                         } else {
                             Some(("s0", pl))
                         },
-                        Some(pl), // prefill path (SDPA + Store), ladder rung m=pl
+                        Some(prefill_rung_pair(stem, pl, 1)), // prefill path (SDPA + Store), ladder rung m=pl, one request per chunk (the packed table lands as its own rungs)
                         // ⛔ ZERO PREFIX BLOCKS, AND THAT IS ONLY RIGHT FOR THE FIRST CHUNK.
                         // `ActiveCap::NONE` is documented as valid ONLY where `start == 0`, but
                         // `manifest.rs`'s `KtirBundle::prefill` is a single `Option` and
@@ -14068,7 +14124,7 @@ fn dump_wavefront_mega(
                             format!("ktir_prefill_{stem_id}"),
                             prefix_len.get(),
                             None,
-                            Some(m),
+                            Some(prefill_rung_pair(stem, m, 1)),
                             scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                             1, // a prompt chunk is one request
                         );
@@ -14102,7 +14158,7 @@ fn dump_wavefront_mega(
                                 format!("ktir_prefill_tp{TP_WORLD}_{stem_id}"),
                                 prefix_len.get(),
                                 None,
-                                Some(m),
+                                Some(prefill_rung_pair(stem, m, 1)),
                                 scratchy_target_spyre::lower_subtile_tape_to_superdsc::ActiveCap::FULL,
                                 1,
                                 Some(&sf_p.sources),
