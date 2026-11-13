@@ -38,7 +38,7 @@ use flex_rs::hal_sbf::rdma_xseg;
 use flex_rs::scheduler::{
     DeviceAddressResolver, FlexAllocatorAddressResolver, P2PRdmaSendParams, P2PRdmaWaitParams,
 };
-use flex_rs::senlib_ffi::pci_addr_for_region;
+use flex_rs::card::pci_addr_for_region;
 use flex_rs::stream::{RuntimeStream, RuntimeStreamMode, RuntimeStreamPriority};
 use scratchy_target_spyre::bundle_code::collective::TpWorld;
 use scratchy_target_spyre_card::runtime::CardRuntime as AnyCard;
