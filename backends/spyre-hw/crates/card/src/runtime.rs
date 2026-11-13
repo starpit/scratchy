@@ -1765,10 +1765,9 @@ pub fn link_peers<T: ktir_superdsc::collective::Tp>(
     cards: &PerRank<T, CardRuntime<T>>,
     window: RecvWindow<T>,
 ) -> Result<(), AttachRefusal<T>> {
-    let region2: PerRank<T, u64> = PerRank::try_from_fn(|r| {
-        flex_rs::card::pci_addr_for_region(cards.get(r).card.pci(), 2)
-    })
-    .map_err(AttachRefusal::PeerRegion)?;
+    let region2: PerRank<T, u64> =
+        PerRank::try_from_fn(|r| flex_rs::card::pci_addr_for_region(cards.get(r).card.pci(), 2))
+            .map_err(AttachRefusal::PeerRegion)?;
     for (me, c) in cards.iter() {
         if let Some(link) = c.link.get() {
             if (link.me, link.window) == (me, window) {
