@@ -1,0 +1,6 @@
+# The toolchain this workspace's card legs are measured under (the re-cutover
+# record, 2026-11-13: rustc 1.99.1 / 58cf8f9c3). Pinned so a card host's
+# rustup default can never silently move the binary's codegen shape; the
+# senlib seam is measured to ms-scale sensitivity across toolchains.
+[toolchain]
+channel = "1.99.1"
