@@ -1567,14 +1567,20 @@ impl MetalWorker {
                 .map(|b| b.weight_bytes)
                 .map_err(|e| init(&format!("{rows} verify rows: {e}")))
         };
-        let cost = scratchy_target_metal::dflash2::VerifyLine::of(
-            weight_bytes(target)?,
-            weight_bytes(model)?,
-        );
+        let drafter = weight_bytes(model)?;
+        let cost = scratchy_target_metal::dflash2::VerifyLine::of(weight_bytes(target)?, drafter);
+        // What its drafting adds to the step it replaces: the drafter's share of the cycle's line.
+        let costs = ::scratchy_serving_engine::spec_decode::block::CycleCosts {
+            fixed: f64::from(cost.fixed),
+            per_row: f64::from(cost.per_row),
+            drafter: drafter.fixed as f64 / (1u64 << 30) as f64,
+        };
         info!(
-            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights and {:.3} GiB a verify row",
-            cost.fixed, cost.per_row
+            "ScratchyWorker(metal): DFlash2 cycle reads {:.2} GiB of weights ({:.2} its drafter's) \
+             and {:.3} GiB a verify row",
+            cost.fixed, costs.drafter, cost.per_row
         );
+        let gate = ::scratchy_serving_engine::spec_decode::block::DraftGate::new(costs);
         let accept =
             scratchy_target_metal::dflash2::DraftAcceptKernel::new(&gpu_device.device, kernels)
                 .map_err(|e| init(&format!("acceptance compile: {e:?}")))?
@@ -1642,6 +1648,7 @@ impl MetalWorker {
             captured_row_bytes: taps * target.hidden_size() as usize * elem_bytes,
             cycle_buffer: None,
             cost,
+            gate,
             window: scratchy_target_metal::dflash2::WindowLayout {
                 window: window as u32,
                 hidden,
@@ -5149,6 +5156,8 @@ struct Dflash2 {
     cycle_buffer: Option<scratchy_target_metal::residency::Pinned>,
     /// What a cycle costs by the rows it verifies, which its verify budget prices rows by.
     cost: scratchy_target_metal::dflash2::VerifyLine,
+    /// Whether each request's drafting pays against the step a cycle replaces.
+    gate: ::scratchy_serving_engine::spec_decode::block::DraftGate,
     /// A ring slot's context window.
     window: scratchy_target_metal::dflash2::WindowLayout,
     /// Each request's admission: where its prefill resumed and the positions it snapshots
@@ -5200,6 +5209,7 @@ impl Dflash2 {
         self.slots.release(req_id);
         self.cycles.remove(req_id);
         self.contexts.remove(req_id);
+        self.gate.forget(req_id);
     }
 }
 
@@ -8125,7 +8135,12 @@ impl Worker for MetalWorker {
                     })
                     .collect();
                 let passes = (d.drafter)
-                    .passes(&step_rows, &scheduler_output.draft_req_ids, &contexts)
+                    .passes(
+                        &step_rows,
+                        &scheduler_output.draft_req_ids,
+                        &contexts,
+                        &mut d.gate,
+                    )
                     .map_err(|e| ExecutorError::WorkerExecution(format!("DFlash2: {e}")))?;
                 match passes {
                     Some(passes) => {
@@ -9045,6 +9060,10 @@ impl Worker for MetalWorker {
                             req_slice.spec_token_ids.len()
                         );
                         let retained = (retained as usize).clamp(1, target_ids.len());
+                        if let Some(d) = self.dflash2.as_mut() {
+                            d.gate
+                                .observe(req_id, target_ids.len() as u32, retained as u32);
+                        }
                         (target_ids[..retained].to_vec(), retained - 1)
                     }
                     None => {
