@@ -41,6 +41,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The card workspace (backends/spyre-hw) resolves flex-rs by path into a sibling
+      # senlib-rs checkout (IBM-internal git — a card host fact), so this runner
+      # synthesizes the resolution stub (scripts/ci-senlib-stub.sh): enough for every
+      # step that only RESOLVES the workspace — rust-cache's own `cargo metadata`
+      # probe included, which is why this precedes it — hollow for anything that
+      # would compile flex-rs. The steps that must compile it (the workspace-wide
+      # and card-surface clippy) are scripts/spyre-hw-card-gate.sh, on a card host.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -86,15 +96,6 @@ jobs:
       - name: Clippy (spyre workspace)
         working-directory: backends/spyre
         run: cargo clippy --workspace --features scratchy-models/granite-3.1-8b-instruct -- -D warnings
-
-      # The card workspace (backends/spyre-hw) resolves flex-rs by path into a sibling
-      # senlib-rs checkout (IBM-internal git — a card host fact), so this runner
-      # synthesizes the resolution stub (scripts/ci-senlib-stub.sh): enough for every
-      # step that only RESOLVES the workspace, hollow for anything that would compile
-      # flex-rs. The steps that must compile it (the workspace-wide and card-surface
-      # clippy) are scripts/spyre-hw-card-gate.sh, on a card host.
-      - name: Senlib-rs stub (resolution sibling for the card workspace)
-        run: scripts/ci-senlib-stub.sh
 
       # The same model under its fp8 preset (`fp8-dynamic-per-channel`): the weights
       # struct's typed handles must cover an fp8 linear too, or every fp8 build panics
@@ -284,6 +285,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), synthesized here (scripts/ci-senlib-stub.sh) — before
+      # rust-cache's metadata probe of that workspace, and before the macos-scope
+      # lock() below reads it.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -306,10 +313,8 @@ jobs:
 
       # The other half of macos-scope's skip: fails if this job compiled a crate
       # whose PRs skip it. lock() reads the card workspace's metadata too, against
-      # the senlib-rs stub — resolution is all it needs, and no macOS job compiles
-      # a spyre-hw crate.
-      - name: Senlib-rs stub (resolution sibling for the card workspace)
-        run: scripts/ci-senlib-stub.sh
+      # the senlib-rs stub synthesized after checkout — resolution is all it
+      # needs, and no macOS job compiles a spyre-hw crate.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
@@ -333,6 +338,12 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), synthesized here (scripts/ci-senlib-stub.sh) — before
+      # rust-cache's metadata probe of that workspace, and before the macos-scope
+      # lock() below reads it.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        run: scripts/ci-senlib-stub.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -466,9 +477,7 @@ jobs:
           cargo clippy -p scratchy-target-metal-cli --features claude,model/smollm2-135m --all-targets -- -D warnings
           cargo test -p scratchy-target-metal-cli --features model/smollm2-135m --test arch_feature_passthrough
 
-      # See the clippy job's last step.
-      - name: Senlib-rs stub (resolution sibling for the card workspace)
-        run: scripts/ci-senlib-stub.sh
+      # See the clippy job's stub step.
       - name: Compiled no crate macos-scope skips for
         run: scripts/ci-macos-scope.sh lock
 
@@ -553,6 +562,18 @@ jobs:
         working-directory: backends/spyre
     steps:
       - uses: actions/checkout@v7
+      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
+      # (IBM-internal git), so this job synthesizes the resolution stub (scripts/
+      # ci-senlib-stub.sh) — before rust-cache's metadata probe of that workspace.
+      # The worker's emu-path steps below only RESOLVE the workspace — the card
+      # runtime is behind `spyre-hw`, off in all of them — so the stub carries them.
+      # The card workspace's card-surface clippy and the worker's CARD path compile
+      # flex-rs; they are scripts/spyre-hw-card-gate.sh, on a card host. The
+      # working directory is this job's default (backends/spyre); the script and
+      # the sibling it writes live at the repo root.
+      - name: Senlib-rs stub (resolution sibling for the card workspace)
+        working-directory: .
+        run: scripts/ci-senlib-stub.sh
       # Same mirror hardening as linux-spyre-emu (the BLAS job's comment).
       - name: Install OpenBLAS
         run: |
@@ -574,14 +595,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (spyre triton)
         run: cargo clippy -p scratchy-target-spyre --features spyre-emu --all-targets -- -D warnings
-      # The card workspace resolves flex-rs by path into a sibling senlib-rs checkout
-      # (IBM-internal git), so this job synthesizes the resolution stub first: the
-      # worker's emu-path steps below only RESOLVE the workspace — the card runtime is
-      # behind `spyre-hw`, off in all of them — so the stub carries them. The card
-      # workspace's card-surface clippy and the worker's CARD path compile flex-rs;
-      # they are scripts/spyre-hw-card-gate.sh, on a card host.
-      - name: Senlib-rs stub (resolution sibling for the card workspace)
-        run: scripts/ci-senlib-stub.sh
       - name: Test (spyre triton golden + emu execution)
         run: cargo test -p scratchy-target-spyre --features spyre-emu --lib --tests
       # The spyre worker's modules compile under no other CI job:
