@@ -2931,14 +2931,27 @@ impl MetalWorker {
         for (u, _) in &map_units {
             shared.units[u.0 as usize] = true;
         }
+        let b = &shared.budget;
+        let ledger = shared.granules.iter().filter(|&&m| m).count() as u64
+            * b.kv_granule_blocks.get() as u64
+            * b.kv_block_bytes
+            + shared.units.iter().filter(|&&m| m).count() as u64
+                * b.unit_slots.get() as u64
+                * b.slot_bytes;
+        let allocated = self
+            .gpu_device
+            .as_ref()
+            .map_or(0, |d| d.device.currentAllocatedSize());
         info!(
             "ScratchyWorker(metal): shared KV budget — {} KV granules and {} snapshot units \
-             released, {} and {} mapped, in {:.1} ms",
+             released, {} and {} mapped, in {:.1} ms; ledger {:.1} MiB, Metal allocated {:.1} MiB",
             release_kv.len(),
             release_units.len(),
             map_kv.len(),
             map_units.len(),
             t.elapsed().as_secs_f64() * 1e3,
+            ledger as f64 / 1_048_576.0,
+            allocated as f64 / 1_048_576.0,
         );
         Ok(())
     }
