@@ -226,8 +226,9 @@ fn request(seed: u64, temperature: Option<f32>, vocab: usize, pad: usize) -> Req
     }
 }
 
-/// Two groups of the two-level ramp, a vocab short of the padded row.
-const VOCAB: usize = 8000;
+/// Two groups of the two-level ramp, a vocab short of the padded row and not a multiple of 64:
+/// the last real block holds pad lanes, as production's 49155 (49155 mod 64 = 3) does.
+const VOCAB: usize = 8003;
 const PAD: usize = 8192;
 
 #[test]
