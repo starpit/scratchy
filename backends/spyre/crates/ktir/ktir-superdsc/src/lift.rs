@@ -127,6 +127,9 @@ enum Val {
     Dyn { index: T, scale: i64, add: i64 },
     /// `tensor.empty`.
     Empty(Vec<Extent>),
+    /// A compare's result: 1 or 0 in the format its operands compared in. Read only by a select
+    /// or a cast.
+    Pred(T),
 }
 
 struct Cx<'f> {
@@ -333,6 +336,10 @@ impl<'f> Cx<'f> {
     ) -> Result<(), LiftError> {
         let v = match self.get(op.operands[0])? {
             Val::Tensor(t) => Val::Tensor(T {
+                view: f(&t.view).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                ..t
+            }),
+            Val::Pred(t) => Val::Pred(T {
                 view: f(&t.view).map_err(|error| LiftError::View { op: op.op_type, error })?,
                 ..t
             }),
@@ -998,16 +1005,20 @@ impl<'f> Cx<'f> {
             K::MathTanh => self.device(op, DeviceOp::Tanh)?,
             K::MathFloor => self.device(op, DeviceOp::Floor)?,
             K::ArithCmpf => {
+                // The device compares with C++'s float comparators (`senulator/pcfg2compute.cpp`
+                // :460-466): `equal` and the orderings are ORDERED (false on NaN) and `notequal`
+                // is UNORDERED (true on NaN). Exactly those predicates are device ops.
                 let d = match op.attr(AttrKey::Predicate) {
-                    Some(Attr::Str("ogt" | "ugt")) => DeviceOp::GreaterThan,
-                    Some(Attr::Str("oge" | "uge")) => DeviceOp::GreaterEqual,
-                    Some(Attr::Str("olt" | "ult")) => DeviceOp::LesserThan,
-                    Some(Attr::Str("ole" | "ule")) => DeviceOp::LesserEqual,
-                    Some(Attr::Str("oeq" | "ueq")) => DeviceOp::Equal,
-                    Some(Attr::Str("one" | "une")) => DeviceOp::NotEqual,
-                    _ => return Err(malformed("arith.cmpf states an ordered or unordered compare")),
+                    Some(Attr::Str("ogt")) => DeviceOp::GreaterThan,
+                    Some(Attr::Str("oge")) => DeviceOp::GreaterEqual,
+                    Some(Attr::Str("olt")) => DeviceOp::LesserThan,
+                    Some(Attr::Str("ole")) => DeviceOp::LesserEqual,
+                    Some(Attr::Str("oeq")) => DeviceOp::Equal,
+                    Some(Attr::Str("une")) => DeviceOp::NotEqual,
+                    _ => return Err(LiftError::Op(op.op_type)),
                 };
-                // The predicate is 0 or 1, held in the format its operands compare in.
+                // The device writes 1 or 0 in the format its inputs compare in
+                // (`senulator/pcfg2compute.cpp:760-781`, `fcmpOp`: `out.setType(type)`).
                 let format = op
                     .operands
                     .iter()
@@ -1017,8 +1028,32 @@ impl<'f> Cx<'f> {
                     })
                     .ok_or(malformed("arith.cmpf compares a tensor"))?;
                 self.pointwise(op, OpFunc::Device(d), format)?;
+                if let Some(r) = op.result
+                    && let Some(Val::Tensor(t)) = self.env.remove(&r)
+                {
+                    self.env.insert(r, Val::Pred(t));
+                }
             }
-            K::ArithSelect => self.device(op, DeviceOp::Where3)?,
+            K::ArithSelect => {
+                // `cond ? a : b`, in the select's own value format; the condition is a
+                // predicate.
+                let shape = Self::result_shape(op)?;
+                let format = Self::result_format(op)?;
+                let Val::Pred(cond) = self.get(op.operands[0])? else {
+                    return Err(malformed("arith.select chooses by a predicate"));
+                };
+                let cond = T {
+                    view: cond.view.broadcast(&shape).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                    ..cond
+                };
+                let a = self.get(op.operands[1])?;
+                let b = self.get(op.operands[2])?;
+                let a = self.operand(op, &a, &shape, format)?;
+                let b = self.operand(op, &b, &shape, format)?;
+                let output = self.local(&shape, format);
+                self.push(OpFunc::Device(DeviceOp::Where3), shape, vec![cond, a, b], output.clone());
+                self.bind(op, Val::Tensor(output));
+            }
             K::ArithExtf | K::ArithTruncf | K::ArithConvertf => {
                 let to = Self::result_format(op)?;
                 let v = self.get(op.operands[0])?;
@@ -1046,8 +1081,9 @@ impl<'f> Cx<'f> {
                     Val::Tensor(t) if t.format == Format::Int32 && to == Format::Fp32 => {
                         self.pointwise(op, OpFunc::Device(DeviceOp::Int32ToFp32), to)?
                     }
-                    // A predicate is already 0 or 1 in the format its operands compared in.
-                    Val::Tensor(t) if t.format == to => self.bind(op, Val::Tensor(t)),
+                    // A predicate is 0 or 1 in the format its operands compared in: as that
+                    // format, it is itself.
+                    Val::Pred(t) if t.format == to => self.bind(op, Val::Tensor(t)),
                     _ => return Err(LiftError::Op(op.op_type)),
                 }
             }

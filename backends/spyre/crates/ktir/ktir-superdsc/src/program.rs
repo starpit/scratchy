@@ -179,6 +179,13 @@ pub struct ConstStick {
     pub bits: u32,
 }
 
+impl ConstStick {
+    /// The value, as stated.
+    pub fn value(self) -> f32 {
+        f32::from_bits(self.bits)
+    }
+}
+
 /// A lowered function.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Program {

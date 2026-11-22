@@ -13,6 +13,8 @@ ktir-core = { path = "../ktir-core" }
 # The output: SuperDSC is the JSON dxp reads.
 serde = { workspace = true }
 serde_json = { workspace = true }
+# fp16 rounding in the evaluator's numeric model.
+half = { workspace = true }
 
 # The production kernels, compiled from their Triton sources for the tests that lift them.
 [dev-dependencies]

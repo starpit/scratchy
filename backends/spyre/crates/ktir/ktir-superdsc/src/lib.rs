@@ -11,6 +11,7 @@
 //! with every address that moves between trips stated as a [`program::Address::Stepped`]. There is
 //! no representation of a trip written out twice.
 
+pub mod eval;
 pub mod lift;
 pub mod lin;
 pub mod program;
