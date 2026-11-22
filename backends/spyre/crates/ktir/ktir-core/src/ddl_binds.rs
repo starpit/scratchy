@@ -175,6 +175,7 @@ device_ops!(
     Fp32ToInt32,
     Dl16ToFp32,
     Fp32ToDl16,
+    Qfp8Ch,
     // ── the reduce family
     Sum,
     Mean,
@@ -223,6 +224,7 @@ impl DeviceOp {
             DeviceOp::Fp32ToInt32 => "fp32toint32",
             DeviceOp::Dl16ToFp32 => "dl16tofp32",
             DeviceOp::Fp32ToDl16 => "fp32todl16",
+            DeviceOp::Qfp8Ch => "qfp8ch",
             DeviceOp::Sum => "sum",
             DeviceOp::Mean => "mean",
             DeviceOp::Max => "max",
@@ -265,7 +267,8 @@ impl DeviceOp {
             DeviceOp::Int32ToFp32
             | DeviceOp::Fp32ToInt32
             | DeviceOp::Dl16ToFp32
-            | DeviceOp::Fp32ToDl16 => DeviceFamily::Convert,
+            | DeviceOp::Fp32ToDl16
+            | DeviceOp::Qfp8Ch => DeviceFamily::Convert,
             DeviceOp::Sum | DeviceOp::Mean | DeviceOp::Max | DeviceOp::Min | DeviceOp::AbsMax => {
                 DeviceFamily::Reduce
             }
@@ -731,6 +734,19 @@ impl DeviceGen for Gen1 {
                    convert-probe 2026-11-07, element-exact at [256,2048] and \
                    [1,2048]; main stages it Standard, so this row keeps main's \
                    behavior, and moving it is the Z4 solve's PR",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Qfp8Ch,
+            dfs: &[DdlDf::Fp16],
+            admitted: &[DdlDf::Fp16],
+            arrangement: ElementArrangement::Standard,
+            citation: "quantization_double_pad.ddl:55 qfp8ch — a TYPELESS bind ([]); the \
+                   dtypes are the CARD's (fp16 in / SEN143_FP8 out). Standard as \
+                   consumed: main's W8A8 chain feeds its output only to the fp8 \
+                   matmul, which reads it in standard order, and that chain ran \
+                   coherent on the card (#299, c9f21b19c: gemma-4-12b fp8, greedy). \
+                   Its order read lane-for-lane beside another value was never \
+                   measured",
         },
         // ── summeanmaxexx2.ddl / summeanmaxexx2_fp32.ddl — the reduce family,
         //    every combiner bound at BOTH formats (the fp16 template's stick

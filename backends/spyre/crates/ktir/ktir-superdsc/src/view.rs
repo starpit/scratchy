@@ -97,7 +97,7 @@ impl SymView {
             }
             v.origin = v
                 .origin
-                .add(c.mul(Lin::constant(axis.stride.get() as i64)).map_err(ViewError::Corner)?);
+                .add(c.times(Lin::constant(axis.stride.get() as i64)).map_err(ViewError::Corner)?);
             v.axes[a].extent = e;
         }
         Ok(v)

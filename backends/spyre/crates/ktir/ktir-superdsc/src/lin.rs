@@ -1,27 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Integers as the program states them: affine in the walk's trip and the launch grid's indices.
+//! Integers as the program states them: affine in the walk's trip and in the parallel axes.
 //!
-//! The lift never runs a loop or a grid point by point. A value computed from `scf.for`'s induction
-//! variable or from `program_id` stays a formula, `c + trip·t + Σ pid[d]·p[d]`, through every
+//! The lift never runs a loop or a grid point by point. A value computed from an induction
+//! variable or from `program_id` stays a formula, `c + trip·t + Σ axis[i]·a[i]`, through every
 //! integer op that keeps it affine. An address built from it therefore states how it moves: its
-//! trip coefficient is how far it steps per trip, and each grid coefficient is the stride of a
-//! parallel axis.
+//! trip coefficient is how far it steps per walk trip, and each axis coefficient is its stride
+//! along a parallel axis (a grid dimension, or a loop whose trips are independent).
+
+/// How many parallel axes one program may open at once: the grid's three and five loops.
+pub const AXES: usize = 8;
 
 /// What an affine integer depends on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Sym {
     /// The trip of the program's walk, counting from 0.
     Trip,
-    /// `program_id(axis)`.
-    Pid(usize),
+    /// The position along parallel axis `i`.
+    Axis(usize),
 }
 
-/// `c + trip·trip + Σ pid[d]·grid_index(d)`.
+/// `c + trip·trip + Σ axis[i]·position(i)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Lin {
     pub c: i64,
     pub trip: i64,
-    pub pid: [i64; 3],
+    pub axis: [i64; AXES],
 }
 
 /// An integer op whose result is not affine in the symbols it reads.
@@ -33,7 +36,7 @@ impl Lin {
         Lin {
             c,
             trip: 0,
-            pid: [0; 3],
+            axis: [0; AXES],
         }
     }
 
@@ -42,46 +45,69 @@ impl Lin {
         let mut l = Lin::constant(0);
         match s {
             Sym::Trip => l.trip = 1,
-            Sym::Pid(d) => l.pid[d] = 1,
+            Sym::Axis(i) => l.axis[i] = 1,
         }
         l
     }
 
+    /// Whether the value depends on no symbol.
+    const fn symbolic(self) -> bool {
+        if self.trip != 0 {
+            return true;
+        }
+        let mut i = 0;
+        while i < AXES {
+            if self.axis[i] != 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// `Some(c)` when the value depends on no symbol.
     pub const fn as_const(self) -> Option<i64> {
-        if self.trip == 0 && self.pid[0] == 0 && self.pid[1] == 0 && self.pid[2] == 0 {
-            Some(self.c)
-        } else {
-            None
+        if self.symbolic() { None } else { Some(self.c) }
+    }
+
+    fn map(self, k: i64, f: fn(i64, i64) -> i64) -> Lin {
+        let mut axis = [0; AXES];
+        let mut i = 0;
+        while i < AXES {
+            axis[i] = f(self.axis[i], k);
+            i += 1;
+        }
+        Lin {
+            c: f(self.c, k),
+            trip: f(self.trip, k),
+            axis,
         }
     }
 
     pub const fn add(self, o: Lin) -> Lin {
+        let mut axis = [0; AXES];
+        let mut i = 0;
+        while i < AXES {
+            axis[i] = self.axis[i] + o.axis[i];
+            i += 1;
+        }
         Lin {
             c: self.c + o.c,
             trip: self.trip + o.trip,
-            pid: [
-                self.pid[0] + o.pid[0],
-                self.pid[1] + o.pid[1],
-                self.pid[2] + o.pid[2],
-            ],
+            axis,
         }
     }
 
-    pub const fn scale(self, k: i64) -> Lin {
-        Lin {
-            c: self.c * k,
-            trip: self.trip * k,
-            pid: [self.pid[0] * k, self.pid[1] * k, self.pid[2] * k],
-        }
+    pub fn scale(self, k: i64) -> Lin {
+        self.map(k, |x, k| x * k)
     }
 
-    pub const fn sub(self, o: Lin) -> Lin {
+    pub fn minus(self, o: Lin) -> Lin {
         self.add(o.scale(-1))
     }
 
     /// The product, affine only when one side is a constant.
-    pub const fn mul(self, o: Lin) -> Result<Lin, NotAffine> {
+    pub fn times(self, o: Lin) -> Result<Lin, NotAffine> {
         match (self.as_const(), o.as_const()) {
             (Some(k), _) => Ok(o.scale(k)),
             (_, Some(k)) => Ok(self.scale(k)),
@@ -89,41 +115,44 @@ impl Lin {
         }
     }
 
-    /// Floor division by a constant: affine when every coefficient is a multiple of the divisor
-    /// (the symbolic part divides exactly; the constant part floors).
-    pub const fn div_floor(self, d: i64) -> Result<Lin, NotAffine> {
-        if d == 0 {
-            return Err(NotAffine);
+    /// Whether every symbolic coefficient is a multiple of `d`.
+    const fn symbols_divide(self, d: i64) -> bool {
+        if self.trip % d != 0 {
+            return false;
         }
-        let sym_divides = self.trip % d == 0
-            && self.pid[0] % d == 0
-            && self.pid[1] % d == 0
-            && self.pid[2] % d == 0;
-        if !sym_divides {
-            return Err(NotAffine);
+        let mut i = 0;
+        while i < AXES {
+            if self.axis[i] % d != 0 {
+                return false;
+            }
+            i += 1;
         }
-        Ok(Lin {
-            c: self.c.div_euclid(d),
-            trip: self.trip / d,
-            pid: [self.pid[0] / d, self.pid[1] / d, self.pid[2] / d],
-        })
+        true
     }
 
-    /// The remainder by a constant: affine (a constant) when every coefficient is a multiple of
-    /// the divisor.
-    pub const fn rem(self, d: i64) -> Result<Lin, NotAffine> {
-        match self.div_floor(d) {
-            Ok(_) => Ok(Lin::constant(self.c.rem_euclid(d))),
-            Err(e) => Err(e),
+    /// Floor division by a constant: affine when every symbolic coefficient is a multiple of the
+    /// divisor (the symbolic part divides exactly; the constant part floors).
+    pub fn div_floor(self, d: i64) -> Result<Lin, NotAffine> {
+        if d == 0 || !self.symbols_divide(d) {
+            return Err(NotAffine);
         }
+        let mut q = self.map(d, |x, d| x / d);
+        q.c = self.c.div_euclid(d);
+        Ok(q)
+    }
+
+    /// The remainder by a constant: a constant when every symbolic coefficient is a multiple of
+    /// the divisor.
+    pub fn modulo(self, d: i64) -> Result<Lin, NotAffine> {
+        if d == 0 || !self.symbols_divide(d) {
+            return Err(NotAffine);
+        }
+        Ok(Lin::constant(self.c.rem_euclid(d)))
     }
 
     /// `ceil(self / d)` for a positive constant `d`.
-    pub const fn div_ceil(self, d: i64) -> Result<Lin, NotAffine> {
-        match self.add(Lin::constant(d - 1)).div_floor(d) {
-            Ok(l) => Ok(l),
-            Err(e) => Err(e),
-        }
+    pub fn div_ceil(self, d: i64) -> Result<Lin, NotAffine> {
+        self.add(Lin::constant(d - 1)).div_floor(d)
     }
 }
 
@@ -134,22 +163,24 @@ mod tests {
     #[test]
     fn an_address_built_from_the_trip_keeps_its_step() {
         // `page_index_table + i * 32` at trip `i`.
-        let a = Lin::constant(5).add(Lin::sym(Sym::Trip).mul(Lin::constant(32)).unwrap());
-        assert_eq!(a, Lin { c: 5, trip: 32, pid: [0; 3] });
+        let a = Lin::constant(5).add(Lin::sym(Sym::Trip).times(Lin::constant(32)).unwrap());
+        assert_eq!(a.trip, 32);
+        assert_eq!(a.c, 5);
         assert_eq!(a.as_const(), None);
     }
 
     #[test]
     fn a_product_of_two_symbols_is_not_affine() {
         let t = Lin::sym(Sym::Trip);
-        assert_eq!(t.mul(Lin::sym(Sym::Pid(0))), Err(NotAffine));
+        assert_eq!(t.times(Lin::sym(Sym::Axis(0))), Err(NotAffine));
     }
 
     #[test]
     fn division_is_affine_only_when_the_symbols_divide() {
         let a = Lin::sym(Sym::Trip).scale(64).add(Lin::constant(70));
-        assert_eq!(a.div_floor(32), Ok(Lin { c: 2, trip: 2, pid: [0; 3] }));
-        assert_eq!(a.rem(32), Ok(Lin::constant(6)));
+        let q = a.div_floor(32).unwrap();
+        assert_eq!((q.c, q.trip), (2, 2));
+        assert_eq!(a.modulo(32), Ok(Lin::constant(6)));
         assert_eq!(Lin::sym(Sym::Trip).div_floor(2), Err(NotAffine));
     }
 }

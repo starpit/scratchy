@@ -75,8 +75,8 @@ fn decode(blocks: i128) -> Program {
         &ATTN_ARGS,
         &[
             ("NUM_TOKENS", Val::Int(1)),
-            ("NUM_HEADS", Val::Int(4)),
-            ("NUM_KV_HEADS", Val::Int(2)),
+            ("NUM_HEADS", Val::Int(16)),
+            ("NUM_KV_HEADS", Val::Int(8)),
             ("HEAD_SIZE", Val::Int(64)),
             ("BLOCK_SIZE", Val::Int(64)),
             ("NUM_PAGES", Val::Int(16)),

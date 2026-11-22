@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //! KTIR → [`Program`]: every op lifted once.
 //!
-//! Integers stay affine in the walk's trip and the grid's indices ([`Lin`]); memory views and
+//! Integers stay affine in the walk's trip and the parallel axes ([`Lin`]); memory views and
 //! access tiles are views over parameters ([`SymView`]); a load is the view itself, read in place;
 //! every tensor op is one device node over the views of its operands, its result a fresh
-//! intermediate. Nothing is evaluated per trip or per grid point:
+//! intermediate. Nothing is evaluated per trip, per grid point or per loop iteration:
 //!
-//! * a top-level `scf.for` of two or more trips becomes one [`Segment::Walk`]. Its induction
+//! * a parallel axis is a grid dimension wider than one, or an `scf.for` whose trips are
+//!   independent (it carries no value, and writes no parameter it also reads). Its position is a
+//!   symbol; each intermediate made under it is held once per position; every node made under it
+//!   gains one outer space axis, each operand's stride along it read off the operand's origin;
+//! * an `scf.for` whose trips depend on each other becomes one [`Segment::Walk`]. Its induction
 //!   variable is `lb + trip·step`, so every address computed from it is [`Address::Stepped`]; each
 //!   value it carries is one buffer the straight code before it initialises and each trip
-//!   overwrites. This arm is the only place an `scf.for` is consumed;
-//! * the grid is parallel axes: `program_id(d)` is the symbol `pid[d]`, each intermediate is held
-//!   once per grid point, and every node gains one outer space axis per grid dimension wider than
-//!   one, each operand's stride along it read off the operand's origin.
+//!   overwrites.
+//!
+//! [`Cx::for_loop`] is the only place an `scf.for` is consumed, and it has no path that lifts a
+//! body more than once into the program.
 
 use std::collections::HashMap;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -61,19 +65,42 @@ struct T {
     gather: Option<G>,
 }
 
+impl T {
+    /// Every store this operand addresses, with whether it is the operand's own (as opposed to an
+    /// index it reads through).
+    fn stores(&self) -> Vec<(Store, bool)> {
+        let mut v = vec![(self.store, true)];
+        match &self.gather {
+            Some(G::Rows { index, .. }) | Some(G::Offset { index, .. }) => {
+                v.extend(index.stores().into_iter().map(|(s, _)| (s, false)));
+            }
+            None => {}
+        }
+        v
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum G {
     Rows { axis: usize, index: Box<T>, rows: Extent },
     Offset { index: Box<T>, step: Stride, bound: Extent },
 }
 
-/// One node during the lift.
+/// One node during the lift, with the parallel axes it was made under, outermost first.
 #[derive(Clone, Debug)]
 struct Raw {
     func: OpFunc,
+    par: Vec<Par>,
     space: Vec<Extent>,
     inputs: Vec<T>,
     output: T,
+}
+
+/// A parallel axis: its symbol slot and its extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Par {
+    slot: usize,
+    extent: Extent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,8 +133,10 @@ struct Cx<'f> {
     run: Vec<Raw>,
     /// `Some(trips, carried)` while a walk's body is being lifted.
     walking: Option<(NonZeroU32, Vec<LocalId>)>,
-    /// The grid's extents, x first.
-    grid: [u64; 3],
+    /// The parallel axes open now, outermost first.
+    par: Vec<Par>,
+    /// The symbol slot of each grid dimension wider than one, x first.
+    grid_slot: [Option<usize>; 3],
 }
 
 fn int_list<'a>(op: &Operation<'a>, k: AttrKey) -> Option<&'a [i64]> {
@@ -183,16 +212,15 @@ impl<'f> Cx<'f> {
         })
     }
 
-    /// A fresh intermediate of `shape`, row-major, held once per grid point.
+    /// A fresh intermediate of `shape`, row-major, held once per position of every open parallel
+    /// axis (the innermost axis's copies adjacent).
     fn local(&mut self, shape: &[Extent], format: Format) -> T {
         let n: u64 = shape.iter().map(|e| e.get()).product();
         let mut origin = Lin::constant(0);
         let mut copies = 1u64;
-        for d in 0..3 {
-            if self.grid[d] > 1 {
-                origin.pid[d] = (n * copies) as i64;
-                copies *= self.grid[d];
-            }
+        for p in self.par.iter().rev() {
+            origin.axis[p.slot] = (n * copies) as i64;
+            copies *= p.extent.get();
         }
         self.locals.push(Local {
             elements: Elems::new(n * copies),
@@ -204,6 +232,12 @@ impl<'f> Cx<'f> {
             format,
             gather: None,
         }
+    }
+
+    /// Push a node made now, under the parallel axes open now.
+    fn push(&mut self, func: OpFunc, space: Vec<Extent>, inputs: Vec<T>, output: T) {
+        let par = self.par.clone();
+        self.run.push(Raw { func, par, space, inputs, output });
     }
 
     /// `v` as an operand over `shape`: a tensor broadcast to it, a scalar or splat as a constant
@@ -274,12 +308,7 @@ impl<'f> Cx<'f> {
             .map(|v| self.operand(op, v, &shape, in_format))
             .collect::<Result<Vec<_>, _>>()?;
         let output = self.local(&shape, format);
-        self.run.push(Raw {
-            func,
-            space: shape,
-            inputs,
-            output: output.clone(),
-        });
+        self.push(func, shape, inputs, output.clone());
         self.bind(op, Val::Tensor(output));
         Ok(())
     }
@@ -337,24 +366,14 @@ impl<'f> Cx<'f> {
         for &a in &folded {
             out.view.axes.insert(a, Axis { extent: space[a], stride: Stride::BROADCAST });
         }
-        self.run.push(Raw {
-            func: OpFunc::Device(d),
-            space,
-            inputs: vec![input],
-            output: out,
-        });
+        self.push(OpFunc::Device(d), space, vec![input], out);
         let init = self.get(op.operands[1])?;
         let value = match init {
             Val::Splat { value, .. } if value == identity => result,
             init => {
                 let rhs = self.operand(op, &init, &out_shape, format)?;
                 let o = self.local(&out_shape, format);
-                self.run.push(Raw {
-                    func: OpFunc::Device(combine),
-                    space: out_shape,
-                    inputs: vec![result, rhs],
-                    output: o.clone(),
-                });
+                self.push(OpFunc::Device(combine), out_shape, vec![result, rhs], o.clone());
                 o
             }
         };
@@ -395,29 +414,38 @@ impl<'f> Cx<'f> {
         if b.view.axes[rank - 2].extent != k {
             return Err(malformed("A's k is B's k"));
         }
+        // The batch: each axis the extent the two operands share, an operand of extent one there
+        // read at stride 0 (one matrix shared across the batch).
+        let mut batch = Vec::with_capacity(rank - 2);
+        for i in 0..rank - 2 {
+            let (ea, eb) = (a.view.axes[i].extent, b.view.axes[i].extent);
+            batch.push(match (ea, eb) {
+                _ if ea == eb => ea,
+                (Extent::ONE, e) | (e, Extent::ONE) => e,
+                _ => return Err(malformed("A's and B's batch extents agree, or one of them is one")),
+            });
+        }
+        let view_err = |error| LiftError::View { op: op.op_type, error };
+        let with_batch = |t: T, last: [Extent; 2]| -> Result<T, LiftError> {
+            let mut to = batch.clone();
+            to.extend(last);
+            Ok(T { view: t.view.broadcast(&to).map_err(view_err)?, ..t })
+        };
+        let a = with_batch(a, [m, k])?;
+        let b = with_batch(b, [k, n])?;
         let format = Self::result_format(op)?;
-        let mut out_shape: Vec<Extent> = a.view.shape()[..rank - 2].to_vec();
+        let mut out_shape: Vec<Extent> = batch.clone();
         out_shape.extend([m, n]);
         let mut space = out_shape.clone();
         space.push(k);
         let result = self.local(&out_shape, format);
-        self.run.push(Raw {
-            func: OpFunc::Contraction,
-            space,
-            inputs: vec![a, b],
-            output: result.clone(),
-        });
+        self.push(OpFunc::Contraction, space, vec![a, b], result.clone());
         let value = match self.get(op.operands[2])? {
             Val::Splat { value: 0.0, .. } | Val::Empty(_) => result,
             init => {
                 let rhs = self.operand(op, &init, &out_shape, format)?;
                 let o = self.local(&out_shape, format);
-                self.run.push(Raw {
-                    func: OpFunc::Device(DeviceOp::Add),
-                    space: out_shape,
-                    inputs: vec![result, rhs],
-                    output: o.clone(),
-                });
+                self.push(OpFunc::Device(DeviceOp::Add), out_shape, vec![result, rhs], o.clone());
                 o
             }
         };
@@ -464,25 +492,37 @@ impl<'f> Cx<'f> {
             ..mem.clone()
         };
         if let Some((a, index, scale, add)) = offset {
-            // Row `index·scale + add` starts the window, so the index may name every row from
-            // which the window still fits: `(held − add − window) / scale + 1` values, a whole
-            // count by construction (the last index whose window fits, plus one).
-            let bad = LiftError::Address { op: op.op_type };
-            let scale = u64::try_from(scale).ok().and_then(NonZeroU64::new).ok_or(bad.clone())?;
-            let add = u64::try_from(add).map_err(|_| bad.clone())?;
-            let (held, window) = (mem.view.axes[a].extent.get(), shape[a].get());
-            let room = held.checked_sub(add + window).ok_or(bad.clone())?;
-            t.gather = Some(G::Offset {
-                index: Box::new(index),
-                step: Stride::new(mem.view.axes[a].stride.get() * scale.get()),
-                bound: Extent::new(NonZeroU64::new(room / scale.get() + 1).ok_or(bad)?),
-            });
+            t.gather = Some(Self::offset_gather(op.op_type, &mem.view, a, shape[a], index, scale, add)?);
         }
         if let Some(o) = order {
             t.view = t.view.transpose(&o).map_err(view_err)?;
         }
         self.bind(op, Val::Mem(t));
         Ok(())
+    }
+
+    /// The gather of a `window`-wide window along axis `a` of `held` that starts at row
+    /// `index·scale + add`, the index read by the device. The index may name every row from which
+    /// the window still fits: `(rows − add − window) / scale + 1` values, a whole count by
+    /// construction (the last index whose window fits, plus one).
+    fn offset_gather(
+        op: OpKind,
+        held: &SymView,
+        a: usize,
+        window: Extent,
+        index: T,
+        scale: i64,
+        add: i64,
+    ) -> Result<G, LiftError> {
+        let bad = LiftError::Address { op };
+        let scale = u64::try_from(scale).ok().and_then(NonZeroU64::new).ok_or(bad.clone())?;
+        let add = u64::try_from(add).map_err(|_| bad.clone())?;
+        let room = held.axes[a].extent.get().checked_sub(add + window.get()).ok_or(bad.clone())?;
+        Ok(G::Offset {
+            index: Box::new(index),
+            step: Stride::new(held.axes[a].stride.get() * scale.get()),
+            bound: Extent::new(NonZeroU64::new(room / scale.get() + 1).ok_or(bad)?),
+        })
     }
 
     /// `ktdp.construct_indirect_access_tile`: one dimension's rows named by an index view.
@@ -510,13 +550,34 @@ impl<'f> Cx<'f> {
                     let Val::Mem(iview) = self.get(op.operands[1 + data[d] as usize])? else {
                         return Err(malformed("an index view is a memory view"));
                     };
-                    let at = self.int(op, offsets[d])?;
-                    let index = T {
-                        view: iview
-                            .view
-                            .window(&[at], &[shape[d]])
-                            .map_err(|error| LiftError::View { op: op.op_type, error })?,
-                        ..iview
+                    let view_err = |error| LiftError::View { op: op.op_type, error };
+                    let index = match self.get(offsets[d])? {
+                        Val::Int(at) => T {
+                            view: iview.view.window(&[at], &[shape[d]]).map_err(view_err)?,
+                            ..iview
+                        },
+                        // The index rows themselves sit at a device-read offset: one access
+                        // cannot follow two indirections, so the rows are gathered into an
+                        // intermediate first and the tile indexes through that.
+                        Val::Dyn { index, scale, add } => {
+                            let block = T {
+                                view: iview.view.window(&[Lin::constant(add)], &[shape[d]]).map_err(view_err)?,
+                                gather: Some(Self::offset_gather(
+                                    op.op_type,
+                                    &iview.view,
+                                    0,
+                                    shape[d],
+                                    index,
+                                    scale,
+                                    add,
+                                )?),
+                                ..iview
+                            };
+                            let rows = self.local(&[shape[d]], block.format);
+                            self.push(OpFunc::Copy, vec![shape[d]], vec![block], rows.clone());
+                            rows
+                        }
+                        _ => return Err(malformed("an indirect tile's offset is an integer")),
                     };
                     rows = Some((d, index));
                 }
@@ -524,8 +585,12 @@ impl<'f> Cx<'f> {
             }
         }
         let (axis, index) = rows.ok_or(malformed("an indirect tile has an indirect dimension"))?;
+        // The index names the rows along `axis`, so the tile may be wider there than the buffer:
+        // the window takes one row along it, and the axis is then the index's length.
         let held = mem.view.axes[axis].extent;
-        let mut view = mem.view.window(&corner, &shape).map_err(|error| LiftError::View { op: op.op_type, error })?;
+        let mut one_row = shape.clone();
+        one_row[axis] = Extent::ONE;
+        let mut view = mem.view.window(&corner, &one_row).map_err(|error| LiftError::View { op: op.op_type, error })?;
         view.axes[axis].extent = shape[axis];
         self.bind(
             op,
@@ -546,17 +611,13 @@ impl<'f> Cx<'f> {
         self.note_param(op.op_type, dest.store, dest.format)?;
         let shape = dest.view.shape();
         let input = self.operand(op, &value, &shape, dest.format)?;
-        self.run.push(Raw {
-            func: OpFunc::Copy,
-            space: shape,
-            inputs: vec![input],
-            output: dest,
-        });
+        self.push(OpFunc::Copy, shape, vec![input], dest);
         Ok(())
     }
 
-    /// A top-level `scf.for`: straight code at one trip, a [`Walk`] at two or more.
-    fn walk(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
+    /// An `scf.for`: straight code at one trip; at two or more, a parallel axis when its trips are
+    /// independent, else a [`Walk`].
+    fn for_loop(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
         let malformed = |what| LiftError::Malformed { op: op.op_type, what };
         let bound = |s: Ssa| self.int(op, s).and_then(|l| l.as_const().ok_or(malformed("a constant loop bound")));
         let (lb, ub, step) = (bound(op.operands[0])?, bound(op.operands[1])?, bound(op.operands[2])?);
@@ -590,7 +651,43 @@ impl<'f> Cx<'f> {
             }
             return Ok(());
         }
-        if self.walking.is_some() {
+        let trips_ext = Extent::new(
+            u64::try_from(trips).ok().and_then(NonZeroU64::new).ok_or(malformed("a positive trip count"))?,
+        );
+        // A loop that carries nothing is a parallel axis, unless a trip writes a parameter the
+        // loop also reads (one trip may then read what another wrote). The body is lifted once
+        // under the axis; a body that writes what it reads is taken back and lifted as a walk.
+        if args.is_empty() {
+            let slot = (0..crate::lin::AXES)
+                .find(|s| !self.par.iter().any(|p| p.slot == *s))
+                .ok_or(malformed("at most eight parallel axes open at once"))?;
+            let (run_len, locals_len) = (self.run.len(), self.locals.len());
+            self.par.push(Par { slot, extent: trips_ext });
+            self.env.insert(iv, Val::Int(Lin::constant(lb).add(Lin::sym(Sym::Axis(slot)).scale(step))));
+            let lifted = self.ops(body);
+            self.par.pop();
+            lifted?;
+            let mut written = std::collections::HashSet::new();
+            let mut read = std::collections::HashSet::new();
+            for r in &self.run[run_len..] {
+                for (s, own) in r.output.stores() {
+                    if let Store::Param(p) = s {
+                        if own { written.insert(p) } else { read.insert(p) };
+                    }
+                }
+                for (s, _) in r.inputs.iter().flat_map(T::stores) {
+                    if let Store::Param(p) = s {
+                        read.insert(p);
+                    }
+                }
+            }
+            if written.is_disjoint(&read) {
+                return Ok(());
+            }
+            self.run.truncate(run_len);
+            self.locals.truncate(locals_len);
+        }
+        if self.walking.is_some() || self.par.len() > self.grid_slot.iter().flatten().count() {
             return Err(LiftError::NestedWalk);
         }
         let trips = NonZeroU32::new(u32::try_from(trips).map_err(|_| malformed("a trip count that fits u32"))?)
@@ -606,12 +703,7 @@ impl<'f> Cx<'f> {
             };
             let buffer = self.local(&shape, format);
             let input = self.operand(op, init, &shape, format)?;
-            self.run.push(Raw {
-                func: OpFunc::Copy,
-                space: shape,
-                inputs: vec![input],
-                output: buffer.clone(),
-            });
+            self.push(OpFunc::Copy, shape, vec![input], buffer.clone());
             let Store::Local(l) = buffer.store else {
                 return Err(malformed("a carried buffer is an intermediate"));
             };
@@ -632,12 +724,7 @@ impl<'f> Cx<'f> {
             }
             let shape = b.view.shape();
             let input = self.operand(op, y, &shape, b.format)?;
-            self.run.push(Raw {
-                func: OpFunc::Copy,
-                space: shape,
-                inputs: vec![input],
-                output: b.clone(),
-            });
+            self.push(OpFunc::Copy, shape, vec![input], b.clone());
         }
         self.close_walk()?;
         for (r, b) in results.iter().zip(buffers) {
@@ -665,7 +752,10 @@ impl<'f> Cx<'f> {
                     _ => op.result.into_iter().collect(),
                 };
                 for (d, r) in names.iter().enumerate().take(3) {
-                    let l = if self.grid[d] > 1 { Lin::sym(Sym::Pid(d)) } else { Lin::constant(0) };
+                    let l = match self.grid_slot[d] {
+                        Some(slot) => Lin::sym(Sym::Axis(slot)),
+                        None => Lin::constant(0),
+                    };
                     self.env.insert(*r, Val::Int(l));
                 }
             }
@@ -689,11 +779,11 @@ impl<'f> Cx<'f> {
                 let v = match (a, b) {
                     (Val::Int(x), Val::Int(y)) => Val::Int(match op.op_type {
                         K::ArithAddi => x.add(y),
-                        K::ArithSubi => x.sub(y),
-                        K::ArithMuli => x.mul(y).map_err(na)?,
+                        K::ArithSubi => x.minus(y),
+                        K::ArithMuli => x.times(y).map_err(na)?,
                         K::ArithDivsi | K::ArithDivui | K::ArithFloordivsi => x.div_floor(konst(y)?).map_err(na)?,
                         K::ArithCeildivsi => x.div_ceil(konst(y)?).map_err(na)?,
-                        K::ArithRemsi | K::ArithRemui => x.rem(konst(y)?).map_err(na)?,
+                        K::ArithRemsi | K::ArithRemui => x.modulo(konst(y)?).map_err(na)?,
                         K::ArithMinsi => Lin::constant(konst(x)?.min(konst(y)?)),
                         _ => Lin::constant(konst(x)?.max(konst(y)?)),
                     }),
@@ -752,7 +842,7 @@ impl<'f> Cx<'f> {
                 for (a, &s) in op.operands[1..].iter().enumerate() {
                     let i = self.int(op, s)?;
                     origin = origin.add(
-                        i.mul(Lin::constant(t.view.axes[a].stride.get() as i64))
+                        i.times(Lin::constant(t.view.axes[a].stride.get() as i64))
                             .map_err(|_| LiftError::NotAffine { op: op.op_type })?,
                     );
                 }
@@ -776,6 +866,14 @@ impl<'f> Cx<'f> {
                         shape,
                     },
                     dynamic @ Val::Dyn { scale: 1, add: 0, .. } => Val::Tensor(self.operand(op, &dynamic, &shape, format)?),
+                    // A one-element tensor repeats its element over every position.
+                    Val::Tensor(t) if t.view.axes.iter().all(|a| a.extent == Extent::ONE) => Val::Tensor(T {
+                        view: SymView {
+                            origin: t.view.origin,
+                            axes: shape.iter().map(|&e| Axis { extent: e, stride: Stride::BROADCAST }).collect(),
+                        },
+                        ..t
+                    }),
                     _ => return Err(malformed("a splat of a scalar")),
                 };
                 self.bind(op, v);
@@ -799,7 +897,19 @@ impl<'f> Cx<'f> {
             }
             K::TensorExpandShape | K::TensorCollapseShape | K::TensorReshape => {
                 let to = Self::result_shape(op)?;
-                self.view_op(op, |v| v.reshape(&to))?;
+                // A reshape is a view of the same elements where the merged axes are one strided
+                // run; elsewhere the value is copied row-major first, which every reshape views.
+                if let Val::Tensor(t) = self.get(op.operands[0])?
+                    && let Err(ViewError::NotContiguous { .. }) = t.view.reshape(&to)
+                {
+                    let shape = t.view.shape();
+                    let dense = self.local(&shape, t.format);
+                    self.push(OpFunc::Copy, shape, vec![t], dense.clone());
+                    let view = dense.view.reshape(&to).map_err(|error| LiftError::View { op: op.op_type, error })?;
+                    self.bind(op, Val::Tensor(T { view, ..dense }));
+                } else {
+                    self.view_op(op, |v| v.reshape(&to))?;
+                }
             }
             K::LinalgBroadcast => {
                 let shape = Self::result_shape(op)?;
@@ -872,6 +982,7 @@ impl<'f> Cx<'f> {
                     Val::Tensor(ref t) => match (t.format, to) {
                         (Format::Fp16, Format::Fp32) => self.pointwise(op, OpFunc::Device(DeviceOp::Dl16ToFp32), to)?,
                         (Format::Fp32, Format::Fp16) => self.pointwise(op, OpFunc::Device(DeviceOp::Fp32ToDl16), to)?,
+                        (Format::Fp16, Format::Fp8) => self.pointwise(op, OpFunc::Device(DeviceOp::Qfp8Ch), to)?,
                         _ => return Err(LiftError::Op(op.op_type)),
                     },
                     _ => return Err(malformed("a conversion of a value")),
@@ -898,7 +1009,7 @@ impl<'f> Cx<'f> {
                 }
                 _ => return Err(LiftError::Op(op.op_type)),
             },
-            K::ScfFor => self.walk(op)?,
+            K::ScfFor => self.for_loop(op)?,
             K::ScfYield => {
                 let vs = op.operands.iter().map(|&s| self.get(s)).collect::<Result<Vec<_>, _>>()?;
                 return Ok(Some(vs));
@@ -918,23 +1029,12 @@ impl<'f> Cx<'f> {
         Ok(None)
     }
 
-    /// The grid axes a node gains, outermost first: each grid dimension wider than one.
-    fn grid_axes(&self) -> Vec<usize> {
-        (0..3).rev().filter(|&d| self.grid[d] > 1).collect()
-    }
-
-    fn finish<O: Clone>(
-        &self,
-        raw: Raw,
-        origin: &impl Fn(Lin) -> Result<O, LiftError>,
-    ) -> Result<Node<O>, LiftError> {
-        let grid = self.grid_axes();
-        let mut space: Vec<Extent> = grid
-            .iter()
-            .map(|&d| Extent::new(NonZeroU64::new(self.grid[d]).unwrap_or(NonZeroU64::MIN)))
-            .collect();
+    /// The node as the program states it: one outer space axis per parallel axis it was made
+    /// under, each operand's stride along it read off the operand's origin.
+    fn finish<O: Clone>(&self, raw: Raw, origin: &impl Fn(Lin) -> Result<O, LiftError>) -> Result<Node<O>, LiftError> {
+        let mut space: Vec<Extent> = raw.par.iter().map(|p| p.extent).collect();
         space.extend(raw.space);
-        let operand = |t: T| self.operand_of(t, &grid, origin);
+        let operand = |t: T| Self::operand_of(t, &raw.par, origin);
         Ok(Node {
             func: raw.func,
             space,
@@ -944,31 +1044,33 @@ impl<'f> Cx<'f> {
     }
 
     fn operand_of<O: Clone>(
-        &self,
         t: T,
-        grid: &[usize],
+        par: &[Par],
         origin: &impl Fn(Lin) -> Result<O, LiftError>,
     ) -> Result<Operand<O>, LiftError> {
-        let mut axes: Vec<Axis> = Vec::with_capacity(grid.len() + t.view.axes.len());
-        for &d in grid {
-            let s = u64::try_from(t.view.origin.pid[d]).map_err(|_| LiftError::Address { op: OpKind::KtdpGetComputeTileId })?;
-            axes.push(Axis {
-                extent: Extent::new(NonZeroU64::new(self.grid[d]).unwrap_or(NonZeroU64::MIN)),
-                stride: Stride::new(s),
-            });
+        let bad = LiftError::Address { op: OpKind::ScfFor };
+        let mut axes: Vec<Axis> = Vec::with_capacity(par.len() + t.view.axes.len());
+        let mut base = t.view.origin;
+        for p in par {
+            let s = u64::try_from(base.axis[p.slot]).map_err(|_| bad.clone())?;
+            axes.push(Axis { extent: p.extent, stride: Stride::new(s) });
+            base.axis[p.slot] = 0;
+        }
+        // An origin that still moves along an axis the node is not under names no one element.
+        if base.axis.iter().any(|&c| c != 0) {
+            return Err(bad);
         }
         axes.extend(t.view.axes);
-        let mut base = t.view.origin;
-        base.pid = [0; 3];
+        let shift = par.len();
         let gather = match t.gather {
             None => None,
             Some(G::Rows { axis, index, rows }) => Some(Gather::Rows {
-                axis: axis + grid.len(),
-                index: Box::new(self.operand_of(*index, grid, origin)?),
+                axis: axis + shift,
+                index: Box::new(Self::operand_of(*index, par, origin)?),
                 rows,
             }),
             Some(G::Offset { index, step, bound }) => Some(Gather::Offset {
-                index: Box::new(self.operand_of(*index, grid, origin)?),
+                index: Box::new(Self::operand_of(*index, par, origin)?),
                 step,
                 bound,
             }),
@@ -1032,16 +1134,38 @@ pub fn lift(f: &IRFunction<'_>) -> Result<Program, LiftError> {
         segments: Vec::new(),
         run: Vec::new(),
         walking: None,
-        grid: [gx.max(1) as u64, gy.max(1) as u64, gz.max(1) as u64],
+        par: Vec::new(),
+        grid_slot: [None; 3],
     };
-    for (i, (s, _)) in f.arguments.iter().enumerate() {
-        cx.env.insert(
-            *s,
-            Val::Ptr {
-                param: ParamId::new(i as u32),
-                at: Lin::constant(0),
-            },
-        );
+    // The grid's dimensions wider than one are the first parallel axes, z outermost.
+    for (d, g) in [(2, gz), (1, gy), (0, gx)] {
+        if let Some(extent) = u64::try_from(g).ok().and_then(NonZeroU64::new).filter(|e| e.get() > 1) {
+            let slot = cx.par.len();
+            cx.par.push(Par { slot, extent: Extent::new(extent) });
+            cx.grid_slot[d] = Some(slot);
+        }
+    }
+    for (i, (s, ty)) in f.arguments.iter().enumerate() {
+        let param = ParamId::new(i as u32);
+        let v = match ty {
+            // A runtime scalar is one element of its own buffer, read by the device.
+            IrType::Scalar(dtype) => {
+                let format = format_of(OpKind::FuncReturn, *dtype)?;
+                cx.params[i] = Some(format);
+                Val::Dyn {
+                    index: T {
+                        store: Store::Param(param),
+                        view: SymView::row_major(Lin::constant(0), &[Extent::ONE]),
+                        format,
+                        gather: None,
+                    },
+                    scale: 1,
+                    add: 0,
+                }
+            }
+            _ => Val::Ptr { param, at: Lin::constant(0) },
+        };
+        cx.env.insert(*s, v);
     }
     let ops = cx.f.operations;
     cx.ops(ops)?;
