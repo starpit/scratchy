@@ -180,18 +180,40 @@ pub struct Local {
     pub format: Format,
 }
 
-/// A constant stick's value, stated in f32 bits (an integer constant exactly so), held in `format`.
+/// One value as a store of some format holds it: an integer format's exactly, a float format's
+/// as its f32 bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Scalar {
+    Float(u32),
+    Int(i32),
+}
+
+impl Scalar {
+    /// `x` as `format` holds it: an integer format takes it only when it is an i32 exactly; a
+    /// float format takes it as f32.
+    pub fn new(x: f64, format: Format) -> Option<Scalar> {
+        match format {
+            Format::Int32 => {
+                let i = x as i32;
+                (f64::from(i) == x).then_some(Scalar::Int(i))
+            }
+            Format::Fp16 | Format::Fp32 | Format::Fp8 => Some(Scalar::Float((x as f32).to_bits())),
+        }
+    }
+
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Scalar::Float(b) => f64::from(f32::from_bits(b)),
+            Scalar::Int(i) => f64::from(i),
+        }
+    }
+}
+
+/// A constant stick: `value` in every lane, held in `format`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConstStick {
     pub format: Format,
-    pub bits: u32,
-}
-
-impl ConstStick {
-    /// The value, as stated.
-    pub fn value(self) -> f32 {
-        f32::from_bits(self.bits)
-    }
+    pub value: Scalar,
 }
 
 /// A lowered function.
@@ -206,10 +228,57 @@ pub struct Program {
     pub segments: Vec<Segment>,
 }
 
-/// A constant table's values, row-major, each stated as f32 bits (an integer exactly so), held in
-/// `format`.
+/// A constant table of `shape`, held in `format`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Table {
     pub format: Format,
-    pub bits: Vec<u32>,
+    pub shape: Vec<Extent>,
+    pub data: TableData,
+}
+
+/// What a constant table holds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TableData {
+    /// `base + Σ index[d]·steps[d]` at index `index`: an affine table, stated by its form (every
+    /// value exact in the table's format, checked where it is made).
+    Ramp { base: i64, steps: Vec<i64> },
+    /// Each element, row-major.
+    Values(Vec<Scalar>),
+}
+
+impl Table {
+    /// The element at row-major position `flat`.
+    pub fn get(&self, flat: u64) -> f64 {
+        match &self.data {
+            TableData::Values(v) => v[flat as usize].as_f64(),
+            TableData::Ramp { base, steps } => {
+                let mut rest = flat;
+                let mut v = *base;
+                for d in (0..self.shape.len()).rev() {
+                    let n = self.shape[d].get();
+                    v += (rest % n) as i64 * steps[d];
+                    rest /= n;
+                }
+                v as f64
+            }
+        }
+    }
+
+    /// The least and greatest value the table holds.
+    pub fn range(&self) -> (f64, f64) {
+        match &self.data {
+            TableData::Values(v) => v.iter().map(|s| s.as_f64()).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| {
+                (lo.min(x), hi.max(x))
+            }),
+            TableData::Ramp { base, steps } => {
+                let (mut lo, mut hi) = (*base, *base);
+                for (e, &s) in self.shape.iter().zip(steps) {
+                    let span = (e.get() as i64 - 1) * s;
+                    lo += span.min(0);
+                    hi += span.max(0);
+                }
+                (lo as f64, hi as f64)
+            }
+        }
+    }
 }

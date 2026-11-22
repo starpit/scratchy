@@ -45,6 +45,7 @@ struct Run<'p> {
     tables: Vec<Vec<f64>>,
 }
 
+
 /// The element offset an origin names on `trip`.
 trait Origin {
     fn at(&self, trip: u64) -> i64;
@@ -106,7 +107,7 @@ impl Run<'_> {
 
     fn read<O: Origin>(&self, ni: usize, o: &Operand<O>, pos: &[u64], trip: u64) -> Result<f64, EvalError> {
         if let Store::Const(c) = o.store {
-            return Ok(f64::from(self.p.consts[c.get() as usize].value()));
+            return Ok(self.p.consts[c.get() as usize].value.as_f64());
         }
         let at = self.address(ni, o, pos, trip)?;
         let buf = self.buffer(o.store);
@@ -259,7 +260,10 @@ pub fn run(p: &Program, params: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, EvalErro
         tables: p
             .tables
             .iter()
-            .map(|t| t.bits.iter().map(|&b| f64::from(f32::from_bits(b))).collect())
+            .map(|t| {
+                let n: u64 = t.shape.iter().map(|e| e.get()).product();
+                (0..n).map(|i| t.get(i)).collect()
+            })
             .collect(),
     };
     for s in &p.segments {

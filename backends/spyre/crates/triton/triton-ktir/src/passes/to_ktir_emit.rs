@@ -495,6 +495,7 @@ fn attr<'a>(v: &Attr, a: &'a Arena) -> Result<KAttr<'a>> {
         }
         Attr::Bool(b) => KAttr::Bool(*b),
         Attr::SplatFloat(f) => KAttr::Float(f.as_f64()),
+        Attr::SplatInt(i) => KAttr::Int(*i),
         Attr::AffineMap(t) => KAttr::AffineMap(affine_map(t, a)?),
         Attr::AffineMapList(l) => {
             let maps: Vec<KMap<'a>> = l.iter().map(|t| affine_map(t, a)).collect::<Result<_>>()?;

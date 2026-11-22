@@ -650,6 +650,8 @@ pub enum Attr {
     Bool(bool),
     /// A dense constant that is a SPLAT: one value, fanned out to `ty`.
     SplatFloat(FloatBits),
+    /// An INTEGER dense splat, held exactly: an i32 constant above 2^24 is not an f32.
+    SplatInt(i64),
     /// An affine map, as its printed body (`"(d0, d1) -> (d1, d0)"`).
     ///
     /// Kept as text ON PURPOSE, and it is the one place this module does. The passes

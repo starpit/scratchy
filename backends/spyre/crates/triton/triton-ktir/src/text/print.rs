@@ -331,6 +331,7 @@ fn print_op(
                 Some(Attr::Int(i)) => i.to_string(),
                 Some(Attr::Float(f)) => print_float(*f),
                 Some(Attr::SplatFloat(f)) => format!("dense<{}>", print_float(*f)),
+                Some(Attr::SplatInt(i)) => format!("dense<{i}>"),
                 Some(Attr::Verbatim(s)) => s.clone(),
                 _ => "<?>".into(),
             };
@@ -686,6 +687,7 @@ pub fn print_attr(a: &Attr) -> String {
                 .join(", ")
         ),
         Attr::Float(f) | Attr::SplatFloat(f) => print_float(*f),
+        Attr::SplatInt(i) => i.to_string(),
         Attr::Str(s) => format!("\"{s}\""),
         Attr::StrList(v) => format!("[{}]", v.join(", ")),
         Attr::Bool(b) => b.to_string(),

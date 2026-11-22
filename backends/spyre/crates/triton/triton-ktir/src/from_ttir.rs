@@ -584,25 +584,14 @@ fn attr_value(m: &ttir::Module, op_name: &str, key: &str, v: &ttir::Attr) -> Res
                 Attr::SplatFloat(float_bits(bits.get(), et, op_name, key)?)
             }
             // AN INTEGER DENSE SPLAT IS PATH-DEPENDENT IN THE READER, and this arm matches
-            // it per path. `text::parse`'s `parse_constant` -- the `arith.constant`
-            // payload path -- reads a dense int splat as `SplatFloat(parse_float(...))`:
-            // the integer text float-parsed at the result type's width (a [1,64] i32
-            // `dense<49155>` becomes the f32 bits of 49155.0). Every OTHER path
-            // (`parse_attr_value`, the attribute dictionaries) falls through to
-            // `Attr::Verbatim` -- for `tt.divisibility = dense<64> : tensor<1xi32>`, the
-            // one in tree, on `attention_flash_causal`'s `arith.muli`. The golden diff
-            // compares this adapter against the reader, so the split is reproduced
-            // exactly: constant payloads model the splat (the sampler's `V` and `j`-init
-            // constants are int dense splats, the first in tree), attribute dictionaries
-            // keep the verbatim string.
+            // it per path. An `arith.constant`'s payload is the splat, held exactly as an
+            // integer (`text::parse`'s `parse_constant` reads it the same way); every OTHER
+            // path (`parse_attr_value`, the attribute dictionaries) falls through to
+            // `Attr::Verbatim` -- for `tt.divisibility = dense<64> : tensor<1xi32>`, the one
+            // in tree, on `attention_flash_causal`'s `arith.muli`.
             ttir::Attr::Int(i, _) => {
                 if op_name == "arith.constant" && key == "value" {
-                    // `parse_float`'s width rule: f16 at 16 bits, everything else 32.
-                    let v = *i as f64;
-                    Attr::SplatFloat(match t.scalar() {
-                        ttir::Type::Float(FloatKind::F16) => FloatBits::f16_from_f32(v as f32),
-                        _ => FloatBits::f32(v as f32),
-                    })
+                    Attr::SplatInt(narrow(*i, op_name, key)?)
                 } else {
                     Attr::Verbatim(format!("dense<{i}> : {t}"))
                 }

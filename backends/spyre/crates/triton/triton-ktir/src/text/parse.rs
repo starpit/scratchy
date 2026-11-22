@@ -693,8 +693,13 @@ impl Parser {
             // the C++ too -- so it is kept verbatim rather than half-read.
             if body.contains('[') {
                 Attr::Verbatim(val.to_string())
-            } else {
+            } else if elem.is_float() {
                 Attr::SplatFloat(parse_float(body, elem, lineno)?)
+            } else {
+                Attr::SplatInt(
+                    parse_int(body)
+                        .ok_or_else(|| err(lineno, format!("cannot read integer splat `{body}`")))?,
+                )
             }
         } else if elem.is_float() {
             Attr::Float(parse_float(val, elem, lineno)?)

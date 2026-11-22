@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use ktir_core::arena::Arena;
 use ktir_superdsc::lift::{LiftError, lift};
-use ktir_superdsc::program::{Program, Segment};
+use ktir_superdsc::program::{Program, Segment, TableData};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
@@ -487,7 +487,17 @@ fn every_kernel_lifts_or_is_on_the_red_list() {
     let mut report = Vec::new();
     let mut wrong = Vec::new();
     for c in &cases {
-        let got = status(&lift_case(c));
+        let lifted = lift_case(c);
+        // Every constant table a kernel states is a ramp (each `tl.arange`), stated by its
+        // form: no kernel stages a table element by element.
+        if let Ok(p) = &lifted {
+            assert!(
+                p.tables.iter().all(|t| matches!(t.data, TableData::Ramp { .. })),
+                "{}: a table stated element by element",
+                c.name
+            );
+        }
+        let got = status(&lifted);
         let line = match &got {
             Status::Lifts { walks } => format!("lifts, {walks} walk(s)"),
             Status::Stops(e) => format!("stops: {e}"),

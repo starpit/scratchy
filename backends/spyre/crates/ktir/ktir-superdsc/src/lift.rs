@@ -31,7 +31,7 @@ use ktir_core::opkind::OpKind;
 use crate::lin::{Lin, NotAffine, Sym};
 use crate::program::{
     Address, Axis, ConstId, ConstStick, Format, Gather, Local, LocalId, Node, OpFunc, Operand,
-    ParamId, Program, Segment, Store, Table, TableId, View, Walk,
+    ParamId, Program, Scalar, Segment, Store, Table, TableData, TableId, View, Walk,
 };
 use crate::qty::{Elems, Extent, Stride};
 use crate::view::{SymView, ViewError, extent};
@@ -54,7 +54,18 @@ pub enum LiftError {
     /// An address that falls before its buffer, or moves backwards, or moves with the trip in
     /// straight code.
     Address { op: OpKind },
+    /// A constant its format cannot hold exactly (an integer past i32, a ramp past what a float
+    /// format holds exactly).
+    Unrepresentable { op: OpKind },
+    /// A `tensor.generate` whose body is not affine in its index, wider than
+    /// [`GENERATE_ELEMENTS`] elements.
+    Generate { elements: u64 },
 }
+
+/// The most elements a `tensor.generate` whose body is not affine in its index is evaluated for,
+/// one element at a time. An affine body (every `tl.arange`) is a ramp, stated by its form at any
+/// width.
+pub const GENERATE_ELEMENTS: u64 = 4096;
 
 /// A tensor during the lift: a view over a store whose origin is still affine.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,17 +238,16 @@ impl<'f> Cx<'f> {
         extents(op.op_type, dims)
     }
 
-    /// The constant stick holding `value` in `format`.
-    fn constant(&mut self, value: f64, format: Format) -> ConstId {
-        let c = ConstStick {
-            format,
-            bits: (value as f32).to_bits(),
-        };
+    /// The constant stick holding `value` in `format`: an integer format takes it only when it
+    /// is an i32 exactly.
+    fn constant(&mut self, op: OpKind, value: f64, format: Format) -> Result<ConstId, LiftError> {
+        let value = Scalar::new(value, format).ok_or(LiftError::Unrepresentable { op })?;
+        let c = ConstStick { format, value };
         let next = ConstId::new(self.consts.len() as u32);
-        *self.const_ids.entry(c).or_insert_with(|| {
+        Ok(*self.const_ids.entry(c).or_insert_with(|| {
             self.consts.push(c);
             next
-        })
+        }))
     }
 
     /// A fresh intermediate of `shape`, row-major, held once per position of every open parallel
@@ -277,10 +287,10 @@ impl<'f> Cx<'f> {
                 view: t.view.broadcast(shape).map_err(view_err)?,
                 ..t.clone()
             }),
-            Val::Splat { value, format, .. } => Ok(self.splat(*value, *format, shape)),
-            Val::Float(x) => Ok(self.splat(*x, format, shape)),
+            Val::Splat { value, format, .. } => self.splat(op.op_type, *value, *format, shape),
+            Val::Float(x) => self.splat(op.op_type, *x, format, shape),
             Val::Int(l) => match l.as_const() {
-                Some(i) => Ok(self.splat(i as f64, format, shape)),
+                Some(i) => self.splat(op.op_type, i as f64, format, shape),
                 None => Err(LiftError::Op(op.op_type)),
             },
             // An fp8 value read as fp16 by anything but a contraction needs `fp8todl16`.
@@ -296,9 +306,9 @@ impl<'f> Cx<'f> {
         }
     }
 
-    fn splat(&mut self, value: f64, format: Format, shape: &[Extent]) -> T {
-        let c = self.constant(value, format);
-        T {
+    fn splat(&mut self, op: OpKind, value: f64, format: Format, shape: &[Extent]) -> Result<T, LiftError> {
+        let c = self.constant(op, value, format)?;
+        Ok(T {
             store: Store::Const(c),
             view: SymView {
                 origin: Lin::constant(0),
@@ -306,7 +316,7 @@ impl<'f> Cx<'f> {
             },
             format,
             gather: None,
-        }
+        })
     }
 
     fn note_param(&mut self, op: OpKind, s: Store, format: Format) -> Result<(), LiftError> {
@@ -573,8 +583,10 @@ impl<'f> Cx<'f> {
     }
 
     /// `tensor.generate`: a tensor whose elements the program states as a function of their
-    /// index, evaluated here, element by element, into a constant table the bake stages. Its body
-    /// may compute scalars only: anything that would put a node on the device is not a constant.
+    /// index, a constant table the bake stages. The body is lifted once over symbolic indices:
+    /// an affine yield is a ramp, stated by its form. Any other body is evaluated element by
+    /// element, up to [`GENERATE_ELEMENTS`]. Either way the body computes scalars only:
+    /// anything that would put a node on the device is not a constant.
     fn generate(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
         let malformed = |what| LiftError::Malformed { op: op.op_type, what };
         let shape = Self::result_shape(op)?;
@@ -591,27 +603,56 @@ impl<'f> Cx<'f> {
         if names.len() != shape.len() {
             return Err(malformed("tensor.generate names one index per dimension"));
         }
-        let total: u64 = shape.iter().map(|e| e.get()).product();
         let nodes = self.run.len();
-        let mut bits = Vec::with_capacity(total as usize);
-        for flat in 0..total {
-            let mut rest = flat;
-            for d in (0..shape.len()).rev() {
-                let n = shape[d].get();
-                self.env.insert(names[d], Val::Int(Lin::constant((rest % n) as i64)));
-                rest /= n;
+        let free: Vec<usize> = (0..crate::lin::AXES).filter(|s| !self.par.iter().any(|p| p.slot == *s)).collect();
+        let mut data = None;
+        if free.len() >= shape.len() {
+            for (d, n) in names.iter().enumerate() {
+                self.env.insert(*n, Val::Int(Lin::sym(Sym::Axis(free[d]))));
             }
-            let value = match self.ops(body)?.as_deref() {
-                Some([Val::Int(l)]) => l.as_const().ok_or(LiftError::NotAffine { op: op.op_type })? as f32,
-                Some([Val::Float(x)]) => *x as f32,
-                _ => return Err(malformed("tensor.generate yields one scalar per element")),
-            };
-            if self.run.len() != nodes {
-                return Err(malformed("tensor.generate's body computes scalars only"));
+            if let Ok(Some(y)) = self.ops(body)
+                && let [Val::Int(l)] = y.as_slice()
+                && l.trip == 0
+                && (0..crate::lin::AXES).all(|s| free[..shape.len()].contains(&s) || l.axis[s] == 0)
+            {
+                let steps = free[..shape.len()].iter().map(|&s| l.axis[s]).collect();
+                data = Some(TableData::Ramp { base: l.c, steps });
             }
-            bits.push(value.to_bits());
         }
-        self.tables.push(Table { format, bits });
+        if self.run.len() != nodes {
+            return Err(malformed("tensor.generate's body computes scalars only"));
+        }
+        let data = match data {
+            Some(d) => d,
+            None => {
+                let total: u64 = shape.iter().map(|e| e.get()).product();
+                if total > GENERATE_ELEMENTS {
+                    return Err(LiftError::Generate { elements: total });
+                }
+                let mut values = Vec::with_capacity(total as usize);
+                for flat in 0..total {
+                    let mut rest = flat;
+                    for d in (0..shape.len()).rev() {
+                        let n = shape[d].get();
+                        self.env.insert(names[d], Val::Int(Lin::constant((rest % n) as i64)));
+                        rest /= n;
+                    }
+                    let x = match self.ops(body)?.as_deref() {
+                        Some([Val::Int(l)]) => l.as_const().ok_or(LiftError::NotAffine { op: op.op_type })? as f64,
+                        Some([Val::Float(x)]) => *x,
+                        _ => return Err(malformed("tensor.generate yields one scalar per element")),
+                    };
+                    if self.run.len() != nodes {
+                        return Err(malformed("tensor.generate's body computes scalars only"));
+                    }
+                    values.push(Scalar::new(x, format).ok_or(LiftError::Unrepresentable { op: op.op_type })?);
+                }
+                TableData::Values(values)
+            }
+        };
+        let table = Table { format, shape: shape.clone(), data };
+        Self::exact_in(op.op_type, &table)?;
+        self.tables.push(table);
         let t = T {
             store: Store::Table(TableId::new(self.tables.len() as u32 - 1)),
             view: SymView::row_major(Lin::constant(0), &shape),
@@ -620,6 +661,21 @@ impl<'f> Cx<'f> {
         };
         self.bind(op, Val::Tensor(t));
         Ok(())
+    }
+
+    /// Every value of `t` held exactly in its format.
+    fn exact_in(op: OpKind, t: &Table) -> Result<(), LiftError> {
+        let (lo, hi) = t.range();
+        let limit = match t.format {
+            Format::Int32 => return (lo >= f64::from(i32::MIN) && hi <= f64::from(i32::MAX)).then_some(()).ok_or(LiftError::Unrepresentable { op }),
+            Format::Fp32 => f64::from(1u32 << 24),
+            Format::Fp16 => 2048.0,
+            Format::Fp8 => return Err(LiftError::Unrepresentable { op }),
+        };
+        match t.data {
+            TableData::Ramp { .. } => (lo >= -limit && hi <= limit).then_some(()).ok_or(LiftError::Unrepresentable { op }),
+            TableData::Values(_) => Ok(()),
+        }
     }
 
     /// `ktdp.construct_indirect_access_tile`: one dimension's rows named by an index view.
@@ -1160,19 +1216,28 @@ impl<'f> Cx<'f> {
             K::ArithSitofp | K::ArithUitofp => {
                 let to = Self::result_format(op)?;
                 match self.get(op.operands[0])? {
-                    // A cast of a constant table is a constant table: its values converted here.
+                    // A cast of a constant table is a constant table: a ramp keeps its form, a
+                    // value table converts each value; every value exact in the new format.
                     Val::Tensor(t) if matches!(t.store, Store::Table(_)) => {
                         let Store::Table(id) = t.store else {
                             return Err(malformed("a table cast reads a table"));
                         };
                         let from = &self.tables[id.get() as usize];
-                        let bits = from
-                            .bits
-                            .iter()
-                            .map(|&b| round_to(f32::from_bits(b), to).map(f32::to_bits))
-                            .collect::<Option<_>>()
-                            .ok_or(malformed("a constant table in a format this crate rounds"))?;
-                        self.tables.push(Table { format: to, bits });
+                        let data = match &from.data {
+                            TableData::Ramp { base, steps } => TableData::Ramp { base: *base, steps: steps.clone() },
+                            TableData::Values(v) => TableData::Values(
+                                v.iter()
+                                    .map(|x| {
+                                        round_to(x.as_f64() as f32, to)
+                                            .and_then(|r| Scalar::new(f64::from(r), to))
+                                    })
+                                    .collect::<Option<_>>()
+                                    .ok_or(LiftError::Unrepresentable { op: op.op_type })?,
+                            ),
+                        };
+                        let table = Table { format: to, shape: from.shape.clone(), data };
+                        Self::exact_in(op.op_type, &table)?;
+                        self.tables.push(table);
                         let store = Store::Table(TableId::new(self.tables.len() as u32 - 1));
                         self.bind(op, Val::Tensor(T { store, format: to, ..t }));
                     }

@@ -34,7 +34,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         .filter(|p| {
             let op = walk::at(module, p).expect("path");
             op.kind == OpKind::ArithConstant
-                && matches!(op.attr(&AttrKey::Value), Some(Attr::SplatFloat(_)))
+                && matches!(op.attr(&AttrKey::Value), Some(Attr::SplatFloat(_) | Attr::SplatInt(_)))
                 && op
                     .result_type()
                     .map(|t| t.dims().is_some())
@@ -51,7 +51,8 @@ pub fn run(module: &mut Module) -> Result<()> {
             .expect("filtered on a shaped result");
         let elem = tensor_ty.elem().expect("a shaped type has an element type");
         let value = match op.attr(&AttrKey::Value) {
-            Some(Attr::SplatFloat(f)) => *f,
+            Some(Attr::SplatFloat(f)) => Attr::Float(*f),
+            Some(Attr::SplatInt(i)) => Attr::Int(*i),
             _ => unreachable!("filtered"),
         };
         let result = op.results[0];
@@ -62,7 +63,7 @@ pub fn run(module: &mut Module) -> Result<()> {
         let scalar = module.fresh_named(&hint);
         let scalar_op = Op::new(OpKind::ArithConstant)
             .with_result(scalar, IrType::Scalar(elem))
-            .with_attr(AttrKey::Value, Attr::Float(value));
+            .with_attr(AttrKey::Value, value);
 
         // tensor.splat fans the scalar out to the original aggregate shape, and
         // KEEPS the original result name so every use is already wired.
