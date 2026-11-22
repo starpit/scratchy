@@ -88,9 +88,10 @@ def page_attn_head_major_decode_kernel(query, query_row_index, k_pages, v_pages,
             k_page = tl.reshape(k_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
             v_page = tl.reshape(v_folded.gather(kv_rows, 0), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         else:
-            # Under the gather floor. The rows `kv_row_pool[page]` names ascend by one
-            # (`page * num_kv_heads + kv`), so they are the num_kv_heads-row tile at the first.
-            first = tl.min(kv_rows, 0)
+            # Under the gather floor. The rows `kv_row_pool[page]` names are
+            # `page * num_kv_heads + kv`, ascending by one, so they are the num_kv_heads-row tile
+            # at `page * num_kv_heads`: read at that offset, with no reduction over the rows.
+            first = page * NUM_KV_HEADS
             k_page = tl.reshape(k_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
             v_page = tl.reshape(v_tiles.load([first, 0]), [NUM_KV_HEADS, BLOCK_SIZE, HEAD_SIZE])
         # scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale

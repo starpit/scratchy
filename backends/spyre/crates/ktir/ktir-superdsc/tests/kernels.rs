@@ -419,9 +419,9 @@ const EXPECTED: &[(&str, &str)] = &[
     ("windowedrmsnorm_oneplus_fwd", "lifts, 0 walk(s)"),
     ("windowedrmsnorm_unit_fwd", "lifts, 0 walk(s)"),
     ("paged_attn_decode", "lifts, 1 walk(s)"),
-    // RED: `tl.min` over int32 row ids; the device reduces fp16/fp32 only
-    // (summeanmaxexx2*.ddl), so this needs the int→fp32, reduce, fp32→int legalization.
-    ("paged_attn_decode_few_kv_heads", "stops: Op(ArithMinsi)"),
+    // Under the gather floor the page's rows are read at `page · NUM_KV_HEADS` (the kernel's
+    // pool is `page · num_kv_heads + kv`), a device-read offset: no integer reduction.
+    ("paged_attn_decode_few_kv_heads", "lifts, 1 walk(s)"),
     ("paged_attn_prefill", "lifts, 1 walk(s)"),
     ("batched_decode", "lifts, 0 walk(s)"),
     ("paged_kv_write", "lifts, 0 walk(s)"),
