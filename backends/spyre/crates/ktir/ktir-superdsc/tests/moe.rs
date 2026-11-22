@@ -53,13 +53,33 @@ fn temp(s: Shape) -> f64 {
     (s.h as f64).powf(-0.5)
 }
 
+/// Which MoE kernel: the decode form (`moe.py`, its rows `M`) or the prefill form
+/// (`moe_prefill.py`, its rows `T`, the dense route as its last parameter).
+#[derive(Clone, Copy, PartialEq)]
+enum Form {
+    Decode,
+    Prefill,
+}
+
 fn moe(s: Shape) -> Program {
-    let path = format!("{}/../../../kernels/moe.py", env!("CARGO_MANIFEST_DIR"));
+    compile(Form::Decode, s)
+}
+
+fn compile(form: Form, s: Shape) -> Program {
+    let (file, kernel, rows) = match form {
+        Form::Decode => ("moe.py", "moe_fwd", "M"),
+        Form::Prefill => ("moe_prefill.py", "moe_prefill_fwd", "T"),
+    };
+    let path = format!("{}/../../../kernels/{file}", env!("CARGO_MANIFEST_DIR"));
     let src = std::fs::read_to_string(&path).expect("read kernel");
+    let args: Vec<(&str, &str)> = match form {
+        Form::Decode => ARGS.to_vec(),
+        Form::Prefill => ARGS[..12].iter().copied().chain([("desc_dense", "*fp16")]).collect(),
+    };
     let mut signature: HashMap<String, ArgSpec> =
-        ARGS.iter().map(|(n, t)| (n.to_string(), ArgSpec::parse(t).expect("arg"))).collect();
+        args.iter().map(|(n, t)| (n.to_string(), ArgSpec::parse(t).expect("arg"))).collect();
     let constexprs: HashMap<String, Val> = [
-        ("M", Val::Int(s.m as i128)),
+        (rows, Val::Int(s.m as i128)),
         ("H", Val::Int(s.h as i128)),
         ("I", Val::Int(s.i as i128)),
         ("E", Val::Int(s.e as i128)),
@@ -77,7 +97,7 @@ fn moe(s: Shape) -> Program {
         signature.insert(n.clone(), ArgSpec::Constexpr);
     }
     let spec = KernelSpec {
-        kernel: "moe_fwd".to_string(),
+        kernel: kernel.to_string(),
         signature,
         constexprs,
         file: path,
@@ -171,7 +191,7 @@ fn quantize(row: &[f32]) -> (f32, Vec<f32>) {
 fn gelu_tanh_times(gate: f32, up: f32) -> f32 {
     let g = gate;
     let cube = h(h(h(g * h(0.044715)) * g) * g);
-    let v = h(h(g + cube) * h(1.595_769_1));
+    let v = h(h(g + cube) * h(1.595_769_121_605_730_8_f64 as f32));
     let e = h((-v).exp());
     h(h(gate / h(e + 1.0)) * up)
 }
@@ -291,4 +311,84 @@ fn the_lifted_moe_computes_the_host_moe() {
     assert_eq!(out[13], f(&want.rs), "the route weights");
     assert!(want.o.iter().all(|x| x.is_finite()) && want.o.iter().any(|&x| x != 0.0), "a finite, nonzero output");
     assert_eq!(out[11], f(&want.o), "the output");
+}
+
+// ── THE PREFILL FORM: every expert over every token, weighted by the dense route. ──
+
+#[test]
+fn the_prefill_experts_are_three_contractions_at_any_prompt_and_expert_count() {
+    let short = compile(Form::Prefill, Shape { m: 16, h: 128, i: 64, e: 16, k: 8 });
+    let long = compile(Form::Prefill, Shape { m: 32, h: 128, i: 64, e: 16, k: 8 });
+    let wide = compile(Form::Prefill, Shape { m: 16, h: 128, i: 64, e: 32, k: 8 });
+    for (what, p) in [("T = 16", &short), ("T = 32", &long), ("E = 32", &wide)] {
+        assert_eq!(contractions(p), 4, "{what}: the router and the three expert projections");
+    }
+    assert_eq!(nodes(&short).len(), nodes(&long).len(), "the node count does not grow with the prompt");
+    assert_eq!(nodes(&short).len(), nodes(&wide).len(), "the node count does not grow with the experts");
+}
+
+/// The prefill host reference: the router as decode's, the dense route, then every expert over
+/// every token, summed over the experts in expert order.
+fn host_prefill(s: Shape, w: &Weights) -> (Vec<f32>, Vec<f32>) {
+    let Shape { m: rows, h: hd, i: id, e: ne, k } = s;
+    let decode = host(s, w);
+    let mut dense = vec![0f32; rows * ne];
+    for t in 0..rows {
+        for j in 0..k {
+            dense[t * ne + decode.ids[t * k + j] as usize] = decode.rs[t * k + j];
+        }
+    }
+    let mut o = vec![0f32; rows * hd];
+    for t in 0..rows {
+        let (sx, qx) = quantize(&w.xe[t * hd..(t + 1) * hd]);
+        let downs: Vec<Vec<f32>> = (0..ne)
+            .map(|e| {
+                let proj = |bank: &[f32], scale: &[f32], c: usize| -> f32 {
+                    let raw = h((0..hd).fold(0f32, |a, x| a + qx[x] * bank[(e * id + c) * hd + x]));
+                    h(h(raw * sx) * scale[e * id + c])
+                };
+                let act: Vec<f32> =
+                    (0..id).map(|c| gelu_tanh_times(proj(&w.wg, &w.sg, c), proj(&w.wu, &w.su, c))).collect();
+                let (sa, qa) = quantize(&act);
+                (0..hd)
+                    .map(|c| {
+                        let raw = h((0..id).fold(0f32, |a, x| a + qa[x] * w.wd[(e * hd + c) * id + x]));
+                        h(h(raw * sa) * w.sd[e * hd + c])
+                    })
+                    .collect()
+            })
+            .collect();
+        for c in 0..hd {
+            o[t * hd + c] = h((0..ne).fold(0f32, |a, e| a + h(downs[e][c] * dense[t * ne + e])));
+        }
+    }
+    (dense, o)
+}
+
+#[test]
+fn the_lifted_prefill_moe_computes_the_host_moe() {
+    let s = Shape { m: 16, h: 128, i: 64, e: 16, k: 8 };
+    let w = weights(s);
+    let p = compile(Form::Prefill, s);
+    let f = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+    let params = vec![
+        f(&w.xr),
+        f(&w.rg),
+        f(&w.rw),
+        f(&w.pes),
+        f(&w.xe),
+        f(&w.wg),
+        f(&w.sg),
+        f(&w.wu),
+        f(&w.su),
+        f(&w.wd),
+        f(&w.sd),
+        vec![0.0; s.m * s.h],
+        vec![0.0; s.m * s.e],
+    ];
+    let out = run(&p, params).expect("the program runs");
+    let (dense, o) = host_prefill(s, &w);
+    assert_eq!(out[12], f(&dense), "the dense route");
+    assert!(o.iter().all(|x| x.is_finite()) && o.iter().any(|&x| x != 0.0), "a finite, nonzero output");
+    assert_eq!(out[11], f(&o), "the output");
 }

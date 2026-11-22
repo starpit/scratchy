@@ -8,9 +8,9 @@ THE PREFILL TWIN OF `moe.py`. The decode kernel (`moe.py`) reads one token's K r
 experts by id — a slab gather per pair, the address depending on data. A prompt routes T
 tokens to up to T·K distinct experts, so this kernel does what IBM spyre-inference's
 `_moe_persistent` does: it builds a DENSE route `[T, E]` (each token's K route weights at
-their expert lanes, zero elsewhere) and sweeps ALL E experts, each a plain matmul of the
-whole `[T, H]` token tile with that expert's slab, scaled per token by its dense weight. No
-address depends on data; every slab is a direct load at a trace-time constant expert.
+their expert lanes, zero elsewhere) and runs ALL E experts over the whole `[T, H]` token
+tile, scaled per token by its dense weight. No address depends on data: the banks are read
+whole.
 
 THE COMPUTATION, IN PROGRAM ORDER:
 
@@ -19,8 +19,10 @@ THE COMPUTATION, IN PROGRAM ORDER:
    at `H^-0.5`, × each selected expert's `per_expert_scale`.
 2. DENSE ROUTE — the K route weights scattered to their expert lanes: round j adds its weight
    to lane `ids[:, j]` by a one-hot select. Lanes off the top-K stay exactly 0.
-3. EXPERTS — for every expert e: gate/up W8A8 over the `[T, H]` tile, gelu-tanh(gate)·up
-   `[T, I]`, down W8A8 back to `[T, H]`, × `dense[:, e]`, accumulated in f16.
+3. EXPERTS — three contractions over all E experts: gate/up W8A8 each ONE contraction of the
+   token codes against every expert's rows stacked (`[T, H] × [H, E·I]`), gelu-tanh(gate)·up
+   `[T, E, I]`, down W8A8 batched over the experts, each (token, expert) row at its own scale
+   (`[E, T, I] × [E, I, H]`), × the dense weight, summed over the experts in f16.
 
 THE NUMERICS ARE `moe.py`'s, AT THE SAME GRAIN, so a token computes the same numbers on
 either path (a prefix cached by one is reusable by the other):
@@ -43,51 +45,13 @@ THE SPLICE'S OWN CONTRACT:
   `INV_QMAX`, `SCALE_FLOOR` — `moe.py`'s, with `T` for `M`.
 * GRID: `[1]`.
 
-⛔ EVERY LOOP IS `tl.static_range` (the ladder's law), and the expert sweep is the one that
-matters: E iterations of three fp8 gemms each. That is the bake cost this kernel brings, and
-whether the card door keeps it unrolled or rolls it into one expert body is the door's
-decision, measured, not this file's.
+The router's top-K and dense-route rounds are `tl.static_range` over the K slots (K is the
+model's, not the prompt's); the experts are no loop at all, each projection one contraction
+over all E.
 """
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _fp8_scale(amax, INV_QMAX: tl.constexpr, SCALE_FLOOR: tl.constexpr, ROWS: tl.constexpr):
-    """`quantscalepertokenfp8`'s `FMIN(FMAX(amax · mulConst, clipMin), clipMax)`, one scale per
-    row (`amax` is `[ROWS]`). f16 bounds from birth: a bare Python float in `tl.minimum`
-    becomes an f32 tensor and widens the scale."""
-    lo = tl.full([ROWS], SCALE_FLOOR, tl.float16)
-    hi = tl.full([ROWS], 448.0, tl.float16)
-    return tl.minimum(tl.maximum(amax * INV_QMAX, lo), hi)
-
-
-@triton.jit
-def _fp8_codes(a, inv, ROWS: tl.constexpr, N: tl.constexpr):
-    """`clip(a · (1/s), ±448)` rounded to e4m3, each row at its own scale; widened back to
-    f16 for the dot (the codes are the values)."""
-    lo = tl.full([ROWS, N], -448.0, tl.float16)
-    hi = tl.full([ROWS, N], 448.0, tl.float16)
-    q = tl.minimum(tl.maximum(a * inv[:, None], lo), hi)
-    return q.to(tl.float8e4nv).to(tl.float16)
-
-
-@triton.jit
-def _w8a8(q, s, w_codes, w_scale, ROWS: tl.constexpr, N: tl.constexpr):
-    """`(q @ W.T · s) · w_scale` — the matmulfp8 and its two dequant legs, `s` per row."""
-    raw = tl.dot(q, w_codes.T, tl.zeros([ROWS, N], dtype=tl.float16))
-    return (raw * s[:, None]) * w_scale
-
-
-@triton.jit
-def _gelu_tanh(g, ROWS: tl.constexpr, N: tl.constexpr):
-    """`moe.py`'s gelu: the tanh form through the sigmoid identity, the cubic in the f32
-    island; the `1` an f16 tile."""
-    g32 = g.to(tl.float32)
-    v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
-    e = tl.exp(-v).to(tl.float16)
-    return tl.fdiv(g, tl.full([ROWS, N], 1.0, tl.float16) + e)
 
 
 @triton.jit
@@ -159,41 +123,58 @@ def moe_prefill_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     dense_desc.store([0, 0], dense)
 
     # ── the experts, every one, over the whole token tile ─────────────────────
+    # ── the experts: THREE CONTRACTIONS over all E experts ───────────────────
+    # Every expert runs every token, weighted by the dense route weight (zero where the
+    # token did not route to it). gate/up read the same token codes for every expert, so
+    # each is ONE contraction against all experts' rows stacked (`[T, H] × [H, E·I]`); down
+    # reads each (expert, token) row's own codes, so it batches over the experts
+    # (`[E, T, I] × [E, I, H]`); the combine is a sum over the experts.
     xe_desc = tl.make_tensor_descriptor(desc_xe, shape=[T, H], strides=[H, 1],
                                         block_shape=[T, H])
-    wg_desc = tl.make_tensor_descriptor(desc_wg, shape=[E, I, H], strides=[I * H, H, 1],
-                                        block_shape=[1, I, H])
-    wu_desc = tl.make_tensor_descriptor(desc_wu, shape=[E, I, H], strides=[I * H, H, 1],
-                                        block_shape=[1, I, H])
+    wg_desc = tl.make_tensor_descriptor(desc_wg, shape=[E * I, H], strides=[H, 1],
+                                        block_shape=[E * I, H])
+    wu_desc = tl.make_tensor_descriptor(desc_wu, shape=[E * I, H], strides=[H, 1],
+                                        block_shape=[E * I, H])
     wd_desc = tl.make_tensor_descriptor(desc_wd, shape=[E, H, I], strides=[H * I, I, 1],
-                                        block_shape=[1, H, I])
-    sg_desc = tl.make_tensor_descriptor(desc_sg, shape=[E, I], strides=[I, 1],
-                                        block_shape=[1, I])
-    su_desc = tl.make_tensor_descriptor(desc_su, shape=[E, I], strides=[I, 1],
-                                        block_shape=[1, I])
+                                        block_shape=[E, H, I])
+    sg_desc = tl.make_tensor_descriptor(desc_sg, shape=[E * I], strides=[1],
+                                        block_shape=[E * I])
+    su_desc = tl.make_tensor_descriptor(desc_su, shape=[E * I], strides=[1],
+                                        block_shape=[E * I])
     sd_desc = tl.make_tensor_descriptor(desc_sd, shape=[E, H], strides=[H, 1],
-                                        block_shape=[1, H])
-    # The route's column e, one expert's weight for every token: a `[T, 1]` window of the
-    # dense route would be 2 bytes wide (under the 16-byte block floor), so each column is
-    # read off the whole `[T, E]` tile by a one-hot reduce instead.
+                                        block_shape=[E, H])
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[T, H], strides=[H, 1],
                                        block_shape=[T, H])
+    # The gate/up activation: each token's input, one scale per token for every expert.
     xe = xe_desc.load([0, 0])
-    # gate/up: one scale per TOKEN row, quantized once for every expert.
-    sx = _fp8_scale(tl.max(tl.abs(xe), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR, T)
-    qx = _fp8_codes(xe, tl.fdiv(tl.full([T], 1.0, tl.float16), sx), T, H)
-    acc = tl.zeros([T, H], dtype=tl.float16)
-    for e in tl.static_range(0, E):
-        wg = tl.reshape(wg_desc.load([e, 0, 0]), [I, H]).to(tl.float16)
-        wu = tl.reshape(wu_desc.load([e, 0, 0]), [I, H]).to(tl.float16)
-        gate = _w8a8(qx, sx, wg, sg_desc.load([e, 0]), T, I)
-        up = _w8a8(qx, sx, wu, su_desc.load([e, 0]), T, I)
-        act = _gelu_tanh(gate, T, I) * up
-        # down: one scale per (token, e) row — `moe.py`'s per-pair grain.
-        sa = _fp8_scale(tl.max(tl.abs(act), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR, T)
-        qa = _fp8_codes(act, tl.fdiv(tl.full([T], 1.0, tl.float16), sa), T, I)
-        wd = tl.reshape(wd_desc.load([e, 0, 0]), [H, I]).to(tl.float16)
-        down = _w8a8(qa, sa, wd, sd_desc.load([e, 0]), T, H)
-        we = tl.sum(tl.where(offs[None, :] == e, dense, zero_e), 1)
-        acc = acc + down * we[:, None]
-    o_desc.store([0, 0], acc)
+    sx = tl.minimum(tl.maximum(tl.max(tl.abs(xe), 1).to(tl.float16) * INV_QMAX,
+                               tl.full([T], SCALE_FLOOR, tl.float16)),
+                    tl.full([T], 448.0, tl.float16))
+    ix = tl.fdiv(tl.full([T], 1.0, tl.float16), sx)
+    qx = tl.minimum(tl.maximum(xe * ix[:, None], tl.full([T, H], -448.0, tl.float16)),
+                    tl.full([T, H], 448.0, tl.float16))
+    qx = qx.to(tl.float8e4nv).to(tl.float16)
+    wg = wg_desc.load([0, 0]).to(tl.float16)
+    wu = wu_desc.load([0, 0]).to(tl.float16)
+    gate = tl.dot(qx, wg.T, out_dtype=tl.float16)
+    up = tl.dot(qx, wu.T, out_dtype=tl.float16)
+    gate = tl.reshape((gate * sx[:, None]) * sg_desc.load([0])[None, :], [T, E, I])
+    up = tl.reshape((up * sx[:, None]) * su_desc.load([0])[None, :], [T, E, I])
+    # gelu_tanh(gate) · up, the cubic in the f32 island (an f16 x³ overflows at |x| ≥ 41).
+    g32 = gate.to(tl.float32)
+    v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
+    eg = tl.exp(-v).to(tl.float16)
+    act = tl.fdiv(gate, tl.full([T, E, I], 1.0, tl.float16) + eg) * up
+    # The down activation: each (token, expert) row's own scale.
+    sa = tl.minimum(tl.maximum(tl.max(tl.abs(act), 2).to(tl.float16) * INV_QMAX,
+                               tl.full([T, E], SCALE_FLOOR, tl.float16)),
+                    tl.full([T, E], 448.0, tl.float16))
+    ia = tl.fdiv(tl.full([T, E], 1.0, tl.float16), sa)
+    qa = tl.minimum(tl.maximum(act * ia[:, :, None], tl.full([T, E, I], -448.0, tl.float16)),
+                    tl.full([T, E, I], 448.0, tl.float16))
+    qa = tl.trans(qa.to(tl.float8e4nv).to(tl.float16), (1, 0, 2))
+    wd = wd_desc.load([0, 0, 0]).to(tl.float16)
+    down = tl.dot(qa, tl.trans(wd, (0, 2, 1)), out_dtype=tl.float16)
+    down = (down * tl.trans(sa, (1, 0))[:, :, None]) * sd_desc.load([0, 0])[:, None, :]
+    # The combine: Σ_e dense[t, e] · down[e, t], in f16.
+    o_desc.store([0, 0], tl.sum(down * tl.trans(dense, (1, 0))[:, :, None], 0))

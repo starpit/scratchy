@@ -51,9 +51,10 @@ THE SPLICE'S OWN CONTRACT:
   projection `desc_rw` `[E, H]`, its per-expert scale `desc_pes` `[E]`; the expert input
   `desc_xe` `[M, H]`; the three banks and their per-channel scales `desc_wg`/`desc_sg`
   `[E, I, H]`/`[E, I]`, `desc_wu`/`desc_su` the same, `desc_wd`/`desc_sd` `[E, H, I]`/`[E, H]`;
-  the output `desc_o` `[M, H]`; then the SCRATCH the program round-trips through memory —
-  `desc_ids` `[M, K]` the routed ids as i32, `desc_rs` `[M, K]` the route weights,
-  `desc_act` `[M, K·I]` the K activations.
+  the output `desc_o` `[M, H]`; then the SCRATCH — `desc_ids` `[M, K]` the routed ids as
+  i32 and `desc_rs` `[M, K]` the route weights, both round-tripped through memory, and
+  `desc_act` `[M, K·I]`, part of the signature the splice states, which the program does
+  not read.
 * CONSTEXPRS: `M`, `H`, `I`, `E`, `K`; `EPS`, `INV_H` (the router norm); `TEMP` (`H^-0.5`);
   `INV_QMAX` (`1/448`) and `SCALE_FLOOR` (`1/448²`), the per-token scale's `mulConst` and
   `clipMin` (`OpFunc::op_consts`).
@@ -61,9 +62,14 @@ THE SPLICE'S OWN CONTRACT:
 
 ⛔ WHY THE SCRATCH IS MEMORY. The slab gather reads its index through a POINTER (the
 indirect tile's index view is a kernel argument — `convert_ttir_to_ktdp::slab_gather`), so
-the routed ids are stored as i32 before any slab is read; the route weights ride with them;
-and each pair's activation is staged at its own window of `desc_act`, the `[K, I]` rows the
-card's down quantize reads as one matrix.
+the routed ids are stored as i32 before any slab is read, and read back as the gather's
+index; the route weights ride with them.
+
+THE EXPERTS ARE THREE BATCHED CONTRACTIONS. The banks are read as `[E, rows·cols]`, so the
+routed experts' slabs are one gather of the ids (row `m·K + j` is token m's slot-j expert).
+gate/up batch over the tokens with each token's K slabs side by side
+(`[M, 1, H] × [M, H, K·I]`, every slot reading the token's codes); down batches over the
+M·K pairs (`[M·K, 1, I] × [M·K, I, H]`, each pair its own codes).
 
 ⛔ WHY THE TOP-K IS ROUND-BASED, NOT THE `topk.ddl` RIPPLE. The ripple reads the logits
 one `[M, 1]` column at a time, and a descriptor block must carry at least 16 bytes in its
@@ -77,45 +83,6 @@ dependent address in the program.
 
 import triton
 import triton.language as tl
-
-
-@triton.jit
-def _fp8_scale(amax, INV_QMAX: tl.constexpr, SCALE_FLOOR: tl.constexpr):
-    """The per-token activation scale — `quantscalepertokenfp8`'s
-    `FMIN(FMAX(amax · mulConst, clipMin), clipMax)` (`OpFunc::op_consts`), for one token
-    row (`amax` is `[1]`). The bounds are f16 tiles from birth: `tl.minimum`/`tl.maximum`
-    turn a bare Python float into an f32 tensor, which would widen the scale to f32."""
-    lo = tl.full([1], SCALE_FLOOR, tl.float16)
-    hi = tl.full([1], 448.0, tl.float16)
-    return tl.minimum(tl.maximum(amax * INV_QMAX, lo), hi)
-
-
-@triton.jit
-def _fp8_codes(a, inv, N: tl.constexpr):
-    """`clip(a · (1/s), ±448)` rounded to e4m3 — the card's `fq_sc`/`fq_clip`/`qfp8ch` legs,
-    for one `[1, N]` row. Widened back to f16 for the dot: the codes are the values."""
-    lo = tl.full([1, N], -448.0, tl.float16)
-    hi = tl.full([1, N], 448.0, tl.float16)
-    q = tl.minimum(tl.maximum(a * inv[:, None], lo), hi)
-    return q.to(tl.float8e4nv).to(tl.float16)
-
-
-@triton.jit
-def _w8a8(q, s, w_codes, w_scale, ROWS: tl.constexpr, N: tl.constexpr):
-    """`(q @ W.T · s) · w_scale` — the matmulfp8 and its two dequant legs."""
-    raw = tl.dot(q, w_codes.T, tl.zeros([ROWS, N], dtype=tl.float16))
-    return (raw * s[:, None]) * w_scale
-
-
-@triton.jit
-def _gelu_tanh(g, N: tl.constexpr):
-    """`gatedact.py`'s gelu: the tanh form through the sigmoid identity, the cubic in the
-    f32 island (an f16 x³ overflows at |x| ≥ 41). The `1` is an f16 tile, `swiglu_mlp.py`'s
-    spelling: `1.0 + e` would make the divide an f16-by-f32 `fdiv`, which upstream refuses."""
-    g32 = g.to(tl.float32)
-    v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
-    e = tl.exp(-v).to(tl.float16)
-    return tl.fdiv(g, tl.full([1, N], 1.0, tl.float16) + e)
 
 
 @triton.jit
