@@ -184,17 +184,6 @@ fn format_of(op: OpKind, dtype: DType) -> Result<Format, LiftError> {
     }
 }
 
-/// `x` as `format` holds it, for a value the lift computes at compile time; `None` for fp8,
-/// whose rounding this crate does not state.
-fn round_to(x: f32, format: Format) -> Option<f32> {
-    match format {
-        Format::Fp32 => Some(x),
-        Format::Fp16 => Some(half::f16::from_f32(x).to_f32()),
-        Format::Int32 => Some(x.trunc()),
-        Format::Fp8 => None,
-    }
-}
-
 fn extents(op: OpKind, dims: &[i64]) -> Result<Vec<Extent>, LiftError> {
     dims.iter()
         .map(|&d| extent(d).ok_or(LiftError::Malformed { op, what: "a dimension of one position or more" }))
@@ -358,12 +347,31 @@ impl<'f> Cx<'f> {
         self.pointwise(op, OpFunc::Device(d), format)
     }
 
+    /// `t` with its per-position gather done: copied, rows as the index names them, into a dense
+    /// intermediate. A gather along an axis names that axis by its index, which a view op would
+    /// renumber; a whole-view offset gather names no axis and needs no copy.
+    fn gathered(&mut self, t: T) -> T {
+        if !matches!(t.gather, Some(G::Rows { .. })) {
+            return t;
+        }
+        let shape = t.view.shape();
+        let dense = self.local(&shape, t.format);
+        self.push(OpFunc::Copy, shape, vec![t], dense.clone());
+        dense
+    }
+
     fn view_op(
         &mut self,
         op: &Operation<'_>,
         f: impl Fn(&SymView) -> Result<SymView, ViewError>,
     ) -> Result<(), LiftError> {
         let v = match self.get(op.operands[0])? {
+            Val::Tensor(t) => Val::Tensor(self.gathered(t)),
+            Val::Pred(t) => Val::Pred(self.gathered(t)),
+            Val::Widened(t) => Val::Widened(self.gathered(t)),
+            other => other,
+        };
+        let v = match v {
             Val::Tensor(t) => Val::Tensor(T {
                 view: f(&t.view).map_err(|error| LiftError::View { op: op.op_type, error })?,
                 ..t
@@ -1227,10 +1235,7 @@ impl<'f> Cx<'f> {
                             TableData::Ramp { base, steps } => TableData::Ramp { base: *base, steps: steps.clone() },
                             TableData::Values(v) => TableData::Values(
                                 v.iter()
-                                    .map(|x| {
-                                        round_to(x.as_f64() as f32, to)
-                                            .and_then(|r| Scalar::new(f64::from(r), to))
-                                    })
+                                    .map(|x| Scalar::new(x.as_f64(), to))
                                     .collect::<Option<_>>()
                                     .ok_or(LiftError::Unrepresentable { op: op.op_type })?,
                             ),

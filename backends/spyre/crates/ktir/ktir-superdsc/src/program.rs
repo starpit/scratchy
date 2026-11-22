@@ -69,6 +69,33 @@ pub enum Format {
 }
 
 impl Format {
+    /// `x` as this format holds it: fp32 to nearest, fp16 and fp8 e4m3 to nearest even (e4m3
+    /// with 3 mantissa bits, normals down to 2^-6, subnormals in steps of 2^-9, saturating at
+    /// ±448, its largest finite value), int32 wrapping.
+    pub fn round(self, x: f64) -> f64 {
+        match self {
+            Format::Fp32 => f64::from(x as f32),
+            Format::Fp16 => f64::from(half::f16::from_f32(x as f32).to_f32()),
+            Format::Int32 => f64::from(x as i64 as i32),
+            Format::Fp8 => {
+                let x = x as f32;
+                if x == 0.0 || x.is_nan() {
+                    return f64::from(x);
+                }
+                let a = f64::from(x.abs()).min(448.0);
+                let quantum = if a >= 2f64.powi(-6) {
+                    2f64.powi(a.log2().floor() as i32 - 3)
+                } else {
+                    2f64.powi(-9)
+                };
+                let q = a / quantum;
+                let r = q.floor();
+                let up = q - r > 0.5 || (q - r == 0.5 && r % 2.0 != 0.0);
+                ((if up { r + 1.0 } else { r }) * quantum).min(448.0).copysign(f64::from(x))
+            }
+        }
+    }
+
     pub const fn bytes_per_elem(self) -> NonZeroU64 {
         match self {
             Format::Fp8 => NonZeroU64::MIN,
@@ -190,14 +217,14 @@ pub enum Scalar {
 
 impl Scalar {
     /// `x` as `format` holds it: an integer format takes it only when it is an i32 exactly; a
-    /// float format takes it as f32.
+    /// float format rounds it ([`Format::round`]).
     pub fn new(x: f64, format: Format) -> Option<Scalar> {
         match format {
             Format::Int32 => {
                 let i = x as i32;
                 (f64::from(i) == x).then_some(Scalar::Int(i))
             }
-            Format::Fp16 | Format::Fp32 | Format::Fp8 => Some(Scalar::Float((x as f32).to_bits())),
+            Format::Fp16 | Format::Fp32 | Format::Fp8 => Some(Scalar::Float((format.round(x) as f32).to_bits())),
         }
     }
 

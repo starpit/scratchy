@@ -425,10 +425,10 @@ const EXPECTED: &[(&str, &str)] = &[
     ("paged_attn_prefill", "lifts, 1 walk(s)"),
     ("batched_decode", "lifts, 0 walk(s)"),
     ("paged_kv_write", "lifts, 0 walk(s)"),
-    // The MoE kernels lift, but as written: `static_range(M) ⊃ static_range(K)` is unrolled by
-    // Triton, so each token's K experts are separate matmuls (25 at M = 1, K = 8). The form they
-    // must reach is one gathered batched contraction over (token, expert slot), the experts'
-    // weights gathered by id: a kernel rewrite.
+    // moe_fwd: the router and three batched contractions, the routed experts' slabs gathered
+    // by id (tests/moe.rs: four contractions at any token or expert count, and numerically the
+    // host's). moe_prefill_fwd lifts AS WRITTEN: Triton unrolls its `static_range` loops, so its
+    // experts are separate matmuls; it needs the same rewrite.
     ("moe_fwd", "lifts, 0 walk(s)"),
     ("moe_prefill_fwd", "lifts, 0 walk(s)"),
     // The sampler lifts. Lifting is not the draw being right: the numeric check of the

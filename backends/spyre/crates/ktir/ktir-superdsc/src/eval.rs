@@ -3,13 +3,12 @@
 //! numeric model, so a lowering can be checked against a reference of the kernel's own math.
 //!
 //! THE MODEL. Every float op computes in f32 and rounds its result to the output's format
-//! (fp16 round-to-nearest-even; fp8 e4m3 is not modelled and is refused by name); an integer op
+//! (fp16 and fp8 e4m3 round to nearest even, e4m3 saturating at ±448); an integer op
 //! wraps in i32; a compare writes 1 or 0; a reduction folds in f32 from its identity; a
 //! contraction accumulates in f32. The device's dl16 format and its transcendental units are
 //! not bit-modelled: what this checks is that the lowering addresses, orders and combines the
 //! values the KTIR states — views, gathers, parallel axes, walks, reductions, casts.
 
-use half::f16;
 use ktir_core::ddl_binds::DeviceOp;
 
 use crate::program::{Address, Format, Gather, Node, OpFunc, Operand, Program, Segment, Store};
@@ -28,15 +27,6 @@ pub enum EvalError {
     Format(Format),
 }
 
-/// Round `x` to what `format` holds.
-fn round(x: f64, format: Format) -> Result<f64, EvalError> {
-    Ok(match format {
-        Format::Fp32 => f64::from(x as f32),
-        Format::Fp16 => f64::from(f16::from_f32(x as f32).to_f32()),
-        Format::Int32 => f64::from(x as i64 as i32),
-        Format::Fp8 => return Err(EvalError::Format(Format::Fp8)),
-    })
-}
 
 struct Run<'p> {
     p: &'p Program,
@@ -120,7 +110,7 @@ impl Run<'_> {
 
     fn write<O: Origin>(&mut self, ni: usize, o: &Operand<O>, pos: &[u64], trip: u64, v: f64) -> Result<(), EvalError> {
         let at = self.address(ni, o, pos, trip)?;
-        let v = round(v, o.format)?;
+        let v = o.format.round(v);
         let buf = match o.store {
             Store::Param(p) => &mut self.params[p.get() as usize],
             Store::Local(l) => &mut self.locals[l.get() as usize],
@@ -239,7 +229,7 @@ fn pointwise(func: OpFunc, x: &[f64]) -> Result<f64, EvalError> {
             DeviceOp::Sigmoid => f64::from(1.0 / (1.0 + (-f(0)).exp())),
             DeviceOp::Silu => f64::from(f(0) / (1.0 + (-f(0)).exp())),
             DeviceOp::Floor => f64::from(f(0).floor()),
-            DeviceOp::Identity | DeviceOp::Dl16ToFp32 | DeviceOp::Fp32ToDl16 => x[0],
+            DeviceOp::Identity | DeviceOp::Dl16ToFp32 | DeviceOp::Fp32ToDl16 | DeviceOp::Qfp8Ch => x[0],
             DeviceOp::AddI32ToI32 => f64::from(i32w(0).wrapping_add(i32w(1))),
             DeviceOp::MulI32ToI32 => f64::from(i32w(0).wrapping_mul(i32w(1))),
             DeviceOp::Int32ToFp32 => f64::from(i32w(0) as f32),

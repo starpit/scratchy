@@ -188,52 +188,69 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     ex = tl.exp(sv - tl.max(sv, 1)[:, None])
     rs_desc.store([0, 0], tl.fdiv(ex, tl.sum(ex, 1)[:, None]).to(tl.float16) * psel)
 
-    # ── the experts ───────────────────────────────────────────────────────────
+    # ── the experts: THREE BATCHED CONTRACTIONS, the slabs gathered by id ─────
+    # The banks are read as `[E, rows·cols]`: an expert's slab is one row, so the routed
+    # experts' slabs are one gather of `ids` (row `m·K + j` is token m's slot-j expert).
+    # gate/up read every slot's slab against the TOKEN's codes, so they batch over the
+    # tokens with the K slabs side by side (`[M, 1, H] × [M, H, K·I]`); down reads each
+    # pair's OWN activation, so it batches over the M·K pairs (`[M·K, 1, I] × [M·K, I, H]`).
+    MK: tl.constexpr = M * K
     xe_desc = tl.make_tensor_descriptor(desc_xe, shape=[M, H], strides=[H, 1],
-                                        block_shape=[1, H])
-    wg_desc = tl.make_tensor_descriptor(desc_wg, shape=[E, I, H], strides=[I * H, H, 1],
-                                        block_shape=[1, I, H])
-    wu_desc = tl.make_tensor_descriptor(desc_wu, shape=[E, I, H], strides=[I * H, H, 1],
-                                        block_shape=[1, I, H])
-    wd_desc = tl.make_tensor_descriptor(desc_wd, shape=[E, H, I], strides=[H * I, I, 1],
-                                        block_shape=[1, H, I])
+                                        block_shape=[M, H])
+    wg_desc = tl.make_tensor_descriptor(desc_wg, shape=[E, I * H], strides=[I * H, 1],
+                                        block_shape=[1, I * H])
+    wu_desc = tl.make_tensor_descriptor(desc_wu, shape=[E, I * H], strides=[I * H, 1],
+                                        block_shape=[1, I * H])
+    wd_desc = tl.make_tensor_descriptor(desc_wd, shape=[E, H * I], strides=[H * I, 1],
+                                        block_shape=[1, H * I])
     sg_desc = tl.make_tensor_descriptor(desc_sg, shape=[E, I], strides=[I, 1],
                                         block_shape=[1, I])
     su_desc = tl.make_tensor_descriptor(desc_su, shape=[E, I], strides=[I, 1],
                                         block_shape=[1, I])
     sd_desc = tl.make_tensor_descriptor(desc_sd, shape=[E, H], strides=[H, 1],
                                         block_shape=[1, H])
-    rw1_desc = tl.make_tensor_descriptor(desc_rs, shape=[M, K], strides=[K, 1],
-                                         block_shape=[1, K])
-    act_desc = tl.make_tensor_descriptor(desc_act, shape=[M, K * I], strides=[K * I, 1],
-                                         block_shape=[1, I])
+    pairs_desc = tl.make_tensor_descriptor(desc_ids, shape=[MK], strides=[1], block_shape=[MK])
+    rw_desc = tl.make_tensor_descriptor(desc_rs, shape=[M, K], strides=[K, 1],
+                                        block_shape=[M, K])
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, H], strides=[H, 1],
-                                       block_shape=[1, H])
-    for m in tl.static_range(0, M):
-        # This token's K route weights, one row; slot j's weight is its one-hot sum.
-        wrow = rw1_desc.load([m, 0])
-        # The gate/up activation: the token's input, one scale for all K pairs.
-        xe = xe_desc.load([m, 0])
-        sx = _fp8_scale(tl.max(tl.abs(xe), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR)
-        qx = _fp8_codes(xe, tl.fdiv(tl.full([1], 1.0, tl.float16), sx), H)
-        # Per routed pair: gate/up at the token's scale, gelu·up, then down at the PAIR's own
-        # activation scale, weighted into the f16 accumulator.
-        acc = tl.zeros([1, H], dtype=tl.float16)
-        for j in tl.static_range(0, K):
-            e = tl.load(desc_ids + (m * K + j))
-            wg = tl.reshape(wg_desc.load([e, 0, 0]), [I, H]).to(tl.float16)
-            wu = tl.reshape(wu_desc.load([e, 0, 0]), [I, H]).to(tl.float16)
-            gate = _w8a8(qx, sx, wg, sg_desc.load([e, 0]), 1, I)
-            up = _w8a8(qx, sx, wu, su_desc.load([e, 0]), 1, I)
-            act = _gelu_tanh(gate, I) * up
-            # The pair's activation is staged in `desc_act` at its own window: the card
-            # quantizes the `[K, I]` activation rows in one op, one scale per row.
-            act_desc.store([m, j * I], act)
-            a = act_desc.load([m, j * I])
-            sa = _fp8_scale(tl.max(tl.abs(a), 1).to(tl.float16), INV_QMAX, SCALE_FLOOR)
-            qa = _fp8_codes(a, tl.fdiv(tl.full([1], 1.0, tl.float16), sa), I)
-            wd = tl.reshape(wd_desc.load([e, 0, 0]), [H, I]).to(tl.float16)
-            down = _w8a8(qa, sa, wd, sd_desc.load([e, 0]), 1, H)
-            w = tl.sum(tl.where(koffs[None, :] == j, wrow, tl.zeros([1, K], tl.float16)), 1)
-            acc = acc + down * w[:, None]
-        o_desc.store([m, 0], acc)
+                                       block_shape=[M, H])
+    pairs = pairs_desc.load([0])
+    # The gate/up activation: each token's input, one scale per token for all K pairs.
+    xe = xe_desc.load([0, 0])
+    sx = tl.minimum(tl.maximum(tl.max(tl.abs(xe), 1).to(tl.float16) * INV_QMAX,
+                               tl.full([M], SCALE_FLOOR, tl.float16)),
+                    tl.full([M], 448.0, tl.float16))
+    ix = tl.fdiv(tl.full([M], 1.0, tl.float16), sx)
+    qx = tl.minimum(tl.maximum(xe * ix[:, None], tl.full([M, H], -448.0, tl.float16)),
+                    tl.full([M, H], 448.0, tl.float16))
+    qx = qx.to(tl.float8e4nv).to(tl.float16)
+    wg = tl.reshape(wg_desc.gather(pairs, 0), [M, K * I, H]).to(tl.float16)
+    wu = tl.reshape(wu_desc.gather(pairs, 0), [M, K * I, H]).to(tl.float16)
+    gate = tl.reshape(tl.dot(qx[:, None, :], tl.trans(wg, (0, 2, 1)), out_dtype=tl.float16),
+                      [M, K, I])
+    up = tl.reshape(tl.dot(qx[:, None, :], tl.trans(wu, (0, 2, 1)), out_dtype=tl.float16),
+                    [M, K, I])
+    sg = tl.reshape(sg_desc.gather(pairs, 0), [M, K, I])
+    su = tl.reshape(su_desc.gather(pairs, 0), [M, K, I])
+    gate = (gate * sx[:, None, None]) * sg
+    up = (up * sx[:, None, None]) * su
+    # gelu_tanh(gate) · up, the cubic in the f32 island (an f16 x³ overflows at |x| ≥ 41).
+    g32 = gate.to(tl.float32)
+    v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
+    e = tl.exp(-v).to(tl.float16)
+    act = tl.fdiv(gate, tl.full([M, K, I], 1.0, tl.float16) + e) * up
+    # The down activation: each PAIR's own row, one scale per pair.
+    sa = tl.minimum(tl.maximum(tl.max(tl.abs(act), 2).to(tl.float16) * INV_QMAX,
+                               tl.full([M, K], SCALE_FLOOR, tl.float16)),
+                    tl.full([M, K], 448.0, tl.float16))
+    ia = tl.fdiv(tl.full([M, K], 1.0, tl.float16), sa)
+    qa = tl.minimum(tl.maximum(act * ia[:, :, None], tl.full([M, K, I], -448.0, tl.float16)),
+                    tl.full([M, K, I], 448.0, tl.float16))
+    qa = tl.reshape(qa.to(tl.float8e4nv).to(tl.float16), [MK, 1, I])
+    wd = tl.reshape(wd_desc.gather(pairs, 0), [MK, H, I]).to(tl.float16)
+    down = tl.reshape(tl.dot(qa, tl.trans(wd, (0, 2, 1)), out_dtype=tl.float16), [M, K, H])
+    sd = tl.reshape(sd_desc.gather(pairs, 0), [M, K, H])
+    down = (down * sa[:, :, None]) * sd
+    # The combine: Σ_j w[m, j] · down[m, j], in f16.
+    w = rw_desc.load([0, 0])
+    o_desc.store([0, 0], tl.sum(down * w[:, :, None], 1))
