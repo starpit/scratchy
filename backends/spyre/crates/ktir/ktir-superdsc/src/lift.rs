@@ -96,6 +96,14 @@ struct Raw {
     output: T,
 }
 
+/// How far a lift had grown: what [`Cx::restore`] takes it back to.
+struct Mark {
+    run: usize,
+    locals: usize,
+    consts: usize,
+    params: Vec<Option<Format>>,
+}
+
 /// A parallel axis: its symbol slot and its extent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Par {
@@ -661,31 +669,16 @@ impl<'f> Cx<'f> {
             let slot = (0..crate::lin::AXES)
                 .find(|s| !self.par.iter().any(|p| p.slot == *s))
                 .ok_or(malformed("at most eight parallel axes open at once"))?;
-            let (run_len, locals_len) = (self.run.len(), self.locals.len());
+            let mark = self.mark();
             self.par.push(Par { slot, extent: trips_ext });
             self.env.insert(iv, Val::Int(Lin::constant(lb).add(Lin::sym(Sym::Axis(slot)).scale(step))));
             let lifted = self.ops(body);
             self.par.pop();
             lifted?;
-            let mut written = std::collections::HashSet::new();
-            let mut read = std::collections::HashSet::new();
-            for r in &self.run[run_len..] {
-                for (s, own) in r.output.stores() {
-                    if let Store::Param(p) = s {
-                        if own { written.insert(p) } else { read.insert(p) };
-                    }
-                }
-                for (s, _) in r.inputs.iter().flat_map(T::stores) {
-                    if let Store::Param(p) = s {
-                        read.insert(p);
-                    }
-                }
-            }
-            if written.is_disjoint(&read) {
+            if self.independent(&mark, slot) {
                 return Ok(());
             }
-            self.run.truncate(run_len);
-            self.locals.truncate(locals_len);
+            self.restore(mark);
         }
         if self.walking.is_some() || self.par.len() > self.grid_slot.iter().flatten().count() {
             return Err(LiftError::NestedWalk);
@@ -731,6 +724,60 @@ impl<'f> Cx<'f> {
             self.env.insert(*r, Val::Tensor(b));
         }
         Ok(())
+    }
+
+    /// Everything a lift grows, as it stands now.
+    fn mark(&self) -> Mark {
+        Mark {
+            run: self.run.len(),
+            locals: self.locals.len(),
+            consts: self.consts.len(),
+            params: self.params.clone(),
+        }
+    }
+
+    /// Take back everything lifted since `m`.
+    fn restore(&mut self, m: Mark) {
+        self.run.truncate(m.run);
+        self.locals.truncate(m.locals);
+        for c in self.consts.drain(m.consts..) {
+            self.const_ids.remove(&c);
+        }
+        self.params = m.params;
+    }
+
+    /// Whether the positions of parallel axis `slot`, as lifted since `m`, are independent: no
+    /// two positions write one element, and nothing the loop writes outside its own
+    /// intermediates is also read by it (one position could read what another wrote).
+    fn independent(&self, m: &Mark, slot: usize) -> bool {
+        // A store made before the loop: a parameter, or an intermediate the loop did not make.
+        let outer = |s: Store| match s {
+            Store::Param(_) => true,
+            Store::Local(l) => (l.get() as usize) < m.locals,
+            Store::Const(_) => false,
+        };
+        let mut written = std::collections::HashSet::new();
+        let mut read = std::collections::HashSet::new();
+        for r in &self.run[m.run..] {
+            // Each position writes its own elements: the output's stride along the axis is at
+            // least the span one position writes, and no index decides where it writes.
+            let o = &r.output;
+            let stride = o.view.origin.axis[slot];
+            if o.gather.is_some() || stride <= 0 || (stride as u64) < o.view.span() {
+                return false;
+            }
+            for (s, own) in o.stores() {
+                if outer(s) {
+                    if own { written.insert(s) } else { read.insert(s) };
+                }
+            }
+            for (s, _) in r.inputs.iter().flat_map(T::stores) {
+                if outer(s) {
+                    read.insert(s);
+                }
+            }
+        }
+        written.is_disjoint(&read)
     }
 
     fn step(&mut self, op: &Operation<'_>) -> Result<Option<Vec<Val>>, LiftError> {

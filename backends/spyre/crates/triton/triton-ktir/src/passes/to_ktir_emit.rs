@@ -1391,72 +1391,6 @@ fn exp2_as_exp<'a>(op: &Op, a: &'a Arena, fresh: &mut Fresh) -> Result<Vec<Opera
 // The one precondition their first reader has
 //===----------------------------------------------------------------------===//
 
-/// Does anything, anywhere in `ops`, address `ptr` with a `ktdp.construct_memory_view`?
-fn views_ptr_somewhere(ops: &[Op], ptr: Ssa) -> bool {
-    ops.iter().any(|o| {
-        (o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(&ptr))
-            || o.regions.iter().any(|r| views_ptr_somewhere(&r.ops, ptr))
-    })
-}
-
-/// FAIL CLOSED: EVERY PARAMETER STATES ITS BUFFER'S WIDTH, AT THE TOP LEVEL.
-///
-/// This is the precondition of the FIRST reader past this boundary.
-/// `ktir_superdsc::emit::lower_ktir_to_superdsc::regions` zips `IRFunction::arguments`
-/// against the launch's bound buffers positionally and, for parameter `i`, takes the one
-/// `ktdp.construct_memory_view` whose address operand is that parameter -- found by a
-/// NON-RECURSIVE `find` over `IRFunction::operations`. Everything it goes on to compute
-/// (the extent, the strides, the fp8 flag, whether the parameter is the output) comes off
-/// that view.
-///
-/// WHY IT IS CHECKED HERE RATHER THAN LEFT TO THEM. Their refusal names `parameter 0 (t0)`
-/// and nothing else, which is true and unactionable: it cannot say whether a pass buried
-/// the view or whether the program never had one, and those want opposite fixes. Both were
-/// live at once when this was written -- `rope_q32` at grid 4,32 had all four views inside
-/// the work loop, `attention_flash_noncausal` had no view for `desc_mask` anywhere -- and
-/// the single message could not tell them apart. So the two are diagnosed separately and
-/// the grid travels in both, because the first of them is grid-dependent and a report that
-/// omits it sends the next reader to the wrong kernel.
-///
-/// WHAT THIS DELIBERATELY DOES NOT DO IS SYNTHESISE ONE. A `[rows, cols]` this crate
-/// invented would let the build proceed and hand the device a well-formed descriptor over a
-/// buffer of assumed extent -- the exact failure this tree keeps being bitten by. A
-/// parameter whose width nothing states is a REFUSAL.
-fn every_parameter_states_its_width(m: &Module, region: &Region, grid: usize) -> Result<()> {
-    for (i, (ptr, _)) in region.args.iter().enumerate() {
-        if region
-            .ops
-            .iter()
-            .any(|o| o.kind == OpKind::KtdpConstructMemoryView && o.operands.first() == Some(ptr))
-        {
-            continue;
-        }
-        // `Module::hints` is diagnostic-only and no pass may branch on it; this is a
-        // message, so the parameter's own spelling is exactly what belongs here.
-        let name = m.hint(*ptr);
-        if views_ptr_somewhere(&region.ops, *ptr) {
-            return Err(refuse(format!(
-                "parameter {i} (%{name}) states its `ktdp.construct_memory_view` only inside \
-                 a nested region, and the consumer pairs a parameter to its extent by a \
-                 non-recursive search of the function's TOP-LEVEL ops -- so at grid [{grid}] \
-                 nothing it can see says how wide the buffer this parameter addresses is. A \
-                 view is loop-invariant by construction (its one operand is the base address, \
-                 its extent is an attribute), so this is a pass that left it nested, not a \
-                 program that needs it there"
-            )));
-        }
-        return Err(refuse(format!(
-            "parameter {i} (%{name}) is addressed NOWHERE: no `ktdp.construct_memory_view` \
-             anywhere in the body takes it, so at grid [{grid}] nothing states how wide the \
-             buffer it addresses is, and this crate will not invent one. The parameter still \
-             occupies binding slot {i} -- the consumer numbers its buffers by parameter \
-             position -- so dropping it here would silently renumber every buffer after it. \
-             Either the kernel should not take it, or the launch should not bind it"
-        )));
-    }
-    Ok(())
-}
-
 //===----------------------------------------------------------------------===//
 // Entry
 //===----------------------------------------------------------------------===//
@@ -1504,7 +1438,6 @@ pub fn lower<'a>(m: &Module, a: &'a Arena) -> Result<IRFunction<'a>> {
     for (v, t) in &region.args {
         arguments.push((ssa(*v), irtype(t, a)?));
     }
-    every_parameter_states_its_width(m, region, grid.0)?;
 
     let mut fresh = Fresh(m.next_ssa);
     let operations = lower_block(&region.ops, a, &mut fresh)?;

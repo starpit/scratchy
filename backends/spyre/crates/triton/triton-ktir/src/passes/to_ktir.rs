@@ -111,7 +111,7 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     // and the runner runs the SSA verifier after EVERY entry, so no step can
     // be added without a verify line following it and none can be quietly
     // skipped. A row's comment says why the step sits where it sits.
-    let steps: [(&'static str, crate::Pass); 16] = [
+    let steps: [(&'static str, crate::Pass); 14] = [
         // Container first: once the pointer arguments are `index`, the casts that bridged
         // `!tt.ptr` to index are index-to-index and fold away, and the body rewrites then
         // run on a `func.func`.
@@ -148,13 +148,6 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
                 Ok(())
             },
         ),
-        // LAST, and after both grid-loop arms: a TIME-tiled loop from the kernel's own source --
-        // flash attention's KV sweep -- is not a grid work loop, so neither arm above looks at it, and
-        // downstream every window reader walks the function's top level. Constant trip counts unroll;
-        // anything else is left for the window guard to report by name. See the pass doc.
-        ("spyre-to-ktir:unroll_constant_trip_loops:1", |m, _| {
-            unroll_constant_trip_loops(m)
-        }),
         ("spyre-to-ktir:fold_unit_grid_tile_id", |m, _| {
             fold_unit_grid_tile_id(m);
             Ok(())
@@ -175,16 +168,6 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
         // corner is the head-grouped family the uniform pass cannot state -- is unrolled.
         ("spyre-to-ktir:unroll_grid_positions", |m, _| {
             unroll_grid_positions(m)
-        }),
-        // SECOND TRIP-UNROLL ARM, deliberately after the grid unroll: a CAUSAL sweep's trip count is a
-        // function of the grid position (`off_band = f(start_m)`), so the FIRST arm above -- run while
-        // the bounds still root at the compute-tile id -- sees no constant and leaves the `scf.for`
-        // standing. The grid unroll folds each copy's bounds to constants, and THIS arm unrolls them.
-        // On the twelve card-verified kernels it is a no-op (their first-arm loops are gone; nothing
-        // new became constant), and on the noncausal 16-tile it is a no-op by construction (the sweep
-        // count is grid-invariant, so the first arm already took it).
-        ("spyre-to-ktir:unroll_constant_trip_loops:2", |m, _| {
-            unroll_constant_trip_loops(m)
         }),
         // AND FOLD AGAIN: the trip unroll splices the loop BODIES out as straight line, replacing the
         // induction variable with a per-trip constant -- but the bodies' own index arithmetic on that
@@ -894,7 +877,7 @@ fn convert_all(
     paths.sort();
     paths.reverse();
     // ONE definition snapshot per batch, rebuilt each outer trip of a fixed-point
-    // caller (see `unroll_constant_trip_loops`): the converters INSERT ops, so a
+    // caller: the converters INSERT ops, so a
     // snapshot from before this batch is stale by the end -- but every converter
     // reads only PRE-EXISTING definitions (its own op's operands), which the
     // snapshot has. Rebuilding per op (the first fix's shape) paid a whole-module
@@ -1590,263 +1573,6 @@ fn fold_grid_work_loop(module: &mut Module) -> Result<()> {
 //===----------------------------------------------------------------------===//
 // Time tiling
 //===----------------------------------------------------------------------===//
-
-/// Unroll every REMAINING `scf.for` whose trip count is a compile-time constant, threading its
-/// `iter_args` from copy to copy by SUBSTITUTION.
-///
-/// # WHY, AND IT IS THE SAME REASON THE GRID LOOP UNROLLS
-///
-/// [`fold_grid_work_loop`]'s multi-trip arm records the refusal in full: every reader in
-/// `ktir_superdsc::emit::lower_ktir_to_superdsc` -- `regions`, `param_tiles`, `r_cover` -- walks
-/// `IRFunction::operations`, the function's TOP-LEVEL op list, and a `ktdp.construct_access_tile`
-/// inside an `scf.for` body is a window none of them can see. Their fallback is "the window is the
-/// whole view", which is the one answer a tiled program never means. MEASURED on
-/// `attention_flash_noncausal`:
-///
-/// ```text
-///   attn_fwd_noncausal: parameter 1 (t1) states 1 of its 1 `ktdp.construct_access_tile`
-///   window(s) INSIDE a region (an `scf.for` body) ... A time-tiled program has to be split into
-///   one node per trip, or its windows hoisted, before a descriptor can span it.
-/// ```
-///
-/// That loop is the flash-attention KV sweep. It is NOT a grid work loop, so `fold_grid_work_loop`
-/// never looks at it: it comes from the kernel's own `for start_n in tl.range(lo, hi, BLOCK_N)`.
-/// Hoisting its windows is unavailable for the same reason it was there -- K's window offset is an
-/// `iter_arg` the body advances by `BLOCK_N` each trip, so no single window above the loop stands
-/// for all four. So one copy per trip is again the only answer.
-///
-/// # WHAT MAKES IT DECIDABLE, AND WHY A LOOP THAT IS NOT IS LEFT ALONE
-///
-/// The non-causal sweep is `lo, hi = 0, N_CTX` over `tl.range(0, 256, 64)` with every bound a
-/// `tl.constexpr`, so the trip count is 4 AT COMPILE TIME and the unroll is exact. The CAUSAL
-/// off-band sweep is `lo, hi = 0, start_m * BLOCK_M`: its trip count is the query-block index, a
-/// function of grid position, and there is no fixed number of copies that is right for every core.
-///
-/// **A loop whose bounds are not constants is therefore LEFT STANDING, not refused here.** That is
-/// deliberate and it is not a hole: the guard quoted above is what catches it, one crate
-/// downstream, by name and with the parameter and the view extent in the message. Refusing here
-/// would replace a specific diagnostic with a vaguer one, and -- since this pass runs on every
-/// configuration -- would turn any future loop-carrying program into a refusal at a stage that has
-/// nothing to say about it.
-///
-/// # A LOOP THAT READS MEMORY THROUGH ITS OWN TRIP STAYS A LOOP
-///
-/// A body whose INDIRECT access tile depends on the induction variable -- a page walk reading its
-/// page table at `i · 32` and gathering the page that row names -- is the device's own loop over
-/// tiles (torch-spyre's `for_each_tile`, which holds ONE block body however many blocks it walks),
-/// and its trip count is a length, not a tile count: a walk over a long context is hundreds of
-/// trips, each one gather, and unrolled it is hundreds of copies of the body. The window guard
-/// above has nothing to hoist there either -- the gather's address IS the trip's table row -- so
-/// such a loop is LEFT STANDING with its trip count stated by its constant bounds
-/// ([`loop_reads_through_its_trip`]). Its loop-invariant buffer views are stated once, above it
-/// ([`hoist_invariant_views`]) -- the same one-declaration-per-parameter rule the unrolled copies
-/// keep below.
-///
-/// # THE SUBSTITUTION IS THE WHOLE OF IT
-///
-/// Copy `t` is the body with three sets of names rewritten: the induction variable becomes the
-/// constant `lb + t * step`; each `iter_arg` becomes the value copy `t - 1` yielded for it (copy 0
-/// takes the loop's own init operands); and every value the copy DEFINES is renamed afresh, since
-/// four copies sharing one set of names is one trip that the later copies shadow. The `scf.yield`
-/// is dropped from each copy -- its operands ARE the next copy's carries -- and uses of the loop's
-/// own results are rewired to the LAST copy's carries. Nothing is folded, reassociated or dropped,
-/// so the unrolled straight line computes the recurrence the loop did, trip for trip.
-fn unroll_constant_trip_loops(module: &mut Module) -> Result<()> {
-    // DEEPEST-FIRST, so unrolling an outer loop copies bodies whose inner loops are already
-    // straight-line, and no path is invalidated under us: `walk::paths` is pre-order, so reversing
-    // it visits children before parents and later siblings before earlier ones.
-    let paths: Vec<OpPath> = walk::paths(module)
-        .into_iter()
-        .filter(|p| {
-            walk::at(module, p)
-                .map(|o| o.kind == OpKind::ScfFor)
-                .unwrap_or(false)
-        })
-        .collect();
-    // ONE definition snapshot: the loop-bound reads below were whole-module
-    // scans paid per loop -- quadratic at kernel scale.
-    let index = module.def_index();
-    for path in paths.into_iter().rev() {
-        let loopp = walk::at(module, &path).expect("path").clone();
-        if loop_reads_through_its_trip(&loopp) {
-            hoist_invariant_views(module, &path);
-            continue;
-        }
-        let lb = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[0]);
-        let ub = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[1]);
-        let step = crate::passes::dot_to_linalg::const_int_index(&index, loopp.operands[2]);
-        // NOT DECIDABLE HERE IS NOT AN ERROR HERE -- see the doc comment. The downstream window
-        // guard is the one that reports it, and it reports it better.
-        let (Some(lb), Some(ub), Some(step)) = (lb, ub, step) else {
-            continue;
-        };
-        if step <= 0 {
-            // A non-positive step is not a trip count this pass can reason about, and unrolling it
-            // would loop forever. The downstream window guard reports it.
-            continue;
-        }
-        if ub <= lb {
-            // ZERO TRIPS, AND THE LOOP'S RESULTS ARE ITS INITS. Causal attention's off-band sweep
-            // is exactly this at grid position 0: `scf.for(0, 0, 64, ...)` states "no KV blocks in
-            // band", and leaving it standing puts its windows inside a region the door cannot read.
-            // The body never runs, so every iter_arg's final value is the init it started with --
-            // which is what the multi-trip arm's `carries = inits` threading already states at
-            // zero iterations.
-            let block = walk::block_mut(module, &path).expect("path");
-            block.remove(path.index());
-            // ONE walk for the loop's every iter_arg result -- the per-result
-            // loop walked the whole module per carry. Applied immediately (not
-            // deferred past the next victim) because later victims' operand
-            // reads must see the rewired inits, the same visibility the
-            // per-result walks gave.
-            let rewires: HashMap<Ssa, Ssa> = loopp
-                .results
-                .iter()
-                .zip(loopp.operands[3..].iter())
-                .map(|(res, init)| (*res, *init))
-                .collect();
-            walk::replace_all_uses_many(module, &rewires);
-            continue;
-        }
-        let trips = (ub - lb + step - 1) / step;
-
-        let (iv, iv_ty) = loopp.regions[0].args[0].clone();
-        let carried: Vec<(Ssa, IrType)> = loopp.regions[0].args[1..].to_vec();
-        let inits: Vec<Ssa> = loopp.operands[3..].to_vec();
-        if carried.len() != inits.len() || loopp.results.len() != carried.len() {
-            return Err(refuse(format!(
-                "an `scf.for` states {} iter_arg block argument(s), {} init operand(s) and {} \
-                 result(s); unrolling threads one carry per iter_arg, so a disagreement between \
-                 the three is a malformed loop rather than something to guess at",
-                carried.len(),
-                inits.len(),
-                loopp.results.len()
-            )));
-        }
-
-        // The body, minus its terminator. `scf.yield`'s operands are the carries, so it is a
-        // JOIN between copies rather than an op any copy contains.
-        let mut body = loopp.regions[0].ops.clone();
-        let yielded: Vec<Ssa> = match body.last() {
-            Some(o) if o.kind == OpKind::ScfYield => {
-                let ops = o.operands.clone();
-                body.pop();
-                ops
-            }
-            _ if carried.is_empty() => Vec::new(),
-            _ => {
-                return Err(refuse(
-                    "an `scf.for` with iter_args does not end in `scf.yield`, so what each trip \
-                     carries to the next is not stated and cannot be inferred",
-                ));
-            }
-        };
-        if yielded.len() != carried.len() {
-            return Err(refuse(format!(
-                "an `scf.for` carries {} iter_arg(s) but yields {} value(s)",
-                carried.len(),
-                yielded.len()
-            )));
-        }
-
-        // A LOOP-INVARIANT BUFFER VIEW IS STATED ONCE, NOT ONCE PER TRIP -- the same rule, and the
-        // same reason, as the grid unroll's `shared` split. `ktdp.construct_memory_view` declares a
-        // buffer's WIDTH, and `regions()` expects one declaration per parameter; four copies of it
-        // would have that reader scan four identical statements of the same fact. A view built from
-        // the induction variable or an iter_arg is not invariant, so it stays in the body and is
-        // duplicated with it.
-        let mut inside: Vec<Ssa> = vec![iv];
-        inside.extend(carried.iter().map(|(v, _)| *v));
-        defined_values(&body, &mut inside);
-        let inside: HashSet<Ssa> = inside.into_iter().collect();
-        let mut flat: Vec<Op> = Vec::new();
-        let mut per_trip: Vec<Op> = Vec::new();
-        for op in body.into_iter() {
-            if op.kind == OpKind::KtdpConstructMemoryView
-                && op.operands.iter().all(|v| !inside.contains(v))
-            {
-                flat.push(op);
-            } else {
-                per_trip.push(op);
-            }
-        }
-
-        // THE IV IS MATERIALISED ONLY WHERE IT IS READ. Attention's sweep advances its own
-        // `iter_args` and never mentions `start_n`, so emitting a constant per trip would leave
-        // four dead constants at the top level of every such program.
-        let iv_used = {
-            let mut used = false;
-            fn scan(ops: &[Op], v: Ssa, used: &mut bool) {
-                for o in ops {
-                    if o.operands.contains(&v) {
-                        *used = true;
-                    }
-                    for r in &o.regions {
-                        scan(&r.ops, v, used);
-                    }
-                }
-            }
-            scan(&per_trip, iv, &mut used);
-            used
-        };
-
-        let mut carries: Vec<Ssa> = inits;
-        for t in 0..trips {
-            let mut map: HashMap<Ssa, Ssa> = HashMap::new();
-            if iv_used {
-                let c = module.fresh_named(&module.hint(iv));
-                flat.push(
-                    Op::new(OpKind::ArithConstant)
-                        .with_result(c, iv_ty.clone())
-                        .with_attr(AttrKey::Value, Attr::Int(lb + t * step)),
-                );
-                map.insert(iv, c);
-            }
-            for ((a, _), carry) in carried.iter().zip(carries.iter()) {
-                map.insert(*a, *carry);
-            }
-            let mut copy = per_trip.clone();
-            // Trip 0 keeps the body's own names, so the unrolled first copy reads exactly like the
-            // body did -- the same convention the grid unroll follows.
-            if t > 0 {
-                let mut defined: Vec<Ssa> = Vec::new();
-                defined_values(&copy, &mut defined);
-                for v in defined {
-                    let h = module.hint(v);
-                    let fresh = module.fresh_named(&h);
-                    map.insert(v, fresh);
-                }
-            }
-            rename_values(&mut copy, &map);
-            flat.extend(copy);
-            // The next trip's carries are THIS copy's yields, under this copy's renaming. A carry
-            // the body passes straight through is an iter_arg, which `map` already resolves to the
-            // incoming carry -- so the chain is closed for both shapes.
-            carries = yielded.iter().map(|v| *map.get(v).unwrap_or(v)).collect();
-        }
-
-        let idx = path.index();
-        {
-            let block = walk::block_mut(module, &path).expect("path");
-            block.remove(idx);
-            for (k, o) in flat.into_iter().enumerate() {
-                block.insert(idx + k, o);
-            }
-        }
-        // The loop's results are the LAST trip's carries. Rewired after the splice, so the
-        // epilogue below the loop reads the final accumulator rather than a value nothing defines.
-        // ONE walk for the whole result set -- the per-result loop walked the
-        // module per carry.
-        let rewires: HashMap<Ssa, Ssa> = loopp
-            .results
-            .iter()
-            .zip(carries.iter())
-            .map(|(res, carry)| (*res, *carry))
-            .collect();
-        walk::replace_all_uses_many(module, &rewires);
-    }
-    Ok(())
-}
 
 /// A GRID OF ONE HAS EXACTLY ONE COMPUTE TILE, so `ktdp.get_compute_tile_id` is statically 0 and
 /// every index expression rooted at it folds to a constant. The ladder's fixtures launch at grid
@@ -2630,8 +2356,9 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
 /// # WHY THIS PASS EXISTS
 ///
 /// The flash recurrence's carries are seeded with `tensor.splat`s -- `m_i` at `-inf`,
-/// `l_i` at 1.0, `acc` at 0 -- and after [`unroll_constant_trip_loops`] those seeds are
-/// OPERANDS of trip 1's pointwise ops (`max(m_seed, m)`, `exp2(m_seed - m)`, `acc·alpha`).
+/// `l_i` at 1.0, `acc` at 0 -- and where a kernel states its first trip in straight line, those
+/// seeds are OPERANDS of that trip's pointwise ops (`max(m_seed, m)`, `exp2(m_seed - m)`,
+/// `acc·alpha`).
 /// The whole-function door refuses a splat operand by name (`whole_function`'s "neither a
 /// load of a parameter nor an intermediate this function produced"), and it is RIGHT to:
 /// a splat reaching a compute op would have to become a caller-seeded buffer, and the C++
@@ -2686,8 +2413,7 @@ fn decompose_matmul_accumulators(module: &mut Module) -> Result<()> {
 ///
 /// # ORDER
 ///
-/// Runs AFTER [`unroll_constant_trip_loops`] (the seeds only become top-level operands
-/// then) and BEFORE [`decompose_matmul_accumulators`] (so trip 1's `acc·alpha` folds to
+/// Runs BEFORE [`decompose_matmul_accumulators`] (so trip 1's `acc·alpha` folds to
 /// the zero splat that pass already treats as `tl.dot`'s default init). Iterates to a
 /// fixed point: `exp(0·ln2)` needs `0·ln2` folded before `exp` can see a splat operand.
 fn fold_splat_seeds(module: &mut Module) {
@@ -3092,87 +2818,6 @@ fn sub_feeds_only_exp2(module: &Module, index: &DefIndex, sub: Ssa) -> bool {
         }
     }
     true
-}
-
-/// Every value `ops` DEFINES, regions included: op results and each nested region's block
-/// arguments. What an unrolled copy has to rename.
-///
-/// `Op::results` is a LIST (see `ir::Op`'s note), so a five-result `scf.for` contributes all
-/// five; and a region's block arguments are definitions too, which is why they are collected
-/// here rather than only at the top level.
-/// Does this `scf.for`'s body read or write memory through an INDIRECT access tile whose operands
-/// depend on the loop's induction variable -- an address taken from memory at a row the trip
-/// chooses? See [`unroll_constant_trip_loops`]'s last section for why such a loop stays a loop.
-fn loop_reads_through_its_trip(loopp: &Op) -> bool {
-    let Some(body) = loopp.regions.first() else {
-        return false;
-    };
-    let Some(&(iv, _)) = body.args.first() else {
-        return false;
-    };
-    // The values the trip reaches: the induction variable, then every result of a body op that
-    // reads one of them (the body is in program order, so one pass closes the set).
-    let mut tripped: HashSet<Ssa> = HashSet::from([iv]);
-    fn reaches(ops: &[Op], tripped: &mut HashSet<Ssa>) -> bool {
-        for o in ops {
-            let reads = o.operands.iter().any(|v| tripped.contains(v));
-            if reads {
-                if o.kind == OpKind::KtdpConstructIndirectAccessTile {
-                    return true;
-                }
-                tripped.extend(o.results.iter().copied());
-            }
-            for r in &o.regions {
-                if reaches(&r.ops, tripped) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    reaches(&body.ops, &mut tripped)
-}
-
-/// Move the buffer views a standing loop's body declares from loop-invariant operands -- a
-/// `ktdp.construct_memory_view` over a kernel pointer, and the cast that turned the pointer into its
-/// base -- to just above the loop. A view declares a buffer's width, and the handoff pairs each
-/// parameter with ONE declaration among the function's top-level ops, so a view left in the body is a
-/// buffer nothing outside it can size. Both ops are pure, so hoisting them moves no effect.
-fn hoist_invariant_views(module: &mut Module, path: &OpPath) {
-    let Some(loopp) = walk::at(module, path).cloned() else {
-        return;
-    };
-    let Some(body) = loopp.regions.first() else {
-        return;
-    };
-    let mut inside: Vec<Ssa> = body.args.iter().map(|(v, _)| *v).collect();
-    defined_values(&body.ops, &mut inside);
-    let mut inside: HashSet<Ssa> = inside.into_iter().collect();
-    let mut hoisted: Vec<Op> = Vec::new();
-    let mut kept: Vec<Op> = Vec::with_capacity(body.ops.len());
-    for o in body.ops.iter() {
-        let pure_view = matches!(
-            o.kind,
-            OpKind::KtdpConstructMemoryView | OpKind::UnrealizedConversionCast
-        );
-        if pure_view && o.regions.is_empty() && o.operands.iter().all(|v| !inside.contains(v)) {
-            for r in &o.results {
-                inside.remove(r);
-            }
-            hoisted.push(o.clone());
-        } else {
-            kept.push(o.clone());
-        }
-    }
-    if hoisted.is_empty() {
-        return;
-    }
-    walk::at_mut(module, path).expect("path").regions[0].ops = kept;
-    let idx = path.index();
-    let block = walk::block_mut(module, path).expect("path");
-    for (k, o) in hoisted.into_iter().enumerate() {
-        block.insert(idx + k, o);
-    }
 }
 
 fn defined_values(ops: &[Op], out: &mut Vec<Ssa>) {

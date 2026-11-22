@@ -489,9 +489,6 @@ fn every_kernel_lifts_or_is_on_the_red_list() {
         if want != Some(line.as_str()) {
             wrong.push(format!("{}: expected {want:?}, got {line:?}", c.name));
         }
-        if let Status::Lifts { walks } = got {
-            assert!(walks <= 1, "{}: a program walks at most once", c.name);
-        }
     }
     assert!(wrong.is_empty(), "\n{}\n\nmismatches:\n{}", report.join("\n"), wrong.join("\n"));
 }

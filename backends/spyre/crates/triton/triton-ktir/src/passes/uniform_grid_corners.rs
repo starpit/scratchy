@@ -316,8 +316,8 @@ pub fn run(module: &mut Module, grid: &[i64]) -> Result<()> {
     // THE DOOR'S OWN READING PRECONDITION, enforced here as a sit-out condition: every
     // window at the function's TOP LEVEL. A kernel whose tiles still live inside a
     // nested region -- the CAUSAL attention's KV sweep, whose trip count is a function
-    // of the grid position and which `unroll_constant_trip_loops` therefore leaves
-    // standing -- needs the clone protocol regardless of what its corners state,
+    // of the grid position and so stays a loop -- needs the clone protocol regardless
+    // of what its corners state,
     // because the door's every window reader walks the top level only. Rewriting that
     // kernel's corners would perturb the pinned clone output without opening anything:
     // the causal Q/O corner IS affine (head stride 128 = gx · BLOCK_M at grid (2,4)),

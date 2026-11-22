@@ -269,67 +269,6 @@ fn the_multi_trip_work_loop_is_unrolled_not_folded() {
     );
 }
 
-/// THE PLANTED DEFECT: put the views back inside a region and the guard says WHICH failure it is.
-///
-/// The hoist and the unroll together make the "view exists but is nested" branch of
-/// `handoff::lower`'s guard unreachable from any of the twelve fixtures, so it is exercised by
-/// re-nesting them on purpose. Without this the guard would have one arm that has never run, and
-/// the two arms are the whole point of it -- a nested view and an absent one need opposite fixes
-/// and must not report the same way.
-///
-/// The region is planted rather than borrowed: rope_q32's own work loop is unrolled away by the
-/// time the handoff sees it, and a test that needed a surviving loop would be measuring the
-/// unroll instead of the guard.
-#[test]
-fn a_view_pushed_into_a_region_is_refused_as_nested_not_as_absent() {
-    let a = Arena::global();
-    let mut m = converted("rope_q32", &[4, 32]);
-    let func = m.kernel().expect("one kernel");
-    // The landmark is the loop-shape lower bound `is_per_core_work_loop` looks for, so the
-    // planted region is the same shape the pass would have produced.
-    let (li, core_id) = func.regions[0]
-        .ops
-        .iter()
-        .enumerate()
-        .find_map(|(i, o)| {
-            (o.kind == triton_ktir::ir::OpKind::KtdpGetComputeTileId).then(|| (i, o.result()))
-        })
-        .expect("the work-distribution landmark survives the unroll");
-    let core_id = core_id.expect("the landmark defines a value");
-    let at: Vec<usize> = (li..func.regions[0].ops.len())
-        .rev()
-        .filter(|i| {
-            func.regions[0].ops[*i].kind == triton_ktir::ir::OpKind::KtdpConstructMemoryView
-        })
-        .collect();
-    let block = &mut m.kernel_mut().expect("one kernel").regions[0].ops;
-    let views: Vec<triton_ktir::ir::Op> = at.into_iter().map(|i| block.remove(i)).collect();
-    assert_eq!(views.len(), 4, "the four views the hoist lifted");
-    let mut body: Vec<triton_ktir::ir::Op> = views;
-    body.reverse();
-    block.insert(
-        li + 1,
-        triton_ktir::ir::Op::new(triton_ktir::ir::OpKind::ScfFor)
-            .with_operands([core_id, core_id, core_id])
-            .with_region(triton_ktir::ir::Region {
-                args: vec![],
-                ops: body,
-            }),
-    );
-
-    let e = triton_ktir::passes::to_ktir_emit::lower(&m, a)
-        .expect_err("a view their reader cannot see is not a width they can read");
-    let msg = e.to_string();
-    assert!(
-        msg.contains("only inside a nested region") && msg.contains("parameter 0 (%desc_x)"),
-        "the refusal must say the view is NESTED and name the parameter -- got {msg:?}"
-    );
-    assert!(
-        !msg.contains("addressed NOWHERE"),
-        "a nested view must not be reported as an absent one -- got {msg:?}"
-    );
-}
-
 //===----------------------------------------------------------------------===//
 // Defect A2: a WINDOW stated inside the work loop
 //===----------------------------------------------------------------------===//
@@ -381,53 +320,37 @@ fn no_parameters_window_is_buried_in_the_work_loop() {
     );
 }
 
-/// THE PROGRAM'S OWN `tl.range` LOOPS STILL BURY THEIR WINDOWS, AND EXACTLY THESE DO.
+/// THE PROGRAM'S OWN `tl.range` LOOPS STAY LOOPS, AND THEIR PER-TRIP WINDOWS STAY INSIDE THEM.
 ///
-/// ⛔ RECORDED, NOT SKIPPED, AND NARROW: the exact parameter list per configuration, so a
-/// change that buries one more window fails here with its name in it and a change that fixes one
-/// fails here too and has to say so. A blanket "these configurations may nest" would have hidden
-/// the work-loop defect the test above exists for.
-///
-/// WHY IT IS A DIFFERENT PIECE OF WORK. These are K-blocking and flash-attention loops the
-/// kernel SOURCE writes (`for k in tl.range(0, D_MODEL, BLOCK_K)`, `swiglu_mlp.py`; the KV-block
-/// loop in `attention_flash*.py`), so the window really does move per trip and there is no
-/// smaller tile that stands for the loop. Their `regions()` names the two legal answers -- one
-/// node per trip, or hoisted windows -- and for a genuine K-blocked matmul the answer is their
-/// `WorkPlan::time_tile_for_lx`, which is the only minter of `TimeTile` and is theirs to run,
-/// not ours to pre-empt by unrolling a 200-trip loop. `bake_py`'s `swiglu_mlp_flat` and
-/// `swiglu_mlp_granite_flat` configurations exist to measure exactly that and are not in the
-/// driver's twelve.
+/// A K-blocking or flash-attention loop the kernel SOURCE writes (`for k in tl.range(0, D_MODEL,
+/// BLOCK_K)`, `swiglu_mlp.py`; the KV-block loop in `attention_flash*.py`) moves its window per
+/// trip, so the window belongs inside the loop: the lowering reads it there, as a walk when the
+/// trips carry a value and as a parallel axis when they are independent, and never as one copy
+/// per trip. The exact parameter list per configuration is recorded, so a pass that hoists or
+/// buries one more window fails here with its name in it.
 ///
 /// The work loop is not like this: its trip count is the grid over the core count, it is ours
-/// rather than the program's, and 4 copies is the whole of it.
+/// rather than the program's, and the grid passes above still decide it.
 #[test]
-fn the_source_loops_that_still_bury_windows_are_exactly_these() {
+fn the_source_loops_keep_exactly_these_windows_inside() {
     let a = Arena::global();
     // (config, grid, the parameters whose windows sit inside a `tl.range` body)
     let recorded: &[(&str, &[i64], &[usize])] = &[
-        // The flash KV-block loop: K, V and the mask are read per block. THE CAUSAL CONFIG IS NO
-        // LONGER BURIED: its off-band trip count is grid-position-dependent, so the first trip
-        // unroll left the sweep standing and the grid unroll's per-copy constant folding plus the
-        // SECOND trip-unroll arm (and its zero-trip deletion) now straight-line it per copy.
-        ("attention_flash_causal", &[4, 4], &[]),
-        // `for n in tl.range(0, D_FF, BLOCK_N)` -- 4 trips at D_FF=256 / BLOCK_N=64. NOT
-        // BURIED ANY MORE: the KV-sweep unroll (27405e501) straight-lines these too, so
-        // the recorded state moved from [0,1,2,3] to [] and this row is now a CONTROL.
-        ("swiglu_mlp_small", &[1], &[]),
-        ("swiglu_mlp_granite", &[1], &[]),
-        ("swiglu_mlp_tiled_k", &[1], &[]),
-        // The decoder's MLP block: the gate/up/down weights. UNBURIED with the swiglu
-        // rows above (same KV-sweep unroll debt, 27405e501) -- the recorded state moved.
-        ("decoder_layer_one", &[1], &[]),
+        // The flash KV-block loop: K, V and the mask are read per block.
+        ("attention_flash_causal", &[4, 4], &[1, 2, 4]),
+        // `for n in tl.range(0, D_FF, BLOCK_N)` -- 4 trips at D_FF=256 / BLOCK_N=64.
+        ("swiglu_mlp_small", &[1], &[0, 1, 2, 3]),
+        ("swiglu_mlp_granite", &[1], &[0, 1, 2, 3]),
+        ("swiglu_mlp_tiled_k", &[1], &[0, 1, 2, 3]),
+        // The decoder's MLP block: the gate/up/down weights.
+        ("decoder_layer_one", &[1], &[11, 12, 13]),
         // Two layers, so the same three weights twice.
-        ("decoder_two_layers", &[1], &[]),
-        // AND THE CONTROLS: these have no source loop left, so nothing is buried.
+        ("decoder_two_layers", &[1], &[8, 9, 10, 17, 18, 19]),
+        // AND THE CONTROLS: these have no source loop, so nothing sits inside one.
         ("embedding_granite_bm128_control", &[2], &[]),
         ("embedding_granite", &[4], &[]),
         ("rmsnorm_granite", &[1], &[]),
         ("rope_kv8", &[4, 8], &[]),
-        // THE ONE THIS COMMIT CHANGED: rope_q32's four parameters were all buried by the WORK
-        // loop, and after the unroll none of them is buried by anything.
         ("rope_q32", &[4, 32], &[]),
     ];
     for (config, grid, want) in recorded {
@@ -443,9 +366,7 @@ fn the_source_loops_that_still_bury_windows_are_exactly_these() {
         assert_eq!(
             got,
             want.to_vec(),
-            "{config} at grid {grid:?}: the parameters whose windows are nested changed. This \
-             list is the recorded state of the SOURCE-loop gap, so a difference is either a \
-             regression or that gap moving -- say which."
+            "{config} at grid {grid:?}: the parameters read per trip inside a source loop changed"
         );
     }
 }
@@ -549,40 +470,6 @@ fn the_unrolled_trips_address_four_distinct_work_items() {
 //===----------------------------------------------------------------------===//
 // Defect B: a parameter nothing addresses
 //===----------------------------------------------------------------------===//
-
-/// A PARAMETER NOTHING ADDRESSES IS REFUSED BY NAME, NOT GIVEN AN INVENTED WIDTH.
-///
-/// `attn_fwd` takes `desc_mask` as parameter 4 in both fixtures. The causal kernel loads it
-/// (`tt.make_tensor_descriptor` + `tt.descriptor_load`, attention_flash_causal.ttir.mlir:52
-/// and :111) so it gets a [64, 64] view; the noncausal one names it in the signature and
-/// NOWHERE else, so no pass has anything to build a view from and none should invent one.
-///
-/// That parameter still occupies a binding slot -- `node_for` numbers `BufferId`s by
-/// parameter position -- so dropping it here would silently renumber every buffer after it.
-/// The refusal is the honest answer and the owner's call is which of the two fixes lands;
-/// see the report on this commit.
-#[test]
-fn a_parameter_nothing_addresses_is_refused_naming_it_and_the_grid() {
-    let a = Arena::global();
-    let m = converted("attention_flash_noncausal", &[4, 4]);
-    let e = triton_ktir::passes::to_ktir_emit::lower(&m, a)
-        .expect_err("a parameter with no view must not reach their reader");
-    let msg = e.to_string();
-    // `grid [16]` was the pre-unroll spelling; the grid-position unroll collapses the
-    // launch to one tile, so the refusal now names the collapsed grid. Both spellings
-    // name the same kernel and the same unaddressed parameter.
-    for needle in [
-        "parameter 4",
-        "desc_mask",
-        "grid [1]",
-        "construct_memory_view",
-    ] {
-        assert!(
-            msg.contains(needle),
-            "the refusal must name {needle:?} -- got {msg:?}"
-        );
-    }
-}
 
 /// THE DISCRIMINATING CONTROL: the same kernel at the same grid, with the mask LIVE, lowers.
 /// Without this, a refusal keyed on the kernel or on the parameter count would pass the test

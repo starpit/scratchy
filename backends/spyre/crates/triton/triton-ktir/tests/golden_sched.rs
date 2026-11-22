@@ -86,16 +86,11 @@ fn the_triton_op_conversions_match_the_cpp_census() {
                 .map(|(_, v)| v)
                 .unwrap_or(0)
         };
-        // The ops THIS pass owns, compared exactly -- with TWO RECORDED SCALINGS, both
-        // measured and both stated where they are checked:
-        //
-        // 1. THE KV-SWEEP UNROLL (`unroll_constant_trip_loops`, commit 27405e501) makes
-        //    the attention bodies 4 trips deep where the golden's C++ chain kept the
-        //    loop; the red this left here (golden 3, ours 4) was already standing at
-        //    that commit.
-        // 2. THE GRID-POSITION UNROLL (`unroll_grid_positions`, 2026-09-28) multiplies
-        //    the post-sweep body by the position count N; see tests/grid_unroll.rs for
-        //    the unroll's own properties and control.
+        // The ops THIS pass owns, compared exactly against the golden's own counts -- with
+        // ONE RECORDED SCALING: THE GRID-POSITION UNROLL (`unroll_grid_positions`,
+        // 2026-09-28) multiplies the body by the position count N; see
+        // tests/grid_unroll.rs for the unroll's own properties and control. The KV sweep
+        // stays a loop, as the golden's C++ chain keeps it.
         //
         // The identity asserted here is therefore:
         //
@@ -126,19 +121,9 @@ fn the_triton_op_conversions_match_the_cpp_census() {
                 failures.push(format!("  {config} / {name}: golden {gv}, ours {ov}"));
             }
         }
-        // The per-BODY ops, against the MEASURED post-KV-sweep baseline times N. The
-        // golden itself no longer describes the body (it predates the KV-sweep unroll
-        // of commit 27405e501 -- the red "golden 7, ours 12" was standing at that
-        // commit), so the baseline is OUR OWN pipeline's count with the sweep unrolled
-        // and the grid unroll off, stated here as a constant so a change in EITHER
-        // number fails loudly. See tests/grid_unroll.rs for the unroll's own control.
-        // causal's off-band sweep trip differs: each position's diagonal band is THREE
-        // KV trips (loop1 = 0..m*64, loop2 = (m+1)*64..256; the sum is 3 at every
-        // position), so 3 expands and 6 generics + 3 matmuls = 9 per position.
-        let (expand_baseline, generic_baseline) = match *config {
-            "attention_flash_causal" => (3usize, 9usize),
-            _ => (4usize, 12usize),
-        };
+        // The per-BODY ops, against the golden's own count times N.
+        let (expand_baseline, generic_baseline) =
+            (count(&g, "tensor.expand_shape"), count(&g, "linalg.generic"));
         {
             let (name, baseline) = ("tensor.expand_shape", expand_baseline);
             let ov = count(&o, name);
@@ -157,9 +142,8 @@ fn the_triton_op_conversions_match_the_cpp_census() {
         //
         //     golden generics == our generics + our surviving matmuls
         //
-        // with the KV-sweep and grid-position unrolls recorded as baseline-times-N
-        // (same as the op counts above): baseline 8 generics + 4 matmuls = 12, times
-        // the position count.
+        // with the grid-position unroll recorded as golden-times-N (same as the op counts
+        // above).
         let gg = count(&g, "linalg.generic");
         let og = count(&o, "linalg.generic") + count(&o, "linalg.matmul");
         if og as i64 != generic_baseline as i64 * n {
@@ -277,16 +261,10 @@ fn every_reduction_generic_is_well_formed_on_both_sides() {
                 );
             }
         }
-        // And the COUNT of single-axis reductions agrees -- against the MEASURED
-        // post-KV-sweep baseline times the grid-unroll's N, for the same reason as the
-        // census test's baselines (the golden predates the sweep unroll, and the grid
-        // unroll copies the whole body once per position). The noncausal body leaves 4
-        // single-axis reductions per position; the CAUSAL body leaves 3, because its
-        // diagonal band is 3 KV trips (not 4) at every position.
-        let (n, red_baseline) = match *config {
-            "attention_flash_causal" => (8i64, 3usize),
-            _ => (8i64, 4usize),
-        };
+        // And the COUNT of single-axis reductions agrees -- against the golden's own count
+        // times the grid-unroll's N (the grid unroll copies the whole body once per
+        // position; the KV sweep stays a loop, as in the golden).
+        let (n, red_baseline) = (8i64, shapes(&g).len());
         assert_eq!(
             shapes(&o).len() as i64,
             red_baseline as i64 * n,

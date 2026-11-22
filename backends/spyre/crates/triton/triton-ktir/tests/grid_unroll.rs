@@ -109,17 +109,16 @@ fn the_unrolled_census_is_the_control_times_positions() {
             .map(|(_, v)| v)
             .unwrap_or(0)
     };
-    // The measured baseline (the control, HEAD's own pipeline before this arm) is
-    // stated here rather than re-derived, so a change in EITHER number fails loudly.
-    // These are the post-KV-unroll counts: the sweep's 4 trips are inside the body the
-    // grid unroll then copies.
+    // The measured baseline (the control, the pipeline before this arm) is stated here
+    // rather than re-derived, so a change in EITHER number fails loudly. The KV sweep is
+    // one loop in the body the grid unroll copies, its body stated once.
     for (name, control) in [
-        ("ktdp.load", 5),
+        ("ktdp.load", 3),
         ("ktdp.store", 1),
-        ("ktdp.construct_access_tile", 6),
-        ("linalg.matmul", 4),
-        ("linalg.generic", 8),
-        ("tensor.expand_shape", 4),
+        ("ktdp.construct_access_tile", 4),
+        ("linalg.matmul", 2),
+        ("linalg.generic", 5),
+        ("tensor.expand_shape", 3),
     ] {
         assert_eq!(
             count(&m, name),

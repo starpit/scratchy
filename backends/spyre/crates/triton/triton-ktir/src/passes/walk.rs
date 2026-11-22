@@ -169,8 +169,8 @@ pub fn splice_many(module: &mut Module, edits: Vec<(OpPath, Vec<Op>)>) {
     // named by those indices. Processing deepest-first means every block whose
     // prefix passes through P's block is already done when P's splice shifts it:
     // the pre-order sort puts a parent before its descendants, so this reverse
-    // visits descendants first (the same law `unroll_constant_trip_loops` and
-    // `walk::erase` state for their own rewrites).
+    // visits descendants first (the same law `walk::erase` states for its own
+    // rewrites).
     blocks.sort();
     blocks.reverse();
     for (prefix, region) in blocks {

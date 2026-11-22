@@ -3434,8 +3434,7 @@ fn grid<F: scratchy_subtile::subtile_ir::RopeForm>(
         SubOp::Elementwise(_) => Ok(vec![1]),
         SubOp::ScalarMul { .. } => Ok(vec![1]),
         // ONE WORK ITEM: the position loop is a constant-trip `tl.range` inside the
-        // kernel, unrolled by the ladder (`to_ktir::unroll_constant_trip_loops`), so the
-        // spliced program is straight-line like the builder's — no grid axis at all.
+        // kernel, a loop the lowering states once — no grid axis at all.
         SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. } => Ok(vec![1]),
         // The same one-work-item law: the row blocks are in-kernel tiles. The MoE
         // sub-ops have no grid row any more — the registry refuses them before the
