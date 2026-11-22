@@ -225,3 +225,185 @@ fn the_decode_walk_computes_the_host_attention_through_the_row_gather() {
 fn the_decode_walk_computes_the_host_attention_through_the_page_offset() {
     check(Shape { kv_heads: 2, group: 4, head: 64, block: 64, pages: 8, blocks: 4 });
 }
+
+// ── PREFILL: a prompt's rows, gathered by `query_row_index`, attend over the walked pages
+// and are scattered back by the same index. ──
+
+#[derive(Clone, Copy)]
+struct Prompt {
+    tokens: usize,
+    rows: usize,
+    kv_heads: usize,
+    group: usize,
+    head: usize,
+    block: usize,
+    pages: usize,
+    blocks: usize,
+}
+
+const PREFILL_ARGS: [(&str, &str); 7] = [
+    ("query", "*fp16"),
+    ("query_row_index", "*i32"),
+    ("k_pages", "*fp16"),
+    ("v_pages", "*fp16"),
+    ("page_index_table", "*i32"),
+    ("mask_stack", "*fp16"),
+    ("out", "*fp16"),
+];
+
+fn prefill(s: Prompt) -> Program {
+    let path = format!("{}/../../../kernels/page_attn_head_major_prefill.py", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read kernel");
+    let mut signature: HashMap<String, ArgSpec> =
+        PREFILL_ARGS.iter().map(|(n, t)| (n.to_string(), ArgSpec::parse(t).expect("arg"))).collect();
+    let constexprs: HashMap<String, Val> = [
+        ("NUM_TOKENS", Val::Int(s.tokens as i128)),
+        ("NUM_HEADS", Val::Int((s.kv_heads * s.group) as i128)),
+        ("NUM_KV_HEADS", Val::Int(s.kv_heads as i128)),
+        ("HEAD_SIZE", Val::Int(s.head as i128)),
+        ("BLOCK_SIZE", Val::Int(s.block as i128)),
+        ("NUM_PAGES", Val::Int(s.pages as i128)),
+        ("NUM_BLOCKS", Val::Int(s.blocks as i128)),
+        ("BLOCKS_PER_TRIP", Val::Int(1)),
+        ("PADDED_QUERY_LEN", Val::Int(s.rows as i128)),
+        ("SCALE", Val::Float(SCALE)),
+    ]
+    .into_iter()
+    .map(|(n, v)| (n.to_string(), v))
+    .collect();
+    for n in constexprs.keys() {
+        signature.insert(n.clone(), ArgSpec::Constexpr);
+    }
+    let spec = KernelSpec {
+        kernel: "page_attn_head_major_prefill_kernel".to_string(),
+        signature,
+        constexprs,
+        file: path,
+    };
+    let grid = [1i64];
+    let mut tt = triton_frontend::codegen::compile(&src, &spec, Target::spyre()).expect("codegen");
+    triton_frontend::opt::make_ttir(&mut tt).expect("make_ttir");
+    let mut m = triton_ktir::from_ttir::convert(&tt).expect("from_ttir");
+    triton_ktir::make_ktir(&mut m, &grid).expect("make_ktir");
+    triton_ktir::passes::to_ktir::run(&mut m, &grid).expect("to_ktir");
+    let f = triton_ktir::passes::to_ktir_emit::lower(&m, Arena::global()).expect("handoff");
+    lift(&f).expect("lift")
+}
+
+struct PromptInputs {
+    query: Vec<f32>,
+    query_rows: Vec<usize>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    table: Vec<usize>,
+    mask: Vec<f32>,
+}
+
+fn prompt_inputs(s: Prompt) -> PromptInputs {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut uniform = |lo: f32, hi: f32| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        h(lo + (hi - lo) * ((state >> 40) as f32 / (1u64 << 24) as f32))
+    };
+    let width = s.kv_heads * s.group * s.head;
+    let cache = s.pages * s.kv_heads * s.block * s.head;
+    let query = (0..s.tokens * width).map(|_| uniform(-1.0, 1.0)).collect();
+    let k = (0..cache).map(|_| uniform(-1.0, 1.0)).collect();
+    let v = (0..cache).map(|_| uniform(-1.0, 1.0)).collect();
+    // This prompt's rows of the batch, not in order and not at the start.
+    let query_rows = (0..s.rows).map(|r| (r * 3 + 5) % s.tokens).collect();
+    let table = (0..s.blocks).map(|i| (i * 5 + 3) % s.pages).collect();
+    // A causal-like mask: row r sees the first (blocks - 1)·block + r + 1 keys.
+    let mask = (0..s.blocks * s.rows * s.block)
+        .map(|j| {
+            let (i, rest) = (j / (s.rows * s.block), j % (s.rows * s.block));
+            let (r, b) = (rest / s.block, rest % s.block);
+            if i * s.block + b > (s.blocks - 1) * s.block + r { -30000.0 } else { 0.0 }
+        })
+        .collect();
+    PromptInputs { query, query_rows, k, v, table, mask }
+}
+
+/// THE HOST REFERENCE: per (kv head, group, prompt row), the decode reference's running
+/// softmax over the walked pages, the row read from and written to the batch row the index names.
+fn host_prompt(s: Prompt, x: &PromptInputs, shift: usize) -> Vec<f32> {
+    let width = s.kv_heads * s.group * s.head;
+    let mut out = vec![0f32; s.tokens * width];
+    for kv in 0..s.kv_heads {
+        for g in 0..s.group {
+            let head = kv * s.group + g;
+            for r in 0..s.rows {
+                let q = &x.query[x.query_rows[r] * width + head * s.head..][..s.head];
+                let (mut tmax, mut tsum) = (f32::NEG_INFINITY, 0f32);
+                let mut tout = vec![0f32; s.head];
+                for i in 0..s.blocks {
+                    let page = x.table[(i + shift) % s.blocks];
+                    let at = (page * s.kv_heads + kv) * s.block * s.head;
+                    let (kp, vp) = (&x.k[at..][..s.block * s.head], &x.v[at..][..s.block * s.head]);
+                    let scores: Vec<f32> = (0..s.block)
+                        .map(|b| {
+                            let dot = h((0..s.head).fold(0f32, |a, d| a + q[d] * kp[b * s.head + d]));
+                            h(h(dot * h(SCALE as f32)) + x.mask[(i * s.rows + r) * s.block + b])
+                        })
+                        .collect();
+                    let smax = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let rescale = h((-(h(smax - tmax).max(0.0))).exp());
+                    let new_max = tmax.max(smax);
+                    let probs: Vec<f32> = scores.iter().map(|&x| h(h(x - new_max).exp())).collect();
+                    tsum = h(h(tsum * rescale) + h(probs.iter().fold(0f32, |a, &p| a + p)));
+                    for d in 0..s.head {
+                        let pv = h((0..s.block).fold(0f32, |a, b| a + probs[b] * vp[b * s.head + d]));
+                        tout[d] = h(h(tout[d] * rescale) + pv);
+                    }
+                    tmax = new_max;
+                }
+                for d in 0..s.head {
+                    out[x.query_rows[r] * width + head * s.head + d] = h(tout[d] / tsum);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_prefill_walk_computes_the_host_attention_over_the_gathered_rows() {
+    let s = Prompt { tokens: 16, rows: 8, kv_heads: 2, group: 2, head: 64, block: 64, pages: 8, blocks: 4 };
+    let p = prefill(s);
+    let walks = p.segments.iter().filter(|seg| matches!(seg, Segment::Walk(_))).count();
+    assert_eq!(walks, 1, "the page walk is one walk");
+    for seg in &p.segments {
+        let nodes: Vec<(OpFunc, Vec<Store>)> = match seg {
+            Segment::Walk(w) => w.body.iter().map(|n| (n.func, n.inputs.iter().map(|o| o.store).collect())).collect(),
+            Segment::Straight(ns) => ns.iter().map(|n| (n.func, n.inputs.iter().map(|o| o.store).collect())).collect(),
+        };
+        let copies_kv = nodes.iter().any(|(func, stores)| {
+            *func == OpFunc::Copy && stores.iter().any(|s| matches!(s, Store::Param(q) if q.get() == 2 || q.get() == 3))
+        });
+        assert!(!copies_kv, "a copy reads a K or V page");
+    }
+    let x = prompt_inputs(s);
+    let f = |v: &[f32]| v.iter().map(|&a| f64::from(a)).collect::<Vec<f64>>();
+    let mut table = vec![0f64; s.blocks * ROWS_PER_TABLE_ENTRY];
+    for (i, &page) in x.table.iter().enumerate() {
+        table[i * ROWS_PER_TABLE_ENTRY] = page as f64;
+    }
+    let width = s.kv_heads * s.group * s.head;
+    let params = vec![
+        f(&x.query),
+        x.query_rows.iter().map(|&r| r as f64).collect(),
+        f(&x.k),
+        f(&x.v),
+        table,
+        f(&x.mask),
+        vec![0.0; s.tokens * width],
+    ];
+    let out = run(&p, params).expect("the program runs");
+    let want = host_prompt(s, &x, 0);
+    assert!(want.iter().any(|&a| a != 0.0) && want.iter().all(|a| a.is_finite()), "a finite, nonzero output");
+    assert_eq!(out[6], f(&want), "the attention output, scattered to the prompt's rows");
+    // NEGATIVE CONTROL: a reference reading each block's neighbouring page must fail.
+    assert_ne!(out[6], f(&host_prompt(s, &x, 1)), "a reference on the wrong pages is not the device");
+}

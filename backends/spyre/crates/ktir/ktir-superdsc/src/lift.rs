@@ -771,14 +771,14 @@ impl<'f> Cx<'f> {
         one_row[axis] = Extent::ONE;
         let mut view = mem.view.window(&corner, &one_row).map_err(|error| LiftError::View { op: op.op_type, error })?;
         view.axes[axis].extent = shape[axis];
-        self.bind(
-            op,
-            Val::Mem(T {
-                view,
-                gather: Some(G::Rows { axis, index: Box::new(index), rows: held }),
-                ..mem
-            }),
-        );
+        // One row named by the index is the whole tile at a device-read offset: it names no axis,
+        // so no view op after it has to keep one.
+        let gather = if shape[axis] == Extent::ONE {
+            G::Offset { index: Box::new(index), step: view.axes[axis].stride, bound: held }
+        } else {
+            G::Rows { axis, index: Box::new(index), rows: held }
+        };
+        self.bind(op, Val::Mem(T { view, gather: Some(gather), ..mem }));
         Ok(())
     }
 
