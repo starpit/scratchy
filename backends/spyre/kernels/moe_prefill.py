@@ -160,7 +160,9 @@ def moe_prefill_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     up = tl.dot(qx, wu.T, out_dtype=tl.float16)
     gate = tl.reshape((gate * sx[:, None]) * sg_desc.load([0])[None, :], [T, E, I])
     up = tl.reshape((up * sx[:, None]) * su_desc.load([0])[None, :], [T, E, I])
-    # gelu_tanh(gate) · up, the cubic in the f32 island (an f16 x³ overflows at |x| ≥ 41).
+    # gelu_tanh(gate) · up. The source states the cubic in f32 (an f16 x³ overflows at
+    # |x| ≥ 41); the front end's type legalization lowers the island to f16, where with
+    # 0.044715 multiplied first the cube overflows only past |x| ≈ 114, to the right limit.
     g32 = gate.to(tl.float32)
     v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
     eg = tl.exp(-v).to(tl.float16)

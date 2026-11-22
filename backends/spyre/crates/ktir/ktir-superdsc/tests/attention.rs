@@ -15,7 +15,7 @@ use half::f16;
 use ktir_core::arena::Arena;
 use ktir_superdsc::eval::run;
 use ktir_superdsc::lift::lift;
-use ktir_superdsc::program::{Program, Segment};
+use ktir_superdsc::program::{OpFunc, Program, Segment, Store};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
@@ -90,7 +90,15 @@ struct Inputs {
     k: Vec<f32>,
     v: Vec<f32>,
     table: Vec<usize>,
+    /// The kv row pool: the cache row page `p`'s kv head `kv` is read at, `pool[p·NKV + kv]`.
+    pool: Vec<usize>,
     mask: Vec<f32>,
+}
+
+/// Whether the kernel reads a page's rows through the pool (eight KV heads or more: the row
+/// gather) rather than at `page · NUM_KV_HEADS` (fewer: the page offset).
+fn through_pool(s: Shape) -> bool {
+    s.kv_heads >= 8
 }
 
 fn inputs(s: Shape) -> Inputs {
@@ -112,12 +120,22 @@ fn inputs(s: Shape) -> Inputs {
     let mask = (0..s.blocks * s.block)
         .map(|j| if j >= s.blocks * s.block - s.block / 2 { -30000.0 } else { 0.0 })
         .collect();
-    Inputs { query, k, v, table, mask }
+    // A permuted pool, so a device that read the rows at the page instead of through the pool
+    // would read different rows (the production pool is the identity).
+    let rows = s.pages * s.kv_heads;
+    let pool = (0..rows).map(|r| (r * 7 + 3) % rows).collect();
+    Inputs { query, k, v, table, pool, mask }
 }
 
 /// THE HOST REFERENCE, written from the kernel's statement: per (kv head, group) row, a
 /// running softmax over the walked pages, every op in f16 as the KTIR states it.
 fn host(s: Shape, x: &Inputs) -> Vec<f32> {
+    host_paged(s, x, 0)
+}
+
+/// The host reference with block `i` read at the table's page `i + shift`: shift 0 is the
+/// reference, any other a reference the device must not match.
+fn host_paged(s: Shape, x: &Inputs, shift: usize) -> Vec<f32> {
     let heads = s.kv_heads * s.group;
     let mut out = vec![0f32; heads * s.head];
     for kv in 0..s.kv_heads {
@@ -126,7 +144,8 @@ fn host(s: Shape, x: &Inputs) -> Vec<f32> {
             let (mut tmax, mut tsum) = (f32::NEG_INFINITY, 0f32);
             let mut tout = vec![0f32; s.head];
             for i in 0..s.blocks {
-                let row = x.table[i] * s.kv_heads + kv;
+                let page = x.table[(i + shift) % s.blocks];
+                let row = if through_pool(s) { x.pool[page * s.kv_heads + kv] } else { page * s.kv_heads + kv };
                 let kp = &x.k[row * s.block * s.head..][..s.block * s.head];
                 let vp = &x.v[row * s.block * s.head..][..s.block * s.head];
                 let scores: Vec<f32> = (0..s.block)
@@ -164,7 +183,7 @@ fn check(s: Shape) {
     for (i, &page) in x.table.iter().enumerate() {
         table[i * ROWS_PER_TABLE_ENTRY] = page as f64;
     }
-    let pool: Vec<f64> = (0..s.pages * s.kv_heads).map(|r| r as f64).collect();
+    let pool: Vec<f64> = x.pool.iter().map(|&r| r as f64).collect();
     let heads = s.kv_heads * s.group;
     let params = vec![
         f(&x.query),
@@ -176,10 +195,25 @@ fn check(s: Shape) {
         f(&x.mask),
         vec![0.0; heads * s.head],
     ];
+    // No copy reads a K or V page (parameters 2 and 3): the walk reads each page where the
+    // cache holds it.
+    for seg in &p.segments {
+        let copies_kv = match seg {
+            Segment::Walk(w) => w.body.iter().any(|n| {
+                n.func == OpFunc::Copy && n.inputs.iter().any(|o| matches!(o.store, Store::Param(q) if q.get() == 2 || q.get() == 3))
+            }),
+            Segment::Straight(ns) => ns.iter().any(|n| {
+                n.func == OpFunc::Copy && n.inputs.iter().any(|o| matches!(o.store, Store::Param(q) if q.get() == 2 || q.get() == 3))
+            }),
+        };
+        assert!(!copies_kv, "a copy reads a K or V page");
+    }
     let out = run(&p, params).expect("the program runs");
     let want = host(s, &x);
     assert!(want.iter().all(|a| a.is_finite()) && want.iter().any(|&a| a != 0.0), "a finite, nonzero output");
     assert_eq!(out[7], f(&want), "the attention output");
+    // NEGATIVE CONTROL: a reference reading each block's neighbouring page must fail.
+    assert_ne!(out[7], f(&host_paged(s, &x, 1)), "a reference on the wrong pages is not the device");
 }
 
 #[test]

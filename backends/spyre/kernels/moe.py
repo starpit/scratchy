@@ -67,9 +67,10 @@ index; the route weights ride with them.
 
 THE EXPERTS ARE THREE BATCHED CONTRACTIONS. The banks are read as `[E, rows·cols]`, so the
 routed experts' slabs are one gather of the ids (row `m·K + j` is token m's slot-j expert).
-gate/up batch over the tokens with each token's K slabs side by side
-(`[M, 1, H] × [M, H, K·I]`, every slot reading the token's codes); down batches over the
-M·K pairs (`[M·K, 1, I] × [M·K, I, H]`, each pair its own codes).
+All three batch over the M·K pairs (`[M·K, 1, H] × [M·K, H, I]` for gate/up,
+`[M·K, 1, I] × [M·K, I, H]` for down), so each reads its slabs through the gather: no copy
+of the weights. A pair's gate/up input is its token's row, repeated across the token's K
+slots before quantizing (one scale per token, as above).
 
 ⛔ WHY THE TOP-K IS ROUND-BASED, NOT THE `topk.ddl` RIPPLE. The ripple reads the logits
 one `[M, 1]` column at a time, and a descriptor block must carry at least 16 bytes in its
@@ -155,12 +156,14 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     ex = tl.exp(sv - tl.max(sv, 1)[:, None])
     rs_desc.store([0, 0], tl.fdiv(ex, tl.sum(ex, 1)[:, None]).to(tl.float16) * psel)
 
-    # ── the experts: THREE BATCHED CONTRACTIONS, the slabs gathered by id ─────
+    # ── the experts: THREE BATCHED CONTRACTIONS over the M·K pairs ────────────
     # The banks are read as `[E, rows·cols]`: an expert's slab is one row, so the routed
-    # experts' slabs are one gather of `ids` (row `m·K + j` is token m's slot-j expert).
-    # gate/up read every slot's slab against the TOKEN's codes, so they batch over the
-    # tokens with the K slabs side by side (`[M, 1, H] × [M, H, K·I]`); down reads each
-    # pair's OWN activation, so it batches over the M·K pairs (`[M·K, 1, I] × [M·K, I, H]`).
+    # experts' slabs are one gather of the ids (pair `p = m·K + j` is token m's slot-j
+    # expert), and reshaping a gathered `[M·K, rows·cols]` to `[M·K, rows, cols]` splits only
+    # the slab's own axis, so the contraction reads the slabs through the gather, never a
+    # copy of the weights. Each pair's gate/up input is its token's row: the token input is
+    # repeated across its K slots before it is quantized (an activation copy, K·H elements a
+    # token), and a token's K rows quantize to the token's one scale.
     MK: tl.constexpr = M * K
     xe_desc = tl.make_tensor_descriptor(desc_xe, shape=[M, H], strides=[H, 1],
                                         block_shape=[M, H])
@@ -182,42 +185,40 @@ def moe_fwd(desc_xr, desc_rg, desc_rw, desc_pes,  #
     o_desc = tl.make_tensor_descriptor(desc_o, shape=[M, H], strides=[H, 1],
                                        block_shape=[M, H])
     pairs = pairs_desc.load([0])
-    # The gate/up activation: each token's input, one scale per token for all K pairs.
-    xe = xe_desc.load([0, 0])
+    # The gate/up activation: each pair's row is its token's input, at its token's scale.
+    xe = tl.reshape(xe_desc.load([0, 0])[:, None, :] + tl.zeros([M, K, H], dtype=tl.float16),
+                    [MK, H])
     sx = tl.minimum(tl.maximum(tl.max(tl.abs(xe), 1).to(tl.float16) * INV_QMAX,
-                               tl.full([M], SCALE_FLOOR, tl.float16)),
-                    tl.full([M], 448.0, tl.float16))
-    ix = tl.fdiv(tl.full([M], 1.0, tl.float16), sx)
-    qx = tl.minimum(tl.maximum(xe * ix[:, None], tl.full([M, H], -448.0, tl.float16)),
-                    tl.full([M, H], 448.0, tl.float16))
-    qx = qx.to(tl.float8e4nv).to(tl.float16)
-    wg = tl.reshape(wg_desc.gather(pairs, 0), [M, K * I, H]).to(tl.float16)
-    wu = tl.reshape(wu_desc.gather(pairs, 0), [M, K * I, H]).to(tl.float16)
-    gate = tl.reshape(tl.dot(qx[:, None, :], tl.trans(wg, (0, 2, 1)), out_dtype=tl.float16),
-                      [M, K, I])
-    up = tl.reshape(tl.dot(qx[:, None, :], tl.trans(wu, (0, 2, 1)), out_dtype=tl.float16),
-                    [M, K, I])
-    sg = tl.reshape(sg_desc.gather(pairs, 0), [M, K, I])
-    su = tl.reshape(su_desc.gather(pairs, 0), [M, K, I])
-    gate = (gate * sx[:, None, None]) * sg
-    up = (up * sx[:, None, None]) * su
-    # gelu_tanh(gate) · up, the cubic in the f32 island (an f16 x³ overflows at |x| ≥ 41).
+                               tl.full([MK], SCALE_FLOOR, tl.float16)),
+                    tl.full([MK], 448.0, tl.float16))
+    ix = tl.fdiv(tl.full([MK], 1.0, tl.float16), sx)
+    qx = tl.minimum(tl.maximum(xe * ix[:, None], tl.full([MK, H], -448.0, tl.float16)),
+                    tl.full([MK, H], 448.0, tl.float16))
+    qx = tl.reshape(qx.to(tl.float8e4nv).to(tl.float16), [MK, 1, H])
+    wg = tl.reshape(wg_desc.gather(pairs, 0), [MK, I, H]).to(tl.float16)
+    wu = tl.reshape(wu_desc.gather(pairs, 0), [MK, I, H]).to(tl.float16)
+    gate = tl.reshape(tl.dot(qx, tl.trans(wg, (0, 2, 1)), out_dtype=tl.float16), [MK, I])
+    up = tl.reshape(tl.dot(qx, tl.trans(wu, (0, 2, 1)), out_dtype=tl.float16), [MK, I])
+    gate = (gate * sx[:, None]) * sg_desc.gather(pairs, 0)
+    up = (up * sx[:, None]) * su_desc.gather(pairs, 0)
+    # gelu_tanh(gate) · up. The source states the cubic in f32 (an f16 x³ overflows at
+    # |x| ≥ 41); the front end's type legalization lowers the island to f16, where with
+    # 0.044715 multiplied first the cube overflows only past |x| ≈ 114, to the right limit.
     g32 = gate.to(tl.float32)
     v = 1.5957691216057308 * (g32 + 0.044715 * g32 * g32 * g32)
     e = tl.exp(-v).to(tl.float16)
-    act = tl.fdiv(gate, tl.full([M, K, I], 1.0, tl.float16) + e) * up
-    # The down activation: each PAIR's own row, one scale per pair.
-    sa = tl.minimum(tl.maximum(tl.max(tl.abs(act), 2).to(tl.float16) * INV_QMAX,
-                               tl.full([M, K], SCALE_FLOOR, tl.float16)),
-                    tl.full([M, K], 448.0, tl.float16))
-    ia = tl.fdiv(tl.full([M, K], 1.0, tl.float16), sa)
-    qa = tl.minimum(tl.maximum(act * ia[:, :, None], tl.full([M, K, I], -448.0, tl.float16)),
-                    tl.full([M, K, I], 448.0, tl.float16))
+    act = tl.fdiv(gate, tl.full([MK, I], 1.0, tl.float16) + e) * up
+    # The down activation: each pair's own row, one scale per pair.
+    sa = tl.minimum(tl.maximum(tl.max(tl.abs(act), 1).to(tl.float16) * INV_QMAX,
+                               tl.full([MK], SCALE_FLOOR, tl.float16)),
+                    tl.full([MK], 448.0, tl.float16))
+    ia = tl.fdiv(tl.full([MK], 1.0, tl.float16), sa)
+    qa = tl.minimum(tl.maximum(act * ia[:, None], tl.full([MK, I], -448.0, tl.float16)),
+                    tl.full([MK, I], 448.0, tl.float16))
     qa = tl.reshape(qa.to(tl.float8e4nv).to(tl.float16), [MK, 1, I])
     wd = tl.reshape(wd_desc.gather(pairs, 0), [MK, H, I]).to(tl.float16)
-    down = tl.reshape(tl.dot(qa, tl.trans(wd, (0, 2, 1)), out_dtype=tl.float16), [M, K, H])
-    sd = tl.reshape(sd_desc.gather(pairs, 0), [M, K, H])
-    down = (down * sa[:, :, None]) * sd
+    down = tl.reshape(tl.dot(qa, tl.trans(wd, (0, 2, 1)), out_dtype=tl.float16), [MK, H])
+    down = tl.reshape((down * sa[:, None]) * sd_desc.gather(pairs, 0), [M, K, H])
     # The combine: Σ_j w[m, j] · down[m, j], in f16.
     w = rw_desc.load([0, 0])
     o_desc.store([0, 0], tl.sum(down * w[:, :, None], 1))

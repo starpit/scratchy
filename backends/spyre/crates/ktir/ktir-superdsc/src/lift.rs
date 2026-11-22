@@ -184,6 +184,15 @@ fn format_of(op: OpKind, dtype: DType) -> Result<Format, LiftError> {
     }
 }
 
+/// Where a row-major reshape from `from` to `to` sends axis `a`, when it keeps the axis whole:
+/// the same extent, with as many elements before it on both sides. `None` when the reshape
+/// splits it, merges it with a neighbour, or moves it.
+fn reshape_keeps(from: &[Extent], to: &[Extent], a: usize) -> Option<usize> {
+    let before = |shape: &[Extent], n: usize| -> u64 { shape[..n].iter().map(|e| e.get()).product() };
+    let at = before(from, a);
+    (0..to.len()).find(|&b| to[b] == from[a] && before(to, b) == at)
+}
+
 fn extents(op: OpKind, dims: &[i64]) -> Result<Vec<Extent>, LiftError> {
     dims.iter()
         .map(|&d| extent(d).ok_or(LiftError::Malformed { op, what: "a dimension of one position or more" }))
@@ -350,9 +359,16 @@ impl<'f> Cx<'f> {
     /// `t` with its per-position gather done: copied, rows as the index names them, into a dense
     /// intermediate. A gather along an axis names that axis by its index, which a view op would
     /// renumber; a whole-view offset gather names no axis and needs no copy.
-    fn gathered(&mut self, t: T) -> T {
-        if !matches!(t.gather, Some(G::Rows { .. })) {
+    /// `t` ready for a view op that sends view axis `a` to `axis(a)` (`None`: the op splits,
+    /// merges or spreads it): a gather along an axis the op keeps whole is renumbered with it;
+    /// a gather along an axis the op does not keep is done first, copied into a dense
+    /// intermediate, rows as the index names them. A whole-view offset gather names no axis.
+    fn gathered(&mut self, t: T, axis: &impl Fn(usize) -> Option<usize>) -> T {
+        let Some(G::Rows { axis: a, index, rows }) = t.gather.clone() else {
             return t;
+        };
+        if let Some(b) = axis(a) {
+            return T { gather: Some(G::Rows { axis: b, index, rows }), ..t };
         }
         let shape = t.view.shape();
         let dense = self.local(&shape, t.format);
@@ -360,15 +376,17 @@ impl<'f> Cx<'f> {
         dense
     }
 
+    /// A view op: `f` re-describes the view, and `axis` says where each view axis goes.
     fn view_op(
         &mut self,
         op: &Operation<'_>,
         f: impl Fn(&SymView) -> Result<SymView, ViewError>,
+        axis: impl Fn(usize) -> Option<usize>,
     ) -> Result<(), LiftError> {
         let v = match self.get(op.operands[0])? {
-            Val::Tensor(t) => Val::Tensor(self.gathered(t)),
-            Val::Pred(t) => Val::Pred(self.gathered(t)),
-            Val::Widened(t) => Val::Widened(self.gathered(t)),
+            Val::Tensor(t) => Val::Tensor(self.gathered(t, &axis)),
+            Val::Pred(t) => Val::Pred(self.gathered(t, &axis)),
+            Val::Widened(t) => Val::Widened(self.gathered(t, &axis)),
             other => other,
         };
         let v = match v {
@@ -1110,7 +1128,11 @@ impl<'f> Cx<'f> {
                     let view = dense.view.reshape(&to).map_err(|error| LiftError::View { op: op.op_type, error })?;
                     self.bind(op, Val::Tensor(T { view, ..dense }));
                 } else {
-                    self.view_op(op, |v| v.reshape(&to))?;
+                    let from = match self.get(op.operands[0])? {
+                        Val::Tensor(t) | Val::Pred(t) | Val::Widened(t) => t.view.shape(),
+                        _ => to.clone(),
+                    };
+                    self.view_op(op, |v| v.reshape(&to), |a| reshape_keeps(&from, &to, a))?;
                 }
             }
             K::LinalgBroadcast => {
@@ -1120,13 +1142,18 @@ impl<'f> Cx<'f> {
                     .iter()
                     .map(|&d| d as usize)
                     .collect();
-                self.view_op(op, |v| {
-                    let mut w = v.clone();
-                    for &d in &added {
-                        w.axes.insert(d, Axis { extent: shape[d], stride: Stride::BROADCAST });
-                    }
-                    Ok(w)
-                })?;
+                self.view_op(
+                    op,
+                    |v| {
+                        let mut w = v.clone();
+                        for &d in &added {
+                            w.axes.insert(d, Axis { extent: shape[d], stride: Stride::BROADCAST });
+                        }
+                        Ok(w)
+                    },
+                    // Old axis `a` lands where the inserted axes leave it.
+                    |a| (0..shape.len()).filter(|d| !added.contains(d)).nth(a),
+                )?;
             }
             K::LinalgTranspose => {
                 let perm: Vec<usize> = int_list(op, AttrKey::Permutation)
@@ -1134,7 +1161,7 @@ impl<'f> Cx<'f> {
                     .iter()
                     .map(|&d| d as usize)
                     .collect();
-                self.view_op(op, |v| v.transpose(&perm))?;
+                self.view_op(op, |v| v.transpose(&perm), |a| perm.iter().position(|&p| p == a))?;
             }
             K::LinalgReduce => self.reduce(op)?,
             K::LinalgMatmul | K::LinalgBatchMatmul => self.contraction(op)?,

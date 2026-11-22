@@ -13,7 +13,7 @@ use half::f16;
 use ktir_core::arena::Arena;
 use ktir_superdsc::eval::run;
 use ktir_superdsc::lift::lift;
-use ktir_superdsc::program::{Node, OpFunc, Program, Segment};
+use ktir_superdsc::program::{Gather, Node, OpFunc, ParamId, Program, Segment, Store};
 use triton_frontend::codegen::{ArgSpec, KernelSpec};
 use triton_frontend::semantic::Val;
 use triton_frontend::target::Target;
@@ -126,16 +126,54 @@ fn contractions(p: &Program) -> usize {
     nodes(p).iter().filter(|n| n.func == OpFunc::Contraction).count()
 }
 
+/// The three fp8 banks: gate, up and down (parameters 5, 7 and 9).
+const BANKS: [u32; 3] = [5, 7, 9];
+
+/// No copy reads a weight bank: every slab reaches its contraction where it is held.
+fn no_bank_copy(p: &Program) {
+    for n in nodes(p).iter().filter(|n| n.func == OpFunc::Copy) {
+        for o in &n.inputs {
+            if let Store::Param(q) = o.store {
+                assert!(!BANKS.contains(&q.get()), "a copy reads weight bank {}", q.get());
+            }
+        }
+    }
+}
+
+/// Every expert contraction reads its bank through a gather, never a copy of it.
+fn banks_gathered(p: &Program) {
+    let reads: Vec<_> = nodes(p)
+        .iter()
+        .filter(|n| n.func == OpFunc::Contraction)
+        .flat_map(|n| n.inputs.iter())
+        .filter(|o| BANKS.iter().any(|&b| o.store == Store::Param(ParamId::new(b))))
+        .collect();
+    assert_eq!(reads.len(), 3, "each bank is read by one contraction");
+    assert!(
+        reads.iter().all(|o| matches!(o.gather, Some(Gather::Rows { .. }))),
+        "each bank is read through the routed ids' gather"
+    );
+}
+
 #[test]
 fn the_experts_are_three_contractions_at_any_token_and_expert_count() {
     let one = moe(Shape { m: 1, h: 128, i: 64, e: 64, k: 8 });
     let two = moe(Shape { m: 2, h: 128, i: 64, e: 64, k: 8 });
+    let four = moe(Shape { m: 4, h: 128, i: 64, e: 64, k: 8 });
     let wide = moe(Shape { m: 1, h: 128, i: 64, e: 64, k: 16 });
-    for (what, p) in [("M = 1", &one), ("M = 2", &two), ("K = 16", &wide)] {
+    let many = moe(Shape { m: 1, h: 128, i: 64, e: 128, k: 8 });
+    for (what, p) in [("M = 1", &one), ("M = 2", &two), ("M = 4", &four), ("K = 16", &wide), ("E = 128", &many)] {
         assert_eq!(contractions(p), 4, "{what}: the router and the three expert projections");
+        no_bank_copy(p);
+        banks_gathered(p);
     }
-    // The tokens are an axis of every node, never more nodes.
-    assert_eq!(nodes(&one).len(), nodes(&two).len(), "the node count does not grow with the tokens");
+    // The tokens and the experts are axes and gathers, never more nodes. A pair's gate/up input
+    // is its token's row repeated across the K slots: at one token that is a view, past one it
+    // is one copy of the M·K·H activations (merging the tokens with the stride-0 slots), so the
+    // count is one higher from M = 2 on and constant after.
+    assert_eq!(nodes(&two).len(), nodes(&four).len(), "the node count does not grow with the tokens");
+    assert_eq!(nodes(&one).len() + 1, nodes(&two).len(), "one token's repeated row is a view");
+    assert_eq!(nodes(&one).len(), nodes(&many).len(), "the node count does not grow with the experts");
 }
 
 // ── THE HOST REFERENCE, written from moe.py's statement, op by op, under the evaluator's
@@ -197,6 +235,12 @@ fn gelu_tanh_times(gate: f32, up: f32) -> f32 {
 }
 
 fn host(s: Shape, w: &Weights) -> Out {
+    host_misrouted(s, w, 0)
+}
+
+/// The host reference with every routed expert read `shift` experts further on: shift 0 is
+/// the reference, any other shift a reference the device must not match.
+fn host_misrouted(s: Shape, w: &Weights, shift: usize) -> Out {
     let Shape { m, h: hd, i: id, e: ne, k } = s;
     let mut ids = vec![0i32; m * k];
     let mut rs = vec![0f32; m * k];
@@ -233,7 +277,7 @@ fn host(s: Shape, w: &Weights) -> Out {
         let mut acc = vec![0f32; hd];
         let mut downs = Vec::with_capacity(k);
         for j in 0..k {
-            let e = ids[t * k + j] as usize;
+            let e = (ids[t * k + j] as usize + shift) % ne;
             let proj = |bank: &[f32], scale: &[f32], c: usize| -> f32 {
                 let raw = h((0..hd).fold(0f32, |a, x| a + qx[x] * bank[(e * id + c) * hd + x]));
                 h(h(raw * sx) * scale[e * id + c])
@@ -311,6 +355,9 @@ fn the_lifted_moe_computes_the_host_moe() {
     assert_eq!(out[13], f(&want.rs), "the route weights");
     assert!(want.o.iter().all(|x| x.is_finite()) && want.o.iter().any(|&x| x != 0.0), "a finite, nonzero output");
     assert_eq!(out[11], f(&want.o), "the output");
+    // NEGATIVE CONTROL: the same check against a reference that reads each pair's neighbouring
+    // expert must fail, so the check sees which expert the device read.
+    assert_ne!(out[11], f(&host_misrouted(s, &w, 1).o), "a misrouted reference is not the device");
 }
 
 // ── THE PREFILL FORM: every expert over every token, weighted by the dense route. ──
@@ -322,6 +369,7 @@ fn the_prefill_experts_are_three_contractions_at_any_prompt_and_expert_count() {
     let wide = compile(Form::Prefill, Shape { m: 16, h: 128, i: 64, e: 32, k: 8 });
     for (what, p) in [("T = 16", &short), ("T = 32", &long), ("E = 32", &wide)] {
         assert_eq!(contractions(p), 4, "{what}: the router and the three expert projections");
+        no_bank_copy(p);
     }
     assert_eq!(nodes(&short).len(), nodes(&long).len(), "the node count does not grow with the prompt");
     assert_eq!(nodes(&short).len(), nodes(&wide).len(), "the node count does not grow with the experts");
@@ -330,12 +378,17 @@ fn the_prefill_experts_are_three_contractions_at_any_prompt_and_expert_count() {
 /// The prefill host reference: the router as decode's, the dense route, then every expert over
 /// every token, summed over the experts in expert order.
 fn host_prefill(s: Shape, w: &Weights) -> (Vec<f32>, Vec<f32>) {
+    host_prefill_misrouted(s, w, 0)
+}
+
+/// The prefill reference with each route weight placed `shift` lanes from its expert.
+fn host_prefill_misrouted(s: Shape, w: &Weights, shift: usize) -> (Vec<f32>, Vec<f32>) {
     let Shape { m: rows, h: hd, i: id, e: ne, k } = s;
     let decode = host(s, w);
     let mut dense = vec![0f32; rows * ne];
     for t in 0..rows {
         for j in 0..k {
-            dense[t * ne + decode.ids[t * k + j] as usize] = decode.rs[t * k + j];
+            dense[t * ne + (decode.ids[t * k + j] as usize + shift) % ne] = decode.rs[t * k + j];
         }
     }
     let mut o = vec![0f32; rows * hd];
@@ -391,4 +444,6 @@ fn the_lifted_prefill_moe_computes_the_host_moe() {
     assert_eq!(out[12], f(&dense), "the dense route");
     assert!(o.iter().all(|x| x.is_finite()) && o.iter().any(|&x| x != 0.0), "a finite, nonzero output");
     assert_eq!(out[11], f(&o), "the output");
+    // NEGATIVE CONTROL: a reference with each route weight one lane off must fail.
+    assert_ne!(out[11], f(&host_prefill_misrouted(s, &w, 1).1), "a misrouted reference is not the device");
 }
