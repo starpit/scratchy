@@ -428,9 +428,14 @@ const EXPECTED: &[(&str, &str)] = &[
     // RED: `tensor.generate`.
     ("moe_fwd", "stops: Op(TensorGenerate)"),
     ("moe_prefill_fwd", "stops: Op(TensorGenerate)"),
-    // RED: the sampler's integer ops — random and greedy draws both, never greedy-only.
-    ("sample_fwd_b1", "stops: Op(ArithUitofp)"),
-    ("sample_fwd_b2", "stops: Op(ArithUitofp)"),
+    // The sampler lifts. Lifting is not the draw being right: the numeric check of the
+    // random AND greedy draws against an exact host computation is its own gate. The grid
+    // ([B], one program per request row) is one outer axis (tests/grid.rs). No production
+    // kernel runs a grid wider than the card's 32 cores: the sampler's grid is the batch
+    // rung, whose widest is 32 (the old crate's `PagedKvPool::WIDEST_BATCH_RUNG`, a rung
+    // fact the bake carries).
+    ("sample_fwd_b1", "lifts, 0 walk(s)"),
+    ("sample_fwd_b2", "lifts, 0 walk(s)"),
 ];
 
 fn status(r: &Result<Program, LiftError>) -> Status {

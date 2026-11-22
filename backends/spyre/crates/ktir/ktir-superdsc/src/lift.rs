@@ -1046,6 +1046,8 @@ impl<'f> Cx<'f> {
                     Val::Tensor(t) if t.format == Format::Int32 && to == Format::Fp32 => {
                         self.pointwise(op, OpFunc::Device(DeviceOp::Int32ToFp32), to)?
                     }
+                    // A predicate is already 0 or 1 in the format its operands compared in.
+                    Val::Tensor(t) if t.format == to => self.bind(op, Val::Tensor(t)),
                     _ => return Err(LiftError::Op(op.op_type)),
                 }
             }
