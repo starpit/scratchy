@@ -990,12 +990,11 @@ dependencies = [
 name = "ktir-superdsc"
 version = "0.1.0"
 dependencies = [
- "half",
  "ktir-core",
- "ktir-superdsc",
- "scratchy-tp-world",
  "serde",
  "serde_json",
+ "triton-frontend",
+ "triton-ktir",
 ]
 
 [[package]]
@@ -1785,13 +1784,13 @@ dependencies = [
  "scratchy-spyre-bundle",
  "scratchy-subtile",
  "scratchy-tensors",
+ "scratchy-tp-world",
  "scratchy-triton-splice",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "tracing",
- "triton-ktir-superdsc",
 ]
 
 [[package]]
@@ -1857,7 +1856,6 @@ dependencies = [
  "serde_json",
  "triton-frontend",
  "triton-ktir",
- "triton-ktir-superdsc",
 ]
 
 [[package]]
@@ -2300,17 +2298,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "triton-ktir-superdsc"
-version = "0.1.0"
-dependencies = [
- "ktir-core",
- "ktir-superdsc",
- "serde_json",
- "triton-frontend",
- "triton-ktir",
-]
-
-[[package]]
 name = "triton-numeric"
 version = "0.1.0"
 dependencies = [
@@ -2319,7 +2306,6 @@ dependencies = [
  "serde_json",
  "triton-frontend",
  "triton-ktir",
- "triton-ktir-superdsc",
 ]
 
 [[package]]

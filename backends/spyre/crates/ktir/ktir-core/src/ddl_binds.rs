@@ -126,7 +126,7 @@ macro_rules! device_ops {
         /// A device op, TYPED — the table's key. One variant per opFuncName
         /// the table states a fact for; the door's string spelling is
         /// [`DeviceOp::op_func`], a property, never a second key.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub enum DeviceOp {
             $($variant,)*
         }
@@ -148,6 +148,12 @@ device_ops!(
     Maximum,
     Minimum,
     Equal,
+    NotEqual,
+    GreaterThan,
+    GreaterEqual,
+    LesserThan,
+    LesserEqual,
+    Where3,
     Gelu,
     Reciprocal,
     Tanh,
@@ -160,6 +166,8 @@ device_ops!(
     Rsqrt,
     Mish,
     Log,
+    Floor,
+    Identity,
     // ── the convert family
     AddI32ToI32,
     MulI32ToI32,
@@ -189,6 +197,12 @@ impl DeviceOp {
             DeviceOp::Maximum => "maximum",
             DeviceOp::Minimum => "minimum",
             DeviceOp::Equal => "equal",
+            DeviceOp::NotEqual => "notequal",
+            DeviceOp::GreaterThan => "greaterthan",
+            DeviceOp::GreaterEqual => "greaterequal",
+            DeviceOp::LesserThan => "lesserthan",
+            DeviceOp::LesserEqual => "lesserequal",
+            DeviceOp::Where3 => "where3",
             DeviceOp::Gelu => "gelu",
             DeviceOp::Reciprocal => "reciprocal",
             DeviceOp::Tanh => "tanh",
@@ -201,6 +215,8 @@ impl DeviceOp {
             DeviceOp::Rsqrt => "rsqrt",
             DeviceOp::Mish => "mish",
             DeviceOp::Log => "log",
+            DeviceOp::Floor => "floor",
+            DeviceOp::Identity => "identity",
             DeviceOp::AddI32ToI32 => "addi32toi32",
             DeviceOp::MulI32ToI32 => "muli32toi32",
             DeviceOp::Int32ToFp32 => "int32tofp32",
@@ -225,6 +241,12 @@ impl DeviceOp {
             | DeviceOp::Maximum
             | DeviceOp::Minimum
             | DeviceOp::Equal
+            | DeviceOp::NotEqual
+            | DeviceOp::GreaterThan
+            | DeviceOp::GreaterEqual
+            | DeviceOp::LesserThan
+            | DeviceOp::LesserEqual
+            | DeviceOp::Where3
             | DeviceOp::Gelu
             | DeviceOp::Reciprocal
             | DeviceOp::Tanh
@@ -236,7 +258,9 @@ impl DeviceOp {
             | DeviceOp::Sqrt
             | DeviceOp::Rsqrt
             | DeviceOp::Mish
-            | DeviceOp::Log => DeviceFamily::Pointwise,
+            | DeviceOp::Log
+            | DeviceOp::Floor
+            | DeviceOp::Identity => DeviceFamily::Pointwise,
             DeviceOp::AddI32ToI32 | DeviceOp::MulI32ToI32 => DeviceFamily::Pointwise,
             DeviceOp::Int32ToFp32
             | DeviceOp::Fp32ToInt32
@@ -461,6 +485,48 @@ impl DeviceGen for Gen1 {
             arrangement: ElementArrangement::Standard,
             citation: "broadcast_ops.ddl:41 equal [%type_fp16, %type_fp32]",
         },
+        DeviceOpRow {
+            op: DeviceOp::NotEqual,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:42 notequal [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::GreaterThan,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:38 greaterthan [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::GreaterEqual,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:37 greaterequal [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::LesserThan,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:40 lesserthan [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::LesserEqual,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:39 lesserequal [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Where3,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "broadcast_ops.ddl:36 where3 [%type_fp16, %type_fp32]",
+        },
         // ── unary_parallel.ddl — the one-input family, most rows bound at both
         //    formats (the fp32 rows ride an internal tensor).
         DeviceOpRow {
@@ -577,6 +643,21 @@ impl DeviceGen for Gen1 {
             citation: "unary_pipeline.ddl:22 log [%type_fp16] (PE+SFP \
                    pipeline) / unary_parallel.ddl:40 log [%type_fp32] \
                    (parallel)",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Floor,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "unary_parallel.ddl:47 floor [%type_fp16, %type_fp32]",
+        },
+        DeviceOpRow {
+            op: DeviceOp::Identity,
+            dfs: &[DdlDf::Fp16, DdlDf::Fp32],
+            admitted: &[DdlDf::Fp16, DdlDf::Fp32],
+            arrangement: ElementArrangement::Standard,
+            citation: "unary_parallel.ddl:45 identity — a TYPELESS bind ([]): it only moves \
+                   data, its input and output free to be any format of one width",
         },
         // ── the integer broadcast ops — the MoE lanes chain's own rows (the
         //    i32 mul/add). Bound in fp32 MODE over uint32 tensors, the value

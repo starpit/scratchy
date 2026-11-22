@@ -34,9 +34,6 @@ publish = false
 triton-frontend = { path = "../triton-frontend" }
 # LEG 2 -- ttir value to our KTIR value, then `passes::to_ktir_emit::lower` to THEIR `IRFunction`.
 triton-ktir = { path = "../triton-ktir" }
-# THE FOURTEEN CONFIGURATIONS, stated once. `cases::case(name)` is the same table `examples/bake_py`
-# drives, so "what is `rope_q32`?" has one answer in this repo and not two.
-triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
 # LEG 3 -- the executor. Re-hosted: scratchy's own `ktir-emulator`, in-tree.
 #
 # `default-features = false` drops `optimizer`, which gates `resident`/`segmented`/`program` --

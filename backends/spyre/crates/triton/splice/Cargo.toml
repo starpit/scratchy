@@ -23,7 +23,6 @@ ktir-superdsc = { path = "../../ktir/ktir-superdsc" }
 # (backends/spyre/crates/triton/PROVENANCE.md, copy rule 2) — no crates.io package regardless.
 triton-frontend = { path = "../triton-frontend" }
 triton-ktir = { path = "../triton-ktir" }
-triton-ktir-superdsc = { path = "../triton-ktir-superdsc" }
 
 [dev-dependencies]
 # The byte-identity dump's per-op stable text: `wire::SdscOp` derives `Serialize`,
