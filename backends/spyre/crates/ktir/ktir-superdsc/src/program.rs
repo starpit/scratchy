@@ -27,6 +27,10 @@ pub struct LocalId(u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ConstId(u32);
 
+/// A constant table: a whole tensor of values stated at compile time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TableId(u32);
+
 macro_rules! id {
     ($t:ident) => {
         impl $t {
@@ -42,6 +46,7 @@ macro_rules! id {
 id!(ParamId);
 id!(LocalId);
 id!(ConstId);
+id!(TableId);
 
 /// Where an operand's elements live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -49,6 +54,9 @@ pub enum Store {
     Param(ParamId),
     Local(LocalId),
     Const(ConstId),
+    /// A tensor whose every element the program states at compile time (`tensor.generate`):
+    /// data the bake stages, never computed on the device.
+    Table(TableId),
 }
 
 /// The format a buffer's elements are held in on the device.
@@ -194,5 +202,14 @@ pub struct Program {
     pub params: Vec<Option<Format>>,
     pub locals: Vec<Local>,
     pub consts: Vec<ConstStick>,
+    pub tables: Vec<Table>,
     pub segments: Vec<Segment>,
+}
+
+/// A constant table's values, row-major, each stated as f32 bits (an integer exactly so), held in
+/// `format`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Table {
+    pub format: Format,
+    pub bits: Vec<u32>,
 }

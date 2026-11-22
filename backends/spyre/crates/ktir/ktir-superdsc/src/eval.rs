@@ -42,6 +42,7 @@ struct Run<'p> {
     p: &'p Program,
     params: Vec<Vec<f64>>,
     locals: Vec<Vec<f64>>,
+    tables: Vec<Vec<f64>>,
 }
 
 /// The element offset an origin names on `trip`.
@@ -70,6 +71,7 @@ impl Run<'_> {
             Store::Param(p) => &self.params[p.get() as usize],
             Store::Local(l) => &self.locals[l.get() as usize],
             Store::Const(_) => &[],
+            Store::Table(t) => &self.tables[t.get() as usize],
         }
     }
 
@@ -121,7 +123,7 @@ impl Run<'_> {
         let buf = match o.store {
             Store::Param(p) => &mut self.params[p.get() as usize],
             Store::Local(l) => &mut self.locals[l.get() as usize],
-            Store::Const(_) => return Err(EvalError::Unmodelled(OpFunc::Copy)),
+            Store::Const(_) | Store::Table(_) => return Err(EvalError::Unmodelled(OpFunc::Copy)),
         };
         let len = buf.len();
         let slot = usize::try_from(at)
@@ -254,6 +256,11 @@ pub fn run(p: &Program, params: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, EvalErro
         p,
         params,
         locals: p.locals.iter().map(|l| vec![0.0; l.elements.get() as usize]).collect(),
+        tables: p
+            .tables
+            .iter()
+            .map(|t| t.bits.iter().map(|&b| f64::from(f32::from_bits(b))).collect())
+            .collect(),
     };
     for s in &p.segments {
         match s {

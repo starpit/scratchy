@@ -425,9 +425,12 @@ const EXPECTED: &[(&str, &str)] = &[
     ("paged_attn_prefill", "lifts, 1 walk(s)"),
     ("batched_decode", "lifts, 0 walk(s)"),
     ("paged_kv_write", "lifts, 0 walk(s)"),
-    // RED: `tensor.generate`.
-    ("moe_fwd", "stops: Op(TensorGenerate)"),
-    ("moe_prefill_fwd", "stops: Op(TensorGenerate)"),
+    // The MoE kernels lift, but as written: `static_range(M) ⊃ static_range(K)` is unrolled by
+    // Triton, so each token's K experts are separate matmuls (25 at M = 1, K = 8). The form they
+    // must reach is one gathered batched contraction over (token, expert slot), the experts'
+    // weights gathered by id: a kernel rewrite.
+    ("moe_fwd", "lifts, 0 walk(s)"),
+    ("moe_prefill_fwd", "lifts, 0 walk(s)"),
     // The sampler lifts. Lifting is not the draw being right: the numeric check of the
     // random AND greedy draws against an exact host computation is its own gate. The grid
     // ([B], one program per request row) is one outer axis (tests/grid.rs). No production

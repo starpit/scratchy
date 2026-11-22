@@ -31,7 +31,7 @@ use ktir_core::opkind::OpKind;
 use crate::lin::{Lin, NotAffine, Sym};
 use crate::program::{
     Address, Axis, ConstId, ConstStick, Format, Gather, Local, LocalId, Node, OpFunc, Operand,
-    ParamId, Program, Segment, Store, View, Walk,
+    ParamId, Program, Segment, Store, Table, TableId, View, Walk,
 };
 use crate::qty::{Elems, Extent, Stride};
 use crate::view::{SymView, ViewError, extent};
@@ -101,6 +101,7 @@ struct Mark {
     run: usize,
     locals: usize,
     consts: usize,
+    tables: usize,
     params: Vec<Option<Format>>,
 }
 
@@ -130,6 +131,10 @@ enum Val {
     /// A compare's result: 1 or 0 in the format its operands compared in. Read only by a select
     /// or a cast.
     Pred(T),
+    /// An fp8 tensor read as fp16: exact, so a contraction reads the fp8 itself (the device's fp8
+    /// matmul) and no op converts it. Anything else that reads it would need the device's
+    /// `fp8todl16`, whose lane order is not measured.
+    Widened(T),
 }
 
 struct Cx<'f> {
@@ -139,6 +144,7 @@ struct Cx<'f> {
     locals: Vec<Local>,
     consts: Vec<ConstStick>,
     const_ids: HashMap<ConstStick, ConstId>,
+    tables: Vec<Table>,
     segments: Vec<Segment>,
     /// The nodes of the run being lifted: straight code, or a walk's body.
     run: Vec<Raw>,
@@ -164,6 +170,17 @@ fn format_of(op: OpKind, dtype: DType) -> Result<Format, LiftError> {
         DType::I32 => Ok(Format::Int32),
         DType::Fp8E4m3 => Ok(Format::Fp8),
         DType::Bool | DType::I64 => Err(LiftError::Format { op, dtype }),
+    }
+}
+
+/// `x` as `format` holds it, for a value the lift computes at compile time; `None` for fp8,
+/// whose rounding this crate does not state.
+fn round_to(x: f32, format: Format) -> Option<f32> {
+    match format {
+        Format::Fp32 => Some(x),
+        Format::Fp16 => Some(half::f16::from_f32(x).to_f32()),
+        Format::Int32 => Some(x.trunc()),
+        Format::Fp8 => None,
     }
 }
 
@@ -266,6 +283,8 @@ impl<'f> Cx<'f> {
                 Some(i) => Ok(self.splat(i as f64, format, shape)),
                 None => Err(LiftError::Op(op.op_type)),
             },
+            // An fp8 value read as fp16 by anything but a contraction needs `fp8todl16`.
+            Val::Widened(_) => Err(LiftError::Op(OpKind::ArithExtf)),
             Val::Dyn { index, scale: 1, add: 0 } => Ok(T {
                 view: SymView {
                     origin: index.view.origin,
@@ -343,6 +362,10 @@ impl<'f> Cx<'f> {
                 view: f(&t.view).map_err(|error| LiftError::View { op: op.op_type, error })?,
                 ..t
             }),
+            Val::Widened(t) => Val::Widened(T {
+                view: f(&t.view).map_err(|error| LiftError::View { op: op.op_type, error })?,
+                ..t
+            }),
             Val::Splat { value, format, .. } => Val::Splat {
                 value,
                 format,
@@ -399,9 +422,18 @@ impl<'f> Cx<'f> {
     /// `linalg.matmul` / `linalg.batch_matmul`: one contraction; a non-zero init adds after.
     fn contraction(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
         let malformed = |what| LiftError::Malformed { op: op.op_type, what };
-        let (Val::Tensor(a), Val::Tensor(b)) = (self.get(op.operands[0])?, self.get(op.operands[1])?) else {
-            return Err(malformed("a contraction reads two tensors"));
+        // Two fp8 values read as fp16 contract as the fp8 they are (the device's fp8 matmul,
+        // main's W8A8 form, card-coherent at #299); otherwise both are tensors as stated.
+        let side = |v: Val| match v {
+            Val::Tensor(t) => Ok((t, false)),
+            Val::Widened(t) => Ok((t, true)),
+            _ => Err(malformed("a contraction reads two tensors")),
         };
+        let ((a, wa), (b, wb)) = (side(self.get(op.operands[0])?)?, side(self.get(op.operands[1])?)?);
+        // A widened side contracts as its fp8 only beside another fp8 side.
+        if (wa || wb) && (a.format != Format::Fp8 || b.format != Format::Fp8) {
+            return Err(LiftError::Op(OpKind::ArithExtf));
+        }
         let rank = a.view.axes.len();
         if rank < 2 || b.view.axes.len() != rank {
             return Err(malformed("a contraction's operands share a rank of two or more"));
@@ -538,6 +570,56 @@ impl<'f> Cx<'f> {
             step: Stride::new(held.axes[a].stride.get() * scale.get()),
             bound: Extent::new(NonZeroU64::new(room / scale.get() + 1).ok_or(bad)?),
         })
+    }
+
+    /// `tensor.generate`: a tensor whose elements the program states as a function of their
+    /// index, evaluated here, element by element, into a constant table the bake stages. Its body
+    /// may compute scalars only: anything that would put a node on the device is not a constant.
+    fn generate(&mut self, op: &Operation<'_>) -> Result<(), LiftError> {
+        let malformed = |what| LiftError::Malformed { op: op.op_type, what };
+        let shape = Self::result_shape(op)?;
+        let format = Self::result_format(op)?;
+        let body = op.regions.first().copied().unwrap_or(&[]);
+        let names: Vec<Ssa> = body
+            .iter()
+            .find(|o| o.op_type == OpKind::RegionBb0Args)
+            .and_then(|o| match o.attr(AttrKey::Names) {
+                Some(Attr::Ssas(v)) => Some(v.to_vec()),
+                _ => None,
+            })
+            .ok_or(malformed("tensor.generate names its index arguments"))?;
+        if names.len() != shape.len() {
+            return Err(malformed("tensor.generate names one index per dimension"));
+        }
+        let total: u64 = shape.iter().map(|e| e.get()).product();
+        let nodes = self.run.len();
+        let mut bits = Vec::with_capacity(total as usize);
+        for flat in 0..total {
+            let mut rest = flat;
+            for d in (0..shape.len()).rev() {
+                let n = shape[d].get();
+                self.env.insert(names[d], Val::Int(Lin::constant((rest % n) as i64)));
+                rest /= n;
+            }
+            let value = match self.ops(body)?.as_deref() {
+                Some([Val::Int(l)]) => l.as_const().ok_or(LiftError::NotAffine { op: op.op_type })? as f32,
+                Some([Val::Float(x)]) => *x as f32,
+                _ => return Err(malformed("tensor.generate yields one scalar per element")),
+            };
+            if self.run.len() != nodes {
+                return Err(malformed("tensor.generate's body computes scalars only"));
+            }
+            bits.push(value.to_bits());
+        }
+        self.tables.push(Table { format, bits });
+        let t = T {
+            store: Store::Table(TableId::new(self.tables.len() as u32 - 1)),
+            view: SymView::row_major(Lin::constant(0), &shape),
+            format,
+            gather: None,
+        };
+        self.bind(op, Val::Tensor(t));
+        Ok(())
     }
 
     /// `ktdp.construct_indirect_access_tile`: one dimension's rows named by an index view.
@@ -739,6 +821,7 @@ impl<'f> Cx<'f> {
             run: self.run.len(),
             locals: self.locals.len(),
             consts: self.consts.len(),
+            tables: self.tables.len(),
             params: self.params.clone(),
         }
     }
@@ -750,6 +833,7 @@ impl<'f> Cx<'f> {
         for c in self.consts.drain(m.consts..) {
             self.const_ids.remove(&c);
         }
+        self.tables.truncate(m.tables);
         self.params = m.params;
     }
 
@@ -761,7 +845,7 @@ impl<'f> Cx<'f> {
         let outer = |s: Store| match s {
             Store::Param(_) => true,
             Store::Local(l) => (l.get() as usize) < m.locals,
-            Store::Const(_) => false,
+            Store::Const(_) | Store::Table(_) => false,
         };
         let mut written = std::collections::HashSet::new();
         let mut read = std::collections::HashSet::new();
@@ -1061,6 +1145,9 @@ impl<'f> Cx<'f> {
                     Val::Float(_) => self.bind(op, v),
                     Val::Splat { value, shape, .. } => self.bind(op, Val::Splat { value, format: to, shape }),
                     Val::Tensor(ref t) if t.format == to => self.bind(op, v),
+                    Val::Tensor(t) if t.format == Format::Fp8 && to == Format::Fp16 => {
+                        self.bind(op, Val::Widened(t))
+                    }
                     Val::Tensor(ref t) => match (t.format, to) {
                         (Format::Fp16, Format::Fp32) => self.pointwise(op, OpFunc::Device(DeviceOp::Dl16ToFp32), to)?,
                         (Format::Fp32, Format::Fp16) => self.pointwise(op, OpFunc::Device(DeviceOp::Fp32ToDl16), to)?,
@@ -1073,6 +1160,22 @@ impl<'f> Cx<'f> {
             K::ArithSitofp | K::ArithUitofp => {
                 let to = Self::result_format(op)?;
                 match self.get(op.operands[0])? {
+                    // A cast of a constant table is a constant table: its values converted here.
+                    Val::Tensor(t) if matches!(t.store, Store::Table(_)) => {
+                        let Store::Table(id) = t.store else {
+                            return Err(malformed("a table cast reads a table"));
+                        };
+                        let from = &self.tables[id.get() as usize];
+                        let bits = from
+                            .bits
+                            .iter()
+                            .map(|&b| round_to(f32::from_bits(b), to).map(f32::to_bits))
+                            .collect::<Option<_>>()
+                            .ok_or(malformed("a constant table in a format this crate rounds"))?;
+                        self.tables.push(Table { format: to, bits });
+                        let store = Store::Table(TableId::new(self.tables.len() as u32 - 1));
+                        self.bind(op, Val::Tensor(T { store, format: to, ..t }));
+                    }
                     Val::Int(l) => self.bind(
                         op,
                         Val::Float(l.as_const().ok_or(LiftError::NotAffine { op: op.op_type })? as f64),
@@ -1095,7 +1198,8 @@ impl<'f> Cx<'f> {
                 _ => return Err(LiftError::Op(op.op_type)),
             },
             K::ScfFor => self.for_loop(op)?,
-            K::ScfYield => {
+            K::TensorGenerate => self.generate(op)?,
+            K::ScfYield | K::TensorYield => {
                 let vs = op.operands.iter().map(|&s| self.get(s)).collect::<Result<Vec<_>, _>>()?;
                 return Ok(Some(vs));
             }
@@ -1216,6 +1320,7 @@ pub fn lift(f: &IRFunction<'_>) -> Result<Program, LiftError> {
         locals: Vec::new(),
         consts: Vec::new(),
         const_ids: HashMap::new(),
+        tables: Vec::new(),
         segments: Vec::new(),
         run: Vec::new(),
         walking: None,
@@ -1259,6 +1364,7 @@ pub fn lift(f: &IRFunction<'_>) -> Result<Program, LiftError> {
         params: cx.params,
         locals: cx.locals,
         consts: cx.consts,
+        tables: cx.tables,
         segments: cx.segments,
     })
 }
